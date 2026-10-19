@@ -554,12 +554,30 @@ pub(super) fn retail_hills_collapsed_scene(
     let target = move_retail_fv(&mut scenario, owner, (62, 69), (68, 69), (66, 69), false);
     observe(scenario.sim(), "after_ordinary_fv_moves");
     let enemy = scenario.runtime.simulation.intern("Russians");
+    // Snapshot401's House admission (d11222e2c) models the native House array:
+    // every registered House carries the name FromName50C170 reads and the
+    // array holds it once. Register the hostile House exactly that way, as
+    // the roster reader would, so the retail save/restore witnesses below
+    // keep validating state the native array can hold.
     scenario
         .runtime
         .simulation
         .houses
         .entry(enemy)
-        .or_insert_with(|| HouseState::new(enemy, 0, None, true, 0, 10));
+        .or_insert_with(|| {
+            let mut house = HouseState::new(enemy, 0, None, true, 0, 10);
+            house.initialize_scenario_name("Russians");
+            house
+        });
+    if !scenario
+        .runtime
+        .simulation
+        .session
+        .house_order
+        .contains(&enemy)
+    {
+        scenario.runtime.simulation.session.house_order.push(enemy);
+    }
     scenario
         .runtime
         .simulation

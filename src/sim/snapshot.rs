@@ -9290,6 +9290,63 @@ mod tests {
         assert_eq!(loaded.sim.state_hash(), expected_hash);
     }
 
+    /// Issue #1949. Retail witnesses register an extra hostile House beside
+    /// the admitted scenario Houses before saving (Dustbowl defences, the
+    /// Hills bridge layers). The native House array holds every entry with
+    /// the bounded name `FromName50C170` reads, so such a registration must
+    /// install that name and its array membership, and snapshot401 must
+    /// restore the mixed scenario. A registration that skips the name stays
+    /// rejectable: the admitted-scenario array invariant is native, not a
+    /// test convenience.
+    #[test]
+    fn additionally_registered_scenario_house_round_trips_through_snapshot() {
+        use crate::sim::house_state::HouseState;
+
+        let mut sim = Simulation::with_seed(0x1949);
+        let launch = sim.interner.intern("<human player>");
+        let mut launch_house = HouseState::new(launch, 0, None, true, 10_000, 10);
+        launch_house.initialize_scenario_name("<human player>");
+        sim.houses.insert(launch, launch_house);
+        sim.session.house_order.push(launch);
+        sim.session.current_house = Some(launch);
+        let hostile = sim.interner.intern("Russians");
+        let mut hostile_house = HouseState::new(hostile, 1, None, true, 0, 10);
+        hostile_house.initialize_scenario_name("Russians");
+        sim.houses.insert(hostile, hostile_house);
+        sim.session.house_order.push(hostile);
+
+        let bytes = GameSnapshot::save(&sim, 0, 0, "mixed-registered-houses", 0);
+        let mut restored = GameSnapshot::load(&bytes).expect("load should succeed").sim;
+        restored
+            .restore_after_snapshot_load()
+            .expect("mixed admitted and additionally registered Houses restore");
+        assert_eq!(restored.scenario_house_named("Russians"), Some(hostile));
+        assert_eq!(
+            restored.houses[&hostile].native_scenario_name(),
+            Some("Russians")
+        );
+
+        // The pre-fix witness shape — the same extra House without its
+        // native name — is the state the validation must keep rejecting.
+        let mut nameless = Simulation::with_seed(0x1949);
+        let launch = nameless.interner.intern("<human player>");
+        let mut launch_house = HouseState::new(launch, 0, None, true, 10_000, 10);
+        launch_house.initialize_scenario_name("<human player>");
+        nameless.houses.insert(launch, launch_house);
+        nameless.session.house_order.push(launch);
+        let hostile = nameless.interner.intern("Russians");
+        nameless
+            .houses
+            .insert(hostile, HouseState::new(hostile, 1, None, true, 0, 10));
+        nameless.session.house_order.push(hostile);
+        let bytes = GameSnapshot::save(&nameless, 0, 0, "nameless-registered-house", 0);
+        let mut rejected = GameSnapshot::load(&bytes).expect("load should succeed").sim;
+        assert!(matches!(
+            rejected.restore_after_snapshot_load(),
+            Err(SnapshotRestoreError::InvalidHouseScenarioName { owner, .. }) if owner == hostile
+        ));
+    }
+
     /// A cell TarCom survives serialize → deserialize as the same
     /// `TargetKind::Cell` variant (regression for SNAPSHOT_VERSION 4 → 5).
     #[test]
