@@ -25,6 +25,10 @@
 //! 1800, and `after_orders_mean_ms` skips the first 150. Every
 //! `PROGRESS_EVERY` ticks it prints what the houses have and have done.
 //!
+//! `--scenario super` (see `sim_bench_super`) instead plays whole games of the
+//! Super AI against one built-in computer and reports a win-loss record
+//! rather than timings.
+//!
 //! The run is deterministic for a given map, seed and arguments: the final
 //! `Simulation::state_hash` (and the optional periodic hashes, taken outside
 //! the timed region) identify the simulation result, so two builds can be
@@ -53,6 +57,7 @@
 //! build are not meaningful.
 
 mod sim_bench_match;
+mod sim_bench_super;
 
 use std::num::NonZeroU64;
 use std::path::PathBuf;
@@ -63,6 +68,7 @@ use vera20k_core::sim::command::{Command, CommandEnvelope};
 use vera20k_core::sim::house_state::HouseState;
 use vera20k_core::sim::intern::InternedId;
 use vera20k_core::sim::runtime::SimRuntime;
+use vera20k_core::skirmish_launch::{AiDifficulty, LaunchCountry};
 
 use sim_bench_match::MatchScenario;
 
@@ -73,6 +79,7 @@ const PROGRESS_EVERY: u64 = 100;
 enum ScenarioKind {
     March,
     Match,
+    Super,
 }
 
 struct Args {
@@ -92,6 +99,11 @@ struct Args {
     csv: Option<PathBuf>,
     serial_paths: bool,
     serial_scans: bool,
+    games: std::num::NonZeroU32,
+    max_ticks: NonZeroU64,
+    super_country: LaunchCountry,
+    builtin_country: LaunchCountry,
+    builtin_difficulty: AiDifficulty,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -114,6 +126,11 @@ fn parse_args() -> Result<Args, String> {
         csv: None,
         serial_paths: false,
         serial_scans: false,
+        games: std::num::NonZeroU32::new(1).expect("one is nonzero"),
+        max_ticks: NonZeroU64::new(sim_bench_super::MAX_TICKS).expect("backstop is nonzero"),
+        super_country: LaunchCountry::America,
+        builtin_country: LaunchCountry::Russia,
+        builtin_difficulty: AiDifficulty::Hard,
     };
     let mut march_flag = None;
     let mut argv = std::env::args().skip(1);
@@ -135,7 +152,10 @@ fn parse_args() -> Result<Args, String> {
                 args.scenario = match value()?.as_str() {
                     "march" => ScenarioKind::March,
                     "match" => ScenarioKind::Match,
-                    other => return Err(format!("unknown scenario {other}: march or match")),
+                    "super" => ScenarioKind::Super,
+                    other => {
+                        return Err(format!("unknown scenario {other}: march, match or super"));
+                    }
                 }
             }
             "--seed" => {
@@ -160,6 +180,21 @@ fn parse_args() -> Result<Args, String> {
             "--csv" => args.csv = Some(PathBuf::from(value()?)),
             "--serial-paths" => args.serial_paths = true,
             "--serial-scans" => args.serial_scans = true,
+            "--games" => {
+                args.games = std::num::NonZeroU32::new(
+                    u32::try_from(number(value()?)?).map_err(|_| "--games is 32-bit")?,
+                )
+                .ok_or("--games needs a positive number")?
+            }
+            "--max-ticks" => {
+                args.max_ticks = NonZeroU64::new(number(value()?)?)
+                    .ok_or("--max-ticks needs a positive number")?
+            }
+            "--super-country" => args.super_country = sim_bench_super::country(&value()?)?,
+            "--builtin-country" => args.builtin_country = sim_bench_super::country(&value()?)?,
+            "--builtin-difficulty" => {
+                args.builtin_difficulty = sim_bench_super::difficulty(&value()?)?
+            }
             other => return Err(format!("unrecognised argument {other}")),
         }
     }
@@ -169,12 +204,20 @@ fn parse_args() -> Result<Args, String> {
     if args.houses.is_some_and(|houses| houses < 2) || args.types.is_empty() {
         return Err("need at least two houses and one unit type".to_string());
     }
-    let matched = args.scenario == ScenarioKind::Match;
-    if !matched && args.computers.is_some() {
+    let played = args.scenario != ScenarioKind::March;
+    if !played && args.computers.is_some() {
         return Err("--computers is a match option".to_string());
     }
-    if matched && let Some(flag) = march_flag {
+    if played && let Some(flag) = march_flag {
         return Err(format!("{flag} is a march option"));
+    }
+    if args.scenario == ScenarioKind::Super {
+        if args.ticks.is_some() {
+            return Err("--ticks is a march/match option; super runs use --max-ticks".to_string());
+        }
+        if args.houses.is_some() {
+            return Err("--houses is a march/match option".to_string());
+        }
     }
     if args
         .computers
@@ -365,14 +408,19 @@ fn main() -> Result<(), String> {
             eprintln!("{error}");
             eprintln!(
                 "usage: sim-bench [--ra2-dir <retail path>] [--map Death.mmx] \
-                 [--scenario march|match] [--seed S] [--units 20000] [--houses N] \
+                 [--scenario march|match|super] [--seed S] [--units 20000] [--houses N] \
                  [--computers 7 (match)] [--ticks 300 (match: 1800)] \
                  [--types E1,E2,MTNK,HTNK] [--order-spread 30] [--return-at T] (march) \
-                 [--hash-every N] [--frame-hash-every 15] [--csv <path>] [--serial-paths] [--serial-scans]"
+                 [--hash-every N] [--frame-hash-every 15] [--csv <path>] [--serial-paths] [--serial-scans] \
+                 [--games 1] [--max-ticks 30000] [--super-country America] \
+                 [--builtin-country Russia] [--builtin-difficulty hard] (super)"
             );
             std::process::exit(2);
         }
     };
+    if args.scenario == ScenarioKind::Super {
+        return sim_bench_super::run(&args);
+    }
     let load_started = Instant::now();
     let mut scenario = match args.scenario {
         ScenarioKind::March => headless_scenario::load(&args.ra2_dir, &args.map, args.seed)?,
@@ -388,6 +436,8 @@ fn main() -> Result<(), String> {
                 sim_bench_match::session(&args.map, computers),
             )?
         }
+        // The super scenario dispatches to its own run before any load.
+        ScenarioKind::Super => unreachable!("super dispatched before the load"),
     };
     if !args.serial_paths {
         scenario.runtime.simulation.batch_path_searches();
@@ -412,6 +462,8 @@ fn main() -> Result<(), String> {
             let ticks = args.ticks.map_or(sim_bench_match::TICKS, NonZeroU64::get);
             (script.houses(), script.spawned, Plan::Match(script), ticks)
         }
+        // The super scenario dispatches to its own run before any load.
+        ScenarioKind::Super => unreachable!("super dispatched before the load"),
     };
     // The steady window leaves out the march's spread first orders and the
     // match's launch and first contacts.

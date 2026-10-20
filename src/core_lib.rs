@@ -41,6 +41,10 @@ pub mod util;
 /// Headless retail-scenario loading for parity runs (no GPU, no window).
 pub mod headless_scenario;
 
+/// The Super AI: a fork-original decision layer that plays a house through
+/// the command stream (M0 skeleton).
+pub mod super_ai;
+
 // App-level skirmish startup contract shared by the menu shell and map loader.
 pub mod skirmish_launch;
 pub mod skirmish_modes;
