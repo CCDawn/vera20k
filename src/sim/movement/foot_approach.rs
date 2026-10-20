@@ -161,7 +161,7 @@ impl Simulation {
                     CrushTarget::from_entity(victim, self.session.binary_frame()),
                     |owner| {
                         crate::sim::combat::combat_weapon::is_ally_by_object(
-                            Some(&self.house_alliances),
+                            Some(self.house_alliances.as_map()),
                             &self.interner,
                             actor.owner(),
                             owner,
@@ -256,7 +256,7 @@ impl Simulation {
             self,
             &self.interner,
             self.resolved_terrain.as_ref(),
-            Some(&self.house_alliances),
+            Some(self.house_alliances.as_map()),
         )
     }
 
@@ -279,7 +279,7 @@ impl Simulation {
         // itself with a declared RET4 (`APPROACH_SEAM`); a replayed row takes
         // that declared answer here, ahead of the head and the body, without
         // touching the Target or the destination. Inactive outside a replay.
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(test)]
         if super::approach_oracle_seam::take_approach_return().is_some() {
             return;
         }
@@ -425,7 +425,7 @@ impl Simulation {
     ///
     /// An empty selected slot keeps the body, as native: GetWeaponRange
     /// answers 0 (`0x007012C0`), In_Range answers false before any query
-    /// (`0x006F7237`), the drop arms (`0x004D5716..0x004D57E4`) still decide,
+    /// (`0x006F7242`), the drop arms (`0x004D5716..0x004D57E4`) still decide,
     /// and a search they admit runs its rings from the foundation-extended
     /// radius with every In_Range candidate test false. The exhausted arm
     /// (`0x004D68E7..0x004D6A58`) drops the Target and sets the passable cell
@@ -480,10 +480,10 @@ impl Simulation {
         let los = combat::line_of_fire::LineOfFireInputs {
             overlay_grid: self.overlay_grid.as_ref(),
             overlay_registry: registry,
-            alliances: Some(&self.house_alliances),
+            alliances: Some(self.house_alliances.as_map()),
         };
         let can_fire = match (weapon, identity) {
-            //0x006F7237: In_Range answers false ahead of any map query when
+            //0x006F7242: In_Range answers false ahead of any map query when
             //GetWeapon gave no weapon (an empty slot), so CanFireAt is false.
             (None, _) => false,
             (Some(weapon), Some(identity)) => in_range::cell_target_in_range(
@@ -503,7 +503,7 @@ impl Simulation {
                 id,
                 &target,
                 &cells,
-                Some(&self.house_alliances),
+                Some(self.house_alliances.as_map()),
                 &los,
                 Some(&target),
             ),
@@ -726,7 +726,7 @@ impl Simulation {
                 retained_candidate = radial;
                 if !cell_rect::cell_is_in_playfield_height_aware_in_query(
                     (i32::from(radial.0), i32::from(radial.1)),
-                    self.playfield_bounds,
+                    self.playfield_bounds(),
                     Some(cells.terrain()),
                     Some(&cells),
                 ) {
@@ -900,7 +900,7 @@ impl Simulation {
                 if !tile.has_image(column, row)
                     || !cell_rect::cell_is_in_playfield_height_aware(
                         (i32::from(cell.0), i32::from(cell.1)),
-                        self.playfield_bounds,
+                        self.playfield_bounds(),
                         terrain,
                     )
                 {
@@ -1036,7 +1036,7 @@ impl Simulation {
     /// Target's coordinate), an XY distance to the Target under 307.2
     /// (`0x007E9230`; `0x004D61A4..0x004D625C`, `0x004D64C0..0x004D6580`).
     /// No weapon (an empty slot) fails the In_Range half at its
-    /// `0x006F7237` test; the CloseRange half never asks the weapon.
+    /// `0x006F7242` test; the CloseRange half never asks the weapon.
     fn approach_accepts(
         &self,
         id: u64,
@@ -1070,7 +1070,7 @@ impl Simulation {
                 &combat::line_of_fire::LineOfFireInputs {
                     overlay_grid: self.overlay_grid.as_ref(),
                     overlay_registry: registry,
-                    alliances: Some(&self.house_alliances),
+                    alliances: Some(self.house_alliances.as_map()),
                 },
             )
         });
