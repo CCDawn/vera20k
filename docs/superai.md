@@ -49,10 +49,16 @@ max-ticks guard) and prints a W/L table. Fair tier is the reference line:
 strength claims cite these runs.
 
 The super side plays the launch's local house, so the scenario_bootstrap
-opening (start waypoint + the country's MCV) gives it a real 1v1 start; a
-30000-tick smoke reaches its natural terminal with the idle MCV still
-standing well into the game. Strategies start from the next milestone:
-deploy the MCV, then macro.
+opening (start waypoint + the country's MCV) gives it a real 1v1 start.
+
+The first strategy slice is landed: the Fair tier deploys the MCV and walks
+the retail opening (power, refinery, barracks, war factory, then a second
+refinery and harvesters) as pure decisions — one command per tick, gated by
+the production cameo state. A retail regression test drives a real Battle
+from the launch MCV to a standing construction yard, power plant and
+refinery; the one-game smoke now runs 22335 ticks before the Hard computer
+overruns the still-defenseless base (the idle-MCV baseline terminated at
+12904). Army, scouting, defense and micro remain open.
 
 ## Upstream sync
 

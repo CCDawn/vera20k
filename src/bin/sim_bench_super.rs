@@ -6,9 +6,9 @@
 //! the launch's own opening. The launch seats every active slot on a start
 //! waypoint and seeds its country's MCV there (`unit_count = 0` buys no
 //! roaming starting units), and the Super AI drives the local house through
-//! [`SuperAi::orders`] — M1 still emits nothing, so the benchmark measures
-//! the load → drive → terminal pipeline over a real opening instead of a
-//! house that spawns with nothing and loses at once. The match naturally
+//! [`SuperAi::orders`] — the Fair tier plays the retail opening (deploy the
+//! MCV, then power, refinery, barracks, war factory and miners) as pure
+//! decisions on top of the native build rules. The match naturally
 //! ends when the local (Super AI) house's outcome is decided, which
 //! `advance_frame`'s `TickResult::terminal_score_finalized` reports
 //! (`advance_frame_for_tooling` discards its output, so this scenario calls
@@ -165,8 +165,8 @@ pub(crate) fn run(args: &super::Args) -> Result<(), String> {
         runtime.simulation.batch_target_scans();
         let builtin =
             builtin_computer(runtime).ok_or("the launch created no built-in computer house")?;
-        // M1 gives the Super AI a real opening but no strategy: the baseline
-        // tier still emits nothing, so the computer decides the game alone.
+        // The Fair tier plays pure decisions: the retail opening with no
+        // economic edge, so the benchmark measures the opening chain alone.
         let mut ai = SuperAi::new(super_house, SuperAiDifficulty::Fair);
 
         let mut ticks = 0u64;
