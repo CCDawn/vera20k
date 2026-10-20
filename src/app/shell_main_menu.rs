@@ -574,7 +574,7 @@ impl App {
         // Main_Game48CEBF also retires ScenarioStarted after score Continue;
         // source: original gamemd.exe Main_Game48CCC0 (EBX=0 at48CCD4).
         if let Some(runtime) = state.match_state.sim_runtime.as_mut() {
-            runtime.simulation.session.set_started(false);
+            runtime.simulation.retire_scenario_started();
         }
         crate::app::match_runtime::sim_tick::flush_replay_log(state);
         Self::capture_returned_multiplayer_scenario(state);
@@ -1311,6 +1311,16 @@ impl App {
             ShellExitThen::WolLobbyHide => crate::app::shell_wol::lobby::commit_hide(state),
             ShellExitThen::WolCreateAccepted { observe } => {
                 crate::app::shell_wol::lobby::commit_create(state, observe)
+            }
+            ShellExitThen::WolOptionsOpen => crate::app::shell_wol::options::commit_open(state),
+            ShellExitThen::WolOptionsClose(staged) => {
+                crate::app::shell_wol::options::commit_close(state, staged)
+            }
+            ShellExitThen::WolSoundOptionsOpen => {
+                crate::app::shell_wol::options::commit_open_sound(state)
+            }
+            ShellExitThen::WolSoundOptionsBack => {
+                crate::app::shell_wol::options::commit_sound_back(state)
             }
         }
     }

@@ -227,7 +227,7 @@ fn receiver_records_an_impassable_current_cell() {
             .resolved_terrain
             .as_mut()
             .unwrap()
-            .cell_mut(10, 10)
+            .cell_mut_for_test(10, 10)
             .unwrap();
         cell.land_type = 2;
         cell.speed_costs.foot = Some(0);

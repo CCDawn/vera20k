@@ -191,7 +191,7 @@ fn supplied_world(
                 .resolved_terrain
                 .as_mut()
                 .unwrap()
-                .cell_mut(x, y)
+                .cell_mut_for_test(x, y)
                 .unwrap();
             terrain.slope_type = signed(&world["default_slope"]) as u8;
             terrain.land_type = land;
@@ -210,7 +210,7 @@ fn supplied_world(
             .resolved_terrain
             .as_mut()
             .unwrap()
-            .cell_mut(at.0, at.1)
+            .cell_mut_for_test(at.0, at.1)
             .unwrap();
         terrain.land_type = land;
         terrain.speed_costs = semantics.speed_costs;
@@ -291,7 +291,7 @@ fn supplied_world(
         actor
             .navigation
             .path_replay_mut()
-            .set_reference_cell(Some((reference.0 as i16, reference.1 as i16)));
+            .set_reference_cell_for_test(Some((reference.0 as i16, reference.1 as i16)));
         actor
             .navigation
             .path_runtime_mut()
@@ -303,11 +303,11 @@ fn supplied_world(
         actor
             .navigation
             .path_runtime_mut()
-            .set_path_blocked(state["blocked"].as_bool().unwrap());
+            .set_path_blocked_for_test(state["blocked"].as_bool().unwrap());
         actor
             .navigation
             .path_runtime_mut()
-            .set_retries_left(state["retries"].as_u64().unwrap() as u32);
+            .set_retries_left_for_test(state["retries"].as_u64().unwrap() as u32);
         actor.body_facing.snap(
             signed(&state["body_facing"]["destination_word"]) as u16,
             sim.session.binary_frame(),
@@ -787,7 +787,7 @@ fn execute_step(
                 .jumpjet_runtime_mut()
                 .unwrap();
             let mut flight = runtime.flight();
-            flight.set_target_height(signed(&inputs["target_height"]));
+            flight.set_target_height_for_test(signed(&inputs["target_height"]));
             *runtime = runtime
                 .clone()
                 .with_phase_for_test(signed(&inputs["phase"]))

@@ -403,8 +403,8 @@ fn walk_path_timer_waits_without_double_aging_or_losing_owner_state() {
         let mut retained = FootPathRuntime::at_frame(0);
         retained.set_movement_timer_for_test(timer);
         retained.set_blocked_timer_for_test(CdTimer::started(100, 60));
-        retained.set_path_blocked(true);
-        retained.set_retries_left(u32::MAX);
+        retained.set_path_blocked_for_test(true);
+        retained.set_retries_left_for_test(u32::MAX);
         let actor = sim.substrate.entities.get_mut(1).unwrap();
         actor.navigation.set_path_runtime_for_test(retained);
         let position = actor.position;
@@ -875,7 +875,7 @@ fn walk_arrival_keeps_list_order_and_snapshot_continuation() {
                 assert!(loaded.zone_grid.as_ref().unwrap().is_native_load_pending());
                 loaded.rebuild_caches_after_load(
                     terrain.clone(),
-                    sim.terrain_speed_config.clone(),
+                    sim.terrain_speed_config().clone(),
                     &rules,
                 );
                 assert!(loaded.rebuild_dynamic_navigation(&rules));
@@ -1384,7 +1384,7 @@ fn gsi_04_10_crusher_and_omnicrusher_never_enter_or_crush_a_terrain_object_cell(
         let mut tank = GameEntity::test_default(1, "HTNK", "Americans", 0, 0);
         tank.set_category_for_test(EntityCategory::Unit);
         tank.lifecycle.set_in_limbo_for_test(false);
-        tank.lifecycle.set_cell_marked(true);
+        tank.lifecycle.set_cell_marked_for_test(true);
         let mut locomotor = make_drive_loco_for_test();
         locomotor.set_movement_zone_for_test(movement_zone);
         tank.locomotor = Some(locomotor);
@@ -1559,7 +1559,7 @@ fn gsi_06_13_fixture_mover(
     e.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Drive));
     e.body_facing.snap(u16::from(facing) << 8, 0);
     e.lifecycle.set_in_limbo_for_test(false);
-    e.lifecycle.set_cell_marked(true);
+    e.lifecycle.set_cell_marked_for_test(true);
     let goal = *path.last().expect("non-empty path");
     e.navigation
         .set_path_replay_for_test(crate::sim::components::FootPathQueue::for_test(

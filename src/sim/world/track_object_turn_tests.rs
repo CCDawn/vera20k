@@ -22,7 +22,7 @@ fn fixture() -> (Simulation, RuleSet) {
     entity.set_category_for_test(EntityCategory::Unit);
     entity.lifecycle.set_object_alive_for_test(true);
     entity.lifecycle.set_in_limbo_for_test(false);
-    entity.lifecycle.set_cell_marked(true);
+    entity.lifecycle.set_cell_marked_for_test(true);
     entity.set_is_voxel_for_test(false);
     entity.mover_facts.set_drive_accelerates_for_test(false);
     entity.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Drive));

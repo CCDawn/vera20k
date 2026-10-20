@@ -77,7 +77,7 @@ fn set_head(sim: &mut Simulation, id: u64, head: Option<u8>) {
         .navigation
         .path_replay_mut();
     queue.set_directions_for_test(head.into_iter().collect());
-    queue.set_cursor(0);
+    queue.set_cursor_for_test(0);
 }
 
 /// A cell whose first object is no Foot jams (`0x0042989A`); an empty one
@@ -177,14 +177,18 @@ fn a_bridge_cell_lists_a_bridge_occupant_on_its_deck() {
     };
     let set_level = |sim: &mut Simulation, cell: (u16, u16), level: u8| {
         let terrain = sim.resolved_terrain.as_mut().unwrap();
-        terrain.cell_mut(cell.0, cell.1).unwrap().level = level;
+        terrain.cell_mut_for_test(cell.0, cell.1).unwrap().level = level;
     };
 
     set_on_bridge(&mut sim, true);
     assert!(jams(&sim, (10, 10)), "no bridge: the ground list");
 
     let terrain = sim.resolved_terrain.as_mut().unwrap();
-    terrain.cell_mut(11, 10).unwrap().bridge_facts.raw_flags |= 0x100;
+    terrain
+        .cell_mut_for_test(11, 10)
+        .unwrap()
+        .bridge_facts
+        .raw_flags |= 0x100;
     assert!(!jams(&sim, (10, 10)), "on a bridge: the empty deck list");
 
     set_on_bridge(&mut sim, false);
@@ -222,7 +226,7 @@ fn a_jammed_chain_detours_the_route_and_a_clear_one_runs_through() {
             tank,
             DriveCoord::cell(11, 10, 0),
             0,
-            sim.playfield_bounds,
+            sim.playfield_bounds(),
         )
         .unwrap();
 

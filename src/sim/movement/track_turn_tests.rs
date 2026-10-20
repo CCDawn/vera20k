@@ -125,7 +125,7 @@ fn fixture(kind: LocomotorKind) -> Simulation {
     entity.set_owner_for_test(sim.intern("Americans"));
     entity.lifecycle.set_object_alive_for_test(true);
     entity.lifecycle.set_in_limbo_for_test(false);
-    entity.lifecycle.set_cell_marked(true);
+    entity.lifecycle.set_cell_marked_for_test(true);
     entity.locomotor = Some(LocomotorState::for_test_kind(kind));
     match kind {
         LocomotorKind::Drive => assert!(
@@ -193,7 +193,7 @@ fn track_entry_matches_all_144_native_rows_and_only_changes_rejected_residual() 
             .navigation
             .path_replay_mut()
             .set_directions_for_test(vec![8, integer(&input["queue_head"]) as u8, 6]);
-        entity.navigation.path_replay_mut().set_cursor(1);
+        entity.navigation.path_replay_mut().set_cursor_for_test(1);
         let mut expected = serde_json::to_value(&*entity).unwrap();
         let field = if kind == LocomotorKind::Drive {
             "Drive"
@@ -722,7 +722,7 @@ fn ordinary_fresh_turn_and_drive_refusal_reach_entry_without_running_speed() {
                     blocker.set_owner_for_test(sim.intern("Americans"));
                     blocker.lifecycle.set_object_alive_for_test(true);
                     blocker.lifecycle.set_in_limbo_for_test(false);
-                    blocker.lifecycle.set_cell_marked(true);
+                    blocker.lifecycle.set_cell_marked_for_test(true);
                     sim.substrate.entities.insert(blocker);
                     sim.substrate.occupancy =
                         crate::sim::occupancy::OccupancyGrid::rebuild(&sim.substrate.entities);
@@ -967,7 +967,7 @@ fn actual_turn_and_arrival_crush_use_binary_frame_for_both_shield_kinds() {
                         victim.crushable_facts.set_crushable_for_test(true);
                         victim.lifecycle.set_object_alive_for_test(true);
                         victim.lifecycle.set_in_limbo_for_test(false);
-                        victim.lifecycle.set_cell_marked(true);
+                        victim.lifecycle.set_cell_marked_for_test(true);
                         victim.invulnerability = Some(InvulnerabilityState::new(
                             crate::sim::timer::CdTimer::started((frame - age) as i32, 30),
                             shield,

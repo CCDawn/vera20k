@@ -125,7 +125,7 @@ fn ordered_tag_rgb_actions_then_the_production_fade_keep_distinct_palette_operat
         None,
     );
     sim.classify_map_triggers(None);
-    sim.session.set_started(true);
+    sim.session.publish_started();
     sim.session.set_map_width_for_test(32);
     sim.session.set_map_height_for_test(32);
     sim.resolved_terrain = Some(crate::map::resolved_terrain::test_grid(

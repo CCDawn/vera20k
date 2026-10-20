@@ -141,7 +141,7 @@ fn a_batched_answer_is_the_serial_search() {
                         .unwrap()
                         .navigation
                         .path_runtime_mut();
-                    runtime.set_path_blocked(urgency == 2);
+                    runtime.set_path_blocked_for_test(urgency == 2);
                     runtime.start_blocked(frame, 0);
                 }
                 if batched {
@@ -758,7 +758,9 @@ fn a_drive_retry_recursion_waits_after_the_frames_answer() {
     // The retry's own preparation: no path left and the timer run out.
     let frame = sim.session.binary_frame();
     let foot = sim.substrate.entities.get_mut(tank).unwrap();
-    foot.navigation.path_replay_mut().clear_directions();
+    foot.navigation
+        .path_replay_mut()
+        .set_directions_for_test(Vec::new());
     foot.navigation.path_runtime_mut().start_movement(frame, 0);
     process(&mut sim, retry);
     let batch = sim.path_batch.as_ref().unwrap();

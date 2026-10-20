@@ -88,7 +88,7 @@ fn building_toggle_scans_tagged_live_marked_unlimboed_buildings_and_returns_a_re
         .get_mut(unmarked)
         .unwrap()
         .lifecycle
-        .set_cell_marked(false);
+        .set_cell_marked_for_test(false);
     sim.substrate
         .entities
         .get_mut(dead)

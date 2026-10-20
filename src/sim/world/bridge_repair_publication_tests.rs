@@ -7,13 +7,6 @@ pub(super) use crate::sim::world::entry_test_fixture::{fixture, fixture_with_rul
 
 fn broken_strip(sim: &mut Simulation) {
     for (x, y) in [(17, 14), (17, 15), (17, 16)] {
-        let c = sim
-            .resolved_terrain
-            .as_mut()
-            .unwrap()
-            .cell_mut(x, y)
-            .unwrap();
-        c.bridge_facts.overlay_id = Some(231);
         sim.overlay_grid
             .as_mut()
             .unwrap()
@@ -213,12 +206,10 @@ fn command_repair_fixture(with_aircraft: bool, with_team: bool) {
     for (x, y) in [(17, 14), (17, 15), (17, 16)] {
         assert!(
             (205..=208).contains(
-                &sim.resolved_terrain
+                &sim.overlay_grid
                     .as_ref()
                     .unwrap()
                     .cell(x, y)
-                    .unwrap()
-                    .bridge_facts
                     .overlay_id
                     .unwrap()
             )
@@ -358,7 +349,7 @@ fn production_fresh_head_and_raw_history_match_original_walk_producer() {
                 .resolved_terrain
                 .as_mut()
                 .unwrap()
-                .cell_mut(x, 10)
+                .cell_mut_for_test(x, 10)
                 .unwrap();
             c.level = 2;
             c.slope_type = 1;
@@ -454,13 +445,7 @@ pub(in crate::sim::world) fn ready_repair_fixture(
         .unwrap();
     if let Some(overlay) = overlay {
         for (x, y) in [(17, 14), (17, 15), (17, 16)] {
-            sim.resolved_terrain
-                .as_mut()
-                .unwrap()
-                .cell_mut(x, y)
-                .unwrap()
-                .bridge_facts
-                .overlay_id = Some(overlay);
+            sim.overlay_cell_mut_for_test(x, y).overlay_id = Some(overlay);
             sim.overlay_grid
                 .as_mut()
                 .unwrap()
@@ -576,9 +561,9 @@ fn cancelled_successor_engineers_finish_their_heads_without_repeating_the_repair
             "live vector removal skips only the immediate successor"
         );
         assert_eq!(repair_sounds(&sim), [true]);
-        assert!(sim.radar_terrain_dirty_generation > 0);
+        assert!(sim.dirty_cells.radar_generation() > 0);
         for p in [(17, 14), (17, 15), (17, 16)] {
-            assert!(sim.radar_terrain_dirty_cells.contains(&p));
+            assert!(sim.dirty_cells.radar().contains(&p));
         }
         if !separated {
             repair_frame(&mut sim, &rules, &registry);
@@ -1015,10 +1000,12 @@ fn walk_completion_uses_retained_destination_and_exact_height_tolerance() {
         e.locomotor.as_mut().unwrap().set_step_head(Some(head));
         e.navigation.path_runtime_mut().start_movement(50, 5);
         e.navigation.path_runtime_mut().start_blocked(40, 6);
-        e.navigation.path_runtime_mut().set_path_blocked(true);
         e.navigation
             .path_runtime_mut()
-            .set_retries_left(0x8000_0001);
+            .set_path_blocked_for_test(true);
+        e.navigation
+            .path_runtime_mut()
+            .set_retries_left_for_test(0x8000_0001);
         // The paid head is the last Foot+5E0 word, as the object-turn
         // suspension exposes it to the real PerCell completion owner.
         sim.run_completed_walk_step(
@@ -1145,13 +1132,7 @@ fn repair_receiver_failure_stops_runtime_before_consumption_or_frame_commit() {
         "the live cursor must stop before the following object"
     );
     assert_eq!(
-        sim.resolved_terrain
-            .as_ref()
-            .unwrap()
-            .cell(17, 15)
-            .unwrap()
-            .bridge_facts
-            .overlay_id,
+        sim.overlay_grid.as_ref().unwrap().cell(17, 15).overlay_id,
         Some(206),
         "already-published repair writes are not rolled back"
     );
@@ -1256,8 +1237,8 @@ fn repair_queries_unrelated_rocketeer_after_move_and_snapshot_restore() {
                 .path_runtime_mut();
             path_runtime.set_movement_timer_for_test(crate::sim::timer::CdTimer::from_raw(-1, 7));
             path_runtime.set_blocked_timer_for_test(crate::sim::timer::CdTimer::from_raw(-1, 31));
-            path_runtime.set_path_blocked(true);
-            path_runtime.set_retries_left(256);
+            path_runtime.set_path_blocked_for_test(true);
+            path_runtime.set_retries_left_for_test(256);
             let grid = sim.path_grid_snapshot();
             assert!(sim.apply_command_with_overlays(
                 "Americans",
@@ -1277,7 +1258,7 @@ fn repair_queries_unrelated_rocketeer_after_move_and_snapshot_restore() {
                 sim.session.binary_frame() as i32,
                 60,
             ));
-            expected_runtime.set_retries_left(256);
+            expected_runtime.set_retries_left_for_test(256);
             assert_eq!(
                 sim.substrate
                     .entities
@@ -1414,12 +1395,10 @@ fn repair_queries_unrelated_rocketeer_after_move_and_snapshot_restore() {
                     crate::sim::movement::locomotor::MovementLayer::Ground
                 ),
                 [(17, 14), (17, 15), (17, 16)].map(|(x, y)| world
-                    .resolved_terrain
+                    .overlay_grid
                     .as_ref()
                     .unwrap()
                     .cell(x, y)
-                    .unwrap()
-                    .bridge_facts
                     .overlay_id),
                 world
                     .resolved_terrain
@@ -1541,7 +1520,7 @@ fn jumpjet_query_fields_hash_and_restore_as_one_suspended_instance() {
     let mut changed = original.clone();
     assert!(changed.contains("5312"));
     changed = changed.replacen("5312", "5313", 1);
-    loco.set_piggyback(serde_json::from_str(&changed).unwrap());
+    loco.set_piggyback_for_test(serde_json::from_str(&changed).unwrap());
     assert_ne!(before, restored.state_hash());
     let loco = restored
         .substrate
@@ -1551,7 +1530,7 @@ fn jumpjet_query_fields_hash_and_restore_as_one_suspended_instance() {
         .locomotor
         .as_mut()
         .unwrap();
-    loco.set_piggyback(serde_json::from_str(&original).unwrap());
+    loco.set_piggyback_for_test(serde_json::from_str(&original).unwrap());
     assert!(piggyback::end(loco).is_some());
     assert_eq!(loco.jumpjet_runtime(), Some(&retained));
 }
@@ -1635,7 +1614,7 @@ fn failed_jumpjet_stop_stock_fatal_receiver_precedes_cache_retirement() {
                 sim.resolved_terrain
                     .as_mut()
                     .unwrap()
-                    .cell_mut(x, y)
+                    .cell_mut_for_test(x, y)
                     .unwrap()
                     .speed_costs
                     .hover = Some(0);

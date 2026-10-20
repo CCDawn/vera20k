@@ -446,7 +446,7 @@ fn ground_command_fixture(
     actor
         .navigation
         .path_replay_mut()
-        .set_reference_cell(Some((reference.0 as i16, reference.1 as i16)));
+        .set_reference_cell_for_test(Some((reference.0 as i16, reference.1 as i16)));
     actor
         .navigation
         .path_runtime_mut()
@@ -458,11 +458,11 @@ fn ground_command_fixture(
     actor
         .navigation
         .path_runtime_mut()
-        .set_path_blocked(state["raw_6b7"] != 0);
+        .set_path_blocked_for_test(state["raw_6b7"] != 0);
     actor
         .navigation
         .path_runtime_mut()
-        .set_retries_left(state["retry"].as_u64().unwrap() as u32);
+        .set_retries_left_for_test(state["retry"].as_u64().unwrap() as u32);
     assert_eq!(state["nav_queue"]["count"], 0);
     assert_eq!(state["destination_history"]["count"], 0);
     let loco = actor.locomotor.as_mut().unwrap();

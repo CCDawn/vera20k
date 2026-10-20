@@ -181,7 +181,7 @@ impl Simulation {
                     .ok_or("retired Walk gate owner")?
                     .navigation
                     .path_runtime_mut()
-                    .set_retries_left(crate::sim::components::FootPathRuntime::RETRY_RELOAD);
+                    .reload_retries();
                 Ok(None)
             }
             4 | 5 => {
@@ -481,7 +481,7 @@ impl Simulation {
                     .get(blocker)
                     .ok_or("retired Walk blocker")?;
                 if crate::map::houses::is_allied_with(
-                    &self.house_alliances,
+                    self.house_alliances.as_map(),
                     self.interner.resolve(actor.owner()),
                     self.interner.resolve(other.owner()),
                 ) {
@@ -597,10 +597,7 @@ fn walk_code2_gate(
     frame: u32,
     blockage_delay: i32,
 ) -> Option<u8> {
-    if !runtime.path_blocked() {
-        runtime.set_path_blocked(true);
-        runtime.start_blocked(frame, blockage_delay);
-    }
+    runtime.latch_blockage(frame, blockage_delay);
     if !runtime.movement_timer().expired(frame as i32) {
         return None;
     }
@@ -698,7 +695,7 @@ mod tests {
             let b = |key: &str| case[key].as_bool().unwrap();
             let frame = n("frame");
             let mut runtime = crate::sim::components::FootPathRuntime::default();
-            runtime.set_path_blocked(b("already_blocked"));
+            runtime.set_path_blocked_for_test(b("already_blocked"));
             runtime.set_blocked_timer_for_test(CdTimer::from_raw(
                 n("grace_start"),
                 n("grace_duration"),

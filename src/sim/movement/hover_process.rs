@@ -418,7 +418,7 @@ impl Simulation {
     ) -> Result<Arrival, FrameAdvanceError> {
         if let Some(entity) = self.substrate.entities.get_mut(id) {
             entity.foot_occupation_enabled.resume();
-            entity.navigation.path_runtime_mut().set_path_blocked(false);
+            entity.navigation.path_runtime_mut().clear_blockage();
             if let Some(hover) = runtime_mut(entity) {
                 hover.pushed = false;
             }
@@ -524,7 +524,7 @@ impl Simulation {
             self.track_raw_mark_at(location, false);
             if let Some(entity) = self.substrate.entities.get_mut(id) {
                 entity.foot_occupation_enabled.suspend();
-                entity.navigation.path_runtime_mut().set_path_blocked(false);
+                entity.navigation.path_runtime_mut().clear_blockage();
             }
         }
         let Some(facing) = self.hover(id).map(|hover| hover.facing.current(frame)) else {
@@ -838,7 +838,7 @@ impl Simulation {
             id,
             destination,
             urgency,
-            self.playfield_bounds,
+            self.playfield_bounds(),
         )
         .ok_or_else(|| self.hover_error(id, "retired Hover Find_Path requester"))?;
         let found = self
@@ -877,7 +877,7 @@ impl Simulation {
             let cell = (i32::from(current.0) + dx, i32::from(current.1) + dy);
             if crate::sim::cell_rect::cell_is_in_playfield_height_aware(
                 cell,
-                self.playfield_bounds,
+                self.playfield_bounds(),
                 self.resolved_terrain.as_ref(),
             ) && self.hover_can_enter(
                 id,
@@ -892,10 +892,7 @@ impl Simulation {
             }
         }
         if let Some(entity) = self.substrate.entities.get_mut(id) {
-            entity
-                .navigation
-                .path_runtime_mut()
-                .set_retries_left(crate::sim::components::FootPathRuntime::RETRY_RELOAD);
+            entity.navigation.path_runtime_mut().reload_retries();
         }
         Ok(())
     }
@@ -938,7 +935,7 @@ impl Simulation {
         };
         let allied = self.substrate.entities.get(nearest).is_some_and(|object| {
             crate::map::houses::is_allied_with(
-                &self.house_alliances,
+                self.house_alliances.as_map(),
                 self.interner.resolve(entity.owner()),
                 self.interner.resolve(object.owner()),
             )
@@ -1206,8 +1203,8 @@ impl Simulation {
                 }
                 if let Some(entity) = self.substrate.entities.get_mut(id) {
                     let queue = entity.navigation.path_replay_mut();
-                    super::super::path_markers::consume_path_replay(queue, 1);
-                    queue.set_reference_cell(Some(coord_cell(head)));
+                    queue.consume(1);
+                    queue.rebase(coord_cell(head));
                 }
                 Ok(0)
             }
@@ -1241,10 +1238,7 @@ impl Simulation {
                     .get_mut(id)
                     .expect("same Hover Foot");
                 let runtime = entity.navigation.path_runtime_mut();
-                if !runtime.path_blocked() {
-                    runtime.set_path_blocked(true);
-                    runtime.start_blocked(frame, rules.general.blockage_path_delay_ticks);
-                }
+                runtime.latch_blockage(frame, rules.general.blockage_path_delay_ticks);
                 if runtime.movement_timer().expired(frame as i32) {
                     entity.navigation.path_replay_mut().clear_live_head();
                 }
@@ -1366,7 +1360,7 @@ mod tests {
                 .resolved_terrain
                 .as_mut()
                 .unwrap()
-                .cell_mut(10, 10)
+                .cell_mut_for_test(10, 10)
                 .unwrap();
             cell.land_type = input["land"].as_u64().unwrap_or(2) as u8;
             let mut entity = GameEntity::test_default(1, "ROBO", "Americans", 10, 10);

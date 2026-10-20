@@ -229,7 +229,7 @@ fn supplied_find_path_results_take_the_native_continuations() {
         }
         e.navigation
             .path_runtime_mut()
-            .set_retries_left(input["retries"].as_u64().unwrap_or(10) as u32);
+            .set_retries_left_for_test(input["retries"].as_u64().unwrap_or(10) as u32);
         sim.session.set_binary_frame_for_test(101);
         if row["events"].as_array().unwrap().is_empty() {
             // 0x741C54..0x741C78: Enter without a radio contact keeps the path
@@ -259,7 +259,7 @@ fn supplied_find_path_results_take_the_native_continuations() {
             e.navigation
                 .path_replay_mut()
                 .set_directions_for_test(directions);
-            e.navigation.path_replay_mut().set_cursor(0);
+            e.navigation.path_replay_mut().set_cursor_for_test(0);
             FindPathResult::Route
         } else {
             FindPathResult::Failed
@@ -391,7 +391,9 @@ fn post_warp_rows_refuse_the_own_cell_search() {
         let (mut sim, rules, registry, id) = unit(input);
         let e = sim.substrate.entities.get_mut(id).unwrap();
         e.navigation.path_replay_mut().clear_live_head();
-        e.navigation.path_runtime_mut().set_retries_left(10);
+        e.navigation
+            .path_runtime_mut()
+            .set_retries_left_for_test(10);
         // The oracle fixture's Foot+668 prestate, which only a setter rewrites.
         e.navigation
             .path_runtime_mut()

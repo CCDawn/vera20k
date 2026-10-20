@@ -2652,7 +2652,9 @@ fn probe_is_illegal(
         world,
         rules: ctx.rules,
         overlay_registry: ctx.los.overlay_registry,
-        fog: ctx.fog.map(|fog| fog.fire_view(&world.house_alliances)),
+        fog: ctx
+            .fog
+            .map(|fog| fog.fire_view(world.house_alliances.as_map())),
         firer,
         obj: ctx.attacker_obj,
         target: Some(super::TargetKind::Entity(candidate.stable_id())),

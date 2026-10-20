@@ -740,7 +740,7 @@ pub(crate) mod tests {
                 lepton::CELL_CENTER_LEPTON,
             );
             pax.lifecycle.set_in_limbo_for_test(false);
-            pax.lifecycle.set_cell_marked(true);
+            pax.lifecycle.set_cell_marked_for_test(true);
             sim.substrate.entities.insert(pax);
             give_walk_locomotor(&mut sim, id);
         }
@@ -1008,7 +1008,7 @@ pub(crate) mod tests {
             .get_mut(22)
             .unwrap()
             .lifecycle
-            .set_cell_marked(true);
+            .set_cell_marked_for_test(true);
         assert_eq!(
             sell_building_occupants(
                 &mut sim,

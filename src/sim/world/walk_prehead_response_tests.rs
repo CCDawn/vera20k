@@ -99,12 +99,13 @@ fn fixture(row: &Value) -> (Simulation, RuleSet, OverlayTypeRegistry, u64, Optio
     // map-node row is cluster0->1, except zone_rejected's candidate cluster1->2.
     let terrain = sim.resolved_terrain.as_mut().unwrap();
     for (x, y) in [(9, 10), (10, 10), (11, 10)] {
-        let cell = terrain.cell_mut(x, y).unwrap();
+        let cell = terrain.cell_mut_for_test(x, y).unwrap();
         cell.level = 2;
         cell.slope_type = 1;
     }
-    terrain.cell_mut(9, 10).unwrap().land_type = input["current_land"].as_u64().unwrap_or(0) as u8;
-    let candidate = terrain.cell_mut(10, 10).unwrap();
+    terrain.cell_mut_for_test(9, 10).unwrap().land_type =
+        input["current_land"].as_u64().unwrap_or(0) as u8;
+    let candidate = terrain.cell_mut_for_test(10, 10).unwrap();
     candidate.level = input["candidate_level"].as_i64().unwrap_or(2) as u8;
     candidate.bridge_facts.raw_flags = input["candidate_flags"].as_u64().unwrap_or(0) as u32;
     if input["current_missing"] == true {
@@ -154,7 +155,7 @@ fn fixture(row: &Value) -> (Simulation, RuleSet, OverlayTypeRegistry, u64, Optio
     e.set_on_bridge(false);
     e.set_in_playfield(input["in_playfield"].as_bool().unwrap_or(false));
     e.lifecycle.set_object_alive_for_test(true);
-    e.lifecycle.set_cell_marked(true);
+    e.lifecycle.set_cell_marked_for_test(true);
     e.tether
         .set_for_test(input["tethered"].as_bool().unwrap_or(false).then_some(999));
     e.mission.apply_test_fixture(MissionTestFixture {
@@ -190,12 +191,12 @@ fn fixture(row: &Value) -> (Simulation, RuleSet, OverlayTypeRegistry, u64, Optio
     e.navigation
         .path_replay_mut()
         .set_directions_for_test(vec![2, 3, 4, 5]);
-    e.navigation.path_replay_mut().set_cursor(0);
-    e.navigation.path_replay_mut().set_reference_cell(Some(
-        input.get("path_reference").map_or((9, 8), |p| {
+    e.navigation.path_replay_mut().set_cursor_for_test(0);
+    e.navigation
+        .path_replay_mut()
+        .set_reference_cell_for_test(Some(input.get("path_reference").map_or((9, 8), |p| {
             (p[0].as_i64().unwrap() as i16, p[1].as_i64().unwrap() as i16)
-        }),
-    ));
+        })));
     let p = e.navigation.path_runtime_mut();
     p.set_movement_timer_for_test(CdTimer::from_raw(
         before["movement_timer"][0].as_i64().unwrap() as i32,
@@ -205,8 +206,8 @@ fn fixture(row: &Value) -> (Simulation, RuleSet, OverlayTypeRegistry, u64, Optio
         before["blockage_timer"][0].as_i64().unwrap() as i32,
         before["blockage_timer"][2].as_i64().unwrap() as i32,
     ));
-    p.set_path_blocked(before["blocked"] == 1);
-    p.set_retries_left(before["retries"].as_i64().unwrap() as u32);
+    p.set_path_blocked_for_test(before["blocked"] == 1);
+    p.set_retries_left_for_test(before["retries"].as_i64().unwrap() as u32);
     p.set_scold_latch_for_test(before["flag68a"].as_u64().unwrap() as u8);
     if input["radio"] == true {
         e.radio_contacts.insert(999);
@@ -235,7 +236,7 @@ fn fixture(row: &Value) -> (Simulation, RuleSet, OverlayTypeRegistry, u64, Optio
         e.position.set_exact_z_leptons_for_test(Some(current.z));
         e.lifecycle
             .set_object_alive_for_test(input["obstacle_alive"].as_bool().unwrap_or(true));
-        e.lifecycle.set_cell_marked(true);
+        e.lifecycle.set_cell_marked_for_test(true);
         e.set_on_bridge(input["obstacle_deck"] == true);
         let mut cloak = CloakRuntime::new(0);
         cloak.set_state_for_test(input["cloak"].as_i64().unwrap_or(0) as i32);

@@ -17,7 +17,7 @@ fn fixture(family: TrackFamily, budget: i32) -> (Simulation, TrackInvocation, i3
     ));
     entity.lifecycle.set_object_alive_for_test(true);
     entity.lifecycle.set_in_limbo_for_test(false);
-    entity.lifecycle.set_cell_marked(true);
+    entity.lifecycle.set_cell_marked_for_test(true);
     let head = DriveCoord {
         x: 10 * 256 + 128,
         y: 9 * 256 + 128,
@@ -1095,7 +1095,7 @@ fn factory_per_cell_fixture(
     producer.set_on_bridge(producer_on_bridge);
     producer.lifecycle.set_object_alive_for_test(true);
     producer.lifecycle.set_in_limbo_for_test(false);
-    producer.lifecycle.set_cell_marked(true);
+    producer.lifecycle.set_cell_marked_for_test(true);
     producer.mission.apply_test_fixture(guard);
     sim.substrate.entities.insert(producer);
     sim.substrate.occupancy =
@@ -1992,8 +1992,8 @@ fn native_depot_arrival_uses_the_original_terminal_handoff() {
         let bounds = crate::map::playfield::PlayfieldBounds::from_normalized_local_size(
             16, -16, -16, 64, 64,
         );
-        sim.playfield_bounds = Some(bounds);
-        sim.playfield_size_height = Some(16);
+        sim.set_playfield_bounds_for_test(Some(bounds));
+        sim.set_playfield_size_height_for_test(Some(16));
         sim.session.set_map_width_for_test(16);
         sim.session.set_map_height_for_test(16);
         let terrain = test_flat_ground_grid(32);
@@ -2280,9 +2280,9 @@ fn idle_base_fixture(category: EntityCategory) -> Simulation {
     actor.locomotor = None;
     actor.lifecycle.set_object_alive_for_test(true);
     actor.lifecycle.set_in_limbo_for_test(false);
-    actor.lifecycle.set_cell_marked(false);
+    actor.lifecycle.set_cell_marked_for_test(false);
     sim.substrate.entities.insert(actor);
-    sim.substrate.next_stable_object_id = 2;
+    sim.set_next_stable_object_id_for_test(2);
     sim
 }
 
@@ -3011,7 +3011,7 @@ fn drive_crush_fixture(
     actor.foot_speed.set_speed_fraction(SIM_ONE);
     actor
         .foot_speed
-        .set_crush_slowdown(input["initial_flag"].as_bool().unwrap());
+        .set_crush_slowdown_for_test(input["initial_flag"].as_bool().unwrap());
     let mut rocking = crate::sim::rocking::RockingState::default();
     rocking.set_angles_native_for_test([0.0, f32::from_bits(0x3e99_999a)]);
     rocking.set_vel_forwards_native(NativeF32Bits::from_bits(0x3d23_d70a));
@@ -3222,7 +3222,7 @@ fn crush_slowdown_is_foot_owned_saved_and_hashed() {
         .get_mut(1)
         .unwrap()
         .foot_speed
-        .set_crush_slowdown(true);
+        .set_crush_slowdown_for_test(true);
     assert_ne!(sim.state_hash(), clear);
     let actor = sim.substrate.entities.get_mut(1).unwrap();
     actor.locomotor = Some(super::super::locomotor::LocomotorState::for_test_kind(

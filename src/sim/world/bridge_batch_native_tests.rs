@@ -180,7 +180,8 @@ fn live_bridge_batch_matches_original_order_recalc_cache_and_hierarchy() {
                 }
                 let terrain = sim.resolved_terrain.as_mut().unwrap();
                 if let Some(value) = change.get("tile") {
-                    terrain.cells[i].final_tile_index = value.as_i64().unwrap() as i32;
+                    terrain.cells_mut_for_test()[i].final_tile_index =
+                        value.as_i64().unwrap() as i32;
                 }
                 if change["missing"] == true {
                     let allocated: Vec<_> = (0..width)
@@ -351,7 +352,7 @@ fn live_raw_bridge_height_keeps_retained_cache_until_native_batch_publication() 
     live.write_raw_bridge_level(cell, 4).unwrap();
     let terrain = sim.resolved_terrain.as_ref().unwrap();
     assert_eq!(terrain.cell(12, 10).unwrap().level, 4);
-    assert_eq!(sim.dynamic_terrain_cells[&(12, 10)].level, 4);
+    assert_eq!(sim.dynamic_terrain_cells.get(&(12, 10)).unwrap().level, 4);
     assert_eq!(
         sim.path_grid().unwrap().cell(12, 10).unwrap().ground_level,
         4

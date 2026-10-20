@@ -55,7 +55,7 @@ pub(super) fn advance(
     let speed = prone_crawls.map_or(speed, |crawls| {
         crate::sim::infantry::apply_prone_speed(SimFixed::from_num(speed), crawls).to_num::<i32>()
     });
-    entity.navigation.path_runtime_mut().set_path_blocked(false); //75BFD1; retain grace timer.
+    entity.navigation.path_runtime_mut().clear_blockage(); //75BFD1; retain grace timer.
     let current = super::ground_pose::position_world_xy(&entity.position);
     let desired = crate::util::direction_tables::facing16_from_delta(
         head.x.wrapping_sub(current[0]),

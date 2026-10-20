@@ -148,7 +148,7 @@ fn staged_terrain(
             .collect(),
     );
     for &(rx, ry) in ore_cells {
-        let cell = terrain.cell_mut(rx, ry).expect("staged ore cell");
+        let cell = terrain.cell_mut_for_test(rx, ry).expect("staged ore cell");
         let tiberium_land_type = LandType::Tiberium.as_index();
         cell.land_type = tiberium_land_type;
         cell.speed_costs = oracle.tiberium_speed_costs;
@@ -165,16 +165,16 @@ fn install_world(
     install_zones: bool,
 ) {
     let terrain = staged_terrain(oracle, ore_cells);
-    sim.playfield_bounds = Some(crate::map::playfield::PlayfieldBounds {
+    sim.set_playfield_bounds_for_test(Some(crate::map::playfield::PlayfieldBounds {
         base: 0,
         off_fc: -64,
         off_100: -1,
         off_104: 128,
         off_108: 65,
-    });
+    }));
     // Map-load authority retains Size height beside the bounds (the shared
     // Foot zone precheck reads both).
-    sim.playfield_size_height = Some(i32::from(terrain.height()));
+    sim.set_playfield_size_height_for_test(Some(i32::from(terrain.height())));
     sim.resolved_terrain = Some(terrain);
     sim.overlay_grid = Some(OverlayGrid::new(GRID_SIZE, GRID_SIZE));
     for &(rx, ry) in ore_cells {
@@ -230,7 +230,7 @@ fn rock_where_grid_blocks(sim: &mut Simulation, grid: &PathGrid) {
             let cell = sim
                 .resolved_terrain
                 .as_mut()
-                .and_then(|terrain| terrain.cell_mut(rx, ry))
+                .and_then(|terrain| terrain.cell_mut_for_test(rx, ry))
                 .expect("staged cell");
             cell.land_type = LandType::Rock.as_index();
             cell.speed_costs = rock;
@@ -304,8 +304,8 @@ fn spawn_inert_dock_instance(sim: &mut Simulation) {
         INERT_DOCK_ID,
         crate::sim::house_tracking::HouseTracking::add_tracking,
     );
-    if sim.substrate.next_stable_object_id <= INERT_DOCK_ID {
-        sim.substrate.next_stable_object_id = INERT_DOCK_ID + 1;
+    if sim.next_stable_object_id() <= INERT_DOCK_ID {
+        sim.set_next_stable_object_id_for_test(INERT_DOCK_ID + 1);
     }
 }
 

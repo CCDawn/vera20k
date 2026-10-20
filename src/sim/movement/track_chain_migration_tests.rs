@@ -55,7 +55,7 @@ fn chain_fixture(passive: bool) -> (Simulation, RuleSet, TrackInvocation) {
     mover.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Drive));
     mover.lifecycle.set_object_alive_for_test(true);
     mover.lifecycle.set_in_limbo_for_test(false);
-    mover.lifecycle.set_cell_marked(true);
+    mover.lifecycle.set_cell_marked_for_test(true);
     assert!(
         mover
             .locomotor
@@ -105,7 +105,7 @@ fn add_blocker(sim: &mut Simulation, moving: bool) {
     blocker.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Drive));
     blocker.lifecycle.set_object_alive_for_test(true);
     blocker.lifecycle.set_in_limbo_for_test(false);
-    blocker.lifecycle.set_cell_marked(true);
+    blocker.lifecycle.set_cell_marked_for_test(true);
     if moving {
         // Unit Can_Enter_Cell's code2 body arm (0x73F86B) sees a NavCom and
         // retains Foot+6B6 while moving.
@@ -162,7 +162,7 @@ fn production_chain_code3_opens_gate_without_consuming_the_queue() {
     gate.building_gate = Some(BuildingGateRuntime::default());
     gate.lifecycle.set_object_alive_for_test(true);
     gate.lifecycle.set_in_limbo_for_test(false);
-    gate.lifecycle.set_cell_marked(true);
+    gate.lifecycle.set_cell_marked_for_test(true);
     sim.substrate.entities.insert(gate);
     sim.interner = test_interner();
     sim.substrate.occupancy = OccupancyGrid::rebuild(&sim.substrate.entities);
@@ -185,8 +185,8 @@ fn production_chain_code6_scatters_once_without_adopting_the_candidate() {
     add_blocker(&mut sim, false);
     // The Unit receiver's Find_Nearby_Passable_Cell bounds its search by the
     // map Size.
-    sim.playfield_bounds = Some(crate::sim::arena_fixture::OPEN_PLAYFIELD);
-    sim.playfield_size_height = Some(20);
+    sim.set_playfield_bounds_for_test(Some(crate::sim::arena_fixture::OPEN_PLAYFIELD));
+    sim.set_playfield_size_height_for_test(Some(20));
     let before = sim.substrate.entities.get(2).unwrap().position;
     let rng = sim.scenario_rng.logical_state();
     sim.run_track_points(invocation, 8, Some(&rules), None);
@@ -328,7 +328,7 @@ fn accepted_chain_per_cell_crush_finishes_lifecycle_in_list_order_before_continu
         victim.crushable_facts.set_crushable_for_test(true);
         victim.lifecycle.set_object_alive_for_test(true);
         victim.lifecycle.set_in_limbo_for_test(false);
-        victim.lifecycle.set_cell_marked(true);
+        victim.lifecycle.set_cell_marked_for_test(true);
         sim.substrate.entities.insert(victim);
     }
     sim.interner = test_interner();

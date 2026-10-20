@@ -45,7 +45,7 @@ fn fixture(row: &Value, rules: &RuleSet) -> (Simulation, Vec<u64>, [u64; 2], Opt
     crate::sim::arena_fixture::flat_arena(&mut sim, rules);
     // Keep the native world-lepton poses without granting this tail fixture
     // a claim about the original map's terrain or preceding placement.
-    let template = sim.resolved_terrain.as_ref().unwrap().cells[0].clone();
+    let template = sim.resolved_terrain.as_ref().unwrap().cells()[0].clone();
     let cells = (0..128)
         .flat_map(|ry| (0..128).map(move |rx| (rx, ry)))
         .map(|(rx, ry)| {

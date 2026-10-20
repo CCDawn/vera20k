@@ -148,7 +148,7 @@ fn infantry_unlimbo_matches_native_gate_incoming_membership_and_signed_xy() {
                 })
                 .collect(),
         );
-        let selected_cell = terrain.cell_mut(cx, cy).unwrap();
+        let selected_cell = terrain.cell_mut_for_test(cx, cy).unwrap();
         selected_cell.level = cell["level_slope"][0].as_u64().unwrap() as u8;
         selected_cell.slope_type = cell["level_slope"][1].as_u64().unwrap() as u8;
         sim.install_resolved_terrain_for_new_map(terrain);
@@ -204,7 +204,7 @@ fn infantry_unlimbo_matches_native_gate_incoming_membership_and_signed_xy() {
                 dispatch_timer: MissionDispatchTimer::from_raw(0, 0),
             });
             gate.lifecycle.set_in_limbo_for_test(false);
-            gate.lifecycle.set_cell_marked(true);
+            gate.lifecycle.set_cell_marked_for_test(true);
             gate.set_in_playfield(true);
             sim.substrate.entities.insert(gate);
             sim.substrate.occupancy.add(
@@ -1402,7 +1402,7 @@ fn assert_generated_projection_rejects_before_mutation(
     let mut sim = Simulation::with_seed(seed);
     install_american_house(&mut sim);
     let scenario_before = sim.scenario_rng.logical_state();
-    let stable_id_before = sim.substrate.next_stable_object_id;
+    let stable_id_before = sim.next_stable_object_id();
     let enter_order_before = sim.substrate.next_air_tracker_order.current();
     let occupancy_generation_before = sim.substrate.occupancy.generation();
     let raw_occupation_entries_before = sim.substrate.raw_cell_occupation.entry_count();
@@ -1412,7 +1412,7 @@ fn assert_generated_projection_rejects_before_mutation(
         Err(expected_error)
     );
     assert_eq!(sim.scenario_rng.logical_state(), scenario_before);
-    assert_eq!(sim.substrate.next_stable_object_id, stable_id_before);
+    assert_eq!(sim.next_stable_object_id(), stable_id_before);
     assert_eq!(
         sim.substrate.next_air_tracker_order.current(),
         enter_order_before
@@ -1484,14 +1484,13 @@ fn techno_constructor_live_overlay_context_admits_ore_and_structural_bridge() {
             .resolved_terrain
             .as_mut()
             .unwrap()
-            .cell_mut(bridge_cell.0, bridge_cell.1)
+            .cell_mut_for_test(bridge_cell.0, bridge_cell.1)
             .unwrap();
         bridge.level = 3;
         bridge.bridge_deck_level = 7;
         bridge.has_bridge_deck = true;
         bridge.bridge_walkable = true;
         bridge.bridge_facts.raw_flags = crate::map::bridge_facts::BRIDGE_FLAG_STRUCTURAL;
-        bridge.bridge_facts.overlay_id = Some(0);
     }
     sim.bridge_state = Some(
         crate::sim::bridge_state::BridgeRuntimeState::from_resolved_terrain(
@@ -1503,13 +1502,6 @@ fn techno_constructor_live_overlay_context_admits_ore_and_structural_bridge() {
     let mut overlays = crate::sim::overlay_grid::OverlayGrid::new(10, 10);
     for cell in [ore_authored, ore_runtime, bridge_cell] {
         overlays.place_overlay(cell.0, cell.1, 0, 0);
-        sim.resolved_terrain
-            .as_mut()
-            .unwrap()
-            .cell_mut(cell.0, cell.1)
-            .unwrap()
-            .bridge_facts
-            .overlay_id = Some(0);
     }
     sim.overlay_grid = Some(overlays);
 
@@ -2050,7 +2042,7 @@ fn techno_constructor_unit_can_enter_rejection_discards_eager_pool_without_refun
     );
 
     assert_eq!(sim.scenario_rng.logical_state(), expected.logical_state());
-    assert_eq!(sim.substrate.next_stable_object_id, 6);
+    assert_eq!(sim.next_stable_object_id(), 6);
     assert_eq!(sim.substrate.entities.len(), 1);
     let blocker = sim.substrate.entities.get(blocker_id).unwrap();
     assert!(blocker.lifecycle.cell_marked() && !blocker.lifecycle.in_limbo());

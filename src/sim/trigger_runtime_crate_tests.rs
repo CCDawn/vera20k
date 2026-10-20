@@ -169,7 +169,7 @@ fn authored_placement_matches_eight_original_controls_and_all_rng_streams() {
             terrain.set_land_speed_rules_for_test(&speed_rules);
             for y in 0..33 {
                 for x in 0..33 {
-                    let c = terrain.cell_mut(x, y).unwrap();
+                    let c = terrain.cell_mut_for_test(x, y).unwrap();
                     c.land_type = 2;
                     c.base_land_type = 2;
                     c.speed_costs = costs;
@@ -637,7 +637,7 @@ fn retail_all07_elapsed_crates_and_money_survive_save_and_notify_logic() {
                 .resolved_terrain
                 .as_mut()
                 .unwrap()
-                .cell_mut(x, y)
+                .cell_mut_for_test(x, y)
                 .unwrap();
             cell.speed_costs = clear.speed_costs;
             cell.base_speed_costs = clear.speed_costs;

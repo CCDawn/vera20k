@@ -13,7 +13,7 @@ impl App {
             .map(|simulation| {
                 (
                     simulation.clone_scenario_rng(),
-                    simulation.session.start_header(),
+                    simulation.session().start_header(),
                 )
             });
         if let Some((gameplay_rng, start_header)) = gameplay_rng
@@ -32,7 +32,6 @@ impl App {
             // its retained Scenario mission counter resets to the ctor's 1.
             runtime
                 .simulation
-                .session
                 .reset_campaign_mission_counter_on_shell_exit();
         }
         Self::retire_running_scenario(state);
@@ -57,7 +56,7 @@ impl App {
             // it at686424. The runtime may remain retained, but Tag
             // destruction must see a stopped session.
             // Source: original gamemd.exe instructions, SHA2561cdd1180..84298c.
-            runtime.simulation.session.set_started(false);
+            runtime.simulation.retire_scenario_started();
         }
         state.match_state.scenario_restart_requested = false;
         state.match_state.debug_pause = false;
@@ -102,7 +101,7 @@ impl App {
             .sim_runtime
             .as_ref()
             .map_or(state.persistence.options_profile.game_speed, |runtime| {
-                runtime.simulation.session.game_options().game_speed
+                runtime.simulation.session().game_options().game_speed
             });
         Some(campaign.restart(
             state.persistence.options_profile.difficulty,
@@ -179,7 +178,7 @@ impl App {
         };
         crate::app::input::commands::preferred_local_owner(state)
             .as_deref()
-            .and_then(|owner| sim.interner.get(owner))
+            .and_then(|owner| sim.interner().get(owner))
             .is_some_and(|owner| sim.ready_outcome_for_owner(owner).is_some())
     }
 
@@ -351,6 +350,10 @@ impl App {
         if next == InGameMenuState::Menu {
             state.match_state.match_presentation.pause_menu_has_saves =
                 !state.persistence.repository.browser_entries().is_empty();
+            crate::app::input::pause_menu::on_open(state);
+        }
+        if next == InGameMenuState::AbortConfirm {
+            crate::app::input::abort::on_open(state);
         }
 
         // Leaving Options: drop the cached `0xBBB` hit-test anchor so the
@@ -359,18 +362,7 @@ impl App {
             state.match_state.match_presentation.in_game_options_anchor = None;
         }
         if next == InGameMenuState::Options {
-            state
-                .match_state
-                .match_presentation
-                .in_game_options
-                .sound_enabled = state.audio.launcher_audio_available;
-            // Reset the transient interaction flags so the drag-gated
-            // value-label quirk resets on every open.
-            state
-                .match_state
-                .match_presentation
-                .in_game_options
-                .on_open();
+            crate::app::input::in_game_options::on_open(state);
         }
 
         // An open modal is the pause (`MatchState::paused`); any transition
@@ -396,9 +388,9 @@ impl App {
             state.match_state.session.mode().is_nonzero(),
             state.match_state.match_presentation.modal_latch,
             sim.and_then(|sim| {
-                sim.session
+                sim.session()
                     .current_house()
-                    .and_then(|house| sim.houses.get(&house))
+                    .and_then(|house| sim.houses().get(&house))
             }),
         );
         if let Some(latch) = latch {
@@ -436,7 +428,23 @@ impl App {
         match outcome {
             ModalOutcome::Stay => {}
             ModalOutcome::Enter(next) => Self::enter_in_game_menu_state(state, next),
-            ModalOutcome::LeaveMatch => Self::exit_match_to_shell(state),
+            ModalOutcome::LeaveMatch { destruct } => {
+                if destruct {
+                    Self::queue_local_destruct(state);
+                }
+                Self::exit_match_to_shell(state)
+            }
+            ModalOutcome::Observe => {
+                // 0x0048CAB2: DESTRUCT and the latch clear; no EXIT. The
+                // latch keeps every modal closed until the House is
+                // Defeated, which re-arms it (0x0048C911).
+                Self::queue_local_destruct(state);
+                state.match_state.match_presentation.modal_latch = false;
+                Self::enter_in_game_menu_state(
+                    state,
+                    crate::ui::pause_menu::InGameMenuState::Closed,
+                );
+            }
             ModalOutcome::RestartScenario => {
                 // State machine48CB2E raises8B41C0 and the modal state
                 // returns to 0; the router consumes it on the next pass.
@@ -446,6 +454,26 @@ impl App {
                     crate::ui::pause_menu::InGameMenuState::Closed,
                 );
             }
+        }
+    }
+
+    /// Queue EVENT_DESTRUCT (type 8) for the local House: B6 results 3 and 4
+    /// construct `EventClass(PlayerPtr->ArrayIndex, 8)` (`0x0048CA34`,
+    /// `0x0048CAB2`) and add it to the ring only while it holds fewer than
+    /// 0x80 events; the latch is cleared either way.
+    fn queue_local_destruct(state: &mut AppState) {
+        let Some(owner) = crate::app::input::commands::preferred_local_owner(state) else {
+            log::warn!("Abort DESTRUCT has no local command owner");
+            return;
+        };
+        if crate::app::input::commands::try_schedule_command(
+            state,
+            &owner,
+            crate::sim::command::Command::Destruct,
+        )
+        .is_none()
+        {
+            log::warn!("Abort DESTRUCT event could not be queued for '{owner}'");
         }
     }
 
@@ -494,7 +522,7 @@ impl App {
                 .sim_runtime
                 .as_ref()
                 .map(|rt| &rt.simulation)
-                .and_then(|sim| sim.interner.get(owner))
+                .and_then(|sim| sim.interner().get(owner))
         });
         let local_outcome_exit_ready = Self::local_outcome_exit_ready(state);
         let executed_owner = state

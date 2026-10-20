@@ -407,8 +407,8 @@ fn refused_miner_order_leaves_teleport_payload_untouched() {
         path_runtime.set_movement_timer_for_test(crate::sim::timer::CdTimer::from_raw(-1, -7));
         path_runtime
             .set_blocked_timer_for_test(crate::sim::timer::CdTimer::from_raw(i32::MAX - 2, 31));
-        path_runtime.set_path_blocked(true);
-        path_runtime.set_retries_left(u32::MAX);
+        path_runtime.set_path_blocked_for_test(true);
+        path_runtime.set_retries_left_for_test(u32::MAX);
         entity.navigation.set_path_runtime_for_test(path_runtime);
         entity.death.set_dying_for_test(true);
         let before = owned_state(entity);
@@ -647,9 +647,9 @@ fn foot_queue_without_class_payload_roundtrips_and_hashes_each_field() {
             .path_replay_mut();
         *queue = replay_fixture();
         match field {
-            0 => queue.set_direction(1, 6),
-            1 => queue.set_cursor(2),
-            _ => queue.set_reference_cell(Some((-18, 301))),
+            0 => queue.set_direction_for_test(1, 6),
+            1 => queue.set_cursor_for_test(2),
+            _ => queue.set_reference_cell_for_test(Some((-18, 301))),
         }
         assert_ne!(
             loaded.state_hash(),
@@ -684,8 +684,7 @@ fn foot_queue_operations_match_original_memory_witnesses() {
             ),
         );
         if operation.contains("fresh") {
-            super::super::path_markers::accept_path_replay(
-                entity.navigation.path_replay_mut(),
+            entity.navigation.path_replay_mut().accept(
                 ((endpoint.0 / 256) as i16, (endpoint.1 / 256) as i16),
                 if operation.ends_with("two") { 2 } else { 1 },
             );
@@ -694,7 +693,7 @@ fn foot_queue_operations_match_original_memory_witnesses() {
         } else if operation == "drive_end" {
             assert!(sim.try_end_piggyback(1, None));
         } else {
-            super::super::path_markers::consume_path_replay(entity.navigation.path_replay_mut(), 1);
+            entity.navigation.path_replay_mut().consume(1);
         }
         let entity = sim.substrate.entities.get(1).unwrap();
         let expected: Vec<u8> =

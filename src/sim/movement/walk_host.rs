@@ -126,7 +126,7 @@ impl Simulation {
                     y: coord.y,
                 },
             ));
-        e.navigation.path_runtime_mut().set_path_blocked(false);
+        e.navigation.path_runtime_mut().clear_blockage();
         self.foot_mark_put(id, rules, registry, effects);
         //75C1EA: the boundary placement tail clears +68A after Mark(PUT).
         //This is not the post-PerCell dead/limbo/falling exit at75C1F1.
@@ -166,7 +166,7 @@ impl Simulation {
         };
         e.navigation
             .path_replay_mut()
-            .set_reference_cell(Some((e.position.rx() as i16, e.position.ry() as i16)));
+            .rebase((e.position.rx() as i16, e.position.ry() as i16));
         //Infantry+1CC=5F5FA0; marked is already false, so the SetHeight0
         //receiver samples current ground+OnBridge without nested Mark calls.
         let on_bridge = e.on_bridge();
@@ -177,7 +177,7 @@ impl Simulation {
             self.path_grid.as_deref(),
         );
         //75BE11 clears only the paid-step latch before head retirement/PerCell.
-        e.navigation.path_runtime_mut().set_path_blocked(false);
+        e.navigation.path_runtime_mut().clear_blockage();
         let (sub_x, sub_y) = (e.position.sub_x(), e.position.sub_y());
         e.sub_cell.hold_offset(sub_x, sub_y);
         //75BE18: FindSubCellDest(null) retires the head, clearing its raw

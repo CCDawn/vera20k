@@ -48,7 +48,10 @@ fn paid_walk_matches_original_numeric_facing_and_boundary_vectors() {
         }
         entity.body_facing = body;
         entity.foot_speed.set_speed_fraction(SimFixed::lit("0.5"));
-        entity.navigation.path_runtime_mut().set_path_blocked(true);
+        entity
+            .navigation
+            .path_runtime_mut()
+            .set_path_blocked_for_test(true);
         let speed = input["speed"].as_i64().unwrap() as i32;
         // The corpus stops before the same-cell SetCoords/SetHeight
         // (`0x0075C20F`, `0x0075C21C`), so it records the proposal's Z. Stand
@@ -117,7 +120,7 @@ fn idle_walk_scold_tails_match_original_through_ordinary_process() {
             actor.locomotor.as_mut().unwrap().runtime_payload_mut()
         {
             // Supplied retained byte at the native tail boundary.
-            state.set_animation_moving(true);
+            state.set_animation_moving_for_test(true);
         }
         actor.foot_speed.set_speed_fraction(initial_speed);
         actor

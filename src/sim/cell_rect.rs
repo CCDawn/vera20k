@@ -1704,7 +1704,7 @@ mod tests {
                 terrain.test_set_dummy_cell_level_slope(level, 0);
             } else {
                 let costs = terrain.land_speed_costs(land);
-                let cell = &mut terrain.cells[0];
+                let cell = &mut terrain.cells_mut_for_test()[0];
                 cell.land_type = land as u8;
                 cell.speed_costs = costs;
                 cell.zone_type = zone_class::GROUND;
@@ -1874,7 +1874,7 @@ mod tests {
             .base_topology_mut_for_test()
             .raw_zone_ids_by_row_mut_for_test()[row][cluster] = u16::MAX;
         assert!(check(&terrain, &zone_grid, 0xFFFF, true));
-        terrain.cells[0].bridge_facts.raw_flags = BRIDGE_FLAG_STRUCTURAL;
+        terrain.cells_mut_for_test()[0].bridge_facts.raw_flags = BRIDGE_FLAG_STRUCTURAL;
         assert_eq!(
             zone_grid.get_zone_id_native(&terrain, (0, 0), MovementZone::Normal, true),
             Some(u32::MAX)
@@ -1892,10 +1892,10 @@ mod tests {
     #[test]
     fn cellrect_passability_bridge_bits_are_not_occupancy_rect_blockers() {
         let mut terrain = flat_terrain(1, 1);
-        terrain.cells[0].bridge_facts.raw_flags = BRIDGE_FLAG_STRUCTURAL;
-        terrain.cells[0].has_bridge_deck = true;
-        terrain.cells[0].bridge_walkable = true;
-        terrain.cells[0].bridge_deck_level = 4;
+        terrain.cells_mut_for_test()[0].bridge_facts.raw_flags = BRIDGE_FLAG_STRUCTURAL;
+        terrain.cells_mut_for_test()[0].has_bridge_deck = true;
+        terrain.cells_mut_for_test()[0].bridge_walkable = true;
+        terrain.cells_mut_for_test()[0].bridge_deck_level = 4;
         let mut occupancy = OccupancyGrid::new();
         occupancy.add(
             0,
@@ -2257,8 +2257,8 @@ mod tests {
     #[test]
     fn gsi_04_05_reservation_checkoccupancy_first_blocker_order_is_exact() {
         let mut terrain = flat_terrain(1, 1);
-        terrain.cells[0].zone_type = zone_class::WATER;
-        terrain.cells[0].slope_type = 2;
+        terrain.cells_mut_for_test()[0].zone_type = zone_class::WATER;
+        terrain.cells_mut_for_test()[0].slope_type = 2;
         let mut reservations = CellReservationGrid::new();
         reservations.reserve(Some(&terrain), 0, 0, 0);
         let mut overlays = OverlayGrid::new(1, 1);
@@ -2303,9 +2303,9 @@ mod tests {
         assert_eq!(blocker!(), Some(OccupancyBlocker::Overlay));
         overlays.clear_overlay(0, 0);
         assert_eq!(blocker!(), Some(OccupancyBlocker::ZoneType));
-        terrain.cells[0].zone_type = zone_class::GROUND;
+        terrain.cells_mut_for_test()[0].zone_type = zone_class::GROUND;
         assert_eq!(blocker!(), Some(OccupancyBlocker::Slope));
-        terrain.cells[0].slope_type = 0;
+        terrain.cells_mut_for_test()[0].slope_type = 0;
         assert_eq!(blocker!(), Some(OccupancyBlocker::Building));
     }
 

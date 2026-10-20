@@ -202,10 +202,10 @@ fn prepare(row: &Value) -> Scene {
         integer(&native["blocked_timer"][0]),
         integer(&native["blocked_timer"][2]),
     ));
-    runtime.set_path_blocked(byte(&native["path_blocked"]) != 0);
+    runtime.set_path_blocked_for_test(byte(&native["path_blocked"]) != 0);
     // Foot+64C is supplied independently as 7 by the same fixture. The
     // accepted setter4D96C2..4D9707 preserves it; FindPath owns its reset.
-    runtime.set_retries_left(u32::try_from(integer(&native["retries"])).unwrap());
+    runtime.set_retries_left_for_test(u32::try_from(integer(&native["retries"])).unwrap());
     entity
         .navigation
         .set_nav_com_for_test(native_nav(row, &native["nav"]));

@@ -1064,7 +1064,7 @@ impl Simulation {
             .resolved_terrain
             .as_ref()
             .and_then(|t| t.cell(cell.0 as u16, cell.1 as u16))
-            .map(|c| c.land_type());
+            .map(|c| c.land_type);
         let restricted = land.is_some_and(|land| {
             land == LandType::Water.as_index()
                 || land == LandType::Beach.as_index()

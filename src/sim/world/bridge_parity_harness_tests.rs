@@ -386,7 +386,12 @@ const MIN_DISTINCT_DECK_CELLS: usize = 6;
 // only: a temporary control hashing the bool gave the previous value in the
 // same test binary, with every tripwire above green. Control removed.
 // Previous: 0xED02_4584_1661_7711.
-const BRIDGE_HARNESS_FINAL_HASH: u64 = 0x427A_48D7_ED16_244B;
+// Snapshot 449 hashes the Techno disguise firing blink timer (+1EC/+1F4,
+// #2183), which every entity carries. Hash composition only: a temporary
+// control on #2183's merge without that hash gave the previous value, with
+// every tripwire above green. Control removed.
+// Previous: 0x427A_48D7_ED16_244B.
+const BRIDGE_HARNESS_FINAL_HASH: u64 = 0x2B34_7F8A_A70F_EA3F;
 
 fn bridge_ini() -> IniFile {
     // One armed ground vehicle and one distant infantryman on a second house, so
