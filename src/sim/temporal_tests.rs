@@ -31,6 +31,7 @@ C4Warhead=Super
 1=GACNST
 2=YAPOWR
 3=GAWEAP
+4=NATBNK
 [Warheads]
 0=ChronoBeam
 1=Super
@@ -93,6 +94,9 @@ Power=-50
 Strength=1000
 WeaponsFactory=yes
 Factory=UnitType
+[NATBNK]
+Strength=1000
+Bunker=yes
 [YAPOWR]
 Strength=1000
 Power=150
@@ -1309,6 +1313,68 @@ fn a_chrono_legionnaire_erases_a_tank() {
                     && entity.owner() == sim.interner.get("Americans").unwrap()
             ),
         "no survivors"
+    );
+}
+
+/// Issue #2231. `TemporalClass::Update`'s erase clears a bunkered target's
+/// bunker: `0x0071AA90` calls `BuildingClass::ClearBunker` (`0x00459470`)
+/// when the erased object's bunker link (`+0x2E4`) names a building, before
+/// FreeSlaves (`0x0071AA95`). A stock warp never holds an installed unit —
+/// the Temporal arm of the detonation (`0x0046946B..0x004694A5`) retargets
+/// the firer at its bunker — so the chain is admitted by fixture ([`chain`]);
+/// the erase itself is the production head update. After it the walls are
+/// down (one walls-down anim and sound), both links clear and the bunker
+/// runtime idles; without the call the UnInit safety net clears the links
+/// but leaves the walls up.
+#[test]
+fn erasing_a_bunkered_tank_clears_its_bunker() {
+    use crate::sim::docking::bunker_install::{BunkerRuntime, BunkerState};
+
+    let rules = rules();
+    let (mut sim, _grid) = arena(11, &rules);
+    let bunker = spawn(&mut sim, &rules, "NATBNK", "Americans", 10, 10);
+    let tank = spawn(&mut sim, &rules, "HTNK", "Americans", 11, 10);
+    let cleg = spawn(&mut sim, &rules, "CLEG", "Russians", 12, 10);
+    if let Some(building) = sim.substrate.entities.get_mut(bunker) {
+        building.bunker_runtime = Some(BunkerRuntime::idle());
+    }
+    // Occupied walls, as UpdateBunker's install leaves them.
+    crate::sim::docking::bunker_link::install_bunker_link(&mut sim, bunker, tank, &rules);
+    crate::sim::docking::bunker_link::emit_bunker_wall_anim(&mut sim, bunker, true, &rules);
+    assert_eq!(entity(&sim, bunker).bunker.occupant(), Some(tank));
+    assert_eq!(
+        entity(&sim, tank).bunker.link(),
+        crate::sim::docking::bunker_link::BunkerLink::Installed(bunker)
+    );
+    sim.sound_events.clear_for_test();
+
+    // One step of Damage 8 erases (Strength is not consulted; the chain's
+    // remaining warp is the fixture's).
+    chain(&mut sim, tank, &[cleg], 8);
+    sim.temporal_update_head(cleg, &rules, None, FrameEffects::default());
+
+    assert!(erased(&sim, tank), "the bunkered tank is erased");
+    let building = entity(&sim, bunker);
+    assert_eq!(building.bunker.occupant(), None);
+    assert_eq!(
+        building.bunker_runtime.map(|runtime| runtime.state()),
+        Some(BunkerState::Idle)
+    );
+    assert_eq!(
+        sim.bunker_wall_events
+            .iter()
+            .filter(|event| !event.up && event.building_id == bunker)
+            .count(),
+        1,
+        "one walls-down anim on the erase"
+    );
+    assert_eq!(
+        sim.sound_events
+            .iter()
+            .filter(|event| matches!(event, SimSoundEvent::BunkerWallsDown { .. }))
+            .count(),
+        1,
+        "ClearBunker plays the walls-down sound once"
     );
 }
 

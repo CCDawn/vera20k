@@ -697,6 +697,25 @@ impl Simulation {
             // in the UnInit below (module residual).
             crate::sim::docking::bunker_link::release_sell_destroy(self, target, effects);
         }
+        // 0x0071AA90: the erased object's own bunker link (`+0x2E4`) names a
+        // building — `BuildingClass::ClearBunker @ 0x00459470`, ahead of
+        // FreeSlaves (`0x0071AA95`). A stock warp never holds an installed
+        // unit (the detonation's Temporal arm retargets the firer at its
+        // bunker, `0x0046946B..0x004694A5`), so this arm sleeps until a
+        // caller admits the chain.
+        if let Some(bunker) = self
+            .substrate
+            .entities
+            .get(target)
+            .and_then(|entity| entity.bunker.link().installed_in())
+            && self
+                .substrate
+                .entities
+                .get(bunker)
+                .is_some_and(|building| building.category() == EntityCategory::Structure)
+        {
+            crate::sim::docking::bunker_link::clear_bunker(self, bunker, rules, effects);
+        }
         // 0x0071AA95..0x0071AAA7: an erased master's slaves pass to the
         // attacker's house (FreeSlaves, no supplied house). Its UnInit and
         // owner-change callbacks share this object turn's map inputs.
@@ -712,9 +731,10 @@ impl Simulation {
                 entity.owner(),
             )
         {
-            // 0x0071AAB5 vtable +0x3B8: Death_Announcement. A bunkered unit's
-            // own release (`0x00459470`) is left to UnInit: the detonation
-            // redirects to the bunker, so no stock warp holds one.
+            // 0x0071AAB5 vtable +0x3B8: Death_Announcement. A bunkered
+            // unit's own release already ran above (`0x0071AA90`); no stock
+            // warp holds an installed unit, because the detonation redirects
+            // to the bunker.
             self.dispatch_unit_lost_events(&[event]);
         }
         // vtable +0xE0 Record_The_Kill(Owner): experience, kill and score.

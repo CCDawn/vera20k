@@ -1070,6 +1070,26 @@ pub(crate) fn commit_entities(
         }
 
         if entered_techno_death {
+            // 0x00737D97: the dying unit's own bunker link (`+0x2E4`) names a
+            // building — `BuildingClass::ClearBunker @ 0x00459470` at the
+            // kill instant, ahead of the death-explosion gates
+            // (`0x00737DA7`) and the kill-site Death_Announcement calls. The
+            // despawn safety net clears the links later but leaves the walls
+            // up.
+            if fatal_category == EntityCategory::Unit
+                && let Some(bunker) = world
+                    .substrate
+                    .entities
+                    .get(target_id)
+                    .and_then(|entity| entity.bunker.link().installed_in())
+                && world
+                    .substrate
+                    .entities
+                    .get(bunker)
+                    .is_some_and(|building| building.category() == EntityCategory::Structure)
+            {
+                crate::sim::docking::bunker_link::clear_bunker(world, bunker, rules, run.effects());
+            }
             {
                 if callbacks_enabled(world) {
                     let attacker = killing_attacker(world, std::slice::from_ref(event), target_id);
