@@ -18,9 +18,14 @@
 //! the side's opening build (power, refinery, barracks, war factory, a second
 //! refinery) keeping the building queue busy, place each ready building next
 //! to the construction yard, and keep the vehicle queue building harvesters
-//! once the war factory stands. Scouting, army mix, defense and micro are
-//! later milestones; the difficulty tiers still change nothing (bonuses land
-//! with them).
+//! once the war factory stands. From this slice the opening also arms: the
+//! vehicle queue keeps miners coming up to a target and then builds the
+//! side's main battle tank without pause, the war factory's rally sits on the
+//! construction yard so its output gathers in the base, and the barracks
+//! queue runs the side's basic soldier continuously. Scouting, army mix
+//! beyond the first tanks, attack orders, defense and micro are later
+//! milestones; the difficulty tiers still change nothing (bonuses land with
+//! them).
 
 use crate::sim::command::Command;
 use crate::sim::command::CommandEnvelope;
@@ -37,6 +42,10 @@ const DEPLOY_ATTEMPTS: u8 = 5;
 
 /// How far from the construction yard the site search scans, in cells.
 const SITE_SEARCH_RADIUS: i16 = 24;
+
+/// Miners the vehicle queue builds before it switches to tanks: enough to
+/// feed two refineries' docks while the army starts coming out.
+const HARVESTER_TARGET: usize = 5;
 
 /// The ladder the Super AI plays at.
 ///
@@ -68,6 +77,10 @@ struct Opening {
     /// The side's miner, if the war factory can build it (Yuri's slave miner
     /// is not a plain vehicle and stays out of the opening).
     harvester: Option<&'static str>,
+    /// The side's first battle tank (Grizzly, Rhino, Lasher).
+    main_tank: &'static str,
+    /// The side's basic soldier (GI, Conscript, Initiate).
+    basic_infantry: &'static str,
 }
 
 const OPENINGS: [Opening; 3] = [
@@ -78,6 +91,8 @@ const OPENINGS: [Opening; 3] = [
         barracks: "GAPILE",
         war_factory: "GAWEAP",
         harvester: Some("CMIN"),
+        main_tank: "MTNK",
+        basic_infantry: "E1",
     },
     Opening {
         construction_yard: "NACNST",
@@ -86,6 +101,8 @@ const OPENINGS: [Opening; 3] = [
         barracks: "NAHAND",
         war_factory: "NAWEAP",
         harvester: Some("HARV"),
+        main_tank: "HTNK",
+        basic_infantry: "E2",
     },
     Opening {
         construction_yard: "YACNST",
@@ -94,6 +111,8 @@ const OPENINGS: [Opening; 3] = [
         barracks: "YABRCK",
         war_factory: "YAWEAP",
         harvester: None,
+        main_tank: "LTNK",
+        basic_infantry: "INIT",
     },
 ];
 
@@ -134,8 +153,10 @@ impl SuperAi {
     ///
     /// One command per tick, in a fixed priority: deploy the opening MCV,
     /// place a ready building, keep the building queue walking the opening,
-    /// keep the vehicle queue building harvesters. See the module docs for
-    /// the determinism contract.
+    /// hold the war factory's rally on the construction yard, keep the
+    /// vehicle queue on miners-then-tanks, keep the barracks queue on the
+    /// side's basic soldier. See the module docs for the determinism
+    /// contract.
     pub fn orders(&mut self, runtime: &SimRuntime, tick: u32) -> Vec<CommandEnvelope> {
         let sim = &runtime.simulation;
         let rules = &runtime.resources.rules;
@@ -221,24 +242,80 @@ impl SuperAi {
                     )];
                 }
             }
+        }
 
-            // The opening stands: keep the vehicle queue building miners.
-            let vehicle_busy = queue.iter().any(|item| {
-                item.queue_category == crate::sim::production::ProductionCategory::Vehicle
-            });
-            if !vehicle_busy
-                && let Some(harvester) = opening.harvester
-                && self.owns_structure_of_type(sim, opening.war_factory)
-                && let Some(ty) = rules.object(harvester)
-                && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
-                && let Some(type_id) = sim.interner.get(harvester)
-            {
-                return vec![CommandEnvelope::new(
-                    self.house,
-                    at,
-                    Command::QueueProduction { type_id },
-                )];
-            }
+        // Keep the war factory's rally on the construction yard so its output
+        // gathers in the base instead of jamming the factory exit. The
+        // command archives the cell per factory (`SetRallyPoint 0x00443860`),
+        // so one correction whenever the archived cell differs suffices.
+        if let Some(center) = self.structure_center(sim, opening.construction_yard)
+            && let Some((factory_id, _)) = self
+                .own_structures(sim)
+                .into_iter()
+                .find(|(_, name)| name == opening.war_factory)
+            && sim
+                .substrate
+                .entities
+                .get(factory_id)
+                .is_some_and(|factory| {
+                    factory.rally_cell() != Some((center.0 as u16, center.1 as u16))
+                })
+        {
+            return vec![CommandEnvelope::new(
+                self.house,
+                at,
+                Command::SetRally {
+                    rx: center.0 as u16,
+                    ry: center.1 as u16,
+                    producer_ids: vec![factory_id],
+                },
+            )];
+        }
+
+        // The war factory stands: keep its queue busy — the economy first
+        // (miners up to the target), then the side's main battle tank without
+        // pause. A queue entered while short on credits simply waits for the
+        // money, as a native production event does.
+        let vehicle_busy = queue
+            .iter()
+            .any(|item| item.queue_category == crate::sim::production::ProductionCategory::Vehicle);
+        let economy_first = opening
+            .harvester
+            .is_some_and(|miner| self.count_units_of_type(sim, miner) < HARVESTER_TARGET);
+        let vehicle_want = if economy_first {
+            opening.harvester
+        } else {
+            Some(opening.main_tank)
+        };
+        if !vehicle_busy
+            && self.owns_structure_of_type(sim, opening.war_factory)
+            && let Some(name) = vehicle_want
+            && let Some(ty) = rules.object(name)
+            && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
+            && let Some(type_id) = sim.interner.get(name)
+        {
+            return vec![CommandEnvelope::new(
+                self.house,
+                at,
+                Command::QueueProduction { type_id },
+            )];
+        }
+
+        // The barracks stands: keep its queue on the side's basic soldier.
+        let infantry_busy = queue.iter().any(|item| {
+            item.queue_category == crate::sim::production::ProductionCategory::Infantry
+        });
+        if !infantry_busy
+            && self.owns_structure_of_type(sim, opening.barracks)
+            && let Some(ty) = rules.object(opening.basic_infantry)
+            && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
+            && let Some(type_id) = sim.interner.get(opening.basic_infantry)
+        {
+            return vec![CommandEnvelope::new(
+                self.house,
+                at,
+                Command::QueueProduction { type_id },
+            )];
         }
         Vec::new()
     }
@@ -302,6 +379,19 @@ impl SuperAi {
         self.own_structures(sim)
             .iter()
             .any(|(_, name)| name == type_name)
+    }
+
+    /// How many of the house's units are exactly this retail type name.
+    fn count_units_of_type(&self, sim: &crate::sim::world::Simulation, type_name: &str) -> usize {
+        sim.substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Unit
+                    && sim.interner.resolve(entity.type_ref()) == type_name
+            })
+            .count()
     }
 
     /// The anchor cell the site search scans around: the construction yard's,
@@ -426,18 +516,18 @@ mod tests {
         assert!(ai.orders(&runtime, 0).is_empty());
     }
 
-    /// The M1 opening on a retail Battle: the Super AI drives the local
-    /// house from its launch MCV and must own a construction yard, a power
-    /// plant and a refinery well inside the tick budget.
-    #[test]
-    #[ignore = "slow; retail; loads a match and drives thousands of frames"]
-    fn fair_opening_deploys_and_builds_the_first_structures() {
-        use crate::sim::world::{FrameEffects, TickLane};
+    /// A retail XMP03T4 Battle as the Super AI plays it in the bench: the
+    /// local house is America (Allied opening) against one Easy Russia, both
+    /// sides starting from their own MCV, and that local house's identity.
+    fn retail_battle() -> (
+        crate::headless_scenario::HeadlessScenario,
+        crate::sim::intern::InternedId,
+    ) {
         use crate::skirmish_launch::{AiDifficulty, LaunchCountry};
 
-        let Ok(ra2) = std::env::var("RA2_DIR") else {
-            return;
-        };
+        let ra2 = std::path::PathBuf::from(
+            std::env::var("RA2_DIR").expect("set RA2_DIR to the retail RA2/YR install directory"),
+        );
         // A four-start map: fewer start waypoints than houses would seed the
         // extra starts at random, which the lobby never allows.
         let map = "XMP03T4.MAP";
@@ -446,14 +536,10 @@ mod tests {
             &[(LaunchCountry::Russia, AiDifficulty::Easy)],
         );
         session.local_slot_mut().country = LaunchCountry::America;
+        // No roaming starting units: the local house opens with its own MCV.
         session.options.unit_count = 0;
-        let mut scenario = crate::headless_scenario::load_session(
-            &std::path::PathBuf::from(ra2),
-            map,
-            0x00C0_FFEE,
-            session,
-        )
-        .unwrap();
+        let scenario =
+            crate::headless_scenario::load_session(&ra2, map, 0x00C0_FFEE, session).unwrap();
         let human = scenario
             .sim()
             .houses
@@ -461,6 +547,44 @@ mod tests {
             .find(|(_, house)| house.is_controlled_by_human(true))
             .map(|(&id, _)| id)
             .expect("the local house");
+        (scenario, human)
+    }
+
+    /// Drive the Super AI's orders until `done` accepts the view or the tick
+    /// budget runs out; the callers assert on the end view.
+    fn drive_until(
+        scenario: &mut crate::headless_scenario::HeadlessScenario,
+        ai: &mut SuperAi,
+        house: crate::sim::intern::InternedId,
+        budget: u32,
+        done: impl Fn(&crate::headless_scenario::HeadlessScenario) -> bool,
+    ) -> u32 {
+        use crate::sim::world::{FrameEffects, TickLane};
+
+        let mut tick = 0u32;
+        while tick < budget && !done(scenario) {
+            let orders = ai.orders(&scenario.runtime, tick);
+            scenario
+                .runtime
+                .advance_frame(
+                    &orders,
+                    crate::headless_scenario::SIM_TICK_MS,
+                    TickLane::Ordinary,
+                    FrameEffects::default(),
+                )
+                .expect("simulation frame failed");
+            tick += 1;
+        }
+        tick
+    }
+
+    /// The M1 opening on a retail Battle: the Super AI drives the local
+    /// house from its launch MCV and must own a construction yard, a power
+    /// plant and a refinery well inside the tick budget.
+    #[test]
+    #[ignore = "slow; retail; loads a match and drives thousands of frames"]
+    fn fair_opening_deploys_and_builds_the_first_structures() {
+        let (mut scenario, human) = retail_battle();
         let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
 
         let owns = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
@@ -476,24 +600,9 @@ mod tests {
                 })
         };
 
-        let mut tick = 0u32;
-        while tick < 6000
-            && !(owns(&scenario, "GACNST")
-                && owns(&scenario, "GAPOWR")
-                && owns(&scenario, "GAREFN"))
-        {
-            let orders = ai.orders(&scenario.runtime, tick);
-            scenario
-                .runtime
-                .advance_frame(
-                    &orders,
-                    crate::headless_scenario::SIM_TICK_MS,
-                    TickLane::Ordinary,
-                    FrameEffects::default(),
-                )
-                .expect("simulation frame failed");
-            tick += 1;
-        }
+        let tick = drive_until(&mut scenario, &mut ai, human, 6000, |scenario| {
+            owns(scenario, "GACNST") && owns(scenario, "GAPOWR") && owns(scenario, "GAREFN")
+        });
         assert!(owns(&scenario, "GACNST"), "the MCV deployed (tick {tick})");
         assert!(
             owns(&scenario, "GAPOWR"),
@@ -502,6 +611,47 @@ mod tests {
         assert!(
             owns(&scenario, "GAREFN"),
             "the refinery stands (tick {tick})"
+        );
+    }
+
+    /// The mass-production slice: past the opening the war factory keeps
+    /// building (miners to target, then Grizzly tanks with the rally on the
+    /// yard) and the barracks runs GIs, so an army exists well inside the
+    /// budget.
+    #[test]
+    #[ignore = "slow; retail; loads a match and drives thousands of frames"]
+    fn fair_opening_arms_the_war_factory() {
+        let (mut scenario, human) = retail_battle();
+        let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
+
+        let units_of_type = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == human
+                        && matches!(
+                            entity.category(),
+                            crate::map::entities::EntityCategory::Unit
+                                | crate::map::entities::EntityCategory::Infantry
+                        )
+                        && scenario.sim().interner.resolve(entity.type_ref()) == name
+                })
+                .count()
+        };
+
+        let tick = drive_until(&mut scenario, &mut ai, human, 12000, |scenario| {
+            units_of_type(scenario, "MTNK") >= 1 && units_of_type(scenario, "E1") >= 1
+        });
+        assert!(
+            units_of_type(&scenario, "MTNK") >= 1,
+            "a Grizzly came out (tick {tick})"
+        );
+        assert!(
+            units_of_type(&scenario, "E1") >= 1,
+            "a GI came out (tick {tick})"
         );
     }
 }

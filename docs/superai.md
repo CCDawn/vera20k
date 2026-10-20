@@ -56,9 +56,16 @@ the retail opening (power, refinery, barracks, war factory, then a second
 refinery and harvesters) as pure decisions — one command per tick, gated by
 the production cameo state. A retail regression test drives a real Battle
 from the launch MCV to a standing construction yard, power plant and
-refinery; the one-game smoke now runs 22335 ticks before the Hard computer
-overruns the still-defenseless base (the idle-MCV baseline terminated at
-12904). Army, scouting, defense and micro remain open.
+refinery (the idle-MCV baseline terminated at 12904 ticks).
+
+The mass-production slice arms the opening: the vehicle queue builds miners
+to a target of five and then the side's main battle tank (Grizzly, Rhino,
+Lasher) without pause, the war factory's rally sits on the construction
+yard, and the barracks runs the side's basic soldier continuously; a second
+retail regression drives a real Battle until a Grizzly and a GI stand.
+Against Hard Russia the one-game smoke now ends at 15528 ticks — passive
+tanks without micro feed the attacker wave by wave, which the combat,
+scouting and defense slices own.
 
 ## Upstream sync
 
