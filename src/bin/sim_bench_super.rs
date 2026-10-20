@@ -1,15 +1,18 @@
 //! sim-bench's super scenario: the Super AI against one built-in computer.
 //!
-//! Each game loads the map as a Battle with one computer house of
-//! `--builtin-country` at `--builtin-difficulty` (Russia, Hard by default),
-//! then adds the Super AI as an extra human house of `--super-country`
-//! (`add_human_house`: no start, no starting force, at war with everyone) and
-//! plays it through [`SuperAi::orders`] — M0 emits nothing, so the skeleton
-//! measures only the load → drive → terminal pipeline. The launch's own local
-//! house idles at its start; the match naturally ends when its outcome is
-//! decided, which `advance_frame`'s `TickResult::terminal_score_finalized`
-//! reports (`advance_frame_for_tooling` discards its output, so this scenario
-//! calls the same transaction through `advance_frame` to read the flag).
+//! Each game loads the map as a Battle whose local house is the Super AI's,
+//! of `--super-country`, against one computer house of `--builtin-country`
+//! at `--builtin-difficulty` (Russia, Hard by default): a symmetric 1v1 with
+//! the launch's own opening. The launch seats every active slot on a start
+//! waypoint and seeds its country's MCV there (`unit_count = 0` buys no
+//! roaming starting units), and the Super AI drives the local house through
+//! [`SuperAi::orders`] — M1 still emits nothing, so the benchmark measures
+//! the load → drive → terminal pipeline over a real opening instead of a
+//! house that spawns with nothing and loses at once. The match naturally
+//! ends when the local (Super AI) house's outcome is decided, which
+//! `advance_frame`'s `TickResult::terminal_score_finalized` reports
+//! (`advance_frame_for_tooling` discards its output, so this scenario calls
+//! the same transaction through `advance_frame` to read the flag).
 //! `--max-ticks` is the deadlock backstop; a game that reaches it is recorded
 //! as a timeout.
 //!
@@ -76,14 +79,19 @@ pub(crate) fn difficulty(name: &str) -> Result<AiDifficulty, String> {
     }
 }
 
-/// The Battle launch of one super game: the local house against one computer.
+/// The Battle launch of one super game: the local house (of `super_country`,
+/// the one the Super AI drives) against one computer.
 fn session(
     map: &str,
+    super_country: LaunchCountry,
     builtin_country: LaunchCountry,
     builtin_difficulty: AiDifficulty,
 ) -> SkirmishLaunchSession {
     let mut session =
         headless_scenario::battle_session(map, &[(builtin_country, builtin_difficulty)]);
+    // The Super AI plays the launch's local house itself, so the launch gives
+    // it that country's start MCV and country rules.
+    session.local_slot_mut().country = super_country;
     // No roaming starting units: the match opens with each side's own MCV.
     session.options.unit_count = 0;
     session
@@ -137,15 +145,28 @@ pub(crate) fn run(args: &super::Args) -> Result<(), String> {
             &args.ra2_dir,
             &args.map,
             seed,
-            session(&args.map, args.builtin_country, args.builtin_difficulty),
+            session(
+                &args.map,
+                args.super_country,
+                args.builtin_country,
+                args.builtin_difficulty,
+            ),
         )?;
-        let super_house = scenario.add_human_house("SuperAI", args.super_country);
+        // The Super AI drives the launch's own local house: seated on a start
+        // waypoint with its country's MCV, so the game opens like a real 1v1.
+        let super_house = scenario
+            .runtime
+            .simulation
+            .session()
+            .current_house()
+            .ok_or("the launch created no local house for the Super AI")?;
         let runtime = &mut scenario.runtime;
         runtime.simulation.batch_path_searches();
         runtime.simulation.batch_target_scans();
         let builtin =
             builtin_computer(runtime).ok_or("the launch created no built-in computer house")?;
-        // M0 plays the baseline tier: the skeleton wires the pipeline only.
+        // M1 gives the Super AI a real opening but no strategy: the baseline
+        // tier still emits nothing, so the computer decides the game alone.
         let mut ai = SuperAi::new(super_house, SuperAiDifficulty::Fair);
 
         let mut ticks = 0u64;
