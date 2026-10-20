@@ -5335,6 +5335,76 @@ ConditionRedSparkingProbability=1.0\nConditionYellowSparkingProbability=1.0\n\n\
         sim.process_pending_delete();
         assert!(sim.particle_systems().get(system_id).is_none());
     }
+
+    /// The reach block (`0x006FAB74`) sends a Foot holding an out-of-zone
+    /// Target to Approach, which has no unarmed exit: GetWeaponRange answers
+    /// 0 (`0x007012C0`), CanFireAt is false (`0x006F7237`), the Attack
+    /// mission passes the drop arms (`0x004D5716..0x004D57E4`), the search
+    /// runs no ring and the exhausted arm (`0x004D68E7..0x004D6A58`) drops
+    /// the Target (`0x004D69FB`) while setting the passable cell nearest it
+    /// in the mover's zone as its destination. The block then ends on the new
+    /// NavCom; its own CanFireAt drop (`0x006FABB2`) stays for an Approach
+    /// that leaves the Target in place.
+    #[test]
+    fn an_unarmed_mover_in_the_reach_block_drops_its_target_and_walks_toward_it() {
+        let Some(fixture) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+            return;
+        };
+        let rules = fixture.rules;
+        let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x6FAB74);
+        sim.intern_rule_type_ids(&rules);
+        sim.resolve_type_handles(&rules);
+        // A water column splits the arena's ground zones.
+        crate::sim::arena_fixture::flood(
+            &mut sim,
+            &rules,
+            32,
+            (0..32).flat_map(|y| (16..19).map(move |x| (x, y))),
+        );
+        let mcv = sim
+            .spawn_object("SMCV", "Americans", 10, 16, 0, &rules)
+            .expect("retail SMCV spawns");
+        let tank = sim
+            .spawn_object("MTNK", "Russians", 24, 16, 0, &rules)
+            .expect("retail MTNK spawns");
+        sim.assign_target_represented(
+            mcv,
+            Some(TargetKind::Entity(tank)),
+            Some(&rules),
+            None,
+            FrameEffects::default(),
+        )
+        .expect("the target assigns");
+        sim.substrate
+            .entities
+            .get_mut(mcv)
+            .unwrap()
+            .mission
+            .set_current_for_test(MissionId::from_known(MissionType::Attack), 0);
+        assert_eq!(
+            sim.foot_is_in_same_zone_as(mcv, TargetKind::Entity(tank), &rules),
+            Ok(false),
+            "the water wall puts the tank out of the MCV's zone"
+        );
+        target_reach_step(&mut sim, mcv, &rules, None, FrameEffects::default());
+        let entity = sim.substrate.entities.get(mcv).unwrap();
+        assert_eq!(
+            entity.attack_target.target(),
+            None,
+            "the exhausted arm dropped the Target"
+        );
+        let NavTargetRef::Cell { rx, .. } = entity
+            .navigation
+            .nav_com()
+            .expect("the destination is the passable cell nearest the tank")
+        else {
+            unreachable!("the exhausted arm sets a Cell destination")
+        };
+        assert!(
+            rx < 16,
+            "the destination lies in the mover's zone (rx {rx})"
+        );
+    }
 }
 
 #[cfg(test)]

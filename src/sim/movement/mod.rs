@@ -63,6 +63,8 @@ pub(crate) mod foot_mark;
 mod foot_path;
 pub(crate) use drive_locomotion::drive_do_turn;
 #[cfg(any(test, feature = "test-support"))]
+pub(crate) mod approach_oracle_seam;
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) use foot_path::FindPathResult;
 pub(crate) use foot_path::FootPathOutcome;
 pub(crate) use foot_path::coord_cell;
