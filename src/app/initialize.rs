@@ -277,7 +277,7 @@ impl App {
                         fnt,
                         gpu.config.width,
                         gpu.config.height,
-                        options_profile.ra2_look,
+                        options_profile.yr_original_style,
                     )
                     .map_err(|err| log::warn!("Could not build retail startup splash: {err:#}"))
                     .ok()
@@ -519,6 +519,7 @@ impl App {
             ),
             match_state: crate::app::match_runtime::state::MatchState {
                 session: Default::default(),
+                network_wait: Default::default(),
                 startup: Default::default(),
                 sim_runtime: None,
                 input: crate::app::input::state::MatchInputState::new(hotkey_bindings),
@@ -543,6 +544,7 @@ impl App {
                         0,
                     ),
                     message_clock: crate::ui::messages::PauseAwareClock::default(),
+                    chat: Default::default(),
                     in_game_menu: crate::ui::pause_menu::InGameMenuState::default(),
                     modal_latch: true,
                     pause_menu_has_saves: false,
@@ -581,8 +583,6 @@ impl App {
                     target_lines: startup_target_lines,
                     cached_overlay_instances: Vec::new(),
                     terrain_grid: None,
-                    height_map: BTreeMap::new(),
-                    bridge_height_map: BTreeMap::new(),
                     overlays: Default::default(),
                     terrain_objects: Vec::new(),
                     overlay_names: BTreeMap::new(),
@@ -699,7 +699,10 @@ impl App {
                 wol_welcome_art: None,
                 wol_login_art: None,
                 wol_lobby_art: None,
+                wol_options_art: None,
+                wol_sound_options_art: None,
                 wol_lobby_globals: Default::default(),
+                wol_preferences: Default::default(),
                 score_page: None,
                 campaign_score_page: None,
                 score_art: None,
