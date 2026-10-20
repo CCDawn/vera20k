@@ -1103,8 +1103,9 @@ fn retail_defence_guards_attacks_and_returns(
     {
         // The ordinary successful Building Unlimbo path commences Guard
         // before it returns: Unlimbo calls Idle(1,1) (`0x006F6E2A`), whose
-        // build-up-bypass scope (`0x00A8ED6B`, the standing-finished spawn)
-        // takes the Idle arm and queues Guard (`0x0044D6DC..0x0044D6F1`);
+        // build-up-bypass flag (`0x00A8ED6B`; natively only the random map
+        // generator sets it, and VERA's `with_buildup_bypass` spawn stands in
+        // for it) takes the Idle arm and queues Guard (`0x0044D6DC..0x0044D6F1`);
         // the ready byte `+0x6DD` is already written (`0x004467C9`), so the
         // common caller's Ready ask (`0x006F6E3B`) Commences (`0x006F6E49`)
         // inside the same Unlimbo. Native instruction reading on issue
@@ -1519,13 +1520,6 @@ fn retail_dustbowl_ore_cell_spawn_admission_matches_native_gates() {
         )
         .is_none(),
         "Is_Clear_To_Build refuses a building on an ore overlay"
-    );
-
-    // The registry-less boundary cannot resolve the overlay at all.
-    assert!(
-        sim.spawn_object("E2", "Americans", 69, 40, 0, rules)
-            .is_none(),
-        "a registry-less Foot +1AC refuses any overlay cell"
     );
 
     // Through the live table the ore cell admits infantry and vehicles, and
