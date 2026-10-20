@@ -1983,8 +1983,9 @@ fn evaluate_candidate(
     // gate, and G13's zero-range arm asks `Is_Armed` separately
     // (`0x006F817A..0x006F8198`). A weapon whose warhead section is missing
     // (`resolve_weapon_index` answers `None`) takes the same null-weapon
-    // path; native's separate null-WeaponType test at `0x006F85DD` shows the
-    // pair can diverge only on that data error.
+    // path. Native tests a null WeaponType apart from its slot elsewhere (the
+    // candidate's current weapon, `0x006F85D3..0x006F85DD`), so the pair can
+    // diverge only on that data error.
     let weapon_index = what_weapon_should_i_use(
         ctx.rules,
         ctx.attacker_obj,
