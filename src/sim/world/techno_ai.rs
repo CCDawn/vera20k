@@ -49,6 +49,8 @@ use crate::sim::intern::StringInterner;
 use crate::sim::miner::MinerConfig;
 use crate::sim::mission::MissionType;
 use crate::sim::scenario_session::ScenarioSession;
+use crate::sim::world::FrameChannel;
+use crate::sim::world::SimSoundEvent;
 
 /// Non-rules world context the mission handler bodies dispatched from the
 /// host need (overlay types and per-tick config the spine already owns;
@@ -1068,8 +1070,14 @@ fn techno_ai_shell(
 /// `owner == g_PlayerPtr` in a skirmish). The flash's existing signed dword
 /// counter is stepped later by4CC770 at6FAC4D, through flash_step; a
 /// newly promoted object's timer therefore loses one on this same visit.
-fn veterancy_promotion_step(sim: &mut Simulation, id: u64, rules: &RuleSet) {
-    let Some(entity) = sim.substrate.entities.get_mut(id) else {
+fn veterancy_promotion_step(
+    interner: &mut StringInterner,
+    substrate: &mut ObjectSubstrate,
+    sound_events: &mut FrameChannel<SimSoundEvent>,
+    id: u64,
+    rules: &RuleSet,
+) {
+    let Some(entity) = substrate.entities.get_mut(id) else {
         return;
     };
     let Some(promotion) = entity
@@ -1088,8 +1096,8 @@ fn veterancy_promotion_step(sim: &mut Simulation, id: u64, rules: &RuleSet) {
             rules.general.upgrade_veteran_sound.as_deref()
         }
     };
-    let sound_id = sound.map(|name| sim.interner.intern(name));
-    sim.sound_events.emit(super::SimSoundEvent::UnitPromoted {
+    let sound_id = sound.map(|name| interner.intern(name));
+    sound_events.emit(super::SimSoundEvent::UnitPromoted {
         owner,
         sound_id,
         rx,
@@ -1402,7 +1410,13 @@ fn techno_common_steps(
     if let Some(sample) = turret_rotate_sample {
         sim.visit_turret_rotate_sound(id, sample, rules, effects);
     }
-    veterancy_promotion_step(sim, id, rules);
+    veterancy_promotion_step(
+        &mut sim.interner,
+        &mut sim.substrate,
+        &mut sim.sound_events,
+        id,
+        rules,
+    );
     crate::sim::credit_income::drain_common_step(sim, id, rules);
     // Techno6FA224..6FA244: only a valid loaded main VXL reaches
     // RockingUpdate70B570 and its immediate Alive guard. This precedes
