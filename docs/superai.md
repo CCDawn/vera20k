@@ -48,10 +48,11 @@ original AI) with per-game seeds, stops at `terminal_score_finalized` (with a
 max-ticks guard) and prints a W/L table. Fair tier is the reference line:
 strength claims cite these runs.
 
-Known M0 gap: the super side spawns through `add_human_house` with no start
-force (no MCV, no base), so the M0 bench measures only the load → drive →
-terminal pipeline. M1's first task is giving the super side a real start
-(MCV or base) before any strategy can be measured.
+The super side plays the launch's local house, so the scenario_bootstrap
+opening (start waypoint + the country's MCV) gives it a real 1v1 start; a
+30000-tick smoke reaches its natural terminal with the idle MCV still
+standing well into the game. Strategies start from the next milestone:
+deploy the MCV, then macro.
 
 ## Upstream sync
 
