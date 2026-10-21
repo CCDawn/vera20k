@@ -63,9 +63,16 @@ to a target of five and then the side's main battle tank (Grizzly, Rhino,
 Lasher) without pause, the war factory's rally sits on the construction
 yard, and the barracks runs the side's basic soldier continuously; a second
 retail regression drives a real Battle until a Grizzly and a GI stand.
-Against Hard Russia the one-game smoke now ends at 15528 ticks — passive
-tanks without micro feed the attacker wave by wave, which the combat,
-scouting and defense slices own.
+Against Hard Russia the one-game smoke ended at 15528 ticks — passive
+tanks without micro feed the attacker wave by wave.
+
+The defense slice holds the base: idle tanks and soldiers attack the
+nearest intruder inside a 16-cell ring around the yard (one order per
+tick, re-derived from each unit's current mission so nothing spams) and
+otherwise post on an Area Guard there. With that, the same smoke no
+longer loses — the one-game run times out at the 30000-tick backstop
+with both sides standing (attack marching is still unimplemented, so a
+won position cannot be converted).
 
 ## Upstream sync
 

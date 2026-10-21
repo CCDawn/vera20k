@@ -22,10 +22,12 @@
 //! vehicle queue keeps miners coming up to a target and then builds the
 //! side's main battle tank without pause, the war factory's rally sits on the
 //! construction yard so its output gathers in the base, and the barracks
-//! queue runs the side's basic soldier continuously. Scouting, army mix
-//! beyond the first tanks, attack orders, defense and micro are later
-//! milestones; the difficulty tiers still change nothing (bonuses land with
-//! them).
+//! queue runs the side's basic soldier continuously. Idle soldiers and tanks
+//! defend the base: the nearest intruder inside a ring around the yard draws
+//! explicit attack orders, and units with nothing to fight hold an Area
+//! Guard post on the yard. Scouting, army mix beyond the first tanks,
+//! attack marching, and micro are later milestones; the difficulty tiers
+//! still change nothing (bonuses land with them).
 
 use crate::sim::command::Command;
 use crate::sim::command::CommandEnvelope;
@@ -46,6 +48,11 @@ const SITE_SEARCH_RADIUS: i16 = 24;
 /// Miners the vehicle queue builds before it switches to tanks: enough to
 /// feed two refineries' docks while the army starts coming out.
 const HARVESTER_TARGET: usize = 5;
+
+/// How far from the construction yard an intruder still counts as attacking
+/// the base, in cells: the defense picks explicit targets out to this ring;
+/// idle units inside it hold an Area Guard post on the yard.
+const BASE_DEFENSE_RADIUS: i16 = 16;
 
 /// The ladder the Super AI plays at.
 ///
@@ -152,11 +159,12 @@ impl SuperAi {
     /// The commands this player issues for the frame after `tick`.
     ///
     /// One command per tick, in a fixed priority: deploy the opening MCV,
-    /// place a ready building, keep the building queue walking the opening,
-    /// hold the war factory's rally on the construction yard, keep the
-    /// vehicle queue on miners-then-tanks, keep the barracks queue on the
-    /// side's basic soldier. See the module docs for the determinism
-    /// contract.
+    /// place a ready building, defend the base (attack the nearest intruder,
+    /// else post idle units on an Area Guard), keep the building queue
+    /// walking the opening, hold the war factory's rally on the construction
+    /// yard, keep the vehicle queue on miners-then-tanks, keep the barracks
+    /// queue on the side's basic soldier. See the module docs for the
+    /// determinism contract.
     pub fn orders(&mut self, runtime: &SimRuntime, tick: u32) -> Vec<CommandEnvelope> {
         let sim = &runtime.simulation;
         let rules = &runtime.resources.rules;
@@ -203,6 +211,40 @@ impl SuperAi {
                     ry,
                 },
             )];
+        }
+
+        // Home defense: idle combat units engage the nearest intruder inside
+        // the base perimeter, and otherwise hold an Area Guard post on the
+        // construction yard, so enemies meet a formed line there instead of
+        // luring lone chasers across the map. Orders issue one unit per tick;
+        // an engaged or posted unit leaves the idle set, so no spam follows.
+        if let Some(center) = self.structure_center(sim, opening.construction_yard) {
+            let idle = self.idle_combat_units(sim, opening);
+            if let Some(&attacker) = idle.first()
+                && let Some(target) = self.nearest_intruder(sim, center)
+            {
+                return vec![CommandEnvelope::new(
+                    self.house,
+                    at,
+                    Command::Attack {
+                        attacker_id: attacker,
+                        target_id: target,
+                    },
+                )];
+            }
+            if let Some(&unit) = idle.first() {
+                return vec![CommandEnvelope::new(
+                    self.house,
+                    at,
+                    Command::Guard {
+                        entity_id: unit,
+                        target: Some(crate::sim::combat::TargetKind::Cell(
+                            center.0 as u16,
+                            center.1 as u16,
+                        )),
+                    },
+                )];
+            }
         }
 
         // Walk the opening while the building queue idles.
@@ -394,6 +436,72 @@ impl SuperAi {
             .count()
     }
 
+    /// The house's idle combat units for the opening's army types, in the
+    /// substrate's stable order: arrived tanks and soldiers whose current
+    /// mission is None or Sleep (a unit walking to the rally, engaging a
+    /// target or holding a post is not idle and takes no new order).
+    fn idle_combat_units(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+    ) -> Vec<u64> {
+        sim.substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.owner() == self.house
+                    && matches!(
+                        entity.category(),
+                        crate::map::entities::EntityCategory::Unit
+                            | crate::map::entities::EntityCategory::Infantry
+                    )
+                    && {
+                        let name = sim.interner.resolve(entity.type_ref());
+                        name == opening.main_tank || name == opening.basic_infantry
+                    }
+                    && matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                    )
+            })
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// The nearest hostile entity inside `BASE_DEFENSE_RADIUS` cells of
+    /// `center`, ties broken by the substrate's stable order. Passive houses
+    /// (observers, civilians) do not count as intruders.
+    fn nearest_intruder(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        center: (i16, i16),
+    ) -> Option<u64> {
+        let limit = i32::from(BASE_DEFENSE_RADIUS) * i32::from(BASE_DEFENSE_RADIUS);
+        let mut best: Option<(i32, u64)> = None;
+        for (id, entity) in sim.substrate.entities.iter_sorted() {
+            let owner = entity.owner();
+            if owner == self.house
+                || !sim
+                    .houses
+                    .iter()
+                    .any(|(&house_id, house)| house_id == owner && !house.multiplay_passive())
+            {
+                continue;
+            }
+            let dx = i32::from(entity.position.rx() as i16 - center.0);
+            let dy = i32::from(entity.position.ry() as i16 - center.1);
+            let distance_squared = dx * dx + dy * dy;
+            if distance_squared > limit {
+                continue;
+            }
+            if best.is_none_or(|(best_distance, _)| distance_squared < best_distance) {
+                best = Some((distance_squared, id));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
     /// The anchor cell the site search scans around: the construction yard's,
     /// or the first own structure's when the yard itself is the ready piece.
     fn structure_center(
@@ -555,7 +663,6 @@ mod tests {
     fn drive_until(
         scenario: &mut crate::headless_scenario::HeadlessScenario,
         ai: &mut SuperAi,
-        house: crate::sim::intern::InternedId,
         budget: u32,
         done: impl Fn(&crate::headless_scenario::HeadlessScenario) -> bool,
     ) -> u32 {
@@ -600,7 +707,7 @@ mod tests {
                 })
         };
 
-        let tick = drive_until(&mut scenario, &mut ai, human, 6000, |scenario| {
+        let tick = drive_until(&mut scenario, &mut ai, 6000, |scenario| {
             owns(scenario, "GACNST") && owns(scenario, "GAPOWR") && owns(scenario, "GAREFN")
         });
         assert!(owns(&scenario, "GACNST"), "the MCV deployed (tick {tick})");
@@ -642,7 +749,7 @@ mod tests {
                 .count()
         };
 
-        let tick = drive_until(&mut scenario, &mut ai, human, 12000, |scenario| {
+        let tick = drive_until(&mut scenario, &mut ai, 12000, |scenario| {
             units_of_type(scenario, "MTNK") >= 1 && units_of_type(scenario, "E1") >= 1
         });
         assert!(
