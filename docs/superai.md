@@ -2,8 +2,8 @@
 
 This branch group (`superai/*`) is a fork-only feature line: a command-layer
 "super AI" player and a headless win-rate bench. It tracks upstream
-`YuriPlanet/vera20k` `main` and keeps its footprint outside `src/sim/` (one
-documented exception, below). Licensed GPL like the rest of the tree.
+`YuriPlanet/vera20k` `main` and keeps its footprint outside `src/sim/` (two
+documented exceptions, below). Licensed GPL like the rest of the tree.
 
 ## Positioning
 
@@ -32,14 +32,38 @@ The build-speed multiplier is simulation-side by nature (INI mods change the
 same native parameters). Super tier therefore allows exactly one minimal
 `src/sim/` change on this fork: a per-house `native_build_time_scale` field
 folded into the country multiplier of `production/factory.rs`
-`time_to_build`. `None` is bit-identical to native. Nothing else in `src/sim/`
-may depend on super-AI code.
+`time_to_build`. `None` is bit-identical to native. The second exception is
+`HouseState::command_driven` (below): a per-house fork flag that stands the
+native AI's decision loops down for a house the command layer drives.
+Nothing else in `src/sim/` may depend on super-AI code.
+
+## In-game selection and the command-driven house
+
+The Super AI is selectable before the match. The skirmish lobby offers a
+**Super AI** opponent row (persisted as its own slot code) that packs the
+native Hard difficulty plus a `super_tier` marker on the launch slot.
+`populate_launch_houses` turns a marked slot into a **command-driven
+house**: it keeps the tier treatment above (Hard row grant, Super build
+scale) and sets `command_driven`, and the native AI's decision loops
+(base building, team creation, factory AI, MCV deploy, AI activation,
+locomotor lifts) stand down for that house — the native AI and the
+command layer must not both drive one house. The app's match loop then
+rebuilds one `SuperAi` per command-driven non-passive non-human house on
+every runtime install (fresh match and saved game) and merges its orders
+into the tick's command stream on the Ordinary lane, including the
+Brutal/Super credit drip the bench harness applies. An ordinary computer
+slot is untouched: native AI, native grants, no drip.
+
+Targeting is alliance-aware (both directions, in-game diplomacy can be
+one-way): a Super AI on team A does not treat its teammates as intruders
+or wave targets.
 
 ## M1 pillars (order of work)
 
 1. **Macro** — build order, power management, economy/harvester escort,
-   expansion, tech timing; production queues never idle. (Opening,
-   mass production and the three-factory expansion have landed.)
+   expansion, tech timing; production queues never idle. (Opening, mass
+   production, the three-factory expansion and the tech climb have
+   landed.)
 2. **Mass waves** — continuous no-gap attack waves, multi-prong pushes.
 3. **Scout & counter** — scout, classify enemy composition, switch unit mix.
 4. **Defense & micro** — AA, engineer/spy response, focus fire, kiting,
@@ -141,6 +165,63 @@ direction as ever without a first win: 0-1-2 (avg 28977, the single
 loss postponed 21073→26932). Both sides now routinely hold to the
 30000-tick backstop; breaking that stalemate is scouting/count and
 micro territory, not more wave shaping.
+
+The tech-climb slice adds the tier the strategy never had. Right behind
+the second war factory the build ladder climbs — the radar class, then
+the battle lab — before the expansion finishes with its third factory,
+and once the lab stands the vehicle queue switches from the side's main
+tank to its tier-2 tank (Prism, Apocalypse, Master Mind — the retail
+`Prerequisite=…,<lab>` chain). The switch reads the lab's existence,
+not the cameo's brightness: `cameo_draw_state` mirrors `StripClass::Draw`,
+which checks factory readiness and build limit but no prerequisites —
+`Recalculate` owns refusal — so a bright cameo appears long before the
+lab exists and switching on it builds a tank the house never earned
+(and stalls the expansion gate, which waits for the first main tank).
+The radar step is the retail radar class, not a fixed type: the ladder
+asks the native `can_build` gate which member of
+`[General] PrerequisiteRadar=GAAIRC,NARADR,AMRADR,NAPSIS` this house
+may build, in the list's order. That matters because GAAIRC itself
+carries `ForbiddenHouses=Americans` — an Americans house builds
+`AMRADR`, its identical twin under the American id; queueing the
+forbidden GAAIRC instead (a stall the queue admits but per-tick
+production keeps refusing, so the item sits at zero progress and zero
+cost) deadlocks the whole climb. While a tech-climb piece (the radar or
+the lab) is under construction the unit queues spend only banked
+credits — an item waits until its own cost sits in the bank, so the
+incoming ore flow stays with the climb instead of splitting three ways
+across tanks and soldiers (miners are exempt: deferring the income
+source behind a cushion would starve everything; so are routine
+expansion buildings — throttling the defending army for every power
+plant costs more games than the building rush saves). A retail
+regression drives a Battle until the radar, the lab and a Prism stand.
+The seeded smoke splits by tier: Brutal converts the climb into the
+strategy's first win — 1-2 over three games, average 16595 ticks (was
+0-3, average 22207) — while Fair pays for it in tempo: 0-3, average
+18015 (was 0-1-2, average 28977). The unsubsidized radar-and-lab
+investment thins the standing army that holds Hard's pressure; when to
+climb on no subsidies is scouting/counter and micro territory, not more
+wave shaping.
+
+The traffic slice de-converges the flows that jammed the base. Rally
+cells and guard posts fan out over an 8-cell offset pattern
+(`SPREAD_OFFSETS`): each war factory rallies its output to its own cell
+around the yard and guard posts spread by unit id instead of stacking
+on the yard itself. A departing wave's dispatches cycle the enemy's
+standing structures (war factories first) by unit id — the mass fans
+out over the target base, and each destination is a live building's
+own cell, always reachable-adjacent. Two hardening rules came out of
+the retail regressions: every offset destination is clamped onto the
+map (a wrapped off-map coordinate is silently dropped by the command
+layer), and a wave episode never re-orders a unit it already
+dispatched — a dropped order used to pin the wave branch on one unit
+every tick and starve every branch below it, freezing all production.
+The same drop-and-reissue starvation later surfaced in the defense and
+guard branches (a guard post cell that a placed building occupies makes
+the order permanently undroppable-in-the-other-direction: the unit
+stays mission-`None`, and the branch re-ordered it every tick for a
+tank's whole build time), so every single-unit order now passes a
+per-unit reissue gate (`IDLE_REORDER_TICKS`): an order the command
+layer drops costs one tick, not the branch's whole attention.
 
 ## Upstream sync
 

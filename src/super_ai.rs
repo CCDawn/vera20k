@@ -29,9 +29,13 @@
 //! hostile bases' mass center. Past the opening the construction queue keeps
 //! expanding production: a second and third war factory (each extra one
 //! multiplies vehicle build time by retail `MultipleFactory=0.8`) with the
-//! power plants to feed them. Scouting, army mix beyond the first tanks and
-//! micro are later milestones; the tiers only change the strength subsidies
-//! (opening grant, halved build times), never the decisions themselves.
+//! power plants to feed them, then the tech climb — the radar class and the
+//! battle lab, which switches the vehicle queue to the side's tier-2 tank
+//! (Prism Tank, Apocalypse, Master Mind). Rallies, guard posts and wave
+//! destinations fan out over fixed offsets so groups spread instead of
+//! jamming on one cell. Scouting and micro are later milestones; the tiers
+//! only change the strength subsidies (opening grant, halved build times),
+//! never the decisions themselves.
 
 use crate::sim::command::Command;
 use crate::sim::command::CommandEnvelope;
@@ -86,6 +90,41 @@ const REFINERY_TARGET: usize = 2;
 /// money and speed subsidies convert into.
 const WAR_FACTORY_TARGET: usize = 3;
 
+/// Ticks between wave episodes. A full pulse drains the standing set to the
+/// guard reserve; this interval lets production refill it before the next
+/// departure and bounds a wave whose dispatches were dropped to one wasted
+/// order per unit per interval.
+const WAVE_RETRY_TICKS: u32 = 300;
+
+/// Every side's war factory type (retail `UIName`s): the structures a wave
+/// razes first to starve the enemy's reinforcements.
+const WAR_FACTORY_TYPES: [&str; 3] = ["GAWEAP", "NAWEAP", "YAWEAP"];
+
+/// How long an idle unit that was just given a one-unit order waits before
+/// taking another: an order the command layer drops leaves the unit's
+/// mission `None`, so without this pause the defense and guard branches
+/// would re-order the same first idle unit every tick and starve every
+/// branch below them (observed: a Guard post cell blocked by a building
+/// froze the whole build ladder for a tank's entire build time).
+const IDLE_REORDER_TICKS: u32 = 150;
+
+/// Deterministic fan-out offsets (cells) that keep the AI's destinations
+/// from converging on one point: rallies, guard posts and wave destinations
+/// each pick an offset by index or entity id, so a group spreads over
+/// neighboring cells instead of jamming on a single one. Move, Guard and
+/// AttackMove all complete in the destination's vicinity, so an offset that
+/// lands on a building still parks the unit beside it rather than stacking.
+const SPREAD_OFFSETS: [(i8, i8); 8] = [
+    (0, 0),
+    (4, 0),
+    (0, 4),
+    (-4, 0),
+    (0, -4),
+    (4, 4),
+    (-4, 4),
+    (-4, -4),
+];
+
 /// The ladder the Super AI plays at.
 ///
 /// The tiers describe the target behaviour, not what the current milestone
@@ -113,11 +152,19 @@ struct Opening {
     refinery: &'static str,
     barracks: &'static str,
     war_factory: &'static str,
+    /// The side's radar-class building — the battle lab's `RADAR`
+    /// prerequisite (Airforce Command, Soviet Radar, Psychic Radar).
+    radar: &'static str,
+    /// The side's battle lab, the tech gate for the tier-2 tank.
+    battle_lab: &'static str,
     /// The side's miner, if the war factory can build it (Yuri's slave miner
     /// is not a plain vehicle and stays out of the opening).
     harvester: Option<&'static str>,
     /// The side's first battle tank (Grizzly, Rhino, Lasher).
     main_tank: &'static str,
+    /// The side's tier-2 battle tank behind the battle lab (Prism Tank,
+    /// Apocalypse, Master Mind).
+    tier2_tank: &'static str,
     /// The side's basic soldier (GI, Conscript, Initiate).
     basic_infantry: &'static str,
 }
@@ -129,8 +176,11 @@ const OPENINGS: [Opening; 3] = [
         refinery: "GAREFN",
         barracks: "GAPILE",
         war_factory: "GAWEAP",
+        radar: "GAAIRC",
+        battle_lab: "GATECH",
         harvester: Some("CMIN"),
         main_tank: "MTNK",
+        tier2_tank: "SREF",
         basic_infantry: "E1",
     },
     Opening {
@@ -139,8 +189,11 @@ const OPENINGS: [Opening; 3] = [
         refinery: "NAREFN",
         barracks: "NAHAND",
         war_factory: "NAWEAP",
+        radar: "NARADR",
+        battle_lab: "NATECH",
         harvester: Some("HARV"),
         main_tank: "HTNK",
+        tier2_tank: "APOC",
         basic_infantry: "E2",
     },
     Opening {
@@ -149,8 +202,14 @@ const OPENINGS: [Opening; 3] = [
         refinery: "YAREFN",
         barracks: "YABRCK",
         war_factory: "YAWEAP",
+        // Yuri's radar class is NAPSIS (Psychic Sensor, `Radar=yes`); the
+        // similarly-named YAPSYT is the Psychic Tower defense building and
+        // satisfies no prerequisite.
+        radar: "NAPSIS",
+        battle_lab: "YATECH",
         harvester: None,
         main_tank: "LTNK",
+        tier2_tank: "MIND",
         basic_infantry: "INIT",
     },
 ];
@@ -171,6 +230,19 @@ pub struct SuperAi {
     /// single file into the enemy's defense. Pinned state, never read from
     /// the runtime — the determinism contract allows exactly this.
     wave_launching: bool,
+    /// Units already dispatched in the current wave episode. A dispatch the
+    /// command layer drops leaves its unit in the standing set; without this
+    /// list the wave branch would re-order the same unit every tick and
+    /// starve every branch below it (observed: two units whose offset
+    /// destination was impassable froze all production).
+    launched: Vec<u64>,
+    /// Earliest tick the next wave episode may trigger. Paces pulses apart
+    /// and bounds the damage a wave of entirely dropped dispatches can do to
+    /// one order per unit per interval.
+    next_wave_tick: u32,
+    /// Earliest tick each idle unit may take another single-unit order; see
+    /// [`IDLE_REORDER_TICKS`]. Pinned state, never read from the runtime.
+    order_gate: std::collections::HashMap<u64, u32>,
 }
 
 impl SuperAi {
@@ -182,6 +254,9 @@ impl SuperAi {
             next_deploy_tick: 0,
             deploy_attempts: 0,
             wave_launching: false,
+            launched: Vec::new(),
+            next_wave_tick: 0,
+            order_gate: std::collections::HashMap::new(),
         }
     }
 
@@ -199,11 +274,12 @@ impl SuperAi {
     ///
     /// One command per tick, in a fixed priority: deploy the opening MCV,
     /// place a ready building, defend the base (attack the nearest intruder;
-    /// else march a gathered group on the enemy center; else post idle units
-    /// on an Area Guard), keep the building queue walking the opening, hold
-    /// the war factory's rally on the construction yard, keep the vehicle
-    /// queue on miners-then-tanks, keep the barracks queue on the side's
-    /// basic soldier. See the module docs for the determinism contract.
+    /// else launch a gathered wave on the enemy's structures, one unit per
+    /// tick; else post idle units on an Area Guard), keep the building queue
+    /// walking the ladder, hold the war factories' rallies around the yard,
+    /// keep the vehicle queue on miners-then-tanks, keep the barracks queue
+    /// on the side's basic soldier. See the module docs for the determinism
+    /// contract.
     pub fn orders(&mut self, runtime: &SimRuntime, tick: u32) -> Vec<CommandEnvelope> {
         let sim = &runtime.simulation;
         let rules = &runtime.resources.rules;
@@ -265,9 +341,10 @@ impl SuperAi {
         // so no spam follows, and a wave that dies lets the next one form.
         if let Some(center) = self.structure_center(sim, opening.construction_yard) {
             let idle = self.idle_combat_units(sim, opening);
-            if let Some(&attacker) = idle.first()
+            if let Some(attacker) = self.due_idle_unit(&idle, tick)
                 && let Some(target) = self.nearest_intruder(sim, center)
             {
+                self.gate_idle_order(attacker, tick);
                 return vec![CommandEnvelope::new(
                     self.house,
                     at,
@@ -278,41 +355,101 @@ impl SuperAi {
                 )];
             }
             let standing = self.standing_combat_units(sim, opening);
-            let enemy_center = self.enemy_center(sim);
-            if !self.wave_launching && standing.len() >= ATTACK_WAVE_SIZE && enemy_center.is_some()
+            let enemy_targets = self.enemy_priority_targets(sim);
+            let enemy_center = if enemy_targets.is_empty() {
+                self.enemy_center(sim)
+            } else {
+                None
+            };
+            if !self.wave_launching
+                && tick >= self.next_wave_tick
+                && standing.len() >= ATTACK_WAVE_SIZE
+                && (!enemy_targets.is_empty() || enemy_center.is_some())
             {
                 self.wave_launching = true;
+                self.launched.clear();
             }
-            if self.wave_launching && standing.len() > GUARD_RESERVE {
-                if let Some(enemy_center) = enemy_center
-                    && let Some(&unit) = standing.first()
-                {
-                    return vec![CommandEnvelope::new(
-                        self.house,
-                        at,
-                        Command::AttackMove {
-                            entity_id: unit,
-                            target: None,
-                            destination: Some(crate::sim::combat::TargetKind::Cell(
-                                enemy_center.0 as u16,
-                                enemy_center.1 as u16,
-                            )),
-                        },
-                    )];
+            if self.wave_launching {
+                // Dispatch one not-yet-launched standing unit per tick. The
+                // `launched` list bounds the episode: a dispatch the command
+                // layer drops (its unit stays standing) is never re-ordered
+                // within the episode, so the branch cannot spin on it and
+                // starve the branches below.
+                let next = standing
+                    .iter()
+                    .find(|&&unit| !self.launched.contains(&unit))
+                    .copied();
+                match next {
+                    Some(unit) if standing.len() > GUARD_RESERVE => {
+                        self.launched.push(unit);
+                        // Each unit attack-moves on one enemy structure's own
+                        // cell, cycled by unit id — the wave fans out over the
+                        // target base instead of converging on one cell, and a
+                        // live building's cell is always reachable-adjacent,
+                        // unlike a centroid plus offset, which can land on
+                        // impassable ground. With no structure left the wave
+                        // falls back to the hostile mobiles' centroid.
+                        let destination = if enemy_targets.is_empty() {
+                            enemy_center.map(|center| {
+                                let spread = SPREAD_OFFSETS[(unit as usize) % SPREAD_OFFSETS.len()];
+                                on_map_cell(
+                                    sim,
+                                    (
+                                        center.0 + i16::from(spread.0),
+                                        center.1 + i16::from(spread.1),
+                                    ),
+                                    center,
+                                )
+                            })
+                        } else {
+                            enemy_targets
+                                .get(unit as usize % enemy_targets.len())
+                                .map(|&(_, cell)| (cell.0 as u16, cell.1 as u16))
+                        };
+                        if let Some((rx, ry)) = destination {
+                            return vec![CommandEnvelope::new(
+                                self.house,
+                                at,
+                                Command::AttackMove {
+                                    entity_id: unit,
+                                    target: None,
+                                    destination: Some(crate::sim::combat::TargetKind::Cell(rx, ry)),
+                                },
+                            )];
+                        }
+                        self.wave_launching = false;
+                        self.next_wave_tick = tick + WAVE_RETRY_TICKS;
+                    }
+                    _ => {
+                        // The reserve is home (a full pulse) or every standing
+                        // unit was already dispatched (dropped orders): end
+                        // the episode and let production fill the next one.
+                        self.wave_launching = false;
+                        self.next_wave_tick = tick + WAVE_RETRY_TICKS;
+                    }
                 }
-            } else {
-                self.wave_launching = false;
             }
-            if let Some(&unit) = idle.first() {
+            if let Some(unit) = self.due_idle_unit(&idle, tick) {
+                self.gate_idle_order(unit, tick);
+                // Spread the guard posts on a ring around the yard by unit
+                // id: defenders hold neighboring cells instead of stacking
+                // on the yard itself. Clamped onto the map for the same
+                // reason as the wave destination.
+                let spread = SPREAD_OFFSETS[(unit as usize) % SPREAD_OFFSETS.len()];
+                let post = on_map_cell(
+                    sim,
+                    (
+                        center.0 + i16::from(spread.0),
+                        center.1 + i16::from(spread.1),
+                    ),
+                    center,
+                );
                 return vec![CommandEnvelope::new(
                     self.house,
                     at,
                     Command::Guard {
                         entity_id: unit,
-                        target: Some(crate::sim::combat::TargetKind::Cell(
-                            center.0 as u16,
-                            center.1 as u16,
-                        )),
+                        target: Some(crate::sim::combat::TargetKind::Cell(post.0, post.1)),
                     },
                 )];
             }
@@ -332,6 +469,38 @@ impl SuperAi {
                     | crate::sim::production::ProductionCategory::Defense
             )
         });
+        // The climb's radar step is the retail radar class, not one fixed
+        // type: `[General] PrerequisiteRadar=GAAIRC,NARADR,AMRADR,NAPSIS`,
+        // and GAAIRC itself carries `ForbiddenHouses=Americans` — an
+        // Americans house builds AMRADR, its twin under the American id.
+        // Ask the native gate which member this house may build, in the
+        // list's own order; the opening's radar is the unreachable-mod
+        // fallback.
+        const RADAR_CLASS: [&str; 4] = ["GAAIRC", "NARADR", "AMRADR", "NAPSIS"];
+        let radar_name = RADAR_CLASS
+            .into_iter()
+            .find(|&name| {
+                rules.object(name).is_some_and(|ty| {
+                    crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                        == crate::sim::production::CanBuild::Yes
+                })
+            })
+            .unwrap_or(opening.radar);
+        // Whether a tech-climb piece (the radar or the battle lab) is the
+        // building under construction. Those two carry the tier the whole
+        // strategy climbs for, so they alone may claim the income flow; a
+        // routine expansion building must not throttle the army that
+        // defends the base while it builds.
+        let tech_climb_busy = queue.iter().any(|item| {
+            matches!(
+                item.queue_category,
+                crate::sim::production::ProductionCategory::Building
+                    | crate::sim::production::ProductionCategory::Defense
+            ) && {
+                let name = sim.interner.resolve(item.type_id);
+                name == radar_name || name == opening.battle_lab
+            }
+        });
         if self
             .structure_center(sim, opening.construction_yard)
             .is_some()
@@ -345,6 +514,14 @@ impl SuperAi {
                 (opening.refinery, REFINERY_TARGET),
                 (opening.power, 2),
                 (opening.war_factory, 2),
+                // Tech before the expansion finishes: the radar class is the
+                // battle lab's `RADAR` prerequisite, and the lab unlocks the
+                // tier-2 tank the vehicle queue switches to (retail
+                // `Prerequisite=GAWEAP,GATECH` and its side's twins). Two
+                // factories fund the climb; the third completes the expansion
+                // once the tier is secure.
+                (radar_name, 1),
+                (opening.battle_lab, 1),
                 (opening.power, POWER_TARGET),
                 (opening.war_factory, WAR_FACTORY_TARGET),
             ];
@@ -374,46 +551,75 @@ impl SuperAi {
             }
         }
 
-        // Keep every war factory's rally on the construction yard so their
-        // output gathers in the base instead of jamming the factory exits.
-        // The command archives the cell per factory (`SetRallyPoint
+        // Keep every war factory's rally around the construction yard so its
+        // output gathers in the base instead of jamming the factory exit —
+        // each factory on its own offset cell (its index in the substrate's
+        // stable order), so three factories don't funnel every tank onto one
+        // point. The command archives the cell per factory (`SetRallyPoint
         // 0x00443860`), so correcting whichever factory's archived cell
         // differs — one per tick — suffices for all of them.
         if let Some(center) = self.structure_center(sim, opening.construction_yard)
-            && let Some(factory_id) = self
+            && let Some((factory_id, desired)) = self
                 .own_structures(sim)
                 .into_iter()
                 .filter(|(_, name)| name == opening.war_factory)
-                .find(|&(id, _)| {
-                    sim.substrate.entities.get(id).is_some_and(|factory| {
-                        factory.rally_cell() != Some((center.0 as u16, center.1 as u16))
-                    })
+                .enumerate()
+                .map(|(index, (id, _))| {
+                    let spread = SPREAD_OFFSETS[index % SPREAD_OFFSETS.len()];
+                    (
+                        id,
+                        on_map_cell(
+                            sim,
+                            (
+                                center.0 + i16::from(spread.0),
+                                center.1 + i16::from(spread.1),
+                            ),
+                            center,
+                        ),
+                    )
                 })
-                .map(|(id, _)| id)
+                .find(|&(id, desired)| {
+                    sim.substrate
+                        .entities
+                        .get(id)
+                        .is_some_and(|factory| factory.rally_cell() != Some(desired))
+                })
         {
             return vec![CommandEnvelope::new(
                 self.house,
                 at,
                 Command::SetRally {
-                    rx: center.0 as u16,
-                    ry: center.1 as u16,
+                    rx: desired.0,
+                    ry: desired.1,
                     producer_ids: vec![factory_id],
                 },
             )];
         }
 
         // The war factory stands: keep its queue busy — the economy first
-        // (miners up to the target), then the side's main battle tank without
-        // pause. A queue entered while short on credits simply waits for the
-        // money, as a native production event does.
+        // (miners up to the target), then tanks without pause. The tier-2
+        // tank takes over the moment its cameo lights up (the battle lab
+        // standing); until then the side's first tank rolls. A queue entered
+        // while short on credits simply waits for the money, as a native
+        // production event does.
         let vehicle_busy = queue
             .iter()
             .any(|item| item.queue_category == crate::sim::production::ProductionCategory::Vehicle);
         let economy_first = opening
             .harvester
             .is_some_and(|miner| self.count_units_of_type(sim, miner) < HARVESTER_TARGET);
+        // The tier-2 tank takes over once the battle lab stands. The lab
+        // standing is the switch's own condition: `cameo_draw_state` mirrors
+        // only the sidebar's draw brightness (`StripClass::Draw`, no
+        // prerequisite query — `Recalculate` owns refusal), so it stays
+        // `enabled` long before the lab exists and would switch the queue to
+        // a tank the house cannot honestly field.
+        let tier2_ready = self.count_structures_of_type(sim, opening.battle_lab) >= 1
+            && sim.interner.get(opening.tier2_tank).is_some();
         let vehicle_want = if economy_first {
             opening.harvester
+        } else if tier2_ready {
+            Some(opening.tier2_tank)
         } else {
             Some(opening.main_tank)
         };
@@ -422,6 +628,15 @@ impl SuperAi {
             && let Some(name) = vehicle_want
             && let Some(ty) = rules.object(name)
             && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
+            // While a tech-climb piece is under construction the unit
+            // queues spend only banked credits — an item waits until its
+            // own cost sits in the bank, so the incoming ore flow stays
+            // with the radar or lab instead of splitting three ways and
+            // stretching the climb over a tank's build time each. Miners
+            // are the income source itself and queue unconditionally.
+            && !(tech_climb_busy
+                && !economy_first
+                && crate::sim::production::credits_for_owner(sim, &owner) < ty.cost)
             && let Some(type_id) = sim.interner.get(name)
         {
             return vec![CommandEnvelope::new(
@@ -439,6 +654,10 @@ impl SuperAi {
             && self.owns_structure_of_type(sim, opening.barracks)
             && let Some(ty) = rules.object(opening.basic_infantry)
             && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
+            // The same banked-credits gate: soldiers wait for their own
+            // cost while a tech-climb piece claims the income flow.
+            && !(tech_climb_busy
+                && crate::sim::production::credits_for_owner(sim, &owner) < ty.cost)
             && let Some(type_id) = sim.interner.get(opening.basic_infantry)
         {
             return vec![CommandEnvelope::new(
@@ -538,27 +757,6 @@ impl SuperAi {
             .count()
     }
 
-    /// The house's living combat units of the opening's army types (tanks
-    /// and basic soldiers), whatever their mission.
-    fn combat_strength(&self, sim: &crate::sim::world::Simulation, opening: &Opening) -> usize {
-        sim.substrate
-            .entities
-            .iter_sorted()
-            .filter(|(_, entity)| {
-                entity.owner() == self.house
-                    && matches!(
-                        entity.category(),
-                        crate::map::entities::EntityCategory::Unit
-                            | crate::map::entities::EntityCategory::Infantry
-                    )
-                    && {
-                        let name = sim.interner.resolve(entity.type_ref());
-                        name == opening.main_tank || name == opening.basic_infantry
-                    }
-            })
-            .count()
-    }
-
     /// The house's idle combat units for the opening's army types, in the
     /// substrate's stable order: arrived tanks and soldiers whose current
     /// mission is None or Sleep (a unit walking to the rally, engaging a
@@ -580,7 +778,9 @@ impl SuperAi {
                     )
                     && {
                         let name = sim.interner.resolve(entity.type_ref());
-                        name == opening.main_tank || name == opening.basic_infantry
+                        name == opening.main_tank
+                            || name == opening.tier2_tank
+                            || name == opening.basic_infantry
                     }
                     && matches!(
                         entity.passive_acquire_mission(),
@@ -590,6 +790,22 @@ impl SuperAi {
             })
             .map(|(id, _)| id)
             .collect()
+    }
+
+    /// The first idle unit clear to take a single-unit order. One whose
+    /// previous order the command layer dropped stays mission-`None`; the
+    /// [`IDLE_REORDER_TICKS`] gate makes it wait instead of monopolizing the
+    /// branch that ordered it.
+    fn due_idle_unit(&self, idle: &[u64], tick: u32) -> Option<u64> {
+        idle.iter()
+            .copied()
+            .find(|&unit| self.order_gate.get(&unit).is_none_or(|&at| tick >= at))
+    }
+
+    /// Mark `unit` as just ordered and forget gates that have expired.
+    fn gate_idle_order(&mut self, unit: u64, tick: u32) {
+        self.order_gate.insert(unit, tick + IDLE_REORDER_TICKS);
+        self.order_gate.retain(|_, &mut at| at > tick);
     }
 
     /// The house's combat units free to take a march order, in the
@@ -613,7 +829,9 @@ impl SuperAi {
                     )
                     && {
                         let name = sim.interner.resolve(entity.type_ref());
-                        name == opening.main_tank || name == opening.basic_infantry
+                        name == opening.main_tank
+                            || name == opening.tier2_tank
+                            || name == opening.basic_infantry
                     }
                     && matches!(
                         entity.passive_acquire_mission(),
@@ -627,9 +845,30 @@ impl SuperAi {
             .collect()
     }
 
+    /// Whether `owner` is an enemy of this AI's house: not itself, not a
+    /// passive observer, and not an ally — team play must not turn the AI's
+    /// defense and waves on its own teammates. Alliances are checked in both
+    /// directions: in-game diplomacy can be one-way.
+    fn is_enemy(&self, sim: &crate::sim::world::Simulation, owner: InternedId) -> bool {
+        if owner == self.house {
+            return false;
+        }
+        let Some(house) = sim.houses.get(&owner) else {
+            return false;
+        };
+        if house.multiplay_passive() {
+            return false;
+        }
+        let me = sim.interner.resolve(self.house);
+        let them = sim.interner.resolve(owner);
+        let alliances = sim.house_alliances();
+        !crate::map::houses::is_allied_with(alliances, me, them)
+            && !crate::map::houses::is_allied_with(alliances, them, me)
+    }
+
     /// The nearest hostile entity inside `BASE_DEFENSE_RADIUS` cells of
     /// `center`, ties broken by the substrate's stable order. Passive houses
-    /// (observers, civilians) do not count as intruders.
+    /// (observers, civilians) and allies do not count as intruders.
     fn nearest_intruder(
         &self,
         sim: &crate::sim::world::Simulation,
@@ -638,13 +877,7 @@ impl SuperAi {
         let limit = i32::from(BASE_DEFENSE_RADIUS) * i32::from(BASE_DEFENSE_RADIUS);
         let mut best: Option<(i32, u64)> = None;
         for (id, entity) in sim.substrate.entities.iter_sorted() {
-            let owner = entity.owner();
-            if owner == self.house
-                || !sim
-                    .houses
-                    .iter()
-                    .any(|(&house_id, house)| house_id == owner && !house.multiplay_passive())
-            {
+            if !self.is_enemy(sim, entity.owner()) {
                 continue;
             }
             let dx = i32::from(entity.position.rx() as i16 - center.0);
@@ -660,46 +893,60 @@ impl SuperAi {
         best.map(|(_, id)| id)
     }
 
-    /// The hostile mass center a gathered wave attack-moves on: the war
-    /// factories first — a wave that razes production starves the
-    /// reinforcements and snowballs — then any hostile structure, then
-    /// their mobile forces when no hostile building stands. Sums over the
+    /// The hostile structures a wave marches on, in the substrate's stable
+    /// order with each one's cell: the enemy's war factories first — a wave
+    /// that razes production starves the reinforcements and snowballs — or
+    /// any hostile structure when no factory stands. Allies and passive
+    /// houses never count as hostile. Wave dispatches cycle this list by unit
+    /// id, so the group fans out over the target base; each destination is a
+    /// live building's own cell, which is always reachable-adjacent.
+    fn enemy_priority_targets(
+        &self,
+        sim: &crate::sim::world::Simulation,
+    ) -> Vec<(u64, (i16, i16))> {
+        let mut factories = Vec::new();
+        let mut structures = Vec::new();
+        for (id, entity) in sim.substrate.entities.iter_sorted() {
+            if entity.category() != crate::map::entities::EntityCategory::Structure
+                || !self.is_enemy(sim, entity.owner())
+            {
+                continue;
+            }
+            let cell = (entity.position.rx() as i16, entity.position.ry() as i16);
+            let name = sim.interner.resolve(entity.type_ref());
+            if WAR_FACTORY_TYPES.contains(&name) {
+                factories.push((id, cell));
+            }
+            structures.push((id, cell));
+        }
+        if factories.is_empty() {
+            structures
+        } else {
+            factories
+        }
+    }
+
+    /// The hostile mass center for the endgame fallback, when no hostile
+    /// building stands: the centroid of their mobile forces. Sums over the
     /// entity set, so the result does not depend on iteration order.
     fn enemy_center(&self, sim: &crate::sim::world::Simulation) -> Option<(i16, i16)> {
-        let hostile = |owner: InternedId| {
-            owner != self.house
-                && sim
-                    .houses
-                    .iter()
-                    .any(|(&house_id, house)| house_id == owner && !house.multiplay_passive())
-        };
-        let centroid =
-            |want_structure: bool, want_types: Option<&[&'static str]>| -> Option<(i16, i16)> {
-                let mut sum_x = 0i64;
-                let mut sum_y = 0i64;
-                let mut count = 0u64;
-                for (_, entity) in sim.substrate.entities.iter_sorted() {
-                    let is_structure =
-                        entity.category() == crate::map::entities::EntityCategory::Structure;
-                    if is_structure != want_structure || !hostile(entity.owner()) {
-                        continue;
-                    }
-                    let name = sim.interner.resolve(entity.type_ref());
-                    if let Some(types) = want_types
-                        && !types.contains(&name)
-                    {
-                        continue;
-                    }
-                    sum_x += i64::from(entity.position.rx());
-                    sum_y += i64::from(entity.position.ry());
-                    count += 1;
+        let centroid = |want_structure: bool| -> Option<(i16, i16)> {
+            let mut sum_x = 0i64;
+            let mut sum_y = 0i64;
+            let mut count = 0u64;
+            for (_, entity) in sim.substrate.entities.iter_sorted() {
+                let is_structure =
+                    entity.category() == crate::map::entities::EntityCategory::Structure;
+                if is_structure != want_structure || !self.is_enemy(sim, entity.owner()) {
+                    continue;
                 }
-                (count > 0).then(|| ((sum_x / count as i64) as i16, (sum_y / count as i64) as i16))
-            };
-        const WAR_FACTORIES: [&str; 3] = ["GAWEAP", "NAWEAP", "YAWEAP"];
-        centroid(true, Some(&WAR_FACTORIES))
-            .or_else(|| centroid(true, None))
-            .or_else(|| centroid(false, None))
+                sum_x += i64::from(entity.position.rx());
+                sum_y += i64::from(entity.position.ry());
+                count += 1;
+            }
+            (count > 0).then(|| ((sum_x / count as i64) as i16, (sum_y / count as i64) as i16))
+        };
+        centroid(false)
     }
 
     /// The anchor cell the site search scans around: the construction yard's,
@@ -717,6 +964,25 @@ impl SuperAi {
         let entity = sim.substrate.entities.get(pick.0)?;
         Some((entity.position.rx() as i16, entity.position.ry() as i16))
     }
+}
+
+/// Clamp an offset destination into the map. An offset target off the map
+/// would wrap through `as u16` to the far corner, and the command layer
+/// silently drops such orders — the unit never leaves its standing set and
+/// the issuing branch would re-order it forever, starving every lower
+/// branch. `fallback` (always an on-map cell, e.g. the un-offset center)
+/// covers a terrain-less simulation.
+fn on_map_cell(
+    sim: &crate::sim::world::Simulation,
+    cell: (i16, i16),
+    fallback: (i16, i16),
+) -> (u16, u16) {
+    let Some(terrain) = sim.resolved_terrain.as_ref() else {
+        return (fallback.0 as u16, fallback.1 as u16);
+    };
+    let max_x = (terrain.width() as i16).saturating_sub(1);
+    let max_y = (terrain.height() as i16).saturating_sub(1);
+    (cell.0.clamp(0, max_x) as u16, cell.1.clamp(0, max_y) as u16)
 }
 
 /// The first legal placement origin for `ty`, scanning outward from `center`
@@ -1065,7 +1331,11 @@ mod tests {
                 })
         };
 
-        let tick = drive_until(&mut scenario, &mut ai, 20000, |scenario| {
+        // The tech climb trades early army for late power: past the first
+        // tank the ladder buys power plants and factories before the army
+        // deepens, so the first 18-strong wave forms later than the pre-tech
+        // timeline. The budget covers the climb, not a speed record.
+        let tick = drive_until(&mut scenario, &mut ai, 26000, |scenario| {
             combat(scenario) >= 8 && marching(scenario)
         });
         assert!(
@@ -1107,5 +1377,157 @@ mod tests {
             structures_of_type(&scenario, "GAWEAP") >= 2,
             "a second war factory stands (tick {tick})"
         );
+    }
+
+    /// The tech slice: past the expansion the ladder climbs — the radar
+    /// class and the battle lab stand, and the vehicle queue switches to the
+    /// side's tier-2 tank (a Prism Tank rolls for America) well inside the
+    /// budget.
+    #[test]
+    #[ignore = "slow; retail; loads a match and drives thousands of frames"]
+    fn fair_tech_climb_builds_the_lab_and_a_tier2_tank() {
+        let (mut scenario, human) = retail_battle();
+        let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
+
+        let owns_structure = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .any(|(_, entity)| {
+                    entity.owner() == human
+                        && entity.category() == crate::map::entities::EntityCategory::Structure
+                        && scenario.sim().interner.resolve(entity.type_ref()) == name
+                })
+        };
+        let units_of_type = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == human
+                        && matches!(
+                            entity.category(),
+                            crate::map::entities::EntityCategory::Unit
+                                | crate::map::entities::EntityCategory::Infantry
+                        )
+                        && scenario.sim().interner.resolve(entity.type_ref()) == name
+                })
+                .count()
+        };
+
+        // The climb sits right behind the second factory, so the budget
+        // spans the expansion's first half plus the climb itself, not the
+        // lab's own build time.
+        let tick = drive_until(&mut scenario, &mut ai, 26000, |scenario| {
+            // Retail country quirk: `ForbiddenHouses=Americans` on GAAIRC
+            // means an Americans house builds AMRADR, its identical twin.
+            let radar_stands =
+                owns_structure(scenario, "GAAIRC") || owns_structure(scenario, "AMRADR");
+            radar_stands
+                && owns_structure(scenario, "GATECH")
+                && units_of_type(scenario, "SREF") >= 1
+        });
+        let radar_stands =
+            owns_structure(&scenario, "GAAIRC") || owns_structure(&scenario, "AMRADR");
+        assert!(radar_stands, "the Airforce Command stands (tick {tick})");
+        assert!(
+            owns_structure(&scenario, "GATECH"),
+            "the battle lab stands (tick {tick})"
+        );
+        assert!(
+            units_of_type(&scenario, "SREF") >= 1,
+            "a Prism Tank rolled out (tick {tick})"
+        );
+    }
+
+    /// The fork launch path (`populate_launch_houses`) turns a `super_tier`
+    /// opponent slot into a command-driven house carrying the tier treatment
+    /// — native Hard difficulty, the Hard-row opening grant, and the Super
+    /// build-time scale — while an ordinary computer slot stays a native
+    /// computer (`docs/superai.md`).
+    #[test]
+    #[ignore = "slow; retail; loads a match from the retail install"]
+    fn launch_super_tier_slot_command_drives_the_opponent_house() {
+        use crate::sim::house_state::HouseDifficulty;
+        use crate::skirmish_launch::{AiDifficulty, LaunchCountry};
+        use crate::util::native_x87::NativeF32Bits;
+
+        let ra2 = std::path::PathBuf::from(
+            std::env::var("RA2_DIR").expect("set RA2_DIR to the retail RA2/YR install directory"),
+        );
+        // A four-start map: fewer start waypoints than houses would seed the
+        // extra starts at random, which the lobby never allows.
+        let map = "XMP03T4.MAP";
+        let mut session = crate::headless_scenario::battle_session(
+            map,
+            &[
+                (LaunchCountry::Russia, AiDifficulty::Hard),
+                (LaunchCountry::America, AiDifficulty::Normal),
+            ],
+        );
+        session.opponents[0].super_tier = Some(SuperAiDifficulty::Super);
+        // No roaming starting units: the tier grant multiplies the launch
+        // balance with nothing deducted or credited back in between.
+        session.options.unit_count = 0;
+        let starting_credits = session.options.starting_credits;
+        let scenario =
+            crate::headless_scenario::load_session(&ra2, map, 0x00C0_FFEE, session).unwrap();
+
+        let house_by_name = |name: &str| {
+            let id = scenario
+                .sim()
+                .interner
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is a launch house name"));
+            scenario
+                .sim()
+                .houses
+                .get(&id)
+                .unwrap_or_else(|| panic!("{name} house"))
+        };
+        let tier_house = house_by_name("Computer1");
+        let plain_house = house_by_name("Computer2");
+
+        assert!(tier_house.command_driven(), "the tier slot command-drives");
+        assert_eq!(tier_house.difficulty(), HouseDifficulty::Hard);
+        assert_eq!(
+            tier_house.native_build_time_scale(),
+            Some(NativeF32Bits::from_bits(0x3F00_0000)),
+            "the Super tier halves build times"
+        );
+        // The tier grant replaced the native opening-credit loop (skipped for
+        // command-driven houses): Hard row x 0.01 x the launch balance.
+        let hard_coefficient = scenario
+            .runtime
+            .resources
+            .rules
+            .general
+            .multiplayer_ai_cm
+            .get(HouseDifficulty::Hard.table_index())
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            tier_house.economy().available_money(),
+            starting_credits
+                + crate::sim::scenario_bootstrap::native_ai_opening_grant(
+                    hard_coefficient,
+                    starting_credits
+                ),
+        );
+
+        assert!(
+            !plain_house.command_driven(),
+            "an ordinary computer slot stays native-AI driven"
+        );
+        assert_eq!(plain_house.difficulty(), HouseDifficulty::Normal);
+        assert_eq!(plain_house.native_build_time_scale(), None);
+        // Retail MultiplayerAICM's Normal row is 0, so the native loop granted
+        // this house nothing on top of its launch balance.
+
+        assert_eq!(plain_house.economy().available_money(), starting_credits);
     }
 }
