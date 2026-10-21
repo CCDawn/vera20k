@@ -45,6 +45,7 @@ pub(super) fn test_launch_session(country: LaunchCountry) -> SkirmishLaunchSessi
             start_position: LaunchStartPosition::Position(1),
             team: LaunchTeam::None,
             difficulty: AiDifficulty::Easy,
+            super_tier: None,
         }],
         pre_fill_house_roster: crate::skirmish_launch::PreFillHouseRoster::from_compact_skirmish(1),
         options: SkirmishLaunchOptions::default(),

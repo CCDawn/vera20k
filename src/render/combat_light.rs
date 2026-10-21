@@ -1228,7 +1228,8 @@ mod tests {
             wgpu::TextureFormat::Bgra8UnormSrgb,
             wgpu::TextureFormat::Rgba8UnormSrgb,
         ] {
-            let mut renderer = CombatLightRenderer::new_with_device(&gpu.device, &gpu.queue, format);
+            let mut renderer =
+                CombatLightRenderer::new_with_device(&gpu.device, &gpu.queue, format);
             for row in rows {
                 let size: [u32; 2] = serde_json::from_value(row["size"].clone()).unwrap();
                 let mut camera: [i32; 2] = serde_json::from_value(row["camera"].clone()).unwrap();

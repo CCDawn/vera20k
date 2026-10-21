@@ -192,8 +192,8 @@ impl MinimapPlayfieldProjection {
             }) {
                 return colors;
             }
-            let valid = resolved_terrain
-                .is_some_and(|terrain| terrain.radar_color_valid(cell.rx, cell.ry));
+            let valid =
+                resolved_terrain.is_some_and(|terrain| terrain.radar_color_valid(cell.rx, cell.ry));
             radar_colors_for_cell(cell, valid, terrain_brightness)
         };
         let structural_color = structural_bridge_radar_color(overlay_radar_colors);
@@ -272,9 +272,7 @@ impl MinimapPlayfieldProjection {
         let native_overrides = if native_radar_surface.is_some() {
             grid.cells
                 .iter()
-                .filter_map(|cell| {
-                    cell_source(cell).map(|(color, _)| ((cell.rx, cell.ry), color))
-                })
+                .filter_map(|cell| cell_source(cell).map(|(color, _)| ((cell.rx, cell.ry), color)))
                 .collect()
         } else {
             BTreeMap::new()

@@ -155,7 +155,10 @@ pub(crate) fn economy_state_machine(
     let Some(house) = sim.houses.get(&owner) else {
         return;
     };
-    if house.is_controlled_by_human(game_mode_nonzero) || !game_mode_nonzero {
+    if house.is_controlled_by_human(game_mode_nonzero)
+        || house.command_driven()
+        || !game_mode_nonzero
+    {
         return;
     }
     let mode = house.ai_production().mode;
@@ -227,7 +230,10 @@ pub(crate) fn update_production_choices(
     let Some(house) = sim.houses.get(&owner) else {
         return;
     };
-    if house.is_controlled_by_human(game_mode_nonzero) || house.multiplay_passive() {
+    if house.is_controlled_by_human(game_mode_nonzero)
+        || house.multiplay_passive()
+        || house.command_driven()
+    {
         return;
     }
     if (sim.session.binary_frame() as i32) % 8 != 0 {
@@ -494,12 +500,12 @@ pub(crate) fn exit_building(
         return BuildingExit::Failed;
     };
     let game_mode_nonzero = sim.session.game_mode_nonzero();
-    // `0x00444F19..0x00444F2A` (`0x0050B730`).
-    if sim
-        .houses
-        .get(&owner)
-        .is_none_or(|house| house.is_controlled_by_human(game_mode_nonzero))
-    {
+    // `0x00444F19..0x00444F2A` (`0x0050B730`). Fork-only: a command-driven
+    // house's yard places nothing either (`docs/superai.md`); its finished
+    // buildings wait for the command layer's placement orders.
+    if sim.houses.get(&owner).is_none_or(|house| {
+        house.is_controlled_by_human(game_mode_nonzero) || house.command_driven()
+    }) {
         return BuildingExit::Failed;
     }
     let Some(ty) = sim

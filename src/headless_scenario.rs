@@ -87,6 +87,7 @@ pub fn battle_session(
                 start_position: LaunchStartPosition::Auto,
                 team: LaunchTeam::None,
                 difficulty,
+                super_tier: None,
             })
             .collect(),
         pre_fill_house_roster: PreFillHouseRoster::from_compact_skirmish(opponents.len()),
@@ -124,6 +125,7 @@ impl HeadlessScenario {
             source_human_index: None,
             handle: None,
             difficulty: crate::sim::house_state::HouseDifficulty::Normal,
+            super_tier: None,
         };
         let runtime = &mut self.runtime;
         crate::sim::scenario_bootstrap::populate_launch_houses(
@@ -149,42 +151,24 @@ impl HeadlessScenario {
     /// (`HouseState::set_native_build_time_scale`). Fair takes nothing: the
     /// tier exists so strength claims can cite exactly what a pure decision
     /// layer achieves.
+    ///
+    /// The kernel itself lives in one owner,
+    /// [`crate::sim::scenario_bootstrap::apply_super_ai_tier_to_house`]; the
+    /// launch's house construction calls the same helper.
     pub fn apply_super_ai_tier(
         &mut self,
         house: InternedId,
         tier: crate::super_ai::SuperAiDifficulty,
     ) {
-        use crate::super_ai::SuperAiDifficulty;
-
-        if tier == SuperAiDifficulty::Fair {
-            return;
-        }
-        let coefficient = self
-            .runtime
-            .resources
-            .rules
-            .general
-            .multiplayer_ai_cm
-            .get(crate::sim::house_state::HouseDifficulty::Hard.table_index())
-            .copied()
-            .unwrap_or(0);
-        let state = self
-            .runtime
-            .simulation
-            .houses
-            .get_mut(&house)
-            .expect("the tier applies to a house the launch created");
-        let grant = crate::sim::scenario_bootstrap::native_ai_opening_grant(
-            coefficient,
-            state.economy().available_money(),
+        crate::sim::scenario_bootstrap::apply_super_ai_tier_to_house(
+            self.runtime
+                .simulation
+                .houses
+                .get_mut(&house)
+                .expect("the tier applies to a house the launch created"),
+            &self.runtime.resources.rules,
+            tier,
         );
-        state.economy_mut().add_credits(grant);
-        if tier == SuperAiDifficulty::Super {
-            // 0.5f32: build twice as fast as the native chain.
-            state.set_native_build_time_scale(crate::util::native_x87::NativeF32Bits::from_bits(
-                0x3F00_0000,
-            ));
-        }
     }
 }
 

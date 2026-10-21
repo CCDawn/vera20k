@@ -557,6 +557,13 @@ pub struct HouseState {
     /// mutable `HouseClass` bytes — gamemd keeps this one on the house type.
     #[serde(default)]
     multiplay_passive: bool,
+    /// Fork-only driver-ownership flag (`docs/superai.md`): an external
+    /// command-layer client owns this house's decisions, so the native AI
+    /// rungs stand down for it and the launch's tier treatment grants its
+    /// opening credits. Not a gamemd port: native `HouseClass` has no such
+    /// byte, so it stays out of the retail-state concerns entirely.
+    #[serde(default)]
+    command_driven: bool,
     /// The HouseType's `Cost*Mult=`, projected from the rules at creation.
     /// Like the flag above it is the type's, so it is left out of the state
     /// hash.
@@ -1021,6 +1028,14 @@ impl HouseState {
         self.multiplay_passive = true;
     }
 
+    /// Fork-only: hand this house's decisions to the external command-layer
+    /// driver (`docs/superai.md`); the native AI rungs stand down for it and
+    /// the launch's tier treatment supplies its opening credits. Not a gamemd
+    /// port.
+    pub fn make_command_driven(&mut self) {
+        self.command_driven = true;
+    }
+
     /// Player control (`+0x1ED`): Create_Houses (`688109..10F`) grants it to
     /// the local source node only; Read_Scenario_INI reads `PlayerControl=`.
     pub(crate) fn assign_player_control(&mut self, controlled: bool) {
@@ -1360,6 +1375,12 @@ impl HouseState {
 
     pub const fn multiplay_passive(&self) -> bool {
         self.multiplay_passive
+    }
+
+    /// Fork-only driver-ownership flag (see the field's docs): the native AI
+    /// rungs read this to stand down for a command-layer-driven house.
+    pub const fn command_driven(&self) -> bool {
+        self.command_driven
     }
 
     pub const fn country_cost_mults(&self) -> CountryCostMults {
@@ -2354,8 +2375,11 @@ impl HouseState {
     /// accepts any nonzero AutoBaseBuilding or signed `CurrentIQ >=
     /// Rules+0x143C`, then writes AutoBaseBuilding, Production, and
     /// AutocreateAllowed in that order without touching AITriggersActive.
+    /// Fork-only first clause (`docs/superai.md`): a command-driven house's
+    /// activation latches stay down so the native AI never takes it over.
     pub(crate) fn update_ai_activation(&mut self, game_mode_nonzero: bool, iq_production: i32) {
-        if self.is_controlled_by_human(game_mode_nonzero)
+        if self.command_driven
+            || self.is_controlled_by_human(game_mode_nonzero)
             || (!self.ai_activation.auto_base_building && self.current_iq < iq_production)
         {
             return;
@@ -2507,6 +2531,7 @@ impl HouseState {
             difficulty: HouseDifficulty::Normal,
             difficulty_biases: HouseDifficultyBiases::default(),
             multiplay_passive: false,
+            command_driven: false,
             country_cost_mults: CountryCostMults::default(),
             country_speed_mults: CountrySpeedMults::default(),
             is_defeated: false,

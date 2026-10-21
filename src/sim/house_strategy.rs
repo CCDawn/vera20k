@@ -90,6 +90,7 @@ pub(crate) fn update_strategy(
     if !house.strategy_timer().expired(frame)
         || house.is_controlled_by_human(sim.session.game_mode_nonzero())
         || house.multiplay_passive()
+        || house.command_driven()
     {
         return;
     }

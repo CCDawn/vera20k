@@ -273,6 +273,9 @@ fn status_help_key_for_ai_row_type(row_type: SkirmishAiRowType) -> Option<&'stat
         SkirmishAiRowType::Easy => Some("STT:PlayerDumbAI"),
         SkirmishAiRowType::Normal => Some("STT:PlayerSmartAI"),
         SkirmishAiRowType::Hard => Some("STT:PlayerGeniusAI"),
+        // No retail key exists for the fork-only row; it builds on the Hard
+        // treatment, so it shares the Genius AI help string.
+        SkirmishAiRowType::SuperAI => Some("STT:PlayerGeniusAI"),
     }
 }
 

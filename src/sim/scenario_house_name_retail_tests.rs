@@ -49,6 +49,7 @@ fn generated_houses(rules: &RuleSet, native: &Value) -> Simulation {
                 source_human_index: None,
                 handle: None,
                 difficulty: HouseDifficulty::Normal,
+                super_tier: None,
             }
         })
         .collect();

@@ -487,6 +487,12 @@ pub struct SkirmishAiSlot {
     pub start_position: LaunchStartPosition,
     pub team: LaunchTeam,
     pub difficulty: AiDifficulty,
+    /// Fork-only Super-AI tier (`docs/superai.md`): when set, the slot's
+    /// house is command-driven — the native AI stands down for it
+    /// (`HouseState::command_driven`) and the app's match loop drives it
+    /// through the command layer instead. `None` is a native computer.
+    #[serde(default)]
+    pub super_tier: Option<crate::super_ai::SuperAiDifficulty>,
 }
 
 fn legacy_raw_ai_slot() -> u8 {
@@ -1045,6 +1051,7 @@ mod tests {
                         start_position: LaunchStartPosition::Auto,
                         team: LaunchTeam::None,
                         difficulty: AiDifficulty::Easy,
+                        super_tier: None,
                     }
                 })
                 .collect();
@@ -1282,6 +1289,7 @@ mod tests {
                     start_position: LaunchStartPosition::Auto,
                     team: LaunchTeam::None,
                     difficulty: AiDifficulty::Easy,
+                    super_tier: None,
                 },
                 SkirmishAiSlot {
                     raw_slot_index: 2,
@@ -1292,6 +1300,7 @@ mod tests {
                     start_position: LaunchStartPosition::Auto,
                     team: LaunchTeam::None,
                     difficulty: AiDifficulty::Easy,
+                    super_tier: None,
                 },
             ],
             pre_fill_house_roster: PreFillHouseRoster::from_compact_skirmish(2),

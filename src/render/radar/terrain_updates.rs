@@ -110,15 +110,8 @@ pub(super) fn apply_radar_terrain_dirty_cells(
         .as_ref()
         .map_or(1.0, NativeRadarTerrainSurface::terrain_brightness);
     for &(rx, ry) in cells {
-        let source = authority.source(
-            rx,
-            ry,
-            structural_bridge_color,
-            overlay_radar_colors,
-        );
-        if let Some((left, right)) =
-            authority.tile_radar_colors(rx, ry, terrain_brightness)
-        {
+        let source = authority.source(rx, ry, structural_bridge_color, overlay_radar_colors);
+        if let Some((left, right)) = authority.tile_radar_colors(rx, ry, terrain_brightness) {
             native_changes.push(NativeRadarCellUpdate {
                 base: NativeRadarCellColors {
                     cell: (rx, ry),
@@ -136,17 +129,10 @@ pub(super) fn apply_radar_terrain_dirty_cells(
         else {
             continue;
         };
-        if let Some((x, y)) = aperture_pixel(
-            layers.native_surface,
-            (terrain_pixel.px, terrain_pixel.py),
-        ) {
-            set_pixel(
-                layers.base_rgba,
-                MINIMAP_WIDTH,
-                x,
-                y,
-                terrain_pixel.color,
-            );
+        if let Some((x, y)) =
+            aperture_pixel(layers.native_surface, (terrain_pixel.px, terrain_pixel.py))
+        {
+            set_pixel(layers.base_rgba, MINIMAP_WIDTH, x, y, terrain_pixel.color);
         }
 
         if let Some((native_color, classification)) = source {

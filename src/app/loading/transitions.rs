@@ -375,6 +375,9 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
             .match_state
             .session
             .retake_mode_from_world(outgoing.simulation.session().game_mode());
+        // No runtime, no Super-AI drivers: a stale driver would issue
+        // commands with a dead house id into the next match.
+        state.match_state.super_players.clear();
     }
     state.match_state.sim_runtime = incoming.map(|(mut simulation, rules)| {
         simulation.install_fresh_process_main(&state.frontend.frontend_main_rng);
@@ -390,6 +393,9 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
             },
         }
     });
+    // Fork-only: seat one command-layer driver per command-driven house of
+    // the installed runtime (`docs/superai.md`).
+    state.match_state.rebuild_super_players();
     if let Some(runtime) = state.match_state.sim_runtime.as_ref() {
         state
             .match_state

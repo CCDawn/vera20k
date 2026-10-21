@@ -193,6 +193,7 @@ pub(crate) fn check_build_need(sim: &Simulation, rules: &RuleSet, owner: Interne
         return false;
     };
     if house.is_controlled_by_human(sim.session.game_mode_nonzero())
+        || house.command_driven()
         || can_make_money(sim, rules, owner)
     {
         return false;

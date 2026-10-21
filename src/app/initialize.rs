@@ -522,6 +522,7 @@ impl App {
                 network_wait: Default::default(),
                 startup: Default::default(),
                 sim_runtime: None,
+                super_players: Vec::new(),
                 input: crate::app::input::state::MatchInputState::new(hotkey_bindings),
                 match_presentation: crate::app::presentation::state::MatchPresentationState {
                     sinking_waterlines: Default::default(),
@@ -912,6 +913,7 @@ mod tests {
                     start_position: LaunchStartPosition::Position(1),
                     team: LaunchTeam::None,
                     difficulty: AiDifficulty::Easy,
+                    super_tier: None,
                 });
                 session.pre_fill_house_roster = PreFillHouseRoster::from_compact_skirmish(1);
             }

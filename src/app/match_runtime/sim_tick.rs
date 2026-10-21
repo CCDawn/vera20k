@@ -1015,6 +1015,26 @@ fn advance_one_simulation_frame(
             } else {
                 Vec::new()
             };
+            // Fork-only Super-AI opponents (`docs/superai.md`): the command
+            // layer drives each command-driven house — its orders merge into
+            // this frame's commands, and the tier's recurring credit bonus
+            // (+1000 per 600 ticks, the same drip the bench applies) rides
+            // along. Ordinary lane only, like every other command source.
+            let mut due_commands = due_commands;
+            if tick_lane == TickLane::Ordinary && !state.match_state.super_players.is_empty() {
+                let tick = sim.session().tick();
+                let mut super_players = std::mem::take(&mut state.match_state.super_players);
+                for ai in super_players.iter_mut() {
+                    due_commands.extend(ai.orders(rt, u32::try_from(tick).unwrap_or(u32::MAX)));
+                    if ai.difficulty() != crate::super_ai::SuperAiDifficulty::Fair
+                        && tick > 0
+                        && tick % 600 == 0
+                    {
+                        rt.grant_house_credits(ai.house(), 1000);
+                    }
+                }
+                state.match_state.super_players = super_players;
+            }
             // Recorded whether or not a client is attached: the history ring
             // backfills a dashboard that connects mid-match.
             #[cfg(feature = "telemetry-dashboard")]

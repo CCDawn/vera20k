@@ -5,9 +5,9 @@
 pub(crate) mod camera;
 pub(crate) mod chat;
 pub(crate) mod commands;
+pub(crate) mod connection;
 pub(crate) mod context_order;
 pub(crate) mod cursor;
-pub(crate) mod connection;
 pub(crate) mod diplomacy;
 pub(crate) mod dispatch;
 pub(crate) mod entity_pick;
@@ -30,7 +30,7 @@ mod bridge_click_tests;
 
 pub(crate) mod sound;
 
-pub(crate) mod keyboard;
-pub(crate) mod network_options;
-pub(crate) mod multiplayer_setup;
 pub(crate) mod campaign_input;
+pub(crate) mod keyboard;
+pub(crate) mod multiplayer_setup;
+pub(crate) mod network_options;

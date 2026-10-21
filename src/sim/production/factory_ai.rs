@@ -81,10 +81,13 @@ pub(crate) fn factory_ai(
     let Some(entity) = sim.substrate.entities.get(building) else {
         return;
     };
+    // `0x00450248..0x0045028C`. Fork-only: a command-driven house's factories
+    // are never AI-managed (`docs/superai.md`); the finished-object exit above
+    // stays unconditional, as it natively is for every house.
     let production = sim
         .houses
         .get(&owner)
-        .is_some_and(|house| house.ai_activation().production);
+        .is_some_and(|house| house.ai_activation().production && !house.command_driven());
     if !production || entity.constructing_or_selling() {
         return;
     }

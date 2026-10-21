@@ -414,6 +414,7 @@ impl MultiplayerShellRuntime {
                         LaunchTeam::None
                     },
                     difficulty,
+                    super_tier: None,
                 });
             } else if persisted.row_type == 3 {
                 vacancies[usize::from(row)] = NetworkVacancy::Closed;
@@ -1534,6 +1535,9 @@ fn ai_row_type_from_persisted(value: i32) -> SkirmishAiRowType {
         4 => SkirmishAiRowType::Hard,
         5 => SkirmishAiRowType::Normal,
         6 => SkirmishAiRowType::Easy,
+        // Fork-only Super AI row; an upstream build reading this save falls
+        // back to the None row rather than misreading it as a native one.
+        7 => SkirmishAiRowType::SuperAI,
         _ => SkirmishAiRowType::None,
     }
 }
@@ -1544,6 +1548,9 @@ fn persisted_row_type(value: SkirmishAiRowType) -> i32 {
         SkirmishAiRowType::Hard => 4,
         SkirmishAiRowType::Normal => 5,
         SkirmishAiRowType::Easy => 6,
+        // Fork-only code beyond the native 4/5/6; the reader above knows it,
+        // and an upstream build falls back to the None row on it.
+        SkirmishAiRowType::SuperAI => 7,
     }
 }
 
@@ -1937,6 +1944,7 @@ mod tests {
                 start_position: LaunchStartPosition::Auto,
                 team: LaunchTeam::None,
                 difficulty: AiDifficulty::Easy,
+                super_tier: None,
             }],
             pre_fill_house_roster:
                 crate::skirmish_launch::PreFillHouseRoster::from_compact_skirmish(1),

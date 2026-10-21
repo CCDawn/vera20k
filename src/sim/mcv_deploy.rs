@@ -113,11 +113,14 @@ fn deploys_into_build_const(sim: &Simulation, entity: &GameEntity, rules: &RuleS
 }
 
 /// The owner's AutoBaseBuilding latch (House+0x1F3) and that no human
-/// controls it (`IsControlledByHuman 0x0050B730`).
+/// controls it (`IsControlledByHuman 0x0050B730`). Fork-only: a command-driven
+/// house's yard maker waits for the command layer's deploy order
+/// (`docs/superai.md`).
 fn owner_builds_its_own_base(sim: &Simulation, entity: &GameEntity) -> bool {
     sim.houses.get(&entity.owner()).is_some_and(|house| {
         house.ai_activation().auto_base_building
             && !house.is_controlled_by_human(sim.session.game_mode_nonzero())
+            && !house.command_driven()
     })
 }
 
@@ -426,7 +429,9 @@ pub(crate) fn mission_unload(
 // can be compared without claiming to emulate the whole construction transaction.
 /// Mission_Unload state 1 after its Deploy (`0x0073DDCB..0x0073DE1E`): a
 /// pending deploy moves to state 2; otherwise a computer house in a nonzero
-/// game mode hunts and everyone else guards.
+/// game mode hunts and everyone else guards. Fork-only: a command-driven
+/// house's maker guards too, until the command layer deploys it
+/// (`docs/superai.md`).
 pub(crate) fn finish_initial_attempt(sim: &mut Simulation, id: u64) {
     if let Some(e) = sim
         .substrate
@@ -444,6 +449,7 @@ pub(crate) fn finish_initial_attempt(sim: &mut Simulation, id: u64) {
         } else {
             let hunt = sim.houses.get(&e.owner()).is_some_and(|house| {
                 !house.is_controlled_by_human(sim.session.game_mode_nonzero())
+                    && !house.command_driven()
             }) && sim.session.game_mode_nonzero();
             queue(
                 sim,

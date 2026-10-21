@@ -227,6 +227,7 @@ fn skirmish(
                 2 => AiDifficulty::Easy,
                 _ => unreachable!("active AI difficulty was validated"),
             },
+            super_tier: None,
         });
     }
     ensure!(

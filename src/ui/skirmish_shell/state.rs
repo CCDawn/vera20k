@@ -191,6 +191,9 @@ pub enum SkirmishAiRowType {
     Easy,
     Normal,
     Hard,
+    /// Fork-only Super AI row ([`crate::super_ai`]): no native counterpart,
+    /// so every native identity below mirrors the Hard row it builds on.
+    SuperAI,
 }
 
 impl SkirmishAiRowType {
@@ -200,11 +203,12 @@ impl SkirmishAiRowType {
             Self::Easy => 2,
             Self::Normal => 1,
             Self::Hard => 0,
+            Self::SuperAI => 0,
         }
     }
 
     pub const fn is_active(self) -> bool {
-        matches!(self, Self::Easy | Self::Normal | Self::Hard)
+        matches!(self, Self::Easy | Self::Normal | Self::Hard | Self::SuperAI)
     }
 
     pub const fn difficulty(self) -> Option<AiDifficulty> {
@@ -213,6 +217,7 @@ impl SkirmishAiRowType {
             Self::Easy => Some(AiDifficulty::Easy),
             Self::Normal => Some(AiDifficulty::Normal),
             Self::Hard => Some(AiDifficulty::Hard),
+            Self::SuperAI => Some(AiDifficulty::Hard),
         }
     }
 
@@ -222,6 +227,18 @@ impl SkirmishAiRowType {
             Self::Easy => ("GUI:AIEasy", "Easy"),
             Self::Normal => ("GUI:AINormal", "Normal"),
             Self::Hard => ("GUI:AIHard", "Hard"),
+            // No retail CSF key exists for the fork-only row; the empty key
+            // makes the label resolve to the English fallback.
+            Self::SuperAI => ("", "Super AI"),
+        }
+    }
+
+    /// The slot's Super-AI tier: the fork-only rows launch command-driven
+    /// instead of as native computers. `None` is a native computer row.
+    pub const fn super_tier(&self) -> Option<crate::super_ai::SuperAiDifficulty> {
+        match self {
+            Self::None | Self::Easy | Self::Normal | Self::Hard => None,
+            Self::SuperAI => Some(crate::super_ai::SuperAiDifficulty::Super),
         }
     }
 }

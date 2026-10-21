@@ -36,6 +36,12 @@ use super::{
 };
 
 pub(super) fn localized_label(state: &AppState, key: &str, fallback: &str) -> String {
+    // An empty key means "no CSF string" (fork-only labels such as the Super
+    // AI row): resolve straight to the supplied English fallback instead of
+    // the table's `MISSING:''` text.
+    if key.is_empty() {
+        return fallback.to_string();
+    }
     state
         .process_assets
         .csf

@@ -340,6 +340,7 @@ mod tests {
                 start_position: LaunchStartPosition::Auto,
                 team: LaunchTeam::None,
                 difficulty: Default::default(),
+                super_tier: None,
             }],
             pre_fill_house_roster:
                 crate::skirmish_launch::PreFillHouseRoster::from_compact_skirmish(1),
@@ -1329,6 +1330,7 @@ mod tests {
                 raw_slot_index: (session.opponents.len() + 1) as u8,
                 color_index,
                 difficulty,
+                super_tier: None,
                 ..session.opponents[0].clone()
             });
         }
@@ -1426,6 +1428,7 @@ mod tests {
             start_position: LaunchStartPosition::Auto,
             team: LaunchTeam::Team(1),
             difficulty: Default::default(),
+            super_tier: None,
         });
         let slots = normalized_launch_slots(&session);
         let alliances =
@@ -1461,6 +1464,7 @@ mod tests {
             start_position: LaunchStartPosition::Auto,
             team: LaunchTeam::None,
             difficulty: Default::default(),
+            super_tier: None,
         });
         let slots = normalized_launch_slots(&session);
 
@@ -1776,6 +1780,7 @@ mod tests {
             start_position: LaunchStartPosition::Auto,
             team: LaunchTeam::None,
             difficulty: Default::default(),
+            super_tier: None,
         });
         let starts = test_launch_starts();
         let mut expected_rng = SimRng::new(8);
@@ -2334,6 +2339,7 @@ mod tests {
                 raw_slot_index: index as u8,
                 color_index: (index + 1) as u8,
                 start_position: LaunchStartPosition::Position(index as u8),
+                super_tier: None,
                 ..ai_template.clone()
             })
             .collect();

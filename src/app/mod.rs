@@ -184,7 +184,9 @@ impl App {
 
     pub fn finish_capture(&mut self) -> Result<()> {
         if let Some(error) = self.startup_failure.as_ref().or_else(|| {
-            self.state.as_ref().and_then(|state| state.frontend.external_launch_error.as_ref())
+            self.state
+                .as_ref()
+                .and_then(|state| state.frontend.external_launch_error.as_ref())
         }) {
             anyhow::bail!("{error}");
         }

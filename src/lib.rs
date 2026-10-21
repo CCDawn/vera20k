@@ -9,7 +9,8 @@
 //! re-exported here, so `crate::sim::...` and `vera20k::sim::...` keep naming
 //! them.
 pub use vera20k_core::{
-    assets, headless_scenario, map, net, rules, sim, skirmish_launch, skirmish_modes, util,
+    assets, headless_scenario, map, net, rules, sim, skirmish_launch, skirmish_modes, super_ai,
+    util,
 };
 
 // Opaque process-RNG cursor receipt shared by map generation and simulation.

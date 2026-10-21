@@ -1106,6 +1106,10 @@ pub struct NormalizedSkirmishSlot {
     /// A human node's handle, CreateHouses' source for House+0x1602A.
     pub handle: Option<String>,
     pub(crate) difficulty: HouseDifficulty,
+    /// Fork-only Super-AI tier (`docs/superai.md`): a computer slot carrying
+    /// one becomes a command-driven house with the tier treatment applied
+    /// where the slot becomes its house; `None` is a native computer.
+    pub super_tier: Option<crate::super_ai::SuperAiDifficulty>,
 }
 
 /// Sim-owned behavioral launch descriptor (F09).
@@ -1645,6 +1649,7 @@ pub fn normalized_launch_slots(session: &SkirmishLaunchSession) -> Vec<Normalize
             source_human_index: Some(index),
             handle: Some(human.name.clone()),
             difficulty: HouseDifficulty::Normal,
+            super_tier: None,
         });
     }
     for (index, opponent) in session.opponents.iter().enumerate() {
@@ -1660,6 +1665,7 @@ pub fn normalized_launch_slots(session: &SkirmishLaunchSession) -> Vec<Normalize
             handle: None,
             difficulty: HouseDifficulty::from_native(opponent.difficulty.as_i32())
                 .expect("native AI difficulty"),
+            super_tier: opponent.super_tier,
         });
     }
     slots
@@ -1791,6 +1797,15 @@ pub fn populate_launch_houses(
         }
         house.resolve_multiplay_passive(Some(rules), Some(country_name));
         house.project_country_mults(rules, &sim.interner);
+        // Fork-only (`docs/superai.md`): a Super-AI opponent slot's house is
+        // command-driven and carries the tier treatment instead of the native
+        // AI ownership the launch would otherwise give it. The tier's opening
+        // grant here replaces this pass's `apply_skirmish_ai_opening_credits`
+        // for the house, which skips command-driven houses.
+        if let Some(tier) = slot.super_tier {
+            house.make_command_driven();
+            apply_super_ai_tier_to_house(&mut house, rules, tier);
+        }
         sim.houses.register(house);
     }
 }
@@ -1821,6 +1836,46 @@ pub(crate) fn native_ai_opening_grant(coefficient: i32, money: i32) -> i32 {
     X87Chop53::ftol_i32_low_masked(product)
 }
 
+/// Apply the Super-AI tier's opening treatment to `house` (`docs/superai.md`).
+///
+/// Brutal and Super take the native Hard AI's opening grant through
+/// [`native_ai_opening_grant`] — the same kernel the launch grants computer
+/// houses with (`apply_skirmish_ai_opening_credits`), with the retail
+/// `[General] MultiplayerAICM` HARD row regardless of the house's own native
+/// difficulty — and Super additionally halves the house's production build
+/// times (`HouseState::set_native_build_time_scale`, 0.5f32), the fork's one
+/// documented simulation-side exception. Fair takes nothing: the tier exists
+/// so strength claims can cite exactly what a pure decision layer achieves.
+///
+/// The one owner of the tier kernel; the headless harness
+/// (`headless_scenario::apply_super_ai_tier`) and the launch's house
+/// construction (`populate_launch_houses`) both come through here.
+pub(crate) fn apply_super_ai_tier_to_house(
+    state: &mut HouseState,
+    rules: &RuleSet,
+    tier: crate::super_ai::SuperAiDifficulty,
+) {
+    use crate::super_ai::SuperAiDifficulty;
+
+    if tier == SuperAiDifficulty::Fair {
+        return;
+    }
+    let coefficient = rules
+        .general
+        .multiplayer_ai_cm
+        .get(HouseDifficulty::Hard.table_index())
+        .copied()
+        .unwrap_or(0);
+    let grant = native_ai_opening_grant(coefficient, state.economy().available_money());
+    state.economy_mut().add_credits(grant);
+    if tier == SuperAiDifficulty::Super {
+        // 0.5f32: build twice as fast as the native chain.
+        state.set_native_build_time_scale(crate::util::native_x87::NativeF32Bits::from_bits(
+            0x3F00_0000,
+        ));
+    }
+}
+
 /// Apply the generated skirmish AI opening-credit grant at the Post_Map_Init handoff.
 ///
 /// Active YR `ScenarioClass__Post_Map_Init @ 0x00686890`, loop `0x006869BE..
@@ -1837,9 +1892,13 @@ pub(crate) fn native_ai_opening_grant(coefficient: i32, money: i32) -> i32 {
 /// the leftover starting-unit budget credited by `seed_starting_extra_units`
 /// (pure integer arithmetic on the native side: `CDQ/SAR/IDIV` budget thirds
 /// and integer cost subtraction, no x87 involvement).
+///
+/// Fork-only: a command-driven house skips too (`docs/superai.md`) — its
+/// opening grant comes from the Super-AI tier treatment
+/// ([`apply_super_ai_tier_to_house`]) instead of the native loop.
 pub fn apply_skirmish_ai_opening_credits(sim: &mut Simulation, rules: &RuleSet) {
     for house in sim.houses.values_mut() {
-        if house.is_human() || house.multiplay_passive() {
+        if house.is_human() || house.multiplay_passive() || house.command_driven() {
             continue;
         }
         let coefficient = rules
@@ -2992,6 +3051,7 @@ mod tests {
                 start_position: LaunchStartPosition::Auto,
                 team: LaunchTeam::None,
                 difficulty: crate::skirmish_launch::AiDifficulty::Normal,
+                super_tier: None,
             });
         session.rebuild_house_roster();
         let descriptor = MatchLaunchDescriptor::from_resolved(session).unwrap();
@@ -3440,6 +3500,7 @@ mod tests {
                         start_position: LaunchStartPosition::Auto,
                         team: LaunchTeam::None,
                         difficulty: crate::skirmish_launch::AiDifficulty::Easy,
+                        super_tier: None,
                     });
                 launch.session.ai_player_count = 1;
                 launch.session.rebuild_house_roster();
@@ -3874,6 +3935,7 @@ mod tests {
             source_human_index: Some(0),
             handle: None,
             difficulty: HouseDifficulty::Normal,
+            super_tier: None,
         }];
         let mut expected = SimRng::new(seed);
         let blocker_word = (expected.next_u32() & 0xFFFF) as u16;
@@ -4075,6 +4137,7 @@ mod tests {
                 start_position: LaunchStartPosition::Position(index + 1),
                 team: LaunchTeam::None,
                 difficulty: AiDifficulty::Easy,
+                super_tier: None,
             })
             .collect();
         session.ai_player_count = session.opponents.len() as i32;

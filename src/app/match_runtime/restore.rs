@@ -41,6 +41,9 @@ pub(crate) fn commit_prepared_load(
         &state.frontend.frontend_main_rng,
         &mut state.match_state.sim_runtime,
     );
+    // Fork-only: a restored timeline reinstalls its Super-AI drivers from
+    // the saved houses' own command-driven state (`docs/superai.md`).
+    state.match_state.rebuild_super_players();
     // All preparation has succeeded. Surface allocation and saved camera
     // conversion now use the tactical upscaler dimensions on either route.
     state.frontend.screen = crate::ui::game_screen::GameScreen::InGame;

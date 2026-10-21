@@ -78,9 +78,41 @@ pub(crate) struct MatchState {
     /// Effective simulation ticks per second — controls game speed.
     /// Default follows retail/YR skirmish stored game speed 1.
     pub(crate) sim_speed_tps: u32,
+    /// Fork-only Super-AI opponents (`docs/superai.md`): one command-layer
+    /// driver per command-driven house of the installed runtime. Rebuilt on
+    /// every runtime install (fresh launch and saved-game restore) from the
+    /// houses' own state, so no driver ever outlives its match.
+    pub(crate) super_players: Vec<crate::super_ai::SuperAi>,
 }
 
 impl MatchState {
+    /// Rebuild the Super-AI drivers from the freshly installed runtime: one
+    /// [`crate::super_ai::SuperAi`] per command-driven house. The tier rides
+    /// on the house's own tier treatment — a build-time scale marks Super, a
+    /// command-driven house without one is Brutal (`docs/superai.md`).
+    pub(crate) fn rebuild_super_players(&mut self) {
+        self.super_players = self
+            .sim_runtime
+            .as_ref()
+            .map(|rt| {
+                rt.simulation
+                    .houses()
+                    .iter()
+                    .filter(|(_, state)| {
+                        state.command_driven() && !state.multiplay_passive() && !state.is_human()
+                    })
+                    .map(|(&house, state)| {
+                        let tier = if state.native_build_time_scale().is_some() {
+                            crate::super_ai::SuperAiDifficulty::Super
+                        } else {
+                            crate::super_ai::SuperAiDifficulty::Brutal
+                        };
+                        crate::super_ai::SuperAi::new(house, tier)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
     /// Shared ScenarioPause684060 audio hold, independent of menu/debug pause.
     /// Main_Tick55D82C also gates offline world admission on its counter.
     pub(crate) fn presentation_paused(&self, screen: &crate::ui::game_screen::GameScreen) -> bool {
