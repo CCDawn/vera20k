@@ -129,6 +129,19 @@ wave sustain and targeting depth. Brutal under the same setup loses 0-3
 (avg 22207): the credits alone do not save games — the ×0.5 build
 scale is what converts into survival.
 
+The wave-pulse slice fixes the offensive's shape. The old branch sent
+one standing unit per tick whenever more than the reserve stood — the
+army left in single file and arrived piecemeal into a standing defense.
+Now `wave_launching` (pinned state, part of the determinism contract)
+gates a pulse: when `ATTACK_WAVE_SIZE` units stand gathered the whole
+group departs over consecutive ticks — a mass, not a conga line — until
+only the guard reserve remains home, and production reforms the next
+wave while the current one fights. The seeded smoke moves the same
+direction as ever without a first win: 0-1-2 (avg 28977, the single
+loss postponed 21073→26932). Both sides now routinely hold to the
+30000-tick backstop; breaking that stalemate is scouting/count and
+micro territory, not more wave shaping.
+
 ## Upstream sync
 
 `superai/base` merges `origin/main` regularly; each pillar lands on its own

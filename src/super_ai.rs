@@ -58,10 +58,11 @@ const HARVESTER_TARGET: usize = 5;
 /// idle units inside it hold an Area Guard post on the yard.
 const BASE_DEFENSE_RADIUS: i16 = 16;
 
-/// How many combat units the army must count before the offensive starts
-/// sending waves: production has to outpace attrition first. Sized for the
-/// three-factory expansion — the faster queue gathers the group quickly
-/// enough that holding it costs less than the bigger punch gains.
+/// How many combat units must stand gathered (idle or on the guard post)
+/// before a wave launches as one mass: production has to outpace attrition
+/// first. Sized for the three-factory expansion — the faster queue gathers
+/// the group quickly enough that holding it costs less than the bigger
+/// punch gains.
 const ATTACK_WAVE_SIZE: usize = 18;
 
 /// How many standing combat units stay home whatever the offensive does: a
@@ -164,6 +165,12 @@ pub struct SuperAi {
     next_deploy_tick: u32,
     /// Deploy orders issued so far this game.
     deploy_attempts: u8,
+    /// Whether a gathered wave is currently launching: one standing unit
+    /// leaves per tick until only the guard reserve remains home, so the
+    /// group departs together and arrives as a mass instead of trickling
+    /// single file into the enemy's defense. Pinned state, never read from
+    /// the runtime — the determinism contract allows exactly this.
+    wave_launching: bool,
 }
 
 impl SuperAi {
@@ -174,6 +181,7 @@ impl SuperAi {
             difficulty,
             next_deploy_tick: 0,
             deploy_attempts: 0,
+            wave_launching: false,
         }
     }
 
@@ -245,14 +253,16 @@ impl SuperAi {
         }
 
         // Home defense and the offensive. Idle combat units first engage the
-        // nearest intruder inside the base perimeter. Otherwise, once the
-        // army has grown to a full group its standing units (idle or on
-        // their guard post) march on the enemy base — attack-move, so the
-        // wave fights whatever it meets — and while the group is still
-        // forming newcomers hold an Area Guard post on the yard. Orders
-        // issue one unit per tick; an engaged, marching or posted unit
-        // leaves the idle set, so no spam follows, and a wave that dies
-        // reforms on its own once production refills the ranks.
+        // nearest intruder inside the base perimeter. Otherwise the offense
+        // moves in waves: once `ATTACK_WAVE_SIZE` units stand gathered (idle
+        // or on their guard post), the wave launches — one standing unit per
+        // tick attack-moves on the enemy center, so the group departs
+        // together and arrives as a mass — until only the guard reserve
+        // remains home; production then rebuilds the next wave while the
+        // current one fights. While a wave is still gathering, newcomers
+        // hold an Area Guard post on the yard. Orders issue one unit per
+        // tick; an engaged, marching or posted unit leaves the standing set,
+        // so no spam follows, and a wave that dies lets the next one form.
         if let Some(center) = self.structure_center(sim, opening.construction_yard) {
             let idle = self.idle_combat_units(sim, opening);
             if let Some(&attacker) = idle.first()
@@ -268,23 +278,30 @@ impl SuperAi {
                 )];
             }
             let standing = self.standing_combat_units(sim, opening);
-            if self.combat_strength(sim, opening) >= ATTACK_WAVE_SIZE
-                && standing.len() > GUARD_RESERVE
-                && let Some(enemy_center) = self.enemy_center(sim)
-                && let Some(&unit) = standing.first()
+            let enemy_center = self.enemy_center(sim);
+            if !self.wave_launching && standing.len() >= ATTACK_WAVE_SIZE && enemy_center.is_some()
             {
-                return vec![CommandEnvelope::new(
-                    self.house,
-                    at,
-                    Command::AttackMove {
-                        entity_id: unit,
-                        target: None,
-                        destination: Some(crate::sim::combat::TargetKind::Cell(
-                            enemy_center.0 as u16,
-                            enemy_center.1 as u16,
-                        )),
-                    },
-                )];
+                self.wave_launching = true;
+            }
+            if self.wave_launching && standing.len() > GUARD_RESERVE {
+                if let Some(enemy_center) = enemy_center
+                    && let Some(&unit) = standing.first()
+                {
+                    return vec![CommandEnvelope::new(
+                        self.house,
+                        at,
+                        Command::AttackMove {
+                            entity_id: unit,
+                            target: None,
+                            destination: Some(crate::sim::combat::TargetKind::Cell(
+                                enemy_center.0 as u16,
+                                enemy_center.1 as u16,
+                            )),
+                        },
+                    )];
+                }
+            } else {
+                self.wave_launching = false;
             }
             if let Some(&unit) = idle.first() {
                 return vec![CommandEnvelope::new(
@@ -1048,7 +1065,7 @@ mod tests {
                 })
         };
 
-        let tick = drive_until(&mut scenario, &mut ai, 15000, |scenario| {
+        let tick = drive_until(&mut scenario, &mut ai, 20000, |scenario| {
             combat(scenario) >= 8 && marching(scenario)
         });
         assert!(
