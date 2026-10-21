@@ -38,7 +38,8 @@ may depend on super-AI code.
 ## M1 pillars (order of work)
 
 1. **Macro** — build order, power management, economy/harvester escort,
-   expansion, tech timing; production queues never idle.
+   expansion, tech timing; production queues never idle. (Opening,
+   mass production and the three-factory expansion have landed.)
 2. **Mass waves** — continuous no-gap attack waves, multi-prong pushes.
 3. **Scout & counter** — scout, classify enemy composition, switch unit mix.
 4. **Defense & micro** — AA, engineer/spy response, focus fire, kiting,
@@ -103,7 +104,30 @@ and are bit-identical to the drip-less run: with five miners feeding a
 single war factory, money is not the binding constraint on this map, so
 extra credits idle and no decision moves. The binding constraint is
 parallel production — one war factory caps army output regardless of
-tier — which is the next macro lever.
+tier — which the next slice addresses.
+
+The expansion slice converts that production cap into pressure. The
+build ladder now counts instead of ticking names off: past the opening
+it adds a second and third war factory (each extra one multiplies
+vehicle build time by retail `MultipleFactory=0.8`, so three build
+tanks at 0.64× the single-factory time) with a power plant ahead of
+each, gated on the first main tank leaving the factory — expanding
+production must not starve the pipeline it expands. A destroyed
+building drops its count and re-enters the ladder, so the walk doubles
+as rebuild, and every factory's rally gets corrected, not just the
+first one found. The wave size grows to match the faster queue (18
+combat units before the first march), and the march target prefers the
+hostile war factories' mass center — razing production starves
+reinforcements — over the raw structure centroid. A retail regression
+drives a Battle until a second GAWEAP stands. The seeded smokes
+against Hard Russia show the trend, still without a first win: 0-3
+(avg 25665) at one factory → 0-2-1 (24053) with three factories →
+0-2-1 (27594) with 18-unit waves → 0-1-2 (27024, two 30000-tick
+timeouts) with factory-focused waves and the tank gate. Survival went
+from three losses to near-parity; closing games needs the next slice's
+wave sustain and targeting depth. Brutal under the same setup loses 0-3
+(avg 22207): the credits alone do not save games — the ×0.5 build
+scale is what converts into survival.
 
 ## Upstream sync
 

@@ -26,9 +26,12 @@
 //! defend the base: the nearest intruder inside a ring around the yard draws
 //! explicit attack orders, and units with nothing to fight hold an Area
 //! Guard post on the yard; a full group gathered there attack-marches on the
-//! hostile bases' mass center. Scouting, army mix beyond the first tanks and
-//! micro are later milestones; the difficulty tiers still change nothing
-//! (bonuses land with them).
+//! hostile bases' mass center. Past the opening the construction queue keeps
+//! expanding production: a second and third war factory (each extra one
+//! multiplies vehicle build time by retail `MultipleFactory=0.8`) with the
+//! power plants to feed them. Scouting, army mix beyond the first tanks and
+//! micro are later milestones; the tiers only change the strength subsidies
+//! (opening grant, halved build times), never the decisions themselves.
 
 use crate::sim::command::Command;
 use crate::sim::command::CommandEnvelope;
@@ -56,13 +59,31 @@ const HARVESTER_TARGET: usize = 5;
 const BASE_DEFENSE_RADIUS: i16 = 16;
 
 /// How many combat units the army must count before the offensive starts
-/// sending waves: production has to outpace attrition first.
-const ATTACK_WAVE_SIZE: usize = 12;
+/// sending waves: production has to outpace attrition first. Sized for the
+/// three-factory expansion — the faster queue gathers the group quickly
+/// enough that holding it costs less than the bigger punch gains.
+const ATTACK_WAVE_SIZE: usize = 18;
 
 /// How many standing combat units stay home whatever the offensive does: a
 /// base emptied of defenders loses to the first counterattack that walks
 /// past the marching wave.
 const GUARD_RESERVE: usize = 4;
+
+/// Power plants the expansion ladder tops out at: each extra war factory
+/// drains, and negative power would slow every build through the native
+/// power factor in `time_to_build`.
+const POWER_TARGET: usize = 3;
+
+/// Refineries the ladder builds before it switches purely to factories:
+/// enough docks to keep five miners turning ore into credits.
+const REFINERY_TARGET: usize = 2;
+
+/// War factories the expansion ladder builds up to: every extra one
+/// multiplies vehicle build time by retail `[General] MultipleFactory=0.8`
+/// (the factory-count loop in `time_to_build`), so the third factory builds
+/// tanks at 0.64× the single-factory time — the army output cap the tiers'
+/// money and speed subsidies convert into.
+const WAR_FACTORY_TARGET: usize = 3;
 
 /// The ladder the Super AI plays at.
 ///
@@ -280,7 +301,12 @@ impl SuperAi {
             }
         }
 
-        // Walk the opening while the building queue idles.
+        // Walk the build ladder while the building queue idles: the opening's
+        // fixed five, then the expansion — each further war factory (retail
+        // MultipleFactory=0.8 per extra one) with a power plant ahead of it,
+        // refineries topping out at the docks five miners keep busy. A
+        // structure the enemy destroys drops the count and re-enters the
+        // ladder, so the walk doubles as rebuild.
         let queue = crate::sim::production::queue_view_for_owner(sim, rules, &owner);
         let building_busy = queue.iter().any(|item| {
             matches!(
@@ -294,21 +320,33 @@ impl SuperAi {
             .is_some()
             && !building_busy
         {
-            for name in [
-                opening.power,
-                opening.refinery,
-                opening.barracks,
-                opening.war_factory,
-                opening.refinery,
-            ] {
-                if self.owns_structure_of_type(sim, name) {
+            let ladder = [
+                (opening.power, 1),
+                (opening.refinery, 1),
+                (opening.barracks, 1),
+                (opening.war_factory, 1),
+                (opening.refinery, REFINERY_TARGET),
+                (opening.power, 2),
+                (opening.war_factory, 2),
+                (opening.power, POWER_TARGET),
+                (opening.war_factory, WAR_FACTORY_TARGET),
+            ];
+            // The first five steps are the opening; the expansion beyond
+            // them waits for the first main tank to leave the factory —
+            // expanding production must not starve the pipeline it expands.
+            const OPENING_STEPS: usize = 5;
+            for (index, (name, target)) in ladder.iter().enumerate() {
+                if index >= OPENING_STEPS && self.count_units_of_type(sim, opening.main_tank) == 0 {
+                    break;
+                }
+                if self.count_structures_of_type(sim, name) >= *target {
                     continue;
                 }
-                if let Some(ty) = rules.object(name)
+                if let Some(ty) = rules.object(*name)
                     && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
                     // Read-only lookup: every retail type name is interned at
                     // rules load; a miss would only skip this candidate.
-                    && let Some(type_id) = sim.interner.get(name)
+                    && let Some(type_id) = sim.interner.get(*name)
                 {
                     return vec![CommandEnvelope::new(
                         self.house,
@@ -319,22 +357,22 @@ impl SuperAi {
             }
         }
 
-        // Keep the war factory's rally on the construction yard so its output
-        // gathers in the base instead of jamming the factory exit. The
-        // command archives the cell per factory (`SetRallyPoint 0x00443860`),
-        // so one correction whenever the archived cell differs suffices.
+        // Keep every war factory's rally on the construction yard so their
+        // output gathers in the base instead of jamming the factory exits.
+        // The command archives the cell per factory (`SetRallyPoint
+        // 0x00443860`), so correcting whichever factory's archived cell
+        // differs — one per tick — suffices for all of them.
         if let Some(center) = self.structure_center(sim, opening.construction_yard)
-            && let Some((factory_id, _)) = self
+            && let Some(factory_id) = self
                 .own_structures(sim)
                 .into_iter()
-                .find(|(_, name)| name == opening.war_factory)
-            && sim
-                .substrate
-                .entities
-                .get(factory_id)
-                .is_some_and(|factory| {
-                    factory.rally_cell() != Some((center.0 as u16, center.1 as u16))
+                .filter(|(_, name)| name == opening.war_factory)
+                .find(|&(id, _)| {
+                    sim.substrate.entities.get(id).is_some_and(|factory| {
+                        factory.rally_cell() != Some((center.0 as u16, center.1 as u16))
+                    })
                 })
+                .map(|(id, _)| id)
         {
             return vec![CommandEnvelope::new(
                 self.house,
@@ -454,6 +492,20 @@ impl SuperAi {
         self.own_structures(sim)
             .iter()
             .any(|(_, name)| name == type_name)
+    }
+
+    /// How many of the house's structures are exactly this retail type name:
+    /// the build ladder's expansion targets count (and re-count what the
+    /// enemy destroys).
+    fn count_structures_of_type(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        type_name: &str,
+    ) -> usize {
+        self.own_structures(sim)
+            .iter()
+            .filter(|(_, name)| name == type_name)
+            .count()
     }
 
     /// How many of the house's units are exactly this retail type name.
@@ -591,10 +643,11 @@ impl SuperAi {
         best.map(|(_, id)| id)
     }
 
-    /// The mass center of the hostile houses' structures — the march target a
-    /// gathered wave attack-moves on — or of their mobile forces when no
-    /// hostile building stands. Sums over the entity set, so the result does
-    /// not depend on iteration order.
+    /// The hostile mass center a gathered wave attack-moves on: the war
+    /// factories first — a wave that razes production starves the
+    /// reinforcements and snowballs — then any hostile structure, then
+    /// their mobile forces when no hostile building stands. Sums over the
+    /// entity set, so the result does not depend on iteration order.
     fn enemy_center(&self, sim: &crate::sim::world::Simulation) -> Option<(i16, i16)> {
         let hostile = |owner: InternedId| {
             owner != self.house
@@ -603,27 +656,33 @@ impl SuperAi {
                     .iter()
                     .any(|(&house_id, house)| house_id == owner && !house.multiplay_passive())
         };
-        let mut center = None;
-        for want_structure in [true, false] {
-            let mut sum_x = 0i64;
-            let mut sum_y = 0i64;
-            let mut count = 0u64;
-            for (_, entity) in sim.substrate.entities.iter_sorted() {
-                let is_structure =
-                    entity.category() == crate::map::entities::EntityCategory::Structure;
-                if is_structure != want_structure || !hostile(entity.owner()) {
-                    continue;
+        let centroid =
+            |want_structure: bool, want_types: Option<&[&'static str]>| -> Option<(i16, i16)> {
+                let mut sum_x = 0i64;
+                let mut sum_y = 0i64;
+                let mut count = 0u64;
+                for (_, entity) in sim.substrate.entities.iter_sorted() {
+                    let is_structure =
+                        entity.category() == crate::map::entities::EntityCategory::Structure;
+                    if is_structure != want_structure || !hostile(entity.owner()) {
+                        continue;
+                    }
+                    let name = sim.interner.resolve(entity.type_ref());
+                    if let Some(types) = want_types
+                        && !types.contains(&name)
+                    {
+                        continue;
+                    }
+                    sum_x += i64::from(entity.position.rx());
+                    sum_y += i64::from(entity.position.ry());
+                    count += 1;
                 }
-                sum_x += i64::from(entity.position.rx());
-                sum_y += i64::from(entity.position.ry());
-                count += 1;
-            }
-            if count > 0 {
-                center = Some(((sum_x / count as i64) as i16, (sum_y / count as i64) as i16));
-                break;
-            }
-        }
-        center
+                (count > 0).then(|| ((sum_x / count as i64) as i16, (sum_y / count as i64) as i16))
+            };
+        const WAR_FACTORIES: [&str; 3] = ["GAWEAP", "NAWEAP", "YAWEAP"];
+        centroid(true, Some(&WAR_FACTORIES))
+            .or_else(|| centroid(true, None))
+            .or_else(|| centroid(false, None))
     }
 
     /// The anchor cell the site search scans around: the construction yard's,
@@ -868,9 +927,7 @@ mod tests {
                     })
             };
             drive_until(&mut scenario, &mut ai, 6000, |scenario| {
-                owns(scenario, "GACNST")
-                    && owns(scenario, "GAPOWR")
-                    && owns(scenario, "GAREFN")
+                owns(scenario, "GACNST") && owns(scenario, "GAPOWR") && owns(scenario, "GAREFN")
             })
         }
         let fair = opening_tick(SuperAiDifficulty::Fair);
@@ -998,6 +1055,40 @@ mod tests {
             combat(&scenario) >= 8 && marching(&scenario),
             "a full group formed and marched (tick {tick}, combat {})",
             combat(&scenario)
+        );
+    }
+
+    /// The expansion slice: past the opening the build ladder keeps going —
+    /// a second war factory (with its power plant) must stand well inside
+    /// the budget, the production capacity the tiers' subsidies convert
+    /// into army output.
+    #[test]
+    #[ignore = "slow; retail; loads a match and drives thousands of frames"]
+    fn fair_expansion_builds_a_second_war_factory() {
+        let (mut scenario, human) = retail_battle();
+        let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
+
+        let structures_of_type = |scenario: &crate::headless_scenario::HeadlessScenario,
+                                  name: &str| {
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == human
+                        && entity.category() == crate::map::entities::EntityCategory::Structure
+                        && scenario.sim().interner.resolve(entity.type_ref()) == name
+                })
+                .count()
+        };
+
+        let tick = drive_until(&mut scenario, &mut ai, 16000, |scenario| {
+            structures_of_type(scenario, "GAWEAP") >= 2
+        });
+        assert!(
+            structures_of_type(&scenario, "GAWEAP") >= 2,
+            "a second war factory stands (tick {tick})"
         );
     }
 }
