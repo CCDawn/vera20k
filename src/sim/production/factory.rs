@@ -616,7 +616,16 @@ pub(super) fn time_to_build_inputs(
     obj: &ObjectType,
 ) -> TimeToBuildInputs {
     let country_multiplier = sim.houses.get(&owner).map_or(NativeF32Bits::ONE, |house| {
-        rules.country_build_time_mult_for_type(sim.interner.resolve(house.house_type_id()), obj)
+        let native = rules
+            .country_build_time_mult_for_type(sim.interner.resolve(house.house_type_id()), obj);
+        // Fold the fork-only Super-AI scale into the same single f32 multiply
+        // ahead of the native chain (`docs/superai.md`); None leaves the chain
+        // bit-identical to the native country multiplier.
+        house.native_build_time_scale().map_or(native, |scale| {
+            NativeF32Bits::from_bits(
+                (f32::from_bits(native.bits()) * f32::from_bits(scale.bits())).to_bits(),
+            )
+        })
     });
     let (power_output, power_drain) = sim
         .power_states

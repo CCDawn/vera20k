@@ -487,6 +487,13 @@ pub struct HouseState {
     left_game: bool,
     #[serde(default)]
     native_construction: Option<NativeHouseConstruction>,
+    /// Fork-only Super-AI knob (`docs/superai.md`): a per-house scale on
+    /// production build times, folded into the native country/type chain in
+    /// `time_to_build`. None is the native behavior — the Super tier's
+    /// half-speed build is the one documented simulation-side exception the
+    /// fork makes. Nothing native writes this; it is not a gamemd port.
+    #[serde(default)]
+    native_build_time_scale: Option<NativeF32Bits>,
     #[serde(default)]
     scenario_parameters: HouseScenarioParameters,
     /// House+16C's retained initial Techno records. ReadScenario684C1B calls
@@ -1337,6 +1344,18 @@ impl HouseState {
 
     pub const fn difficulty(&self) -> HouseDifficulty {
         self.difficulty
+    }
+
+    /// The fork-only Super-AI build-time scale, if the tier set one (see
+    /// the field's docs).
+    pub const fn native_build_time_scale(&self) -> Option<NativeF32Bits> {
+        self.native_build_time_scale
+    }
+
+    /// Set the fork-only Super-AI build-time scale; the launch tier setup
+    /// is its only writer.
+    pub fn set_native_build_time_scale(&mut self, scale: NativeF32Bits) {
+        self.native_build_time_scale = Some(scale);
     }
 
     pub const fn multiplay_passive(&self) -> bool {
@@ -2478,6 +2497,7 @@ impl HouseState {
             ui_name: HouseUiName::TypeName,
             left_game: false,
             native_construction: None,
+            native_build_time_scale: None,
             scenario_parameters: HouseScenarioParameters::default(),
             initial_techno_records: Vec::new(),
             side_index: side_index.into(),

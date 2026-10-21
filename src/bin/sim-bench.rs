@@ -104,6 +104,7 @@ struct Args {
     super_country: LaunchCountry,
     builtin_country: LaunchCountry,
     builtin_difficulty: AiDifficulty,
+    super_tier: vera20k_core::super_ai::SuperAiDifficulty,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -131,6 +132,7 @@ fn parse_args() -> Result<Args, String> {
         super_country: LaunchCountry::America,
         builtin_country: LaunchCountry::Russia,
         builtin_difficulty: AiDifficulty::Hard,
+        super_tier: vera20k_core::super_ai::SuperAiDifficulty::Fair,
     };
     let mut march_flag = None;
     let mut argv = std::env::args().skip(1);
@@ -194,6 +196,16 @@ fn parse_args() -> Result<Args, String> {
             "--builtin-country" => args.builtin_country = sim_bench_super::country(&value()?)?,
             "--builtin-difficulty" => {
                 args.builtin_difficulty = sim_bench_super::difficulty(&value()?)?
+            }
+            "--super-tier" => {
+                args.super_tier = match value()?.as_str() {
+                    "fair" => vera20k_core::super_ai::SuperAiDifficulty::Fair,
+                    "brutal" => vera20k_core::super_ai::SuperAiDifficulty::Brutal,
+                    "super" => vera20k_core::super_ai::SuperAiDifficulty::Super,
+                    other => {
+                        return Err(format!("unknown super tier {other}: fair, brutal or super"));
+                    }
+                }
             }
             other => return Err(format!("unrecognised argument {other}")),
         }
@@ -413,7 +425,8 @@ fn main() -> Result<(), String> {
                  [--types E1,E2,MTNK,HTNK] [--order-spread 30] [--return-at T] (march) \
                  [--hash-every N] [--frame-hash-every 15] [--csv <path>] [--serial-paths] [--serial-scans] \
                  [--games 1] [--max-ticks 30000] [--super-country America] \
-                 [--builtin-country Russia] [--builtin-difficulty hard] (super)"
+                 [--builtin-country Russia] [--builtin-difficulty hard]
+                 [--super-tier fair] (super)"
             );
             std::process::exit(2);
         }

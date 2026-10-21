@@ -143,6 +143,15 @@ impl<'a> SimView<'a> {
 }
 
 impl SimRuntime {
+    /// Grant `amount` credits to `house` — the Super-AI tier's recurring
+    /// credit bonus (fork-only, `docs/superai.md`); the bench calls it from
+    /// its drive loop for the Brutal and Super tiers.
+    pub fn grant_house_credits(&mut self, house: crate::sim::intern::InternedId, amount: i32) {
+        if let Some(state) = self.simulation.houses.get_mut(&house) {
+            state.economy_mut().add_credits(amount);
+        }
+    }
+
     /// Clear the exact radar-terrain batch a completed presentation update read.
     pub fn acknowledge_radar_terrain_dirty(&mut self, generation: u64) -> bool {
         self.simulation.acknowledge_radar_terrain_dirty(generation)

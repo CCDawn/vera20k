@@ -845,6 +845,42 @@ mod tests {
         );
     }
 
+    /// The Super tier's one simulation-side exception halves build times:
+    /// on the same map and seed the opening's first three buildings must
+    /// stand sooner under Super than under Fair.
+    #[test]
+    #[ignore = "slow; retail; loads two matches and drives thousands of frames"]
+    fn super_tier_builds_the_opening_faster_than_fair() {
+        fn opening_tick(tier: SuperAiDifficulty) -> u32 {
+            let (mut scenario, human) = retail_battle();
+            scenario.apply_super_ai_tier(human, tier);
+            let mut ai = SuperAi::new(human, tier);
+            let owns = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
+                scenario
+                    .sim()
+                    .substrate
+                    .entities
+                    .iter_sorted()
+                    .any(|(_, entity)| {
+                        entity.owner() == human
+                            && entity.category() == crate::map::entities::EntityCategory::Structure
+                            && scenario.sim().interner.resolve(entity.type_ref()) == name
+                    })
+            };
+            drive_until(&mut scenario, &mut ai, 6000, |scenario| {
+                owns(scenario, "GACNST")
+                    && owns(scenario, "GAPOWR")
+                    && owns(scenario, "GAREFN")
+            })
+        }
+        let fair = opening_tick(SuperAiDifficulty::Fair);
+        let super_tier = opening_tick(SuperAiDifficulty::Super);
+        assert!(
+            super_tier < fair,
+            "the halved build times must finish the opening sooner (super {super_tier} vs fair {fair})"
+        );
+    }
+
     /// The mass-production slice: past the opening the war factory keeps
     /// building (miners to target, then Grizzly tanks with the rally on the
     /// yard) and the barracks runs GIs, so an army exists well inside the

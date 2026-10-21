@@ -17,14 +17,23 @@ determinism, replays and upstream merges intact.
 | Tier   | Strength sources                                             |
 |--------|--------------------------------------------------------------|
 | Fair   | None. Decisions only. Baseline for win-rate measurement.     |
-| Brutal | Fair + money/harvest bonuses (original Brutal-style, later). |
-| Super  | Fast build + parallel factories + continuous mass waves.     |
+| Brutal | Fair + the native Hard AI's opening grant plus a recurring   |
+|        | credit bonus (+1000 per 600 ticks in the bench harness).     |
+| Super  | Brutal + per-house build times scaled ×0.5 (fast build).     |
+
+The tier treatment is applied by the harness (`apply_super_ai_tier` in
+`headless_scenario.rs` plus the bench's drip), not by the strategy: Brutal and
+Super re-use `native_ai_opening_grant` — the same kernel behind retail
+`[General] MultiplayerAICM=400,0,0`'s Hard row — so the grant itself is a
+native calculation, and the recurring drip goes through `Economy::add_credits`,
+the entry native credit actions already use.
 
 The build-speed multiplier is simulation-side by nature (INI mods change the
 same native parameters). Super tier therefore allows exactly one minimal
-`src/sim/` change on this fork: a per-house build-time multiplier field read
-in `production/factory.rs` `time_to_build`. Nothing else in `src/sim/` may
-depend on super-AI code.
+`src/sim/` change on this fork: a per-house `native_build_time_scale` field
+folded into the country multiplier of `production/factory.rs`
+`time_to_build`. `None` is bit-identical to native. Nothing else in `src/sim/`
+may depend on super-AI code.
 
 ## M1 pillars (order of work)
 
@@ -81,6 +90,20 @@ seeded games end 21946–26910 ticks against Hard Russia, versus the pure-
 defense timeouts: no economic edge and no micro means every frontal
 trade is negative. The march is the delivery vehicle for the Brutal and
 Super tiers; the Fair baseline keeps it on record.
+
+The tier slice lands the strength model itself. `apply_super_ai_tier`
+applies the opening treatment before the first tick (Brutal and Super
+take the native Hard grant; Super additionally installs the ×0.5
+build-time scale), and the bench drips +1000 credits per 600 ticks into
+Brutal/Super. A retail regression drives the same opening under Fair
+and Super and asserts Super finishes it strictly earlier — the scale
+and grant measurably reach `time_to_build`. The three seeded games
+against Hard Russia end 0-3 (22098–29727 ticks) with the drip active
+and are bit-identical to the drip-less run: with five miners feeding a
+single war factory, money is not the binding constraint on this map, so
+extra credits idle and no decision moves. The binding constraint is
+parallel production — one war factory caps army output regardless of
+tier — which is the next macro lever.
 
 ## Upstream sync
 

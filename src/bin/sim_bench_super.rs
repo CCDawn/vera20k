@@ -160,18 +160,28 @@ pub(crate) fn run(args: &super::Args) -> Result<(), String> {
             .session()
             .current_house()
             .ok_or("the launch created no local house for the Super AI")?;
+        // The tier's opening treatment: Brutal/Super take the native Hard
+        // AI's opening grant; Super also halves build times (the one
+        // simulation-side exception, applied before any tick runs).
+        scenario.apply_super_ai_tier(super_house, args.super_tier);
         let runtime = &mut scenario.runtime;
         runtime.simulation.batch_path_searches();
         runtime.simulation.batch_target_scans();
         let builtin =
             builtin_computer(runtime).ok_or("the launch created no built-in computer house")?;
-        // The Fair tier plays pure decisions: the retail opening with no
-        // economic edge, so the benchmark measures the opening chain alone.
-        let mut ai = SuperAi::new(super_house, SuperAiDifficulty::Fair);
+        // The chosen tier plays its pure decisions; its opening treatment
+        // (grant, build scale) is already applied above.
+        let mut ai = SuperAi::new(super_house, args.super_tier);
 
         let mut ticks = 0u64;
         let mut finished = false;
         while ticks < args.max_ticks.get() {
+            // The Brutal/Super tiers' recurring credit bonus (`docs/superai.md`):
+            // +1000 credits per 600 ticks, the sustained edge the strength
+            // model adds on top of the opening grant. Fair stays untouched.
+            if args.super_tier != SuperAiDifficulty::Fair && ticks > 0 && ticks % 600 == 0 {
+                runtime.grant_house_credits(super_house, 1000);
+            }
             let batch = ai.orders(runtime, u32::try_from(ticks).unwrap_or(u32::MAX));
             let output = runtime
                 .advance_frame(
@@ -216,8 +226,8 @@ pub(crate) fn run(args: &super::Args) -> Result<(), String> {
     }
     let games = args.games.get();
     println!(
-        "super record: {}-{} over {} game(s), {} timeout(s)",
-        wins, losses, games, timeouts
+        "super record ({:?}): {}-{} over {} game(s), {} timeout(s)",
+        args.super_tier, wins, losses, games, timeouts
     );
     println!("average ticks per game: {}", total_ticks / u64::from(games));
     Ok(())

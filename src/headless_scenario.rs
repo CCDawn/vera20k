@@ -137,6 +137,55 @@ impl HeadlessScenario {
             .get(owner_name)
             .expect("the house constructor interns its name")
     }
+
+    /// Apply the Super-AI tier's opening treatment to `house`
+    /// (`docs/superai.md`): Brutal and Super take the native Hard AI's
+    /// opening grant through the same kernel the launch grants computer
+    /// houses with (`apply_skirmish_ai_opening_credits`'s
+    /// `native_ai_opening_grant`; retail `[General] MultiplayerAICM=400,0,0`
+    /// gives the Hard row 400% of the opening balance), and Super
+    /// additionally halves this house's production build times — the fork's
+    /// one documented simulation-side exception
+    /// (`HouseState::set_native_build_time_scale`). Fair takes nothing: the
+    /// tier exists so strength claims can cite exactly what a pure decision
+    /// layer achieves.
+    pub fn apply_super_ai_tier(
+        &mut self,
+        house: InternedId,
+        tier: crate::super_ai::SuperAiDifficulty,
+    ) {
+        use crate::super_ai::SuperAiDifficulty;
+
+        if tier == SuperAiDifficulty::Fair {
+            return;
+        }
+        let coefficient = self
+            .runtime
+            .resources
+            .rules
+            .general
+            .multiplayer_ai_cm
+            .get(crate::sim::house_state::HouseDifficulty::Hard.table_index())
+            .copied()
+            .unwrap_or(0);
+        let state = self
+            .runtime
+            .simulation
+            .houses
+            .get_mut(&house)
+            .expect("the tier applies to a house the launch created");
+        let grant = crate::sim::scenario_bootstrap::native_ai_opening_grant(
+            coefficient,
+            state.economy().available_money(),
+        );
+        state.economy_mut().add_credits(grant);
+        if tier == SuperAiDifficulty::Super {
+            // 0.5f32: build twice as fast as the native chain.
+            state.set_native_build_time_scale(crate::util::native_x87::NativeF32Bits::from_bits(
+                0x3F00_0000,
+            ));
+        }
+    }
 }
 
 /// Native logic-frame cadence (66 ms). NOTE: this does NOT match the
