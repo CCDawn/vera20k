@@ -69,10 +69,18 @@ tanks without micro feed the attacker wave by wave.
 The defense slice holds the base: idle tanks and soldiers attack the
 nearest intruder inside a 16-cell ring around the yard (one order per
 tick, re-derived from each unit's current mission so nothing spams) and
-otherwise post on an Area Guard there. With that, the same smoke no
-longer loses — the one-game run times out at the 30000-tick backstop
-with both sides standing (attack marching is still unimplemented, so a
-won position cannot be converted).
+otherwise post on an Area Guard there. With pure defense the one-game
+smoke stops losing — a 30000-tick timeout with both sides standing.
+
+The offensive slice then arms the march: once the army counts twelve
+combat units, its standing units (idle or on their guard post) attack-
+move on the hostile bases' mass center, keeping a four-unit guard
+reserve home. The mechanism works and changes games, but at the Fair
+tier every form of marching loses faster than pure defense — three
+seeded games end 21946–26910 ticks against Hard Russia, versus the pure-
+defense timeouts: no economic edge and no micro means every frontal
+trade is negative. The march is the delivery vehicle for the Brutal and
+Super tiers; the Fair baseline keeps it on record.
 
 ## Upstream sync
 

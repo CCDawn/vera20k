@@ -25,9 +25,10 @@
 //! queue runs the side's basic soldier continuously. Idle soldiers and tanks
 //! defend the base: the nearest intruder inside a ring around the yard draws
 //! explicit attack orders, and units with nothing to fight hold an Area
-//! Guard post on the yard. Scouting, army mix beyond the first tanks,
-//! attack marching, and micro are later milestones; the difficulty tiers
-//! still change nothing (bonuses land with them).
+//! Guard post on the yard; a full group gathered there attack-marches on the
+//! hostile bases' mass center. Scouting, army mix beyond the first tanks and
+//! micro are later milestones; the difficulty tiers still change nothing
+//! (bonuses land with them).
 
 use crate::sim::command::Command;
 use crate::sim::command::CommandEnvelope;
@@ -53,6 +54,15 @@ const HARVESTER_TARGET: usize = 5;
 /// the base, in cells: the defense picks explicit targets out to this ring;
 /// idle units inside it hold an Area Guard post on the yard.
 const BASE_DEFENSE_RADIUS: i16 = 16;
+
+/// How many combat units the army must count before the offensive starts
+/// sending waves: production has to outpace attrition first.
+const ATTACK_WAVE_SIZE: usize = 12;
+
+/// How many standing combat units stay home whatever the offensive does: a
+/// base emptied of defenders loses to the first counterattack that walks
+/// past the marching wave.
+const GUARD_RESERVE: usize = 4;
 
 /// The ladder the Super AI plays at.
 ///
@@ -159,12 +169,12 @@ impl SuperAi {
     /// The commands this player issues for the frame after `tick`.
     ///
     /// One command per tick, in a fixed priority: deploy the opening MCV,
-    /// place a ready building, defend the base (attack the nearest intruder,
-    /// else post idle units on an Area Guard), keep the building queue
-    /// walking the opening, hold the war factory's rally on the construction
-    /// yard, keep the vehicle queue on miners-then-tanks, keep the barracks
-    /// queue on the side's basic soldier. See the module docs for the
-    /// determinism contract.
+    /// place a ready building, defend the base (attack the nearest intruder;
+    /// else march a gathered group on the enemy center; else post idle units
+    /// on an Area Guard), keep the building queue walking the opening, hold
+    /// the war factory's rally on the construction yard, keep the vehicle
+    /// queue on miners-then-tanks, keep the barracks queue on the side's
+    /// basic soldier. See the module docs for the determinism contract.
     pub fn orders(&mut self, runtime: &SimRuntime, tick: u32) -> Vec<CommandEnvelope> {
         let sim = &runtime.simulation;
         let rules = &runtime.resources.rules;
@@ -213,11 +223,15 @@ impl SuperAi {
             )];
         }
 
-        // Home defense: idle combat units engage the nearest intruder inside
-        // the base perimeter, and otherwise hold an Area Guard post on the
-        // construction yard, so enemies meet a formed line there instead of
-        // luring lone chasers across the map. Orders issue one unit per tick;
-        // an engaged or posted unit leaves the idle set, so no spam follows.
+        // Home defense and the offensive. Idle combat units first engage the
+        // nearest intruder inside the base perimeter. Otherwise, once the
+        // army has grown to a full group its standing units (idle or on
+        // their guard post) march on the enemy base — attack-move, so the
+        // wave fights whatever it meets — and while the group is still
+        // forming newcomers hold an Area Guard post on the yard. Orders
+        // issue one unit per tick; an engaged, marching or posted unit
+        // leaves the idle set, so no spam follows, and a wave that dies
+        // reforms on its own once production refills the ranks.
         if let Some(center) = self.structure_center(sim, opening.construction_yard) {
             let idle = self.idle_combat_units(sim, opening);
             if let Some(&attacker) = idle.first()
@@ -229,6 +243,25 @@ impl SuperAi {
                     Command::Attack {
                         attacker_id: attacker,
                         target_id: target,
+                    },
+                )];
+            }
+            let standing = self.standing_combat_units(sim, opening);
+            if self.combat_strength(sim, opening) >= ATTACK_WAVE_SIZE
+                && standing.len() > GUARD_RESERVE
+                && let Some(enemy_center) = self.enemy_center(sim)
+                && let Some(&unit) = standing.first()
+            {
+                return vec![CommandEnvelope::new(
+                    self.house,
+                    at,
+                    Command::AttackMove {
+                        entity_id: unit,
+                        target: None,
+                        destination: Some(crate::sim::combat::TargetKind::Cell(
+                            enemy_center.0 as u16,
+                            enemy_center.1 as u16,
+                        )),
                     },
                 )];
             }
@@ -436,6 +469,27 @@ impl SuperAi {
             .count()
     }
 
+    /// The house's living combat units of the opening's army types (tanks
+    /// and basic soldiers), whatever their mission.
+    fn combat_strength(&self, sim: &crate::sim::world::Simulation, opening: &Opening) -> usize {
+        sim.substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.owner() == self.house
+                    && matches!(
+                        entity.category(),
+                        crate::map::entities::EntityCategory::Unit
+                            | crate::map::entities::EntityCategory::Infantry
+                    )
+                    && {
+                        let name = sim.interner.resolve(entity.type_ref());
+                        name == opening.main_tank || name == opening.basic_infantry
+                    }
+            })
+            .count()
+    }
+
     /// The house's idle combat units for the opening's army types, in the
     /// substrate's stable order: arrived tanks and soldiers whose current
     /// mission is None or Sleep (a unit walking to the rally, engaging a
@@ -463,6 +517,41 @@ impl SuperAi {
                         entity.passive_acquire_mission(),
                         crate::sim::mission::MissionType::None
                             | crate::sim::mission::MissionType::Sleep
+                    )
+            })
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// The house's combat units free to take a march order, in the
+    /// substrate's stable order: idle units plus the ones holding their
+    /// guard post — an attack-move simply replaces that post. Units already
+    /// marching or engaging a target are not re-pointed.
+    fn standing_combat_units(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+    ) -> Vec<u64> {
+        sim.substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.owner() == self.house
+                    && matches!(
+                        entity.category(),
+                        crate::map::entities::EntityCategory::Unit
+                            | crate::map::entities::EntityCategory::Infantry
+                    )
+                    && {
+                        let name = sim.interner.resolve(entity.type_ref());
+                        name == opening.main_tank || name == opening.basic_infantry
+                    }
+                    && matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
                     )
             })
             .map(|(id, _)| id)
@@ -500,6 +589,41 @@ impl SuperAi {
             }
         }
         best.map(|(_, id)| id)
+    }
+
+    /// The mass center of the hostile houses' structures — the march target a
+    /// gathered wave attack-moves on — or of their mobile forces when no
+    /// hostile building stands. Sums over the entity set, so the result does
+    /// not depend on iteration order.
+    fn enemy_center(&self, sim: &crate::sim::world::Simulation) -> Option<(i16, i16)> {
+        let hostile = |owner: InternedId| {
+            owner != self.house
+                && sim
+                    .houses
+                    .iter()
+                    .any(|(&house_id, house)| house_id == owner && !house.multiplay_passive())
+        };
+        let mut center = None;
+        for want_structure in [true, false] {
+            let mut sum_x = 0i64;
+            let mut sum_y = 0i64;
+            let mut count = 0u64;
+            for (_, entity) in sim.substrate.entities.iter_sorted() {
+                let is_structure =
+                    entity.category() == crate::map::entities::EntityCategory::Structure;
+                if is_structure != want_structure || !hostile(entity.owner()) {
+                    continue;
+                }
+                sum_x += i64::from(entity.position.rx());
+                sum_y += i64::from(entity.position.ry());
+                count += 1;
+            }
+            if count > 0 {
+                center = Some(((sum_x / count as i64) as i16, (sum_y / count as i64) as i16));
+                break;
+            }
+        }
+        center
     }
 
     /// The anchor cell the site search scans around: the construction yard's,
@@ -759,6 +883,85 @@ mod tests {
         assert!(
             units_of_type(&scenario, "E1") >= 1,
             "a GI came out (tick {tick})"
+        );
+    }
+
+    /// The offensive slice: once the army has grown to a full group, its
+    /// standing units march — a tank is on a Move mission beyond the base
+    /// perimeter (not the short walk from the factory to the rally) with the
+    /// enemy base still standing, well inside the budget.
+    #[test]
+    #[ignore = "slow; retail; loads a match and drives thousands of frames"]
+    fn fair_offensive_marches_a_gathered_group() {
+        let (mut scenario, human) = retail_battle();
+        let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
+
+        let combat = |scenario: &crate::headless_scenario::HeadlessScenario| {
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == human
+                        && matches!(
+                            entity.category(),
+                            crate::map::entities::EntityCategory::Unit
+                                | crate::map::entities::EntityCategory::Infantry
+                        )
+                        && matches!(
+                            scenario.sim().interner.resolve(entity.type_ref()),
+                            "MTNK" | "E1"
+                        )
+                })
+                .count()
+        };
+        let yard = |scenario: &crate::headless_scenario::HeadlessScenario| {
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .find(|(_, entity)| {
+                    entity.owner() == human
+                        && entity.category() == crate::map::entities::EntityCategory::Structure
+                        && scenario.sim().interner.resolve(entity.type_ref()) == "GACNST"
+                })
+                .map(|(_, entity)| (entity.position.rx() as i16, entity.position.ry() as i16))
+        };
+        let marching = |scenario: &crate::headless_scenario::HeadlessScenario| {
+            let Some(yard) = yard(scenario) else {
+                return false;
+            };
+            let limit =
+                i32::from(super::BASE_DEFENSE_RADIUS) * i32::from(super::BASE_DEFENSE_RADIUS);
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .any(|(_, entity)| {
+                    if entity.owner() != human
+                        || entity.category() != crate::map::entities::EntityCategory::Unit
+                        || scenario.sim().interner.resolve(entity.type_ref()) != "MTNK"
+                        || entity.passive_acquire_mission()
+                            != crate::sim::mission::MissionType::Move
+                    {
+                        return false;
+                    }
+                    let dx = i32::from(entity.position.rx() as i16 - yard.0);
+                    let dy = i32::from(entity.position.ry() as i16 - yard.1);
+                    dx * dx + dy * dy > limit
+                })
+        };
+
+        let tick = drive_until(&mut scenario, &mut ai, 15000, |scenario| {
+            combat(scenario) >= 8 && marching(scenario)
+        });
+        assert!(
+            combat(&scenario) >= 8 && marching(&scenario),
+            "a full group formed and marched (tick {tick}, combat {})",
+            combat(&scenario)
         );
     }
 }
