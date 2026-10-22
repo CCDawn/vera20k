@@ -108,6 +108,63 @@ const WAR_FACTORY_TYPES: [&str; 3] = ["GAWEAP", "NAWEAP", "YAWEAP"];
 /// froze the whole build ladder for a tank's entire build time).
 const IDLE_REORDER_TICKS: u32 = 150;
 
+/// The army's core — its main tank, the side's basic soldier — fills
+/// every queue slot until it reaches this size; only then does the mix
+/// diversify. A diversified opening would field specialists before the
+/// line that holds the base exists.
+const CORE_BEFORE_SPECIALISTS: usize = 6;
+
+/// Out of every ten queue slots past the core, one goes to each
+/// specialist role and the situation can raise the demanded role to
+/// three: anti-air steps up while hostile aircraft exist, and
+/// armor-crackers against a hostile armored mass. The core keeps every
+/// remaining slot.
+const ROLE_SHARE_BASE: usize = 1;
+const ROLE_SHARE_BOOST: usize = 3;
+
+/// Retail's air-capable combat types the mix reacts to — the engine
+/// files them under infantry or vehicle categories, not aircraft:
+/// Rocketeer, Kirov, Harrier, Black Hawk, Hind, Floating Disk.
+const AIR_THREAT_TYPES: [&str; 6] = ["JUMPJET", "ZEP", "ORCA", "SHAD", "HIND", "DISK"];
+
+/// Ticks a superweapon launch attempt waits before trying again. The
+/// engine refuses a second storm while one runs and the dominator
+/// mid-pulse; a refused launch must not spin this branch the way a
+/// dropped unit order would starve the branches below it.
+const SW_FIRE_RETRY_TICKS: u32 = 150;
+
+/// Combat-slot wheels: past the core, every Nth issued combat slot goes
+/// to the roster mix and the rest back to the core type. A live-count
+/// gate measures the war, not the build program — under attrition the
+/// standing army never clears the core floor (observed: a whole game
+/// with no IFV while the queue rebuilt tanks), so the mix rides issued
+/// slots, which only ever grow.
+const SPECIALIST_EVERY_VEHICLE: u32 = 4;
+const SPECIALIST_EVERY_INFANTRY: u32 = 3;
+
+/// Growth caps: refineries stop here once the miner fleet saturates
+/// the standing docks (two miners each); factories once six stand —
+/// retail's MultipleFactory=0.8 per extra one has shrinking returns.
+/// The first [`FACTORY_BUILDOUT`] factories are part of the standard
+/// build-out and queue without any wallet bar: the ladder's last step
+/// (the 5000-credit superweapon) leaves the bank drained and from there
+/// the army queues absorb the income, so a wallet gate on the fourth
+/// factory never coincides with a free building slot (observed: a whole
+/// game stuck at three under bars of 3000 and 1500 alike — the item
+/// draws its cost as it builds, the native way, instead of waiting for
+/// a lump sum). Only factories past the build-out wait for
+/// [`FACTORY_CREDITS`], a bar the wallet must clear before another
+/// production line is worth feeding.
+const REFINERY_CAP: usize = 4;
+const FACTORY_BUILDOUT: usize = 4;
+const FACTORY_CAP: usize = 6;
+const FACTORY_CREDITS: i32 = 1500;
+/// Growth power cap. Without one the deficit rule (queue a plant the
+/// moment drain overtakes output) claims every growth slot in a
+/// power-hungry base and the refinery and factory rules behind it never
+/// take a turn (observed: two growth plants and no fourth factory).
+const POWER_CAP: usize = 8;
+
 /// Deterministic fan-out offsets (cells) that keep the AI's destinations
 /// from converging on one point: rallies, guard posts and wave destinations
 /// each pick an offset by index or entity id, so a group spreads over
@@ -144,6 +201,26 @@ pub enum SuperAiDifficulty {
     Super,
 }
 
+/// The battlefield role a buildable combat type fills in the army mix.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// Shoots air — the answer to hostile aircraft.
+    AntiAir,
+    /// Cracks armor.
+    AntiArmor,
+    /// Sweeps infantry.
+    AntiInfantry,
+    /// Long-range damage against structures and massed targets.
+    Siege,
+}
+
+/// One combat type the army mixes in past its core, with the role the
+/// mix targets it at.
+struct RosterEntry {
+    name: &'static str,
+    role: Role,
+}
+
 /// One side's opening build, by retail type name. The construction yard each
 /// MCV deploys into names the side (`GACNST`/`NACNST`/`YACNST`).
 struct Opening {
@@ -167,6 +244,27 @@ struct Opening {
     tier2_tank: &'static str,
     /// The side's basic soldier (GI, Conscript, Initiate).
     basic_infantry: &'static str,
+    /// The side's superweapon structure and the special it grants
+    /// (retail `SuperWeapon=` on the building): Weather Controller,
+    /// Iron Curtain, Psychic Dominator. Every retail one is
+    /// `DisableableFromShell=yes`, so the lobby's superweapons toggle
+    /// owns the whole chain — CanBuild refuses the building while it is
+    /// off and the engine revokes a standing grant.
+    super_weapon_building: &'static str,
+    super_weapon_type: &'static str,
+    /// Whether the special lands on friends rather than enemies: the
+    /// Iron Curtain makes the vehicles under it invulnerable while
+    /// organic infantry there take damage instead, so it aims at the
+    /// standing armor while the storm and the dominator strike the
+    /// enemy base.
+    super_weapon_targets_self: bool,
+    /// Combat vehicles the army mixes in past its core tank, each with
+    /// its role; the core keeps the remaining slots. Country-locked
+    /// entries stay in the table — CanBuild's `RequiredHouses=` gate
+    /// skips them for other houses.
+    vehicles: &'static [RosterEntry],
+    /// Infantry the barracks mixes in past its core soldier.
+    infantry: &'static [RosterEntry],
 }
 
 const OPENINGS: [Opening; 3] = [
@@ -182,6 +280,61 @@ const OPENINGS: [Opening; 3] = [
         main_tank: "MTNK",
         tier2_tank: "SREF",
         basic_infantry: "E1",
+        super_weapon_building: "GAWEAT",
+        super_weapon_type: "LightningStormSpecial",
+        super_weapon_targets_self: false,
+        // Anti-air picks cite the weapon's retail projectile `AA=yes`:
+        // the IFV's HoverMissile fires AAHeatSeeker2, the Rocketeer's
+        // 20mm Invisible3. The Tank Destroyer is Germans-only and the
+        // Robot Tank waits for its Robot Control Center — CanBuild
+        // gates both until the house qualifies.
+        vehicles: &[
+            RosterEntry {
+                name: "FV",
+                role: Role::AntiAir,
+            },
+            RosterEntry {
+                name: "MGTK",
+                role: Role::AntiArmor,
+            },
+            RosterEntry {
+                name: "TNKD",
+                role: Role::AntiArmor,
+            },
+            RosterEntry {
+                name: "ROBO",
+                role: Role::AntiInfantry,
+            },
+            RosterEntry {
+                name: "BFRT",
+                role: Role::Siege,
+            },
+        ],
+        infantry: &[
+            // The Guardian GI's deployed MissileLauncher is also the
+            // Allied anti-air answer (AAHeatSeeker2); filed under
+            // AntiArmor because its standing role cracks vehicles.
+            RosterEntry {
+                name: "GGI",
+                role: Role::AntiArmor,
+            },
+            RosterEntry {
+                name: "JUMPJET",
+                role: Role::AntiAir,
+            },
+            RosterEntry {
+                name: "GHOST",
+                role: Role::AntiInfantry,
+            },
+            RosterEntry {
+                name: "SNIPE",
+                role: Role::AntiInfantry,
+            },
+            RosterEntry {
+                name: "TANY",
+                role: Role::AntiInfantry,
+            },
+        ],
     },
     Opening {
         construction_yard: "NACNST",
@@ -195,6 +348,53 @@ const OPENINGS: [Opening; 3] = [
         main_tank: "HTNK",
         tier2_tank: "APOC",
         basic_infantry: "E2",
+        super_weapon_building: "NAIRON",
+        super_weapon_type: "IronCurtainSpecial",
+        super_weapon_targets_self: true,
+        // Flak answers air on both lines: the Flak Track's
+        // FlakTrackAAGun and the Flak Trooper's FlakGuyAAGun fire the
+        // AA-only FlakProj. The Tesla Tank is Russians-only and the
+        // Desolator Arabs-only; CanBuild gates them per house.
+        vehicles: &[
+            RosterEntry {
+                name: "HTK",
+                role: Role::AntiAir,
+            },
+            RosterEntry {
+                name: "DRON",
+                role: Role::AntiArmor,
+            },
+            RosterEntry {
+                name: "TTNK",
+                role: Role::AntiInfantry,
+            },
+            RosterEntry {
+                name: "V3",
+                role: Role::Siege,
+            },
+        ],
+        infantry: &[
+            RosterEntry {
+                name: "FLAKT",
+                role: Role::AntiAir,
+            },
+            RosterEntry {
+                name: "SHK",
+                role: Role::AntiArmor,
+            },
+            RosterEntry {
+                name: "IVAN",
+                role: Role::AntiInfantry,
+            },
+            RosterEntry {
+                name: "DESO",
+                role: Role::AntiInfantry,
+            },
+            RosterEntry {
+                name: "BORIS",
+                role: Role::AntiArmor,
+            },
+        ],
     },
     Opening {
         construction_yard: "YACNST",
@@ -211,6 +411,40 @@ const OPENINGS: [Opening; 3] = [
         main_tank: "LTNK",
         tier2_tank: "MIND",
         basic_infantry: "INIT",
+        super_weapon_building: "YAPPET",
+        super_weapon_type: "PsychicDominatorSpecial",
+        super_weapon_targets_self: false,
+        // The Gattling Tank's AAGattling fires the AA-only Invisible4.
+        // The Magnetron lifts armor, the Chaos Drone gas masses; the
+        // Floating Disk stays out until the naval/air chains land.
+        vehicles: &[
+            RosterEntry {
+                name: "YTNK",
+                role: Role::AntiAir,
+            },
+            RosterEntry {
+                name: "TELE",
+                role: Role::AntiArmor,
+            },
+            RosterEntry {
+                name: "CAOS",
+                role: Role::AntiInfantry,
+            },
+        ],
+        infantry: &[
+            RosterEntry {
+                name: "BRUTE",
+                role: Role::AntiArmor,
+            },
+            RosterEntry {
+                name: "VIRUS",
+                role: Role::AntiInfantry,
+            },
+            RosterEntry {
+                name: "YURI",
+                role: Role::AntiArmor,
+            },
+        ],
     },
 ];
 
@@ -243,6 +477,14 @@ pub struct SuperAi {
     /// Earliest tick each idle unit may take another single-unit order; see
     /// [`IDLE_REORDER_TICKS`]. Pinned state, never read from the runtime.
     order_gate: std::collections::HashMap<u64, u32>,
+    /// Earliest tick the next superweapon launch may be attempted. Pinned
+    /// state, never read from the runtime; see [`SW_FIRE_RETRY_TICKS`].
+    next_sw_fire_tick: u32,
+    /// Combat production slots issued since deploy — vehicles and infantry
+    /// each. Pinned state driving the specialist wheels; see
+    /// [`SPECIALIST_EVERY_VEHICLE`].
+    vehicle_slots: u32,
+    infantry_slots: u32,
 }
 
 impl SuperAi {
@@ -257,6 +499,9 @@ impl SuperAi {
             launched: Vec::new(),
             next_wave_tick: 0,
             order_gate: std::collections::HashMap::new(),
+            next_sw_fire_tick: 0,
+            vehicle_slots: 0,
+            infantry_slots: 0,
         }
     }
 
@@ -324,6 +569,38 @@ impl SuperAi {
                     type_id: ready.type_id,
                     rx,
                     ry,
+                },
+            )];
+        }
+
+        // A charged superweapon fires. The lobby toggle already gates the
+        // whole chain upstream: with superweapons off, `can_build` refuses
+        // the `DisableableFromShell=yes` building (and the engine revokes a
+        // standing grant), so no instance is ever owned or charged. The
+        // charge gate (`charge_start_tick` set, active, ready) mirrors the
+        // fire button's own admission; `LaunchSuperWeapon` can still be
+        // refused (a storm already in flight, a dominator mid-pulse), so a
+        // launch retries after [`SW_FIRE_RETRY_TICKS`] instead of
+        // monopolizing this tick's single command.
+        if tick >= self.next_sw_fire_tick
+            && let Some(sw_type) = sim.interner.get(opening.super_weapon_type)
+            && let Some(instance) = sim
+                .super_weapons()
+                .get(&self.house)
+                .and_then(|house_sws| house_sws.get(&sw_type))
+            && instance.charge_start_tick() != -1
+            && instance.is_active()
+            && instance.is_ready()
+            && let Some((rx, ry)) = self.superweapon_target(sim, opening)
+        {
+            self.next_sw_fire_tick = tick + SW_FIRE_RETRY_TICKS;
+            return vec![CommandEnvelope::new(
+                self.house,
+                at,
+                Command::LaunchSuperWeapon {
+                    sw_type_id: sw_type,
+                    target_rx: rx,
+                    target_ry: ry,
                 },
             )];
         }
@@ -469,15 +746,21 @@ impl SuperAi {
                     | crate::sim::production::ProductionCategory::Defense
             )
         });
-        // The climb's radar step is the retail radar class, not one fixed
-        // type: `[General] PrerequisiteRadar=GAAIRC,NARADR,AMRADR,NAPSIS`,
-        // and GAAIRC itself carries `ForbiddenHouses=Americans` — an
-        // Americans house builds AMRADR, its twin under the American id.
-        // Ask the native gate which member this house may build, in the
-        // list's own order; the opening's radar is the unreachable-mod
-        // fallback.
-        const RADAR_CLASS: [&str; 4] = ["GAAIRC", "NARADR", "AMRADR", "NAPSIS"];
-        let radar_name = RADAR_CLASS
+        // The climb's radar step resolves within the side's own radar
+        // class. GAAIRC is the Allied default and AMRADR its
+        // Americans-buildable twin (retail `ForbiddenHouses=Americans` on
+        // GAAIRC); Soviet and Yuri keep their own radar. The side must come
+        // first: the native CanBuild answers Yes without prerequisites for
+        // a house no human controls, so scanning the whole retail
+        // `PrerequisiteRadar=GAAIRC,NARADR,AMRADR,NAPSIS` class lets an AI
+        // Soviet or Yuri house accept the Allied Airforce Command (its
+        // `Owner=` lists every side). The gate still sorts the Allied pair
+        // — the forbidden-houses check runs for AI houses too.
+        let mut radar_candidates = [opening.radar, opening.radar];
+        if opening.radar == "GAAIRC" {
+            radar_candidates[1] = "AMRADR";
+        }
+        let radar_name = radar_candidates
             .into_iter()
             .find(|&name| {
                 rules.object(name).is_some_and(|ty| {
@@ -486,11 +769,11 @@ impl SuperAi {
                 })
             })
             .unwrap_or(opening.radar);
-        // Whether a tech-climb piece (the radar or the battle lab) is the
-        // building under construction. Those two carry the tier the whole
-        // strategy climbs for, so they alone may claim the income flow; a
-        // routine expansion building must not throttle the army that
-        // defends the base while it builds.
+        // Whether a tech-climb piece (the radar, the battle lab or the
+        // superweapon) is the building under construction. Those carry the
+        // tier the whole strategy climbs for, so they alone may claim the
+        // income flow; a routine expansion building must not throttle the
+        // army that defends the base while it builds.
         let tech_climb_busy = queue.iter().any(|item| {
             matches!(
                 item.queue_category,
@@ -498,7 +781,9 @@ impl SuperAi {
                     | crate::sim::production::ProductionCategory::Defense
             ) && {
                 let name = sim.interner.resolve(item.type_id);
-                name == radar_name || name == opening.battle_lab
+                name == radar_name
+                    || name == opening.battle_lab
+                    || name == opening.super_weapon_building
             }
         });
         if self
@@ -522,15 +807,26 @@ impl SuperAi {
                 // once the tier is secure.
                 (radar_name, 1),
                 (opening.battle_lab, 1),
+                // The superweapon step follows the lobby toggle for free:
+                // every retail one is `DisableableFromShell=yes`, so its
+                // cameo stays dark while superweapons are off (CanBuild
+                // refuses the building) and the step falls through to the
+                // expansion without occupying a slot.
+                (opening.super_weapon_building, 1),
                 (opening.power, POWER_TARGET),
                 (opening.war_factory, WAR_FACTORY_TARGET),
             ];
             // The first five steps are the opening; the expansion beyond
-            // them waits for the first main tank to leave the factory —
+            // them waits for a battle tank to leave the factory —
             // expanding production must not starve the pipeline it expands.
+            // The tier-2 tank counts once the lab stands, so the death of
+            // the first tanks never freezes the base at its opening size.
             const OPENING_STEPS: usize = 5;
+            let any_tank = self.count_units_of_type(sim, opening.main_tank)
+                + self.count_units_of_type(sim, opening.tier2_tank)
+                > 0;
             for (index, (name, target)) in ladder.iter().enumerate() {
-                if index >= OPENING_STEPS && self.count_units_of_type(sim, opening.main_tank) == 0 {
+                if index >= OPENING_STEPS && !any_tank {
                     break;
                 }
                 if self.count_structures_of_type(sim, name) >= *target {
@@ -547,6 +843,67 @@ impl SuperAi {
                         at,
                         Command::QueueProduction { type_id },
                     )];
+                }
+            }
+
+            // The growth tail: the base keeps expanding past the fixed
+            // ladder instead of reaching a scripted size and stopping.
+            // Whichever limb runs furthest behind claims the next slot —
+            // power only on an actual deficit (a base that browns out
+            // builds nothing, but a margin rule claims every growth slot
+            // under war damage: observed five plants while refineries sat
+            // at two), then war factories (the fourth as part of the
+            // standard build-out with no wallet bar — the ladder's
+            // superweapon drains the bank and the army queues absorb the
+            // income after, so a wallet gate never coincides with a free
+            // slot; observed a whole game stuck at three under bars of
+            // 3000 and 1500 alike — while the fifth and sixth wait for a
+            // deep wallet), then refineries while the miner fleet can
+            // feed another dock (two miners each). Every candidate
+            // still passes its own cameo, so a limb the house cannot build
+            // falls through to the next instead of wedging the queue.
+            if any_tank {
+                let (output, drain) =
+                    crate::sim::production::power_balance_for_owner(sim, rules, &owner);
+                let refineries = self.count_structures_of_type(sim, opening.refinery);
+                let factories = self.count_structures_of_type(sim, opening.war_factory);
+                let miners = opening
+                    .harvester
+                    .map(|miner| self.count_units_of_type(sim, miner))
+                    .unwrap_or(usize::MAX);
+                let growth = [
+                    (
+                        output - drain < 0
+                            && self.count_structures_of_type(sim, opening.power) < POWER_CAP,
+                        opening.power,
+                    ),
+                    (
+                        factories < FACTORY_BUILDOUT
+                            || (factories < FACTORY_CAP
+                                && crate::sim::production::credits_for_owner(sim, &owner)
+                                    > FACTORY_CREDITS),
+                        opening.war_factory,
+                    ),
+                    (
+                        refineries < REFINERY_CAP && miners >= refineries * 2,
+                        opening.refinery,
+                    ),
+                ];
+                for (behind, name) in growth {
+                    if !behind {
+                        continue;
+                    }
+                    if let Some(ty) = rules.object(name)
+                        && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
+                            .enabled
+                        && let Some(type_id) = sim.interner.get(name)
+                    {
+                        return vec![CommandEnvelope::new(
+                            self.house,
+                            at,
+                            Command::QueueProduction { type_id },
+                        )];
+                    }
                 }
             }
         }
@@ -597,17 +954,29 @@ impl SuperAi {
         }
 
         // The war factory stands: keep its queue busy — the economy first
-        // (miners up to the target), then tanks without pause. The tier-2
-        // tank takes over the moment its cameo lights up (the battle lab
-        // standing); until then the side's first tank rolls. A queue entered
-        // while short on credits simply waits for the money, as a native
-        // production event does.
+        // (miners up to the target), then the core tank until
+        // [`CORE_BEFORE_SPECIALISTS`] combat slots have been issued, then a
+        // wheel that sends every [`SPECIALIST_EVERY_VEHICLE`]th slot to the
+        // roster mix that reads the battlefield and the rest back to the
+        // core. The mix rides issued slots, not standing vehicles: under
+        // fire the army dies faster than the queue replaces it, and a
+        // live-count gate stays on core tanks forever (observed: a whole
+        // game with no IFV while the line hovered under six). The tier-2
+        // tank takes over the core the moment its cameo lights up (the
+        // battle lab standing); until then the side's first tank rolls. A
+        // queue entered while short on credits simply waits for the money,
+        // as a native production event does.
         let vehicle_busy = queue
             .iter()
             .any(|item| item.queue_category == crate::sim::production::ProductionCategory::Vehicle);
-        let economy_first = opening
-            .harvester
-            .is_some_and(|miner| self.count_units_of_type(sim, miner) < HARVESTER_TARGET);
+        let economy_first = opening.harvester.is_some_and(|miner| {
+            // Two miners per standing dock, floored at the opening target:
+            // the growth tail's refinery rule (below) builds the next dock
+            // while the fleet saturates the standing ones, and the fleet
+            // must then grow to match or the rule starves itself.
+            let refineries = self.count_structures_of_type(sim, opening.refinery);
+            self.count_units_of_type(sim, miner) < (refineries * 2).max(HARVESTER_TARGET)
+        });
         // The tier-2 tank takes over once the battle lab stands. The lab
         // standing is the switch's own condition: `cameo_draw_state` mirrors
         // only the sidebar's draw brightness (`StripClass::Draw`, no
@@ -616,12 +985,26 @@ impl SuperAi {
         // a tank the house cannot honestly field.
         let tier2_ready = self.count_structures_of_type(sim, opening.battle_lab) >= 1
             && sim.interner.get(opening.tier2_tank).is_some();
+        let core_tank = if tier2_ready {
+            opening.tier2_tank
+        } else {
+            opening.main_tank
+        };
         let vehicle_want = if economy_first {
             opening.harvester
-        } else if tier2_ready {
-            Some(opening.tier2_tank)
+        } else if self.vehicle_slots < CORE_BEFORE_SPECIALISTS as u32 {
+            Some(core_tank)
+        } else if self.vehicle_slots % SPECIALIST_EVERY_VEHICLE == SPECIALIST_EVERY_VEHICLE - 1 {
+            // The wheel's specialist slot: the roster role furthest behind
+            // its demanded share — lifted against hostile air or an
+            // out-tanking enemy — claims it, and an entry this house cannot
+            // field never does. With every share met the core keeps the
+            // line rolling: the wave pipeline refills instead of resting at
+            // a capped-out mix.
+            self.army_pick(sim, rules, opening.vehicles)
+                .or(Some(core_tank))
         } else {
-            Some(opening.main_tank)
+            Some(core_tank)
         };
         if !vehicle_busy
             && self.owns_structure_of_type(sim, opening.war_factory)
@@ -639,6 +1022,9 @@ impl SuperAi {
                 && crate::sim::production::credits_for_owner(sim, &owner) < ty.cost)
             && let Some(type_id) = sim.interner.get(name)
         {
+            if !economy_first {
+                self.vehicle_slots += 1;
+            }
             return vec![CommandEnvelope::new(
                 self.house,
                 at,
@@ -646,20 +1032,37 @@ impl SuperAi {
             )];
         }
 
-        // The barracks stands: keep its queue on the side's basic soldier.
+        // The barracks stands: keep its queue on the side's basic soldier
+        // until the core fills, then the same battlefield mix over the
+        // infantry roster.
         let infantry_busy = queue.iter().any(|item| {
             item.queue_category == crate::sim::production::ProductionCategory::Infantry
         });
+        // The same wheel as the vehicles: core soldiers for the first
+        // [`CORE_BEFORE_SPECIALISTS`] infantry slots, then every
+        // [`SPECIALIST_EVERY_INFANTRY`]th slot to the mix.
+        let infantry_want = if self.infantry_slots < CORE_BEFORE_SPECIALISTS as u32 {
+            Some(opening.basic_infantry)
+        } else if self.infantry_slots % SPECIALIST_EVERY_INFANTRY == SPECIALIST_EVERY_INFANTRY - 1 {
+            // The same mix over the infantry roster, the core soldier
+            // keeping the line rolling once every share is met.
+            self.army_pick(sim, rules, opening.infantry)
+                .or(Some(opening.basic_infantry))
+        } else {
+            Some(opening.basic_infantry)
+        };
         if !infantry_busy
             && self.owns_structure_of_type(sim, opening.barracks)
-            && let Some(ty) = rules.object(opening.basic_infantry)
+            && let Some(name) = infantry_want
+            && let Some(ty) = rules.object(name)
             && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
             // The same banked-credits gate: soldiers wait for their own
             // cost while a tech-climb piece claims the income flow.
             && !(tech_climb_busy
                 && crate::sim::production::credits_for_owner(sim, &owner) < ty.cost)
-            && let Some(type_id) = sim.interner.get(opening.basic_infantry)
+            && let Some(type_id) = sim.interner.get(name)
         {
+            self.infantry_slots += 1;
             return vec![CommandEnvelope::new(
                 self.house,
                 at,
@@ -755,6 +1158,159 @@ impl SuperAi {
                     && sim.interner.resolve(entity.type_ref()) == type_name
             })
             .count()
+    }
+
+    /// How many of the house's combat units — vehicle or infantry; the
+    /// engine files foot soldiers and the Rocketeer under `Infantry`, tanks
+    /// under `Unit` — are exactly this retail type name. The mix's fielded
+    /// count reads both: a soldiers-only count reads zero for an infantry
+    /// roster and the mix would never see its shares met.
+    fn count_combat_of_type(&self, sim: &crate::sim::world::Simulation, type_name: &str) -> usize {
+        sim.substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.owner() == self.house
+                    && matches!(
+                        entity.category(),
+                        crate::map::entities::EntityCategory::Unit
+                            | crate::map::entities::EntityCategory::Infantry
+                    )
+                    && sim.interner.resolve(entity.type_ref()) == type_name
+            })
+            .count()
+    }
+
+    /// How many combat units of exactly this retail type name stand under
+    /// hostile flags — the mix's air-pressure reading counts the enemy's
+    /// aircraft one type at a time.
+    fn count_enemy_units_of_type(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        type_name: &str,
+    ) -> usize {
+        sim.substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                self.is_enemy(sim, entity.owner())
+                    && matches!(
+                        entity.category(),
+                        crate::map::entities::EntityCategory::Unit
+                            | crate::map::entities::EntityCategory::Infantry
+                    )
+                    && sim.interner.resolve(entity.type_ref()) == type_name
+            })
+            .count()
+    }
+
+    /// The hostile vehicle count — the armor-pressure reading's enemy side.
+    fn count_enemy_vehicles(&self, sim: &crate::sim::world::Simulation) -> usize {
+        sim.substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                self.is_enemy(sim, entity.owner())
+                    && entity.category() == crate::map::entities::EntityCategory::Unit
+            })
+            .count()
+    }
+
+    /// The house's own vehicle count — the armor-pressure reading's home
+    /// side.
+    fn count_own_vehicles(&self, sim: &crate::sim::world::Simulation) -> usize {
+        sim.substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Unit
+            })
+            .count()
+    }
+
+    /// The specialist a wheel slot goes to once the core has its
+    /// [`CORE_BEFORE_SPECIALISTS`] slots: the roster role furthest behind
+    /// its demanded share. Hostile aircraft lift anti-air's demand to
+    /// [`ROLE_SHARE_BOOST`] — the mix fields answer guns instead of
+    /// losing the base to air it cannot touch — and an enemy that
+    /// out-tanks this house lifts armor-crackers the same way. A role
+    /// whose entries this house cannot field (country-locked types such
+    /// as the Germans' Tank Destroyer, a hero past its `BuildLimit`)
+    /// passes its turn to the next role behind, so the queue never rests
+    /// on a cameo that stays dark. `None` — every role meets its share —
+    /// hands the slot back to the caller's core.
+    fn army_pick(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        roster: &[RosterEntry],
+    ) -> Option<&'static str> {
+        let enemy_air: usize = AIR_THREAT_TYPES
+            .iter()
+            .map(|&name| self.count_enemy_units_of_type(sim, name))
+            .sum();
+        let anti_air_demand = if enemy_air > 0 {
+            ROLE_SHARE_BOOST
+        } else {
+            ROLE_SHARE_BASE
+        };
+        let anti_armor_demand = if self.count_enemy_vehicles(sim) > self.count_own_vehicles(sim) {
+            ROLE_SHARE_BOOST
+        } else {
+            ROLE_SHARE_BASE
+        };
+        let demands = [
+            (Role::AntiAir, anti_air_demand),
+            (Role::AntiArmor, anti_armor_demand),
+            (Role::AntiInfantry, ROLE_SHARE_BASE),
+            (Role::Siege, ROLE_SHARE_BASE),
+        ];
+        for (role, demand) in demands {
+            let fielded: usize = roster
+                .iter()
+                .filter(|entry| entry.role == role)
+                .map(|entry| self.count_combat_of_type(sim, entry.name))
+                .sum();
+            if fielded >= demand {
+                continue;
+            }
+            if let Some(entry) = roster.iter().find(|entry| {
+                entry.role == role
+                    && rules.object(entry.name).is_some_and(|ty| {
+                        crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
+                    })
+            }) {
+                return Some(entry.name);
+            }
+        }
+        None
+    }
+
+    /// Where a charged superweapon lands. The Iron Curtain is the one
+    /// friendly special — its invulnerability goes on this house's own
+    /// armor (organic infantry under the curtain take damage instead), so
+    /// it centers the first standing vehicle. The storm and the dominator
+    /// strike the enemy where it hurts most: their war factories if any
+    /// stand, else any structure, else the hostile mass center.
+    fn superweapon_target(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+    ) -> Option<(u16, u16)> {
+        if opening.super_weapon_targets_self {
+            let vehicle = sim.substrate.entities.iter_sorted().find(|(_, entity)| {
+                entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Unit
+            })?;
+            return Some((vehicle.1.position.rx(), vehicle.1.position.ry()));
+        }
+        let cell = self
+            .enemy_priority_targets(sim)
+            .first()
+            .map(|&(_, cell)| cell)
+            .or_else(|| self.enemy_center(sim))?;
+        Some((cell.0 as u16, cell.1 as u16))
     }
 
     /// The house's idle combat units for the opening's army types, in the
@@ -1110,6 +1666,47 @@ mod tests {
             &[(LaunchCountry::Russia, AiDifficulty::Easy)],
         );
         session.local_slot_mut().country = LaunchCountry::America;
+        // No roaming starting units: the local house opens with its own MCV.
+        session.options.unit_count = 0;
+        let scenario =
+            crate::headless_scenario::load_session(&ra2, map, 0x00C0_FFEE, session).unwrap();
+        let human = scenario
+            .sim()
+            .houses
+            .iter()
+            .find(|(_, house)| house.is_controlled_by_human(true))
+            .map(|(&id, _)| id)
+            .expect("the local house");
+        (scenario, human)
+    }
+
+    /// A retail Battle like [`retail_battle`] with the local house's country
+    /// and the lobby's superweapon toggle chosen by the caller; the local
+    /// house's identity.
+    fn retail_battle_as(
+        country: crate::skirmish_launch::LaunchCountry,
+        super_weapons: bool,
+    ) -> (
+        crate::headless_scenario::HeadlessScenario,
+        crate::sim::intern::InternedId,
+    ) {
+        use crate::skirmish_launch::AiDifficulty;
+
+        let ra2 = std::path::PathBuf::from(
+            std::env::var("RA2_DIR").expect("set RA2_DIR to the retail RA2/YR install directory"),
+        );
+        // A four-start map: fewer start waypoints than houses would seed the
+        // extra starts at random, which the lobby never allows.
+        let map = "XMP03T4.MAP";
+        let mut session = crate::headless_scenario::battle_session(
+            map,
+            &[(
+                crate::skirmish_launch::LaunchCountry::Russia,
+                AiDifficulty::Easy,
+            )],
+        );
+        session.local_slot_mut().country = country;
+        session.options.super_weapons = super_weapons;
         // No roaming starting units: the local house opens with its own MCV.
         session.options.unit_count = 0;
         let scenario =
@@ -1529,5 +2126,238 @@ mod tests {
         // this house nothing on top of its launch balance.
 
         assert_eq!(plain_house.economy().available_money(), starting_credits);
+    }
+
+    /// The growth slice: past the fixed ladder the base keeps expanding and
+    /// the army mixes its roster in, and with superweapons enabled the
+    /// opening's weather controller stands — the chain the lobby toggle
+    /// owns, exercised end to end.
+    #[test]
+    #[ignore = "slow; retail; loads a match and drives thousands of frames"]
+    fn fair_growth_mixes_the_roster_and_climbs_to_the_superweapon() {
+        let (mut scenario, human) =
+            retail_battle_as(crate::skirmish_launch::LaunchCountry::America, true);
+        let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
+
+        let structures = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == human
+                        && entity.category() == crate::map::entities::EntityCategory::Structure
+                        && scenario.sim().interner.resolve(entity.type_ref()) == name
+                })
+                .count()
+        };
+        let units = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == human
+                        && matches!(
+                            entity.category(),
+                            crate::map::entities::EntityCategory::Unit
+                                | crate::map::entities::EntityCategory::Infantry
+                        )
+                        && scenario.sim().interner.resolve(entity.type_ref()) == name
+                })
+                .count()
+        };
+
+        // End-state counts are war reports, not build logs: by 42000 ticks
+        // the enemy has razed factories (observed: a ladder-complete base
+        // read GAWEAP=1 mid-rebuild), so the assertion asks what stood at
+        // each tick's best moment, not what survived to the last one.
+        #[derive(Default)]
+        struct Seen {
+            superweapon: usize,
+            factories: usize,
+            refineries: usize,
+            power: usize,
+            ifv: usize,
+            guardian: usize,
+        }
+        let seen = std::cell::RefCell::new(Seen::default());
+        let tick = drive_until(&mut scenario, &mut ai, 42000, |scenario| {
+            let mut seen = seen.borrow_mut();
+            seen.superweapon = seen.superweapon.max(structures(scenario, "GAWEAT"));
+            seen.factories = seen.factories.max(structures(scenario, "GAWEAP"));
+            seen.refineries = seen.refineries.max(structures(scenario, "GAREFN"));
+            seen.power = seen.power.max(structures(scenario, "GAPOWR"));
+            seen.ifv = seen.ifv.max(units(scenario, "FV"));
+            seen.guardian = seen.guardian.max(units(scenario, "GGI"));
+            seen.superweapon >= 1 && seen.factories >= 4 && seen.ifv >= 1 && seen.guardian >= 1
+        });
+        let seen = seen.into_inner();
+        // The census names the vehicle line's every member and the queue's
+        // current items: which gate held the mix back is a question about
+        // counts (miners, core tanks, army size) and the queue's contents,
+        // and one slow rerun must answer it outright.
+        let queue_names = |scenario: &crate::headless_scenario::HeadlessScenario| {
+            crate::sim::production::queue_view_for_owner(
+                scenario.sim(),
+                &scenario.runtime.resources.rules,
+                scenario.sim().interner.resolve(human),
+            )
+            .iter()
+            .map(|item| {
+                format!(
+                    "{:?}:{}",
+                    item.queue_category,
+                    scenario.sim().interner.resolve(item.type_id)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+        };
+        // One combined assertion with the full census: a slow retail test
+        // must explain its whole end state in one panic, not one fact per
+        // rerun.
+        assert!(
+            seen.superweapon >= 1 && seen.factories >= 4 && seen.ifv >= 1 && seen.guardian >= 1,
+            "growth slice incomplete at tick {tick}: GAWEAT={} GAWEAP={} refineries={} \
+             power={} FV={} GGI={} credits={} miners={} MTNK={} SREF={} E1={} queue=[{}]",
+            seen.superweapon,
+            seen.factories,
+            seen.refineries,
+            seen.power,
+            seen.ifv,
+            seen.guardian,
+            crate::sim::production::credits_for_owner(
+                scenario.sim(),
+                scenario.sim().interner.resolve(human),
+            ),
+            units(&scenario, "CMIN"),
+            units(&scenario, "MTNK"),
+            units(&scenario, "SREF"),
+            units(&scenario, "E1"),
+            queue_names(&scenario),
+        );
+    }
+
+    /// The Soviet house climbs on its own radar class only. The native
+    /// CanBuild answers Yes without prerequisites for a house no human
+    /// controls, so the earlier whole-class scan let a Soviet house queue
+    /// the Allied Airforce Command (its `Owner=` lists every side); the
+    /// side-scoped candidates keep GAAIRC and its American twin out of a
+    /// Russian base.
+    #[test]
+    #[ignore = "slow; retail; loads a match and drives thousands of frames"]
+    fn soviet_climb_builds_the_soviet_radar_class_only() {
+        let (mut scenario, human) =
+            retail_battle_as(crate::skirmish_launch::LaunchCountry::Russia, true);
+        let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
+
+        let structures = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == human
+                        && entity.category() == crate::map::entities::EntityCategory::Structure
+                        && scenario.sim().interner.resolve(entity.type_ref()) == name
+                })
+                .count()
+        };
+
+        // The Soviet opening is pricier than the Allied one (a power plant
+        // costs 600 against 300, the radar 2000 against 1000), so the Fair
+        // climb needs the wider budget; the census in the panic separates a
+        // slow climb from a stalled one.
+        let tick = drive_until(&mut scenario, &mut ai, 40000, |scenario| {
+            structures(scenario, "NARADR") >= 1
+        });
+        assert!(
+            structures(&scenario, "NARADR") >= 1,
+            "no Soviet radar at tick {tick}: power={} refineries={} barracks={} \
+             factory={} NARADR={} NATECH={}",
+            structures(&scenario, "NAPOWR"),
+            structures(&scenario, "NAREFN"),
+            structures(&scenario, "NAHAND"),
+            structures(&scenario, "NAWEAP"),
+            structures(&scenario, "NARADR"),
+            structures(&scenario, "NATECH"),
+        );
+        assert_eq!(
+            structures(&scenario, "GAAIRC"),
+            0,
+            "no Allied Airforce Command in a Soviet base"
+        );
+        assert_eq!(structures(&scenario, "AMRADR"), 0, "nor its American twin");
+    }
+
+    /// With the lobby's superweapon toggle off the chain never starts: the
+    /// Weather Controller's cameo stays dark (CanBuild refuses the
+    /// `DisableableFromShell=yes` building while the toggle is off), so no
+    /// instance is granted, charged or fired while the rest of the climb
+    /// walks past the step.
+    #[test]
+    #[ignore = "slow; retail; loads a match and drives thousands of frames"]
+    fn superweapons_off_skips_the_superweapon_entirely() {
+        let (mut scenario, human) =
+            retail_battle_as(crate::skirmish_launch::LaunchCountry::America, false);
+        let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
+
+        let structures = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == human
+                        && entity.category() == crate::map::entities::EntityCategory::Structure
+                        && scenario.sim().interner.resolve(entity.type_ref()) == name
+                })
+                .count()
+        };
+
+        // The battle lab standing proves the ladder walked past the
+        // superweapon step (it sits between the lab and the expansion)
+        // instead of stalling on a dark cameo.
+        let tick = drive_until(&mut scenario, &mut ai, 28000, |scenario| {
+            structures(scenario, "GATECH") >= 1
+        });
+        assert!(
+            structures(&scenario, "GATECH") >= 1,
+            "the climb passed the battle lab (tick {tick})"
+        );
+        assert_eq!(
+            structures(&scenario, "GAWEAT"),
+            0,
+            "the superweapon building never stood"
+        );
+        // The engine constructs every super's entry for a house at scenario
+        // start (`SuperClass` constructor, inactive); the toggle-off pass
+        // merely never grants one (`Deactivate`: "the entry stays"). And a
+        // country's own support powers stay out of scope: America's
+        // paratroopers (`SuperWeapon=AmericanParaDropSpecial` on the country
+        // section) are granted with the country, not by a
+        // `DisableableFromShell` building. So the proof of "off" is the
+        // side's superweapon special — the storm — never activating, not an
+        // empty or fully-inactive map.
+        let storm = scenario
+            .sim()
+            .interner
+            .get("LightningStormSpecial")
+            .and_then(|sw_type| {
+                scenario
+                    .sim()
+                    .super_weapons()
+                    .get(&human)
+                    .and_then(|house_sws| house_sws.get(&sw_type))
+            });
+        assert!(
+            storm.is_none_or(|sw| !sw.is_active()),
+            "the storm special is never granted while the toggle is off"
+        );
     }
 }

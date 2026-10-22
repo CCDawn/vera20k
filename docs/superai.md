@@ -223,6 +223,67 @@ tank's whole build time), so every single-unit order now passes a
 per-unit reissue gate (`IDLE_REORDER_TICKS`): an order the command
 layer drops costs one tick, not the branch's whole attention.
 
+The situation slice gives the strategy the three things its first pass
+lacked. **Superweapons follow the lobby setting** — the build ladder's
+superweapon step (Weather Controller, Iron Curtain, Psychic Dominator,
+right behind the battle lab) needs no toggle of its own: every retail
+superweapon is `DisableableFromShell=yes`, so `can_build` refuses the
+building while the lobby toggle is off, its cameo stays dark and the
+step falls through to the expansion; with it on, a charged instance
+fires (charge gate, active and ready — the fire button's own
+admission), the Iron Curtain centering the first standing own vehicle
+(its invulnerability buffs armor; organic infantry under it take
+damage) and the storm/dominator striking the hostile war factories if
+any stand, else any structure, else the hostile mass center; a refused
+launch (a storm already in flight, a dominator mid-pulse) retries after
+150 ticks instead of spinning the branch. **The army mixes its whole
+roster in**, chosen by the situation: each side's vehicle and infantry
+rosters carry retail-evidenced roles (anti-air picks cite the weapon's
+`AA=yes` projectile; the Tank Destroyer is Germans-only, the Tesla Tank
+Russians-only), the queue fills the core tank/soldier for the first
+six issued combat slots, then a wheel sends every fourth vehicle slot
+(every third infantry slot) to the role furthest behind its demanded
+share — the mix rides issued slots, not standing vehicles: under
+attrition the army dies faster than the queue replaces it, and a
+live-count gate stayed on core tanks forever (observed: a whole game
+with no IFV while the line hovered under six) — and hostile aircraft
+(`AIR_THREAT_TYPES`: Rocketeer, Kirov, Harrier, Black Hawk, Hind,
+Floating Disk) lift anti-air's demand to three, an enemy that
+out-tanks the house lifts armor-crackers the same way — and a role
+whose entries this house cannot field (country-locked types, a hero
+past its `BuildLimit`) passes its turn to the next role behind, so the
+queue never rests on a cameo that stays dark; when every share is met
+the core keeps the queues rolling — the wave pipeline refills instead
+of resting at a capped-out mix, and the miner target scales with the
+standing docks so the refinery rule never starves itself. The
+specialists the wheel fields hold the base for now — wave dispatch
+names only the opening's core types, so specialists marching with the
+attack waves is a follow-up. **The base
+keeps expanding** past the fixed ladder (the earlier freeze: the ladder broke
+on a live main-tank count of zero, so once the army switched to tier-2
+tanks the base stopped growing forever): a growth tail queues whichever
+limb runs furthest behind — power only on an actual deficit (the
+margin rule claimed every growth slot under war damage: five plants
+while refineries sat at two), war factories (the fourth queues as
+part of the standard build-out with no wallet bar — the ladder's
+superweapon drains the bank and the army queues absorb the income
+after, so a wallet gate never coincides with a free slot; observed a
+whole game stuck at three under bars of 3000 and 1500 alike, the item
+drawing its cost as it builds the native way — while the fifth and
+sixth wait for a wallet over 1500 credits, capped at six by retail's
+`MultipleFactory=0.8` shrinking returns), refineries while the miner
+fleet can feed another dock (two miners each, capped at four) — and the expansion gate now counts the tier-2 tank
+too. The radar climb is also side-scoped: the native `can_build`
+answers Yes without prerequisites for a house no human controls, so
+the earlier whole-`PrerequisiteRadar`-class scan let a Soviet or Yuri
+house queue the Allied Airforce Command (its `Owner=` lists every
+side); the candidates now start from the side's own radar. Three
+retail regressions cover the slice: a Fair Battle driven until the
+Weather Controller, four war factories, an IFV and a Guardian GI all
+stand; a Russian house driven until its Soviet radar stands with zero
+Allied radars in the base; and a superweapons-off Battle driven past
+the battle lab with no superweapon ever built or granted.
+
 ## Upstream sync
 
 `superai/base` merges `origin/main` regularly; each pillar lands on its own
