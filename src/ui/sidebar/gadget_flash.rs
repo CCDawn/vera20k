@@ -243,8 +243,11 @@ impl SidebarGadgetState {
     }
 
     /// Display4AC8C0(0)/4AC660(0): a pending building placement refuses mode
-    /// changes. Display's Power/Waypoint/Beacon bytes have no active owner;
-    /// the independent PlanMgr and bare Super pointer are not canceled.
+    /// changes. Only the Repair/Sell bytes clear here; the Beacon byte has
+    /// its own owner (app::input::beacon, 4AC960). Power (4AC820) and the
+    /// Waypoint byte (+0x11B3, 4AC700) are never armed in YR, and the
+    /// PlanMgr planning mode and the bare Super pointer are separate owners
+    /// these Display setters do not cancel.
     pub(crate) fn disable_selection_modes(&mut self, placement_armed: bool) {
         if !placement_armed {
             self.repair_mode_on = false;
@@ -346,6 +349,30 @@ mod tests {
         assert!(!state.repair_mode_on && state.sell_mode_on);
         assert!(!state.toggle_selection_mode(SelectionMode::Sell, false, 1));
         assert!(!state.repair_mode_on && !state.sell_mode_on);
+    }
+
+    /// The team-key prologue (Recall731205, CenterCamera7313DE, AddTeam7314FD)
+    /// calls this owner for SetRepairMode(0) 0x4AC8C0 / SetSellMode(0)
+    /// 0x4AC660: a pending building placement refuses both, and the beacon
+    /// byte (+0x11B4) stays with its own owner (app::input::beacon, 4AC960).
+    #[test]
+    fn disable_selection_modes_refuses_placement_and_leaves_the_beacon_byte() {
+        let mut state = SidebarGadgetState::new();
+        state.repair_mode_on = true;
+        state.sell_mode_on = true;
+        state.place_beacon_mode_on = true;
+        state.disable_selection_modes(true);
+        assert!(
+            state.repair_mode_on && state.sell_mode_on,
+            "a pending placement refuses 4AC8C0(0)/4AC660(0)"
+        );
+        assert!(
+            state.place_beacon_mode_on,
+            "the beacon byte belongs to 4AC960's owner, not this one"
+        );
+        state.disable_selection_modes(false);
+        assert!(!state.repair_mode_on && !state.sell_mode_on);
+        assert!(state.place_beacon_mode_on);
     }
 
     #[test]
