@@ -361,15 +361,48 @@ impl StableIdCursor {
     }
 }
 
-/// The object kinds the LogicVector registration/removal dispatch
-/// distinguishes (F13). Classification probes the stores in this fixed order:
-/// anims → voxel anims → particle systems → terrain objects → projectiles →
-/// waves → entities — the pre-consolidation dispatch order with the
-/// `VoxelAnimClass` registry inserted next to the other ObjectClass registry it
-/// shares a death with. Object IDs are unique across stores (one monotonic
-/// `next_stable_object_id` namespace), so at most one store can match.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ObjectKind {
+/// Declares [`ObjectKind`] and [`ObjectKind::ALL`] from one list, so every
+/// walk over `ALL` covers a new kind.
+macro_rules! object_kinds {
+    ($($(#[$doc:meta])* $kind:ident,)+) => {
+        /// The ObjectClass kinds the stores hold, one per store. Object IDs are
+        /// unique across stores (one monotonic `next_stable_object_id`
+        /// namespace), so an ID names one kind ([`Simulation::classify_object`]).
+        /// Each lifecycle dispatch matches on the kind without a wildcard, so a
+        /// new kind must take a side in every one:
+        ///
+        /// | Kind | Logic | Pointer expiry | Ready to delete |
+        /// | --- | --- | --- | --- |
+        /// | `Entity` | member | listens | `!ObjectAlive` |
+        /// | `Anim` | member | listens | out of Logic |
+        /// | `VoxelAnim` | member | Object's (`0x005F5230`): nothing to clear | VERA removes it on its AI's Delete (`visit_voxel_anim`); native's UnInit (`0x005F65F0`) queues it |
+        /// | `Spotlight` | member | `0x00436A00`, apart from the roster | `!ObjectAlive` |
+        /// | `ParticleSystem` | member | listens | done and empty (`0x0062FE60`) |
+        /// | `Terrain` | member | `0x0071CFD0`: Object's retained successor relink | dead and out of Logic |
+        /// | `Projectile` | member | listens | out of Logic |
+        /// | `Wave` | member | listens | out of Logic |
+        /// | `Smudge` | never | Object's: nothing to clear | `!ObjectAlive` |
+        /// | `Particle` | never: its type's Logic byte (`+0x234`, zeroed at `0x00644DB5`) is clear, so Unlimbo skips RegisterObject (`0x005F4FEF`); its system runs it | Object's: nothing to clear | `!ObjectAlive` (`0x005F6690`) |
+        ///
+        /// A snapshot restore registers every kind's IDs (`RestoredObjectIndex`).
+        ///
+        /// [`Simulation::classify_object`]: super::Simulation::classify_object
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum ObjectKind {
+            $($(#[$doc])* $kind,)+
+        }
+
+        impl ObjectKind {
+            /// Every kind, in [`Simulation::classify_object`]'s probe order.
+            ///
+            /// [`Simulation::classify_object`]: super::Simulation::classify_object
+            pub(crate) const ALL: [Self; [$(ObjectKind::$kind),+].len()] = [$(Self::$kind),+];
+        }
+    };
+}
+
+object_kinds! {
+    Entity,
     Anim,
     VoxelAnim,
     Spotlight,
@@ -378,7 +411,29 @@ pub(crate) enum ObjectKind {
     Projectile,
     Wave,
     Smudge,
-    Entity,
+    /// A `ParticleClass` (vtable `0x007EF954`) in its system or detached
+    /// from it; the Display Air layer holds it (`reveal_particle`). Finding
+    /// one walks the systems, so it is probed last.
+    Particle,
+}
+
+impl ObjectKind {
+    /// Whether this kind's objects join LogicClass (`RegisterObject @
+    /// 0x0055BAA0`). A smudge never does, and a particle is run by its
+    /// system's AI.
+    pub(crate) const fn joins_logic(self) -> bool {
+        match self {
+            Self::Smudge | Self::Particle => false,
+            Self::Entity
+            | Self::Anim
+            | Self::VoxelAnim
+            | Self::Spotlight
+            | Self::ParticleSystem
+            | Self::Terrain
+            | Self::Projectile
+            | Self::Wave => true,
+        }
+    }
 }
 
 /// Owns the active-object order and the substrate's monotonic counters. Field
@@ -423,6 +478,10 @@ pub struct ObjectSubstrate {
     /// Plain-struct entity storage (dense, in stable_id order, + infantry registry).
     /// The authoritative object store — serialized verbatim (NOT skipped).
     pub(crate) entities: EntityStore,
+    /// Synchronous Phobos limbo hook controls; stable saves restore enabled/idle.
+    #[cfg(feature = "phobos")]
+    #[serde(skip)]
+    pub(crate) phobos_limbo_control: crate::sim::house_tracking::PhobosLimboControl,
     /// Separate AnimClass registry sharing the global object ID namespace and
     /// LogicVector with entities.
     #[serde(default)]
@@ -463,6 +522,8 @@ impl ObjectSubstrate {
             air_slots: AirSlotGrid::default(),
             base_reservations: CellReservationGrid::new(),
             entities: EntityStore::new(),
+            #[cfg(feature = "phobos")]
+            phobos_limbo_control: Default::default(),
             anims: AnimStore::default(),
             voxel_anims: VoxelAnimStore::default(),
             spotlights: Default::default(),
@@ -473,6 +534,15 @@ impl ObjectSubstrate {
 }
 
 impl ObjectSubstrate {
+    /// Shared identity source for every modeled runtime `AbstractClass` analogue.
+    ///
+    /// `AbstractClass::Create_ID @ 0x00410230` delegates to
+    /// `ScenarioClass::NextUniqueID @ 0x0068BCB0`; individual stores therefore
+    /// must not own independent counters.
+    pub fn allocate_stable_id(&mut self) -> u64 {
+        self.next_stable_object_id.allocate(&self.entities)
+    }
+
     /// Restore-time validation of the substrate's monotonic counters and the
     /// deserialized LogicVector (F13; moved verbatim from
     /// `restore_after_snapshot_load`, which remains the ordered coordinator).

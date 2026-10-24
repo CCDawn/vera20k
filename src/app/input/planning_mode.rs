@@ -4,7 +4,6 @@
 use crate::app::AppState;
 use crate::app::input::hotkeys::{HotkeyCommand, HotkeyResolution};
 use crate::audio::events::{GameSoundEvent, SoundEventQueue};
-use crate::net::lockstep::SynchronizedCommand;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::command::CommandEnvelope;
 use crate::sim::selection::SelectionState;
@@ -41,6 +40,9 @@ impl PlanningInputState {
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
+    /// Install supplied state for local-handler comparison fixtures. Player
+    /// load uses reset; it does not restore active YR planning.
+    #[cfg(test)]
     pub(crate) fn restore_active(&mut self, active: bool) {
         self.active = active;
         self.key = None;
@@ -51,7 +53,7 @@ impl PlanningInputState {
     /// The single PlanMgr6379C0/637A10 transition, also reached by
     /// House4FC1EE. Return the native OutList event to the caller's existing
     /// scheduler; a House visit must admit it before this frame's dispatch.
-    /// Original1cdd controls: tools/spatial_oracle/planning_local_defeat.
+    /// Original gamemd controls: tools/spatial_oracle/planning_local_defeat.
     pub(crate) fn set_active(
         &mut self,
         active: bool,
@@ -71,7 +73,7 @@ impl PlanningInputState {
             sim.and_then(|sim| {
                 let owner = sim.session().current_house()?;
                 let record = sim.encode_plan_commit_record(owner)?;
-                SynchronizedCommand::opaque(record).decode_for_simulation(sim, sim.session().tick())
+                Some(CommandEnvelope::synchronized(record, sim.session().tick()))
             })
         };
         if !active {
@@ -229,7 +231,7 @@ fn set_active(state: &mut AppState, active: bool) {
         &mut state.match_state.match_audio.sound_events,
     );
     if let (Some(rt), Some(command)) = (rt, command) {
-        rt.simulation.queue_command(command);
+        rt.simulation.issue_local_command(command);
     }
 }
 
@@ -273,6 +275,7 @@ fn queue_orders_in_sim(
             order.payload,
             crate::sim::command::Command::TogglePrimaryFactory { .. }
                 | crate::sim::command::Command::SetRally { .. }
+                | crate::sim::command::Command::ArchiveObject { .. }
                 | crate::sim::command::Command::SellBuilding { .. }
                 | crate::sim::command::Command::UndeployBuilding { .. }
                 | crate::sim::command::Command::MoveFlash { .. }
@@ -283,19 +286,15 @@ fn queue_orders_in_sim(
             // refused as DEPLOY9; a mobile self-click is Unload16.
             // ClickedAction_Cell builds the MoveFlash (`0x004D7EB5`) before
             // its Move reaches Player_Send_Command.
-            sim.queue_command(order);
+            sim.issue_local_command(order);
             added = true;
             continue;
         }
         let Some(record) = sim.encode_planning_order_record(order.owner, &order.payload) else {
             continue;
         };
-        if let Some(envelope) =
-            SynchronizedCommand::opaque(record).decode_for_simulation(sim, order.execute_tick)
-        {
-            sim.queue_command(envelope);
-            added = true;
-        }
+        sim.issue_local_command(CommandEnvelope::synchronized(record, order.execute_tick));
+        added = true;
     }
     Ok(added)
 }
@@ -398,14 +397,13 @@ pub(crate) fn connect_at_cursor(state: &mut AppState) -> bool {
     if let Some(rt) = state.match_state.sim_runtime.as_mut()
         && let Some(owner) = rt.simulation.session().current_house()
     {
-        for actor in rt.simulation.planning_connect_actors(owner, &selected) {
+        for actor in rt.simulation.planning_connect_actors(&selected) {
             if let Some(record) = rt
                 .simulation
                 .encode_plan_connect_record_at_screen(owner, actor, point)
-                && let Some(command) = SynchronizedCommand::opaque(record)
-                    .decode_for_simulation(&rt.simulation, rt.simulation.session().tick())
             {
-                rt.simulation.queue_command(command);
+                let command = CommandEnvelope::synchronized(record, rt.simulation.session().tick());
+                rt.simulation.issue_local_command(command);
             }
         }
     }
@@ -413,10 +411,11 @@ pub(crate) fn connect_at_cursor(state: &mut AppState) -> bool {
 }
 
 /// Residual: native Delete (0x00731A10) deletes the retained highlight
-/// AC4BF0 (0x0063AC60), not the node under the cursor.
-pub(crate) fn delete_at_cursor(state: &mut AppState) {
+/// AC4BF0 (0x0063AC60), not the node under the cursor. False when there is
+/// no node, where Delete turns to the selected beacon (0x00731A24).
+pub(crate) fn delete_at_cursor(state: &mut AppState) -> bool {
     if hover_native_screen(state).is_none() {
-        return;
+        return false;
     }
     let point = cursor_native_screen(state);
     if let Some(rt) = state.match_state.sim_runtime.as_mut()
@@ -424,11 +423,12 @@ pub(crate) fn delete_at_cursor(state: &mut AppState) {
         && let Some(record) = rt
             .simulation
             .encode_plan_node_delete_record_at_screen(owner, point)
-        && let Some(command) = SynchronizedCommand::opaque(record)
-            .decode_for_simulation(&rt.simulation, rt.simulation.session().tick())
     {
-        rt.simulation.queue_command(command);
+        let command = CommandEnvelope::synchronized(record, rt.simulation.session().tick());
+        rt.simulation.issue_local_command(command);
+        return true;
     }
+    false
 }
 
 #[cfg(test)]
@@ -594,39 +594,19 @@ mod tests {
             ),
             (
                 7,
-                Command::EnterTransport {
-                    passenger_id: 42,
-                    transport_id: 43,
-                },
-            ),
-            (
-                7,
-                Command::EnterBunker {
-                    unit_id: 42,
-                    bunker_id: 43,
-                },
-            ),
-            (
-                7,
-                Command::RepairAtDepot {
-                    entity_id: 42,
-                    depot_id: 43,
-                },
-            ),
-            (
-                7,
-                Command::MinerReturn {
-                    entity_id: 42,
-                    target_refinery_id: Some(43),
-                },
+                Command::clicked_mission(
+                    42,
+                    crate::sim::mission::MissionType::Enter,
+                    crate::sim::combat::TargetKind::Entity(43),
+                ),
             ),
             (
                 10,
-                Command::HarvestCell {
-                    entity_id: 42,
-                    target_rx: 5,
-                    target_ry: 6,
-                },
+                Command::clicked_mission(
+                    42,
+                    crate::sim::mission::MissionType::Harvest,
+                    crate::sim::combat::TargetKind::Cell(5, 6),
+                ),
             ),
         ];
         for (mission, payload) in commands {
@@ -640,7 +620,7 @@ mod tests {
                 .is_ok_and(|added| added),
                 "lost {payload:?}"
             );
-            let queued = sim.take_due_commands();
+            let queued = sim.take_frame_commands_for_test();
             assert_eq!(queued.len(), 1);
             let Command::PlanningRecord { record } = &queued[0].payload else {
                 panic!("ordinary order escaped planning");
@@ -659,13 +639,17 @@ mod tests {
                 rx: 5,
                 ry: 6,
             },
+            Command::ArchiveObject {
+                entity_id: 42,
+                target_id: 43,
+            },
             Command::SellBuilding { entity_id: 42 },
             Command::UndeployBuilding { entity_id: 42 },
             Command::MoveFlash { rx: 5, ry: 6 },
         ] {
             let envelope = CommandEnvelope::new(local, 0, payload);
             assert!(queue_orders_in_sim(&mut sim, local, &[42], vec![envelope.clone()]).unwrap());
-            assert_eq!(sim.take_due_commands(), vec![envelope]);
+            assert_eq!(sim.take_frame_commands_for_test(), vec![envelope]);
         }
         for payload in [
             Command::DeployMcv { entity_id: 42 },
@@ -681,7 +665,7 @@ mod tests {
                 )
                 .unwrap()
             );
-            let queued = sim.take_due_commands();
+            let queued = sim.take_frame_commands_for_test();
             assert_eq!(queued.len(), 1);
             let Command::PlanningRecord { record } = &queued[0].payload else {
                 panic!("mobile self-click escaped Planning Mode");
@@ -942,14 +926,19 @@ mod tests {
     }
 
     #[test]
-    fn restored_planning_preserves_mode_without_retaining_physical_key() {
+    fn fixture_activation_does_not_retain_physical_key() {
         let mut input = PlanningInputState::default();
         input.key_transition(true, KeyCode::KeyZ, true, false);
         input.restore_active(true);
         assert!(input.active());
         assert!(!input.owns_key(KeyCode::KeyZ));
+        input.key_transition(true, KeyCode::KeyZ, true, false);
+        input.node_deleted(99, Some(7));
+        assert!(input.owns_key(KeyCode::KeyZ));
         input.reset();
         assert!(!input.active());
+        assert!(!input.owns_key(KeyCode::KeyZ));
+        assert_eq!(input.highlighted_node(), None);
     }
 
     #[test]

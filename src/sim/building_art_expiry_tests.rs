@@ -161,8 +161,8 @@ fn scene(golden: &Value, row: &Value) -> (Simulation, RuleSet, u64, u64) {
     sim.scenario_rng =
         SimRng::from_native_state_hex_for_test(row["rng_before"]["scenario"].as_str().unwrap());
     let building = case["building"].as_str().unwrap();
-    let id = sim.allocate_stable_id();
-    let contact = sim.allocate_stable_id();
+    let id = sim.substrate.allocate_stable_id();
+    let contact = sim.substrate.allocate_stable_id();
     let mut actor =
         GameEntity::test_default_of_category(contact, "HTNK", "A", 10, 10, EntityCategory::Unit);
     actor.set_type_ref_for_test(sim.interner.intern("HTNK"));
@@ -203,9 +203,7 @@ fn scene(golden: &Value, row: &Value) -> (Simulation, RuleSet, u64, u64) {
     // Negative native vector counts have no equivalent valid Rust vector;
     // this control supplies its empty predicate, without certifying malformed state.
     if case["garrison_count"].as_i64().unwrap_or(0) > 0 {
-        let mut cargo = crate::sim::passenger::PassengerCargo::new(1, 0.0);
-        cargo.board_forced_chain(&[(contact, 1.0)]);
-        entity.passenger_role = crate::sim::passenger::PassengerRole::transport(cargo);
+        entity.passenger_role.occupants_mut().add(contact);
     }
     sim.substrate.entities.insert(entity);
     let slot = integer(&case["slot"]) as u8;
@@ -404,7 +402,7 @@ fn original_64_slot_expiry_controls_and_actual_sprite_frame_histories() {
         } else if case["scalar_clear"] == true {
             sim.clear_building_anim_slot(id, integer(&case["slot"]) as u8);
         } else {
-            sim.building_anim_pointer_expired(expired, Some(&rules));
+            sim.building_anim_pointer_expired(expired, &rules);
         }
         assert_boundary(&sim, id, &row["after"], name);
         let after = sim.entities().get(id).unwrap();
@@ -489,7 +487,7 @@ fn snapshot_restores_completed_retraction_and_independent_building_marker() {
             restored.anim(expired).unwrap().is_building_anim(),
             sim.anim(expired).unwrap().is_building_anim()
         );
-        restored.building_anim_pointer_expired(expired, Some(&rules));
+        restored.building_anim_pointer_expired(expired, &rules);
         assert_boundary(&restored, id, &row["after"], name);
     }
 }

@@ -17,8 +17,8 @@
 //! Render-agnostic: depends only on `ui::shell` + `std` (no sim/render/assets),
 //! honouring the `ui/` layering rule. The app layer (`app::frontend::shell_transition`) maps
 //! the showing screen to a `DialogId`, drives the wave each frame, and plays the
-//! start cue (`GUIMoveInSound`, stock `MenuSlideIn`); the stock-empty end cue
-//! (`ShellButtonSlideSound`) stays silent.
+//! start cue (`GUIMoveInSound`, stock `MenuSlideIn`) and the end cue
+//! (`ShellButtonSlideSound`, empty in stock rules).
 
 use std::time::{Duration, Instant};
 
@@ -305,6 +305,61 @@ pub(crate) const RENDERED_SHELL_SLIDES: &[SlideDialogSpec] = &[
         top_panel: false,
         campaign_score: false,
     },
+    // The WOL persona questions 0x112 (Yes, then No) and 0xFE (OK, created
+    // disabled and still counted, then Cancel): executed slide records.
+    SlideDialogSpec {
+        dialog_id: 0x0112,
+        top_buttons: 1,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: false,
+    },
+    // 0x117: Cancel only; 0x122: Yes, then No (executed slide records).
+    SlideDialogSpec {
+        dialog_id: 0x0117,
+        top_buttons: 0,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: false,
+    },
+    SlideDialogSpec {
+        dialog_id: 0x0122,
+        top_buttons: 1,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: false,
+    },
+    // 0x116: Create, Join, Add, Page and Remove, then Back: the executed
+    // slide record.
+    SlideDialogSpec {
+        dialog_id: 0x0116,
+        top_buttons: 5,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: false,
+    },
+    // 0x114: Play Buddy, Clan, Tournament, Forget (template-disabled,
+    // counted) and Manage, then Back: the executed slide record.
+    SlideDialogSpec {
+        dialog_id: 0x0114,
+        top_buttons: 5,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: false,
+    },
+    SlideDialogSpec {
+        dialog_id: 0x00FE,
+        top_buttons: 1,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: false,
+    },
     SlideDialogSpec {
         dialog_id: 0x00D6,
         top_buttons: 0,
@@ -426,16 +481,6 @@ pub(crate) enum PanelArt {
     /// it under the dialog, so a renderer needs no second draw; the fixture
     /// still records the native call for the slide-out tail.
     ScrBackdrop,
-}
-
-/// Top-left of a column row's SDBTNANM frame `shape_w` wide: right-aligned
-/// over the row's tile, as `0x006071E0` draws it (the executed positions in
-/// `tools/storage_oracle/shell_slide_engine.json`).
-pub(crate) fn column_draw_origin(panel: RightPanelRects, row: u32, shape_w: i32) -> (i32, i32) {
-    (
-        panel.tile.x + panel.tile.w - shape_w,
-        panel.tile.y + row as i32 * panel.tile.h,
-    )
 }
 
 /// Top-left of a top-panel shape of `shape_w` x `shape_h`: SDTP and SDWRNTMP
@@ -955,8 +1000,8 @@ mod tests {
     /// position helper, as `CC_Draw_Shape` receives it: `[x, y, frame]`.
     fn button_draw_at(screen: (i32, i32), draw: ColumnDraw) -> [i64; 3] {
         let panel = geom::right_panel_rects(screen.0, screen.1);
-        let (x, y) = column_draw_origin(panel, draw.row, SDBTNANM_SIZE.0);
-        [i64::from(x), i64::from(y), draw.frame as i64]
+        let cell = panel.row_cell(draw.row as i32, SDBTNANM_SIZE.0, SDBTNANM_SIZE.1);
+        [i64::from(cell.x), i64::from(cell.y), draw.frame as i64]
     }
 
     fn art_at(screen: (i32, i32), art: PanelArt) -> (String, i64, i64, i64) {

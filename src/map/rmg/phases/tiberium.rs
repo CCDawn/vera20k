@@ -19,7 +19,7 @@ use crate::map::rmg::tiles::TileIds;
 use crate::map::rmg::x87::{Gaussian, TruncF64, approx_sqrt, approx_sqrt_f32};
 use crate::util::native_x87::X87Chop53;
 
-use super::blob::MinHeap;
+use super::blob::{CellHeap, by_key};
 use super::regions::Regions;
 use super::zones::diamond_frame_contains;
 
@@ -322,7 +322,7 @@ fn place_field(
     let mut anchor = origin;
     let mut placed = 0i32;
     let mut seed_count = 0i32;
-    let mut heap = MinHeap::new(cap);
+    let mut heap = CellHeap::new(cap);
     let mut current: Option<(i32, i32)> = None;
     let mut first_written = false;
 
@@ -333,10 +333,10 @@ fn place_field(
         if current.is_none() {
             // New seed: wipe every claim, re-seed from the same origin.
             ctx.scratch.clear_stamps();
-            heap = MinHeap::new(cap);
+            heap = CellHeap::new(cap);
             ctx.scratch.get_mut(origin.0, origin.1).stamp = field_id;
-            heap.push(0.0, origin);
-            current = heap.pop().map(|(_, coord)| coord);
+            heap.push((0.0, origin), by_key);
+            current = heap.pop(by_key).map(|(_, coord)| coord);
             seed_count += 1;
             anchor = origin;
             first_written = false;
@@ -353,11 +353,24 @@ fn place_field(
                 anchor = cur;
                 first_written = true;
                 // Rebinding the anchor discards the current frontier.
-                heap = MinHeap::new(cap);
+                heap = CellHeap::new(cap);
                 if !is_gem {
                     let variant = tibtre_draw(ctx.rng);
                     out.trees
                         .push((format!("TIBTRE0{variant}"), cur.0 as i16, cur.1 as i16));
+                    // RMG PlaceField5A28C0 calls TerrainCtor71BB90 at
+                    //5A2C05, before painting5A2C12. Its Unlimbo clears an
+                    // old resource first, including on overlapping/reseeded
+                    // anchors, so the following empty-cell draw still occurs.
+                    if let Some(cell) = ctx.grid.get_mut(cur.0, cur.1) {
+                        (cell.overlay, cell.density) =
+                            crate::map::tiberium_cell::terrain_unlimbo_overlay_fields(
+                                cell.overlay,
+                                cell.density,
+                                is_tiberium_overlay,
+                            );
+                        cell.occupied = true;
+                    }
                 }
             }
             let mut counted = true;
@@ -413,10 +426,10 @@ fn place_field(
                 .add(jitter)
                 .to_f64() as f32;
             ctx.scratch.get_mut(nx, ny).stamp = field_id;
-            heap.push(priority, (nx, ny));
+            heap.push((priority, (nx, ny)), by_key);
         }
 
-        current = heap.pop().map(|(_, coord)| coord);
+        current = heap.pop(by_key).map(|(_, coord)| coord);
     }
 }
 
@@ -566,6 +579,49 @@ mod tests {
                 "tree name {name} is a valid TIBTRE variant"
             );
         }
+    }
+
+    #[test]
+    fn ore_seed_constructor_replaces_prior_resource_before_the_painter_draw() {
+        // RMG PlaceField5A28C0 calls TerrainCtor71BB90 at5A2C05 before
+        // the overlay branch5A2C12. Unlimbo71D112..71D12B clears old
+        // resource, so an overlapping field has the empty-cell RNG path.
+        let place_seed = |prior_overlay, prior_density| {
+            let (targs, stride) = args(1, 0);
+            let mut w = world(stride);
+            let source = w.grid.get_mut(32, 32).unwrap();
+            source.overlay = prior_overlay;
+            source.density = prior_density;
+            let identity = ids();
+            let mut rng = RmgRng::new(9);
+            let mut gauss = Gaussian::default();
+            let mut out = TiberiumOutcome::default();
+            place_field(
+                &mut TiberiumCtx {
+                    grid: &mut w.grid,
+                    scratch: &mut w.scratch,
+                    ids: &identity,
+                    rng: &mut rng,
+                    gauss: &mut gauss,
+                    regions: &Regions::default(),
+                    waypoints: &[],
+                },
+                &targs,
+                (32, 32),
+                1,
+                1,
+                false,
+                &mut out,
+            );
+            (out.trees, *w.grid.get(32, 32).unwrap(), rng.next_u32())
+        };
+        let empty = place_seed(-1, 0);
+        let overlap = place_seed(ORE_BASE + 3, 9);
+        assert_eq!(
+            overlap, empty,
+            "constructor clears before the resource draw"
+        );
+        assert!(overlap.1.occupied, "the constructed drill retains its cell");
     }
 
     #[test]

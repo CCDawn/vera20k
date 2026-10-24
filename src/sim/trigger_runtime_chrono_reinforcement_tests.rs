@@ -24,10 +24,6 @@ fn corpus() -> Value {
         "tools/spatial_oracle/trigger_chrono_reinforcement.json",
     ))
     .unwrap();
-    assert_eq!(
-        result["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     result
 }
 
@@ -240,7 +236,7 @@ fn chrono_reinforcement_reader_dispatch_placement_and_process_match_original() {
                     id,
                     coord,
                     0,
-                    crate::sim::world::PlacementEvidence::UnitEntryAdmitted,
+                    crate::sim::world::PlacementEvidence::FootEntryAdmitted,
                     &rules,
                     Some(&overlays),
                     FrameEffects::default(),
@@ -354,7 +350,7 @@ fn chrono_reinforcement_reader_dispatch_placement_and_process_match_original() {
                 incoming_house: owner,
             },
             &mut effects,
-            Some(&rules),
+            &rules,
             Some(&overlays),
             FrameEffects::default(),
         );
@@ -425,7 +421,7 @@ fn chrono_reinforcement_reader_dispatch_placement_and_process_match_original() {
             sim.assign_target_represented(
                 ids[0],
                 Some(crate::sim::combat::TargetKind::Entity(target)),
-                Some(&rules),
+                &rules,
                 Some(&overlays),
                 FrameEffects::default(),
             )

@@ -237,7 +237,7 @@ fn announce_upgrade(
 
 /// `0x00481C03..0x00481D6B`: the multiplayer eligibility switch on the
 /// selected slot and the over-water test. Returns the slot the arm runs.
-fn multiplayer_eligible_slot(
+pub(crate) fn multiplayer_eligible_slot(
     sim: &Simulation,
     rules: &RuleSet,
     actor_id: u64,
@@ -266,14 +266,18 @@ fn multiplayer_eligible_slot(
         // `0x00481CDE`: an actor already sped up, or an Aircraft.
         POWERUP_SPEED => {
             actor.foot_speed.crate_multiplier() == NativeF64Bits::ONE
-                && actor.category() != EntityCategory::Aircraft
+                // Ares Speed1@1005F9D0 returns481D52 directly after its
+                // Ext+90 check, bypassing the stock Aircraft(+2C==2) gate.
+                && (crate::rules::ARES_ENABLED || actor.category() != EntityCategory::Aircraft)
         }
         // `0x00481D0B`: an actor already boosted, or unarmed (`Is_Armed`).
         POWERUP_FIREPOWER => {
-            actor.crate_multipliers.firepower() == NativeF64Bits::ONE
-                && object.is_some_and(|object| {
+            actor.crate_multipliers.crate_firepower() == NativeF64Bits::ONE
+                // Installed Firepower1@1005F940 returns481D52 directly,
+                //bypassing stock Is_Armed just as Speed1 bypasses Aircraft.
+                && (crate::rules::ARES_ENABLED || object.is_some_and(|object| {
                     crate::sim::combat::combat_weapon::is_armed(actor, object)
-                })
+                }))
         }
         // `0x00481C91`: a Techno actor whose type is not `Trainable=`, or
         // one already elite.
@@ -302,7 +306,7 @@ fn multiplayer_eligible_slot(
 /// tracked building, more than 1500 available credits and no tracked first
 /// ownable `BaseUnit=` is forced onto the Unit slot.
 fn mcv_preempt(sim: &Simulation, rules: &RuleSet, owner: InternedId) -> bool {
-    use crate::sim::ai_buildable::{first_owner_compatible, house_country_bit};
+    use crate::sim::ai_buildable::first_owner_compatible;
     let Some(house) = sim.houses.get(&owner) else {
         return false;
     };
@@ -312,7 +316,7 @@ fn mcv_preempt(sim: &Simulation, rules: &RuleSet, owner: InternedId) -> bool {
     if house.economy().available_money() <= MCV_PREEMPT_CREDITS {
         return false;
     }
-    let country_bit = house_country_bit(rules, sim.interner.resolve(house.house_type_id()));
+    let country_bit = rules.country_owner_mask(sim.interner.resolve(house.house_type_id()));
     let mcv_tracked = first_owner_compatible(
         rules,
         &rules.general.base_unit_types,
@@ -367,7 +371,7 @@ pub(crate) fn pickup_crate(
     {
         return true;
     }
-    //Steam3e81a617:481A6D..481AC1, trigger_action_values --crate.
+    //Steam gamemd:481A6D..481AC1, trigger_action_values --crate.
     //The original EmptyCell89E748 is initialized to(0,0) by47B2F0.
     //Only an actual nonnull Tag call gates on the actor's reread Alive byte;
     //a null Tag still sets Scenario34BE, even for an already-dead input.
@@ -377,7 +381,7 @@ pub(crate) fn pickup_crate(
             49,
             Some(actor_id),
             None,
-            crate::sim::world::UninitContext::new(Some(rules), Some(registry))
+            crate::sim::world::UninitContext::new(rules, Some(registry))
                 .with_effects(frame_effects),
         );
         if had_tag
@@ -424,18 +428,7 @@ pub(crate) fn pickup_crate(
     // `0x00481D86`: removal, then the replacement crate.
     let _ = remove_pickup_crate(sim, rules, registry, cell);
     if multiplayer && sim.session.game_options().crates {
-        let lighting = sim
-            .session
-            .lighting()
-            .profile(crate::sim::scenario_session::ScenarioLightingProfile::Normal)
-            .into();
-        let _ = place_one_random_crate(
-            sim,
-            rules,
-            registry,
-            lighting,
-            ForcedPostPrecheckFailure::None,
-        );
+        let _ = place_one_random_crate(sim, rules, registry, ForcedPostPrecheckFailure::None);
     }
     if powerup == POWERUP_SQUAD {
         powerup = POWERUP_MONEY;
@@ -455,8 +448,16 @@ pub(crate) fn pickup_crate(
     if powerup <= LAST_DISPATCHED_SLOT {
         let mut arm = powerup;
         if arm == POWERUP_UNIT {
-            let chosen = effects::choose_unit_crate_type(sim, rules, owner, preempted)
-                .map(|object| object.id.clone());
+            let chosen = effects::choose_unit_crate_type(
+                &sim.interner,
+                &sim.session,
+                &mut sim.scenario_rng,
+                &sim.houses,
+                rules,
+                owner,
+                preempted,
+            )
+            .map(|object| object.id.clone());
             let Some(type_id) = chosen else {
                 return spawn_pickup_anim(sim, rules, anim_slot, cell, receiver);
             };
@@ -523,7 +524,7 @@ pub(crate) fn pickup_crate(
                     cell,
                     center,
                 );
-                effects::apply_heal_base_crate(sim, rules, Some(registry), owner, frame_effects);
+                effects::apply_heal_base_crate(sim, rules, Some(registry), actor_id, frame_effects);
             }
             POWERUP_DARKNESS => {
                 sim.reset_shroud_for_owner(owner, rules);
@@ -542,6 +543,8 @@ pub(crate) fn pickup_crate(
             POWERUP_ARMOR => {
                 let owners = effects::apply_multiplier_crate(
                     &mut sim.substrate,
+                    rules,
+                    &sim.interner,
                     center,
                     radius,
                     magnitude,
@@ -560,6 +563,8 @@ pub(crate) fn pickup_crate(
                 if super::speed::apply_speed_crate(
                     &mut sim.substrate,
                     &sim.houses,
+                    rules,
+                    &sim.interner,
                     center,
                     radius,
                     magnitude,
@@ -585,6 +590,8 @@ pub(crate) fn pickup_crate(
             POWERUP_FIREPOWER => {
                 let owners = effects::apply_multiplier_crate(
                     &mut sim.substrate,
+                    rules,
+                    &sim.interner,
                     center,
                     radius,
                     magnitude,
@@ -600,7 +607,14 @@ pub(crate) fn pickup_crate(
                 );
             }
             POWERUP_VETERAN => {
-                effects::apply_veteran_crate(sim, rules, center, radius, magnitude);
+                effects::apply_veteran_crate(
+                    &sim.interner,
+                    &mut sim.substrate,
+                    rules,
+                    center,
+                    radius,
+                    magnitude,
+                );
                 play_crate_sound(
                     &mut sim.sound_events,
                     general.crate_promote_sound.as_deref(),

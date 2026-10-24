@@ -75,7 +75,7 @@ fn start_production_worker(
     shared_cell_dummy: &crate::map::resolved_terrain::SharedCellDummy,
 ) -> std::sync::mpsc::Receiver<RandomMapUpdate> {
     begin_random_map_generation_owners(runtime, retention, options);
-    let prepared = prepare_random_map_generation(assets, options, Some(native_rules))
+    let prepared = prepare_random_map_generation(assets, options, Some(native_rules), None)
         .expect("production retail generation preparation");
     let decision = retention.map_storage_decision(options);
     let receiver = spawn_random_map_generation_worker(
@@ -150,11 +150,13 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
     let seed_name = "Unit2Lifecycle.Sed";
     let options = RmgOptions {
         theater: 0,
-        map_type: 3,
+        // Exercise preview Building constructors on a normal four-start map.
+        // The two-player match may use a subset of its accepted start slots.
+        map_type: 1,
         resources: 2,
         ruggedness: 35,
         water_amount: 50,
-        num_players: 2,
+        num_players: 4,
         tiberium: 35,
         vegetation: 30,
         urban_presence: 40,
@@ -174,6 +176,10 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
     };
     let mut runtime = MultiplayerShellRuntime::initialize(
         0x0412_0003,
+        &mut crate::app::process_assets::ProcessAssets::new(
+            crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+            false,
+        ),
         None,
         None,
         None,
@@ -200,6 +206,10 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
         &shared_cell_dummy,
     );
     let (entries, generated_a) = receive_production_generation(receiver);
+    assert!(
+        !generated_a.construction_trace.events.is_empty(),
+        "the preview RNG control requires an actual Building constructor"
+    );
     generation_entries += entries;
     let signature_a = (
         generated_a.map_file.ini.content_hash(),

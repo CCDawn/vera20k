@@ -1,5 +1,4 @@
-//! Execute96/109 integration. Native96 controls execute gamemd.exe SHA256
-//! 3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600,
+//! Execute96/109 integration. Native96 controls execute gamemd.exe,
 //! reusing trigger_action_values::nuke_strike_dispatch_case's ABI transport.
 //! Edge/velocity literals below are observed native outputs, not Rust results.
 use super::*;
@@ -53,7 +52,7 @@ fn run(sim: &mut Simulation, rules: &RuleSet, kind: i32) -> bool {
             input: TagEventInput::default(),
         },
         &mut Vec::new(),
-        Some(rules),
+        rules,
         None,
         FrameEffects::default(),
     )
@@ -144,9 +143,9 @@ fn counted_trigger_dispatches_both_strikes_then_continues() {
         None,
         None,
     );
-    sim.classify_map_triggers(None);
+    sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
     sim.session.publish_started();
-    sim.advance_triggers(Some(&rules), None, FrameEffects::default());
+    sim.advance_triggers(&rules, None, FrameEffects::default());
     assert!(sim.trigger_local_is_set_for_test(0));
     assert_eq!(sim.projectiles.iter().count(), 1);
     let entity = sim.entities().get(victim).unwrap();

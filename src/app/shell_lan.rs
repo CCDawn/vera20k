@@ -37,9 +37,8 @@ const RESERVED_LITERALS: [&str; 7] = [
     "<OpenObserver>",
 ];
 
-/// Semantic service requests, not serialized packets or an online backend.
-/// A controlled service drains these and returns the same events as a future
-/// transport adapter. No request ever manufactures a successful response.
+/// Semantic UI requests consumed by the LAN transport adapter. Controlled
+/// captures use the same boundary; no request manufactures a successful reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LanServiceRequest {
     Refresh,
@@ -126,6 +125,7 @@ impl App {
     /// MainMenu52E418 and setup-return5DC624/5DC964 construct a fresh BB.
     /// The retained preference owner supplies the edit; admission stays empty.
     pub(crate) fn open_lan_lobby(state: &mut AppState) {
+        crate::app::shell_main_menu::clear_typed_codes_for_network_session(state);
         Self::prepare_multiplayer_settings(
             state,
             crate::app::shell_main_menu::MultiplayerSettingsContext::Shell,
@@ -144,6 +144,7 @@ impl App {
             .lobby
             .replace_players(vec![local_lobby_row(&local.name)]);
         state.frontend.lan = Some(runtime);
+        crate::app::lan_service::open(state);
         crate::app::frontend::main_menu_shell_render::clear_ra2ts_movie_session(state);
         shell_transition::invalidate_main_menu_dialog_instance(state);
         state.frontend.shell_route = crate::app::shell_route::ShellRoute::LanLobby;
@@ -159,6 +160,7 @@ impl App {
             .multiplayer_shell_runtime
             .persist_lan_preferences();
         state.frontend.lan = None;
+        crate::app::lan_service::close(state);
         state.match_state.session.leave_network();
         Self::close_single_player_shell(state);
         state
@@ -170,12 +172,13 @@ impl App {
     }
 
     pub(crate) fn commit_lan_create(state: &mut AppState, observe: bool) {
+        crate::app::lan_service::force_presence(state);
         state.frontend.lan = None;
         Self::open_host_setup(state, observe);
     }
 }
 
-fn local_lobby_row(name: &str) -> LanPlayerRow {
+pub(crate) fn local_lobby_row(name: &str) -> LanPlayerRow {
     LanPlayerRow {
         name: name.to_owned(),
         color: None,
@@ -263,8 +266,22 @@ fn show_modal(state: &mut AppState, key: &'static str) {
 /// all wrapping, row retention and scroll behavior for BB, BC and BD.
 pub(crate) fn append_chat(state: &mut AppState, line: LanChatLine) {
     let route = state.frontend.shell_route;
+    // WOL Quick Match's 0x117 is the top dialog with a 0x53F.
+    if route.wol() && crate::app::shell_wol::quick_match::page_open(state) {
+        crate::app::shell_wol::quick_match::append_line(state, line);
+        return;
+    }
     let setup = route == crate::app::shell_route::ShellRoute::NetworkSetup;
-    let wol_lobby = route.wol_lobby();
+    append_chat_to(state, setup, !setup && route.wol_lobby(), line);
+}
+
+/// The WOL lobby `0x113`'s transcript even while C2/C9 cover it: native
+/// keeps it in the shell stack, hidden, and its sinks still write to it.
+pub(crate) fn append_wol_lobby_chat(state: &mut AppState, line: LanChatLine) {
+    append_chat_to(state, false, true, line);
+}
+
+fn append_chat_to(state: &mut AppState, setup: bool, wol_lobby: bool, line: LanChatLine) {
     let (rect, scale) = if setup {
         let layout = crate::app::input::multiplayer_setup::layout(state);
         (layout.chat_log, layout.page.scale)
@@ -390,12 +407,15 @@ pub(crate) fn dispatch(state: &mut AppState, action: LanLobbyAction) {
                 .push(LanServiceRequest::NameChanged(value.clone()));
             // Local discovery row is a projection. It is always first only
             // when looking at the Lobby sentinel, never a selected game's roster.
+            // 0x541's handler rebuilds the roster (0x005DAFE0), so a selected
+            // own row loses its selection with its old name.
             if runtime.lobby.game_list.selected == Some(0) {
-                if let Some(local) = runtime.lobby.players.first_mut() {
-                    local.name = value;
-                } else {
-                    runtime.lobby.players.push(local_lobby_row(&value));
+                let mut players = runtime.lobby.players.clone();
+                match players.first_mut() {
+                    Some(local) => local.name = value,
+                    None => players.push(local_lobby_row(&value)),
                 }
+                runtime.lobby.replace_players(players);
             }
         }
         LanLobbyAction::SendChat(message) => {
@@ -730,6 +750,30 @@ pub(crate) fn mouse(state: &mut AppState, button: MouseButton, pressed: bool) {
                 if let Some(action) = join {
                     dispatch(state, action);
                 }
+                App::play_launcher_options_cue(state, LauncherCue::GenericClick);
+            }
+        } else if control == Some(PLAYERS) {
+            let geometry =
+                lobby
+                    .player_list
+                    .geometry(layout.players, lobby.players.len(), layout.page.scale);
+            // A double-click's second press only notifies LBN_DBLCLK
+            // (0x0061A904..0x0061A945), which this dialog ignores.
+            // RESIDUAL: native also focuses the list (SetFocus, 0x0061A9CB),
+            // which would stop chat typing; VERA keeps chat focus, as for the
+            // games list.
+            let double = crate::ui::shell::list::is_double_click(
+                &mut lobby.player_list.last_press,
+                Instant::now(),
+                x,
+                y,
+                crate::ui::shell::saved_file_input::host_double_click_limits(),
+            );
+            if !double
+                && let Some(row) =
+                    geometry.row_at(lobby.players.len(), lobby.player_list.top_index, x, y)
+                && lobby.select_player(row)
+            {
                 App::play_launcher_options_cue(state, LauncherCue::GenericClick);
             }
         } else if matches!(control, Some(OBSERVER_IMAGE | OBSERVER_TOGGLE)) {

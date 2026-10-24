@@ -78,3 +78,37 @@ pub fn open_manager(ra2_dir: &Path, all_mixes: bool) -> Result<AssetManager, Str
 
     Ok(manager)
 }
+
+/// Only INI commands use host INI policy; ordinary archive tools stay retail.
+/// An explicit CLI request replaces the entire config, never individual fields.
+pub fn open_ini_manager(
+    root: &Path,
+    all_mixes: bool,
+    explicit: Option<&crate::util::ini_roots::IniRootConfig>,
+) -> Result<AssetManager, String> {
+    let config = match explicit {
+        Some(config) => config.clone(),
+        None => {
+            GameConfig::load()
+                .map_err(|error| format!("INI configuration: {error:#}"))?
+                .ini
+        }
+    };
+    config.validate()?;
+    open_manager(root, all_mixes)?
+        .with_ini_roots(&config)
+        .map_err(|error| error.to_string())
+}
+
+/// INI expansion may be audited against a MOD/source directory that lacks
+/// required retail media. This explicit tooling scope never changes new() or
+/// the archive stack used by the game and normal asset commands.
+pub fn open_ini_probe_manager(ra2_dir: &Path, all_mixes: bool) -> Result<AssetManager, String> {
+    let mut manager = AssetManager::from_ini_probe_root(ra2_dir).map_err(|err| err.to_string())?;
+    if all_mixes {
+        manager
+            .load_all_disk_mixes()
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(manager)
+}

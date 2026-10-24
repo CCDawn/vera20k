@@ -20,7 +20,7 @@ impl Simulation {
     pub(crate) fn finish_walk_navigation(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         effects: FrameEffects<'_>,
     ) -> Result<(), String> {
         let Some(actor) = self.substrate.entities.get(id) else {
@@ -71,7 +71,7 @@ impl Simulation {
         &mut self,
         id: u64,
         coord: DriveCoord,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) {
@@ -139,7 +139,7 @@ impl Simulation {
         &mut self,
         id: u64,
         head: DriveCoord,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) -> Result<bool, crate::sim::world::FrameAdvanceError> {
@@ -192,7 +192,7 @@ impl Simulation {
         //75BE20..75BE2F calls Foot4D3710(0.0) for the -1 path head BEFORE
         //PerCell can conceal a boarding passenger and skip the finish suffix.
         //An intermediate head retains its fraction. Native execution controls:
-        //tools/spatial_oracle/foot_speed_owner.walk_arrival.json (Steam3e81a617).
+        //tools/spatial_oracle/foot_speed_owner.walk_arrival.json (Steam gamemd).
         if let Some(e) = self.substrate.entities.get_mut(id)
             && e.navigation.path_replay().remaining_directions().is_empty()
         {

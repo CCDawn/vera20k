@@ -15,7 +15,7 @@ fn ordinary_frame(sim: &mut Simulation, rules: &RuleSet) -> Vec<super::SimFireEv
     let output = sim
         .advance_app_frame(
             &commands,
-            Some(rules),
+            rules,
             None,
             33,
             TickLane::Ordinary,
@@ -93,13 +93,17 @@ fn stock_kirov_bomb_impact_rocks_its_live_neighbor_then_rolls_it() {
         sim.fog.mark_visible_for_owner(owner, x, y);
     }
     for id in [target, neighbor] {
-        sim.queue_command(CommandEnvelope::new(
-            enemy,
-            1,
-            Command::Guard {
+        // Establish the AI's guard posture through the class receiver; this
+        // fixture does not originate a player event for the computer House.
+        assert!(sim.apply_command_with_overlays(
+            "Russians",
+            &Command::Guard {
                 entity_id: id,
                 target: None,
             },
+            &rules,
+            None,
+            FrameEffects::default(),
         ));
     }
     let source = sim.substrate.entities.get(kirov).unwrap();
@@ -720,13 +724,21 @@ fn real_nested_death_weapon_area_rocks_after_its_nonrocking_parent_receivers() {
         };
         let trigger = scene.rules.warhead("AreaRockerTrigger").unwrap();
         assert_eq!(
-            trigger.verses_f64
-                [crate::sim::combat::armor_index(&scene.rules.object("DRON").unwrap().armor)],
+            f64::from_bits(
+                trigger
+                    .interaction(scene.rules.object("DRON").unwrap().armor_id())
+                    .multiplier()
+                    .bits()
+            ),
             1.0
         );
         assert_eq!(
-            trigger.verses_f64
-                [crate::sim::combat::armor_index(&scene.rules.object("MTNK").unwrap().armor)],
+            f64::from_bits(
+                trigger
+                    .interaction(scene.rules.object("MTNK").unwrap().armor_id())
+                    .multiplier()
+                    .bits()
+            ),
             0.0
         );
         assert!(!scene.rules.warhead("AreaRockerTrigger").unwrap().rocker);

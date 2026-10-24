@@ -1,7 +1,6 @@
 # Building Construction → Grand_Opening
 
-Original reference: active-retail `gamemd.exe`, SHA-256
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`.
+Original reference: active-retail `gamemd.exe`.
 The generator checks every executable PE section before and after execution;
 original instructions are never patched.
 
@@ -9,7 +8,7 @@ original instructions are never patched.
 Additive `--joined` produces `building_construction_joined.json` and its explicit
 assumptions, substituted boundaries and source identities in the matching meta.
 The joined payload SHA-256 is
-`62e31e63c49350afa9be3ffefafe158a7ae4423a898c3614e80b0506b7889ae3`.
+`19d8c02d24280f08b424bec1308c9358f430fd9c058072ba02accb458c6c9bcd`.
 The three Rust replay hash changes have a separate
 819-boundary composition receipt (`tools/spatial_oracle/building_construction_replay/README.md`, in git at 1b1a8b43e);
 their observed Rust pins are not native goldens.

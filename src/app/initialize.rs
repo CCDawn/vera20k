@@ -9,8 +9,8 @@ use crate::app::persistence::options_profile::{RetailOptionsLoad, RetailOptionsP
 
 use super::{
     ActiveEventLoop, App, AppState, Arc, AssetManager, BTreeMap, BasicSection, BatchRenderer,
-    BitFont, Fullscreen, GameConfig, GameScreen, GpuContext, HashMap, HouseRoster, Instant,
-    MusicPlayer, PhysicalSize, PlatformState, RandomMapGenerationRetention, Result, SfxPlayer,
+    BitFont, GameConfig, GameScreen, GpuContext, HashMap, HouseRoster, Instant, MusicPlayer,
+    PhysicalSize, PlatformState, RandomMapGenerationRetention, Result, SfxPlayer,
     SidebarChromeLayoutSpec, SidebarTab, StartupAudioDisposition, Window, WindowAttributes,
     frontend::startup_splash,
 };
@@ -31,11 +31,63 @@ fn startup_asset_or_error<T>(result: Result<T>, error: &mut Option<String>) -> O
     match result {
         Ok(asset) => Some(asset),
         Err(err) => {
-            let message = format!("{err:#}");
-            log::warn!("{message}");
-            error.get_or_insert(message);
+            // The log keeps the raw chain, which carries the host's localized
+            // OS text; the card gets an English description instead, because
+            // its in-repo face cannot draw a localised sentence.
+            log::warn!("{err:#}");
+            error.get_or_insert_with(|| describe_startup_error(&err));
             None
         }
+    }
+}
+
+/// English description of a startup failure, for the error card.
+///
+/// `std::io::Error`'s own message is localized by the host, so on a Chinese
+/// Windows the raw chain reads a localized sentence and the card could only
+/// draw boxes. This walks the `anyhow` chain and states each link in English:
+/// our own context strings already are, and I/O kinds are mapped here.
+fn describe_startup_error(err: &anyhow::Error) -> String {
+    use crate::assets::error::AssetError;
+
+    let mut parts: Vec<String> = Vec::new();
+    for cause in err.chain() {
+        let part = if let Some(asset) = cause.downcast_ref::<AssetError>() {
+            match asset {
+                AssetError::Io(io) => describe_io_error(io),
+                other => other.to_string(),
+            }
+        } else if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            describe_io_error(io)
+        } else {
+            cause.to_string()
+        };
+        // The same I/O failure arrives through several context layers; say it
+        // once.
+        if parts.last() != Some(&part) {
+            parts.push(part);
+        }
+    }
+    parts.join(": ")
+}
+
+/// One I/O failure in English, with the numeric code kept for the log search.
+fn describe_io_error(err: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+
+    let text = match err.kind() {
+        ErrorKind::NotFound => "the file or path does not exist",
+        ErrorKind::PermissionDenied => "access was denied",
+        ErrorKind::AlreadyExists => "the target already exists",
+        ErrorKind::InvalidData => "the file is not a valid game archive",
+        ErrorKind::InvalidInput => "the file name or data is invalid",
+        ErrorKind::UnexpectedEof => "the file is truncated",
+        ErrorKind::WouldBlock => "the file is in use by another program",
+        _ => "the file could not be read",
+    };
+    match err.raw_os_error() {
+        Some(code) => format!("{text} (os error {code})"),
+        None => text.to_owned(),
     }
 }
 
@@ -49,11 +101,11 @@ where
     LoadProfile: FnOnce(&Path, &RetailStartupOptions) -> RetailOptionsLoad,
 {
     if capture_dimensions.is_some() {
-        RetailOptionsLoad::without_ra2md(&RetailStartupOptions::default())
+        RetailOptionsLoad::without_settings(&RetailStartupOptions::default())
     } else if let Some(ra2_dir) = ra2_dir {
         load_profile(ra2_dir, startup_options)
     } else {
-        RetailOptionsLoad::without_ra2md(startup_options)
+        RetailOptionsLoad::without_settings(startup_options)
     }
 }
 
@@ -66,15 +118,11 @@ trait StartupAudioProfileOperations {
 
 impl StartupAudioProfileOperations for crate::app::audio_runtime::AppAudioRuntime {
     fn set_sound_volume(&mut self, volume: f64) {
-        if let Some(player) = self.sfx_player.as_mut() {
-            player.set_sound_volume(volume);
-        }
+        crate::app::audio_runtime::AppAudioRuntime::set_sound_volume(self, volume);
     }
 
     fn set_voice_volume(&mut self, volume: f64) {
-        if let Some(player) = self.sfx_player.as_mut() {
-            player.set_voice_volume(volume);
-        }
+        crate::app::audio_runtime::AppAudioRuntime::set_voice_volume(self, volume);
     }
 
     fn set_score_volume(&mut self, volume: f32) {
@@ -120,17 +168,42 @@ impl App {
         // automation lane, so it uses exact defaults and its explicit
         // dimensions instead of ingesting operator argv/profile screen state.
         let mut main_menu_shell_error = None;
-        let game_config = startup_asset_or_error(GameConfig::load(), &mut main_menu_shell_error);
+        let mut personal_rules = crate::rules::personal_rules::PersonalRules::default();
+        let game_config = startup_asset_or_error(
+            GameConfig::load().and_then(|config| {
+                if capture_dimensions.is_none() {
+                    crate::app::persistence::profile_file::import_legacy(&config.paths).map_err(
+                        |error| anyhow::Error::new(error).context("Could not prepare VERA.INI"),
+                    )?;
+                    let bytes = crate::app::persistence::rules_profile::load_or_create(
+                        config.paths.settings_dir(),
+                    )
+                    .context("Could not prepare VERARULES.INI")?;
+                    personal_rules =
+                        crate::rules::personal_rules::PersonalRules::from_bytes(&bytes)
+                            .context("Could not read VERARULES.INI")?;
+                }
+                Ok(config)
+            }),
+            &mut main_menu_shell_error,
+        );
         let options_load = select_startup_options_load(
             capture_dimensions,
             &startup_options,
             game_config
                 .as_ref()
                 .map(|config| config.paths.settings_dir()),
-            RetailOptionsLoad::from_ra2md,
+            RetailOptionsLoad::from_settings,
         );
         let profile_screen = options_load.startup_shell_screen;
-        let options_profile = options_load.retained_profile;
+        let mut options_profile = options_load.retained_profile;
+        options_profile.render_interpolation =
+            crate::app::presentation::interpolation::startup_enabled(
+                options_profile.render_interpolation,
+                std::env::var("VERA20K_RENDER_INTERPOLATION")
+                    .ok()
+                    .as_deref(),
+            );
         let (window_width, window_height, window_visible) =
             startup_window_projection(profile_screen, capture_dimensions);
         let startup_audio =
@@ -149,16 +222,33 @@ impl App {
         // The saved Full Screen choice goes in at creation: macOS retries it
         // only then, when the first attempt fails (a launch from an app that
         // is itself full screen). The resize that ends the animation re-fits
-        // the surface.
+        // the surface. The saved screen is resolved here too, so full screen
+        // covers it and a windowed launch opens on it; a screen that is no
+        // longer attached leaves both to the system.
+        let displays = if capture {
+            Vec::new()
+        } else {
+            crate::app::display_target::current_displays_for(event_loop)
+        };
+        let wanted_display = super::display_target::screen_for(&displays, &options_profile.display);
+        let fullscreen = (!capture && options_profile.full_screen)
+            .then(|| super::display_target::fullscreen_for(&displays, &options_profile.display));
         let mut window_attrs: WindowAttributes = WindowAttributes::default()
-            .with_title("RA2 Engine")
+            .with_title(super::WINDOW_TITLE)
             .with_inner_size(inner_size)
             .with_resizable(!capture)
-            .with_fullscreen(
-                (!capture && options_profile.full_screen).then_some(Fullscreen::Borderless(None)),
-            )
+            .with_fullscreen(fullscreen)
             .with_visible(window_visible)
             .with_active(window_visible);
+        // The Wayland app ID and X11 class, which the AppImage's desktop entry
+        // names (StartupWMClass), so docks show its icon for the window.
+        // Unset, Wayland has none and X11 takes the name the program was
+        // started by: an AppImage's own file name, version included.
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::wayland::WindowAttributesExtWayland as _;
+            window_attrs = window_attrs.with_name("vera20k", "vera20k");
+        }
         // macOS full screen hides the menu bar and Dock instead of revealing
         // them at the edges the player scrolls against, where the system would
         // draw its own cursor over the game's. winit applies this to its own
@@ -177,6 +267,16 @@ impl App {
             window_attrs = icon.apply(window_attrs);
         }
         let window: Arc<Window> = Arc::new(event_loop.create_window(window_attrs)?);
+        // A windowed launch on a saved screen: the window opens centred there.
+        // Full screen already covers it from the attributes above.
+        if let Some(monitor) = wanted_display
+            .as_ref()
+            .filter(|_| !options_profile.full_screen)
+        {
+            window.set_outer_position(super::display_target::centered_outer_position(
+                &window, monitor,
+            ));
+        }
         // gamemd's WinMain builds WWMouse (`0x006BDF1C`), whose constructor hides
         // the cursor, before the startup splash; from the first frame after it,
         // `show_os_cursor_only_without_game_cursor` owns the cursor.
@@ -188,6 +288,8 @@ impl App {
         let gpu: GpuContext = GpuContext::new(window.clone())?;
         let batch_renderer: BatchRenderer = BatchRenderer::new(&gpu);
         let status_screen_fill = batch_renderer.create_texture(&gpu, &[255; 4], 1, 1);
+        let status_card_glow =
+            crate::app::frontend::status_screen::build_button_glow(&gpu, &batch_renderer);
         let mut terrain_draw_renderer = crate::render::terrain_draw::TerrainDrawRenderer::new(
             &gpu.device,
             &gpu.queue,
@@ -197,6 +299,8 @@ impl App {
         terrain_draw_renderer.generate_ion_blast_frames(&gpu.device, &gpu.queue);
         let combat_light_renderer = crate::render::combat_light::CombatLightRenderer::new(&gpu);
         let mut bit_font = BitFont::fallback_5x7(&gpu.device, &gpu.queue, &batch_renderer);
+        let fps_overlay =
+            crate::app::diagnostics::fps_overlay::FpsOverlay::new(&gpu, &batch_renderer);
         let depth_view: wgpu::TextureView = gpu.create_depth_texture();
         let shell_surface_presenter =
             crate::render::shell_surface_present::ShellSurfacePresenter::new(&gpu)?;
@@ -211,6 +315,7 @@ impl App {
         let mut startup_asset_manager = game_config.as_ref().and_then(|config| {
             startup_asset_or_error(
                 AssetManager::new(&config.paths.ra2_dir, startup_options.media_archive_mode)
+                    .and_then(|assets| assets.with_ini_roots(&config.ini))
                     .context("Could not load the game archives"),
                 &mut main_menu_shell_error,
             )
@@ -286,17 +391,22 @@ impl App {
             None
         };
         if let Some(splash) = startup_splash.as_mut() {
+            // Surface acquisition can be transient before the first event-loop
+            // redraw. A splash that did not reach the screen stays unarmed for
+            // the frame loop to retry.
             match startup_splash::render_and_present(
                 &gpu,
                 &batch_renderer,
                 &shell_surface_presenter,
                 &depth_view,
+                &fps_overlay,
                 splash,
             ) {
-                Ok(()) => splash.mark_presented(Instant::now()),
+                Ok(true) => splash.mark_presented(Instant::now()),
+                Ok(false) => {
+                    log::warn!("Initial retail startup splash present deferred: no surface frame");
+                }
                 Err(err) => {
-                    // Surface acquisition can be transient before the first
-                    // event-loop redraw. Keep the unarmed splash for retry.
                     log::warn!("Initial retail startup splash present deferred: {err:#}");
                 }
             }
@@ -308,10 +418,15 @@ impl App {
         // presented swapchain frame stays composited while this thread blocks,
         // and the hold armed above is measured from that present, so a slow
         // load is spent inside the five seconds instead of before them.
-        let mut process_assets = crate::app::process_assets::ProcessAssets::new(
+        let mut process_assets = crate::app::process_assets::ProcessAssets::new_with_ini_config(
             startup_options.media_archive_mode,
             startup_audio.load_audio_indices,
-        );
+            game_config
+                .as_ref()
+                .map(|config| config.ini.clone())
+                .unwrap_or_default(),
+        )
+        .with_personal_rules(personal_rules);
         process_assets.csf = startup_csf;
         let (startup_rules, startup_rules_projection) = startup_asset_manager
             .as_ref()
@@ -397,6 +512,9 @@ impl App {
                 },
             )
             .unwrap_or_default();
+        if let Some(assets) = startup_asset_manager.as_ref() {
+            process_assets.install_native_ini_hashes(assets, &skirmish_modes);
+        }
         let mut skirmish_shell_state = crate::ui::skirmish_shell::SkirmishShellState::default();
         // Seed the Credits/Unit Count slider ranges from rulesmd's
         // [MultiplayerDialogSettings] so a mod that changes the money/unit bounds
@@ -423,6 +541,7 @@ impl App {
         let multiplayer_shell_runtime =
             crate::app::frontend::skirmish_session::MultiplayerShellRuntime::initialize(
                 frontend_seed.value,
+                &mut process_assets,
                 game_config
                     .as_ref()
                     .map(|config| config.paths.settings_dir()),
@@ -502,7 +621,7 @@ impl App {
             sfx_player,
             launcher_audio_available,
             theme_startup_suppressed: false,
-            movie_audio: Default::default(),
+            master_groups: Default::default(),
         };
         if let Some(assets) = startup_asset_manager.as_ref() {
             startup_audio_runtime.initialize_theme(assets);
@@ -518,13 +637,21 @@ impl App {
                 capture_dimensions.map(|(w, h)| PhysicalSize::new(w, h)),
             ),
             match_state: crate::app::match_runtime::state::MatchState {
+                campaign_names: Default::default(),
                 session: Default::default(),
                 network_wait: Default::default(),
+                network_failure: None,
+                live_network: None,
+                lan_service: None,
                 startup: Default::default(),
                 sim_runtime: None,
                 super_players: Vec::new(),
                 input: crate::app::input::state::MatchInputState::new(hotkey_bindings),
                 match_presentation: crate::app::presentation::state::MatchPresentationState {
+                    interpolation:
+                        crate::app::presentation::interpolation::RenderInterpolation::new(
+                            options_profile.render_interpolation,
+                        ),
                     sinking_waterlines: Default::default(),
                     barrel_image_pitches: Default::default(),
                     building_zshape: None,
@@ -544,8 +671,8 @@ impl App {
                         crate::ui::messages::MESSAGE_MAX_VISIBLE_RETAIL,
                         0,
                     ),
-                    message_clock: crate::ui::messages::PauseAwareClock::default(),
                     chat: Default::default(),
+                    beacons: Default::default(),
                     in_game_menu: crate::ui::pause_menu::InGameMenuState::default(),
                     modal_latch: true,
                     pause_menu_has_saves: false,
@@ -555,11 +682,15 @@ impl App {
                     abort_secondary: Default::default(),
                     sound_dialog: None,
                     abort_buttons: Default::default(),
+                    surrender_buttons: Default::default(),
                     diplomacy: Default::default(),
+                    restate: Default::default(),
+                    restate_text: String::new(),
                     saved_game_browser: None,
                     in_game_options: startup_in_game_options,
                     in_game_options_anchor: None,
                     combat_lights: Default::default(),
+                    screen_shake: Default::default(),
                     line_trails: Default::default(),
                     lasers: Default::default(),
                     talk_bubble: Default::default(),
@@ -578,11 +709,12 @@ impl App {
                     radar_content_insets: None,
                     has_radar: false,
                     selection_overlay: None,
+                    beacon_art: None,
                     shroud_buffer: None,
                     theater_name: "TEMPERATE".to_string(),
                     theater_ext: "tem".to_string(),
                     target_lines: startup_target_lines,
-                    cached_overlay_instances: Vec::new(),
+                    cached_cell_body_instances: Vec::new(),
                     terrain_grid: None,
                     overlays: Default::default(),
                     terrain_objects: Vec::new(),
@@ -655,7 +787,6 @@ impl App {
                 skirmish_shell_state,
                 choose_map_last_mode_row: None,
                 multiplayer_shell_runtime,
-                skirmish_shell_last_painted_pressed_button: None,
                 skirmish_shell_chrome,
                 main_menu_shell_state: crate::ui::main_menu_shell::MainMenuShellState::default(),
                 single_player_shell_state:
@@ -693,6 +824,7 @@ impl App {
                 load_saved_game: None,
                 wol: None,
                 wol_account: Default::default(),
+                wol_test_credentials: Vec::new(),
                 network_options: None,
                 lan: None,
                 multiplayer_setup: None,
@@ -701,11 +833,19 @@ impl App {
                 wol_login_art: None,
                 wol_lobby_art: None,
                 wol_options_art: None,
+                wol_auto_login_art: None,
+                wol_my_info_art: None,
+                wol_buddy_art: None,
+                wol_quick_match_art: None,
+                wol_buddies: Default::default(),
+                wol_test_buddies: crate::app::shell_wol::test_service_buddies(),
+                wol_test_guest: Default::default(),
                 wol_sound_options_art: None,
                 wol_lobby_globals: Default::default(),
                 wol_preferences: Default::default(),
                 score_page: None,
                 campaign_score_page: None,
+                coop_score_page: None,
                 score_art: None,
                 campaign_score_art: None,
                 finished_game_count: 0,
@@ -714,7 +854,10 @@ impl App {
             renderer: crate::app::renderer_state::RendererState {
                 gpu,
                 batch_renderer,
+                fps_overlay,
                 combat_light_renderer,
+                screen_presentation:
+                    crate::render::screen_presentation::ScreenPresentationPass::new(),
                 terrain_draw_renderer,
                 instance_pool: crate::render::batch::InstanceBufferPool::new(),
                 depth_view,
@@ -723,7 +866,9 @@ impl App {
                 sidebar_surface: None,
                 in_game_shell_surface: None,
                 status_screen_fill,
+                status_card_glow,
                 bit_font,
+                status_font: crate::render::status_font::StatusFaceCache::new(),
                 outcome_banner_art,
                 vxl_pose_frame_cache: std::cell::RefCell::new(Default::default()),
                 retail_screenshot_frame_cache: Default::default(),
@@ -761,6 +906,11 @@ impl App {
             // the unverified legacy Battle loader. It has no artificial AI
             // opponent or starting forces; this is not campaign admission.
             let session = quickplay_launch_session(quickplay);
+            #[cfg(feature = "ares")]
+            crate::app::frontend::skirmish_session::prepare_external_skirmish_countries(
+                &mut state.process_assets,
+                &session,
+            );
             let mut clock = crate::app::match_bootstrap::OrdinaryMatchSeedClock;
             let seed = crate::app::match_bootstrap::read_match_seed(&mut clock);
             let request = crate::app::loading::pump::LoadingRequest::unverified_legacy_skirmish(
@@ -830,6 +980,38 @@ fn quickplay_launch_session(selected_map: String) -> crate::skirmish_launch::Ski
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_errors_are_described_in_english_not_host_locale() {
+        // A missing install surfaces as io::ErrorKind::NotFound inside the
+        // asset error. The card cannot draw the host's localized sentence, so
+        // the description must state the cause in English and keep the code.
+        let io = std::io::Error::from_raw_os_error(3);
+        let asset = crate::assets::error::AssetError::Io(io);
+        let err = anyhow::Error::new(asset).context("Could not load the game archives");
+        let text = describe_startup_error(&err);
+        assert!(text.is_ascii(), "{text}");
+        assert!(text.contains("Could not load the game archives"), "{text}");
+        assert!(
+            text.contains("does not exist") || text.contains("could not be read"),
+            "{text}"
+        );
+        assert!(text.contains("os error 3"), "{text}");
+    }
+
+    #[test]
+    fn asset_errors_keep_their_own_context() {
+        let asset = crate::assets::error::AssetError::AssetNotFound {
+            name: "SDBTNANM.SHP".to_owned(),
+        };
+        let err = anyhow::Error::new(asset).context("Required game-menu artwork is unavailable");
+        let text = describe_startup_error(&err);
+        assert!(text.contains("SDBTNANM.SHP"), "{text}");
+        assert!(
+            text.contains("Required game-menu artwork is unavailable"),
+            "{text}"
+        );
+    }
 
     #[test]
     fn required_string_table_failure_is_retained_for_the_startup_error_screen() {
@@ -1134,7 +1316,7 @@ mod tests {
         assert!(!profile_loader_called.get());
         assert_eq!(
             options_load,
-            RetailOptionsLoad::without_ra2md(&RetailStartupOptions::default())
+            RetailOptionsLoad::without_settings(&RetailStartupOptions::default())
         );
         assert_eq!(
             startup_window_projection(options_load.startup_shell_screen, capture_dimensions),

@@ -1,11 +1,10 @@
 //! Hospital arm of Building::MissionRepairAndProduce44B780,44B870..44BA79.
-//! Original Steam gamemd.exe SHA256
-//! 3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600.
+//! Original Steam gamemd.exe.
 //! Instruction-level reading. It uses the
 //! building's existing StageClass, Techno RepairTick and ExitObject owners.
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
-use crate::sim::mission::authority::EntityReadyInputProvider;
+use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::passenger::{DepartureRoute, depart_cargo_head};
 use crate::sim::radio::{self, RadioMessage, RadioResponse};
@@ -63,13 +62,8 @@ pub(super) fn mission_repair(
         }
         building.mission_leaf.set_building_ready_latch(0);
         building.mission_leaf.reset_building_repair_progress();
-        let response = radio::transmit_to_contact(
-            sim,
-            hospital,
-            RadioMessage::RepairTick,
-            Some(rules),
-            effects,
-        );
+        let response =
+            radio::transmit_to_contact(sim, hospital, RadioMessage::RepairTick, rules, effects);
         if matches!(
             response,
             RadioResponse::Negatory
@@ -113,7 +107,13 @@ pub(super) fn mission_repair(
                 DepartureRoute::Hospital,
                 |sim, patient| {
                     let _ = crate::sim::production::exit_produced_object(
-                        sim, rules, hospital, patient, registry, effects,
+                        sim,
+                        rules,
+                        hospital,
+                        patient,
+                        (0, 0),
+                        registry,
+                        effects,
                     );
                     Ok(())
                 },
@@ -125,7 +125,7 @@ pub(super) fn mission_repair(
                     MissionId::from_known(MissionType::Guard),
                     0,
                     now,
-                    &EntityReadyInputProvider,
+                    &LiveReadyInputProvider { rules },
                 );
             }
         }

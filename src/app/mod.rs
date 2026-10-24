@@ -12,7 +12,7 @@ use winit::event::{MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
+use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::app::match_runtime::sim_tick;
 use crate::app::presentation::render;
@@ -32,18 +32,25 @@ use crate::ui::sidebar::{SidebarChromeLayoutSpec, SidebarTab};
 use crate::ui::skirmish_shell::{SavedSeedBrowserState, SavedSeedMode};
 use crate::util::config::GameConfig;
 
+pub mod app_bundle;
 pub(crate) mod audio_runtime;
 pub(crate) mod campaign_defeat;
 pub(crate) mod campaign_victory;
 pub(crate) mod chrono_screen;
 mod cncnet;
+mod cooperative_round;
 #[cfg(feature = "debug-tools")]
 pub(crate) mod debug_tools;
 pub(crate) mod diagnostics;
+/// Which screen the game opens on: the Display list's own translation between
+/// VERA's profile value and the window system's monitors.
+pub(crate) mod display_target;
 mod frame;
 pub mod frontend;
+mod game_data_check;
 mod handler;
 mod in_game;
+pub(crate) mod lan_service;
 mod initialize;
 pub(crate) mod input;
 pub(crate) mod loading;
@@ -53,6 +60,8 @@ pub(crate) mod match_diagnostics;
 pub(crate) mod match_runtime;
 pub(crate) mod movie_playback;
 pub(crate) mod persistence;
+/// The build description's native version metadata (`Phobos.version.h`).
+pub(crate) mod phobos_version;
 pub(crate) mod presentation;
 pub(crate) mod process_assets;
 #[cfg(feature = "telemetry-dashboard")]
@@ -87,6 +96,29 @@ pub(crate) mod telemetry_server;
 pub(crate) mod types;
 mod window_icon;
 
+/// Main window title. The single-instance gate finds a running copy's window by
+/// this exact title, so `main` hands the same constant to
+/// `util::single_instance::acquire`.
+pub const WINDOW_TITLE: &str = match (
+    crate::rules::ARES_ENABLED,
+    crate::rules::PHOBOS_ENABLED,
+    crate::rules::NPATCH_ENABLED,
+) {
+    (true, true, true) => "VERA20K [Ares+Phobos+NPatch]",
+    (true, true, false) => "VERA20K [Ares+Phobos]",
+    (true, false, true) => "VERA20K [Ares+NPatch]",
+    (true, false, false) => "VERA20K [Ares]",
+    (false, true, true) => "VERA20K [Phobos+NPatch]",
+    (false, true, false) => "VERA20K [Phobos]",
+    (false, false, true) => "VERA20K [NPatch]",
+    (false, false, false) => "VERA20K",
+};
+
+/// Identity stamp shared by the status screen and the telemetry capture. Not a
+/// retail build string, and not the tactical view's version description —
+/// that one is Phobos's own text ([`phobos_version`]).
+pub(crate) const BUILD_STAMP: &str = concat!("VERA20K ", env!("CARGO_PKG_VERSION"));
+
 pub(crate) use shell_random_map::RandomMapGenerationRetention;
 pub(crate) use state::{AppState, PlatformState, reset_scenario_exit_runtime};
 
@@ -101,6 +133,9 @@ pub struct App {
     startup_options: crate::app::frontend::startup_options::RetailStartupOptions,
     spawn_request: Option<crate::app::frontend::cncnet_spawn::SpawnRequest>,
     startup_failure: Option<String>,
+    /// Make sure config.toml names a game folder before the window opens
+    /// ([`app_bundle`]).
+    ask_for_game_folder: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +182,7 @@ impl App {
             startup_options,
             spawn_request: None,
             startup_failure: None,
+            ask_for_game_folder: false,
         }
     }
 
@@ -162,6 +198,7 @@ impl App {
             startup_options: crate::app::frontend::startup_options::RetailStartupOptions::default(),
             spawn_request: None,
             startup_failure: None,
+            ask_for_game_folder: false,
         }
     }
 
@@ -179,7 +216,15 @@ impl App {
             startup_options: crate::app::frontend::startup_options::RetailStartupOptions::default(),
             spawn_request: None,
             startup_failure: None,
+            ask_for_game_folder: false,
         }
+    }
+
+    /// Before the window opens, ask for the Yuri's Revenge folder until
+    /// config.toml names one: a launch from the macOS app bundle or the Linux
+    /// AppImage.
+    pub fn ask_for_game_folder_first(&mut self) {
+        self.ask_for_game_folder = true;
     }
 
     pub fn finish_capture(&mut self) -> Result<()> {

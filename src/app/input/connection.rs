@@ -43,8 +43,9 @@ pub(crate) fn mouse(state: &mut AppState, button: MouseButton, pressed: bool) {
     if pressed {
         page.buttons.press(target);
         if target.is_some() {
-            // Owner-draw buttons click at button-down (0x0061374B..0x00613771).
-            App::play_skirmish_shell_generic_click_sound(state);
+            // Owner-draw buttons play GUIMainButtonSound at button-down
+            // (0x0061374B..0x00613771).
+            App::play_main_menu_button_sound(state);
         }
         return;
     }

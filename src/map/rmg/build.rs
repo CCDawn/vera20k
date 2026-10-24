@@ -106,6 +106,7 @@ pub struct GenerationPointView<'a> {
     geometry: MapGeometry,
     grid: &'a grid::RmgGrid,
     waypoints: &'a [(u8, u16, u16)],
+    terrain: &'a [(String, i16, i16)],
 }
 
 impl GenerationPointView<'_> {
@@ -115,16 +116,16 @@ impl GenerationPointView<'_> {
 
     /// Project the grid as it stands into a `MapFile`.
     ///
-    /// Trees and tech buildings are left out: the pipeline collects them as it
-    /// goes and hands them over only at the end, and the preview draws neither
-    /// — it reads cells and overlays.
+    /// Terrain placements borrow the pipeline's chronological accumulator,
+    /// so an early snapshot contains only constructors already reached.
+    /// Projection uses the same emitter as the final generated map.
     pub fn snapshot(&self) -> GenerationSnapshot {
         let mut map_file = emit::empty_map_file(
             self.options,
             self.geometry.gen_w as u32,
             self.geometry.gen_h as u32,
         );
-        emit::populate(&mut map_file, self.grid, &[], &[], self.waypoints);
+        emit::populate(&mut map_file, self.grid, self.terrain, &[], self.waypoints);
         GenerationSnapshot {
             map_file,
             start_waypoints: self.waypoints.to_vec(),
@@ -221,15 +222,20 @@ pub fn generate_map_observed(
         geometry,
         grid: &grid,
         waypoints: &[],
+        terrain: &[],
     });
 
-    let mut on_stage = |stage: Stage, grid: &grid::RmgGrid, waypoints: &[(u8, u16, u16)]| {
+    let mut on_stage = |stage: Stage,
+                        grid: &grid::RmgGrid,
+                        waypoints: &[(u8, u16, u16)],
+                        terrain: &[(String, i16, i16)]| {
         observe(GenerationPointView {
             point: GenerationPoint::After(stage),
             options: &options,
             geometry,
             grid,
             waypoints,
+            terrain,
         });
     };
     let output = pipeline::run_pipeline(

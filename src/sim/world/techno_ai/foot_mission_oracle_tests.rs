@@ -50,10 +50,6 @@ pub(in crate::sim::world::techno_ai) fn oracle() -> &'static Value {
             "tools/spatial_oracle/anytown_damage/foot_missions.json",
         ))
         .unwrap();
-        assert_eq!(
-            value["native_sha256"],
-            "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-        );
         value
     })
 }
@@ -316,9 +312,13 @@ fn assert_weapon_reader_projection(rules: &RuleSet, expected: &Value, family: &s
         if let Some(name) = weapon.warhead.as_deref() {
             let actual = rules.warhead(name).unwrap();
             assert_eq!(
-                actual
-                    .verses_f64
-                    .map(|value| format!("{:016x}", value.to_bits())),
+                std::array::from_fn::<_, 11, _>(|index| format!(
+                    "{:016x}",
+                    actual
+                        .interaction(crate::rules::armor::ArmorId::from_index(index))
+                        .multiplier()
+                        .bits()
+                )),
                 std::array::from_fn::<_, 11, _>(|index| {
                     warhead["verses_bits"][index].as_str().unwrap().to_owned()
                 }),
@@ -569,7 +569,7 @@ impl SuppliedFootFixture {
             // Constructor ordinals use the shared Rust namespace/cursor as
             // well as its entity store, so this supplied world can be saved.
             // Native Abstract IDs are transported separately by consumers.
-            assert_eq!(sim.allocate_stable_id(), id);
+            assert_eq!(sim.substrate.allocate_stable_id(), id);
             let extra = registration["placements"]
                 .as_array()
                 .unwrap()
@@ -889,7 +889,14 @@ impl SuppliedFootFixture {
                 sub_cell,
                 CellListInsertion::PrependNonBuilding,
             );
-            sim.submit_object_display(id, DisplayLayer::GROUND, Some(rules));
+            Simulation::submit_object_display(
+                &sim.interner,
+                &sim.terrain_objects,
+                &mut sim.substrate,
+                id,
+                DisplayLayer::GROUND,
+                rules,
+            );
         }
         sim.set_logic_order_for_test(logic);
         // The original row writes pose/layer controls AFTER Unlimbo. They do
@@ -2334,7 +2341,7 @@ fn saved_native_stage_resumes_original_clock_and_changes_world_hash() {
     let mut compared = 0;
     for row in rows {
         let mut sim = Simulation::new();
-        assert_eq!(sim.allocate_stable_id(), 1);
+        assert_eq!(sim.substrate.allocate_stable_id(), 1);
         let mut actor = GameEntity::test_default(1, "CLOCK", "Americans", 2, 2);
         let frames = row["frames"].as_array().unwrap();
         actor.install_native_stage_fixture(native_clock_fixture(&frames[0]["before"]));

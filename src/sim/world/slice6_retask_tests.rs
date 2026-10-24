@@ -77,6 +77,7 @@ fn unit(owner: &str, type_id: &str, cx: u16, cy: u16, cat: EntityCategory) -> Ma
         mission: None,
         recruitable_a: true,
         recruitable_b: true,
+        group: -1,
         structure_upgrades: [None, None, None],
         structure_ai_sellable: false,
         structure_ai_repairable: false,
@@ -381,7 +382,25 @@ fn unit(owner: &str, type_id: &str, cx: u16, cy: u16, cat: EntityCategory) -> Ma
 // control on #2183's merge without that hash gave the previous value, with
 // every tripwire above green. Control removed.
 // Previous: 0xDE7B_17EE_FC74_D0AF.
-const SLICE6_BASELINE_HASH: u64 = 0xF35B_3382_2DEF_1F00;
+// Unit Is_Ready_To_Commence's moving defer (`0x007442C2..0x00744327`) now
+// reads GetHeight: the tank's Attack stays queued behind its Move while it
+// drives (pinned in the loop), so its MissionCom differs. All three RNG
+// streams and the per-frame replay are unchanged. Previous:
+// 0xF35B_3382_2DEF_1F00.
+// #2543 removed the entity hash's determines_waypoint_edge input with the
+// frozen type fact it read; every object here hashed it as false. Hash
+// composition only: a temporary control restoring that false gave the
+// previous value, with every tripwire above green. Control removed.
+// Previous: 0x51BE_2569_5006_2383.
+// 2026-10-24 shared ammo/reload: entity hashing now includes count
+// presence, signed unlimited ammo and the raw constructor reload clock.
+// Against raw c753af366, all 17 recorded non-hash observations, RNG
+// draws/caller sequences and the other 12 final hash domains matched
+// after the new zero clock; backtrace line shifts mapped to unchanged
+// source. This remains a Rust regression pin, not a native game golden.
+// Previous: 0x619E_E645_0B3E_881C.
+// Hash composition includes constructor planning registration and the shared ammo reload clock.
+const SLICE6_BASELINE_HASH: u64 = 0xAEA5_D31A_37FA_33F9;
 
 #[test]
 fn replay_hash_stable_through_slice6() {
@@ -542,21 +561,26 @@ fn replay_hash_stable_through_slice6() {
                 "({rx}, {ry}) beyond the fixture's M60 Range=5"
             );
 
+            // Unit Is_Ready_To_Commence's moving defer (`0x007442C2..
+            // 0x00744327`): the ForceAttackCell (frame 5) and Attack (frame 7)
+            // orders queue Attack while the tank drives the segment it had
+            // committed toward its Move destination, on Move, with no `+0xB8`
+            // bypass. So Attack stays queued, behind the Move committed at
+            // frame 1, and Stop keeps it there.
             let tank = sim.substrate.entities.get(1).expect("retasked tank lives");
             assert_eq!(
                 tank.mission.current(),
+                MissionId::from_known(MissionType::Move)
+            );
+            assert_eq!(
+                tank.mission.queued(),
                 MissionId::from_known(MissionType::Attack)
             );
-            assert_eq!(tank.mission.queued(), MissionId::NONE);
-            assert_eq!(tank.mission.mission_start_frame(), 5);
-            assert_eq!(tank.mission.ai_counter(), tick as u32 - 4);
-            assert_eq!(
-                (
-                    tank.mission.dispatch_timer().start_frame(),
-                    tank.mission.dispatch_timer().delay()
-                ),
-                (5, 14),
-                "Stop retains Attack's dispatch timer and counter"
+            assert_eq!(tank.mission.mission_start_frame(), 1);
+            assert_eq!(tank.mission.movement_bypass_latch(), 0);
+            assert!(
+                !sim.mission_ready_to_commence(1, &rules),
+                "the queued Attack waits for the drive to stop"
             );
             let drive = tank
                 .locomotor
@@ -650,8 +674,8 @@ fn replay_hash_stable_through_slice6() {
     super::global_parity_harness_tests::print_replay_summary("slice6", &sim);
     assert_eq!(
         [1, 2, 3].map(|id| sim.substrate.entities.get(id).unwrap().mission.ai_counter()),
-        [11, 16, 7],
-        "Stop retains Attack; Unit/Infantry Commence precedes the Techno counter increment"
+        [15, 16, 7],
+        "the tank's Move counts every visit since frame 1; Unit/Infantry Commence precedes the Techno counter increment"
     );
     // Original Unit736473 / Infantry51BC51 Commence clears C4 before
     // Techno6FA64E increments it; the mission_counter corpus pins that owner.

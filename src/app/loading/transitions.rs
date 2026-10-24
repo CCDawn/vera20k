@@ -48,6 +48,7 @@ pub(crate) fn sync_in_game_options_speed_from_sim(state: &mut AppState) {
 pub(crate) fn fallback_map_load_result() -> init::MapLoadResult {
     init::MapLoadResult {
         scenario: init::ScenarioLoadInputs {
+            campaign_names: None,
             startup: crate::app::match_bootstrap::LoadingStartup::Generic {
                 selected_map_file: "fallback".to_string(),
             },
@@ -99,6 +100,7 @@ pub(crate) fn fallback_map_load_result() -> init::MapLoadResult {
 /// App-only projections transferred with a new runtime. This bundle has no
 /// gameplay authority: its source values belong to the loaded map/resources.
 pub(crate) struct MapPresentationInputs {
+    pub(crate) campaign_names: Option<crate::rules::campaign_loading::CampaignScenarioNames>,
     pub(crate) basic: BasicSection,
     pub(crate) ranking: crate::map::ranking::RankingSection,
     pub(crate) source: crate::map::source::LoadedMapSource,
@@ -108,6 +110,8 @@ pub(crate) struct MapPresentationInputs {
     pub(crate) terrain_objects: Vec<crate::map::overlay::TerrainObject>,
     pub(crate) house_roster: HouseRoster,
     pub(crate) lighting_config: crate::map::lighting::LightingConfig,
+    /// Present only for a fresh map, from before authored Overlay admission.
+    pub(crate) lighting_events: Option<Vec<crate::sim::light_sources::LightingEvent>>,
     pub(crate) theater_name: String,
     pub(crate) theater_ext: String,
 }
@@ -122,6 +126,9 @@ pub(crate) fn install_world_presentation(
     map: MapPresentationInputs,
     assets: init::PresentationLoadAssets,
 ) {
+    if let Some(names) = map.campaign_names {
+        state.match_state.campaign_names = names;
+    }
     state.match_state.map_basic = map.basic;
     state.match_state.map_ranking = map.ranking;
     state.match_state.loaded_map_source = Some(map.source);
@@ -134,6 +141,7 @@ pub(crate) fn install_world_presentation(
         .map(|runtime| runtime.resources.overlay_registry.clone());
 
     state.match_state.match_presentation.combat_lights.clear();
+    state.match_state.match_presentation.interpolation.clear();
     state.match_state.match_presentation.lasers.clear_on_load();
     state
         .match_state
@@ -230,6 +238,7 @@ pub(crate) fn install_world_presentation(
         map.lighting_config,
         presentation.in_game_options.detail_level,
         live,
+        map.lighting_events.as_deref(),
     );
     // Current MapClass authority, including restored/triggered LocalSize,
     // reaches camera and minimap before either route positions its view.
@@ -269,6 +278,34 @@ pub(crate) fn install_world_presentation(
         &state.renderer.batch_renderer,
         state.process_assets.manager(),
     ));
+    // Full_Init 687BB2 -> Init_BeaconArt 4309D0; each row's ColorScheme is
+    // its House's (+0x16054).
+    state.match_state.match_presentation.beacon_art =
+        state.process_assets.manager().and_then(|assets| {
+            let runtime = state.match_state.sim_runtime.as_ref()?;
+            let sim = &runtime.simulation;
+            let colors = &state.match_state.match_presentation.house_color_map;
+            let ramps: Vec<_> = sim
+                .houses()
+                .order()
+                .iter()
+                .take(crate::app::match_runtime::beacons::BEACON_HOUSES)
+                .map(|house| {
+                    let index = colors
+                        .get(sim.interner().resolve(*house))
+                        .copied()
+                        .unwrap_or(crate::rules::house_colors::NO_REMAP);
+                    *runtime.resources.rules.house_color_ramps.ramp(index)
+                })
+                .collect();
+            Some(crate::render::beacon_art::BeaconArt::new(
+                &state.renderer.gpu.device,
+                &state.renderer.gpu.queue,
+                &state.renderer.batch_renderer,
+                assets,
+                &ramps,
+            ))
+        });
     let shroud_buffer = state.process_assets.manager().and_then(|assets| {
         let grid = state
             .match_state
@@ -279,7 +316,7 @@ pub(crate) fn install_world_presentation(
         let shp =
             crate::assets::shp_file::ShpFile::from_bytes(assets.get_ref("shroud.shp")?).ok()?;
         let (frame_pixels, cw, ch) = crate::render::shroud_buffer::extract_shp_brightness(&shp);
-        Some(crate::render::shroud_buffer::ShroudBuffer::new(
+        let mut buffer = crate::render::shroud_buffer::ShroudBuffer::new(
             &state.renderer.gpu.device,
             &state.renderer.gpu.queue,
             [state.render_width(), state.render_height()],
@@ -287,7 +324,13 @@ pub(crate) fn install_world_presentation(
             frame_pixels,
             [cw, ch],
             crate::render::shroud_buffer::SHROUD_EDGE_LUT,
-        ))
+        );
+        // Cell47EFE0/47F250 use FOG.SHP's raw A bytes when Scenario0x1000
+        // is set. It belongs to this same tactical source, not a sprite atlas.
+        let fog = crate::assets::shp_file::ShpFile::from_bytes(assets.get_ref("fog.shp")?).ok()?;
+        let (frames, width, height) = crate::render::shroud_buffer::extract_shp_brightness(&fog);
+        buffer.install_fog_frames(frames, [width, height]);
+        Some(buffer)
     });
     state.match_state.match_presentation.shroud_buffer = shroud_buffer;
 }
@@ -297,6 +340,13 @@ pub(crate) fn install_world_presentation(
 /// owner suspends/resumes audio; the later Theme queue/Stop(true) belongs to
 /// apply_map_load_result (683E4D..683E66), after this movie returns.
 pub(crate) fn finish_fresh_scenario_read(state: &mut AppState, mut result: init::MapLoadResult) {
+    // Read_INI_Basic689FD6/689FF4 retains these two buffers across fresh
+    // ClearScene reads. Saved restoration instead installs the saved values
+    // directly through install_world_presentation; it must not inherit here.
+    result
+        .scenario
+        .basic
+        .resolve_retained_destinations(&state.match_state.map_basic);
     let action_movie = result.scenario.startup.campaign().and_then(|startup| {
         // Start_Scenario683D9C tests its DL argument before the movie.
         if !startup.plays_action_movie() {
@@ -383,7 +433,6 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
         simulation.install_fresh_process_main(&state.frontend.frontend_main_rng);
         simulation.publish_scenario_started();
         simulation.batch_path_searches();
-        simulation.batch_target_scans();
         crate::sim::runtime::SimRuntime {
             simulation,
             resources: crate::sim::runtime::SimResources {
@@ -402,14 +451,21 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
             .session
             .hand_mode_to_world(runtime.simulation.session().game_mode());
     }
+    crate::app::audio_runtime::bind_match_eva_context(state);
     // Only an actually-carried lease returns. A fallback result must not wipe
     // the process-sticky manager already restored by its failure path.
     if let Some(manager) = result.asset_manager {
         state.process_assets.return_from_loading(manager);
     }
+    let lighting_events = state
+        .match_state
+        .sim_runtime
+        .as_mut()
+        .map(|runtime| runtime.simulation.take_lighting_events());
     install_world_presentation(
         state,
         MapPresentationInputs {
+            campaign_names: result.scenario.campaign_names,
             basic: result.scenario.basic,
             ranking: result.scenario.ranking,
             source: result.scenario.map_source,
@@ -419,6 +475,7 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
             terrain_objects: result.scenario.terrain_objects,
             house_roster: result.scenario.house_roster,
             lighting_config: result.scenario.map_lighting_config,
+            lighting_events,
             theater_name: result.scenario.theater_name,
             theater_ext: result.scenario.theater_ext,
         },
@@ -484,9 +541,10 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
         crate::ui::messages::MESSAGE_MAX_VISIBLE_RETAIL,
         0,
     );
-    state.match_state.match_presentation.message_clock =
-        crate::ui::messages::PauseAwareClock::default();
     state.match_state.match_presentation.chat = Default::default();
+    // Clear_Scene6851F0 -> 534450 resets BeaconManagerClass (53499B).
+    // Display Init_Clear4A88C0 clears +11B0..+11B2, not beacon mode +11B4.
+    state.match_state.match_presentation.beacons = Default::default();
     state.match_state.input.minimap_dragging = false;
     state.match_state.input.tactical_mouse.reset_for_new_view();
     state.match_state.input.keys_held.clear();
@@ -494,9 +552,6 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
     state.match_state.input.cursor_y = tactical_height as f32 * 0.5;
     state.platform.frame_pacer.reset_for_immediate_frame();
     state.match_state.input.queued_order_mode = render::OrderMode::Move;
-    for group in &mut state.match_state.input.control_groups {
-        group.clear();
-    }
     state.match_state.local_owner_override = result.scenario.initial_local_owner;
     state.match_state.match_audio.reset_for_new_match();
     state.match_state.sandbox_full_visibility = result.scenario.sandbox_full_visibility;
@@ -555,7 +610,16 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
         crate::app::match_bootstrap::LoadingStartup::Network(prepared) => {
             state.match_state.session.assert_network_start(&prepared);
             state.match_state.startup.clear();
-            Ok(())
+            // A co-op continuation's GameExit tail (`0x00685D7A` victory,
+            // `0x0068639A` defeat) restores the record after Start_Scenario.
+            if let Some(record) = prepared.carry_over()
+                && let Some(runtime) = state.match_state.sim_runtime.as_mut()
+            {
+                runtime
+                    .simulation
+                    .restore_campaign_carry_over(record, &runtime.resources.rules);
+            }
+            crate::app::lan_service::install_gameplay(state).map_err(|error| error.to_string())
         }
         crate::app::match_bootstrap::LoadingStartup::UnverifiedLegacy { .. }
         | crate::app::match_bootstrap::LoadingStartup::Generic { .. } => {

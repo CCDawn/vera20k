@@ -16,7 +16,7 @@ fn complete(
             target_rx: cell.0,
             target_ry: cell.1,
         },
-        Some(rules),
+        rules,
         None,
         FrameEffects::default(),
     )
@@ -32,7 +32,7 @@ fn cancel(
     sim.apply_command_with_overlays(
         &name,
         &Command::CancelPaidSuperWeapon { selection },
-        Some(rules),
+        rules,
         None,
         FrameEffects::default(),
     )
@@ -187,7 +187,16 @@ fn superweapon_money_two_stage_reset_and_defeat_invalidate_pending_selection() {
                 .set_is_defeated_for_test(true);
             superweapon::update_owned_supers(&mut sim, &rules, owner);
         } else {
-            superweapon::reset_super(&mut sim, &rules, owner, "Sphere");
+            superweapon::reset_super(
+                &sim.interner,
+                &sim.session,
+                &mut sim.substrate,
+                &mut sim.sound_events,
+                &mut sim.super_weapons,
+                &rules,
+                owner,
+                "Sphere",
+            );
         }
         assert!(sim.paid_super_weapon_selection(owner).is_none());
         assert!(!complete(&mut sim, &rules, owner, ticket, (15, 15)));
@@ -351,14 +360,14 @@ fn superweapon_money_two_stage_begin_cancel_reselect_in_one_saved_command_batch(
     }
     assert!(sim.projected_paid_super_weapon_selection(owner).is_none());
     let mut loaded = restore(&sim, &rules);
-    let commands = loaded.take_due_commands();
+    let commands = loaded.take_frame_commands_for_test();
     assert_eq!(commands.len(), 5);
     for (index, command) in commands.iter().enumerate() {
         assert_eq!(
             loaded.apply_command_with_overlays(
                 "Americans",
                 &command.payload,
-                Some(&rules),
+                &rules,
                 None,
                 FrameEffects::default()
             ),
@@ -372,7 +381,7 @@ fn superweapon_money_two_stage_begin_cancel_reselect_in_one_saved_command_batch(
     assert!(!loaded.apply_command_with_overlays(
         "Americans",
         &commands[0].payload,
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default()
     ));
@@ -450,7 +459,7 @@ fn superweapon_money_two_stage_refused_source_request_id_is_never_reused() {
     assert!(!sim.apply_command_with_overlays(
         "Americans",
         &request,
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default()
     ));
@@ -471,7 +480,7 @@ fn superweapon_money_two_stage_refused_source_request_id_is_never_reused() {
     assert!(sim.apply_command_with_overlays(
         "Americans",
         &request,
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default()
     ));

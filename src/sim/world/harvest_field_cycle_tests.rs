@@ -141,7 +141,7 @@ fn order(s: &mut Scene, command: crate::sim::command::Command) {
     assert!(s.sim.apply_command_with_overlays(
         "Americans",
         &command,
-        Some(&s.rules),
+        &s.rules,
         Some(registry()),
         crate::sim::world::FrameEffects::default(),
     ));
@@ -158,10 +158,11 @@ fn a_return_order_ends_the_harvesting_byte_and_oregath() {
     let refinery = s.refinery;
     order(
         &mut s,
-        crate::sim::command::Command::MinerReturn {
-            entity_id: miner,
-            target_refinery_id: Some(refinery),
-        },
+        crate::sim::command::Command::clicked_mission(
+            miner,
+            crate::sim::mission::MissionType::Enter,
+            crate::sim::combat::TargetKind::Entity(refinery),
+        ),
     );
     let sample = frame(&mut s);
     assert!(!sample.harvesting, "Unit+0x6D2 cleared by the unit AI");
@@ -212,7 +213,7 @@ fn retail_war_miner_area_guard_returns_to_harvesting() {
         assert!(s.sim.apply_command_with_overlays(
             "Americans",
             &command.payload,
-            Some(&s.rules),
+            &s.rules,
             Some(&registry),
             Default::default(),
         ));
@@ -270,7 +271,7 @@ fn retail_war_miner_attacks_without_cutting_ore_and_resumes_its_idle_mission() {
             assert!(s.sim.apply_command_with_overlays(
                 "Americans",
                 &command,
-                Some(&s.rules),
+                &s.rules,
                 Some(&registry),
                 crate::sim::world::FrameEffects::default(),
             ));

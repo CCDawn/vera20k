@@ -8,10 +8,26 @@ use crate::rules::ini_parser::IniFile;
 use crate::sim::production::{ProductionCategory, construct_active_factory_fixture};
 use serde_json::{Value, json};
 
+#[cfg(feature = "ares")]
+#[path = "can_build_ares_tests.rs"]
+mod ares_tests;
+
 fn rows(section: &str) -> Vec<Value> {
     let data: Value =
         serde_json::from_str(crate::test_fixture::text("tools/can_build_oracle.json")).unwrap();
     data[section].as_array().unwrap().clone()
+}
+
+#[cfg(not(feature = "ares"))]
+fn comparable_can_build_rows() -> impl Iterator<Item = Value> {
+    rows("can_build").into_iter().filter(|row| {
+        // These gamemd controls intentionally differ from Ares100082B0's
+        // positive specific count and CountOwnedNow100032F0's tracked
+        // alternates. The Ares corpus covers those component boundaries.
+        !crate::rules::ARES_ENABLED
+            || (row["proc_alternate"].is_null()
+                && row["name"].as_str() != Some("BuildingType count negative"))
+    })
 }
 
 fn int(value: &Value) -> i32 {
@@ -283,9 +299,112 @@ fn query(row: &Value, rules: &RuleSet) -> ObjectType {
     rules.object_in_category(class, "Q").unwrap().clone()
 }
 
+#[cfg(not(feature = "ares"))]
+fn upgrade_prerequisite_world() -> (Simulation, RuleSet, InternedId) {
+    let rules = RuleSet::from_ini(&IniFile::from_str(
+        "[Countries]\n0=C1\n[VehicleTypes]\n0=Q\n\
+         [BuildingTypes]\n0=HOST\n1=UPGRADE\n2=OTHER\n\
+         [Q]\nTechLevel=1\nPrerequisite=UPGRADE\n\
+         [HOST]\nStrength=100\nUpgrades=3\n\
+         [UPGRADE]\nStrength=100\nPowersUpBuilding=HOST\n\
+         [OTHER]\nStrength=100\n",
+    ))
+    .unwrap();
+    let (mut sim, owner) = sim_for(&json!({}), &rules);
+    for (id, name, x) in [(1, "HOST", 10), (2, "OTHER", 14)] {
+        crate::sim::production::tests::spawn_structure(&mut sim, &rules, id, "H0", name, x, 10);
+    }
+    let upgrade = sim.interner.get("UPGRADE").unwrap();
+    sim.substrate
+        .entities
+        .get_mut(1)
+        .unwrap()
+        .set_building_upgrades_for_test(0, [None, None, Some(upgrade)]);
+    (sim, rules, owner)
+}
+
+/// Steam CanBuild4F7DF8..4F7E4E stops at the last eligible House building,
+/// even when an earlier host carries the prerequisite. Its fixed three-type
+/// scan does not read the upgrade count or compare PowersUpBuilding's name.
 #[test]
+#[cfg(not(feature = "ares"))]
+fn upgrade_prerequisite_uses_house_order_and_all_three_type_slots() {
+    let (mut sim, rules, owner) = upgrade_prerequisite_world();
+    let product = rules.object("Q").unwrap();
+    assert_eq!(
+        can_build(&sim, &rules, owner, product, false, true),
+        CanBuild::No,
+        "the newer unrelated building hides the earlier installed upgrade"
+    );
+    sim.houses
+        .get_mut(&owner)
+        .unwrap()
+        .base_projection_mut()
+        .replace_buildings_for_test(vec![2, 1]);
+    assert_eq!(
+        can_build(&sim, &rules, owner, product, false, true),
+        CanBuild::Yes,
+        "House order decides; the third type slot counts even with count zero"
+    );
+    let upgrade = sim.interner.get("UPGRADE").unwrap();
+    sim.substrate
+        .entities
+        .get_mut(2)
+        .unwrap()
+        .set_building_upgrades_for_test(0, [None, None, Some(upgrade)]);
+    sim.houses
+        .get_mut(&owner)
+        .unwrap()
+        .base_projection_mut()
+        .replace_buildings_for_test(vec![1, 2]);
+    assert_eq!(
+        can_build(&sim, &rules, owner, product, false, true),
+        CanBuild::Yes,
+        "the selected building need not match the declared host type"
+    );
+}
+
+#[test]
+#[cfg(not(feature = "ares"))]
+fn upgrade_prerequisite_skips_limbo_offline_and_both_selling_missions() {
+    use crate::sim::mission::MissionDispatchTimer;
+    use crate::sim::mission::state::MissionTestFixture;
+
+    let (mut sim, rules, owner) = upgrade_prerequisite_world();
+    let product = rules.object("Q").unwrap();
+    let guard = MissionId::from_known(MissionType::Guard);
+    let selling = MissionId::from_known(MissionType::Selling);
+    for (limbo, online, current, queued) in [
+        (true, true, guard, MissionId::NONE),
+        (false, false, guard, MissionId::NONE),
+        (false, true, selling, MissionId::NONE),
+        (false, true, guard, selling),
+    ] {
+        let latest = sim.substrate.entities.get_mut(2).unwrap();
+        latest.lifecycle.set_in_limbo_for_test(limbo);
+        latest.set_building_online_for_test(online);
+        latest.mission.apply_test_fixture(MissionTestFixture {
+            current,
+            suspended: MissionId::NONE,
+            queued,
+            movement_bypass_latch: 0,
+            handler_state: 0,
+            mission_start_frame: 0,
+            ai_counter: 0,
+            dispatch_timer: MissionDispatchTimer::at_frame(0),
+        });
+        assert_eq!(
+            can_build(&sim, &rules, owner, product, false, true),
+            CanBuild::Yes,
+            "skip latest building: limbo={limbo}, online={online}, current={current:?}, queued={queued:?}"
+        );
+    }
+}
+
+#[test]
+#[cfg(not(feature = "ares"))]
 fn can_build_matches_the_original() {
-    for row in rows("can_build") {
+    for row in comparable_can_build_rows() {
         let rules = rules_for(&row);
         let (sim, owner) = sim_for(&row, &rules);
         let args = row["args"].as_array().unwrap();
@@ -304,6 +423,51 @@ fn can_build_matches_the_original() {
         };
         assert_eq!(answer, int(&row["answer"]), "{}", row["name"]);
     }
+}
+
+/// ReadOwners4750D0 clears DA0 before comma tokenization; CanBuild4F79E4
+/// rejects that zero mask. The limit-only and prerequisite-override arms
+/// precede this country gate in the original function.
+#[test]
+#[cfg(not(feature = "ares"))]
+fn comma_only_required_houses_refuses_ordinary_can_build_but_keeps_shortcuts() {
+    let make = |required: &str| {
+        RuleSet::from_ini(&IniFile::from_str(&format!(
+            "[Countries]\n0=C0\n1=C1\n[BuildingTypes]\n0=Q\n1=BYPASS\n\
+             [Q]\nStrength=100\nTechLevel=1\nOwner=C1\nPrerequisiteOverride=BYPASS\n\
+             RequiredHouses={required}\n[BYPASS]\nStrength=100\n"
+        )))
+        .unwrap()
+    };
+    let rules = make(",,,");
+    let product = rules.object("Q").unwrap();
+    let (mut sim, owner) = sim_for(&json!({}), &rules);
+    assert_eq!(
+        can_build(&sim, &rules, owner, product, false, true),
+        CanBuild::No
+    );
+    let (ai, ai_owner) = sim_for(&json!({"house":{"human":false}}), &rules);
+    assert_eq!(
+        can_build(&ai, &rules, ai_owner, product, false, true),
+        CanBuild::No
+    );
+    assert_eq!(
+        can_build(&sim, &rules, owner, product, true, true),
+        CanBuild::Yes
+    );
+
+    crate::sim::production::tests::spawn_structure(&mut sim, &rules, 1, "H0", "BYPASS", 10, 10);
+    assert_eq!(
+        can_build(&sim, &rules, owner, product, false, true),
+        CanBuild::Yes
+    );
+    let blank = make("");
+    let (sim, owner) = sim_for(&json!({}), &blank);
+    assert_eq!(
+        can_build(&sim, &blank, owner, blank.object("Q").unwrap(), false, true),
+        CanBuild::Yes,
+        "an empty ReadString keeps the unrestricted constructor default"
+    );
 }
 
 #[test]
@@ -327,10 +491,10 @@ fn captured_secret_lab_grants_before_normal_tech_admission_and_retracts_on_loss(
         &IniFile::from_str(
             "[Countries]\n0=C0\n[C0]\nSide=GDI\n\
              [InfantryTypes]\n0=Q\n\
-             [BuildingTypes]\n0=LAB\n1=MISSING\n\
-             [Q]\nTechLevel=-1\nStrength=100\nCost=100\nPrerequisite=MISSING\n\
+             [BuildingTypes]\n0=LAB\n1=MISSING\n2=FACTORY\n\
+             [Q]\nTechLevel=-1\nStrength=100\nCost=100\nOwner=C0\nPrerequisite=MISSING\n\
              [LAB]\nStrength=100\nCapturable=yes\nNeedsEngineer=yes\nSecretLab=yes\nSecretInfantry=Q\n\
-             [MISSING]\nStrength=100\n",
+             [MISSING]\nStrength=100\n[FACTORY]\nStrength=100\nFactory=InfantryType\nOwner=C0\n",
         ),
     )
     .unwrap();
@@ -344,6 +508,10 @@ fn captured_secret_lab_grants_before_normal_tech_admission_and_retracts_on_loss(
         sim.houses
             .register(HouseState::new(id, 0, Some(country), human, 1000, 10));
     }
+    #[cfg(feature = "ares")]
+    crate::sim::production::tests::spawn_structure(
+        &mut sim, &rules, 10000, "Self", "FACTORY", 20, 20,
+    );
     let lab = sim.spawn_object("LAB", "Other", 12, 5, 0, &rules).unwrap();
     let product = rules.object("Q").unwrap();
     assert_eq!(
@@ -364,8 +532,9 @@ fn captured_secret_lab_grants_before_normal_tech_admission_and_retracts_on_loss(
 }
 
 #[test]
+#[cfg(not(feature = "ares"))]
 fn can_build_after_runtime_tech_level_change_matches_original_current_value_controls() {
-    for row in rows("can_build") {
+    for row in comparable_can_build_rows() {
         let native_tech_level = row["type"]["tech"].as_i64().unwrap_or(1) as i32;
         let mut initial = row.clone();
         // The original corpus's current value comes from the trigger owner,
@@ -413,11 +582,9 @@ fn retail_slave_miner_meets_proc_and_docks_limit_harriers() {
         .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
     let on_map = |sim: &mut Simulation, house, category, name: &str, count| {
         let type_id = sim.interner.get(name).unwrap();
-        sim.houses
-            .get_mut(&house)
-            .unwrap()
-            .tracking_mut()
-            .set_active_for_test(category, type_id, count);
+        let tracking = sim.houses.get_mut(&house).unwrap().tracking_mut();
+        tracking.set_active_for_test(category, type_id, count);
+        tracking.set_owned_for_test(category, type_id, count);
     };
 
     let yuri = sim.interner.intern("YuriCountry");
@@ -425,6 +592,16 @@ fn retail_slave_miner_meets_proc_and_docks_limit_harriers() {
         .register(HouseState::new(yuri, 2, None, true, 0, 10));
     on_map(&mut sim, yuri, EntityCategory::Structure, "YABRCK", 1);
     on_map(&mut sim, yuri, EntityCategory::Structure, "YACNST", 1);
+    #[cfg(feature = "ares")]
+    crate::sim::production::tests::spawn_structure(
+        &mut sim,
+        rules,
+        10000,
+        "YuriCountry",
+        "YACNST",
+        20,
+        20,
+    );
     let yaweap = rules.object("YAWEAP").unwrap();
     assert_eq!(
         can_build(&sim, rules, yuri, yaweap, false, true),
@@ -449,6 +626,7 @@ fn retail_slave_miner_meets_proc_and_docks_limit_harriers() {
 }
 
 #[test]
+#[cfg(not(feature = "ares"))]
 fn secret_lab_can_build_matches_original_human_ai_limit_and_priority_controls() {
     let native: Value =
         serde_json::from_str(crate::test_fixture::text("tools/can_build_secret_lab.json")).unwrap();

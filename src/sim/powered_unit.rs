@@ -3,7 +3,7 @@
 //! it has none, its `PoweredUnit=` vehicles go offline (Techno `+0x1C8`,
 //! [`Deactivation`]).
 //!
-//! gamemd-derived (instruction reading; YR 1.001, SHA-256 `1cdd1180…4298c`):
+//! gamemd-derived (instruction reading; YR 1.001):
 //! - the house's count of powered centers (House `+0x2D8`) and each
 //!   building's share in it (`+0x662`): the `PowersUnit=` arms of
 //!   BuildingClass's operational-edge dispatcher (`0x004549B0`: on at
@@ -59,14 +59,15 @@
 //!   and no scenario initialization under way (`0x00A8E7AC`,
 //!   `0x0050E088..0x0050E0C4`); the walks push the line without them.
 //!   Inaudible: retail `evamd.ini` has no entries for either line.
-//! - A rules-less lifecycle (fixture paths) cannot read `PowersUnit=`:
-//!   Removed_From_Game still uncounts the building but walks nothing.
 
 use crate::map::entities::EntityCategory;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::intern::InternedId;
+use crate::sim::intern::StringInterner;
 use crate::sim::movement::ground_pose::object_location;
 use crate::sim::movement::locomotor::MovementLayer;
+use crate::sim::world::FrameChannel;
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::{FrameEffects, SimSoundEvent, Simulation};
 
 /// String `0x00824E4C`.
@@ -155,7 +156,7 @@ impl Simulation {
         if operational {
             self.house_gained_powered_center(owner, powers_unit, rules, effects);
         } else {
-            self.house_lost_powered_center(owner, Some(powers_unit), Some(rules), effects);
+            self.house_lost_powered_center(owner, Some(powers_unit), rules, effects);
         }
     }
 
@@ -165,7 +166,7 @@ impl Simulation {
     pub(super) fn powered_center_removed(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         effects: FrameEffects<'_>,
     ) {
         let Some(building) = self.substrate.entities.get(id) else {
@@ -177,8 +178,8 @@ impl Simulation {
             return;
         }
         let owner = building.owner();
-        let unit_type = rules
-            .and_then(|rules| self.object_type(building.type_ref(), rules))
+        let unit_type = self
+            .object_type(building.type_ref(), rules)
             .and_then(|object| object.powers_unit.as_deref());
         self.substrate
             .entities
@@ -220,7 +221,7 @@ impl Simulation {
         &mut self,
         owner: InternedId,
         unit_type: Option<&str>,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         effects: FrameEffects<'_>,
     ) {
         let Some(house) = self.houses.get_mut(&owner) else {
@@ -229,7 +230,7 @@ impl Simulation {
         if house.lose_powered_center() != 0 {
             return;
         }
-        let (Some(unit_type), Some(rules)) = (unit_type, rules) else {
+        let Some(unit_type) = unit_type else {
             return;
         };
         if self.for_each_powered_unit(owner, unit_type, |sim, id| {
@@ -320,7 +321,14 @@ impl Simulation {
                 id,
             );
         }
-        self.latch_deactivated(id, true, rules);
+        Self::latch_deactivated(
+            &self.interner,
+            &mut self.substrate,
+            &mut self.sound_events,
+            id,
+            true,
+            rules,
+        );
     }
 
     /// `TechnoClass::Reactivate @ 0x0070FBE0`: ResetOrdersToGuard
@@ -342,6 +350,48 @@ impl Simulation {
         else {
             return;
         };
+        // Installed Ares Activate1004CCB0 replaces70FBE0 and vetoes before
+        // ResetOrders/Power_On/sound. Keep this admission in the shared owner:
+        // House50E010's power-center recovery also calls this function.
+        #[cfg(feature = "ares")]
+        {
+            let entity = self.substrate.entities.get(id).expect("same receiver");
+            // Selected live Drive/Walk path: Techno70EFD0 tests signed>0.
+            // Unit746C90's separate DeathFrame override remains outside this chain.
+            if entity.emp_remaining() > 0 {
+                return;
+            }
+            if self
+                .object_type(entity.type_ref(), rules)
+                .is_some_and(|object| object.powered_unit)
+            {
+                //100454F0 scans the existing House+6C building order, not its
+                // aggregate center count: matching PowersUnit, counted+662,
+                // and no EMP on that center. No second building registry.
+                let powered = self.houses.get(&entity.owner()).is_some_and(|house| {
+                    house.base_projection().buildings().iter().any(|building| {
+                        self.substrate
+                            .entities
+                            .get(*building)
+                            .is_some_and(|center| {
+                                center.building_powered_center.is_counted()
+                                    && center.emp_remaining() <= 0
+                                    && self
+                                        .object_type(center.type_ref(), rules)
+                                        .and_then(|object| object.powers_unit.as_deref())
+                                        .is_some_and(|name| {
+                                            self.interner
+                                                .resolve(entity.type_ref())
+                                                .eq_ignore_ascii_case(name)
+                                        })
+                            })
+                    })
+                });
+                if !powered {
+                    return;
+                }
+            }
+        }
         self.reset_orders_to_guard(id, rules, effects);
         if foot
             && let Some(locomotor) = self
@@ -352,29 +402,42 @@ impl Simulation {
         {
             locomotor.power_on();
         }
-        self.latch_deactivated(id, false, rules);
+        Self::latch_deactivated(
+            &self.interner,
+            &mut self.substrate,
+            &mut self.sound_events,
+            id,
+            false,
+            rules,
+        );
     }
 
     /// The two bodies' tails: the type's sound for a change of state, at the
     /// object's Location, then the latch.
     /// `TechnoClass::Deactivate @ 0x0070FC90` (`0x0070FD0E..0x0070FD62`) and
     /// `TechnoClass::Reactivate @ 0x0070FBE0` (`0x0070FC18..0x0070FC7A`).
-    fn latch_deactivated(&mut self, id: u64, deactivated: bool, rules: &RuleSet) {
-        let Some(entity) = self.substrate.entities.get(id) else {
+    fn latch_deactivated(
+        interner: &StringInterner,
+        substrate: &mut ObjectSubstrate,
+        sound_events: &mut FrameChannel<SimSoundEvent>,
+        id: u64,
+        deactivated: bool,
+        rules: &RuleSet,
+    ) {
+        let Some(entity) = substrate.entities.get(id) else {
             return;
         };
         if entity.deactivated.is_offline() != deactivated
-            && let Some(object) = self.object_type(entity.type_ref(), rules)
+            && let Some(object) = interner.object_type(entity.type_ref(), rules)
             && let Some(sound) = if deactivated {
                 object.deactivate_sound.clone()
             } else {
                 object.activate_sound.clone()
             }
         {
-            self.sound_events
-                .emit(SimSoundEvent::voc_at(sound, &entity.position));
+            sound_events.emit(SimSoundEvent::voc_at(sound, &entity.position));
         }
-        self.substrate
+        substrate
             .entities
             .get_mut(id)
             .expect("same object")

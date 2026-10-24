@@ -23,19 +23,25 @@
 //! - A `PostClick=` type whose `PreDependent=` is unset or past the list
 //!   (constructor -1) reads outside the Supers vector natively; VERA pairs
 //!   nothing. Dormant in retail.
-//! - ClickFire's charge-drain arm remains unported; no retail type sets
-//!   `UseChargeDrain=`. One-time consumption uses the same retained instance
-//!   owner as ordinary charging.
+//! - Authored charge-drain uses the native state/timer branch. Fresh House
+//!   construction clears FirestormActive+1FA; imported nonzero native House
+//!   states have no represented producer. Installed stock types do not enable
+//!   UseChargeDrain. Ordinary one-time consumption uses the retained instance.
 
 #[cfg(test)]
 #[path = "fire_tests.rs"]
 mod tests;
 
+use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::rules::superweapon_type::{SuperWeaponKind, SuperWeaponType};
+use crate::sim::houses::Houses;
 use crate::sim::intern::InternedId;
+use crate::sim::rng::SimRng;
+use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::world::FrameEffects;
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::{SimSoundEvent, Simulation};
 
 impl Simulation {
@@ -85,11 +91,27 @@ impl Simulation {
         if super_instance(self, owner, sw_type_id).is_none() {
             return false;
         }
+        // Refuse extension identities before any paired-state, charge, wallet,
+        // RNG or presentation writes, including manually forged rule records.
+        #[cfg(not(feature = "ares"))]
+        {
+            let _ = automatic;
+            if selection.is_some()
+                || matches!(
+                    sw.kind,
+                    SuperWeaponKind::GenericWarhead | SuperWeaponKind::UnitDelivery
+                )
+            {
+                return false;
+            }
+        }
         // Burn a well-formed explicit source request's ID even if admission
         // later refuses (e.g. funds changed while queued). Otherwise an old
         // cancel/final for that refused request could match a future retry.
         // This is sequence metadata only: no wallet, charge or pair is touched.
+        #[cfg(feature = "ares")]
         let requested_source = selection.filter(|_| sw.pre_click && !sw.post_click);
+        #[cfg(feature = "ares")]
         if let Some(request) = requested_source {
             let Some(next) = self.next_paid_super_weapon_selection(rules, owner, sw_type_id) else {
                 return false;
@@ -107,14 +129,15 @@ impl Simulation {
         // Optional extension preflight precedes paired-Super writes, effects,
         // defense alerts and charge consumption. Stock-only commands retain
         // their native behavior, including native refused-click side effects.
-        if sw.building_requirements.is_some()
-            && !super::building_requirements_met(self, rules, owner, sw)
-        {
+        #[cfg(any(feature = "ares", feature = "phobos"))]
+        if !super::super_weapon_available(self, rules, owner, &sw.id) {
             return false;
         }
+        #[cfg(feature = "ares")]
         if super::targeting::check(self, rules, owner, sw, cell, automatic).is_err() {
             return false;
         }
+        #[cfg(feature = "ares")]
         if sw.kind == SuperWeaponKind::UnitDelivery
             && !super::unit_delivery::admits(self, rules, owner, sw, cell)
         {
@@ -125,14 +148,18 @@ impl Simulation {
             .then(|| super::pre_dependent(rules, sw))
             .flatten()
             .and_then(|(name, pre)| Some((self.interner.get(name)?, pre)));
+        #[cfg(feature = "ares")]
         let paid_source = super::two_stage::destination_for_source(self, rules, sw_type_id, sw);
+        #[cfg(feature = "ares")]
         let paid_final = paired.filter(|_| super::paid_pair_source(rules, sw).is_some());
+        #[cfg(feature = "ares")]
         if paid_source.is_none()
             && paid_final.is_none()
             && !super::money::configuration_supported(sw)
         {
             return false;
         }
+        #[cfg(feature = "ares")]
         if let Some((source, source_sw)) = paid_final {
             let Some(ticket) = selection else {
                 return false;
@@ -159,6 +186,7 @@ impl Simulation {
         } else if selection.is_some() && paid_source.is_none() {
             return false;
         }
+        #[cfg(feature = "ares")]
         let source_ticket = if paid_source.is_some() {
             if !super::two_stage::source_available(self, rules, owner, sw_type_id, sw) {
                 return false;
@@ -174,22 +202,38 @@ impl Simulation {
         };
         // PostClick takes SOURCE settings (Ares SWTypeExt::Launch), even when
         // the destination has a different fee or grant. No second wallet exists.
+        #[cfg(feature = "ares")]
         let payment = paid_final.unwrap_or((sw_type_id, sw));
+        #[cfg(feature = "ares")]
         let guarded = paid_source.is_some() || paid_final.is_some() || sw.money_amount != 0;
         // Explicit extension only: all admission precedes paired-Super writes.
         // Stock zero-cost Fire_SW retains its native refused-click tail.
+        #[cfg(feature = "ares")]
         if guarded
             && (!(if paid_source.is_some() || paid_final.is_some() {
                 super::targeting::on_map(self, cell)
             } else {
                 super::money::valid_target(self, sw, cell)
             }) || !click_fire_admission(self, owner, sw_type_id, sw)
-                || !super::money::admit(self, owner, payment.0, payment.1))
+                || !super::money::admit(
+                    &mut self.sound_events,
+                    &self.houses,
+                    owner,
+                    payment.0,
+                    payment.1,
+                ))
         {
             return false;
         }
+        #[cfg(feature = "ares")]
         if paid_source.is_some() {
-            self.retire_paid_selections(rules, owner);
+            Self::retire_paid_selections(
+                &mut self.substrate,
+                &mut self.sound_events,
+                &mut self.super_weapons,
+                rules,
+                owner,
+            );
         }
         if let Some((pre_type, _)) = paired {
             let Some(pre) = super_instance(self, owner, pre_type) else {
@@ -200,6 +244,12 @@ impl Simulation {
                 .expect("retained fired Super")
                 .chrono_cell = cell;
         }
+        #[cfg(feature = "ares")]
+        let click_payment = paid_source.is_none().then_some(payment);
+        #[cfg(feature = "ares")]
+        let selecting_paid_source = paid_source.is_some();
+        #[cfg(not(feature = "ares"))]
+        let (click_payment, selecting_paid_source) = (None, false);
         let called_launch = click_fire(
             self,
             rules,
@@ -209,22 +259,21 @@ impl Simulation {
             cell,
             overlay_registry,
             frame_effects,
-            if paid_source.is_some() {
-                None
-            } else {
-                Some(payment)
-            },
-            paid_source.is_some(),
+            click_payment,
+            selecting_paid_source,
         );
+        #[cfg(feature = "ares")]
         if !called_launch && guarded {
             return false;
         }
+        #[cfg(feature = "ares")]
         if let Some(ticket) = source_ticket {
             let instance = super_instance(self, owner, sw_type_id).expect("retained source");
             instance.paid_sequence = ticket.sequence;
             instance.paid_selection = Some(ticket);
         }
         if let Some((pre_type, pre_sw)) = paired {
+            #[cfg(feature = "ares")]
             if paid_final.is_some() {
                 let frame = self.session.binary_frame();
                 let source = super_instance(self, owner, pre_type).expect("retained paired source");
@@ -246,13 +295,30 @@ impl Simulation {
                 .expect("retained paired Super")
                 .stop_preclick(pre_sw, frame);
         }
+        #[cfg(feature = "ares")]
         if called_launch && paid_source.is_none() && paid_final.is_none() {
-            self.retire_paid_selections(rules, owner);
+            Self::retire_paid_selections(
+                &mut self.substrate,
+                &mut self.sound_events,
+                &mut self.super_weapons,
+                rules,
+                owner,
+            );
         }
         // `0x004FAEC6..0x004FAEF2`: every house, last to first.
         let houses: Vec<InternedId> = self.houses.order().iter().rev().copied().collect();
         for house in houses {
-            alert_super_weapon_defense(self, rules, house, sw, cell);
+            alert_super_weapon_defense(
+                &self.session,
+                &mut self.scenario_rng,
+                &self.substrate,
+                &mut self.houses,
+                &self.resolved_terrain,
+                rules,
+                house,
+                sw,
+                cell,
+            );
         }
         called_launch
     }
@@ -279,18 +345,65 @@ fn click_fire(
     payment: Option<(InternedId, &SuperWeaponType)>,
     selecting_paid_source: bool,
 ) -> bool {
+    if sw.use_charge_drain {
+        // ClickFire6CB934..6CBA7A precedes ordinary ready/running/one-time
+        // admission. House control is independent of local launch output.
+        let Some(house) = sim.houses.get(&owner) else {
+            return false;
+        };
+        let human = house.is_controlled_by_human(sim.session.game_mode_nonzero());
+        let called_launch = if human {
+            let frame = sim.session.binary_frame();
+            let Some(instance) = super_instance(sim, owner, sw_type_id) else {
+                return false;
+            };
+            instance.click_charge_drain(sw, frame, rules.general.charge_to_drain_ratio)
+        } else {
+            // HouseCtor4F573A clears +1FA; no enabled fresh writer has been
+            // established. Native6CBA52 tests that byte, without human timer
+            // conversion. Do not manufacture a Firestorm effect/toggle here.
+            true
+        };
+        if called_launch {
+            launch(
+                sim,
+                rules,
+                owner,
+                sw_type_id,
+                sw,
+                cell,
+                overlay_registry,
+                frame_effects,
+            );
+        }
+        return called_launch;
+    }
     // Paid launches passed this same owner before the outer transaction writes.
-    if sw.money_amount == 0 && !click_fire_admission(sim, owner, sw_type_id, sw) {
+    #[cfg(feature = "ares")]
+    let needs_native_admission = sw.money_amount == 0;
+    #[cfg(not(feature = "ares"))]
+    let needs_native_admission = true;
+    #[cfg(not(feature = "ares"))]
+    let _ = (payment, selecting_paid_source);
+    if needs_native_admission && !click_fire_admission(sim, owner, sw_type_id, sw) {
         return false;
     }
+    #[cfg(feature = "ares")]
     if sw.kind == SuperWeaponKind::GenericWarhead
         && !super::generic_warhead::can_launch(sim, rules, sw, cell)
     {
         return false;
     }
+    #[cfg(feature = "ares")]
     if let Some((money_type, money_sw)) = payment
         && money_sw.money_amount != 0
-        && !super::money::transact(sim, owner, money_type, money_sw)
+        && !super::money::transact(
+            &mut sim.sound_events,
+            &mut sim.houses,
+            owner,
+            money_type,
+            money_sw,
+        )
     {
         return false;
     }
@@ -317,12 +430,13 @@ fn click_fire(
     }
     let frame = sim.session.binary_frame();
     if let Some(instance) = sim.super_weapons.instance_mut(&owner, &sw_type_id) {
+        #[cfg(feature = "ares")]
         if selecting_paid_source {
             // Selection neither consumes a one-time grant nor starts recharge.
             instance.is_ready = false;
-        } else {
-            instance.finish_click_fire(sw, frame);
+            return true;
         }
+        instance.finish_click_fire(sw, frame);
     }
     true
 }
@@ -371,9 +485,24 @@ fn launch(
     frame_effects: FrameEffects<'_>,
 ) {
     use super::paradrop::ParaDropKind;
+    // Every native stock case except ChronoWarp begins with rawReady+6F
+    // (ForceShield6CD072..6CD077; case4 starts6CC4B2 with radar production).
+    // Drain ClickFire can reach Launch after Reset retained state1 but cleared
+    // rawReady. Keep the earlier timer transition while skipping case effects.
+    let native_kind = sw.kind.native_index();
+    if (0..12).contains(&native_kind)
+        && native_kind != 4
+        && !super::is_charged(sim, owner, sw_type_id)
+    {
+        return;
+    }
     match sw.kind {
+        // Launch6CC3A3..6CC3AC: the constructor's -1 exits without case
+        // effects. ClickFire's ordinary/one-time finish still runs afterwards.
+        SuperWeaponKind::NoEffect => {}
+        #[cfg(feature = "ares")]
         SuperWeaponKind::UnitDelivery => {
-            super::unit_delivery::launch(
+            if super::unit_delivery::launch(
                 sim,
                 rules,
                 owner,
@@ -382,8 +511,12 @@ fn launch(
                 (rx, ry),
                 overlay_registry,
                 frame_effects,
-            );
+            ) {
+                super::record_ares_launch(sim, rules, owner, sw_type_id);
+            }
         }
+        #[cfg(not(feature = "ares"))]
+        SuperWeaponKind::GenericWarhead | SuperWeaponKind::UnitDelivery => {}
         SuperWeaponKind::MultiMissile => {
             super::nuke::launch(sim, rules, owner, sw_type_id, sw, (rx, ry));
         }
@@ -403,7 +536,7 @@ fn launch(
             );
         }
         SuperWeaponKind::ForceShield => {
-            super::force_shield::launch(sim, rules, owner, rx, ry, sw_type_id);
+            super::force_shield::launch(sim, rules, owner, rx, ry, sw_type_id, frame_effects);
         }
         SuperWeaponKind::GeneticConverter => {
             super::genetic_converter::launch(
@@ -464,8 +597,9 @@ fn launch(
         SuperWeaponKind::SpyPlane => {
             super::spy_plane::launch(sim, rules, owner, sw_type_id, (rx, ry), frame_effects);
         }
+        #[cfg(feature = "ares")]
         SuperWeaponKind::GenericWarhead => {
-            super::generic_warhead::launch(
+            if super::generic_warhead::launch(
                 sim,
                 rules,
                 owner,
@@ -474,7 +608,9 @@ fn launch(
                 (rx, ry),
                 overlay_registry,
                 frame_effects,
-            );
+            ) {
+                super::record_ares_launch(sim, rules, owner, sw_type_id);
+            }
         }
     }
 }
@@ -506,13 +642,17 @@ fn super_instance(
 /// base the origin (the zeroed static `0x00A8EFF8`), and the distance is
 /// `CoordStruct::Distance3D @ 0x0041C380` of base minus cell.
 fn alert_super_weapon_defense(
-    sim: &mut Simulation,
+    session: &ScenarioSession,
+    scenario_rng: &mut SimRng,
+    substrate: &ObjectSubstrate,
+    houses: &mut Houses,
+    resolved_terrain: &Option<ResolvedTerrainGrid>,
     rules: &RuleSet,
     house_id: InternedId,
     sw: &SuperWeaponType,
     cell: (u16, u16),
 ) {
-    let Some(house) = sim.houses.get(&house_id) else {
+    let Some(house) = houses.get(&house_id) else {
         return;
     };
     if house.multiplay_passive() || house.is_human() || !sw.ai_defend_against {
@@ -521,7 +661,7 @@ fn alert_super_weapon_defense(
     let base = house.base_origin();
     let probability = house.difficulty_value(&rules.general.ai_super_defense_probability);
     let first_yard = house.build_const_order().first().copied();
-    let terrain = sim.resolved_terrain.as_ref();
+    let terrain = resolved_terrain.as_ref();
     let cell_coords = |(x, y): (u16, u16)| {
         let coord = crate::sim::projectile::cell_ground_coord(terrain, x, y);
         [coord.x, coord.y, coord.z]
@@ -535,21 +675,21 @@ fn alert_super_weapon_defense(
     if distance > rules.general.ai_super_defense_distance {
         return;
     }
-    if sim.scenario_rng.next_range_i32_inclusive(0, 99) > probability {
+    if scenario_rng.next_range_i32_inclusive(0, 99) > probability {
         return;
     }
     let defended = first_yard
-        .and_then(|yard| sim.substrate.entities.get(yard))
+        .and_then(|yard| substrate.entities.get(yard))
         .map(|yard| {
             let coords = crate::sim::movement::ground_pose::object_get_coords(
                 yard,
-                sim.resolved_terrain.as_ref(),
+                resolved_terrain.as_ref(),
             );
             ((coords.x / 256) as u16, (coords.y / 256) as u16)
         })
         .unwrap_or(base);
-    let frame = sim.session.binary_frame() as i32;
-    if let Some(house) = sim.houses.get_mut(&house_id) {
+    let frame = session.binary_frame() as i32;
+    if let Some(house) = houses.get_mut(&house_id) {
         house.alert_super_weapon_defense(defended, frame);
     }
 }

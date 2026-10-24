@@ -27,17 +27,14 @@
 //! draws over a repairing building (`app::presentation::ui_overlays`).
 //!
 //! RESIDUALS:
-//! - The wrench byte (`+0x6DE`: set when a repair starts below Strength,
-//!   flipped by every repair step) is read only by the Building CRC
-//!   (`0x00454260`); VERA does not keep it.
+//! - Repair phase `+6DE` is omitted: Building CRC4543EB reads it; the active
+//!   multiplayer checksum64DAB0 does not consume that class CRC.
 //! - Presentation: the repair step's redraw byte (`+0x80`, from
 //!   `BuildingClass::GetCurrentFrame 0x0043EF90`).
 //! - ToggleRepair's sounds and EVA play only for the owner's local player
 //!   (the app's `audible_to` gate), which is `IsHumanPlayer` outside
 //!   campaigns; in a campaign it reads `+0x1EC`/`+0x1ED` instead (dormant
 //!   while campaigns do not launch).
-//! - The REPAIR event resolves any target (`0x004C6ED5`) and needs only its
-//!   `+0x90`; VERA's command also requires the sender to own the building.
 //! - `UnitClass::Deploy` marks the deployed building AI-repairable when its
 //!   owner is not the local player (`IsHumanPlayer`, `0x007397E4`); VERA asks
 //!   whether a human controls the owner, the same in a skirmish. Another
@@ -55,7 +52,6 @@ use crate::sim::world::{FrameEffects, SimSoundEvent, Simulation};
 use crate::util::native_x87::{MaskedX87Chop53 as X87, MaskedX87Ordering, NativeF64Bits};
 
 use super::production_sell::{SellOrder, sell_back, undeploys};
-use crate::rules::foundation::foundation_dimensions;
 
 /// A building's repair byte, `BuildingClass+0x6E8`: the repair step pays for
 /// each `RepairStep=` of health while it is on. The constructor clears it;
@@ -227,7 +223,8 @@ pub fn toggle_repair(
             // disguise/countdown owner, not a separate repair flash timer.
             // Original call arguments: building_repair.json toggle events.
             if owner_is_player {
-                entity.flash_base(7);
+                sim.substrate
+                    .flash_building(id, 7, sim.session.binary_frame());
             }
             sim.sound_events.emit(SimSoundEvent::Repairing { owner });
         }
@@ -307,7 +304,7 @@ pub fn can_repair_building(sim: &Simulation, rules: &RuleSet, id: u64) -> bool {
     object.click_repairable
         && object.repairable
         && entity.health.current() != object.strength
-        && !(foundation_dimensions(&object.foundation) == (1, 1) && undeploys(rules, object))
+        && !(object.foundation.dimensions() == (1, 1) && undeploys(rules, object))
 }
 
 /// Shared TechnoType repair step cost, vt+0xB0 (`0x007120D0`):
@@ -315,7 +312,7 @@ pub fn can_repair_building(sim: &Simulation, rules: &RuleSet, id: u64) -> bool {
 /// `Strength / RepairStep` steps (both IDIV), times `RepairPercent=` under the
 /// ambient PC53/chop x87 word, through `ftol`, and at least 1. Retail 15% is
 /// just below .15, so per-step shares of 20, 40 and 100 cost 2, 5 and 14.
-pub(crate) fn repair_step_cost(rules: &RuleSet, object: &ObjectType) -> i32 {
+pub fn repair_step_cost(rules: &RuleSet, object: &ObjectType) -> i32 {
     let step = rules.general.repair_step;
     let steps = object.strength.checked_div(step).unwrap_or_else(|| {
         panic!(
@@ -362,7 +359,7 @@ pub(crate) fn update_repair_and_power(
         && !entity.constructing_or_selling()
         && can_repair_building(sim, rules, id);
     if admitted {
-        if available_money(sim, owner) < rules.general.credit_reserve {
+        if available_money(&sim.houses, owner) < rules.general.credit_reserve {
             low_credit_sale(sim, rules, id, registry, effects);
         } else {
             auto_repair_start(sim, rules, id);
@@ -378,7 +375,7 @@ pub(crate) fn update_repair_and_power(
 /// retail `SellBack=2` no skirmish building gets this far and none draws.
 /// Then `RandomRanged(0, 0x32)` on the Scenario stream (`0x004507C4`) must
 /// fall below the owner's TechLevel (unsigned), and a tagged building
-/// (`+0x34`, `0x004507D7`; VERA has no per-object tags), a construction yard
+/// (`Object+0x34`, `0x004507D7..0x004507DC`), a construction yard
 /// (`Factory=BuildingType`, `Type+0xEB8 == 7`, `0x004507DE`) and one at or
 /// above ConditionRed (`0x004507ED`) stay. The rest take [`sell_back`]'s
 /// computer order (`0x0045080D`).
@@ -414,7 +411,9 @@ fn low_credit_sale(
         MaskedX87Ordering::Less | MaskedX87Ordering::Unordered
     );
     let roll = sim.scenario_rng.next_range_u32_inclusive(0, 0x32);
-    if roll >= tech_level as u32 || yard || !below_red {
+    // UpdateRepairAndPower4507D7..4507DC checks raw Object+34 after
+    // the roll: even a disabled Trigger's attached Tag vetoes this order.
+    if roll >= tech_level as u32 || sim.object_has_trigger_tag(id) || yard || !below_red {
         return;
     }
     let _ = sell_back(sim, rules, id, SellOrder::Computer, registry, effects);
@@ -497,7 +496,7 @@ fn repair_step(sim: &mut Simulation, rules: &RuleSet, id: u64) {
     };
     let (strength, cost) = (object.strength, repair_step_cost(rules, object));
     let owner = entity.owner();
-    if available_money(sim, owner) < cost {
+    if available_money(&sim.houses, owner) < cost {
         if let Some(entity) = sim.substrate.entities.get_mut(id) {
             entity.repairing.on = false;
         }
@@ -516,5 +515,5 @@ fn repair_step(sim: &mut Simulation, rules: &RuleSet, id: u64) {
         entity.repairing.on = false;
     }
     sim.refresh_building_damage_state(id, rules);
-    sim.retire_damage_smoke_after_heal(id, rules);
+    Simulation::retire_damage_smoke_after_heal(&sim.interner, &mut sim.substrate, id, rules);
 }

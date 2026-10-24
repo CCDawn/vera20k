@@ -447,33 +447,20 @@ fn is_ship_locomotor(entity: &GameEntity) -> bool {
         .is_some_and(|loco| matches!(loco.active_kind(), LocomotorKind::Ship))
 }
 
+/// `CellClass::GetCoords` (`0x00486840`) of the cell `MapClass::Get_CellClass`
+/// (`0x005657A0`) gives for `(rx, ry)` through `cells`, which stamps the
+/// query's fallback CellClass on a miss. Z 0 for an unsupported slope
+/// ([`CellRef::get_coords`]).
+///
+/// [`CellRef::get_coords`]: crate::sim::cell_rect::CellRef::get_coords
 pub(crate) fn target_cell_coord(
     rx: u16,
     ry: u16,
     cells: Option<&crate::map::resolved_terrain::NativeCellQuery<'_>>,
 ) -> DriveCoord {
     if let Some(cells) = cells {
-        let identity = cells.lookup((rx as i16, ry as i16));
-        let (x, y, z) = crate::sim::cell_kernel::native_cell_own_coords(identity, cells)
-            .unwrap_or_else(|| {
-                // Preserve this caller's existing unsupported-slope zero-Z
-                // adapter. The receiver identity/XY still come from the same
-                // Cell and the shared center kernel.
-                let (x, y) = cells.coord(identity);
-                let point = crate::sim::cell_kernel::cell_center(
-                    crate::sim::cell_kernel::CellCoordinate {
-                        x: i32::from(x),
-                        y: i32::from(y),
-                    },
-                    0,
-                );
-                (i64::from(point.x), i64::from(point.y), 0)
-            });
-        return DriveCoord {
-            x: x as i32,
-            y: y as i32,
-            z: z as i32,
-        };
+        return crate::sim::cell_rect::native_cell_ref(cells, cells.lookup((rx as i16, ry as i16)))
+            .get_coords();
     }
     // Map-less fixtures take the centre at Z 0. Every gameplay world (app,
     // headless, replay, sim-bench) comes from a map load.
@@ -489,6 +476,24 @@ pub(crate) fn target_cell_coord(
         y: point.y,
         z: point.z,
     }
+}
+
+/// Cell486840 through an already-retained pointer (virtual+48/+4C).
+/// Recover the allocation from the original command coordinate without a Map
+/// lookup: a later miss can have moved the shared Dummy, even onto a real
+/// cell's coordinate, while its own level and slope still belong to Dummy.
+pub(crate) fn retained_cell_coord(
+    rx: u16,
+    ry: u16,
+    cells: Option<&crate::map::resolved_terrain::NativeCellQuery<'_>>,
+) -> DriveCoord {
+    let Some(cells) = cells else {
+        return target_cell_coord(rx, ry, None);
+    };
+    let identity = crate::sim::combat::TargetKind::Cell(rx, ry)
+        .cell_identity(cells.terrain())
+        .expect("Cell target has a Cell allocation identity");
+    crate::sim::cell_rect::native_cell_ref(cells, identity).get_coords()
 }
 
 /// Shared destination-setter adjustment (Drive4AFD40 / Ship69F450). Each call
@@ -601,7 +606,7 @@ pub(crate) fn nav_target_coordinate(
 ) -> Result<DriveCoord, String> {
     let id = match target {
         NavTargetRef::Cell { rx, ry } => {
-            return Ok(target_cell_coord(
+            return Ok(retained_cell_coord(
                 rx,
                 ry,
                 terrain
@@ -862,7 +867,7 @@ impl crate::sim::world::Simulation {
         &mut self,
         id: u64,
         nonnull: bool,
-        rules: Option<&crate::rules::ruleset::RuleSet>,
+        rules: &crate::rules::ruleset::RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> bool {
@@ -907,7 +912,7 @@ impl crate::sim::world::Simulation {
     pub(crate) fn foot_null_destination(
         &mut self,
         id: u64,
-        rules: Option<&crate::rules::ruleset::RuleSet>,
+        rules: &crate::rules::ruleset::RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) {
@@ -959,7 +964,7 @@ impl crate::sim::world::Simulation {
     pub(crate) fn locomotor_stop_moving(
         &mut self,
         id: u64,
-        rules: Option<&crate::rules::ruleset::RuleSet>,
+        rules: &crate::rules::ruleset::RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> Result<(), String> {

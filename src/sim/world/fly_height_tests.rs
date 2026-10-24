@@ -58,7 +58,7 @@ fn fixture(row: &serde_json::Value) -> (Simulation, RuleSet) {
         .cell_mut_for_test(10, 10)
         .unwrap()
         .slope_type = integer("slope", 0) as u8;
-    assert_eq!(sim.allocate_stable_id(), 1);
+    assert_eq!(sim.substrate.allocate_stable_id(), 1);
     let category = if input["kind"] == "unit" {
         EntityCategory::Unit
     } else {
@@ -89,7 +89,7 @@ fn fixture(row: &serde_json::Value) -> (Simulation, RuleSet) {
     ));
     sim.remove_entity_occupancy(1);
     if flag("loaded") {
-        assert_eq!(sim.allocate_stable_id(), 2);
+        assert_eq!(sim.substrate.allocate_stable_id(), 2);
         insert_entity(&mut sim, 2, EntityCategory::Infantry);
         sim.substrate.entities.get_mut(2).unwrap().passenger_role =
             PassengerRole::inside_for_test(1, false);
@@ -133,7 +133,7 @@ fn healthy_native_height_vectors_reach_production_coordinates() {
         let before_rng = sim.scenario_rng.logical_state();
         sim.tick_air_movement_with_cell_lists_one(
             1,
-            Some(&rules),
+            &rules,
             None,
             crate::sim::world::FrameEffects::default(),
         )
@@ -220,7 +220,7 @@ fn fly_integer_target_flags_and_cargo_survive_save_and_continuation() {
                 instance
                     .tick_air_movement_with_cell_lists_one(
                         1,
-                        Some(&rules),
+                        &rules,
                         None,
                         crate::sim::world::FrameEffects::default(),
                     )
@@ -340,7 +340,7 @@ fn landing_base_fixture(row: &serde_json::Value) -> (Simulation, RuleSet) {
     let mut slots = crate::sim::radio::contacts::Contacts::with_capacity(contacts.len());
     let mut holes = Vec::new();
     for contact in contacts {
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         slots.insert(id).unwrap();
         let Some(kind) = contact.as_str() else {
             holes.push(id);
@@ -420,7 +420,17 @@ fn assert_native_move_takeoff(sim: &mut Simulation, rules: &RuleSet, row: &serde
         .as_ref()
         .map(crate::map::resolved_terrain::NativeCellQuery::canonical);
     let coordinate = crate::sim::movement::target_cell_coord(12, 10, cells.as_ref());
-    assert!(sim.move_air_coordinate(1, coordinate, None, Some(rules)));
+    assert!(Simulation::move_air_coordinate(
+        &mut sim.interner,
+        &sim.session,
+        &mut sim.substrate,
+        &mut sim.sound_events,
+        &sim.resolved_terrain,
+        1,
+        coordinate,
+        None,
+        rules
+    ));
     let entity = sim.substrate.entities.get(1).unwrap();
     assert_eq!(
         entity.locomotor.as_ref().unwrap().fly_target_height(),
@@ -565,7 +575,12 @@ fn destination_fixture(row: &serde_json::Value) -> (Simulation, RuleSet) {
 }
 
 fn issue_coordinate(sim: &mut Simulation, rules: &RuleSet, xyz: [i32; 3]) -> bool {
-    sim.move_air_coordinate(
+    Simulation::move_air_coordinate(
+        &mut sim.interner,
+        &sim.session,
+        &mut sim.substrate,
+        &mut sim.sound_events,
+        &sim.resolved_terrain,
         1,
         crate::sim::components::DriveCoord {
             x: xyz[0],
@@ -574,9 +589,9 @@ fn issue_coordinate(sim: &mut Simulation, rules: &RuleSet, xyz: [i32; 3]) -> boo
         },
         Some(crate::sim::movement::DestinationTiming::from_rules(
             sim.session.binary_frame(),
-            Some(rules),
+            rules,
         )),
-        Some(rules),
+        rules,
     )
 }
 
@@ -642,7 +657,17 @@ fn fly_cell_orders_resolve_ground_before_retaining_the_coordinate() {
         .as_ref()
         .map(crate::map::resolved_terrain::NativeCellQuery::canonical);
     let coordinate = crate::sim::movement::target_cell_coord(64, 64, cells.as_ref());
-    assert!(sim.move_air_coordinate(1, coordinate, None, Some(&rules)));
+    assert!(Simulation::move_air_coordinate(
+        &mut sim.interner,
+        &sim.session,
+        &mut sim.substrate,
+        &mut sim.sound_events,
+        &sim.resolved_terrain,
+        1,
+        coordinate,
+        None,
+        &rules
+    ));
     let destination = sim
         .substrate
         .entities
@@ -686,7 +711,7 @@ fn fly_retained_destination_drives_subcell_arrival_after_save_and_restore() {
         instance
             .tick_air_movement_with_cell_lists_one(
                 1,
-                Some(&rules),
+                &rules,
                 None,
                 crate::sim::world::FrameEffects::default(),
             )
@@ -711,7 +736,6 @@ fn fly_retained_destination_drives_subcell_arrival_after_save_and_restore() {
 #[test]
 fn fly_destination_is_hashed_and_persisted_in_active_and_stashed_runtime() {
     use crate::rules::locomotor_type::LocomotorKind;
-    use crate::sim::movement::locomotion::piggyback;
     let row = destination_vectors().remove(0);
     for stashed in [false, true] {
         let (mut sim, rules) = destination_fixture(&row);
@@ -732,10 +756,7 @@ fn fly_destination_is_hashed_and_persisted_in_active_and_stashed_runtime() {
                 .locomotor
                 .as_mut()
                 .unwrap();
-            assert_eq!(
-                piggyback::begin(loco, LocomotorKind::Drive, 0),
-                piggyback::BeginOutcome::Installed
-            );
+            assert!(loco.begin_piggyback(LocomotorKind::Drive, 0));
         }
         sim.scenario_rng = crate::sim::rng::SimRng::new(0);
         let bytes = GameSnapshot::save(&sim, 0, 0, "Fly active/stashed destination", 0);
@@ -753,7 +774,7 @@ fn fly_destination_is_hashed_and_persisted_in_active_and_stashed_runtime() {
             .as_mut()
             .unwrap();
         if stashed {
-            assert!(piggyback::end(loco).is_some());
+            assert!(loco.end_piggyback().is_some());
         }
         let destination = loco.fly_runtime().unwrap().destination();
         assert_eq!(
@@ -855,7 +876,14 @@ fn fly_takeoff_callback_matches_all_original_histories() {
     for row in rows {
         let (mut sim, rules) = takeoff_fixture(&row);
         let rng = sim.scenario_rng.logical_state();
-        sim.apply_fly_takeoff_callback(1, Some(&rules));
+        Simulation::apply_fly_takeoff_callback(
+            &sim.interner,
+            &sim.session,
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            1,
+            &rules,
+        );
         assert_native_takeoff_result(&sim, &row);
         assert_eq!(sim.scenario_rng.logical_state(), rng);
     }
@@ -874,7 +902,7 @@ fn fly_takeoff_phase_matches_native_display_reordering_and_gates() {
         if !row["input"]["marked"].as_bool().unwrap_or(false) {
             sim.remove_entity_occupancy(1);
         }
-        let peer = sim.allocate_stable_id();
+        let peer = sim.substrate.allocate_stable_id();
         insert_entity(&mut sim, peer, EntityCategory::Aircraft);
         let owner = sim.substrate.entities.get(1).unwrap();
         let (position, on_bridge, loco) =
@@ -883,15 +911,27 @@ fn fly_takeoff_phase_matches_native_display_reordering_and_gates() {
         other.position = position;
         other.set_on_bridge(on_bridge);
         other.locomotor = loco;
-        sim.submit_entity_display(1, Some(&rules), None);
-        sim.submit_entity_display(peer, Some(&rules), None);
-        let rng = sim.scenario_rng.logical_state();
-        let admitted = sim.complete_fly_phase(
+        Simulation::submit_entity_display(
+            &sim.interner,
+            &sim.terrain_objects,
+            &mut sim.substrate,
+            &sim.resolved_terrain,
             1,
-            Some(&rules),
+            &rules,
             None,
-            crate::sim::world::FrameEffects::default(),
         );
+        Simulation::submit_entity_display(
+            &sim.interner,
+            &sim.terrain_objects,
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            peer,
+            &rules,
+            None,
+        );
+        let rng = sim.scenario_rng.logical_state();
+        let admitted =
+            sim.complete_fly_phase(1, &rules, None, crate::sim::world::FrameEffects::default());
         assert_eq!(
             admitted,
             !row["phase_calls"].as_array().unwrap().is_empty(),
@@ -944,7 +984,7 @@ fn fly_nonlandable_phase_matches_native_without_display_resubmission() {
     assert_eq!(rows.len(), 64);
     for row in rows {
         let (mut sim, rules) = takeoff_fixture(&row);
-        let peer = sim.allocate_stable_id();
+        let peer = sim.substrate.allocate_stable_id();
         insert_entity(&mut sim, peer, EntityCategory::Aircraft);
         let owner = sim.substrate.entities.get(1).unwrap();
         let (position, on_bridge, loco) =
@@ -953,12 +993,28 @@ fn fly_nonlandable_phase_matches_native_without_display_resubmission() {
         other.position = position;
         other.set_on_bridge(on_bridge);
         other.locomotor = loco;
-        sim.submit_entity_display(1, Some(&rules), None);
-        sim.submit_entity_display(peer, Some(&rules), None);
+        Simulation::submit_entity_display(
+            &sim.interner,
+            &sim.terrain_objects,
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            1,
+            &rules,
+            None,
+        );
+        Simulation::submit_entity_display(
+            &sim.interner,
+            &sim.terrain_objects,
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            peer,
+            &rules,
+            None,
+        );
         let rng = sim.scenario_rng.logical_state();
         assert!(!sim.complete_fly_phase(
             1,
-            Some(&rules),
+            &rules,
             None,
             crate::sim::world::FrameEffects::default()
         ));
@@ -1010,10 +1066,18 @@ fn fly_nonlandable_production_tick_replaces_landing_target_and_restores() {
         "landable":false, "flight_level":40000, "moving":true,
     }});
     let (mut sim, rules) = takeoff_fixture(&row);
-    sim.submit_entity_display(1, Some(&rules), None);
+    Simulation::submit_entity_display(
+        &sim.interner,
+        &sim.terrain_objects,
+        &mut sim.substrate,
+        &sim.resolved_terrain,
+        1,
+        &rules,
+        None,
+    );
     sim.tick_air_movement_with_cell_lists_one(
         1,
-        Some(&rules),
+        &rules,
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -1040,7 +1104,7 @@ fn fly_nonlandable_production_tick_replaces_landing_target_and_restores() {
             instance
                 .tick_air_movement_with_cell_lists_one(
                     1,
-                    Some(&rules),
+                    &rules,
                     None,
                     crate::sim::world::FrameEffects::default(),
                 )
@@ -1081,7 +1145,7 @@ fn fly_phase_outer_health_power_and_life_gates_precede_nonlandable_override() {
         let before = sim.state_hash();
         assert!(!sim.complete_fly_phase(
             1,
-            Some(&rules),
+            &rules,
             None,
             crate::sim::world::FrameEffects::default()
         ));
@@ -1092,7 +1156,6 @@ fn fly_phase_outer_health_power_and_life_gates_precede_nonlandable_override() {
 #[test]
 fn fly_landing_state_hashes_and_restores_active_and_stashed_instances() {
     use crate::rules::locomotor_type::LocomotorKind;
-    use crate::sim::movement::locomotion::piggyback;
     for stashed in [false, true] {
         for field in ["moving", "landing_effect_latched", "airport_bound", "pitch"] {
             let row = destination_vectors().remove(0);
@@ -1120,10 +1183,7 @@ fn fly_landing_state_hashes_and_restores_active_and_stashed_instances() {
                         .locomotor
                         .as_mut()
                         .unwrap();
-                    assert_eq!(
-                        piggyback::begin(loco, LocomotorKind::Drive, 0),
-                        piggyback::BeginOutcome::Installed
-                    );
+                    assert!(loco.begin_piggyback(LocomotorKind::Drive, 0));
                 }
                 instance.scenario_rng = crate::sim::rng::SimRng::new(0);
             }
@@ -1147,17 +1207,16 @@ fn fly_landing_state_hashes_and_restores_active_and_stashed_instances() {
             for instance in [&mut changed, &mut restored] {
                 if stashed {
                     assert!(
-                        piggyback::end(
-                            instance
-                                .substrate
-                                .entities
-                                .get_mut(1)
-                                .unwrap()
-                                .locomotor
-                                .as_mut()
-                                .unwrap()
-                        )
-                        .is_some()
+                        instance
+                            .substrate
+                            .entities
+                            .get_mut(1)
+                            .unwrap()
+                            .locomotor
+                            .as_mut()
+                            .unwrap()
+                            .end_piggyback()
+                            .is_some()
                     );
                 }
             }
@@ -1218,7 +1277,7 @@ fn fly_production_process_resets_enter_mode_using_native_mission_precedence() {
         let rng = sim.scenario_rng.logical_state();
         sim.tick_air_movement_with_cell_lists_one(
             1,
-            Some(&rules),
+            &rules,
             None,
             crate::sim::world::FrameEffects::default(),
         )
@@ -1267,7 +1326,7 @@ fn fly_production_tick_uses_primary_current_and_continues_after_restore() {
             instance
                 .tick_air_movement_with_cell_lists_one(
                     1,
-                    Some(&rules),
+                    &rules,
                     None,
                     crate::sim::world::FrameEffects::default(),
                 )
@@ -1399,7 +1458,7 @@ fn fly_paid_step_matches_native_math_and_production_type_speed() {
         let rng = sim.scenario_rng.logical_state();
         sim.tick_air_movement_with_cell_lists_one(
             1,
-            Some(&rules),
+            &rules,
             None,
             crate::sim::world::FrameEffects::default(),
         )
@@ -1415,7 +1474,7 @@ fn fly_paid_step_matches_native_math_and_production_type_speed() {
             restored
                 .tick_air_movement_with_cell_lists_one(
                     1,
-                    Some(&rules),
+                    &rules,
                     None,
                     crate::sim::world::FrameEffects::default(),
                 )
@@ -1427,7 +1486,7 @@ fn fly_paid_step_matches_native_math_and_production_type_speed() {
                     instance
                         .tick_air_movement_with_cell_lists_one(
                             1,
-                            Some(&rules),
+                            &rules,
                             None,
                             crate::sim::world::FrameEffects::default(),
                         )

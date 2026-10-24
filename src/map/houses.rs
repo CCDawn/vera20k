@@ -162,25 +162,11 @@ impl HouseRoster {
     }
 }
 
-/// Returns true when two house names should be treated as friendly.
-pub fn are_houses_friendly(alliances: &HouseAllianceMap, a: &str, b: &str) -> bool {
-    if a.eq_ignore_ascii_case(b) {
-        return true;
-    }
-    with_house_key(a, |a| {
-        with_house_key(b, |b| {
-            alliances.get(a).is_some_and(|set| set.contains(b))
-                || alliances.get(b).is_some_and(|set| set.contains(a))
-        })
-    })
-}
-
 /// Directional alliance test: does `asker` consider `other` an ally?
 ///
 /// gamemd's `HouseClass::IsAlliedWith` reads only the *asker's* own ally
 /// bitfield, so alliance is one-way until both sides set their bit; a house is
-/// always allied with itself. [`are_houses_friendly`] keeps its symmetric OR
-/// for the call sites not yet traced to their native asker (#582).
+/// always allied with itself. Each caller names its native asker.
 pub fn is_allied_with(alliances: &HouseAllianceMap, asker: &str, other: &str) -> bool {
     ally_test(alliances, asker)(other)
 }
@@ -201,8 +187,8 @@ pub fn ally_test<'a>(
 /// Mutual-alliance test — both houses must name each other.
 ///
 /// This is the pairwise predicate the native game-over scan applies to every
-/// surviving house pair, and it is strictly stronger than
-/// [`are_houses_friendly`]: a one-way alliance does not end the match.
+/// surviving house pair, and it is strictly stronger than either house's
+/// [`is_allied_with`]: a one-way alliance does not end the match.
 pub fn are_houses_mutually_allied(alliances: &HouseAllianceMap, a: &str, b: &str) -> bool {
     is_allied_with(alliances, a, b) && is_allied_with(alliances, b, a)
 }
@@ -438,13 +424,16 @@ mod tests {
         assert_eq!(roster.houses[0].iq, 0);
         assert_eq!(roster.houses[1].allies, 1 << 31);
         let alliances = roster.alliance_map();
-        assert!(!are_houses_friendly(
-            &alliances,
-            "Russians",
-            "Confederation"
-        ));
-        assert!(!are_houses_friendly(&alliances, "YuriCountry", "Russians"));
-        assert!(!are_houses_friendly(&alliances, "Americans", "Russians"));
+        for (a, b) in [
+            ("Russians", "Confederation"),
+            ("YuriCountry", "Russians"),
+            ("Americans", "Russians"),
+        ] {
+            assert!(
+                !is_allied_with(&alliances, a, b) && !is_allied_with(&alliances, b, a),
+                "{a} {b}"
+            );
+        }
     }
 
     #[test]
@@ -466,8 +455,6 @@ mod tests {
             "Americans",
             "Russians"
         ));
-        // The symmetric helper still answers "friendly" for the same pair.
-        assert!(are_houses_friendly(&alliances, "Russians", "Americans"));
 
         alliances
             .entry("RUSSIANS".to_string())
@@ -478,6 +465,40 @@ mod tests {
             "Americans",
             "Russians"
         ));
+    }
+
+    /// Ares47527C/475297 preserves late allies in a long authored list.
+    /// Equal Country never creates an edge; the ordinary roster/graph owns
+    /// both the long-list result and the deliberately one-way control.
+    #[test]
+    fn long_house_allies_keep_late_members_only_with_ares() {
+        let names: Vec<_> = (0..19).map(|i| format!("Guard{i:02} House")).collect();
+        let mut source = String::from("[Houses]\n");
+        for (index, name) in names.iter().enumerate() {
+            source.push_str(&format!("{index}={name}\n"));
+        }
+        let list = names[..18].join(",");
+        assert!(list.len() > 127 && list.len() < 511);
+        for (index, name) in names.iter().enumerate() {
+            source.push_str(&format!("[{name}]\nCountry=Russians\n"));
+            if index == 0 {
+                source.push_str(&format!("Allies={list}\n"));
+            } else if index == 17 {
+                source.push_str(&format!("Allies={}\n", names[0]));
+            }
+        }
+        let roster = parse_house_roster(&IniFile::from_str(&source), &[], None);
+        assert_eq!(roster.houses.len(), 19);
+        let alliances = roster.alliance_map();
+        assert_eq!(
+            is_allied_with(&alliances, &names[0], &names[17]),
+            crate::rules::ARES_ENABLED,
+        );
+        assert!(is_allied_with(&alliances, &names[17], &names[0]));
+        assert!(is_allied_with(&alliances, &names[0], &names[1]));
+        assert!(!is_allied_with(&alliances, &names[1], &names[0]));
+        assert!(!is_allied_with(&alliances, &names[0], &names[18]));
+        assert!(!is_allied_with(&alliances, &names[18], &names[0]));
     }
 
     #[test]
@@ -678,6 +699,5 @@ mod tests {
             .insert("BRITISH".into());
         assert!(is_allied_with(&alliances, " americans", "British "));
         assert!(!is_allied_with(&alliances, "British", "Americans"));
-        assert!(are_houses_friendly(&alliances, "british", "AMERICANS "));
     }
 }

@@ -404,7 +404,7 @@ fn post_warp_rows_refuse_the_own_cell_search() {
             id,
             -1,
             own,
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
             None,
             crate::sim::world::FrameEffects::default()
         ));
@@ -468,10 +468,11 @@ fn depot_release_and_pad_entry_route_through_find_path() {
             .set_for_test(hp);
         assert!(sim.apply_command(
             "Americans",
-            &crate::sim::command::Command::RepairAtDepot {
-                entity_id: tank,
-                depot_id: depot,
-            },
+            &crate::sim::command::Command::clicked_mission(
+                tank,
+                MissionType::Enter,
+                crate::sim::combat::TargetKind::Entity(depot)
+            ),
             Some(&rules),
         ));
     }
@@ -575,7 +576,7 @@ fn teleporter_bound_for_its_refinery(
     sim.assign_destination_represented(
         miner,
         Some(NavTargetRef::cell(16, 10)),
-        Some(&rules),
+        &rules,
         Some(&registry),
         crate::sim::world::FrameEffects::default(),
     )
@@ -612,7 +613,7 @@ fn teleporter_behind_a_moving_tank() -> (
     sim.assign_destination_represented(
         tank,
         Some(NavTargetRef::cell(14, 2)),
-        Some(&rules),
+        &rules,
         Some(&registry),
         crate::sim::world::FrameEffects::default(),
     )
@@ -733,7 +734,7 @@ fn batched_the_teleporter_ladder_waits_and_keeps_the_redirect_navcom() {
 
     for frame in 100..103 {
         sim.session.set_binary_frame_for_test(frame);
-        sim.answer_batched_path_searches(Some(&rules), Some(&registry));
+        sim.answer_batched_path_searches(&rules, Some(&registry));
         assert_eq!(
             process_drive(&mut sim, miner, &rules, &registry),
             Ok(false),
@@ -797,10 +798,11 @@ fn a_teleporter_and_a_hover_unit_are_serviced_at_a_depot() {
             .set_for_test(150);
         assert!(sim.apply_command(
             "Americans",
-            &crate::sim::command::Command::RepairAtDepot {
-                entity_id: id,
-                depot_id: depot,
-            },
+            &crate::sim::command::Command::clicked_mission(
+                id,
+                MissionType::Enter,
+                crate::sim::combat::TargetKind::Entity(depot)
+            ),
             Some(&rules),
         ));
         // The Teleporter must also drive off the pad again.
@@ -926,7 +928,7 @@ fn forced_track_end_requests_its_own_cell_in_the_same_process() {
         id,
         0x47,
         head,
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         crate::sim::world::FrameEffects::default()
     ));
@@ -1113,7 +1115,7 @@ fn after_active_rows_gate_the_same_call_continuation() {
                 .begin_track_end_continuation(
                     id,
                     family,
-                    Some(&rules),
+                    &rules,
                     crate::sim::world::FrameEffects::default(),
                 )
                 .unwrap();
@@ -1224,7 +1226,7 @@ fn null_destination_mid_track_stops_the_tank_at_its_track_end() {
             "ordered attack" => {
                 sim.assign_null_destination(
                     id,
-                    Some(&rules),
+                    &rules,
                     None,
                     crate::sim::world::FrameEffects::default(),
                 );
@@ -1237,6 +1239,7 @@ fn null_destination_mid_track_stops_the_tank_at_its_track_end() {
                     id,
                     attacker,
                     &rules,
+                    Some(&registry),
                     crate::sim::world::FrameEffects::default()
                 ));
                 assert_eq!(
@@ -1341,6 +1344,7 @@ fn restore_mid_track_heads_for_the_restored_order_at_the_track_end() {
         id,
         attacker,
         &rules,
+        Some(&registry),
         crate::sim::world::FrameEffects::default()
     ));
     sim.session.set_binary_frame_for_test(frame);
@@ -1354,7 +1358,7 @@ fn restore_mid_track_heads_for_the_restored_order_at_the_track_end() {
     assert!(
         sim.mission_restore_represented(
             id,
-            Some(&rules),
+            &rules,
             Some(&registry),
             crate::sim::world::FrameEffects::default()
         )

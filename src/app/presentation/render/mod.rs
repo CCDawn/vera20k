@@ -21,16 +21,22 @@
 //! - Part of the app layer — may depend on everything.
 
 #[cfg(test)]
+mod anim_translucency_gpu_tests;
+#[cfg(test)]
 mod bridge_shadow_gpu_tests;
 mod build_instances;
 #[cfg(test)]
 mod building_bracket_gpu_tests;
 #[cfg(test)]
 mod building_shadow_gpu_tests;
+#[cfg(test)]
+mod building_slot_native_gpu_tests;
 mod draw_passes;
 #[cfg(test)]
 mod magnetic_wave_gpu_tests;
 mod object_extras;
+#[cfg(test)]
+mod parachute_native_gpu_tests;
 #[cfg(test)]
 mod parachute_owner_color_gpu_tests;
 #[cfg(test)]
@@ -40,9 +46,12 @@ mod status_gpu_tests;
 #[cfg(test)]
 mod target_laser_gpu_tests;
 #[cfg(test)]
-pub(crate) use draw_passes::{draw_bridge_shadows, draw_pooled_overlay_bodies};
+pub(crate) use draw_passes::{draw_bridge_shadows, draw_pooled_cell_bodies};
 pub(crate) mod draw_plan_lowering;
 mod merge_passes;
+mod object_stages;
+#[cfg(test)]
+mod object_stages_gpu_tests;
 pub(crate) mod minimap_transaction;
 
 use anyhow::Result;
@@ -164,8 +173,14 @@ pub(crate) fn render_game(
     let render_started = state.diag.telemetry_observer.active().then(Instant::now);
     // RadarClass::Draw 653100 consumes timeGetTime buckets. The frame owner
     // supplies wall time normally, or the map diagnostic's recorded OS input.
-    if let Some(radar) = state.match_state.match_presentation.radar_anim.as_mut() {
-        radar.tick(&state.renderer.gpu, times.radar_ms);
+    let housing_settled = state
+        .match_state
+        .match_presentation
+        .radar_anim
+        .as_mut()
+        .is_some_and(|radar| radar.tick(&state.renderer.gpu, times.radar_ms));
+    if housing_settled {
+        crate::app::radar_movie::end_radar_sound_loop(state);
     }
     let (sw, sh) = (state.render_width() as f32, state.render_height() as f32);
 
@@ -252,6 +267,19 @@ pub(crate) fn render_game(
     {
         let view = rt.view();
         let owner_id = view.interner().get(owner).unwrap_or_default();
+        // Rendering may perform native Dummy lookups without changing the
+        // simulation's retained Dummy coordinate or its fog cache bytes.
+        let cells = view
+            .resolved_terrain()
+            .map(crate::map::resolved_terrain::NativeCellQuery::isolated);
+        let fog_options = crate::render::shroud_buffer::FogDrawOptions {
+            fog_of_war: view.session().game_options().fog_of_war,
+            current_house_defeated: view
+                .session()
+                .current_house()
+                .and_then(|house| view.houses().get(&house))
+                .is_some_and(|house| house.is_defeated()),
+        };
         shroud_buf.rebuild_if_needed(
             &state.renderer.gpu.device,
             &state.renderer.gpu.queue,
@@ -262,6 +290,8 @@ pub(crate) fn render_game(
             rw,
             rh,
             state.match_state.input.zoom_level,
+            cells.as_ref(),
+            fog_options,
         );
     }
 
@@ -296,7 +326,7 @@ pub(crate) fn render_game(
     state
         .match_state
         .match_presentation
-        .cached_overlay_instances = world.overlay;
+        .cached_cell_body_instances = world.cell_bodies;
 
     // A single immutable upload serves System body slots and the distinct
     // late5FFFA0 vector. Neither phase can rewrite another light's slot.
@@ -417,12 +447,26 @@ pub(crate) fn render_game(
     if let Some(runtime) = state.match_state.sim_runtime.as_ref() {
         let sim = runtime.view().simulation();
         let rules = &runtime.resources.rules;
+        let interpolation = &state.match_state.match_presentation.interpolation;
         state
             .match_state
             .match_presentation
             .electric_bolts
             .follow_owners(|owner| {
-                crate::sim::combat::electric_bolt::owner_source(sim, rules, owner)
+                let point = crate::sim::combat::electric_bolt::owner_source(sim, rules, owner)?;
+                let [x, y, z] = interpolation
+                    .sample_draw_point(
+                        crate::app::presentation::interpolation::PointKind::BoltSource,
+                        owner.unit,
+                        crate::app::presentation::interpolation::PointPose::new(
+                            [point.x, point.y, point.z],
+                            0,
+                            None,
+                        ),
+                        sim.session().binary_frame(),
+                    )
+                    .coord;
+                Some(crate::sim::projectile::ProjectileCoord::new(x, y, z))
             });
     }
     let presentation = &mut state.match_state.match_presentation;
@@ -454,8 +498,18 @@ pub(crate) fn render_game(
         .as_ref()
         .map(|runtime| runtime.view().simulation());
     let segments = presentation.line_trails.composite(|id| {
-        sim.and_then(|sim| sim.projectiles().get(id))
-            .map(|bullet| bullet.position())
+        let sim = sim?;
+        sim.projectiles().get(id).map(|bullet| {
+            presentation
+                .interpolation
+                .sample_point(
+                    crate::app::presentation::interpolation::PointKind::Bullet,
+                    id,
+                    crate::app::presentation::interpolation::PointPose::bullet(bullet),
+                    sim.session().binary_frame(),
+                )
+                .projectile_coord()
+        })
     });
     let frame_rate = presentation.detail.borrow().frame_rate();
     presentation.radiation_beams.composite(frame_rate, viewport);
@@ -573,9 +627,10 @@ pub(crate) fn render_game(
         encoder,
         &composition_view,
         &draw_passes::DrawPassData {
-            overlay_render_z: &world.overlay_render_z,
+            cell_body_draws: &world.cell_body_draws,
             bridge_shadows: &world.bridge_body_shadow,
             object_layers: &world.object_layers,
+            fogged_objects: &world.fogged_objects,
             building_status_text: &world.building_status_text,
             surface_effects,
             tactical_lines,
@@ -658,6 +713,11 @@ fn upload_to_gpu(
     let (super_timer_fill, super_timer_text) =
         crate::app::presentation::super_timers::build_super_timer_instances(state);
 
+    // GScreenClass_DrawText's Phobos build description, the tactical view's
+    // top-right identity box; empty outside Phobos builds.
+    let (build_text_fill, build_text_text) =
+        crate::app::presentation::build_text::build_instances(state);
+
     let pool: &mut InstanceBufferPool = &mut state.renderer.instance_pool;
 
     // Debug overlays
@@ -671,11 +731,16 @@ fn upload_to_gpu(
 
     // Terrain + overlays
     pool.upload(&state.renderer.gpu, "terrain", &world.terrain.normal);
-    pool.upload(&state.renderer.gpu, "overlay", &world.overlay);
+    pool.upload(&state.renderer.gpu, "cell_body", &world.cell_bodies);
     pool.upload(
         &state.renderer.gpu,
         "building_status_text",
         &world.building_status_text.instances,
+    );
+    pool.upload(
+        &state.renderer.gpu,
+        "fogged_objects",
+        &world.fogged_objects.instances,
     );
     for (layer, objects) in world.object_layers.iter().enumerate() {
         pool.upload_page(
@@ -693,24 +758,24 @@ fn upload_to_gpu(
     }
     pool.upload(
         &state.renderer.gpu,
-        "overlay_bridge_body",
-        &world.bridge_body,
-    );
-    pool.upload(
-        &state.renderer.gpu,
         "overlay_bridge_body_shadow",
         &world.bridge_body_shadow,
     );
-    // Smudges: drawn inside the terrain layer, before the bridge body and
-    // before overlays, matching the native per-cell tile-then-smudge dispatch.
+    // Smudges: drawn inside the terrain layer, before the cell bodies,
+    // matching the native per-cell tile-then-smudge dispatch.
     pool.upload(&state.renderer.gpu, "smudge", &world.smudge);
 
     // Residual effects keep their existing uploads and pass ownership.
     pool.upload(&state.renderer.gpu, "cell_sparkles", &world.cell_sparkles);
     pool.upload(&state.renderer.gpu, "super_timer_fill", &super_timer_fill);
     pool.upload(&state.renderer.gpu, "super_timer_text", &super_timer_text);
+    pool.upload(&state.renderer.gpu, "build_text_fill", &build_text_fill);
+    pool.upload(&state.renderer.gpu, "build_text_text", &build_text_text);
 
     // UI overlays
+    for (house, beacons) in ui.beacons.iter().enumerate() {
+        pool.upload_page(&state.renderer.gpu, "beacons", house, beacons);
+    }
     pool.upload(&state.renderer.gpu, "drag", &ui.drag);
     pool.upload(&state.renderer.gpu, "software_cursor", &ui.software_cursor);
     pool.upload(&state.renderer.gpu, "placement", &ui.placement);

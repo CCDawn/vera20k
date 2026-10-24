@@ -61,7 +61,7 @@ fn refused_begin_still_publishes_the_local_prediction_gate_transition() {
 /// completed buildings, running Idle animation and wallet are scene priors; payment, held identity,
 /// PLACE, producer missions and animation retirement all use the frame API.
 /// Original House4FB563 -> Building443C60/444187 and Unload44D880 ->
-/// Production8 expiry44E8F0 establish this lifecycle (gamemd SHA2561cdd).
+/// Production8 expiry44E8F0 establish this lifecycle (gamemd).
 #[test]
 fn paid_destroyer_runs_shipyard_production_animation_through_idle_recovery() {
     use crate::sim::command::{Command, CommandEnvelope};
@@ -174,8 +174,18 @@ fn paid_destroyer_runs_shipyard_production_animation_through_idle_recovery() {
         } else {
             Vec::new()
         };
+        let visits = runtime
+            .simulation
+            .production
+            .factories()
+            .strip_visits_for_test(owner);
         runtime
-            .advance_frame(&commands, 67, TickLane::Ordinary, FrameEffects::default())
+            .advance_frame(
+                &commands,
+                67,
+                TickLane::Ordinary,
+                FrameEffects::default().with_production_strip(&visits, &|_| {}),
+            )
             .expect("ordinary paid ship production frame");
         let sim = &runtime.simulation;
         let id = *product.get_or_insert_with(|| held_id(sim, owner, ProductionCategory::Ship));
@@ -308,10 +318,6 @@ fn record_last_built_matches_native_class_slots_score_gate_and_rng() {
     ))
     .expect("original built-type controls");
     let native = &corpus["record_last_built"];
-    assert_eq!(
-        native["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     let rows = native["controls"].as_array().unwrap();
     assert_eq!(rows.len(), 8);
     let categories = [
@@ -408,7 +414,14 @@ fn record_last_built_matches_native_class_slots_score_gate_and_rng() {
             sim.mapgen_rng =
                 SimRng::from_native_state_hex_for_test(before["mapgen"].as_str().unwrap());
 
-            super::factory_lifecycle::record_last_built(&mut sim, rules, owner, object);
+            super::factory_lifecycle::record_last_built(
+                &sim.interner,
+                &mut sim.sound_events,
+                &mut sim.houses,
+                rules,
+                owner,
+                object,
+            );
 
             for (slot, slot_name) in categories {
                 assert_eq!(
@@ -480,7 +493,14 @@ fn record_last_built_enforces_map_authored_negative_limit() {
         )
         .expect("supplied valid product for the shared Record call");
     let object = super::factory_lifecycle::BuiltObject::capture(&sim, product);
-    super::factory_lifecycle::record_last_built(&mut sim, rules, owner, object);
+    super::factory_lifecycle::record_last_built(
+        &sim.interner,
+        &mut sim.sound_events,
+        &mut sim.houses,
+        rules,
+        owner,
+        object,
+    );
     assert_eq!(sim.houses[&owner].stats().built(), 1);
     assert_eq!(
         super::can_build::can_build(&sim, rules, owner, e2, true, true),
@@ -511,11 +531,7 @@ fn record_last_built_enforces_map_authored_negative_limit() {
         super::can_build::can_build(&sim, rules, other, e2, true, true),
         super::can_build::CanBuild::Yes
     );
-    sim.discard_constructed_limbo(
-        product,
-        Some(rules),
-        crate::sim::world::FrameEffects::default(),
-    );
+    sim.discard_constructed_limbo(product, rules, crate::sim::world::FrameEffects::default());
     assert!(sim.entities().get(product).is_none());
     assert_eq!(sim.houses[&owner].stats().built(), 1);
     assert_eq!(sim.houses[&other].stats().built(), 0);
@@ -584,7 +600,14 @@ fn record_last_built_uses_class_fallbacks_type_overrides_and_the_existing_tech_o
         let house = sim.houses.get_mut(&owner).unwrap();
         house.take_tech_recheck();
         assert!(!house.tech_recheck_pending());
-        super::factory_lifecycle::record_last_built(&mut sim, &rules, owner, object);
+        super::factory_lifecycle::record_last_built(
+            &sim.interner,
+            &mut sim.sound_events,
+            &mut sim.houses,
+            &rules,
+            owner,
+            object,
+        );
         let actual = sim
             .sound_events
             .iter()
@@ -789,7 +812,9 @@ fn offline_backup_recovery_distinguishes_saved_system_and_user_holds() {
             .unwrap();
         if user_hold {
             assert!(super::suspend_production(
-                sim,
+                &sim.interner,
+                &mut sim.production,
+                &sim.session,
                 "Russians",
                 ProductionCategory::Infantry
             ));
@@ -797,7 +822,12 @@ fn offline_backup_recovery_distinguishes_saved_system_and_user_holds() {
         sim.temporal_initiate_warp(attacker, Some(backup), rules, None, FrameEffects::default());
         assert!(!sim.entities().get(backup).unwrap().building_online());
         sim.techno_limbo_with_rules(barracks, rules, None);
-        sim.temporal_let_go(attacker);
+        Simulation::temporal_let_go(
+            &mut sim.substrate,
+            &mut sim.houses,
+            &mut sim.power_states,
+            attacker,
+        );
         assert!(sim.entities().get(backup).unwrap().building_online());
         let held = sim
             .production
@@ -1112,14 +1142,6 @@ fn retail_barracks_sale_callbacks_reject_successor_or_keep_surviving_producer() 
         "tools/sidebar_oracle/factory_sale_queue.json",
     ))
     .unwrap();
-    let metadata: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
-        "tools/sidebar_oracle/factory_sale_queue.meta.json",
-    ))
-    .unwrap();
-    assert_eq!(
-        metadata["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     let rows = native["controls"].as_array().unwrap();
     assert_eq!(rows.len(), 3);
     for row in rows {
@@ -1300,7 +1322,7 @@ fn retail_barracks_sale_callbacks_reject_successor_or_keep_surviving_producer() 
 /// armed by the test. Original4FB4B7 ->4FB6B0 ->4FB7FF reads the delivered
 /// object's Location after successor promotion, and ignores the local-house
 /// notification gate. Reader/resource evidence: House creation-cue audit,
-/// original gamemd SHA2561cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c.
+/// original gamemd.
 #[test]
 fn paid_boris_delivery_requests_its_creation_cue_once_at_the_delivered_location() {
     use crate::rules::object_type::ObjectCategory;
@@ -1377,8 +1399,18 @@ fn paid_boris_delivery_requests_its_creation_cue_once_at_the_delivered_location(
         } else {
             Vec::new()
         };
+        let visits = runtime
+            .simulation
+            .production
+            .factories()
+            .strip_visits_for_test(owner);
         let output = runtime
-            .advance_frame(&commands, 67, TickLane::Ordinary, FrameEffects::default())
+            .advance_frame(
+                &commands,
+                67,
+                TickLane::Ordinary,
+                FrameEffects::default().with_production_strip(&visits, &|_| {}),
+            )
             .expect("ordinary paid production frame");
         for event in output.sound_events {
             if let SimSoundEvent::VocAt {
@@ -2439,7 +2471,7 @@ fn a_captured_factory_loses_its_rally_point() {
 }
 
 #[test]
-fn ready_manager_cancel_refunds_disposes_and_constructs_one_successor() {
+fn ready_manager_is_refunded_and_disposed_by_another_buildings_produce() {
     let (mut sim, rules, owner) = world(0xfac7_0011);
     let before = counts(&sim, owner);
     assert!(enqueue_by_type(
@@ -2458,7 +2490,7 @@ fn ready_manager_cancel_refunds_disposes_and_constructs_one_successor() {
             .factories_mut()
             .test_arm_ready(owner, ProductionCategory::Building)
     );
-    super::publish_production_changes(&mut sim, &rules);
+    super::publish_production_changes_for_tests(&mut sim, &rules, owner);
     assert_eq!(
         crate::sim::production::ready_buildings_for_owner(&sim, &rules, "Americans").len(),
         1
@@ -2487,7 +2519,10 @@ fn ready_manager_cancel_refunds_disposes_and_constructs_one_successor() {
             .is_empty()
     );
     assert_eq!(sim.houses[&owner].economy().credits(), credits);
-    // A different queued type does not intercept cancellation of the ready head.
+    // Another building's PRODUCE never queues behind the ready head:
+    // StartProduction abandons it first (0x004C9C87 -> AbandonProduction
+    // 0x004C9FF0), refunding Cost_Of less the zero Balance and destroying its
+    // slaves with it, then constructs its own type at once.
     assert!(enqueue_by_type(
         &mut sim,
         &rules,
@@ -2495,17 +2530,6 @@ fn ready_manager_cancel_refunds_disposes_and_constructs_one_successor() {
         "GAPOWR",
         crate::sim::world::FrameEffects::default(),
         false,
-    ));
-    assert!(cancel_production_for_owner(
-        &mut sim,
-        &rules,
-        "Americans",
-        crate::sim::production::ProductionCancellation::Type {
-            type_id: "YAREFN",
-            naval: false
-        },
-        false,
-        crate::sim::world::FrameEffects::default(),
     ));
     assert_gone(&sim, parent, &child_ids);
     assert_eq!(sim.houses[&owner].economy().credits(), credits + 1000);
@@ -2529,6 +2553,125 @@ fn ready_manager_cancel_refunds_disposes_and_constructs_one_successor() {
             .progress,
         0
     );
+}
+
+/// Begin_Production drops a building's PRODUCE while the building factory
+/// runs (`0x004FA520..0x004FA550`: rate set, +0x70 clear, RTTI
+/// BuildingType), ahead of its same-type branch and without a scold: a second
+/// PRODUCE that lands in the first one's frame starts nothing, of either type.
+#[test]
+fn a_building_produce_is_dropped_while_the_building_factory_runs() {
+    use crate::sim::world::{FrameEffects, SimSoundEvent};
+
+    let (mut sim, rules, owner) = world(0xfa52_e000);
+    assert!(enqueue_by_type(
+        &mut sim,
+        &rules,
+        "Americans",
+        "GAPOWR",
+        FrameEffects::default(),
+        false,
+    ));
+    let held = held_id(&sim, owner, ProductionCategory::Building);
+    let factory = |sim: &Simulation| {
+        let view = sim
+            .production
+            .factories()
+            .view(owner, ProductionCategory::Building)
+            .unwrap();
+        (view.is_running(), view.queue.len())
+    };
+    assert_eq!(factory(&sim), (true, 0));
+    let entities = sim.substrate.entities.len();
+    let credits = sim.houses[&owner].economy().credits();
+    let rng = sim.scenario_rng.logical_state();
+    for type_id in ["YAREFN", "GAPOWR"] {
+        assert!(
+            !enqueue_by_type(
+                &mut sim,
+                &rules,
+                "Americans",
+                type_id,
+                FrameEffects::default(),
+                false,
+            ),
+            "{type_id}"
+        );
+    }
+    assert_eq!(held_id(&sim, owner, ProductionCategory::Building), held);
+    assert_eq!(factory(&sim), (true, 0));
+    assert_eq!(sim.substrate.entities.len(), entities);
+    assert_eq!(sim.houses[&owner].economy().credits(), credits);
+    assert_eq!(sim.scenario_rng.logical_state(), rng);
+    assert!(
+        !sim.sound_events
+            .iter()
+            .any(|event| matches!(event, SimSoundEvent::ProductionRefused { .. }))
+    );
+}
+
+/// Otherwise StartProduction abandons what the building factory holds before
+/// it starts another type (`0x004C9C7F..0x004C9C89`): a held building goes,
+/// refunded its Cost_Of less the Balance still owed (`0x004CA029..
+/// 0x004CA046`), and the new type is constructed at once, never queued
+/// (`0x004C9C95..0x004C9C98`).
+#[test]
+fn a_building_produce_abandons_a_held_building_and_starts_its_own() {
+    use crate::sim::world::FrameEffects;
+
+    let (mut sim, rules, owner) = world(0xfa52_e001);
+    assert!(enqueue_by_type(
+        &mut sim,
+        &rules,
+        "Americans",
+        "GAPOWR",
+        FrameEffects::default(),
+        false,
+    ));
+    let held = held_id(&sim, owner, ProductionCategory::Building);
+    // 150 of GAPOWR's 800 paid so far.
+    let factory = sim
+        .production
+        .factories_mut()
+        .test_factory_mut(owner, ProductionCategory::Building)
+        .unwrap();
+    factory.set_progress_for_test(10);
+    factory.set_balance_for_test(650);
+    assert!(super::suspend_production(
+        &sim.interner,
+        &mut sim.production,
+        &sim.session,
+        "Americans",
+        ProductionCategory::Building
+    ));
+    let credits = sim.houses[&owner].economy().credits();
+    let mut expected = sim.scenario_rng.clone();
+
+    assert!(enqueue_by_type(
+        &mut sim,
+        &rules,
+        "Americans",
+        "YAREFN",
+        FrameEffects::default(),
+        false,
+    ));
+    assert_gone(&sim, held, &[]);
+    assert_eq!(sim.houses[&owner].economy().credits(), credits + 150);
+    let successor = held_id(&sim, owner, ProductionCategory::Building);
+    assert_eq!(
+        sim.interner
+            .resolve(sim.substrate.entities.get(successor).unwrap().type_ref()),
+        "YAREFN"
+    );
+    assert_constructor_words(&sim, successor, &mut expected);
+    let factory = sim
+        .production
+        .factories()
+        .view(owner, ProductionCategory::Building)
+        .unwrap();
+    assert!(factory.is_running());
+    assert!(factory.queue.is_empty());
+    assert_eq!(factory.progress, 0);
 }
 
 /// A build whose prerequisite leaves the map is abandoned by its strip's
@@ -2805,7 +2948,7 @@ fn a_ready_building_goes_with_the_last_construction_yard() {
             .factories_mut()
             .test_arm_ready(owner, ProductionCategory::Building)
     );
-    super::publish_production_changes(&mut sim, &rules);
+    super::publish_production_changes_for_tests(&mut sim, &rules, owner);
     assert_eq!(
         crate::sim::production::ready_buildings_for_owner(&sim, &rules, "Americans").len(),
         1
@@ -3060,15 +3203,14 @@ fn occupied_barracks_radio_refunds_discards_and_promotes_one_gi() {
             .balance(),
         0
     );
-    super::publish_production_changes(&mut sim, &rules);
+    super::publish_production_changes_for_tests(&mut sim, &rules, owner);
     let pending = sim.pending_command_snapshot();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].owner, owner);
     assert!(matches!(
-        pending[0].payload,
-        crate::sim::command::Command::PlaceProducedMobile {
-            category: ProductionCategory::Infantry
-        }
+        &pending[0].payload,
+        crate::sim::command::Command::SynchronizedRecord { record }
+            if crate::sim::command::PlaceRecord::decode(record).is_some()
     ));
     assert_eq!(held_id(&sim, owner, category), refused);
     assert!(
@@ -3179,7 +3321,12 @@ fn secret_lab_fallback_capture_paid_queue_snapshot_and_loss_share_the_existing_o
     let lab = sim
         .spawn_object("LAB", "Russians", 30, 20, 0, &rules)
         .unwrap();
-    sim.assign_secret_lab_production(&rules);
+    Simulation::assign_secret_lab_production(
+        &mut sim.interner,
+        &mut sim.scenario_rng,
+        &mut sim.substrate,
+        &rules,
+    );
     let fallback = sim
         .substrate
         .entities

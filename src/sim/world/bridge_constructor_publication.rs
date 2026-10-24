@@ -47,7 +47,7 @@ impl LivePublication<'_> {
         if self.sim.native_unique_ids.is_none() {
             return Err("live bridge constructor has no Scenario native-ID continuation".into());
         }
-        let id = self.sim.allocate_stable_id();
+        let id = self.sim.substrate.allocate_stable_id();
         let handle = self
             .sim
             .load_objects
@@ -243,16 +243,10 @@ impl OverlayMarkHost for BridgeMarkHost<'_, '_> {
             &request,
         );
         let sim = &mut *self.publication.sim;
-        let lighting = sim
-            .session
-            .lighting()
-            .profile(crate::sim::scenario_session::ScenarioLightingProfile::Normal)
-            .into();
         sim.construct_overlay_cell_anim(
             rules,
             request,
             ground,
-            lighting,
             crate::sim::anim_class::AnimConstructorInput::Runtime,
         )
         .map(|_| ())

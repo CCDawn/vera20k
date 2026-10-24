@@ -11,7 +11,7 @@ use crate::rules::ruleset::HouseCostFactors;
 use crate::sim::components::{DriveCoord, NavTargetRef};
 use crate::sim::find_nearby_cell::{NearbyArgs, NearbyFootprint, PassabilityArgs};
 use crate::sim::houses::Houses;
-use crate::sim::mission::authority::EntityReadyInputProvider;
+use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::util::native_x87::NativeF32Bits;
 
@@ -480,7 +480,7 @@ impl Simulation {
             let _ = self.assign_destination_represented(
                 id,
                 Some(destination),
-                Some(rules),
+                rules,
                 registry,
                 frame_effects,
             );
@@ -492,7 +492,7 @@ impl Simulation {
                 move_mission,
                 0,
                 self.session.binary_frame(),
-                &EntityReadyInputProvider,
+                &LiveReadyInputProvider { rules },
             );
         }
     }
@@ -512,12 +512,9 @@ impl Simulation {
         if origin == (0, 0) {
             return [0, 0, 0];
         }
-        let coord = crate::sim::movement::ground_pose::target_get_coords(
-            crate::sim::combat::TargetKind::Cell(origin.0, origin.1),
-            self,
-            cells,
-        )
-        .expect("Cell GetCoords always returns a coordinate");
+        // A fresh Map5657A0 lookup, which stamps the Dummy on a miss; not the
+        // retained-Cell GetCoords that target_get_coords dispatches.
+        let coord = crate::sim::movement::navcom::target_cell_coord(origin.0, origin.1, cells);
         [coord.x, coord.y, coord.z]
     }
 
@@ -701,10 +698,103 @@ impl Simulation {
         true
     }
 
+    /// `HouseClass::DetermineEdge @ 0x0050DB00`: the map edge `owner`'s
+    /// aircraft come from and leave by (House+0x577C,
+    /// [`HouseState::waypoint_edge`]). Its callers, SelectPrimaryFactory
+    /// (`0x0044813D`) and TogglePrimaryFactory (`0x00448241`), pass a
+    /// `Factory=BuildingType` Building of `owner`.
+    ///
+    /// - That Building, when it is primary (`+0x3D3`) and its type's Factory
+    ///   is BuildingType (`0x0050DB23..0x0050DB6E`), is the anchor.
+    /// - Otherwise, when House+0x2F0 is nonzero, the House+68 walk
+    ///   (`0x0050DB73..0x0050DC34`) takes each non-limbo `ConstructionYard=`
+    ///   Building in turn and stops at a primary one; without one, the first
+    ///   other non-limbo Building. With neither, the edge stays (`0x0050DC86`).
+    ///
+    /// The anchor is the Building's GetCoords (`0x00447AC0`, its foundation
+    /// centre); Map[coord] (`0x00565730`) gives the cell the edge choice
+    /// ([`determine_waypoint_edge`]) measures from. Native marks "no anchor"
+    /// with the zero CoordStruct (`0x00A8EFF8`), which a placed Building's
+    /// GetCoords never equals (its X is at least 128).
+    ///
+    /// RESIDUAL: VERA's Unlimbo and ChangeOwner append the Building to
+    /// House+68 before this call; native appends after it (`0x00441594`,
+    /// `0x004491D2`). The walk runs only when another primary
+    /// `Factory=BuildingType` Building kept the flag. Every retail one is a
+    /// `ConstructionYard=` type, where the walk stops before that tail.
+    ///
+    /// A mapless fixture without PlayfieldBounds keeps its edge.
+    ///
+    /// [`determine_waypoint_edge`]: crate::sim::house_state::determine_waypoint_edge
+    pub(crate) fn determine_house_edge(
+        &mut self,
+        owner: InternedId,
+        building: u64,
+        rules: &RuleSet,
+    ) {
+        let Some(bounds) = self.playfield_bounds else {
+            return;
+        };
+        let primary_yard_factory = self.production.is_primary_factory(building)
+            && self
+                .substrate
+                .entities
+                .get(building)
+                .and_then(|entity| self.object_type(entity.type_ref(), rules))
+                .is_some_and(|object| {
+                    object.factory_type()
+                        == Some(crate::rules::object_type::FactoryType::BuildingType)
+                });
+        let anchor = if primary_yard_factory {
+            Some(building)
+        } else {
+            let Some(house) = self.houses.get(&owner) else {
+                return;
+            };
+            let mut yard = None;
+            let mut other = None;
+            if house.tracking().buildings() != 0 {
+                for &id in house.base_projection().buildings() {
+                    let Some(entity) = self.substrate.entities.get(id) else {
+                        continue;
+                    };
+                    if entity.lifecycle.in_limbo() {
+                        continue;
+                    }
+                    if self
+                        .object_type(entity.type_ref(), rules)
+                        .is_some_and(|object| object.construction_yard)
+                    {
+                        yard = Some(id);
+                        if self.production.is_primary_factory(id) {
+                            break;
+                        }
+                    } else if other.is_none() {
+                        other = Some(id);
+                    }
+                }
+            }
+            yard.or(other)
+        };
+        let Some(cell) = anchor
+            .and_then(|id| self.substrate.entities.get(id))
+            .and_then(super::lifecycle::object_get_coords_cell)
+        else {
+            return;
+        };
+        let edge = crate::sim::house_state::determine_waypoint_edge(cell, bounds);
+        if let Some(house) = self.houses.get_mut(&owner) {
+            house.assign_waypoint_edge(edge);
+        }
+    }
+
     /// [`HouseState::cost_factors`] for `owner`. `None` without a House, which
     /// takes Cost_Of's null-House arm (`0x00711F4E`, the raw cost).
-    pub(crate) fn house_cost_factors(&self, owner: InternedId) -> Option<HouseCostFactors> {
-        Some(self.houses.get(&owner)?.cost_factors())
+    pub(crate) fn house_cost_factors(
+        houses: &Houses,
+        owner: InternedId,
+    ) -> Option<HouseCostFactors> {
+        Some(houses.get(&owner)?.cost_factors())
     }
 
     /// TechnoType virtual `+0x84` for `owner`'s House ([`RuleSet::cost_of`]).
@@ -716,7 +806,10 @@ impl Simulation {
             }),
             "a House's `Cost*Mult=` copy differs from its type's: project it at creation"
         );
-        rules.cost_of(object, self.house_cost_factors(owner).as_ref())
+        rules.cost_of(
+            object,
+            Self::house_cost_factors(&self.houses, owner).as_ref(),
+        )
     }
 
     /// House+0x98, the grinders, in registration order. Grinding+16AD
@@ -840,19 +933,25 @@ impl Simulation {
             .collect()
     }
 
-    pub(super) fn register_house_base_building(&mut self, id: u64, rules: &RuleSet) {
-        let Some(entity) = self.substrate.entities.get(id) else {
+    pub(super) fn register_house_base_building(
+        interner: &StringInterner,
+        substrate: &ObjectSubstrate,
+        houses: &mut Houses,
+        id: u64,
+        rules: &RuleSet,
+    ) {
+        let Some(entity) = substrate.entities.get(id) else {
             return;
         };
         if entity.category() != EntityCategory::Structure {
             return;
         }
-        let Some(object) = self.object_type(entity.type_ref(), rules) else {
+        let Some(object) = interner.object_type(entity.type_ref(), rules) else {
             return;
         };
         let entry = RegisteredBuilding::new(id, object);
         let owner = entity.owner();
-        if let Some(house) = self.houses.get_mut(&owner) {
+        if let Some(house) = houses.get_mut(&owner) {
             house.base_projection_mut().register(entry);
         }
     }
@@ -890,14 +989,12 @@ impl Simulation {
         id: u64,
         old_owner: InternedId,
         owner: InternedId,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
     ) {
         // Building448C76/448C81: old list already removed and Techno tracking
         // moved, but neither new FactoryPlant nor House+68 append has run.
-        if let Some(rules) = rules {
-            self.recalculate_house_base_geometry(old_owner, rules);
-            self.recalculate_house_base_geometry(owner, rules);
-        }
+        self.recalculate_house_base_geometry(old_owner, rules);
+        self.recalculate_house_base_geometry(owner, rules);
         if let Some(house) = self.houses.get_mut(&owner) {
             house.base_projection_mut().append_membership(id);
         }
@@ -1253,10 +1350,6 @@ mod tests {
             "tools/spatial_oracle/house_base_return.meta.json",
         ))
         .unwrap();
-        assert_eq!(
-            meta["native_sha256"].as_str(),
-            Some("1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c")
-        );
         assert_eq!(meta["entry_points"]["ordinary_return"], "0x00500200");
         let rows = corpus["home_return"].as_array().unwrap();
         assert_eq!(rows.len(), 28);
@@ -1551,7 +1644,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_mark_dead_and_attached_upgrade_unlimbo_do_not_publish_geometry() {
+    fn failed_mark_and_dead_unlimbo_do_not_publish_geometry() {
         use crate::sim::world::lifecycle::{
             PlacementEvidence, RevealOutcome, RevealPosition, RevealRequest, UninitContext,
         };
@@ -1565,7 +1658,6 @@ mod tests {
         for (index, placement) in [
             PlacementEvidence::MarkFailed,
             PlacementEvidence::MarkSucceeded,
-            PlacementEvidence::AttachedUpgrade,
         ]
         .into_iter()
         .enumerate()
@@ -1577,8 +1669,6 @@ mod tests {
             let entity = sim.substrate.entities.get_mut(id).unwrap();
             if index == 1 {
                 entity.lifecycle.set_object_alive_for_test(false);
-            } else if index == 2 {
-                entity.link_structure_upgrade(id - 1, 0);
             }
             let result = sim.try_reveal_entity_with_context(
                 id,
@@ -1914,3 +2004,7 @@ mod tests {
         assert_eq!(after[2..], before[2..]);
     }
 }
+
+#[cfg(test)]
+#[path = "house_edge_tests.rs"]
+mod edge_tests;

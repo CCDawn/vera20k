@@ -1,4 +1,4 @@
-//! RA2 Engine — client library root.
+//! VERA20k — client library root.
 //!
 //! Re-exports all modules so the game and the tool binaries in `src/bin/`
 //! can access the engine's functionality. The binary entry point (main.rs)
@@ -12,6 +12,24 @@ pub use vera20k_core::{
     assets, headless_scenario, map, net, rules, sim, skirmish_launch, skirmish_modes, super_ai,
     util,
 };
+
+// Cargo unifies dependency features across a workspace. Refuse a client built
+// without its Ares consumers when another package enables the core capability.
+const _: () = assert!(
+    cfg!(feature = "ares") == rules::ARES_ENABLED,
+    "enable Ares through the vera20k package's ares feature"
+);
+// The same boundary for Phobos: the capability is independent of Ares and is
+// likewise enabled through the client package.
+const _: () = assert!(
+    cfg!(feature = "phobos") == rules::PHOBOS_ENABLED,
+    "enable Phobos through the vera20k package's phobos feature"
+);
+// The same boundary for the NPatch placeholder.
+const _: () = assert!(
+    cfg!(feature = "npatch") == rules::NPATCH_ENABLED,
+    "enable NPatch through the vera20k package's npatch feature"
+);
 
 // Opaque process-RNG cursor receipt shared by map generation and simulation.
 use vera20k_core::rng_continuation;

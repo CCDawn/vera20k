@@ -65,10 +65,15 @@ use crate::sim::base_plan::{BasePlanNode, pack_base_plan_cell, unpack_base_plan_
 use crate::sim::build_site::{Flush, can_place_building_at, flush_for_placement};
 use crate::sim::houses::Houses;
 use crate::sim::intern::InternedId;
+use crate::sim::intern::StringInterner;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::movement::locomotor::MovementLayer;
+use crate::sim::power_system::PowerStates;
 use crate::sim::production::find_factory;
+use crate::sim::rng::SimRng;
+use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::world::FrameEffects;
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::{PlacementEvidence, Simulation};
 
 /// The computer's production state on its House.
@@ -146,13 +151,17 @@ impl HouseAiProduction {
 /// 1 from `RandomRanged(0,1)` (`0x00509863`), else a non-building exit moves
 /// it to 1; at or above it, modes 1 and 2 return to 0, and mode 3 only above.
 pub(crate) fn economy_state_machine(
-    sim: &mut Simulation,
+    interner: &StringInterner,
+    session: &ScenarioSession,
+    scenario_rng: &mut SimRng,
+    houses: &mut Houses,
+    power_states: &PowerStates,
     rules: &RuleSet,
     owner: InternedId,
     building_exit: bool,
 ) {
-    let game_mode_nonzero = sim.session.game_mode_nonzero();
-    let Some(house) = sim.houses.get(&owner) else {
+    let game_mode_nonzero = session.game_mode_nonzero();
+    let Some(house) = houses.get(&owner) else {
         return;
     };
     if house.is_controlled_by_human(game_mode_nonzero)
@@ -162,7 +171,7 @@ pub(crate) fn economy_state_machine(
         return;
     }
     let mode = house.ai_production().mode;
-    let money = crate::sim::credit_income::available_money(sim, owner);
+    let money = crate::sim::credit_income::available_money(houses, owner);
     let cutoff = rules.general.ai_alternate_production_credit_cutoff;
     let next = match mode {
         0 => (money < cutoff).then_some(if building_exit { 2 } else { 1 }),
@@ -174,7 +183,7 @@ pub(crate) fn economy_state_machine(
             // from each list.
             let owns_any = |types: &[String]| {
                 types.iter().any(|name| {
-                    sim.interner.get(name).is_some_and(|id| {
+                    interner.get(name).is_some_and(|id| {
                         house
                             .tracking()
                             .active_count(crate::map::entities::EntityCategory::Structure, id)
@@ -182,14 +191,13 @@ pub(crate) fn economy_state_machine(
                     })
                 })
             };
-            let (output, drain) = sim
-                .power_states
+            let (output, drain) = power_states
                 .get(&owner)
                 .map_or((0, 0), |power| (power.total_output(), power.total_drain()));
             let may_stay = owns_any(&rules.build_barracks_types)
                 && owns_any(&rules.build_weapons_types)
                 && drain <= output;
-            if may_stay && sim.scenario_rng.next_range_i32_inclusive(0, 1) != 0 {
+            if may_stay && scenario_rng.next_range_i32_inclusive(0, 1) != 0 {
                 None
             } else {
                 (!building_exit).then_some(1)
@@ -200,7 +208,7 @@ pub(crate) fn economy_state_machine(
         _ => None,
     };
     if let Some(next) = next
-        && let Some(house) = sim.houses.get_mut(&owner)
+        && let Some(house) = houses.get_mut(&owner)
     {
         house.ai_production_mut().mode = next;
     }
@@ -306,10 +314,7 @@ fn unit_choice_is_harvester(sim: &Simulation, rules: &RuleSet, owner: InternedId
     let Some(house) = sim.houses.get(&owner) else {
         return false;
     };
-    let country_bit = crate::sim::ai_buildable::house_country_bit(
-        rules,
-        sim.interner.resolve(house.house_type_id()),
-    );
+    let country_bit = rules.country_owner_mask(sim.interner.resolve(house.house_type_id()));
     crate::sim::ai_buildable::first_owner_compatible_harvester(rules, country_bit)
         .and_then(|harvester| rules.type_array_index(ObjectCategory::Vehicle, &harvester.id))
         .is_some_and(|index| index == house.ai_unit_choices().get(UnitChoiceKind::Unit))
@@ -367,7 +372,16 @@ pub(crate) fn choose_building(
         let percent = sim.houses.get(&owner).map_or(0, |house| {
             house.difficulty_value(&rules.general.ai_pick_wall_defense_percent)
         });
-        if draw < percent && build_walls(sim, rules, owner, index) {
+        if draw < percent
+            && build_walls(
+                &sim.interner,
+                &sim.substrate,
+                &mut sim.houses,
+                rules,
+                owner,
+                index,
+            )
+        {
             if let Some(house) = sim.houses.get_mut(&owner) {
                 house.base_plan_mut().remove_equal(node);
             }
@@ -516,7 +530,16 @@ pub(crate) fn exit_building(
     else {
         return BuildingExit::Failed;
     };
-    economy_state_machine(sim, rules, owner, true);
+    economy_state_machine(
+        &sim.interner,
+        &sim.session,
+        &mut sim.scenario_rng,
+        &mut sim.houses,
+        &sim.power_states,
+        rules,
+        owner,
+        true,
+    );
     if let Some(house) = sim.houses.get_mut(&owner) {
         house.ai_production_mut().clear_building_choice();
     }
@@ -765,7 +788,7 @@ pub(crate) fn suggest_new_object<'r>(
     let unit_choice = |kind: UnitChoiceKind| {
         rules.type_array_at(kind.category(), house.ai_unit_choices().get(kind))
     };
-    // Steam3e81a617..08600, two-level tables4FBE0C/4FBDF8. This one
+    // Steam gamemd, two-level tables4FBE0C/4FBDF8. This one
     // consumer and factory accounting accept object/type aliases, unlike
     // FindFactory's exact class comparison. Other RTTIs return null.
     match FactoryType::for_production_rtti(factory_rtti)? {
@@ -824,7 +847,7 @@ pub(crate) fn node_satisfied(
     node: &BasePlanNode,
     registry: Option<&OverlayTypeRegistry>,
 ) -> bool {
-    if node_building(sim, owner, node).is_some() {
+    if node_building(&sim.substrate, owner, node).is_some() {
         return true;
     }
     let Some(ty) = rules.building_type_at(node.type_or_control) else {
@@ -857,7 +880,7 @@ pub(crate) fn node_satisfied(
 /// top-left cell is the node's cell. The `PowersUpBuilding=` arm is dormant
 /// (module residual).
 pub(crate) fn node_building(
-    sim: &Simulation,
+    substrate: &ObjectSubstrate,
     owner: InternedId,
     node: &BasePlanNode,
 ) -> Option<u64> {
@@ -865,11 +888,10 @@ pub(crate) fn node_building(
         return None;
     }
     let (rx, ry) = map_cell(node.packed_cell)?;
-    let id = sim
-        .substrate
+    let id = substrate
         .occupancy
         .first_building_on_layer(rx, ry, MovementLayer::Ground)?;
-    let building = sim.substrate.entities.get(id)?;
+    let building = substrate.entities.get(id)?;
     ((building.position.rx(), building.position.ry()) == (rx, ry)
         && building.owner() == owner
         && building.type_facts.base_plan_type_index() == node.type_or_control)
@@ -951,18 +973,24 @@ fn plan_node(houses: &Houses, owner: InternedId, index: usize) -> BasePlanNode {
 /// `index`: walls the nearest `ProtectWithWall=` building before it
 /// ([`wall_nodes`]) with the house's wall type. Whether it wrote any; it
 /// makes no draw.
-fn build_walls(sim: &mut Simulation, rules: &RuleSet, owner: InternedId, index: usize) -> bool {
-    let Some(house) = sim.houses.get(&owner) else {
+fn build_walls(
+    interner: &StringInterner,
+    substrate: &ObjectSubstrate,
+    houses: &mut Houses,
+    rules: &RuleSet,
+    owner: InternedId,
+    index: usize,
+) -> bool {
+    let Some(house) = houses.get(&owner) else {
         return false;
     };
     let wall = wall_type(rules, house.side_index());
     let nodes = house.base_plan().nodes();
     let walls = wall_nodes(nodes, index, wall, |at| {
-        let building = sim
-            .substrate
+        let building = substrate
             .entities
-            .get(node_building(sim, owner, &nodes[at])?)?;
-        let ty = sim.object_type(building.type_ref(), rules)?;
+            .get(node_building(substrate, owner, &nodes[at])?)?;
+        let ty = interner.object_type(building.type_ref(), rules)?;
         ty.protect_with_wall.then(|| {
             (
                 (building.position.rx() as i16, building.position.ry() as i16),
@@ -973,7 +1001,7 @@ fn build_walls(sim: &mut Simulation, rules: &RuleSet, owner: InternedId, index: 
     let Some((at, walls)) = walls else {
         return false;
     };
-    if let Some(house) = sim.houses.get_mut(&owner) {
+    if let Some(house) = houses.get_mut(&owner) {
         for node in walls {
             house.base_plan_mut().insert_after(at, node);
         }

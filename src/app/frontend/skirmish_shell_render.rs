@@ -25,11 +25,39 @@ pub(crate) use saved_games::{family_saved_game_overlays, render_saved_game_shell
 mod launcher_options;
 pub(crate) use launcher_options::render_launcher_options;
 mod modals;
+mod network_failure;
+pub(crate) use network_failure::render_network_failure;
 pub(crate) use modals::render_saved_game_loading;
 mod preview;
 mod text;
 
 pub(crate) use preview::SkirmishPreviewTexture;
+
+/// The preview the setup dialog shows for `file`, decoded the way BC's own
+/// preview is: the LAN host's `[0xAC1154]` for its preview upload.
+pub(crate) fn decode_network_map_preview(
+    state: &AppState,
+    file: &str,
+) -> Option<crate::map::preview::DecodedPreview> {
+    let entry = state
+        .frontend
+        .scenario_catalog
+        .shell_maps()
+        .iter()
+        .find(|entry| entry.file_name.eq_ignore_ascii_case(file))?;
+    let ra2_dir = state
+        .platform
+        .game_config
+        .as_ref()
+        .map(|config| config.paths.ra2_dir.as_path())
+        .or_else(|| {
+            state
+                .process_assets
+                .manager()
+                .map(|assets| assets.ra2_dir())
+        });
+    preview::decode_preview_for_map_entry(entry, ra2_dir, state.process_assets.manager())
+}
 pub(crate) use text::{
     combo_item_label, skirmish_right_panel_label_strings, skirmish_selected_map_name,
 };
@@ -43,6 +71,7 @@ use crate::render::batch::SpriteInstance;
 use crate::render::bit_font::BitFont;
 #[cfg(test)]
 use crate::render::shell_text::ShellAlign;
+use crate::render::shell_text::ShellTextDraw;
 use crate::render::shell_transition_pass::ShellRenderTarget;
 use crate::render::skirmish_shell_chrome::{SkirmishShellChromeAtlas, SkirmishShellChromeEntry};
 use crate::rules::color_scheme::ColorSchemeEntry;
@@ -421,36 +450,7 @@ fn build_skirmish_shell_instances(
             );
         }
     }
-
-    push_dropdown_instances(&mut instances, atlas, color_schemes, layout, shell, maps);
     instances
-}
-
-fn apply_owner_draw_button_paint_state(
-    last_painted_pressed_button: &mut Option<OwnerDrawButton>,
-    pressed: Option<OwnerDrawButton>,
-    mode: ShellRenderMode,
-) -> bool {
-    if mode == ShellRenderMode::TransitionPreview {
-        return false;
-    }
-    let play_sound = pressed.is_some() && last_painted_pressed_button.is_none();
-    *last_painted_pressed_button = pressed;
-    play_sound
-}
-
-fn update_owner_draw_button_paint_sound(state: &mut AppState, mode: ShellRenderMode) {
-    let pressed = state
-        .frontend
-        .skirmish_shell_state
-        .pressed_owner_draw_button;
-    if apply_owner_draw_button_paint_state(
-        &mut state.frontend.skirmish_shell_last_painted_pressed_button,
-        pressed,
-        mode,
-    ) {
-        crate::app::App::play_skirmish_shell_generic_click_sound(state);
-    }
 }
 
 pub(crate) fn render_skirmish_shell(
@@ -573,13 +573,6 @@ fn render_skirmish_shell_with_atlas(
     // dialog's own surface (`0x00607EC8`, `0x00607EF1` with record `+0xD5`),
     // so no right-panel child shows while either slide runs.
     let sliding = wave.is_some();
-    // No pressed-button click is painted while a slide draws the frames.
-    let paint_mode = if leaving {
-        ShellRenderMode::TransitionPreview
-    } else {
-        mode
-    };
-    update_owner_draw_button_paint_sound(state, paint_mode);
     // `0x6B`'s and `0x105`'s heading and status line, revealed from the
     // entry slide's end.
     let chooser_statics = match (
@@ -730,6 +723,27 @@ fn render_skirmish_shell_with_atlas(
         );
     }
     let parent_showing = !message_box_up && choose_map_layout.is_none() && !leaving;
+    // ComboDropWin is a popup over the dialog: its frame and rows go after
+    // every dialog text, which this unbuffered pass paints in queue order.
+    let mut dropdown_instances = Vec::new();
+    let dropdown_text_draws = if parent_showing {
+        push_dropdown_instances(
+            &mut dropdown_instances,
+            atlas,
+            color_schemes,
+            &layout,
+            &state.frontend.skirmish_shell_state,
+            state.frontend.scenario_catalog.shell_maps(),
+        );
+        text::build_dropdown_text_draws(
+            state,
+            &layout,
+            &state.frontend.skirmish_shell_state,
+            state.frontend.scenario_catalog.shell_maps(),
+        )
+    } else {
+        Vec::new()
+    };
     let parent_statics = if parent_showing {
         text::paint_skirmish_statics(state, &layout, sliding)
     } else {
@@ -832,6 +846,19 @@ fn render_skirmish_shell_with_atlas(
                 .create_instance_buffer(&state.renderer.gpu, &d.instances)
         })
         .collect();
+    let dropdown_buffer = state
+        .renderer
+        .batch_renderer
+        .create_instance_buffer(&state.renderer.gpu, &dropdown_instances);
+    let dropdown_text_buffers: Vec<_> = dropdown_text_draws
+        .iter()
+        .map(|d| {
+            state
+                .renderer
+                .batch_renderer
+                .create_instance_buffer(&state.renderer.gpu, &d.instances)
+        })
+        .collect();
     let cursor_instances: Vec<SpriteInstance> =
         crate::app::frontend::shell_pass::software_cursor(state, SHELL_CURSOR_DEPTH)
             .map(|(_, instance)| instance)
@@ -914,23 +941,22 @@ fn render_skirmish_shell_with_atlas(
             *count,
         );
     }
-    for (draw, buf) in shell_draws.iter().zip(scissored_text_buffers.iter()) {
-        let Some((buffer, count)) = buf.as_ref() else {
-            continue;
-        };
-        pass.set_scissor_rect(
-            draw.scissor.x,
-            draw.scissor.y,
-            draw.scissor.w,
-            draw.scissor.h,
-        );
+    draw_scissored_text(&mut pass, state, &shell_draws, &scissored_text_buffers);
+    pass.set_scissor_rect(0, 0, state.render_width(), state.render_height());
+    if let Some((buffer, count)) = dropdown_buffer.as_ref() {
         state.renderer.batch_renderer.draw_with_buffer_passthrough(
             &mut pass,
-            state.renderer.bit_font.atlas(),
+            &atlas.texture,
             buffer,
             *count,
         );
     }
+    draw_scissored_text(
+        &mut pass,
+        state,
+        &dropdown_text_draws,
+        &dropdown_text_buffers,
+    );
     // Reset scissor to full render so any subsequent draws / passes aren't clipped.
     pass.set_scissor_rect(0, 0, state.render_width(), state.render_height());
     // Software cursor draws last, on top of all chrome/controls/modals.
@@ -943,6 +969,32 @@ fn render_skirmish_shell_with_atlas(
     drop(pass);
 
     Ok(action)
+}
+
+/// Each draw under its own scissor; the caller resets the scissor after.
+fn draw_scissored_text<'a>(
+    pass: &mut wgpu::RenderPass<'a>,
+    state: &'a AppState,
+    draws: &[ShellTextDraw],
+    buffers: &'a [Option<(wgpu::Buffer, u32)>],
+) {
+    for (draw, buf) in draws.iter().zip(buffers) {
+        let Some((buffer, count)) = buf.as_ref() else {
+            continue;
+        };
+        pass.set_scissor_rect(
+            draw.scissor.x,
+            draw.scissor.y,
+            draw.scissor.w,
+            draw.scissor.h,
+        );
+        state.renderer.batch_renderer.draw_with_buffer_passthrough(
+            pass,
+            state.renderer.bit_font.atlas(),
+            buffer,
+            *count,
+        );
+    }
 }
 
 fn clear_shell_target(
@@ -1077,39 +1129,6 @@ mod tests {
     fn preview_backdrop_sits_behind_fitted_preview_surface() {
         const { assert!(SHELL_PREVIEW_BACKDROP_DEPTH > SHELL_PREVIEW_SURFACE_DEPTH) };
         const { assert!(SHELL_PREVIEW_BACKDROP_DEPTH < 0.00080) };
-    }
-
-    #[test]
-    fn transition_preview_suppresses_owner_draw_paint_side_effects() {
-        let mut last = None;
-        let play_sound = apply_owner_draw_button_paint_state(
-            &mut last,
-            Some(OwnerDrawButton::StartGame0x617),
-            ShellRenderMode::TransitionPreview,
-        );
-
-        assert!(!play_sound);
-        assert_eq!(last, None);
-    }
-
-    #[test]
-    fn visible_render_updates_owner_draw_paint_state_once() {
-        let mut last = None;
-        let play_sound = apply_owner_draw_button_paint_state(
-            &mut last,
-            Some(OwnerDrawButton::StartGame0x617),
-            ShellRenderMode::Visible,
-        );
-        assert!(play_sound);
-        assert_eq!(last, Some(OwnerDrawButton::StartGame0x617));
-
-        let play_sound = apply_owner_draw_button_paint_state(
-            &mut last,
-            Some(OwnerDrawButton::StartGame0x617),
-            ShellRenderMode::Visible,
-        );
-        assert!(!play_sound);
-        assert_eq!(last, Some(OwnerDrawButton::StartGame0x617));
     }
 
     #[test]
@@ -1903,6 +1922,8 @@ mod abort;
 pub(crate) use abort::render_abort_shell;
 mod diplomacy;
 pub(crate) use diplomacy::render_diplomacy_shell;
+mod restate;
+pub(crate) use restate::render_restate_shell;
 mod connection;
 pub(crate) use connection::{connection_shell_drawable, render_connection_shell};
 
@@ -1916,14 +1937,29 @@ pub(crate) use chrome::type3_button_frames;
 mod keyboard;
 mod lan_lobby;
 mod network_options;
+mod wol_buddy;
 mod wol_lobby;
 mod wol_login;
+mod wol_my_info;
 mod wol_options;
+mod wol_page;
+mod wol_persona;
+mod wol_quick_match;
 pub(crate) use lan_lobby::render_lan_lobby;
-pub(crate) use wol_lobby::{paint_wol_lobby_children, paint_wol_lobby_popup};
+pub(crate) use wol_buddy::paint_wol_buddy_children;
+pub(crate) use wol_lobby::{WolLobbyPaint, paint_wol_lobby_children, paint_wol_lobby_popup};
 pub(crate) use wol_login::{paint_wol_login_children, wol_button_label_rgb};
+pub(crate) use wol_my_info::paint_wol_my_info_children;
 pub(crate) use wol_options::{paint_shell_sound_children, paint_wol_options_children};
+pub(crate) use wol_page::{
+    in_match_page_draw, paint_wol_add_buddy, paint_wol_page_dialog, paint_wol_page_received,
+    paint_wol_verify,
+};
+pub(crate) use wol_persona::{paint_wol_auto_login_children, paint_wol_locale_children};
+pub(crate) use wol_quick_match::paint_wol_quick_match_children;
+mod coop_score;
 mod multiplayer_setup;
+pub(crate) use coop_score::render_coop_score;
 pub(crate) use keyboard::render_keyboard_shell;
 pub(crate) use multiplayer_setup::render_multiplayer_setup;
 pub(crate) use network_options::render_network_options;

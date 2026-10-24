@@ -842,20 +842,33 @@ impl ReplayRunner {
         runtime
             .simulation
             .hash_state_every(std::num::NonZeroU64::MIN);
+        let network = std::cell::RefCell::new(crate::sim::command_queue::FrameChecksumState::new());
         let mut hashes: Vec<Option<u64>> = Vec::with_capacity(replay.ticks.len());
         for input in &replay.initial_scenario_services {
             input.apply(&mut runtime.simulation);
         }
-        for entry in &replay.ticks {
+        for (index, entry) in replay.ticks.iter().enumerate() {
             let due_commands = runtime
                 .simulation
                 .take_due_replay_commands(entry.commands.iter().cloned());
-            let output = runtime.advance_frame(
+            let mut output = runtime.advance_frame(
                 &due_commands,
                 tick_ms,
                 crate::sim::world::TickLane::Ordinary,
-                crate::sim::world::FrameEffects::default(),
+                crate::sim::world::FrameEffects::default().with_network_commands(&network),
             )?;
+            if output.network_failure.is_some() {
+                anyhow::ensure!(
+                    index + 1 == replay.ticks.len(),
+                    "diagnostic log continues after a fatal FRAMEINFO mismatch"
+                );
+                // Live records this final hash only after Stop acknowledges
+                // the modal. Headless playback acknowledges automatically and
+                // resumes only that frame's saved tail, never Logic/DoList.
+                output = runtime.resume_after_network_failure(
+                    crate::sim::world::FrameEffects::default().with_network_commands(&network),
+                )?;
+            }
             hashes.push(output.tick.state_hash);
             for input in &entry.scenario_services {
                 input.apply(&mut runtime.simulation);
@@ -947,24 +960,40 @@ impl ReplayRunner {
         // Playback returns every frame's hash, so a test world hashes each one;
         // a recording compared with it must ask for the same.
         sim.hash_state_every(std::num::NonZeroU64::MIN);
+        let network = std::cell::RefCell::new(crate::sim::command_queue::FrameChecksumState::new());
         let mut hashes: Vec<Option<u64>> = Vec::with_capacity(replay.ticks.len());
         for input in &replay.initial_scenario_services {
             input.apply(sim);
         }
-        for entry in &replay.ticks {
+        for (index, entry) in replay.ticks.iter().enumerate() {
             let due_commands = sim.take_due_replay_commands(entry.commands.iter().cloned());
-            let result = sim
+            let mut result = sim
                 .advance_master_frame(
                     &due_commands,
-                    rules,
+                    rules.unwrap_or(crate::rules::ruleset::RuleSet::empty_for_test()),
                     overlay_registry,
                     tick_ms,
                     TickLane::Ordinary,
                     poll_triggers,
-                    crate::sim::world::FrameEffects::default(),
+                    crate::sim::world::FrameEffects::default().with_network_commands(&network),
                 )
                 .expect("fixture frame must complete")
                 .into_tick();
+            if sim.pending_network_failure().is_some() {
+                assert_eq!(
+                    index + 1,
+                    replay.ticks.len(),
+                    "diagnostic log continues after a fatal FRAMEINFO mismatch"
+                );
+                result = sim
+                    .resume_after_network_failure(
+                        rules.unwrap_or(crate::rules::ruleset::RuleSet::empty_for_test()),
+                        overlay_registry,
+                        crate::sim::world::FrameEffects::default().with_network_commands(&network),
+                    )
+                    .expect("recorded checksum modal tail must complete")
+                    .tick;
+            }
             // Replay has no app layer to consume presentation-only trigger effects.
             let _ = sim.drain_trigger_effects();
             hashes.push(result.state_hash);
@@ -1415,6 +1444,95 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_runners_compare_frame_info_and_finish_the_recorded_failure_tail() {
+        use crate::sim::command_queue::{FrameChecksumState, FrameInfo};
+        use crate::sim::runtime::SimRuntime;
+        use crate::sim::world::FrameEffects;
+        use std::cell::RefCell;
+
+        fn world(frame: u32) -> Simulation {
+            let mut sim = Simulation::with_seed(73);
+            let owner = sim.interner.intern("Human");
+            sim.houses
+                .register(crate::sim::house_state::HouseState::new(
+                    owner, 0, None, true, 0, 10,
+                ));
+            sim.session
+                .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Wol);
+            sim.session.set_binary_frame_for_test(frame);
+            sim.session.set_tick_for_test(u64::from(frame));
+            sim.hash_state_every(std::num::NonZeroU64::MIN);
+            sim
+        }
+        for (frame, wrong_crc) in [(0, true), (256, false), (256, true)] {
+            let mut control = SimRuntime::from_simulation(world(frame));
+            let checksum = control
+                .advance_frame(&[], 33, TickLane::Ordinary, FrameEffects::empty())
+                .unwrap()
+                .multiplayer_checksum
+                .unwrap()
+                .checksum
+                .unwrap()
+                .value;
+            let record = FrameInfo {
+                house_id: 0,
+                event_frame: frame as i32,
+                checksum: if wrong_crc { checksum ^ 1 } else { checksum },
+                timing_word: 0,
+                delay: 0,
+            }
+            .encode();
+            let mut live = SimRuntime::from_simulation(world(frame));
+            let mut replay = ReplayLog::new(ReplayHeader {
+                version: 1,
+                tick_hz: 15,
+                seed: 73,
+                map_name: "frameinfo".into(),
+                rules_hash: 0,
+                pixel_conversion_bounds: live.simulation.session().pixel_conversion_bounds(),
+            });
+            let network = RefCell::new(FrameChecksumState::new());
+            live.simulation.admit_native_command_record(record);
+            let mut output = live
+                .advance_frame(
+                    &[],
+                    33,
+                    TickLane::Ordinary,
+                    FrameEffects::empty().with_network_commands(&network),
+                )
+                .unwrap();
+            assert_eq!(output.network_failure.is_some(), frame != 0 && wrong_crc);
+            if output.network_failure.is_some() {
+                output = live
+                    .resume_after_network_failure(
+                        FrameEffects::empty().with_network_commands(&network),
+                    )
+                    .unwrap();
+            }
+            replay.record_tick(
+                output.tick.tick,
+                output.take_admitted_commands(),
+                output.tick.state_hash,
+            );
+            let expected = vec![output.tick.state_hash];
+            let mut runtime = SimRuntime::from_simulation(world(frame));
+            assert_eq!(
+                ReplayRunner::run_runtime(&mut runtime, &replay, 33).unwrap(),
+                expected
+            );
+            assert!(runtime.simulation.pending_network_failure().is_none());
+            assert_eq!(runtime.simulation.session().binary_frame(), frame + 1);
+            let mut fixture = world(frame);
+            assert_eq!(
+                ReplayRunner::run_fixture(&mut fixture, &replay, None, None, 33),
+                expected
+            );
+            assert!(fixture.pending_network_failure().is_none());
+            assert_eq!(fixture.session().binary_frame(), frame + 1);
+        }
+    }
+
+    #[test]
     fn diagnostic_log_json_roundtrip() {
         let mut log = ReplayLog::new(ReplayHeader {
             pixel_conversion_bounds: Default::default(),
@@ -1524,7 +1642,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_replay_discards_a_malformed_future_entry() {
+    fn diagnostic_replay_retains_a_future_admission_until_its_frame() {
         let mut sim = Simulation::with_seed(7);
         let owner = sim.interner.intern("Local");
         let mut log = ReplayLog::new(ReplayHeader {
@@ -1550,13 +1668,13 @@ mod tests {
 
         assert_eq!(hashes.len(), 2);
         assert!(
-            sim.pending_command_snapshot().is_empty(),
-            "the old replay seam ignored and discarded a future-stamped entry"
+            matches!(sim.pending_command_snapshot().as_slice(), [command] if command.execute_tick == 9),
+            "the admission journal retains accepted future work"
         );
     }
 
     #[test]
-    fn diagnostic_replay_consumes_only_recorded_due_regenerated_copies() {
+    fn diagnostic_replay_reconciles_each_recorded_admission_once() {
         let mut sim = Simulation::with_seed(7);
         let owner = sim.interner.intern("Local");
         let place = CommandEnvelope::new(
@@ -1577,11 +1695,11 @@ mod tests {
 
         let due = sim.take_due_replay_commands([place.clone(), future.clone()]);
 
-        assert_eq!(due, std::slice::from_ref(&place));
+        assert_eq!(due, [place.clone(), future]);
         assert_eq!(
             sim.pending_command_snapshot(),
-            &[unrelated, place, future],
-            "one recorded due PLACE consumes one copy; future/unrelated work survives"
+            &[unrelated, place],
+            "each recorded admission consumes one matching copy, including future work"
         );
     }
 }

@@ -53,7 +53,7 @@ fn wall_sale_detach_clears_only_matching_team_target_fields() {
     assert!(sim.apply_command_with_overlays(
         "Receiver",
         &Command::SellWallAtCell { x: 4, y: 4 },
-        Some(&rules),
+        &rules,
         Some(&overlays),
         FrameEffects::default(),
     ));
@@ -70,6 +70,23 @@ fn wall_sale_detach_clears_only_matching_team_target_fields() {
             "70D562..57A clears Team pointers directly, without AssignMissionTarget member orders"
         );
     }
+
+    //70D562/70D577 compare allocations, including fixed512 aliases and Dummy.
+    sim.resolved_terrain = Some(crate::sim::tiberium::test_support::flat_terrain(8, 8));
+    let team = *sim.team_script_vm.teams.keys().next().unwrap();
+    sim.team_script_vm
+        .teams
+        .get_mut(&team)
+        .unwrap()
+        .mission_target = Some(TeamTarget::Cell { x: 516, y: 3 }); // same allocation as4,4
+    sim.stop_all_targeting_cell(4, 4, &rules, Some(&overlays), FrameEffects::default());
+    assert_eq!(sim.team_script_vm.team(team).unwrap().mission_target, None);
+    let state = sim.team_script_vm.teams.get_mut(&team).unwrap();
+    state.mission_target = Some(TeamTarget::Cell { x: -1, y: 0 });
+    state.focus = Some(TeamTarget::Cell { x: 9, y: 9 });
+    sim.stop_all_targeting_cell(12, 12, &rules, Some(&overlays), FrameEffects::default());
+    let state = sim.team_script_vm.team(team).unwrap();
+    assert_eq!((state.mission_target, state.focus), (None, None));
 }
 
 #[test]
@@ -82,7 +99,12 @@ fn object_detach_clears_team_targets_without_expiring_zone_or_members() {
     state.mission_target = Some(TeamTarget::Object(44));
     state.focus = Some(TeamTarget::Cell { x: 4, y: 4 });
     state.zone = state.mission_target;
-    sim.stop_all_targeting_on_detach(44, None, None, FrameEffects::default());
+    sim.stop_all_targeting_on_detach(
+        44,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+        None,
+        FrameEffects::default(),
+    );
     let state = sim.team_script_vm.team(team).unwrap();
     assert_eq!(state.mission_target, None);
     assert_eq!(state.focus, Some(TeamTarget::Cell { x: 4, y: 4 }));
@@ -109,7 +131,7 @@ fn tesla_charger_team_recalls_an_automatic_target_but_keeps_an_explicit_attack()
             sim.assign_target_represented(
                 source,
                 Some(TargetKind::Entity(coil)),
-                Some(&rules),
+                &rules,
                 None,
                 FrameEffects::default(),
             )
@@ -704,6 +726,144 @@ fn retail_sov01_script17_uses_the_production_script_registry() {
     }
 }
 
+/// Script actions 25 (`0x006E9901`), 26 (`0x006E9921`) and 27
+/// (`0x006E993E`) play the argument's sound, movie and song, then move on,
+/// instead of leaving the team stalled on an unported action.
+#[test]
+fn sound_movie_and_music_actions_play_and_advance() {
+    let rules = rules();
+    let mut sim = Simulation::new();
+    let owner = sim.interner.intern("Russians");
+    sim.houses
+        .register(HouseState::new(owner, 1, None, false, 0, 10));
+    let script = sim.interner.intern("SOUND SCRIPT");
+    sim.team_script_vm.register_script(TeamScriptDefinition {
+        id: script,
+        source: TeamAiDefinitionSource::FixedAimd,
+        actions: [(25, 7), (26, 4), (27, 3), (25, 7)]
+            .map(|(action_id, argument)| TeamScriptAction {
+                action_id,
+                argument,
+            })
+            .to_vec(),
+    });
+    let team = sim.team_script_vm.create_team(owner, script, Vec::new(), 0);
+    {
+        let state = sim.team_script_vm.teams.get_mut(&team).unwrap();
+        state.cursor = -1;
+        state.advance_pending = true;
+    }
+    for _ in 0..3 {
+        sim.team_step_script(team, &rules, None, FrameEffects::default());
+    }
+    let state = sim.team_script_vm.team(team).unwrap();
+    assert_eq!(state.cursor(), 2);
+    assert!(state.advance_pending());
+    assert!(state.refusal().is_none());
+    assert!(matches!(
+        sim.sound_events.take_for_test().as_slice(),
+        [crate::sim::world::SimSoundEvent::VocCenteredIndex { index: 7 }]
+    ));
+    assert!(matches!(
+        sim.drain_trigger_effects().as_slice(),
+        [
+            crate::sim::trigger_runtime::TriggerEffect::FullscreenMovie { index: 4 },
+            crate::sim::trigger_runtime::TriggerEffect::MusicTheme {
+                request: crate::sim::trigger_runtime::ThemeRequest::Index(3),
+            }
+        ]
+    ));
+}
+
+/// Script34 uses Zone GetCoords, then the same ground/deck owners as the
+/// original camera-coordinate controls. An object Zone keeps its subcell XY.
+#[test]
+fn script34_focuses_the_zone_at_ground_or_bridge_height_and_finishes_immediately() {
+    use crate::sim::components::DriveCoord;
+    use crate::sim::trigger_runtime::TriggerEffect;
+
+    let controls: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/trigger_action_values.json",
+    ))
+    .unwrap();
+    let controls = controls
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["case_kind"] == "waypoint_coord")
+        .unwrap();
+    for (name, object_zone, offset) in [
+        ("bridge_400", false, [0, 0]),
+        ("both_bridge_flags", true, [17, -19]),
+    ] {
+        let row = controls["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| {
+                row["input"]["name"] == name
+                    && row["calls"].as_array().unwrap().last().unwrap()["call"] == "focus"
+            })
+            .unwrap();
+        let input = &row["input"];
+        let sink = row["calls"].as_array().unwrap().last().unwrap();
+        let point = DriveCoord {
+            x: sink["coord"][0].as_i64().unwrap() as i32 + offset[0],
+            y: sink["coord"][1].as_i64().unwrap() as i32 + offset[1],
+            z: 999,
+        };
+        let cell = (
+            input["cell"][0].as_i64().unwrap() as i16,
+            input["cell"][1].as_i64().unwrap() as i16,
+        );
+        let rules = rules();
+        let mut sim = Simulation::with_seed(0x6E9ACF);
+        crate::sim::arena_fixture::flat_arena(&mut sim, &rules);
+        let (team, members, _) = building_team(&mut sim, &rules, &[(34, 4), (5, 1)], &[]);
+        sim.substrate
+            .entities
+            .get_mut(members[0])
+            .unwrap()
+            .position
+            .put_location(point);
+        let terrain = sim.resolved_terrain.as_mut().unwrap();
+        let identity = terrain.native_cell_identity(cell);
+        terrain.write_native_cell_level(identity, input["level"].as_i64().unwrap_or(0) as u8);
+        terrain
+            .cell_mut_for_test(cell.0 as u16, cell.1 as u16)
+            .unwrap()
+            .slope_type = input["slope"].as_u64().unwrap_or(0) as u8;
+        terrain.write_native_cell_flags(identity, input["flags"].as_u64().unwrap() as u32);
+        let state = sim.team_script_vm.teams.get_mut(&team).unwrap();
+        state.cursor = 0;
+        state.advance_pending = false; // The native handler has no first-only gate.
+        state.zone = Some(if object_zone {
+            TeamTarget::Object(members[0])
+        } else {
+            TeamTarget::Cell {
+                x: cell.0,
+                y: cell.1,
+            }
+        });
+        let rng = sim.rng_state();
+        sim.team_step_script(team, &rules, None, FrameEffects::default());
+        assert_eq!(
+            sim.drain_trigger_effects(),
+            [TriggerEffect::CameraAtCoord {
+                coord: [point.x, point.y, sink["coord"][2].as_i64().unwrap() as i32],
+                velocity: Some(4),
+            }]
+        );
+        assert_eq!(sim.rng_state(), rng);
+        let state = sim.team_script_vm.team(team).unwrap();
+        assert_eq!(state.cursor(), 0);
+        assert!(state.advance_pending());
+        sim.team_step_script(team, &rules, None, FrameEffects::default());
+        assert_eq!(sim.team_script_vm.team(team).unwrap().cursor(), 1);
+        assert!(sim.drain_trigger_effects().is_empty());
+    }
+}
+
 /// The building tests' power plants: the Russians' own, the Americans' near
 /// and far ones, and the Germans'.
 const PLANTS: [(&str, u16, u16); 4] = [
@@ -831,7 +991,7 @@ fn script59_building_gate_and_retained_ammo_route_match_original_controls() {
         }
         if input["count"] == 0 {
             for &member in &members {
-                sim.team_remove_member(team, member, false, Some(&rules), FrameEffects::default());
+                sim.team_remove_member(team, member, false, &rules, FrameEffects::default());
             }
         }
         if !first {

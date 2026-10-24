@@ -34,8 +34,8 @@ pub use self::factory::{
     PendingObject, STEP_RATE_MAX, STEP_RATE_MIN, StepOutcome, TimeToBuildInputs,
     category_for_object, time_to_build, type_base_build_time,
 };
-pub use self::factory_lifecycle::suspend_production;
-pub use self::production_spawn::mark_war_factory_spawn_contact;
+pub(crate) use self::factory_lifecycle::enqueue_selected;
+pub(crate) use self::factory_lifecycle::suspend_production;
 pub use self::factory_lifecycle::{
     FactoryRestoreError, ready_building_entity_for_owner, validate_restored_factory_state,
 };
@@ -48,7 +48,9 @@ pub use self::production_placement::{
     is_within_build_area, placement_preview_for_owner_with_overlays,
 };
 #[cfg(any(test, feature = "test-support"))]
-pub use self::production_queue::dispatch_production_changes_for_tests;
+pub use self::production_queue::{
+    dispatch_production_changes_for_tests, publish_production_changes_for_tests,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub(in crate::sim) use self::production_queue::house_for_test;
 pub use self::production_queue::{
@@ -58,10 +60,8 @@ pub use self::production_queue::{
 };
 pub(crate) use self::production_refinery::spawn_building_free_unit;
 pub use self::production_repair::can_repair_building;
-pub use self::production_repair::{RepairControl, toggle_repair};
-pub(crate) use self::production_repair::{
-    engineer_repair, repair_step_cost, update_repair_and_power,
-};
+pub use self::production_repair::{RepairControl, repair_step_cost, toggle_repair};
+pub(crate) use self::production_repair::{engineer_repair, update_repair_and_power};
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use self::production_sell::begin_selling;
 pub(crate) use self::production_sell::sell_back;
@@ -70,8 +70,10 @@ pub use self::production_sell::sell_building_now_for_test;
 pub use self::production_sell::sell_stage_zero;
 pub use self::production_sell::{SellOrder, can_sell_building};
 pub(crate) use self::production_sell::{
-    archive_less_sale, sell_complete, sell_stage_one, techno_refund, type_refund, undeploy_target,
+    archive_less_sale, sell_after_owner_change, sell_complete, sell_stage_one, techno_refund,
+    type_refund, undeploy_target,
 };
+pub use self::production_spawn::mark_war_factory_spawn_contact;
 pub use self::production_tech::{
     CameoDrawState, all_build_options_for_owner, cameo_draw_state, construction_options_for_owner,
     initial_construction_options,
@@ -132,3 +134,6 @@ mod lifecycle_tests;
 
 #[cfg(test)]
 mod manual_primary_tests;
+
+#[cfg(test)]
+mod native_event_tests;

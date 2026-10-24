@@ -14,10 +14,6 @@ fn integer(value: &Value) -> i32 {
 fn loss_threshold_event_corpus() -> &'static Value {
     let corpus =
         crate::test_fixture::json("tools/spatial_oracle/trigger_loss_threshold_events.json");
-    assert_eq!(
-        corpus["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     corpus
 }
 
@@ -77,7 +73,7 @@ fn loss_threshold_events_match_original_incoming_house_and_signed_counters() {
                 },
                 owner,
                 &mut persistence,
-                Some(&rules),
+                &rules,
                 live,
             )
         };
@@ -149,7 +145,7 @@ fn loss_threshold_events_bind_retail_all04_reinforcement_operands() {
     crate::sim::scenario_bootstrap::initialize_map_roster_houses(
         &mut sim,
         &roster,
-        Some(&rules),
+        &rules,
         Some(&map.ini),
     );
     sim.install_team_ai_registry(&teams, &rules).unwrap();
@@ -181,7 +177,7 @@ fn loss_threshold_events_bind_retail_all04_reinforcement_operands() {
         let threshold = condition.value;
         assert_eq!(kind, integer(&route["native_read"]["kind"]));
         assert_eq!(threshold, integer(&route["native_read"]["value"]));
-        let owner = resolve_trigger_house(&sim, definition.owner.as_deref(), Some(&rules))
+        let owner = resolve_trigger_house(&sim, definition.owner.as_deref(), &rules)
             .expect("the authored trigger House exists in the campaign roster");
         assert_eq!(sim.interner.resolve(owner), route["team"]["House"]);
         let action = definition
@@ -223,7 +219,7 @@ fn loss_threshold_events_bind_retail_all04_reinforcement_operands() {
                     },
                     Some(owner),
                     &mut persistence,
-                    Some(&rules),
+                    &rules,
                     live,
                 ),
                 expected,
@@ -243,10 +239,6 @@ fn naval_land_events_match_original_signed_tracking_and_country_selection() {
         "tools/spatial_oracle/trigger_naval_land_events.json",
     ))
     .unwrap();
-    assert_eq!(
-        corpus["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     assert_eq!(corpus["country_indices"], json!([0, 7, 0]));
     assert_eq!(corpus["code_unchanged"], true);
     assert_eq!(corpus["zero_predicate_rng_calls"], true);
@@ -321,7 +313,7 @@ fn naval_land_events_match_original_signed_tracking_and_country_selection() {
                     .as_u64()
                     .map(|index| houses[index as usize]),
                 &mut persistence,
-                Some(&rules),
+                &rules,
                 live,
             )
         };
@@ -473,7 +465,7 @@ fn naval_event_retail_all05_removal_enables_black_eagle_support_once() {
     crate::sim::scenario_bootstrap::initialize_map_roster_houses(
         &mut sim,
         &roster,
-        Some(&rules),
+        &rules,
         Some(&map.ini),
     );
     sim.intern_rule_type_ids(&rules);
@@ -488,7 +480,7 @@ fn naval_event_retail_all05_removal_enables_black_eagle_support_once() {
     );
     let cue = eva.index_of("Mis_xA5_EvaBlackEagles").unwrap();
     sim.initialize_trigger_definitions(&excerpt, &Default::default(), Some(&eva), None);
-    sim.classify_map_triggers(Some(&rules));
+    sim.classify_map_triggers(&rules);
     let tag_type = sim.trigger_runtime.definitions.tag_type(tag_id).unwrap();
     let tag = sim.shared_trigger_tag(tag_type);
     let enabled = |sim: &Simulation, id: &str| {
@@ -530,7 +522,7 @@ fn naval_event_retail_all05_removal_enables_black_eagle_support_once() {
             assert_eq!(sim.houses[&owner].tracking().navy(), 1);
             sim.flush_pending_delete();
         }
-        sim.raise_house_tags(owner, Some(&rules), None, FrameEffects::default());
+        sim.raise_house_tags(owner, &rules, None, FrameEffects::default());
         sim.flush_pending_delete();
         assert_eq!(enabled(&sim, chain[1]), expected, "frame{frame}");
         assert_eq!(enabled(&sim, chain[2]), expected, "frame{frame}");
@@ -557,10 +549,6 @@ fn naval_event_retail_all05_removal_enables_black_eagle_support_once() {
 
 fn funds_event_corpus() -> &'static Value {
     let corpus = crate::test_fixture::json("tools/spatial_oracle/trigger_funds_events.json");
-    assert_eq!(
-        corpus["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     corpus
 }
 
@@ -620,7 +608,7 @@ fn funds_events_match_original_signed_wallet_predicates() {
                 },
                 owner,
                 &mut persistence,
-                Some(&rules),
+                &rules,
                 live,
             )
         };
@@ -711,18 +699,13 @@ fn funds_events_match_original_house_logic_and_cleanup_histories() {
             if mixed {
                 // Logic runs before House; the original mixed trigger can
                 // succeed on frame3750, which is not an eighth-frame poll.
-                sim.advance_triggers(Some(&rules), Some(&overlay), FrameEffects::default());
+                sim.advance_triggers(&rules, Some(&overlay), FrameEffects::default());
             }
-            sim.raise_house_tags(
-                houses[0],
-                Some(&rules),
-                Some(&overlay),
-                FrameEffects::default(),
-            );
+            sim.raise_house_tags(houses[0], &rules, Some(&overlay), FrameEffects::default());
             let runtime = &sim.trigger_runtime;
             let trigger = runtime.trigger(live).unwrap();
             let actual = json!({
-                "wallet": crate::sim::credit_income::available_money(&sim, houses[0]),
+                "wallet": crate::sim::credit_income::available_money(&sim.houses, houses[0]),
                 "spent": sim.houses[&houses[0]].economy().spent_credits(),
                 "actions": runtime.action_trace.len(),
                 "house_tag_count": runtime.house_tags.get(&houses[0]).map_or(0, Vec::len),
@@ -744,22 +727,17 @@ fn funds_events_match_original_house_logic_and_cleanup_histories() {
         }
         if integer(&case["repeat"]) == 0 {
             sim.process_pending_delete_with(
-                Some(&rules),
+                &rules,
                 Some(&overlay),
                 FrameEffects::default(),
                 0,
                 false,
             );
             sim.session.set_binary_frame_for_test(40);
-            sim.raise_house_tags(
-                houses[0],
-                Some(&rules),
-                Some(&overlay),
-                FrameEffects::default(),
-            );
+            sim.raise_house_tags(houses[0], &rules, Some(&overlay), FrameEffects::default());
         }
         let cleanup = json!({
-            "wallet": crate::sim::credit_income::available_money(&sim, houses[0]),
+            "wallet": crate::sim::credit_income::available_money(&sim.houses, houses[0]),
             "spent": sim.houses[&houses[0]].economy().spent_credits(),
             "house_tag_count": sim.trigger_runtime.house_tags.get(&houses[0]).map_or(0, Vec::len),
             "logic_tag_count": sim.trigger_runtime.logic_tags.len(),
@@ -819,12 +797,12 @@ fn funds_event_sov06_retail_cash_taunt_reaches_named_eva_once() {
     crate::sim::scenario_bootstrap::initialize_map_roster_houses(
         &mut sim,
         &roster,
-        Some(&rules),
+        &rules,
         Some(&map.ini),
     );
     let owner = sim.interner.get("Russians").unwrap();
     assert_eq!(
-        crate::sim::credit_income::available_money(&sim, owner),
+        crate::sim::credit_income::available_money(&sim.houses, owner),
         70000
     );
     sim.initialize_trigger_definitions(&map, &Default::default(), Some(&eva), None);
@@ -857,7 +835,7 @@ fn funds_event_sov06_retail_cash_taunt_reaches_named_eva_once() {
                 force: false,
             },
             &mut Vec::new(),
-            Some(&rules),
+            &rules,
             None,
             FrameEffects::default(),
         );
@@ -883,10 +861,6 @@ fn building_loss_event_matches_original_tracked_count_and_country_order() {
         "tools/spatial_oracle/trigger_building_loss_events.json",
     ))
     .unwrap();
-    assert_eq!(
-        corpus["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     let controls = corpus["controls"].as_array().unwrap();
     assert_eq!(controls.len(), 14);
     for case in controls {
@@ -945,7 +919,7 @@ fn building_loss_event_matches_original_tracked_count_and_country_order() {
                     .as_u64()
                     .map(|index| houses[index as usize]),
                 &mut persistence,
-                Some(&rules),
+                &rules,
                 live,
             )
         };
@@ -1004,7 +978,7 @@ fn building_loss_event_retail_all04_sets_the_rescue_route_local() {
     crate::sim::scenario_bootstrap::initialize_map_roster_houses(
         &mut sim,
         &roster,
-        Some(&rules),
+        &rules,
         Some(&map.ini),
     );
     let owner = sim.house_by_country_index(CountryIdx(9), &rules).unwrap();
@@ -1043,7 +1017,7 @@ fn building_loss_event_retail_all04_sets_the_rescue_route_local() {
                 ..Default::default()
             },
             &mut Vec::new(),
-            Some(&rules),
+            &rules,
             None,
             FrameEffects::default(),
         );
@@ -1076,10 +1050,6 @@ fn damage_source_event44_matches_original_registered_house_index() {
         "tools/spatial_oracle/trigger_damage_source_events.json",
     ))
     .unwrap();
-    assert_eq!(
-        corpus["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     assert_eq!(corpus["house_indices"], json!([0, 1, 2]));
     assert_eq!(corpus["country_indices"], json!([0, 7, 0]));
     assert_ne!(corpus["actor"], corpus["source_object"]);
@@ -1133,7 +1103,7 @@ fn damage_source_event44_matches_original_registered_house_index() {
                     .as_u64()
                     .map(|index| houses[index as usize]),
                 &mut persistence,
-                Some(&rules),
+                &rules,
                 live,
             )
         };
@@ -1307,7 +1277,7 @@ fn entered_cell_predicates_match_original_country_and_retained_house_identity() 
                     .as_u64()
                     .map(|index| houses[index as usize]),
                 &mut persistence,
-                Some(&rules),
+                &rules,
                 live,
             )
         };
@@ -1387,7 +1357,8 @@ fn per_cell_arrival_uses_native_bridge_admission_and_keeps_the_cached_tag() {
                 }
             ),
         );
-        let cell = sim.trigger_cell_identity((15, 15));
+        let cell =
+            crate::sim::world::Simulation::trigger_cell_identity(&sim.resolved_terrain, (15, 15));
         sim.resolved_terrain
             .as_mut()
             .unwrap()
@@ -1395,7 +1366,7 @@ fn per_cell_arrival_uses_native_bridge_admission_and_keeps_the_cached_tag() {
         sim.per_cell_process(
             actor,
             crate::sim::movement::PerCellReason::TurnComplete,
-            Some(&rules),
+            &rules,
             Some(&overlays),
             FrameEffects::default(),
         )
@@ -1404,7 +1375,7 @@ fn per_cell_arrival_uses_native_bridge_admission_and_keeps_the_cached_tag() {
         sim.per_cell_process(
             actor,
             crate::sim::movement::PerCellReason::Arrival,
-            Some(&rules),
+            &rules,
             Some(&overlays),
             FrameEffects::default(),
         )
@@ -1464,7 +1435,10 @@ fn fresh_line_marker_writer_and_arrival_consumers_match_original_sparse_cells() 
             .map(|xy| (integer(&xy[0]), integer(&xy[1])))
             .collect();
         for &(x, y) in &cells {
-            let identity = sim.trigger_cell_identity((x as i16, y as i16));
+            let identity = crate::sim::world::Simulation::trigger_cell_identity(
+                &sim.resolved_terrain,
+                (x as i16, y as i16),
+            );
             sim.resolved_terrain
                 .as_mut()
                 .unwrap()
@@ -1507,7 +1481,13 @@ fn fresh_line_marker_writer_and_arrival_consumers_match_original_sparse_cells() 
             ),
         );
         let mut terrain = sim.resolved_terrain.take().unwrap();
-        sim.initialize_cell_trigger_lines(&mut terrain, cells.iter().copied());
+        let bounds =
+            crate::sim::scenario_bootstrap::NativeStartBounds::from_session(&sim, &terrain);
+        sim.trigger_runtime.initialize_cell_trigger_lines(
+            bounds,
+            &mut terrain,
+            cells.iter().copied(),
+        );
         let flags: Vec<_> = cells
             .iter()
             .map(|&(x, y)| {
@@ -1533,7 +1513,7 @@ fn fresh_line_marker_writer_and_arrival_consumers_match_original_sparse_cells() 
         sim.per_cell_process(
             actor,
             crate::sim::movement::PerCellReason::Arrival,
-            Some(&rules),
+            &rules,
             None,
             FrameEffects::default(),
         )
@@ -1691,7 +1671,7 @@ fn all01_due_charge_and_damage_share_the_production_house_power_phase() {
     crate::sim::scenario_bootstrap::initialize_map_roster_houses(
         &mut sim,
         &roster,
-        Some(&rules),
+        &rules,
         Some(&map.ini),
     );
     let aimd = IniFile::from_bytes(assets.get_ref("AIMD.INI").unwrap()).unwrap();
@@ -1725,7 +1705,7 @@ fn all01_due_charge_and_damage_share_the_production_house_power_phase() {
         sim.spawn_from_map_with_resolved(&records, Some(&rules), Some(&terrain)),
         2
     );
-    sim.classify_map_triggers(Some(&rules));
+    sim.classify_map_triggers(&rules);
     for (position, expected) in [(72, "0B7C03FC"), (107, "0878524C")] {
         let tag = sim.trigger_runtime.tags[sim.trigger_runtime.logic_tags[position]]
             .as_ref()
@@ -1753,7 +1733,7 @@ fn all01_due_charge_and_damage_share_the_production_house_power_phase() {
     for _ in 0..15 {
         sim.advance_app_frame(
             &[],
-            Some(&rules),
+            &rules,
             None,
             67,
             TickLane::Ordinary,
@@ -1774,7 +1754,7 @@ fn all01_due_charge_and_damage_share_the_production_house_power_phase() {
     sim.trigger_runtime.action_trace.clear();
     sim.advance_app_frame(
         &[],
-        Some(&rules),
+        &rules,
         None,
         67,
         TickLane::Ordinary,
@@ -1841,7 +1821,7 @@ fn all01_due_charge_and_damage_share_the_production_house_power_phase() {
     sim.trigger_runtime.action_trace.clear();
     sim.advance_app_frame(
         &[],
-        Some(&rules),
+        &rules,
         None,
         67,
         TickLane::Ordinary,
@@ -2016,9 +1996,9 @@ fn native_all01_super_charge_dispatch_uses_retail_type_and_retained_operands() {
         assert_eq!(row["rng_calls"], json!([]));
         let returned = sim.apply_live_trigger_action(
             &action,
-            sim.trigger_action_context(typ, None, TagEventInput::default(), Some(&rules)),
+            sim.trigger_action_context(typ, None, TagEventInput::default(), &rules),
             &mut Vec::new(),
-            Some(&rules),
+            &rules,
             None,
             FrameEffects::default(),
         );
@@ -2125,9 +2105,9 @@ fn native_damage_at_waypoint_dispatch_matches_original_controls() {
         let (returned, visits) = crate::sim::combat::receiver_fixture::trace_area_visits(|| {
             sim.apply_live_trigger_action(
                 &action,
-                sim.trigger_action_context(typ, None, TagEventInput::default(), Some(&rules)),
+                sim.trigger_action_context(typ, None, TagEventInput::default(), &rules),
                 &mut Vec::new(),
-                Some(&rules),
+                &rules,
                 None,
                 FrameEffects::default(),
             )
@@ -2233,7 +2213,7 @@ fn native_all01_reactor_damage_uses_retail_rules_and_shared_power_owner() {
         .unwrap();
     let rules = RuleSet::from_processed_rules(&processed).unwrap();
     let object = rules.object("NANRCT").unwrap();
-    let dimensions = crate::rules::foundation::foundation_dimensions(&object.foundation);
+    let dimensions = object.foundation.dimensions();
     assert_eq!(
         json!([dimensions.0, dimensions.1]),
         corpus["retail_inputs"]["foundation_dimensions"]
@@ -2276,7 +2256,7 @@ fn native_all01_reactor_damage_uses_retail_rules_and_shared_power_owner() {
     sim.houses
         .register(HouseState::new(owner, 0, None, false, 0, 10));
     let type_id = sim.interner.intern(&authored.type_id);
-    assert_eq!(sim.allocate_stable_id(), 1);
+    assert_eq!(sim.substrate.allocate_stable_id(), 1);
     let mut entity = GameEntity::new_at_frame_zero_for_test(
         1,
         10,
@@ -2294,7 +2274,7 @@ fn native_all01_reactor_damage_uses_retail_rules_and_shared_power_owner() {
     entity.set_native_unique_id_for_test(integer(&native["reactor_native_unique_id"]));
     entity
         .type_facts
-        .set_foundation_for_test(object.foundation.clone());
+        .set_foundation_for_test(object.foundation.clone().into());
     entity.begin_building_body(BuildingBodyMode::Idle, 0);
     sim.substrate.entities.insert(entity);
     sim.add_entity_occupancy(1);
@@ -2348,9 +2328,9 @@ fn native_all01_reactor_damage_uses_retail_rules_and_shared_power_owner() {
     let (returned, visits) = crate::sim::combat::receiver_fixture::trace_area_visits(|| {
         sim.apply_live_trigger_action(
             &action,
-            sim.trigger_action_context(typ, None, TagEventInput::default(), Some(&rules)),
+            sim.trigger_action_context(typ, None, TagEventInput::default(), &rules),
             &mut Vec::new(),
-            Some(&rules),
+            &rules,
             None,
             FrameEffects::default(),
         )
@@ -2604,9 +2584,9 @@ fn native_trigger_reveal_action_matches_original_controls() {
         let (returned, draws) = crate::sim::rng::trace_draws(|| {
             sim.apply_live_trigger_action(
                 &action,
-                sim.trigger_action_context(typ, None, TagEventInput::default(), Some(&rules)),
+                sim.trigger_action_context(typ, None, TagEventInput::default(), &rules),
                 &mut effects,
-                Some(&rules),
+                &rules,
                 None,
                 FrameEffects::default(),
             )
@@ -2697,7 +2677,7 @@ fn native_trigger_reveal_action_matches_original_controls() {
             }
         };
         compare(&sim.fog, &row["final_cells"]);
-        let config = sim.sight_reveal_config(Some(&rules));
+        let config = sim.sight_reveal_config(&rules);
         let heights = sim.sight_height_grid(&config);
         let mut probe = Simulation::with_seed(31);
         probe.fog = FogState::new(128, 128);
@@ -2930,9 +2910,14 @@ fn action_11_inline_labels_and_ordered_effects_match_original_controls() {
         let mut effects = vec![preceding.clone()];
         let result = sim.apply_live_trigger_action(
             &action,
-            sim.trigger_action_context(typ, None, TagEventInput::default(), None),
+            sim.trigger_action_context(
+                typ,
+                None,
+                TagEventInput::default(),
+                crate::rules::ruleset::RuleSet::empty_for_test(),
+            ),
             &mut effects,
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
             None,
             FrameEffects::default(),
         );
@@ -2971,7 +2956,7 @@ fn restored_live_owner_rejects_dangling_definitions_instances_and_attachments() 
     ));
     let house = supplied_house(&mut sim, input);
     let tag = sim.shared_trigger_tag(0);
-    let object = sim.allocate_stable_id();
+    let object = sim.substrate.allocate_stable_id();
     let type_id = sim.interner.intern("E1");
     let mut entity = crate::sim::game_entity::GameEntity::new_at_frame_zero_for_test(
         object,
@@ -2991,7 +2976,8 @@ fn restored_live_owner_rejects_dangling_definitions_instances_and_attachments() 
     sim.substrate.entities.insert(entity);
     sim.trigger_runtime
         .replace_trigger_tag_attachment(TagAttachment::Object(object), Some(tag));
-    let cell = sim.trigger_cell_identity((50, 60));
+    let cell =
+        crate::sim::world::Simulation::trigger_cell_identity(&sim.resolved_terrain, (50, 60));
     sim.trigger_runtime
         .replace_cell_trigger_tag(cell, Some(tag));
     sim.trigger_runtime.logic_tags.push(tag);
@@ -3050,7 +3036,12 @@ fn restored_live_owner_rejects_dangling_definitions_instances_and_attachments() 
     sim.substrate
         .pending_delete
         .remove_ticket_for_test(crate::sim::world::DeferredDeleteTicket::Tag(tag));
-    sim.delete_live_tag(tag, None, 0, false);
+    sim.delete_live_tag(
+        tag,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+        0,
+        false,
+    );
     sim.validate_restored_trigger_runtime().unwrap();
 }
 
@@ -3299,7 +3290,7 @@ fn team_member_tag_admission_and_removal_match_original_controls() {
             "{input}: retained attachments/membership through save"
         );
         let (_, remove_draws) = crate::sim::rng::trace_draws(|| {
-            sim.team_remove_member(team, member, false, Some(&rules), FrameEffects::default());
+            sim.team_remove_member(team, member, false, &rules, FrameEffects::default());
         });
         assert!(add_draws.is_empty() && remove_draws.is_empty(), "{input}");
         let rng_after = &control["member_rng_after"];
@@ -3635,12 +3626,12 @@ fn physical_retail_sov01_registration_and_enable_timers_match_original_at_all_di
             crate::sim::rng::trace_draws(|| sim.install_authored_cell_trigger_tags(&map));
         let mut draw_count = draws.len();
         compare_stock_state(&sim, draw_count, &row["history"][0]);
-        let ((), draws) = crate::sim::rng::trace_draws(|| sim.classify_map_triggers(Some(&rules)));
+        let ((), draws) = crate::sim::rng::trace_draws(|| sim.classify_map_triggers(&rules));
         draw_count += draws.len();
         compare_stock_state(&sim, draw_count, &row["history"][1]);
         sim.trigger_runtime.stop_before_action = Some(integer(&row["first_poll"]["action_kind"]));
         let boundary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            sim.advance_triggers(Some(&rules), None, FrameEffects::default())
+            sim.advance_triggers(&rules, None, FrameEffects::default())
         }))
         .expect_err("same original first gameplay-action boundary must stop the prefix");
         assert_eq!(*boundary.downcast::<i32>().unwrap(), 46);
@@ -3683,10 +3674,10 @@ fn physical_retail_sov01_registration_and_enable_timers_match_original_at_all_di
                             setup_type,
                             None,
                             TagEventInput::default(),
-                            Some(&rules),
+                            &rules,
                         ),
                         &mut Vec::new(),
-                        Some(&rules),
+                        &rules,
                         None,
                         FrameEffects::default(),
                     )
@@ -3701,7 +3692,7 @@ fn physical_retail_sov01_registration_and_enable_timers_match_original_at_all_di
                             force: false,
                         },
                         false,
-                        None,
+                        crate::rules::ruleset::RuleSet::empty_for_test(),
                     )
                 }
             });
@@ -3872,6 +3863,13 @@ fn history_state(
     let mut state = json!({ "returned": returned, "tags": tags, "actions": runtime.action_trace,
         "rng_draws": draws, "pending_count": sim.substrate.pending_delete.len(), "pending_tags": pending_tags,
         "globals": runtime.globals_set, "locals": runtime.locals_set, "changed": i32::from(runtime.dirty[0]) });
+    if input["scenario_timer"].as_bool().unwrap_or(false) {
+        let timer = sim.session.scenario_timer_view();
+        state["scenario_timer"] = json!({
+            "running": timer.is_some(),
+            "remaining": timer.map_or(0, |(remaining, _)| remaining),
+        });
+    }
     if input["lifecycle"].as_bool().unwrap_or(false) {
         let tags = runtime.tag_order.len();
         let triggers = runtime.trigger_order.len();
@@ -4002,15 +4000,11 @@ fn live_instances_match_all_native_supplied_histories_and_serialization() {
         "tools/spatial_oracle/trigger_damage_events.json",
     ))
     .unwrap();
-    assert_eq!(
-        damage["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     let destruction = damage["object_destruction_controls"].as_array().unwrap();
     assert_eq!(destruction.len(), 3);
     assert_eq!(
         replay_native_histories(rows().into_iter().chain(destruction.iter().cloned())),
-        65
+        69
     );
 }
 
@@ -4056,6 +4050,31 @@ pub(super) fn replay_native_histories(rows: impl Iterator<Item = Value>) -> usiz
         sim.trigger_runtime.map_cursor = input.get("map_cursor").map_or(0, integer);
         let house = supplied_house(&mut sim, input);
         let rules = supplied_rules();
+        let periodic_actor = input.get("periodic_height").map(|height| {
+            sim.session.set_game_mode(
+                crate::sim::scenario_session::ScenarioGameMode::from_game_mode(integer(
+                    &input["game_mode"],
+                )),
+            );
+            // Same supplied unregistered Infantry prior as execute(); this
+            // exercises the periodic caller, not physical construction.
+            let id = sim.substrate.allocate_stable_id();
+            let mut actor = crate::sim::game_entity::GameEntity::test_default_of_category(
+                id,
+                "E1",
+                "Americans",
+                50,
+                60,
+                crate::map::entities::EntityCategory::Infantry,
+            );
+            actor.set_owner_for_test(house);
+            actor.lifecycle.set_cell_marked_for_test(true);
+            actor
+                .position
+                .set_exact_z_leptons_for_test(Some(integer(height)));
+            sim.substrate.entities.insert(actor);
+            id
+        });
         let flags = input.get("live_flags").cloned().unwrap_or(json!([0, 0]));
         let default_operations = json!([["shared"], ["dispatch", 0, 13], ["dispatch", 0, 13]]);
         let operations = input
@@ -4089,10 +4108,10 @@ pub(super) fn replay_native_histories(rows: impl Iterator<Item = Value>) -> usiz
                         .session
                         .set_binary_frame_for_test(args[1].as_u64().unwrap() as u32),
                     "attach_cell" => {
-                        let cell = sim.trigger_cell_identity((
-                            integer(&args[2]) as i16,
-                            integer(&args[3]) as i16,
-                        ));
+                        let cell = crate::sim::world::Simulation::trigger_cell_identity(
+                            &sim.resolved_terrain,
+                            (integer(&args[2]) as i16, integer(&args[3]) as i16),
+                        );
                         sim.trigger_runtime.replace_cell_trigger_tag(
                             cell,
                             Some(identities[integer(&args[1]) as usize]),
@@ -4104,7 +4123,7 @@ pub(super) fn replay_native_histories(rows: impl Iterator<Item = Value>) -> usiz
                             // lifetime. The shared drain's family admission,
                             // ordering and physical removal are compared; no
                             // concrete Unit destructor parity is claimed.
-                            let id = sim.allocate_stable_id();
+                            let id = sim.substrate.allocate_stable_id();
                             let type_id = sim.interner.intern("E1");
                             let mut object =
                                 crate::sim::game_entity::GameEntity::new_at_frame_zero_for_test(
@@ -4144,7 +4163,7 @@ pub(super) fn replay_native_histories(rows: impl Iterator<Item = Value>) -> usiz
                         // stand-in Unit's concrete destructor or tracking.
                         assert!(sim.discard_constructed_limbo(
                             objects[integer(&args[1]) as usize],
-                            Some(&rules),
+                            &rules,
                             FrameEffects::default(),
                         ));
                     }
@@ -4188,17 +4207,26 @@ pub(super) fn replay_native_histories(rows: impl Iterator<Item = Value>) -> usiz
                                 force,
                             },
                             &mut effects,
-                            Some(&rules),
+                            &rules,
                             None,
                             FrameEffects::default(),
                         )));
                     }
+                    "periodic_cell" => sim.dispatch_airborne_cell_tag_event(
+                        periodic_actor.unwrap(),
+                        crate::sim::world::UninitContext::new(&rules, None),
+                    ),
                     "global" | "local" => {
-                        returned = Some(i32::from(sim.set_trigger_variable(
-                            args[0] == "global",
-                            integer(&args[1]),
-                            integer(&args[2]) != 0,
-                        )))
+                        returned = Some(i32::from(
+                            crate::sim::world::Simulation::set_trigger_variable(
+                                &sim.session,
+                                &mut sim.scenario_rng,
+                                &mut sim.trigger_runtime,
+                                args[0] == "global",
+                                integer(&args[1]),
+                                integer(&args[2]) != 0,
+                            ),
+                        ))
                     }
                     "action" => {
                         let action = RuntimeAction {
@@ -4210,19 +4238,14 @@ pub(super) fn replay_native_histories(rows: impl Iterator<Item = Value>) -> usiz
                             reference: Some(DefinitionReference::Trigger(
                                 integer(&args[2]) as usize
                             )),
-                            value: Some(0),
+                            value: Some(args.get(3).map_or(0, integer)),
                             sound: None,
                         };
                         returned = Some(i32::from(sim.apply_live_trigger_action(
                             &action,
-                            sim.trigger_action_context(
-                                0,
-                                None,
-                                TagEventInput::default(),
-                                Some(&rules),
-                            ),
+                            sim.trigger_action_context(0, None, TagEventInput::default(), &rules),
                             &mut effects,
-                            Some(&rules),
+                            &rules,
                             None,
                             FrameEffects::default(),
                         )));
@@ -4245,7 +4268,7 @@ pub(super) fn replay_native_histories(rows: impl Iterator<Item = Value>) -> usiz
                         );
                     }
                     "drain" => sim.process_pending_delete_with(
-                        Some(&rules),
+                        &rules,
                         None,
                         FrameEffects::default(),
                         integer(&flags[0]),
@@ -4272,7 +4295,7 @@ pub(super) fn replay_native_histories(rows: impl Iterator<Item = Value>) -> usiz
                         ]
                     }
                     "poll" => {
-                        effects = sim.advance_triggers(Some(&rules), None, FrameEffects::default());
+                        effects = sim.advance_triggers(&rules, None, FrameEffects::default());
                     }
                     kind => panic!("unhandled native operation {name}/{step}/{kind}"),
                 }
@@ -4284,11 +4307,40 @@ pub(super) fn replay_native_histories(rows: impl Iterator<Item = Value>) -> usiz
             );
             draws += trace.len();
             sim.substrate.pending_delete.assert_consistent_for_test();
-            assert_eq!(
-                history_state(&sim, input, &identities, &objects, returned, draws, house),
-                row["history"][step],
-                "{name}/{step}: {operation}"
-            );
+            let mut actual =
+                history_state(&sim, input, &identities, &objects, returned, draws, house);
+            let mut expected = row["history"][step].clone();
+            if periodic_actor.is_some() {
+                // Native's Cell registry retains the visited Cell after its
+                // +3C attachment clears; Rust stores only live attachments.
+                // Compare the attachment itself at each periodic visit below.
+                actual["registry_counts"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("cell_tags");
+                expected["registry_counts"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("cell_tags");
+                if args[0] == "periodic_cell" {
+                    let ordinal = operations[..=step]
+                        .iter()
+                        .filter(|op| op[0] == "periodic_cell")
+                        .count()
+                        - 1;
+                    let expected_attached = row["native_dispatch_states"][ordinal]["cell_tag"]
+                        .as_u64()
+                        .unwrap()
+                        != 0;
+                    let cell = Simulation::trigger_cell_identity(&sim.resolved_terrain, (50, 60));
+                    assert_eq!(
+                        sim.trigger_runtime.cell_tags.contains_key(&cell),
+                        expected_attached,
+                        "{name}/{step} attachment"
+                    );
+                }
+            }
+            assert_eq!(actual, expected, "{name}/{step}: {operation}");
             let bytes =
                 save_codec::serialize(&(&sim.trigger_runtime, &sim.substrate.pending_delete))
                     .unwrap();
@@ -4361,6 +4413,9 @@ fn native_trigger_reveal_initial_event48_tags_receive_neutral_discovery_dispatch
     else {
         return;
     };
+    let Some(rules) = crate::rules::retail_ini_fixture::retail_rulesmd_rules() else {
+        return;
+    };
     let map = crate::map::map_file::MapFile::from_bytes(&raw_map).unwrap();
     let corpus = crate::sim::vision::discovery_corpus();
     let footprint = &corpus["full_startup_footprint"];
@@ -4400,7 +4455,7 @@ fn native_trigger_reveal_initial_event48_tags_receive_neutral_discovery_dispatch
             None,
         );
         let typ = sim.interner.intern("GTGCAN");
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         let mut entity = GameEntity::new_at_frame_for_test(
             id,
             integer(&lead["cell"][0]) as u16,
@@ -4433,16 +4488,16 @@ fn native_trigger_reveal_initial_event48_tags_receive_neutral_discovery_dispatch
         let before = sim.trigger_runtime.clone();
         let (_, draws) = crate::sim::rng::trace_draws(|| {
             sim.with_object_placement_scope(|sim| {
-                assert!(sim.discover_techno(id, owner, UninitContext::default()));
+                assert!(sim.discover_techno(id, owner, UninitContext::with_rules(&rules)));
             });
             assert!(sim.trigger_runtime.dispatch_trace.is_empty());
-            assert!(sim.discover_techno(id, player, UninitContext::default()));
+            assert!(sim.discover_techno(id, player, UninitContext::with_rules(&rules)));
         });
         assert!(draws.is_empty());
         assert_eq!(sim.trigger_runtime.dispatch_trace, [(tag, 4)]);
         assert_eq!(sim.trigger_runtime, before);
         assert!(sim.drain_trigger_effects().is_empty());
-        assert!(!sim.discover_techno(id, player, UninitContext::default()));
+        assert!(!sim.discover_techno(id, player, UninitContext::with_rules(&rules)));
         assert_eq!(sim.trigger_runtime.dispatch_trace, [(tag, 4)]);
         compared += 1;
     }

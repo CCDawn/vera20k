@@ -1,7 +1,7 @@
 //! Jumpjet flight kernel: the per-frame altitude and translation body shared by
 //! every moving Jumpjet state, and the cruise state that steers it.
 //!
-//! gamemd-derived (disassembly read 2026-09-15; YR 1.001, SHA-256 `1cdd1180…4298c`):
+//! gamemd-derived (disassembly read 2026-09-15; YR 1.001):
 //!
 //! - `JumpjetLocomotionClass::Update_Coordinates_And_Altitude @ 0x0054D0F0`,
 //!   called from `Process @ 0x0054AEC0` whenever the locomotor reports moving.
@@ -315,6 +315,7 @@ impl Default for JumpjetFlight {
 pub(crate) enum FlightOwnerKind {
     Unit,
     Infantry,
+    Aircraft,
     Other,
 }
 
@@ -324,6 +325,7 @@ impl FlightOwnerKind {
         match category {
             EntityCategory::Unit => Self::Unit,
             EntityCategory::Infantry => Self::Infantry,
+            EntityCategory::Aircraft => Self::Aircraft,
             _ => Self::Other,
         }
     }
@@ -337,6 +339,11 @@ pub(crate) trait JumpjetFlightHost {
     fn owner_kind(&self) -> FlightOwnerKind;
     /// Object+90, checked after Update54AF24 before the state dispatch.
     fn is_object_alive(&self) -> bool;
+    /// Process's tail after the state dispatch (`0x0054B07D..0x0054B16C`):
+    /// the owner's deselect over the player's shroud, then its discovery by
+    /// the player over open ground. The callback runs on the published
+    /// instance.
+    fn visibility_tail(&mut self, runtime: &mut JumpjetRuntime);
     fn marked(&self) -> bool;
     /// Save/clear/restore Object+74 without calling Mark or changing lists.
     fn replace_marked_byte(&mut self, marked: bool) -> bool;
@@ -884,8 +891,9 @@ pub(crate) fn state3_translate(
     state
 }
 
-/// One `Process @ 0x0054AEC0` frame: the Update gate, the crash latch, then the
-/// state at `+0x50` through the jump table at `0x0054B19C`. Returns the new
+/// One `Process @ 0x0054AEC0` frame: the Update gate, the crash latch, the
+/// state at `+0x50` through the jump table at `0x0054B19C`, then the
+/// visibility tail ([`JumpjetFlightHost::visibility_tail`]). Returns the new
 /// state.
 ///
 /// The gate is the moving byte or `Is_Moving_Now` (`0x0054D0D0`, any state
@@ -893,8 +901,7 @@ pub(crate) fn state3_translate(
 /// Jumpjet is advanced by nothing at all. It comes first, so a crashing owner
 /// idle in the hold never latches and hangs where it is, natively too.
 ///
-/// Not modelled: `0x0053A130`'s constant-false arm and the two visibility
-/// probes in the tail.
+/// Not modelled: `0x0053A130`'s constant-false arm.
 pub(crate) fn process(runtime: &mut JumpjetRuntime, host: &mut impl JumpjetFlightHost) -> i32 {
     let state = runtime.phase;
     if !runtime.moving
@@ -935,6 +942,7 @@ pub(crate) fn process(runtime: &mut JumpjetRuntime, host: &mut impl JumpjetFligh
         STATE_CRASH => state5_crash(runtime, host),
         other => other,
     };
+    host.visibility_tail(runtime);
     runtime.phase
 }
 
@@ -1293,7 +1301,9 @@ pub(crate) fn state4_descend(
 /// crashes it. Otherwise the cell under its Location is weighed
 /// (`0x0054CDC3..0x0054CE9A`): a cell its `Can_Enter_Cell` admits (and, for a
 /// `JumpJet=` type, Wheel can cross) lands it through State 4 with a null
-/// destination; water it is refused sinks it; anything else crashes it.
+/// destination; water it is refused sinks it; anything else crashes it. An
+/// Aircraft owner also needs Wheel to cross the cell, whatever its type's
+/// `JumpJet=` (`0x0054CE43..0x0054CE65`).
 /// Then a crash, or an owner no Magnetron lifted, above the ground loses
 /// the drop's credit, and a deck crossing after the weighing sets OnBridge
 /// (`0x0054CFBC..0x0054D012`).
@@ -1305,9 +1315,7 @@ pub(crate) fn state4_descend(
 ///
 /// Dead and not ported: the landing's crash for a Foot speed fraction
 /// (`+0x578`) of 5.0 or 7.0 (`0x0054CF3C..0x0054CF75`); its only writer,
-/// `SetSpeedFraction @ 0x004D3710`, clamps it to [0, 1]. The weighing's
-/// Aircraft arm (`0x0054CE43..0x0054CE65`) is unreachable: Jumpjet owners
-/// here are Units and Infantry.
+/// `SetSpeedFraction @ 0x004D3710`, clamps it to [0, 1].
 pub(crate) fn state5_crash(runtime: &mut JumpjetRuntime, host: &mut impl JumpjetFlightHost) -> i32 {
     let frame = host.binary_frame();
     let [x, y, old_z] = host.location();
@@ -1353,7 +1361,13 @@ pub(crate) fn state5_crash(runtime: &mut JumpjetRuntime, host: &mut impl Jumpjet
             let land = host.cell_land_type(xy);
             let water = land == LAND_WATER && !crossed_deck;
             let beach = land == LAND_BEACH && !crossed_deck;
-            let answer = host.can_enter_cell(cell);
+            let mut answer = host.can_enter_cell(cell);
+            // Aircraft's own entry query can admit impassable terrain.
+            // State5 asks the Cell's Wheel check separately and replaces
+            // its answer with Move_No (7) on refusal (54CE43..54CE65).
+            if host.owner_kind() == FlightOwnerKind::Aircraft && !host.wheel_clear(cell) {
+                answer = 7;
+            }
             let landable = (!host.jumpjet_type() || host.wheel_clear(cell)) && answer == 0;
             if landable {
                 if host.holds_air_slot_at(cell) {
@@ -1464,6 +1478,7 @@ mod tests {
         fn is_object_alive(&self) -> bool {
             true
         }
+        fn visibility_tail(&mut self, _runtime: &mut JumpjetRuntime) {}
         fn marked(&self) -> bool {
             true
         }
@@ -1937,6 +1952,7 @@ mod tests {
         fn is_object_alive(&self) -> bool {
             true
         }
+        fn visibility_tail(&mut self, _runtime: &mut JumpjetRuntime) {}
         fn marked(&self) -> bool {
             true
         }

@@ -57,9 +57,9 @@ use crate::util::native_x87::{
 #[derive(Clone)]
 pub(crate) struct GarrisonSnapshot {
     /// `+0x69C`, the firing occupant's index: the shot's muzzle port.
-    pub fire_index: u8,
+    pub fire_index: i32,
     /// The occupant count (`+0x694`), GetROF's divisor.
-    pub occupant_count: u8,
+    pub occupant_count: i32,
 }
 
 /// Snapshot of an attacker's state for target scanning.
@@ -457,7 +457,9 @@ pub(crate) fn should_retaliate(
         .weapon_at(subject.weapon_index)
         .and_then(|weapon| super::combat_weapon::warhead_of(rules, weapon))
         .is_none_or(|warhead| {
-            warhead.verses_f64[super::armor_index(&source_type.armor)] > f64::from(0.01_f32)
+            // Ares 3.0 hook100543E0 replaces only this original threshold
+            // with the independently retained Retaliate flag.
+            warhead.interaction(source_type.armor_id()).can_retaliate()
         })
 }
 

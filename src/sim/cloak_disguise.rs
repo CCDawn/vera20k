@@ -685,6 +685,16 @@ impl Default for DisguiseRuntime {
     }
 }
 
+impl crate::sim::game_entity::GameEntity {
+    /// The disguise runtime, created at `frame` when the object has none yet.
+    /// Native keeps the disguise fields inline; sparse Rust storage creates
+    /// them on the first disguise write, stamped with that frame.
+    pub(crate) fn disguise_mut(&mut self, frame: u32) -> &mut DisguiseRuntime {
+        self.disguise
+            .get_or_insert_with(|| DisguiseRuntime::new(frame))
+    }
+}
+
 impl DisguiseRuntime {
     pub const fn new(construction_frame: u32) -> Self {
         Self {
@@ -821,10 +831,10 @@ impl DisguiseRuntime {
 
 impl crate::sim::world::Simulation {
     /// Forced GetDisguise(1): Infantry522640 and Unit7465B0, Steam
-    /// gamemd3e81a617..08600. It reads retained Techno+518 without testing
+    /// gamemd. It reads retained Techno+518 without testing
     /// Disguised+1D8. Infantry alone falls back to Rules+D58/D5C/D60 by
     /// PlayerPtr's planning side; NULL/other sides select the third slot.
-    pub(crate) fn forced_disguise_type(
+    pub fn forced_disguise_type(
         &self,
         actor: u64,
         rules: &crate::rules::ruleset::RuleSet,
@@ -924,8 +934,7 @@ impl crate::sim::world::Simulation {
             .entities
             .get_mut(firer)
             .expect("present firer")
-            .disguise
-            .get_or_insert_with(|| DisguiseRuntime::new(frame));
+            .disguise_mut(frame);
         match worn {
             Some((kind, house)) => disguise.acquire(frame, kind, house),
             None => disguise.raise(frame),
@@ -1037,8 +1046,7 @@ impl crate::sim::world::Simulation {
                     .entities
                     .get_mut(id)
                     .expect("live disguise owner")
-                    .disguise
-                    .get_or_insert_with(|| DisguiseRuntime::new(frame));
+                    .disguise_mut(frame);
                 state.block_reacquisition(frame, rules.general.infantry_blink_disguise_time);
                 state.clear_unit();
             } else if acquire
@@ -1066,8 +1074,7 @@ impl crate::sim::world::Simulation {
                     .entities
                     .get_mut(id)
                     .expect("live disguise owner")
-                    .disguise
-                    .get_or_insert_with(|| DisguiseRuntime::new(frame))
+                    .disguise_mut(frame)
                     .acquire(frame, Some(disguise_type), None);
             }
         }

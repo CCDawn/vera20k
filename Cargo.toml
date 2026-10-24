@@ -1,6 +1,6 @@
 [package]
 name = "vera20k"
-version = "0.1.0"
+version = "0.2.2"
 edition = "2024"
 description = "Vera20k Engine — a from-scratch Rust engine for Red Alert 2: Yuri's Revenge"
 autobins = false
@@ -41,6 +41,13 @@ required-features = ["telemetry-dashboard"]
 # Development builds carry the Ctrl+Shift dev chord. The release workflow builds
 # with `--no-default-features`, so shipped binaries do not.
 default = ["dev-overlays"]
+# Optional gameplay extensions. Neither default nor shipping builds enable this.
+ares = ["vera20k-core/ares"]
+# Optional Phobos extensions, independent of the Ares capability; neither
+# default nor shipping builds enable this either.
+phobos = ["vera20k-core/phobos"]
+# Placeholder for the NPatch capability; no chain reads it yet.
+npatch = ["vera20k-core/npatch"]
 # The Ctrl+Shift dev chord: renderer-native diagnostic overlays (grid, heightmap,
 # pathgrid, foot path, fog), the debug pause and quicksave/quickload. Captures
 # rely on it (literal Ctrl+Shift+M/N quicksave/quickload).
@@ -66,10 +73,12 @@ wgpu = "27"
 winit = "0.30"
 # raw-window-handle + windows-sys let us clip the OS cursor to the game window
 # with the Win32 ClipCursor API . That is reliable on frameless
-# windows, where winit's CursorGrabMode::Confined mis-computes the clip rect and
-# pins the pointer in place ("mouse won't move").
+# windows. winit's CursorGrabMode::Confined instead clips a *hidden* cursor to a
+# one-pixel box at the client centre (its `refresh_os_cursor`, to keep the pointer
+# off the taskbar), and VERA hides the OS arrow whenever it draws mouse.shp, so the
+# grab mode pins the pointer in place ("mouse won't move").
 raw-window-handle = "0.6"
-# `Win32_UI_WindowsAndMessaging` covers ClipCursor/GetClientRect;
+# `Win32_UI_WindowsAndMessaging` covers ClipCursor/GetClipCursor/GetClientRect;
 # `Win32_Graphics_Gdi` adds ClientToScreen (maps the client rect into screen coords).
 windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
 # bytemuck enables safe transmutation of structs to GPU-friendly byte slices.
@@ -102,15 +111,25 @@ rodio = { version = "0.22", default-features = false, features = ["playback"] }
 # existing core dependency already pins the same libc version in Cargo.lock.
 libc = "0.2"
 
-# --- macOS application icon ---
+# --- macOS application icon and game folder chooser ---
 # macOS has no per-window icon; the Dock shows NSApplication's icon image, which
-# `app::window_icon` sets at startup. objc2 0.6 and Foundation 0.3 are the
-# versions already in the lock (via cpal), and AppKit 0.3 matches them; default
-# features are off because they enable every AppKit framework class.
+# `app::window_icon` sets at startup. The app bundle's first launch asks for the
+# game folder with NSAlert and NSOpenPanel (`app::app_bundle`). objc2 0.6 and Foundation 0.3
+# are the versions already in the lock (via cpal), and AppKit 0.3 matches them;
+# default features are off because they enable every AppKit framework class.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSAlert", "NSApplication", "NSButton", "NSControl", "NSImage", "NSOpenPanel", "NSPanel", "NSResponder", "NSSavePanel", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSData", "NSLocale", "NSString", "NSURL"] }
+
+# --- Windows program icon and version details ---
+# build.rs compiles them into vera20k.exe with the Windows SDK's resource
+# compiler. A target table for build dependencies matches the host, so other
+# hosts never build this. The default `toml` feature reads
+# [package.metadata.winresource], which build.rs does not use; 0.1.34 has
+# `compile_for`, which keeps them to the game.
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "0.1.34", default-features = false }
 
 [dev-dependencies]
 # Client tests use core's test fixtures and helpers.

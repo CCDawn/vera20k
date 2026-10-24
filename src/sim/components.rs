@@ -43,9 +43,10 @@ pub use crate::sim::building_construction::BuildingUp;
 /// and snapshot restore rejects an ID that two registries claim), so the ID
 /// alone says which store holds the object and what kind it is.
 ///
-/// A Cell compares by its coordinates, not as the native Dummy cell pointer
-/// (`0x00ABDC50`) that stands for any cell the map lacks: see the residuals
-/// in `sim::aircraft::leave_map` and `Per_Cell_Process` (`movement::per_cell`).
+/// Derived coordinate equality compares cells by coordinates. Consumers that
+/// require native allocation identity (including Aircraft AI's dummy clear)
+/// use `TargetKind::cell_identity` after conversion; see the remaining
+/// `Per_Cell_Process` residual in `movement::per_cell`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum NavTargetRef {
     /// A `CellClass*`, by its cell.
@@ -62,6 +63,23 @@ impl NavTargetRef {
 
     pub fn object(id: u64) -> Self {
         Self::Object { id }
+    }
+
+    /// Compare retained Abstract pointers without querying or restamping Map.
+    /// Distinct missing-coordinate tokens name the one CellClass Dummy;
+    /// packed fixed-stride aliases also name the same allocated Cell.
+    pub(crate) fn same_pointer(
+        self,
+        other: Self,
+        terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
+    ) -> bool {
+        match (self, other, terrain) {
+            (Self::Cell { rx: ax, ry: ay }, Self::Cell { rx: bx, ry: by }, Some(terrain)) => {
+                terrain.native_fixed_cell_index(ax as i16, ay as i16)
+                    == terrain.native_fixed_cell_index(bx as i16, by as i16)
+            }
+            _ => self == other,
+        }
     }
 
     /// The object this names; a Cell names none.
@@ -290,6 +308,12 @@ impl From<WorldCoordinate> for DriveCoord {
     }
 }
 
+/// The most direction words Find_Path's ordinary copy installs
+/// (`0x004D3E82..0x004D3EA1`): AStar returns the whole route, and a Foot
+/// requests the next window when this one runs short, so a long trip adapts
+/// to blockers found on the way.
+pub(crate) const FIND_PATH_WINDOW_WORDS: usize = 24;
+
 /// Foot-owned path replay. Native shifts a 24-dword queue on consumption;
 /// Rust retains the consumed prefix with an explicit cursor. Consumers must
 /// interpret the remaining suffix, not vector emptiness, as the native queue.
@@ -345,7 +369,11 @@ impl FootPathQueue {
 
     /// The queue `FootClass::Find_Path @ 0x004D3920` installs from a found
     /// route (`0x004D393A..0x004D4003`): the directions from `reference`
-    /// through `path` from `first_destination` on, unconsumed.
+    /// through `path` from `first_destination` on, unconsumed. The ordinary
+    /// zero-prefix copy at `0x004D3E82..0x004D3EA1` takes at most
+    /// [`FIND_PATH_WINDOW_WORDS`] words of the whole AStar route; tube jumps
+    /// count as one word. The Vec's end represents a short route's
+    /// terminator without retaining unused native backing words.
     pub(crate) fn install(
         &mut self,
         reference: (u16, u16),
@@ -354,7 +382,11 @@ impl FootPathQueue {
     ) {
         let mut from = (reference.0 as i16, reference.1 as i16);
         self.directions.clear();
-        for &destination in path.iter().skip(first_destination) {
+        for &destination in path
+            .iter()
+            .skip(first_destination)
+            .take(FIND_PATH_WINDOW_WORDS)
+        {
             self.directions.push(direction_from_step(from, destination));
             from = (destination.0 as i16, destination.1 as i16);
         }
@@ -524,8 +556,16 @@ pub struct FootSpeedState {
     /// Every speed query reads it (GetCurrentSpeed multiplies it in). Its only
     /// native writer is the Speed crate (`accept_speed_crate`), reached from
     /// `CellClass::PickupCrate` (`crates::pickup`) when a Foot commits to a
-    /// crate cell; saved and hashed (v181).
+    /// crate cell; saved and hashed (v181). With Ares this is the permanent
+    /// Ext+90 baseline; the separately owned derived Foot+580 is below.
     crate_multiplier: crate::util::native_x87::NativeF64Bits,
+    /// Ares100460A0's derived Foot+580, distinct from its permanent
+    /// TechnoExt+90 crate baseline above. None denotes an unchanged baseline.
+    /// The attachment owner updates it synchronously after native mutations;
+    /// snapshot restore validates it against that owner's ordered vector.
+    #[cfg(feature = "ares")]
+    #[serde(default)]
+    attached_speed: Option<crate::util::native_x87::NativeF64Bits>,
     /// Foot+6B5, constructor0 at4D3444. Drive's straight/CrusherAll
     /// pre-entry arm4B1A2F sets it; Unit's admitted overlay tail73B067
     /// clears it. Both the Track speed prefix and RockingUpdate read it.
@@ -538,6 +578,8 @@ impl Default for FootSpeedState {
         Self {
             applied_fraction: crate::util::fixed_math::SIM_ZERO,
             crate_multiplier: crate::util::native_x87::NativeF64Bits::ONE,
+            #[cfg(feature = "ares")]
+            attached_speed: None,
             crush_slowdown: false,
         }
     }
@@ -567,6 +609,24 @@ impl FootSpeedState {
 
     pub fn crate_multiplier(&self) -> crate::util::native_x87::NativeF64Bits {
         self.crate_multiplier
+    }
+
+    /// Live Foot+580. Crate eligibility continues to read the permanent
+    /// baseline; GetCurrentSpeed reads this derived value under Ares.
+    pub fn effective_multiplier(&self) -> crate::util::native_x87::NativeF64Bits {
+        #[cfg(feature = "ares")]
+        if let Some(multiplier) = self.attached_speed {
+            return multiplier;
+        }
+        self.crate_multiplier
+    }
+
+    #[cfg(feature = "ares")]
+    pub(crate) fn set_attached_speed(
+        &mut self,
+        multiplier: crate::util::native_x87::NativeF64Bits,
+    ) {
+        self.attached_speed = (multiplier != self.crate_multiplier).then_some(multiplier);
     }
 
     /// Foot `+0x578`, the applied speed fraction.

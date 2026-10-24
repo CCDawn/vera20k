@@ -3,6 +3,7 @@
 //! MatchSession alone owns accepted participants, setup and loading admission.
 
 use super::*;
+use crate::app::frontend::skirmish_session::cooperative::encode_name;
 use crate::app::input::multiplayer_setup as setup_input;
 use crate::app::match_runtime::session::{
     NetworkLoadingRequest, NetworkMapMetadata, NetworkVacancy, SessionMode,
@@ -15,7 +16,11 @@ use crate::ui::shell::geom::RectPx;
 use winit::event::MouseButton;
 use winit::keyboard::KeyCode;
 
+mod live;
+
 const TRANSFER_FILE: &str = "CONTROLLED.MAP";
+/// The Soviet campaign's first map (`coopcampmd.ini` `[Soviet]` `Map1`).
+const COOP_MAP: &str = "C2S01MD.MAP";
 const TRANSFER_ROOT_MARKER: &str = ".vera20k-lan-capture-root";
 /// The controlled host's own install directory inside the isolated root, from
 /// which it generates its random map.
@@ -31,6 +36,7 @@ struct ControlledRandomMap {
     capacity: i32,
     staging: crate::map::preview::ScenarioStartStaging,
     image: Vec<u8>,
+    preview_bin: Vec<u8>,
 }
 
 /// Diagnostic file lease, never a map/catalog authority. Existing files are
@@ -70,6 +76,12 @@ impl Drop for OwnedTransferFile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LanTarget {
+    LiveHost,
+    LiveGuest,
+    LiveTimeoutHost,
+    LiveQuitHost,
+    BattleHost,
+    BattleGuest,
     Lobby,
     Chat,
     Discovery,
@@ -145,6 +157,9 @@ pub enum LanTarget {
     /// map change, the host's `'W'` staging, `RandMap.Sed` then
     /// `RandMap.img` at GO, and the match starts on the `'W'` cells.
     GuestRandomMap,
+    /// The same guest on BD once `Preview.bin` arrived: the host's 64-colour
+    /// half-size preview with the `'W'` start markers.
+    GuestRandomMapPreview,
     /// B6 Observe in a two-human LAN match, through the executed DESTRUCT and
     /// the local defeat to the re-armed menu and its Observe-less B6.
     HostObserve,
@@ -161,9 +176,38 @@ pub enum LanTarget {
     StartPrompt,
     StartPromptAccepted,
     LoadingTimeoutReturn,
+    /// Choose Map over BC with Cooperative clicked: `+0x4C`'s campaign rows.
+    CoopChooser,
+    /// Use Map on the Soviet campaign row: BC in Cooperative with the
+    /// campaign's description and stage countries, its C0 published.
+    CoopHost,
+    /// That BC once a guest joins: its country admitted by the stage
+    /// (`+0x1C`, `+0x28`) and the campaign published again (`+0x94`).
+    CoopJoin,
+    /// The two-human Cooperative match through Start to its first loading
+    /// frame.
+    CoopHostGo,
+    /// BD given Cooperative host options and the host's C0: the campaign's
+    /// description and stage countries.
+    CoopGuest,
+    /// The Cooperative match won (its AI Houses flagged to die, a
+    /// controlled outcome): `+0xA0` advanced the record and BC6 opened.
+    CoopResult,
+    /// BC6's Continue, the guest's ready and ack, and the next mission's
+    /// first loading frame.
+    CoopNext,
+    /// The Cooperative match lost (both humans flagged to die): BC6 after
+    /// the defeat, then the same mission's first loading frame.
+    CoopRetry,
 }
 
 pub(crate) const LAN_CHECKPOINTS: &[(&str, LanTarget)] = &[
+    ("lan-live-host", LanTarget::LiveHost),
+    ("lan-live-guest", LanTarget::LiveGuest),
+    ("lan-live-timeout-host", LanTarget::LiveTimeoutHost),
+    ("lan-live-quit-host", LanTarget::LiveQuitHost),
+    ("lan-battle-host", LanTarget::BattleHost),
+    ("lan-battle-guest", LanTarget::BattleGuest),
     ("lan-0xbb-steady", LanTarget::Lobby),
     ("lan-0xbb-chat", LanTarget::Chat),
     ("lan-0xbb-discovery", LanTarget::Discovery),
@@ -177,6 +221,14 @@ pub(crate) const LAN_CHECKPOINTS: &[(&str, LanTarget)] = &[
     ("lan-0xbc-solo-start", LanTarget::SoloStart),
     ("lan-0x6b-steady", LanTarget::ChooseMap),
     ("lan-0x6b-cancel", LanTarget::ChooseMapCancel),
+    ("lan-0x6b-coop-campaigns", LanTarget::CoopChooser),
+    ("lan-0xbc-coop-soviet", LanTarget::CoopHost),
+    ("lan-0xbc-coop-join", LanTarget::CoopJoin),
+    ("lan-coop-host-loading-first", LanTarget::CoopHostGo),
+    ("lan-0xbd-coop-campaign", LanTarget::CoopGuest),
+    ("lan-0xbc6-coop-result", LanTarget::CoopResult),
+    ("lan-coop-next-loading", LanTarget::CoopNext),
+    ("lan-coop-defeat-retry", LanTarget::CoopRetry),
     ("lan-0xbc-back", LanTarget::HostBack),
     ("lan-0xbc-missing-map", LanTarget::HostMissingMap),
     ("lan-0xbc-readiness", LanTarget::HostReadiness),
@@ -224,6 +276,10 @@ pub(crate) const LAN_CHECKPOINTS: &[(&str, LanTarget)] = &[
     ("lan-ingame-taunt", LanTarget::IngameTaunt),
     ("lan-host-random-map", LanTarget::HostRandomMap),
     ("lan-guest-random-map", LanTarget::GuestRandomMap),
+    (
+        "lan-0xbd-random-map-preview",
+        LanTarget::GuestRandomMapPreview,
+    ),
     ("lan-host-observe", LanTarget::HostObserve),
     ("lan-host-observe-offered", LanTarget::HostObserveOffered),
     (
@@ -239,6 +295,17 @@ pub(crate) const LAN_CHECKPOINTS: &[(&str, LanTarget)] = &[
     ),
 ];
 impl LanTarget {
+    pub(crate) fn live(self) -> bool {
+        matches!(
+            self,
+            Self::LiveHost
+                | Self::LiveGuest
+                | Self::LiveTimeoutHost
+                | Self::LiveQuitHost
+                | Self::BattleHost
+                | Self::BattleGuest
+        )
+    }
     fn host_observer(self) -> bool {
         matches!(
             self,
@@ -255,6 +322,24 @@ impl LanTarget {
                 | Self::TransferFailureReturn
                 | Self::TransferGo
         )
+    }
+    fn cooperative_host(self) -> bool {
+        matches!(
+            self,
+            Self::CoopChooser
+                | Self::CoopHost
+                | Self::CoopJoin
+                | Self::CoopHostGo
+                | Self::CoopResult
+                | Self::CoopNext
+                | Self::CoopRetry
+        )
+    }
+    fn cooperative_continuation(self) -> bool {
+        matches!(self, Self::CoopResult | Self::CoopNext | Self::CoopRetry)
+    }
+    fn random_map_guest(self) -> bool {
+        matches!(self, Self::GuestRandomMap | Self::GuestRandomMapPreview)
     }
     fn guest(self) -> bool {
         matches!(
@@ -278,9 +363,11 @@ impl LanTarget {
                 | Self::GuestAbortReturn
                 | Self::RemoteLoadingProgress
                 | Self::GuestRandomMap
+                | Self::GuestRandomMapPreview
                 | Self::JoinDenied
                 | Self::JoinDeniedReturn
                 | Self::JoinTimeoutReturn
+                | Self::CoopGuest
         )
     }
 }
@@ -333,6 +420,12 @@ enum LanPhase {
     ConnectionLeft,
     /// The match was won: waiting for the score dialog.
     ScoreWait,
+    /// The co-op AI Houses were flagged to die: waiting for BC6.
+    CoopOutcome,
+    /// BC6's continuation step `n` (one per frame).
+    CoopRound(u8),
+    /// The next co-op mission is loading: waiting for its first frame.
+    CoopNextLoading,
     /// In-battle chat step `n` (one per frame).
     Chat(u8),
     /// Alliance step `n`; a step may wait several frames.
@@ -361,6 +454,7 @@ enum LanPhase {
 }
 
 pub(super) struct LanCapture {
+    live: Option<live::LiveLanCapture>,
     target: LanTarget,
     phase: LanPhase,
     route: Vec<Value>,
@@ -379,10 +473,20 @@ pub(super) struct LanCapture {
     /// The random-map route has committed `RandMap.Sed` to BC.
     random_map_committed: bool,
     random_map_host: Option<ControlledRandomMap>,
+    /// The Cooperative route has used its campaign row on BC.
+    cooperative_committed: bool,
+    /// The co-op continuation's first mission.
+    cooperative_first_map: Option<String>,
 }
 impl LanCapture {
+    pub(super) fn configure_live(&mut self, config: Option<super::super::LiveLanConfig>) {
+        if self.target.live() {
+            self.live = config.map(|config| live::LiveLanCapture::new(self.target, config));
+        }
+    }
     pub(super) fn new(target: LanTarget) -> Self {
         Self {
+            live: None,
             target,
             phase: LanPhase::Main,
             route: Vec::new(),
@@ -397,11 +501,28 @@ impl LanCapture {
             offline_selection: None,
             random_map_committed: false,
             random_map_host: None,
-            inputs: super::native_corpus("tools/storage_oracle/lan_shell_controls.json")
-                .expect("native LAN corpus"),
+            cooperative_committed: false,
+            cooperative_first_map: None,
+            inputs: if target.live() {
+                Value::Null
+            } else {
+                super::native_corpus("tools/storage_oracle/lan_shell_controls.json")
+                    .expect("native LAN corpus")
+            },
         }
     }
     pub(super) fn timeout(&self) -> Duration {
+        if self.target.live() {
+            // Only the extended diagnostic opening gets more wall time;
+            // network and production deadlines remain their ordinary owners.
+            return Duration::from_secs(
+                if matches!(self.target, LanTarget::BattleHost | LanTarget::BattleGuest) {
+                    300
+                } else {
+                    180
+                },
+            );
+        }
         // Original peer wait is3600 wall-clock buckets (57.6s). Only this
         // diagnostic budget grows; loading retains its production timer.
         Duration::from_secs(
@@ -412,6 +533,9 @@ impl LanCapture {
                     | LanTarget::HostObserveOffered
                     | LanTarget::ConnectionTimeout
                     | LanTarget::Score
+                    | LanTarget::CoopResult
+                    | LanTarget::CoopNext
+                    | LanTarget::CoopRetry
             ) {
                 120
             } else {
@@ -477,17 +601,23 @@ impl LanCapture {
             .clone();
         let values = &self.inputs["host_options"];
         let mode_id = values["mode_id"].as_i64().context("native mode")? as i32;
-        let mode = state
-            .frontend
-            .skirmish_modes
-            .iter()
-            .find(|m| m.id == mode_id)
-            .context("retail native mode")?;
+        let mode = if self.target == LanTarget::CoopGuest {
+            cooperative_mode(state)?
+        } else {
+            state
+                .frontend
+                .skirmish_modes
+                .iter()
+                .find(|m| m.id == mode_id)
+                .context("retail native mode")?
+        };
         launch.mode = SkirmishLaunchMode::from_game_mode(mode);
-        let file = if self.target.missing_map() {
+        let file = if self.target == LanTarget::CoopGuest {
+            COOP_MAP
+        } else if self.target.missing_map() {
             self.assert_map_absent(state)?;
             TRANSFER_FILE
-        } else if self.target == LanTarget::GuestRandomMap {
+        } else if self.target.random_map_guest() {
             crate::map::skirmish_scenarios::RANDMAP_SED
         } else {
             let file = values["map"].as_str().context("native map")?;
@@ -532,19 +662,29 @@ impl LanCapture {
         vacancies[7] = NetworkVacancy::Closed;
         setup::service_event(
             state,
-            NetworkSetupEvent::HostSetup {
+            NetworkSetupEvent::HostSetup(crate::app::shell_network_setup::HostOptions {
                 launch,
                 vacancies,
-                map_metadata: self.map_metadata()?,
-                // Packet7+57 -> observer reservation8316A4/5E08C8.
-                observer_row: Some(
-                    self.inputs["host_options"]["observer_row"]
-                        .as_u64()
-                        .context("native observer row")? as u8,
-                ),
+                map_metadata: if self.target == LanTarget::CoopGuest {
+                    setup::local_map_metadata(state, COOP_MAP)?
+                } else {
+                    self.map_metadata()?
+                },
+                // Packet7+57 -> observer reservation8316A4/5E08C8. A
+                // Cooperative host has none: its +0x20 (0x005C1A10) clears
+                // it and sends "O8".
+                observer_row: if self.target == LanTarget::CoopGuest {
+                    None
+                } else {
+                    Some(
+                        self.inputs["host_options"]["observer_row"]
+                            .as_u64()
+                            .context("native observer row")? as u8,
+                    )
+                },
                 cooperative_difficulty: 0,
                 seed: Some(self.seed()?),
-            },
+            }),
         )?;
         self.assert_guest_order(state, true)
     }
@@ -663,6 +803,172 @@ impl LanCapture {
     }
     /// The peer's 0x1B: the host clears its acceptance and sends the `'W'`
     /// with the staging Generate wrote; the peer then accepts again.
+    /// Click Cooperative in the chooser's game types: `+0x4C` lists the
+    /// campaigns. The other routes then use the Soviet row.
+    fn cooperative_chooser(&mut self, state: &mut AppState, frame: u32) -> Result<()> {
+        let layout = crate::app::frontend::shell_layout::choose_map_layout(state);
+        let mode_id = cooperative_mode(state)?.id;
+        let modal = state
+            .frontend
+            .skirmish_shell_state
+            .choose_map_modal
+            .as_ref()
+            .context("chooser")?;
+        let row = modal
+            .mode_rows()
+            .iter()
+            .position(|id| *id == mode_id)
+            .context("Cooperative listed on the network")?;
+        let point = list_row_point(modal.mode_geometry(&layout), row, modal.mode_top_index);
+        chooser_press(state, point);
+        let modal = state
+            .frontend
+            .skirmish_shell_state
+            .choose_map_modal
+            .as_ref()
+            .context("chooser")?;
+        ensure!(
+            modal.selected_mode_id == mode_id,
+            "the game-type click missed Cooperative"
+        );
+        let labels = modal.row_labels.clone().context("Cooperative rows")?;
+        ensure!(
+            labels.first().is_some_and(|label| label.starts_with("1. ")),
+            "Cooperative rows lack the first campaign: {labels:?}"
+        );
+        self.route
+            .push(json!({"frame":frame,"action":"Cooperative clicked in 0x6B","rows":labels}));
+        if self.target == LanTarget::CoopChooser {
+            self.settle(state);
+            return Ok(());
+        }
+        let row = labels
+            .iter()
+            .position(|label| label.starts_with("2. "))
+            .context("the Soviet campaign row")?;
+        let point = list_row_point(modal.map_geometry(&layout), row, modal.map_top_index);
+        chooser_press(state, point);
+        ensure!(
+            state
+                .frontend
+                .skirmish_shell_state
+                .choose_map_modal
+                .as_ref()
+                .is_some_and(|modal| modal.highlighted_filtered_index == Some(row)),
+            "the Soviet row was not selected"
+        );
+        let button = layout.use_map_button;
+        chooser_press(state, (button.x + button.w / 2, button.y + button.h / 2));
+        self.event(frame, "Soviet campaign row used");
+        self.phase = LanPhase::ChooserReturn;
+        Ok(())
+    }
+
+    /// BC after Use Map on the Soviet row: Cooperative on its first map,
+    /// the stage's description, Random countries and the published C0.
+    fn assert_cooperative_campaign_used(&mut self, state: &mut AppState, frame: u32) -> Result<()> {
+        let mode_id = cooperative_mode(state)?.id;
+        let launch = state.match_state.session.network_setup().context("BC")?;
+        ensure!(launch.mode.id == mode_id, "Use Map left Cooperative");
+        let file = launch.selected_map_file.clone().context("campaign map")?;
+        ensure!(
+            file.eq_ignore_ascii_case(COOP_MAP),
+            "the Soviet row chose {file}"
+        );
+        ensure!(
+            launch.local_slot().country_random,
+            "the Soviet first stage has three countries: Random"
+        );
+        let requests = self.drain_requests(state);
+        let text = requests
+            .iter()
+            .find_map(|request| match request {
+                NetworkSetupRequest::PublishCooperativeCampaign(text) => Some(text.clone()),
+                _ => None,
+            })
+            .context("Use Map published no C0")?;
+        ensure!(
+            text.starts_with("C0,1,0,"),
+            "C0 names another campaign: {text}"
+        );
+        let view = setup::view(state).context("BC")?;
+        ensure!(
+            view.cooperative && view.cooperative_description.is_some(),
+            "BC lacks the campaign description"
+        );
+        self.route
+            .push(json!({"frame":frame,"action":"Cooperative campaign on BC",
+            "map":file,"c0":text,"description":view.cooperative_description}));
+        Ok(())
+    }
+
+    /// The guest's join in Cooperative: its America is not a Soviet stage
+    /// country, so it takes the stage default (Random), and `+0x94`
+    /// publishes the campaign with both names.
+    fn assert_cooperative_join(&mut self, state: &mut AppState, frame: u32) -> Result<()> {
+        let peer = self.human(false)?.name;
+        let launch = state.match_state.session.network_setup().context("BC")?;
+        let guest = launch
+            .humans
+            .iter()
+            .find(|human| human.name == peer)
+            .context("joined guest")?;
+        ensure!(
+            guest.slot.country_random,
+            "the stage admitted the guest's America"
+        );
+        let requests = self.drain_requests(state);
+        let text = requests
+            .iter()
+            .find_map(|request| match request {
+                NetworkSetupRequest::PublishCooperativeCampaign(text) => Some(text.clone()),
+                _ => None,
+            })
+            .context("the join published no C0")?;
+        let names = format!(
+            ",{},{}",
+            encode_name(self.human(true)?.name.as_bytes()),
+            encode_name(peer.as_bytes())
+        );
+        ensure!(
+            text.starts_with("C0,1,0,") && text.ends_with(&names),
+            "the join's C0 lacks the campaign or names: {text}"
+        );
+        self.route
+            .push(json!({"frame":frame,"action":"guest joined Cooperative BC","c0":text}));
+        Ok(())
+    }
+
+    /// The host's C0 for the Soviet campaign at its first stage (variant 0
+    /// each), names in the host's order.
+    fn guest_receives_campaign(&mut self, state: &mut AppState, frame: u32) -> Result<()> {
+        let text = format!(
+            "C0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,{},{}",
+            encode_name(self.human(true)?.name.as_bytes()),
+            encode_name(self.human(false)?.name.as_bytes())
+        );
+        setup::service_event(state, NetworkSetupEvent::CooperativeCampaign(text.clone()))?;
+        let view = setup::view(state).context("BD")?;
+        let expected = App::csf_label(state, "NAME:COOPDESC21", "NAME:COOPDESC21");
+        ensure!(
+            view.cooperative && view.cooperative_description.as_deref() == Some(expected.as_str()),
+            "BD lacks the received campaign's description"
+        );
+        ensure!(
+            state
+                .match_state
+                .session
+                .network_setup()
+                .context("BD")?
+                .local_slot()
+                .country_random,
+            "the received stage has three countries: Random"
+        );
+        self.route
+            .push(json!({"frame":frame,"action":"host C0 received on BD","c0":text}));
+        Ok(())
+    }
+
     fn host_answers_preview_request(&mut self, state: &mut AppState, frame: u32) -> Result<()> {
         self.drain_requests(state);
         setup::service_event(state, NetworkSetupEvent::PreviewRequested)?;
@@ -671,9 +977,9 @@ impl LanCapture {
             "0x1B kept the peer's acceptance"
         );
         let staging = state.frontend.multiplayer_shell_runtime.start_staging();
-        let published: Vec<String> = self
-            .drain_requests(state)
-            .into_iter()
+        let requests = self.drain_requests(state);
+        let published: Vec<&String> = requests
+            .iter()
             .filter_map(|request| match request {
                 NetworkSetupRequest::PublishStartStaging(text) => Some(text),
                 _ => None,
@@ -681,14 +987,47 @@ impl LanCapture {
             .collect();
         ensure!(
             published.len() == 1
-                && crate::map::preview::ScenarioStartStaging::parse_w_text(&published[0])
+                && crate::map::preview::ScenarioStartStaging::parse_w_text(published[0])
                     == Some(staging)
                 && staging.count >= 2,
             "0x1B did not send the generated staging once: {published:?}"
         );
+        ensure!(
+            requests.last() == Some(&NetworkSetupRequest::OfferPreview),
+            "the 'W' was not followed by the 0x19 offer: {requests:?}"
+        );
+        let w = published[0].clone();
+        // The peer's 0x1A completes the offer: Preview.bin is written from
+        // the host's preview, halved and cut to 64 colours, and sent.
+        let preview_path = Self::isolated_root(state)?.join("Preview.bin");
+        // Only the guests the offer went to count; the host's own index does
+        // not complete it.
+        setup::service_event(state, NetworkSetupEvent::PreviewAcknowledged { index: 0 })?;
+        ensure!(
+            self.drain_requests(state).is_empty(),
+            "the host's own index completed the offer"
+        );
+        setup::service_event(state, NetworkSetupEvent::PreviewAcknowledged { index: 1 })?;
+        ensure!(
+            self.drain_requests(state) == vec![NetworkSetupRequest::SendPreviewFile],
+            "the last 0x1A did not send Preview.bin"
+        );
+        let host_preview = crate::app::frontend::skirmish_shell_render::decode_network_map_preview(
+            state,
+            crate::map::skirmish_scenarios::RANDMAP_SED,
+        )
+        .context("host random-map preview")?;
+        let received = crate::map::preview::preview_bin_blob(&fs::read(&preview_path)?)
+            .and_then(|blob| crate::map::preview::paletted_preview_image(&blob))
+            .context("Preview.bin did not decode")?;
+        ensure!(
+            (received.width, received.height) == (host_preview.width / 2, host_preview.height / 2),
+            "Preview.bin is not the host preview halved"
+        );
         self.route
             .push(json!({"frame":frame,"action":"controlled 0x1B answered",
-            "w":published[0]}));
+            "w":w,"preview_bin":{"bytes":fs::metadata(&preview_path)?.len(),
+            "width":received.width,"height":received.height}}));
         setup::service_event(
             state,
             NetworkSetupEvent::PlayerReady {
@@ -697,7 +1036,7 @@ impl LanCapture {
             },
         )
     }
-    fn isolated_root(state: &AppState) -> Result<PathBuf> {
+    pub(super) fn isolated_root(state: &AppState) -> Result<PathBuf> {
         let assets = state
             .process_assets
             .manager()
@@ -763,16 +1102,39 @@ impl LanCapture {
             "controlled random map staged {} starts",
             staging.count
         );
-        let image = crate::assets::pcx_file::encode_direct_rgb(64, 32, &[96; 64 * 32 * 3])?;
+        // The host's preview stand-in: a 138x70 gradient, the size of the
+        // generator's own RandMap.img.
+        let (width, height) = (138u16, 70u16);
+        let mut rgb = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                rgb.extend_from_slice(&[(40 + x) as u8, (60 + 2 * y) as u8, ((x + y) / 2) as u8]);
+            }
+        }
+        let image = crate::assets::pcx_file::encode_direct_rgb(width, height, &rgb)?;
+        let mut rgba = Vec::new();
+        for pixel in rgb.chunks_exact(3) {
+            rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 0xFF]);
+        }
+        let preview_bin =
+            crate::map::preview::preview_bin_bytes(&crate::map::preview::create_paletted_preview(
+                &crate::map::preview::DecodedPreview {
+                    width: u32::from(width),
+                    height: u32::from(height),
+                    rgba,
+                },
+                crate::map::preview::PALETTED_PREVIEW_COLORS,
+            ));
         self.route.push(json!({"controlled_random_map":{"seed":options.seed,
             "sed_bytes":sed.len(),"w":staging.to_w_text(),
-            "boundary":"controlled host generation through the production loader, slots 0 and 1 swapped in the W; flat RandMap.img stand-in"}}));
+            "boundary":"controlled host generation through the production loader, slots 0 and 1 swapped in the W; gradient stand-in for the host preview"}}));
         self.random_map_host = Some(ControlledRandomMap {
             digest: options.native_digest(),
             capacity: options.num_players,
             sed,
             staging,
             image,
+            preview_bin,
         });
         Ok(())
     }
@@ -822,6 +1184,50 @@ impl LanCapture {
             .context("no controlled random map")?
             .staging;
         setup::service_event(state, NetworkSetupEvent::StartStaging(staging.to_w_text()))?;
+        // The offer that follows: the guest acks and receives Preview.bin.
+        ensure!(
+            state
+                .frontend
+                .network_setup_protocol
+                .as_ref()
+                .is_some_and(|protocol| protocol.received_preview().is_none()),
+            "an unverified map kept a preview"
+        );
+        setup::service_event(state, NetworkSetupEvent::PreviewOffered)?;
+        ensure!(
+            self.drain_requests(state)
+                == vec![
+                    NetworkSetupRequest::AcknowledgePreview,
+                    NetworkSetupRequest::RequestPreviewFile
+                ],
+            "0x19 did not ack and request the file"
+        );
+        setup::service_event(state, NetworkSetupEvent::PreviewOffered)?;
+        ensure!(
+            self.drain_requests(state).is_empty(),
+            "a second 0x19 during the receive was answered"
+        );
+        let preview_bin = &self
+            .random_map_host
+            .as_ref()
+            .context("no controlled random map")?
+            .preview_bin;
+        fs::write(Self::isolated_root(state)?.join("Preview.bin"), preview_bin)?;
+        setup::service_event(
+            state,
+            NetworkSetupEvent::PreviewFileReceived {
+                transferred_file: Some("Preview.bin".into()),
+            },
+        )?;
+        ensure!(
+            state
+                .frontend
+                .network_setup_protocol
+                .as_ref()
+                .and_then(|protocol| protocol.received_preview())
+                .is_some_and(|(_, preview)| (preview.width, preview.height) == (69, 35)),
+            "the guest did not take the host's Preview.bin"
+        );
         ensure!(
             state.frontend.multiplayer_shell_runtime.start_staging() == staging,
             "the guest did not take the host's 'W'"
@@ -942,6 +1348,13 @@ impl LanCapture {
         rendered: PresentedShell,
         frame: u32,
     ) -> Result<()> {
+        if self.target.live() {
+            return self
+                .live
+                .as_mut()
+                .context("live LAN configuration")?
+                .after_present(state, rendered, frame);
+        }
         if frame % 120 == 0 {
             log::debug!(
                 "LAN capture {:?} frame {frame}: phase={:?} rendered={rendered:?} route={:?} slide={:?} wave={} title_terminal={} main={:?}",
@@ -964,9 +1377,9 @@ impl LanCapture {
             && state.frontend.screen == GameScreen::Loading
         {
             let requests = state.match_state.session.take_network_loading_requests();
-            // The local terminal report is raw 100, or 200 for a random map,
-            // whose milestones are halved for display; the peer, loading the
-            // same map, reports the same terminal value.
+            // The local terminal report is display100, including random maps
+            // whose raw milestones were halved before publication. A peer
+            // loading the same map reports the same terminal value.
             if let Some(terminal) = requests.iter().find_map(|request| match request {
                 NetworkLoadingRequest::ReportProgress(percent) if *percent >= 100 => Some(*percent),
                 _ => None,
@@ -1320,6 +1733,12 @@ impl LanCapture {
                         setup_button(state, crate::ui::multiplayer_setup::CHOOSE_MAP)?;
                         self.phase = LanPhase::RandomMapChooser;
                     }
+                    target if target.cooperative_host() && !self.cooperative_committed => {
+                        self.offline_selection = Some(offline_selection(state));
+                        setup_button(state, crate::ui::multiplayer_setup::CHOOSE_MAP)?;
+                        self.phase = LanPhase::Chooser;
+                    }
+                    LanTarget::CoopHost => self.settle(state),
                     LanTarget::ChooseMap | LanTarget::ChooseMapCancel => {
                         self.offline_selection = Some(offline_selection(state));
                         setup_button(state, crate::ui::multiplayer_setup::CHOOSE_MAP)?;
@@ -1404,7 +1823,7 @@ impl LanCapture {
                                 .position(|map| map.player_capacity >= 3)
                                 .context("a map for three players")?;
                             crate::app::shell_network_setup::commit_map_selection(
-                                state, mode_id, index,
+                                state, mode_id, index, None,
                             )?;
                             let file = state
                                 .match_state
@@ -1418,6 +1837,11 @@ impl LanCapture {
                             state,
                             NetworkSetupEvent::ParticipantJoined(self.human(false)?),
                         )?;
+                        if self.target == LanTarget::CoopJoin {
+                            self.assert_cooperative_join(state, frame)?;
+                            self.settle(state);
+                            return Ok(());
+                        }
                         if matches!(
                             self.target,
                             LanTarget::HostObserverGo
@@ -1641,7 +2065,7 @@ impl LanCapture {
                     );
                 }
                 self.admitted = Some(session_receipt(state));
-                setup::service_event(state, NetworkSetupEvent::GoCompleted)?;
+                setup::service_event(state, NetworkSetupEvent::ControlledGoCompleted)?;
                 self.phase = LanPhase::Loading;
             }
             LanPhase::SettingsControl(step)
@@ -1947,11 +2371,14 @@ impl LanCapture {
                         NetworkSetupEvent::ParticipantJoined(self.human(true)?),
                     )?;
                     self.assert_guest_order(state, true)?;
-                    if self.target == LanTarget::GuestRandomMap {
+                    if self.target.random_map_guest() {
                         self.prepare_controlled_random_map(state)?;
                     }
                     let launch = self.host_options(state)?;
                     self.publish_setup(state, launch)?;
+                    if self.target == LanTarget::CoopGuest {
+                        self.guest_receives_campaign(state, frame)?;
+                    }
                     let status = if self.target == LanTarget::NoMap {
                         0
                     } else if matches!(
@@ -1975,7 +2402,7 @@ impl LanCapture {
                         requests.contains(&NetworkSetupRequest::MapStatus(status)),
                         "production map availability did not publish K{status}"
                     );
-                    if self.target == LanTarget::GuestRandomMap {
+                    if self.target.random_map_guest() {
                         self.guest_takes_start_staging(state, frame, &requests)?;
                     }
                     ensure!(
@@ -1993,9 +2420,11 @@ impl LanCapture {
                 }
             }
             LanPhase::Configured if setup_settled(state, false) => match self.target {
-                LanTarget::Guest | LanTarget::NoMap | LanTarget::TransferEligible => {
-                    self.settle(state)
-                }
+                LanTarget::Guest
+                | LanTarget::CoopGuest
+                | LanTarget::NoMap
+                | LanTarget::TransferEligible
+                | LanTarget::GuestRandomMapPreview => self.settle(state),
                 LanTarget::StartPrompt | LanTarget::StartPromptAccepted => {
                     self.drain_requests(state);
                     setup::service_event(state, NetworkSetupEvent::StartPrompt)?;
@@ -2157,7 +2586,7 @@ impl LanCapture {
                                 | LanTarget::GuestAbortReturn
                                 | LanTarget::RemoteLoadingProgress
                         ) {
-                            setup::service_event(state, NetworkSetupEvent::GoCompleted)?;
+                            setup::service_event(state, NetworkSetupEvent::ControlledGoCompleted)?;
                             self.phase = LanPhase::Loading;
                         } else {
                             setup::service_event(state, NetworkSetupEvent::MapTransferStarted)?;
@@ -2273,7 +2702,9 @@ impl LanCapture {
                     self.offline_selection == Some(offline_selection(state)),
                     "LAN Choose Map wrote the offline Skirmish selection"
                 );
-                if self.target == LanTarget::ChooseMap {
+                if self.target.cooperative_host() {
+                    self.cooperative_chooser(state, frame)?;
+                } else if self.target == LanTarget::ChooseMap {
                     self.settle(state);
                 } else {
                     state.match_state.input.cursor_x = 720.;
@@ -2301,7 +2732,13 @@ impl LanCapture {
                     self.offline_selection == Some(offline_selection(state)),
                     "LAN Choose Map Cancel wrote the offline Skirmish selection"
                 );
-                self.settle(state);
+                if self.target.cooperative_host() {
+                    self.assert_cooperative_campaign_used(state, frame)?;
+                    self.cooperative_committed = true;
+                    self.phase = LanPhase::Host;
+                } else {
+                    self.settle(state);
+                }
             }
             LanPhase::Returned if rendered == PresentedShell::LanLobby && lobby_settled(state) => {
                 ensure!(
@@ -2476,6 +2913,39 @@ impl LanCapture {
                 self.observed_runtime = Some(json!({"mode":"Lan", "tick":sim.session().tick(),
                     "current_house":sim.session().current_house().map(|id|sim.interner().resolve(id)),
                     "map":sim.session().map_name(),"host":state.match_state.session.host()}));
+                if self.target.cooperative_continuation() {
+                    let runtime = state
+                        .match_state
+                        .sim_runtime
+                        .as_mut()
+                        .context("installed co-op runtime")?;
+                    let sim = &mut runtime.simulation;
+                    let lose = self.target == LanTarget::CoopRetry;
+                    let doomed: Vec<_> = sim
+                        .houses()
+                        .in_order()
+                        .filter(|house| house.is_human() == lose && !house.multiplay_passive())
+                        .map(|house| house.name())
+                        .collect();
+                    ensure!(!doomed.is_empty(), "no co-op House to flag");
+                    self.cooperative_first_map = Some(sim.session().map_name().to_owned());
+                    for owner in &doomed {
+                        sim.flag_house_to_die(*owner);
+                    }
+                    let names: Vec<String> = doomed
+                        .iter()
+                        .map(|owner| sim.interner().resolve(*owner).to_string())
+                        .collect();
+                    self.route.push(json!({"frame":frame,
+                        "action":if lose {
+                            "controlled co-op defeat: both human Houses flagged to die"
+                        } else {
+                            "controlled co-op win: every AI House flagged to die"
+                        },
+                        "houses":names}));
+                    self.phase = LanPhase::CoopOutcome;
+                    return Ok(());
+                }
                 if self.target == LanTarget::HostPeerLeft {
                     crate::app::match_runtime::network_match::service_event(
                         state,
@@ -3084,6 +3554,158 @@ impl LanCapture {
                     LanPhase::Settle(SETTLE_FRAMES)
                 };
             }
+            LanPhase::CoopOutcome => {
+                if !crate::app::input::coop_score::active(state) {
+                    return Ok(());
+                }
+                ensure!(
+                    state.frontend.score_page.is_none(),
+                    "the co-op exit opened the score dialog"
+                );
+                let page = state
+                    .frontend
+                    .coop_score_page
+                    .as_ref()
+                    .context("BC6 page")?;
+                let rows: Vec<&str> = page
+                    .model
+                    .rows
+                    .iter()
+                    .map(|row| row.name.as_str())
+                    .collect();
+                let lose = self.target == LanTarget::CoopRetry;
+                ensure!(
+                    page.victory != lose && page.model.can_continue,
+                    "BC6 after the first mission"
+                );
+                let launch = state
+                    .match_state
+                    .session
+                    .network_setup()
+                    .context("the round roster")?;
+                let round = state
+                    .match_state
+                    .session
+                    .cooperative_round()
+                    .context("the round phase")?;
+                ensure!(
+                    !round.local_ready()
+                        && state
+                            .match_state
+                            .session
+                            .cooperative_round_continue_enabled(),
+                    "BC6 opens unready with Continue enabled"
+                );
+                let next = launch.selected_map_file.clone();
+                let first = self
+                    .cooperative_first_map
+                    .as_deref()
+                    .context("the first map")?;
+                ensure!(
+                    next.as_deref()
+                        .is_some_and(|next| next.eq_ignore_ascii_case(first))
+                        == lose,
+                    "a win selects the next map and a defeat the same one: {first} -> {next:?}"
+                );
+                self.route
+                    .push(json!({"frame":frame,"action":"BC6 opened","rows":rows,
+                    "next_map":next,"next_mission":page.model.next_mission,"time":page.model.time,
+                    "description":page.model.description}));
+                self.phase = if matches!(self.target, LanTarget::CoopNext | LanTarget::CoopRetry) {
+                    LanPhase::CoopRound(0)
+                } else {
+                    LanPhase::Settle(SETTLE_FRAMES)
+                };
+            }
+            LanPhase::CoopRound(step) => {
+                use crate::app::match_runtime::session::CooperativeRoundEvent;
+                match step {
+                    0 => {
+                        let layout = crate::app::input::coop_score::layout(state);
+                        let rect = layout
+                            .control_rect(crate::ui::coop_score_shell::CONTINUE)
+                            .context("Continue rect")?;
+                        let point = set_window_pointer_to_rect_center(state, rect);
+                        crate::app::input::coop_score::cursor_moved(state);
+                        crate::app::input::coop_score::mouse(state, MouseButton::Left, true);
+                        crate::app::input::coop_score::mouse(state, MouseButton::Left, false);
+                        let requests = state.match_state.session.take_network_loading_requests();
+                        ensure!(
+                            matches!(
+                                requests.as_slice(),
+                                [
+                                    NetworkLoadingRequest::CooperativeOptions(_),
+                                    NetworkLoadingRequest::CooperativeReady
+                                ]
+                            ),
+                            "the master's Continue sent {requests:?}"
+                        );
+                        ensure!(
+                            !state
+                                .match_state
+                                .session
+                                .cooperative_round_continue_enabled(),
+                            "Continue stays enabled once ready"
+                        );
+                        self.route.push(json!({"frame":frame,"action":"BC6 Continue",
+                            "point":point,"requests":requests.iter().map(|r|format!("{r:?}")).collect::<Vec<_>>()}));
+                    }
+                    1 => {
+                        crate::app::cooperative_round::service_event(
+                            state,
+                            CooperativeRoundEvent::PeerReady { source: 1 },
+                        )?;
+                        let requests = state.match_state.session.take_network_loading_requests();
+                        let Some(NetworkLoadingRequest::CooperativeOptions(options)) =
+                            requests.get(1)
+                        else {
+                            anyhow::bail!("the all-ready sent {requests:?}");
+                        };
+                        ensure!(
+                            requests.first() == Some(&NetworkLoadingRequest::CooperativeBegin),
+                            "the begin must precede the options: {requests:?}"
+                        );
+                        let ai: Vec<String> = options
+                            .opponents
+                            .iter()
+                            .map(|ai| {
+                                format!("{}:{:?}:{}", ai.raw_slot_index, ai.country, ai.color_index)
+                            })
+                            .collect();
+                        self.route.push(json!({"frame":frame,
+                            "action":"controlled guest 0x26: begin, +0x68 and 0x0069B8C0",
+                            "ai_rows":ai,"ai_count":options.ai_player_count}));
+                    }
+                    _ => {
+                        let seed = state.match_state.session.network_start_seed();
+                        crate::app::cooperative_round::service_event(
+                            state,
+                            CooperativeRoundEvent::Ack { source: 1 },
+                        )?;
+                        let requests = state.match_state.session.take_network_loading_requests();
+                        ensure!(
+                            requests.contains(&NetworkLoadingRequest::CooperativeGo),
+                            "the master's last ack sent {requests:?}"
+                        );
+                        ensure!(
+                            state.frontend.screen == GameScreen::Loading,
+                            "the go did not start loading"
+                        );
+                        ensure!(
+                            state.match_state.session.network_start_seed() == seed,
+                            "the continuation changed the agreed seed"
+                        );
+                        self.route.push(json!({"frame":frame,
+                            "action":"controlled guest 0x23: go and the next mission's load",
+                            "seed":seed,"max_ahead_frames":state.match_state.session.network_max_ahead_frames(),
+                            "map":state.match_state.session.network_setup().and_then(|launch| launch.selected_map_file.clone())}));
+                        self.phase = LanPhase::CoopNextLoading;
+                        return Ok(());
+                    }
+                }
+                self.phase = LanPhase::CoopRound(step + 1);
+            }
+            LanPhase::CoopNextLoading => {}
             LanPhase::ScoreWait => {
                 if rendered != PresentedShell::Score || !super::super::score::reveals_settled(state)
                 {
@@ -3739,14 +4361,28 @@ impl LanCapture {
                 | LanTarget::HostObserveOffered
                 | LanTarget::GuestAbortReturn
                 | LanTarget::LoadingTimeoutReturn
+                | LanTarget::CoopResult
+                | LanTarget::CoopNext
+                | LanTarget::CoopRetry
         )
     }
     pub(super) fn owns_simulation_steps(&self, state: &AppState) -> bool {
+        if let Some(live) = &self.live {
+            return live.owns_simulation_steps();
+        }
         self.abort_return()
             && self.phase == LanPhase::Loading
             && state.frontend.screen == GameScreen::InGame
     }
     pub(super) fn ready(&self, state: &AppState) -> Result<bool> {
+        if let Some(live) = &self.live {
+            return Ok(live.ready());
+        }
+        if self.phase == LanPhase::CoopNextLoading {
+            return Ok(state.frontend.screen == GameScreen::Loading
+                && crate::app::loading::pump::next_native_loading_frame(state)
+                    == Some(crate::app::loading::pump::NextLoadingFrame::First));
+        }
         if self.phase == LanPhase::RemoteProgress {
             ensure!(
                 state.frontend.screen == GameScreen::Loading,
@@ -3772,6 +4408,9 @@ impl LanCapture {
             && state.frontend.shell_first_paint_slide.is_none())
     }
     pub(super) fn receipt(&self, state: &AppState) -> Result<Value> {
+        if let Some(live) = &self.live {
+            return live.receipt(state);
+        }
         let loader_source = self.transferred_loader_source(state)?;
         let presentation = crate::app::loading::pump::network_loading_presentation(state);
         if self.target == LanTarget::HostObserverGo {
@@ -3804,11 +4443,42 @@ impl LanCapture {
             "art":format!("{:?}",loading.art),"atlas_ready":loading.atlas_ready,
             "participants":loading.participants.iter().map(|row|json!({"label":row.label,"art":format!("{:?}",row.art)})).collect::<Vec<_>>()}));
         Ok(
-            json!({"target":format!("{:?}",self.target),"route":self.route,"native_sha256":self.inputs["native_sha256"],
+            json!({"target":format!("{:?}",self.target),"route":self.route,
             "service_boundary":"controlled decoded inputs; no transport/backend claim","session":session_receipt(state),"before_handoff":self.admitted,"installed_runtime":self.observed_runtime,"observed_exit_cascade":self.observed_exit_cascade,"file_delivery":self.delivery,"parsed_transfer_source":loader_source,"loading_presentation":presentation}),
         )
     }
 }
+/// The retail Cooperative game type.
+fn cooperative_mode(state: &AppState) -> Result<&crate::skirmish_modes::SkirmishGameMode> {
+    state
+        .frontend
+        .skirmish_modes
+        .iter()
+        .find(|mode| mode.class == crate::skirmish_modes::MpModeClass::Cooperative)
+        .context("retail Cooperative mode")
+}
+
+/// The middle of a chooser list's row.
+fn list_row_point(
+    geometry: crate::ui::shell::list::ShellListGeometry,
+    row: usize,
+    top: usize,
+) -> (i32, i32) {
+    let row_h = geometry.metrics.row_h;
+    (
+        geometry.content.x + 4,
+        geometry.content.y + (row.saturating_sub(top) as i32) * row_h + row_h / 2,
+    )
+}
+
+/// A press and release on the chooser through its production handlers.
+fn chooser_press(state: &mut AppState, (x, y): (i32, i32)) {
+    state.match_state.input.cursor_x = x as f32;
+    state.match_state.input.cursor_y = y as f32;
+    App::handle_choose_map_modal_mouse_down(state);
+    App::handle_choose_map_modal_mouse_up(state);
+}
+
 fn session_receipt(state: &AppState) -> Value {
     json!({"mode":format!("{:?}",state.match_state.session_mode()),"host":state.match_state.session.host(),
         "setup":state.match_state.session.network_setup(),"seed":state.match_state.session.network_start_seed(),

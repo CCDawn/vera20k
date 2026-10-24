@@ -18,8 +18,6 @@ Set `RA2_DIR` or `VERA20K_GAMEMD_EXE` as described in
 archive input owner. No asset extraction directory or Rust output is required.
 `--write` records a new reference only after original execution succeeds.
 
-The pinned executable SHA-256 is
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`.
 `bridge_shadow_render.meta.json` records execution boundaries, substitutions
 and the payload digest. Archive, INI, palette and shape hashes are in the data.
 
@@ -270,7 +268,7 @@ CI clippy set passed with `VERA20K_REQUIRE_RETAIL_INI=1`: **9,567 passed,
 0 failed, 231 ignored**; clippy exited 0 with existing repository warnings.
 The simulation field ratchet passed at **2,532 baseline/current fields**.
 The [validation receipt](bridge_shadow_render.validation.json) records exact
-commands, source/log hashes and the corrected lifecycle fixture's separate run.
+commands, log hashes and the corrected lifecycle fixture's separate run.
 
 ```sh
 VERA20K_REQUIRE_RETAIL_INI=1 python -m tools.cargo_run -- test --workspace --lib

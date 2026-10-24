@@ -1,5 +1,95 @@
 # Native comparison workflow
 
+### Ordinary animation translucency
+
+`python -m tools.spatial_oracle.anim_translucency --check` runs physical FlakWH
+selection and SMKPUFF's original reader, constructor, AI, DrawIt and RGB565 raster.
+Three supplied background/A surfaces at four actual stages retain full color
+outputs and checked unchanged Z/A planes. The actual Display-effect emitter,
+lowering and GPU consumer is `anim_translucency_gpu_tests`; building-slot
+temporal state and complete battles are outside the comparison.
+See [inputs and boundaries](spatial_oracle/anim_translucency.md).
+
+### Building-slot animation translucency
+
+`python -m tools.spatial_oracle.building_anim_translucency --check` runs
+physical GAPOWR/GAPOWR_A readers and slot construction, a populated temporal
+notice, whole LetGo, AI and complete no-shadow animation draws. Three supplied
+surfaces cover all eight loop frames and replacement during erasure: 78 full
+color/Z/A outputs. Compact lossless planes accompany a complete raw archive.
+The ordinary CLEG Attack/Stop lifecycle and actual slot-emitter GPU comparison
+are separate tests. See [inputs and boundaries](spatial_oracle/building_anim_translucency.md).
+
+### Mind-control attacked-object events
+
+`python -m tools.spatial_oracle.mind_control_tags --check` runs eleven original
+`BulletClass::DetonateAtCoord` controls through attached-object events 6 and 44.
+The ordinary rows stop before CaptureUnit; two rejection controls execute its
+refusal. The fixture inputs, callback state and excluded world lifecycles are
+documented in [`mind_control_tags.md`](spatial_oracle/mind_control_tags.md).
+
+The Rust regression
+`retail_all02_mind_control_attack_starts_the_authored_stallone_script` uses the
+physical Allied mission 2 map's Lasher/Stallone actors and unchanged trigger
+definitions. A stock YURI attack must start the authored ChangeHouse, CreateTeam
+and Voice chain without damaging the tank. It supplies a flat arena and an
+already-acquired YURI; it does not replay the Engineer/base-building opening or
+compare a complete original campaign. Set `RA2_DIR` to the retail install and
+`VERA20K_REQUIRE_RETAIL_ASSETS=1` so absent archives fail instead of skipping.
+
+### Attached animation detail admission
+
+`python -m tools.spatial_oracle.building_anim_detail --check` keeps one physical
+GAPOWR/GAPOWR_A slot and runs 16 whole DrawIfVisible controls. Original Logic
+counters and Throttle supply sampled rates; options, hysteresis and offscreen
+controls retain actual FPS-query counts, thresholds, latch changes and Surface
+admission. The retail CPU test consumes those observations through the actual
+slot emitter and shared Display traversal. See
+[inputs and boundaries](spatial_oracle/building_anim_detail.md).
+
+### Computer sale of captured buildings
+
+`python -m tools.spatial_oracle.captured_building_sale --check` executes the
+original Engineer order/Walk/capture path through Building ChangeOwner's sale
+handoff, with additional bounded controls for its predicates, C4, Buildup and
+upgrade refunds. The real Building constructor establishes the initial House;
+the current owner may subsequently change without replacing that identity.
+The input setup, original call sites and explicit fixture boundaries are in
+[`captured_building_sale.md`](spatial_oracle/captured_building_sale.md).
+
+The corpus stops before the Selling mission visits. The retail Rust tests in
+`world::ai_captured_building_sale_tests` supply an ordinary AI Capture order,
+observe Engineer movement, and run the captured plant's sale through its
+refund/removal. A second test captures, saves/loads, and recaptures the plant
+for its constructor House, which keeps it. These compose the rebuilt engine;
+they do not execute autonomous native Team/Hunt planning or original SAV load.
+
+### Selected-weapon target-scan bound
+
+`python -m tools.spatial_oracle.threat_scan_bound --check` compares 65 original
+`Greatest_Threat` bound calculations at `0x6F9042..0x6F9148`. The preceding
+`Threat_Range` result and runtime type, weapon, veterancy and cargo state are
+supplied. Original getters execute without substitutions; the bound is read
+from `ESP+0x38`. Checked completion requires the relevant branch visits,
+unchanged object storage and stack pointer, and no writes outside the stack.
+
+The controls cover nonzero hard bounds, current weapon slots for non-Gattling
+types with `TurretCount > 0`, the underwater/organic/self-healing `GuardRange`
+branch, fallback slots 0/1, signed cell truncation, `AirRangeBonus`, elite
+fallback and open-topped cargo limits. The Rust comparison is
+`scan_bound_matches_original_weapon_selection_slice` in
+`src/sim/combat/greatest_threat.rs`. The slice ends before occupied-building
+adjustments, target traversal and scoring; it is not a whole-game comparison.
+
+The related stock regression,
+`retail_sniper_ifv_guard_scan_uses_its_boarded_weapon_range`, uses retail Battle
+rules and the production boarding command to put `SNIPE` in an `FV`. It checks
+Guard acquisition at 12 cells with `AWPE`, rejection at 15 cells, and rejection
+after unloading restores `HoverMissile`. Set `RA2_DIR` to the retail install
+and `VERA20K_REQUIRE_RETAIL_ASSETS=1` so missing archive inputs fail instead
+of skipping. This joins stock boarding to the rebuilt scanner; it does not
+run a matching whole native scenario.
+
 ### Terror Drone firing, impulse and Drive controls
 
 `tools.spatial_oracle.gattling_unit_fire --shp-frames --check` compares the
@@ -74,13 +164,13 @@ and explicit direct-Limbo/Attach boundary are documented with the
 
 For original byte reads, disassembly and whole-code scans, use the indexed
 [native inspection tool](native_inspect.md). It shares this runner's executable
-identity and PE owner; static inspection is separate from checked execution.
+selection and PE owner; static inspection is separate from checked execution.
 
 Native comparison guidance; adapt as useful and distinguish findings from hypotheses.
 
 Use original `gamemd.exe` instructions to produce reference outputs, then compare
 the Rust function used by the engine against them. The shared Python runner handles
-executable identity, bounded execution, fresh function-call state, diagnostics, and
+executable selection, bounded execution, fresh function-call state, diagnostics, and
 reference-file checks. It does not establish that a chosen function or fixture
 represents the game's active path.
 
@@ -93,71 +183,52 @@ interpretation; a static file scan does not observe initialized memory.
 
 ## Run an existing comparison
 
-From the repository root, with Python 3.10+ and Unicorn **2.1.4** installed:
+From the repository root, using Python **3.12+** and the pinned test dependencies
+(including Unicorn **2.1.4**):
 
 ```powershell
-python -m pip install unicorn==2.1.4
+python -m pip install -r tools/requirements-test.txt
 $env:VERA20K_GAMEMD_EXE = 'C:/your-retail-install/gamemd.exe'
 python -m tools.color_oracle.hsv_to_rgb
-cargo test -p vera20k-core --lib rules::color_scheme::tests::hsv_to_rgb_matches_native_oracle_all_hues_at_sv_boundaries
+python -m tools.cargo_run -- test -p vera20k-core --lib rules::color_scheme::tests::hsv_to_rgb_matches_native_oracle_all_hues_at_sv_boundaries
 ```
 
 `RA2_DIR` is an alternative; an explicit executable path takes precedence and never
-silently falls back. The loader hashes the same immutable bytes it maps. It accepts
-these exact retail executables, including under optimized Python:
-
-- Historical reference: `1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`.
-- Steam installation: `3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600`.
+silently falls back. The loader maps whichever `gamemd.exe` that selects, with no
+identity check or refusal: every copy (the original 1.001, Steam and other releases)
+is treated as the same game.
 
 No executable is distributed here.
-This restriction belongs to these comparison tools alone, because their harnesses
-run code at fixed addresses of that build. The game reads no `gamemd.exe` bytes.
-The Rust table checks read the `RA2_DIR` executable's math tables at the same
+The harnesses run code at fixed retail addresses, so a copy whose code differs
+there produces different outputs and fails `--check`. The game reads no `gamemd.exe`
+bytes. The Rust table checks read the `RA2_DIR` executable's math tables at the same
 retail addresses and compare every byte, without checking the file hash.
 
-### Steam compatibility and evidence identity
+### Evidence identity
 
-The Steam file's four file-backed section hashes/layouts match the historical
-sections in the sealed
-[`loader_compatibility.json`](spatial_oracle/shrapnel_damage/loader_compatibility.json).
-This establishes identical section bytes and virtual addresses for these fixed-address
-fixtures. The comparison results belong in the PR description, not a committed
-inspection receipt. It does not compare PE headers/section-external bytes or establish Windows
-startup, imports, DRM or complete game behavior. Reproduce the Steam section record
-with `python -m tools.native_inspect sections` after selecting the Steam EXE.
-
-`image_sha256()` and `provenance()` identify the actual selected file. Static
-inspection, native frame reports and standalone new execution receipts do so too.
-`NATIVE_SHA256` remains the historical reference identifier in legacy Rust-facing
-vector payloads; it must not be used to attest a newly selected executable.
-The authoritative execution identity for those legacy vectors is their provenance
-sidecar. Existing sidecars and historical fixture replays retain strict identity
-checks: accepting another input does not relabel old evidence as Steam execution.
-Ghidra annotation ledgers also remain tied to their own `program_sha256`; a Steam
-program needs a ledger authored for that program.
-
-The factory packet's registered helper profiles and inspection-owner seal are
-unchanged. Its public historical replay admission checks the actual file, including
-the direct consumer/gate routes. Only the explicitly unregistered candidate helper
-map is refreshed for the changed shared sources; it is not a compatibility verdict.
+Every `gamemd.exe` build is the same game, so references record what the executable
+computes, never which build ran it; `replay_command` records how the payload was
+made. `finish_vectors` refuses, under `--check` and `--write` alike, output that would
+publish a `gamemd.exe` hash: the configured executable's SHA-256 anywhere in the
+payload, its sidecars or the raw archive. It recognizes only that digest, so record
+no other hash of the executable or its sections either. Producers with their own
+writers bypass the check; new comparisons use `finish_vectors`. To compare two
+releases' code, use `python -m tools.native_inspect sections`.
+Ghidra annotation ledgers replay on any `gamemd.exe` program.
 Saved-receipt unit tests validate retained profile claims against the sealed
 registration independently of today's source admission. Native factory controls
 have not been replayed or rebaselined by this change.
 
-Generate and check Steam-specific evidence at a separate path, preserving the old
-goldens (the parent directory is created by `--write`):
+Any `gamemd.exe` checks the committed references directly:
 
 ```powershell
 $env:VERA20K_GAMEMD_EXE = 'C:/Games/RA2/gamemd.exe'
-python -m tools.native_inspect sections
-python -m tools.spatial_oracle.shroud_current_sight --write --output logs/steam/shroud.json
-python -m tools.spatial_oracle.shroud_current_sight --check --output logs/steam/shroud.json
+python -m tools.spatial_oracle.shroud_current_sight --check
 ```
 
-Compare the separate Steam payload with
-[`shroud_current_sight.json`](spatial_oracle/shroud_current_sight.json), preserving
-its Steam provenance sidecar. These 23 histories and 9 timer cases cover selected
-cell reveal/gap and timer transitions, not renderer pixels or full-game parity.
+[`shroud_current_sight.json`](spatial_oracle/shroud_current_sight.json)'s 23 histories
+and 9 timer cases cover selected cell reveal/gap and timer transitions, not renderer
+pixels or full-game parity.
 Keep execution receipts and validation results outside the source tree and report
 them in the PR description.
 
@@ -182,6 +253,15 @@ complete map. No custom map, ART, SHP or sound file is required. The 20 range ro
 cover the Unit bunker bonus, direct/arcing boundaries and declared ordering and
 overflow controls. Their native input readers establish LTNK/ATGUN/Cannon fields;
 installation, acquisition, firing and rendering remain separate validation.
+
+### Tank-bunker entry
+
+`python -m tools.spatial_oracle.bunker_entry --check` executes eight joined
+original histories through the Unit destination, Building radio and Foot Enter
+owners, including busy, cancellation, replacement and AI seek controls. A supplied
+arrival exercises PerCell DOCK_NOW; a prepared state3 control pins the native
+wait for a retained Drive destination. Rust consumes these outputs separately
+from stock world-frame installation tests. See [scope and reproduction](spatial_oracle/bunker_entry.md).
 
 ### Stationary attack actions and building control
 
@@ -230,6 +310,7 @@ covered. The metadata records the executed binary, command and supplied type get
 
 | Python module | Sampled native behavior | Rust consumer/test location |
 | --- | --- | --- |
+| `tools.spatial_oracle.vehicle_passenger_escape` | Six resolved-input Unit passenger controls through the original death-escape caller, full Unit Unlimbo, map occupation, virtual Scatter and destination setter. Two-passenger rows retain the first passenger's native writes: its new NavCom admits the second before movement. Includes Sleep-to-Guard Unlimbo, frame, retained destination and blocked-neighbor controls. Boarding, damage prefix, full constructors/readers and later movement are excluded. | `world/vehicle_passenger_escape_oracle_tests.rs` compares placement, navigation, occupancy and RNG; `passenger/gunner_tests.rs` exercises stock LCRF/MTNK boarding and destruction through production commands and damage. |
 | `tools.rmg_oracle.gen_rng_vectors` | Seeded state and 16 draws for five seeds | `src/map/rmg/rng.rs` |
 | `tools.rmg_oracle.gen_x87_vectors` | Eight Gaussian draws for two seeds | `src/map/rmg/x87.rs` |
 | `tools.storage_oracle.sed_description` | 28 fresh-file Description fixtures and one cached-section diagnostic; original reader with supplied INI indexes | `src/map/rmg/description.rs`; disk-load regression in `saved_seeds.rs` |
@@ -261,6 +342,7 @@ covered. The metadata records the executed binary, command and supplied type get
 | `tools.spatial_oracle.radiation_damage_boundary` | Six original percentage/Radiation reader, flat-site spread, Foot admission and Object receiver rows explaining the shared Verses regression | `combat_tests::rad_damage_fires_on_application_delay_boundary_only`; final health/admission only, with native base59 versus Rust60 explicitly unresolved. [Bounds and required radiation follow-up](spatial_oracle/radiation_damage_boundary.md) |
 | `tools.rules_oracle.bridge_child_sound` | Original selected SOUNDMD registry/Voc readers and three ART Report bindings; native Release versus hard-stop on two playing one-shot events | `sound_dispatch::bridge_child_sound_tests` exercises the existing Anim event/audio owner; device channels, waveform equivalence and whole child AI order remain outside native execution. [Sound evidence](rules_oracle/bridge_child_sound.md) |
 | `tools.rules_oracle.anim_image` | 11 original Image25 reads and loader fallback selections; exact section and current-ID default supplied from the caller | `art_data_tests.rs`, asset catalog and both atlas consumers preserve literal animation type identity |
+| `tools.rules_oracle.anim_theater_flags` | 26 original fresh AnimType reader/theater-postpass controls: Image-section flag defaults, own overrides, invalid/missing values, one-hop aliases and literal-file availability; declared header-only SHPs | `art_data_tests.rs::animation_theater_flags_match_original_fresh_read_and_postpass`; [scope and reproduction](rules_oracle/anim_theater_flags.md). Retained INI rereads, instance lifetime and the complete Theater filename policy are excluded |
 | `tools.spatial_oracle.bridge_debris_producer` | 266 original Cell47DD70 producer/Anim constructors plus 12 shared death-debris loops; production-exported 15/4 animation pools and SHP frame counts | `world/bridge_debris_tests.rs` and combat death-debris tests; synchronous constructor/RNG order, excluding later AI |
 | `tools.spatial_oracle.bridge_debris_flight` | 32 joined original producer/primary AnimAI/Bounce histories across dry, water, deck and discontinuous ground; per-visit RNG and child constructors; duplicate pending-delete queue drain executes once | `world/bridge_debris_flight_tests.rs`; only primary AI scheduled, empty contact/observer lists, supplied audio boundaries and false bridge drivers. See chain evidence |
 | `tools.spatial_oracle.terrain_debris_receiver` | 24 original Bouncer contact/Terrain ReceiveDamage/unlink/Logic/retirement rows; actual retail TREE01 occupation bits | `anim_debris_tests.rs` compares 19 single-tree receiver cases. Synthetic multi-tree, custom successful death-animation and populated observer chains are excluded |
@@ -281,6 +363,7 @@ covered. The metadata records the executed binary, command and supplied type get
 | `tools.spatial_oracle.bridge_base_edges` | 86 signed/clamped endpoint, canonical pair, reverse bucket order and deduplication cases | `src/sim/pathfinding/bridge_base_native_tests.rs`, production `zone_build.rs`; cache/restore regression in `world/navigation_tests.rs` |
 | `tools.spatial_oracle.tube_hierarchy` | 65 high/Tube hierarchy helper cases, five ReadTubes writes, six raw-zone gate cases, five constant-walk endpoints and seventeen DWORD zone queries; raw data domain remains bounded | `src/sim/pathfinding/tube_hierarchy_native_tests.rs`, production `zone_build/hierarchy.rs`; route/transaction regressions in `zone_search_tests.rs` and `app/persistence/tube_hierarchy_restore_tests.rs` |
 | `tools.spatial_oracle.path_entry` | 19 original endpoint lookup/query/retained projection and conditional playfield cases; final mover predicate supplied | `src/sim/pathfinding/zone_search/native_path_entry.rs`, production wrappers and tests in `zone_search_tests.rs` |
+| `tools.spatial_oracle.foot_path_window` | 10 original Unit/Drive-or-Ship/Find_Path wrapper cases: short and 23/24/25-word routes, an in-window tube word, copy canaries, terminator and reference-cell observations; complete AStar output supplied, search and later movement excluded. [Reproduction, bounds and manual check](spatial_oracle/foot_path_window.md) | `src/sim/movement/foot_path_window_tests.rs::installed_path_window_matches_original_find_path_copy` compares live words and reference cell; `retail_tank_and_infantry_replace_path_windows_and_reach_their_move_destination` separately runs stock MTNK/E1 long Move orders through serial and batched whole-frame Rust continuation, without a native route or timing claim |
 | `tools.spatial_oracle.astar_structural_height` (`--finishing`, `--hills-inputs`, `--mtnk-inputs`, `--threat-inputs`) | Original successful reconstruction/both finishing passes, physical Hills/MTNK inputs, Team coefficient readers/getter and signed House adjustment kernel | Shared movement/pathfinding and retained threat owners; [evidence bounds and commands](spatial_oracle/astar_path_finishing.md). Whole native route and production validation are separate requirements. |
 | `tools.spatial_oracle.bounce_height` | 48 ground/query/surface cases through original Bounce update; flat contacts and airborne slopes, velocity signed zero excluded from Rust comparison | `src/sim/world/bounce_terrain_tests.rs`, live `bounce_terrain.rs` and `bounce.rs`; separate cliff/slope physics remains open |
 | `tools.spatial_oracle.bounce_startup_capture` | Original process captures Bounce104/416 scalars and x87 control at four startup boundaries; executable section integrity | Inputs to `bounce_height`; constructor/startup evidence, not complete debris physics |
@@ -298,6 +381,7 @@ covered. The metadata records the executed binary, command and supplied type get
 | `tools.spatial_oracle.aircraft_fire_location` | 51 full original FindFireLocation calls: target identity, native rings/ranking, map/visibility, live reservations, Spawned/Carryall/AirportBound admission and RNG continuation; supplied runtime state, no substituted calls | `util/native_trig.rs` compares candidate geometry and ranked distances against existing deterministic math; production search, destination assignment and state1 integration remain required |
 | `tools.spatial_oracle.fly_destination` | 26 original non-null Fly MoveTo calls: retained XYZ, signed-cell landing refusal, power gate, signed Ammo/Target height substitution, FlightLevel fallback, mode/readiness suffix; no substituted calls | `world/fly_height_tests.rs` compares retained destination and refusal through the air order boundary, plus production cell orders and save/restore; moving/mode suffix, null/Stop and full Aircraft/Foot navigation remain unported |
 | `tools.spatial_oracle.track_destination --null-boundary` | 84 original Foot/Aircraft NULL setter calls over constructed Drive/Ship locomotors: current/queued Attack and target gate, clear/Stop/timer order, NULL admission bypass, flags, power, already-null NavCom, skip latch and signed timer edges; RNG continuation | `track_destination_null_boundary.{json,meta.json}` bounds evidence to Foot/class NULL control and timers. The Aircraft vtable with Drive/Ship is an explicit boundary probe; native Fly Stop and stock Aircraft flight are excluded. |
+| `tools.spatial_oracle.magnetron_aircraft_lift` | Ten original hit/Imbue/class-destination/Jumpjet histories, bounded release and restore gates, two Aircraft landing gates, and five terminal impact/Notice controls | `sim/locomotor_lift_native_tests.rs`, `world/crash_tests.rs` and Jumpjet landing tests consume the bounded native results. [Scope and reproduction](spatial_oracle/magnetron_aircraft_lift.md) separates supplied states and impact effect leaves from the physical ORCA/BEAG whole-frame Rust regression. |
 | `tools.spatial_oracle.fly_takeoff` | 80 original callbacks with live facing histories, strict height thresholds, Carryall landing base, bridge/slope, signed ROT and both flag clears; no substituted calls | `world/fly_height_tests.rs` compares production callback fields; existing FacingClass owns both turns. Excludes BeginTakeoff, landing and full flight |
 | `tools.spatial_oracle.fly_takeoff_phase` | 75 full original phase-dispatch calls with actual Foot/Techno/Object Mark and Display, health/flag gates and same-layer reordering | `world/fly_height_tests.rs` compares the production pure-takeoff transaction and save/restore continuation; excludes preceding Process motion, landing and non-Landable branches |
 | `tools.spatial_oracle.fly_landing_phase` | 29 full original accepted ordinary landing phases: retained Top-to-Ground resubmission, threshold/latch, air-tracker removal, neighbor-counter migration, destination clear/path timer and unchanged RNG | Evidence for the pending Rust landing callback; no substituted gameplay calls. Covers already-OnBridge state, not changed-layer phase suffixes, refusal/search/destruction, AirportBound docking, Carryall/type+C95 effects or full flight/rendered parity |
@@ -310,6 +394,8 @@ covered. The metadata records the executed binary, command and supplied type get
 | `tools.spatial_oracle.trigger_action_values` | 61 original TAction constructor/read/global-local dispatch cases: parameter type versus operand, token8 overrides, empty tokens, signed overflow and variable bounds | `sim/trigger_runtime_tests.rs::parsed_variable_actions_match_native_reader_dispatch_and_restore` compares parsed actions through production frames and save/restore. Excludes named sound/theme/speech lookup and live timer-reset fanout |
 | `tools.spatial_oracle.trigger_event_records` | 54 original counted reader cases: variable record widths, numeric/type-name materialization, reversed event list, timer/elapsed/global/local predicate samples | `sim/trigger_runtime_tests.rs::parsed_event_records_match_native_list_and_production_predicates` compares parsed records and supported predicates through production frames. Excludes resolved Team references, nonempty TechnoType scans and live Trigger completion/timers |
 | `tools.spatial_oracle.tag_lifecycle` | 49 original histories: shared/fresh Tags, reversed linked execution, repeat modes/refcounts, Object/cell attachment and detach, completion bits, timer/RNG/reset fanout, force/enable/disable, deferred destructors and Logic polling/list mutation | Evidence for the pending live-instance migration. Supplies allocation/free storage, OS pointer probing and initialized registries; no gameplay calls replaced. Excludes scenario registration classification/countdown expiry, Team/physical Object destruction and gated House-win/cursor updates; no Rust live-instance parity claim |
+| `tools.spatial_oracle.tag_lifecycle --spy-entry-events` | 17 original event53 forced display-House predicates, eight cached CellTag53/54 caller slices and one linked one-shot Tag lifecycle | `trigger_runtime_shroud_spy_tests.rs` consumes all predicate controls, the ordinary caller's raise order and the linked lifecycle's locals/queue count. Caller mutations remain native evidence only. The retail Spy entry/save/restore/message regression is Rust integration; no whole native scenario, rendering or arbitrary callback parity claim |
+| `tools.spatial_oracle.building_sale_triggers` | Original sale-completion sentinel, live destruction callbacks and post-callback refund on a physically constructed Building | [Boundaries and reproduction](spatial_oracle/building_sale_triggers.md). Rust compares the shared callback and accounting owners; a separate physical ALL01 regression drives ordinary SELL through build-down and the authored SpySat_Boom map actions. Full native campaign execution and rendered parity are excluded. |
 | `tools.spatial_oracle.techno_rearm` | 267 original GetROF numeric/RNG cases with explicit virtual query substitutions; original RTTI leaves separately establish Unit1, Aircraft2, Building6, Infantry15 | Evidence for rearm migration; Unit delay and Building one-frame shortcut identities corrected; no complete production rearm parity claim |
 | `tools.spatial_oracle.building_fire_turn` | 140 original voxel-building facing retry decisions using raw Type ROT; stops before Snap/GetFireError | `combat/combat_turret_facing_tests.rs` drives the production fire receiver against every decision |
 | `tools.spatial_oracle.building_voxel_flh` | 13 original `BuildingClass::GetFLH 0x00453840` coordinate cases covering its `+0x16C5` arm and disabled/primary-pixel precedence controls: the type's TurretAnimIsVoxel/X/Y, PrimaryFirePixelOffset/DualOffset and merged FLH, the `+0x388` heading snapped by `0x004C9300`, burst parities, the stock GTGCAN 3/28 and YAGGUN 0/15 inputs, and the `+0x16C6`-clear prefix; each row records GetFLH's coordinate, the building's own `GetCoords 0x00459EF0` and the reached addresses (the disabled control never reaches `IsometricPixelToWorld 0x006D2070`) | `combat/fire_coord_building_tests.rs::building_voxel_turret_shot_origin_matches_the_original_flh` replays every row through the production rules/ART readers; `retail_voxel_turret_inputs_match_the_native_rows` checks the stock inputs against the retail layers and `app/presentation/fire_effects.rs::stock_voxel_turret_shot_positions_bullet_flash_and_report_together` drives a real Grand Cannon shot through `advance_tick` and checks its bullet, bound muzzle AnimClass and positioned report sound |
@@ -357,30 +443,38 @@ PerCell (`0x54C8CB..0x54C8F0`), then calls the class NULL setter unconditionally
 The no-target production regression is in `world/per_cell_object_turn_tests.rs`;
 the shared NULL corpus provides the timer arithmetic comparison.
 
-Sidecars identify the executable, Unicorn Python binding and native core versions,
-entries, fixture assumptions, substitutions, coverage, and canonical payload hash.
-Metadata changes fail checks even if outputs match, prompting review of the changed
-environment. Existing references without sidecars remain checkable, with an explicit
-message that their historical environment is unknown. Regeneration can record the
-current environment; it cannot recover historical provenance.
+Sidecars record entries, fixture assumptions, substitutions, coverage and the
+canonical payload hash, plus the Unicorn Python binding and native core versions that
+ran the replay. Evidence metadata changes fail checks even if outputs match.
+`oracle_sources.evidence` leaves out `replay_command` and those runtime versions, and
+a raw archive is compared by its content rather than its zlib-dependent compressed
+bytes, so another environment that reproduces the output passes. Existing references
+without sidecars remain checkable, with an explicit message that their historical
+environment is unknown. Regeneration can record the current environment; it cannot
+recover historical provenance.
 
-Sidecars pin no hashes of repository sources (AGENTS.md), so an edit to a shared
-helper fails no `finish_vectors` check whose native output is unchanged. The runner
-still hashes the sources a producer declares in `source_paths` and refuses to compare
-or publish if one changed while it ran. `replay_command` records how the payload was
-made; it is not evidence. A sidecar from another branch that still carries the old
-`source_normalized_lf_sha256` pin passes; `--write` drops the field.
-
-Some older producers still keep source hashes in fields of their own, such as
-`harness_sha256`, `sources` or `source_pins`, and compare their whole sidecar. An edit
-to such a source fails their `--check` until those fields are removed (#1137).
+Sidecars and payloads pin no hashes of repository sources (AGENTS.md), so an edit to
+a shared helper fails no check whose native output is unchanged. The runner still
+hashes the sources a producer declares in `source_paths` and refuses to compare or
+publish if one changed while it ran; it records nothing.
 
 ## Add a comparison
 
-Start with `tools/color_oracle/hsv_to_rgb.py` for a complete example. Establish the
-body, active callers, calling convention, input/state ownership, and observable
-outputs before constructing the fixture. Select cases that exercise meaningful
-branches and boundaries. Avoid a second Python implementation of the algorithm.
+Read native instructions for ordinary control flow and arithmetic. Execute native
+code only for a shared numeric kernel, RNG draws, a known arithmetic trap reached
+by retail data, or a discrepancy demonstrated by a playtest or bug report; see
+[AGENTS.md](../AGENTS.md#exactness-and-evidence).
+
+New committed fixtures hold at most about 20 cases, contain only the inputs and
+outputs the Rust test asserts, and stay under 100 KB per file. Keep call traces,
+addresses, register values and stack dumps out of those payloads. Keep a harness
+only while a Rust test consumes its output, with a sidecar recording the replay command.
+
+Use `tools/color_oracle/hsv_to_rgb.py` as an API example. Its existing 2,304-input
+sweep is historical, not guidance for new fixture size. Establish the body, active
+callers, calling convention, input/state ownership, and observable outputs before
+constructing the fixture. Choose boundary cases, not sweeps or grids, and avoid a
+second Python implementation of the algorithm.
 
 * `call(address, ecx=..., stack_args=[...], writes={...}, dumps={...})` maps verified
   code in a fresh emulator for each invocation. Entries must lie in an original
@@ -400,14 +494,15 @@ branches and boundaries. Avoid a second Python implementation of the algorithm.
   Pass `source_paths={label: Path(...)}` for the producer and its relevant helpers:
   the shared publisher hashes them before generation and refuses to compare or
   publish if one changed through metadata construction. This is a run consistency
-  check; nothing is recorded. Do not hash sources into metadata fields: sidecars
-  pin no repository sources, and `--check` compares every field but
-  `replay_command`. Do not list the Rust consumers either: the native run executes
+  check; nothing is recorded. Do not hash sources into the payload or metadata:
+  `--check` compares every evidence field, so a source hash would fail it after any
+  unrelated edit. Do not list the Rust consumers either: the native run executes
   no Rust, and their own tests compare them with the corpus.
+* Record no hash of `gamemd.exe` in the payload or provenance, such as a digest of
+  `image_bytes()` (see Evidence identity).
 * Consume native outputs in a focused Rust test of the actual production function.
   Assert case identity/coverage as well as output equality, and review the connection
-  to callers independently. The HSV example checks 2,304 inputs, not all 256³ inputs
-  or final rendered colors.
+  to callers independently.
 
 ## Investigating a failed native run
 
@@ -453,9 +548,8 @@ Context must be a JSON object and is frozen before execution. `call` accepts the
 same argument and adds a reserved `call` object containing ECX/EDX, stack
 arguments, FPCW, observation mode and fixture write ranges. Reports do not copy
 the full heap, pointed-to data or executable and cannot restore an emulator.
-Include the fixture selectors needed to reproduce the case. The recorded
-`supported_native_sha256` lists accepted input identities, not an attestation of a
-custom machine: `run_checked` also accepts synthetic tests.
+Include the fixture selectors needed to reproduce the case. `run_checked` also
+accepts synthetic tests.
 
 The shared `Reader.invoke(..., context=...)` forwards this context. Anytown
 `Mission.setup` supplies its fixture class, phase/frame, continuation inputs and
@@ -508,7 +602,8 @@ python -m unittest tools.test_native_oracle -v
 
 These test runner behavior, not retail behavior. The tests cover limits, faults,
 premature stops, alternate exits, missing paths, fresh state, FSTP completion,
-executable identity, reference preservation, provenance mismatches, and diagnostics.
+executable selection, executable-hash refusal,
+reference preservation, provenance mismatches, and diagnostics.
 
 ## Saved-map browser comparisons
 

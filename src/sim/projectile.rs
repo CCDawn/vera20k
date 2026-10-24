@@ -201,44 +201,42 @@ impl ProjectileCoord {
     }
 }
 
-/// CellClass virtual +0x48 @ 0x00486840: cell centre and its ground surface.
-/// This remains distinct from +0x58's structural bridge aim offset.
+/// CellClass virtual +0x48 @ 0x00486840 of the cell `MapClass::Get_CellClass`
+/// (`0x005657A0`) gives for `(rx, ry)`, through the simulation's lookup
+/// ([`crate::sim::movement::target_cell_coord`]): a cell off the map is the
+/// shared fallback CellClass, which the lookup stamps with the coordinate.
 pub(crate) fn cell_ground_coord(
     terrain: Option<&ResolvedTerrainGrid>,
     rx: u16,
     ry: u16,
 ) -> ProjectileCoord {
-    if let Some(cell) = terrain.and_then(|grid| grid.cell(rx, ry)) {
-        let point = crate::sim::cell_rect::CellRef::Real(cell)
-            .center_coordinate()
-            .expect("resolved CellClass target must have a supported slope");
-        return ProjectileCoord::new(point.x, point.y, point.z);
-    }
-    // Preserve the mapless/missing-cell flat-ground adapter. Production misses
-    // retain the shared CellClass and use dummy_cell_ground_coord instead.
-    let point = crate::sim::cell_kernel::cell_center(
-        crate::sim::cell_kernel::CellCoordinate {
-            x: i32::from(rx as i16),
-            y: i32::from(ry as i16),
-        },
-        0,
-    );
+    let cells = terrain.map(crate::map::resolved_terrain::NativeCellQuery::canonical);
+    let point = crate::sim::movement::target_cell_coord(rx, ry, cells.as_ref());
     ProjectileCoord::new(point.x, point.y, point.z)
 }
 
-/// CellClass virtual +0x58 @ 0x00486890: +0x48 ground coordinate plus 416
-/// leptons iff the cell's own structural bit is live. FireAt, Bullet::Fire
-/// and the final impact ladder all read this aim, independently of walkability.
+/// CellClass virtual +0x58 @ 0x00486890 of the cell `MapClass::Get_CellClass`
+/// gives for `(rx, ry)`, as [`cell_ground_coord`] looks it up. FireAt,
+/// Bullet::Fire and the final impact ladder all read this aim,
+/// independently of walkability.
 pub(crate) fn cell_target_coord(
     terrain: Option<&ResolvedTerrainGrid>,
     rx: u16,
     ry: u16,
 ) -> ProjectileCoord {
-    let structural = terrain
-        .and_then(|grid| grid.cell(rx, ry))
-        .is_some_and(|cell| cell.bridge_facts.has_structural_bridge());
-    let mut coord = cell_ground_coord(terrain, rx, ry);
-    if structural {
+    cell_ref_target_coord(&crate::sim::cell_rect::get_cellclass_fallback(
+        terrain,
+        i32::from(rx),
+        i32::from(ry),
+    ))
+}
+
+/// CellClass virtual +0x58 of a cell already looked up: its +0x48 ground
+/// coordinate plus 416 leptons iff its own structural bit is live.
+pub(crate) fn cell_ref_target_coord(cell: &crate::sim::cell_rect::CellRef<'_>) -> ProjectileCoord {
+    let ground = cell.get_coords();
+    let mut coord = ProjectileCoord::new(ground.x, ground.y, ground.z);
+    if cell.bridge_flags_0x1180() & crate::map::bridge_facts::BRIDGE_FLAG_STRUCTURAL != 0 {
         coord.z = coord
             .z
             .wrapping_add(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
@@ -252,8 +250,7 @@ pub(crate) fn dummy_cell_ground_coord(dummy: &SharedCellDummy) -> ProjectileCoor
     let point = crate::sim::cell_rect::CellRef::Dummy {
         cell: dummy.clone(),
     }
-    .center_coordinate()
-    .expect("shared CellClass target must have a supported slope");
+    .get_coords();
     ProjectileCoord::new(point.x, point.y, point.z)
 }
 
@@ -261,23 +258,18 @@ pub(crate) fn dummy_cell_ground_coord(dummy: &SharedCellDummy) -> ProjectileCoor
 /// shared fallback CellClass. Unlike a stable allocated cell, every later miss
 /// can change the coordinate observed through this retained identity.
 pub(crate) fn dummy_cell_target_coord(dummy: &SharedCellDummy) -> ProjectileCoord {
-    let structural =
-        dummy.retained_bridge_flags() & crate::map::bridge_facts::BRIDGE_FLAG_STRUCTURAL != 0;
-    let mut coord = dummy_cell_ground_coord(dummy);
-    if structural {
-        coord.z = coord
-            .z
-            .wrapping_add(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
-    }
-    coord
+    cell_ref_target_coord(&crate::sim::cell_rect::CellRef::Dummy {
+        cell: dummy.clone(),
+    })
 }
 
 /// The original target retained by a projectile after weapon fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ProjectileTarget {
     Entity(u64),
-    /// Stable MapClass CellClass identity. Its target coordinate is resolved
-    /// from live terrain state instead of freezing the cleanup-time Vec3.
+    /// Stable MapClass CellClass identity, always a real cell; one off the
+    /// map is [`Self::DummyCell`]. Its target coordinate is resolved from live
+    /// terrain state instead of freezing the cleanup-time Vec3.
     Cell {
         rx: u16,
         ry: u16,
@@ -296,6 +288,32 @@ pub enum ProjectileTarget {
 }
 
 impl ProjectileTarget {
+    /// The cell `MapClass::Get_CellClass` (`0x005657A0`) gives for `(rx, ry)`
+    /// as a target ([`Self::of_cell`]); the lookup stamps a miss with the
+    /// coordinate. A map-less fixture keeps the cell.
+    pub(crate) fn looked_up_cell(terrain: Option<&ResolvedTerrainGrid>, rx: u16, ry: u16) -> Self {
+        if terrain.is_none() {
+            return Self::Cell { rx, ry };
+        }
+        Self::of_cell(&crate::sim::cell_rect::get_cellclass_fallback(
+            terrain,
+            i32::from(rx),
+            i32::from(ry),
+        ))
+    }
+
+    /// A looked-up cell as a target: a real cell, or [`Self::DummyCell`] for
+    /// the shared fallback CellClass.
+    pub(crate) fn of_cell(cell: &crate::sim::cell_rect::CellRef<'_>) -> Self {
+        match cell {
+            crate::sim::cell_rect::CellRef::Real(cell) => Self::Cell {
+                rx: cell.rx,
+                ry: cell.ry,
+            },
+            crate::sim::cell_rect::CellRef::Dummy { .. } => Self::DummyCell,
+        }
+    }
+
     /// Stable identity of a represented Object pointer. IDs are unique across
     /// stores; retaining the enum kind still controls coordinate dispatch.
     pub(crate) fn object_id(self) -> Option<u64> {
@@ -724,8 +742,9 @@ pub fn projectile_shrapnel_count(
 /// receiver now skips bridge continuation, executes SelectAnim including its
 /// RNG, then substitutes WeaponNullifyAnim (+350) for normal animation/light
 /// at469BEA..46A301. Entry4690C1 initializes the ordinary result to1, so none
-/// of these special arms applies the result0 water-unit gate. Future ordinary
-/// debris/Airburst tail implementations must preserve the same early return.
+/// of these special arms applies the result0 water-unit gate. The shared
+/// debris/Airburst tail preserves this early return; the original Airburst
+/// consumer is separately gated from Ares's installed replacement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpecialDetonationAction {
     /// `MindControl=` (`WarheadTypeClass+0x155`), test `0x00469211` ->
@@ -2048,6 +2067,7 @@ impl ProjectileStore {
             source_is_jumpjet,
             target_is_aircraft,
             safety_altitude,
+            false,
             collides_at,
             nuke,
         )
@@ -2067,6 +2087,7 @@ impl ProjectileStore {
         source_is_jumpjet: bool,
         target_is_aircraft: bool,
         safety_altitude: i32,
+        degenerates: bool,
         mut collides_at: impl FnMut(
             &Projectile,
             ProjectileCoord,
@@ -2348,6 +2369,13 @@ impl ProjectileStore {
         fuse_mode = projectile_fuse_mode(fuse_mode, source_is_jumpjet);
 
         if !projectile_impact_admitted(impact_flag, fuse_mode, projectile.collision.dropping) {
+            // BulletClass::AI467C86..467CA4, gamemd: only the continuing
+            // flight reads current BulletType+2A6 and decrements Health+6C.
+            // Damage is the existing saved/hashed payload authority; impacts,
+            // early retirement and NUKE waits never enter this branch.
+            if degenerates && projectile.payload.base_damage > 5 {
+                projectile.payload.base_damage -= 1;
+            }
             projectile.position = candidate;
             projectile.previous_cell = ((candidate.x / 256) as i16, (candidate.y / 256) as i16);
             return Some(result);
@@ -2818,6 +2846,16 @@ pub fn projectile_shp_frame(
     projectile: &Projectile,
     projectile_type: &crate::rules::projectile_type::ProjectileType,
 ) -> u8 {
+    projectile_shp_frame_with_velocity(projectile, projectile_type, projectile.velocity)
+}
+
+/// Read-only directional frame selection, also used with client-sampled
+/// velocity. Animation counters stay authoritative; only direction varies.
+pub fn projectile_shp_frame_with_velocity(
+    projectile: &Projectile,
+    projectile_type: &crate::rules::projectile_type::ProjectileType,
+    velocity: ProjectileVelocity,
+) -> u8 {
     if projectile.visual.anim_low != 0 || projectile.visual.anim_high != 0 {
         return projectile.visual.runtime_frame;
     }
@@ -2833,7 +2871,6 @@ pub fn projectile_shp_frame(
     use native_math::{atan, d};
     // FCHS of the velocity Y, `Math::atan2 @ 0x004CAE30`, then the DirStruct
     // word conversion (FSUB pi/2, FMUL, ftol).
-    let velocity = projectile.velocity;
     let word = facing16_from_angle(atan(X::neg(d(velocity.y)), d(velocity.x)));
     // 46805D: the 32-step bucket of the angle word indexes the 0x007F4890 table.
     DRAGON_FRAME_TABLE[usize::from(step32_from_facing16(word))] as u8
@@ -2919,6 +2956,50 @@ fn detonation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn flat_32_by_32() -> ResolvedTerrainGrid {
+        ResolvedTerrainGrid::from_cells(
+            32,
+            32,
+            (0..32)
+                .flat_map(|y| {
+                    (0..32).map(move |x| crate::map::resolved_terrain::test_flat_cell(x, y))
+                })
+                .collect(),
+        )
+    }
+
+    /// A cell off the map is the shared fallback CellClass that
+    /// `MapClass::Get_CellClass` (`0x005657A0`) stamps with the coordinate:
+    /// GetCoords takes its ground, GetTargetCoords its structural rise, and a
+    /// target names it as [`ProjectileTarget::DummyCell`].
+    #[test]
+    fn an_off_map_cell_is_the_shared_fallback_cellclass() {
+        let terrain = flat_32_by_32();
+        let dummy = terrain.shared_cell_dummy();
+        dummy.set_level_slope(2, 0);
+        dummy.test_set_retained_bridge_flags(crate::map::bridge_facts::BRIDGE_FLAG_STRUCTURAL);
+        let level_z = crate::util::lepton::ground_height_leptons(2, 0, 0, 0).unwrap();
+        assert_ne!(level_z, 0);
+
+        assert_eq!(
+            cell_ground_coord(Some(&terrain), 40, 41),
+            ProjectileCoord::new(40 * 256 + 128, 41 * 256 + 128, level_z)
+        );
+        assert_eq!(dummy.snapshot().coord, (40, 41));
+        assert_eq!(cell_target_coord(Some(&terrain), 40, 41).z, level_z + 416);
+        assert_eq!(
+            ProjectileTarget::looked_up_cell(Some(&terrain), 40, 41),
+            ProjectileTarget::DummyCell
+        );
+        assert_eq!(
+            ProjectileTarget::looked_up_cell(Some(&terrain), 3, 4),
+            ProjectileTarget::Cell { rx: 3, ry: 4 }
+        );
+        // A real cell is read without touching the fallback.
+        assert_eq!(cell_ground_coord(Some(&terrain), 3, 4).z, 0);
+        assert_eq!(dummy.snapshot().coord, (40, 41));
+    }
 
     #[test]
     fn resolve_impact_coord_matches_the_original() {
@@ -3079,6 +3160,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn degenerates_obeys_collision_and_dropping_fuse_admission() {
+        // Original467C70..467CA4: Dropping suppresses a detector-only
+        // detonation, making that visit eligible for degeneration. A real
+        // collision still detonates without decrementing the impact damage.
+        for (dropping, collision, continues) in [
+            (false, false, false),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let mut store = ProjectileStore::new();
+            let mut shot = spawn(ProjectileTarget::Entity(99));
+            shot.origin = ProjectileCoord::new(0, 0, 100);
+            shot.speed_leptons_per_frame = 128;
+            shot.payload.base_damage = 6;
+            shot.ranged_fuse = true;
+            shot.collision.dropping = dropping;
+            let id = store.spawn(1, shot);
+            let head = store.begin_ai_visit(id).unwrap();
+            let result = store
+                .advance_after_head(
+                    head,
+                    1,
+                    |_, _| Some(ProjectileCoord::new(128, 0, 0)),
+                    None,
+                    &SharedCellDummy::fresh(),
+                    6,
+                    false,
+                    false,
+                    0,
+                    true,
+                    |_, candidate, phase| {
+                        (collision && matches!(phase, ProjectileCollisionPhase::Shared))
+                            .then_some(ProjectileCollisionResponse::TargetZClamp(candidate))
+                    },
+                    None,
+                )
+                .unwrap();
+            assert_eq!(result.detonations.is_empty(), continues);
+            assert_eq!(
+                store.get(id).unwrap().payload.base_damage,
+                if continues { 5 } else { 6 }
+            );
+            if let Some(impact) = result.detonations.first() {
+                assert_eq!(impact.payload.base_damage, 6);
+            }
+        }
+    }
+
     /// Bullet AI's admitted-impact clamp (`0x00467BF0..0x00467C06`) is
     /// GetHeight below 0, then SetHeight(0), and both count the deck for an
     /// OnBridge bullet (`0x005F5F40`, `0x005F5FA0`). FireAt copies an Inviso
@@ -3221,7 +3351,7 @@ mod tests {
     fn simulation_hash_and_save_preserve_pending_projectile() {
         let mut empty = crate::sim::world::Simulation::new();
         let mut sim = crate::sim::world::Simulation::new();
-        let stable_id = sim.allocate_stable_id();
+        let stable_id = sim.substrate.allocate_stable_id();
         sim.admit_projectile(stable_id, spawn(ProjectileTarget::Cell { rx: 1, ry: 0 }));
         // Native in-scenario load restarts Scenario RNG from Seed0. Normalize
         // both controls so this fixture isolates projectile persistence/hash.

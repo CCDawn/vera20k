@@ -110,6 +110,7 @@ pub(super) fn follow_selection_writes(
             .super_weapon(sim.interner().resolve(*sw_type))
             .map(|sw| sw.kind)
         {
+            #[cfg(feature = "ares")]
             Some(SuperWeaponKind::GenericWarhead | SuperWeaponKind::UnitDelivery) => {
                 // Ares new-type cleanup only clears the fired selection:
                 // an automatic launch must not disarm a different SW.
@@ -183,6 +184,7 @@ mod tests {
         Some(TargetingMode::SuperWeapon("ChronoWarpSpecial".to_string()))
     }
 
+    #[cfg(feature = "ares")]
     #[test]
     fn paid_superweapon_selection_tracks_the_ticket_and_never_revives_cancelled_source() {
         use crate::sim::command::Command;
@@ -280,6 +282,7 @@ mod tests {
         assert_eq!(targeting, warp_selected());
     }
 
+    #[cfg(feature = "ares")]
     #[test]
     fn extensions_only_clear_the_matching_local_selection() {
         for kind in ["GenericWarhead", "UnitDelivery"] {
@@ -293,8 +296,7 @@ mod tests {
             let launched = |owner| SimSoundEvent::SuperWeaponLaunched {
                 owner,
                 sw_type,
-                rx: 10,
-                ry: 10,
+                world: crate::sim::components::DriveCoord::cell(10, 10, 0).into(),
             };
             let mut selected = Some(TargetingMode::SuperWeapon("Other".to_owned()));
             follow_selection_writes(
@@ -342,8 +344,7 @@ mod tests {
         let launched = |owner, sw_type| SimSoundEvent::SuperWeaponLaunched {
             owner,
             sw_type,
-            rx: 21,
-            ry: 21,
+            world: crate::sim::components::DriveCoord::cell(21, 21, 0).into(),
         };
         let mut targeting = None;
         follow_selection_writes(
@@ -410,8 +411,7 @@ mod tests {
         let launched = |owner| SimSoundEvent::SuperWeaponLaunched {
             owner,
             sw_type: dominator,
-            rx: 21,
-            ry: 21,
+            world: crate::sim::components::DriveCoord::cell(21, 21, 0).into(),
         };
         let selected = || {
             Some(TargetingMode::SuperWeapon(
@@ -480,8 +480,7 @@ mod tests {
                     vec![SimSoundEvent::SuperWeaponLaunched {
                         owner,
                         sw_type,
-                        rx: 40,
-                        ry: 40,
+                        world: crate::sim::components::DriveCoord::cell(40, 40, 0).into(),
                     }]
                 } else {
                     Vec::new()
@@ -520,8 +519,7 @@ mod tests {
         let launched = |owner, sw_type| SimSoundEvent::SuperWeaponLaunched {
             owner,
             sw_type,
-            rx: 21,
-            ry: 21,
+            world: crate::sim::components::DriveCoord::cell(21, 21, 0).into(),
         };
         let selected = || Some(TargetingMode::SuperWeapon("NukeSpecial".to_string()));
         let oracle: serde_json::Value =

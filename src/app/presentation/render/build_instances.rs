@@ -33,15 +33,18 @@ mod planning_lines;
 /// Game-world sprite instances: terrain tiles, overlays, entities, bridges.
 pub(super) struct WorldInstances {
     pub terrain: crate::render::terrain_instances::TerrainInstances,
-    pub overlay: Vec<SpriteInstance>,
-    pub overlay_render_z: Vec<crate::render::tactical_draw_plan::RenderZPolicy>,
+    /// Every overlay body, high bridge or ordinary, in the cell body sweep's
+    /// order, with each instance's draw beside it.
+    pub cell_bodies: Vec<SpriteInstance>,
+    pub cell_body_draws: Vec<instances::CellBodyDraw>,
     /// Represented Display parents in their five retained native layer orders.
     pub object_layers: [super::draw_plan_lowering::ObjectLayerPass; 5],
+    /// Native separate FoggedObject drawing pass before live building bases.
+    pub fogged_objects: super::draw_plan_lowering::ObjectLayerPass,
     /// One BuildingClass::Array-ordered text sweep after Ground2 bodies.
     pub building_status_text: crate::app::presentation::ui_overlays::BuildingStatusTextInstances,
     /// Static smudge decals (craters, scorches) — drawn between terrain and entities.
     pub smudge: Vec<SpriteInstance>,
-    pub bridge_body: Vec<SpriteInstance>,
     pub bridge_body_shadow: Vec<SpriteInstance>,
     /// Actual particle pieces observed by the existing map diagnostic policy.
     pub particle_draws: Option<Vec<instances::ParticleDrawObservation>>,
@@ -71,6 +74,8 @@ pub(super) struct UiInstances {
     pub tactical_line_calls: Vec<crate::app::presentation::airstrike_lines::TacticalLineCall>,
     pub factory_rally_first: Vec<SpriteInstance>,
     pub factory_rally_second: Vec<SpriteInstance>,
+    /// One stream per beacon row: each row has its own House Convert strip.
+    pub beacons: [Vec<SpriteInstance>; crate::app::match_runtime::beacons::BEACON_HOUSES],
 }
 
 /// Sidebar chrome, cameos, text, minimap, and radar animation.
@@ -186,30 +191,30 @@ pub(super) fn build_world_instances(
         })
         .unwrap_or_default();
     let mut planned_objects = Vec::new();
-    let mut overlay: Vec<SpriteInstance> = std::mem::take(
-        &mut state
-            .match_state
-            .match_presentation
-            .cached_overlay_instances,
-    );
-    overlay.clear();
-    let mut overlay_render_z = Vec::new();
+    let mut bodies = Vec::new();
     instances::build_overlay_instances(
         state,
         sw,
         sh,
-        &mut overlay,
-        &mut overlay_render_z,
+        &mut bodies,
         &mut planned_objects,
         &display_order,
     );
-    // Bridge body and shadow emission live in instances::bridges
-    // (Phase D). Read live CellClass bridge fields post-tick (NOT OverlayGrid).
-    let mut bridge_body: Vec<SpriteInstance> = Vec::new();
+    // High-bridge bodies read live CellClass bridge fields post-tick (NOT
+    // OverlayGrid), then join the ordinary bodies in one native sweep.
+    instances::bridges::build_bridge_body_instances(state, sw, sh, &mut bodies);
+    let mut cell_bodies: Vec<SpriteInstance> = std::mem::take(
+        &mut state
+            .match_state
+            .match_presentation
+            .cached_cell_body_instances,
+    );
+    cell_bodies.clear();
+    let mut cell_body_draws = Vec::new();
+    instances::submit_cell_body_sweep(bodies, &mut cell_bodies, &mut cell_body_draws);
+    // The shadow sweep keeps the same cell order; accepted pixels write Z.
     let mut bridge_body_shadow: Vec<SpriteInstance> = Vec::new();
-    instances::bridges::build_bridge_body_instances(state, sw, sh, &mut bridge_body);
     instances::bridges::build_bridge_shadow_instances(state, &mut bridge_body_shadow);
-    // Both bridge passes retain native cell sweeps; accepted pixels write Z.
 
     // Smudges: static crater/scorch decals on top of terrain, under entities.
     // Registered SmudgeType SHPs share the live OverlayAtlas and Cell light
@@ -226,19 +231,15 @@ pub(super) fn build_world_instances(
     // A building's voxel turret remains owned by the building display call.
     // The SHP builder therefore adds it to the same contiguous Ground parent
     // instead of leaking it into an atlas-level tie.
-    // Parachute canopies are composed into their body's draw, so they take the
-    // body's key rather than deriving one. Collected here, consumed by
-    // `build_parachute_instances` below — which is why it must run after this.
-    let mut parachute_body_depths = instances::ParachuteBodyDepths::new();
-    instances::build_shp_instances(
-        state,
-        &mut parachute_body_depths,
-        &mut planned_objects,
-        &display_order,
-    );
-    // Building slots keep their sole existing binding/light producer. Dynamic
-    // Anim/System/Particle bodies then share one retained Display traversal.
-    instances::build_building_anim_instances(state, &mut planned_objects, &display_order);
+    instances::build_shp_instances(state, &mut planned_objects, &display_order);
+    // Prepare slot binding/light pieces without querying the shared FPS latch.
+    // Each Anim's retained Display encounter admits and appends its pieces.
+    let mut building_anim_instances = Vec::new();
+    instances::build_building_anim_instances(state, &mut building_anim_instances, &display_order);
+    let prepared_building_anims = building_anim_instances
+        .into_iter()
+        .map(|parent| (parent.parent.id, parent))
+        .collect();
     let mut particle_draws = state.diagnostic_presentation_ms().map(|_| Vec::new());
     let display_inputs = state.match_state.sim_runtime.as_ref().map(|runtime| {
         let presentation = &state.match_state.match_presentation;
@@ -246,6 +247,7 @@ pub(super) fn build_world_instances(
         let local_owner = crate::app::input::commands::preferred_local_owner_name(state)
             .and_then(|name| runtime.simulation.interner().get(&name));
         instances::DisplayEffectInputs {
+            interpolation: Some(&presentation.interpolation),
             sim: &runtime.simulation,
             rules: &runtime.resources.rules,
             camera: [
@@ -260,6 +262,7 @@ pub(super) fn build_world_instances(
             detail: &presentation.detail,
             detail_level: presentation.in_game_options.detail_level,
             lighting: presentation.lighting.grid(),
+            retained_anim_intensities: Some(presentation.lighting.anim_intensities()),
             house_colors: &presentation.house_color_map,
             hidden_super_anims: &presentation.hidden_super_anims,
             show_hidden: presentation.in_game_options.show_hidden,
@@ -268,13 +271,14 @@ pub(super) fn build_world_instances(
         }
     });
     if let Some(input) = display_inputs.as_ref() {
-        particle_draws =
-            instances::build_display_effect_instances(input, &mut planned_objects, &display_order);
+        particle_draws = instances::build_display_effect_instances(
+            input,
+            &mut planned_objects,
+            &display_order,
+            prepared_building_anims,
+        );
     }
     instances::build_projectile_visual_instances(state, &mut planned_objects, &display_order);
-    if let Some(input) = display_inputs.as_ref() {
-        instances::build_parachute_instances(input, &mut planned_objects, &parachute_body_depths);
-    }
 
     // Every dynamic pose consumer, including Bullet46B0C0, has now populated
     // the shared page. One upload precedes this frame's draw submission.
@@ -369,11 +373,38 @@ pub(super) fn build_world_instances(
                             });
                     }
                 }
+                let painted =
+                    crate::app::presentation::interpolation::screen_position(state, entity);
+                let native = crate::render::locomotor_visual::screen_position(entity);
+                status.translate_for_interpolation([painted.0 - native.0, painted.1 - native.1]);
                 status
             });
         }
     }
     instances::build_weapon_wave_instances(state, &mut planned_objects, &display_order);
+    // Entity body builders already sampled their anchors. Cancel the same
+    // sampled height for depth and per-pixel Z rather than the authority's
+    // next height; otherwise climbing units slide through their occluders.
+    if let Some(rt) = state.match_state.sim_runtime.as_ref() {
+        let axis = instances::depth_axis(state);
+        let cache = &state.match_state.match_presentation.interpolation;
+        for object in &mut planned_objects {
+            if let Some(entity) = rt.simulation.entities().get(object.parent.id) {
+                let dz = cache.entity_offset(entity, rt.simulation.session().binary_frame())[2];
+                if dz != 0. {
+                    for piece in &mut object.pieces {
+                        piece.instance.z_adjust -= dz;
+                        piece.instance.depth = (piece.instance.depth
+                            - dz / axis.world_height.max(1.))
+                        .clamp(0.001, 0.999);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(rt) = state.match_state.sim_runtime.as_ref() {
+        instances::assign_tether_redraws(&rt.simulation, &mut planned_objects);
+    }
     // Native +99 is set before a Building's body opportunity, independently
     // of successful pixels. Empty body frames still have a retained parent.
     let building_body_opportunities = planned_objects
@@ -383,6 +414,7 @@ pub(super) fn build_world_instances(
         .collect();
     let building_status_text = build_building_status_instances(state, &building_body_opportunities);
     let object_layers = super::draw_plan_lowering::lower_object_instances(planned_objects);
+    let fogged_objects = instances::build_fogged_instances(state);
 
     // PixelFX water/ore sparkles — per-frame 1-pixel cell dots.
     let cell_sparkles: Vec<SpriteInstance> = build_pixel_fx_sparkle_instances(state, sw, sh);
@@ -400,7 +432,7 @@ pub(super) fn build_world_instances(
             "First frame: {} terrain tiles (of {} cells) + {} fixed overlays + {} retained object sprites",
             terrain.normal.len(),
             total_grid,
-            overlay.len() + bridge_body.len(),
+            cell_bodies.len(),
             object_layers
                 .iter()
                 .map(|layer| layer.instances.len())
@@ -410,12 +442,12 @@ pub(super) fn build_world_instances(
 
     WorldInstances {
         terrain,
-        overlay,
-        overlay_render_z,
+        cell_bodies,
+        cell_body_draws,
         object_layers,
+        fogged_objects,
         building_status_text,
         smudge,
-        bridge_body,
         bridge_body_shadow,
         particle_draws,
         cell_sparkles,
@@ -641,6 +673,7 @@ pub(super) fn update_minimap(state: &mut AppState, local_owner: &Option<String>)
     }
 
     let full_visibility = state.match_state.sandbox_full_visibility;
+    let beacon_draws = crate::app::match_runtime::beacons::draws(state);
     let presentation = &mut state.match_state.match_presentation;
     if let (Some(minimap), Some(runtime)) = (
         presentation.minimap.as_mut(),
@@ -676,6 +709,10 @@ pub(super) fn update_minimap(state: &mut AppState, local_owner: &Option<String>)
                     view.resolved_terrain(),
                     radar_dirty_cells,
                     radar_dirty_generation,
+                    presentation
+                        .beacon_art
+                        .as_ref()
+                        .map(|art| (art, beacon_draws.as_slice())),
                 ),
             )
         });
@@ -723,9 +760,24 @@ pub(super) fn build_ui_instances(state: &AppState, wall_ms: u32) -> UiInstances 
         let sim = &runtime.simulation;
         for (id, entity) in sim.entities().iter_sorted() {
             if entity.health.current() != 0
-                && let Some(coords) =
+                && let Some(mut coords) =
                     sim.airstrike_designation_coordinates(id, &runtime.resources.rules)
             {
+                use crate::app::presentation::interpolation::{PointKind, PointPose};
+                for (i, coord) in coords.iter_mut().enumerate() {
+                    let [x, y, z] = state
+                        .match_state
+                        .match_presentation
+                        .interpolation
+                        .sample_draw_point(
+                            PointKind::Airstrike(i as u8),
+                            id,
+                            PointPose::new([coord.x, coord.y, coord.z], 0, None),
+                            sim.session().binary_frame(),
+                        )
+                        .coord;
+                    *coord = crate::sim::components::DriveCoord { x, y, z };
+                }
                 designations.insert(id, coords);
             }
         }
@@ -766,7 +818,7 @@ pub(super) fn build_ui_instances(state: &AppState, wall_ms: u32) -> UiInstances 
     };
     let (mut target_line, planning_highlights) = planning_lines::build(state, view);
     target_line.extend(
-        crate::app::presentation::target_lines::build_target_line_instances(
+        crate::app::presentation::target_lines::build_target_line_instances_sampled(
             &state.match_state.match_presentation.target_lines,
             state.match_state.input.planning.active(),
             state
@@ -788,6 +840,7 @@ pub(super) fn build_ui_instances(state: &AppState, wall_ms: u32) -> UiInstances 
                 None
             },
             &mut shroud_alpha,
+            Some(&state.match_state.match_presentation.interpolation),
         ),
     );
     target_line.extend(planning_highlights);
@@ -802,7 +855,7 @@ pub(super) fn build_ui_instances(state: &AppState, wall_ms: u32) -> UiInstances 
         state.match_state.input.selection_order_pending,
     );
     let [factory_rally_first, factory_rally_second] =
-        crate::app::presentation::target_lines::build_factory_rally_line_instances(
+        crate::app::presentation::target_lines::build_factory_rally_line_instances_sampled(
             state
                 .match_state
                 .sim_runtime
@@ -814,6 +867,7 @@ pub(super) fn build_ui_instances(state: &AppState, wall_ms: u32) -> UiInstances 
             preferred_local_owner(state).as_deref(),
             view,
             &mut shroud_alpha,
+            Some(&state.match_state.match_presentation.interpolation),
         );
 
     UiInstances {
@@ -824,7 +878,33 @@ pub(super) fn build_ui_instances(state: &AppState, wall_ms: u32) -> UiInstances 
         tactical_line_calls,
         factory_rally_first,
         factory_rally_second,
+        beacons: build_beacon_instances(state),
     }
+}
+
+/// `BeaconManagerClass` Draw `0x00430AC0`, called by TacticalClass::Draw at
+/// `0x006D46B6` just before BandBox.
+fn build_beacon_instances(
+    state: &AppState,
+) -> [Vec<SpriteInstance>; crate::app::match_runtime::beacons::BEACON_HOUSES] {
+    let mut rows: [Vec<SpriteInstance>; crate::app::match_runtime::beacons::BEACON_HOUSES] =
+        Default::default();
+    let (Some(art), Some(runtime)) = (
+        state.match_state.match_presentation.beacon_art.as_ref(),
+        state.match_state.sim_runtime.as_ref(),
+    ) else {
+        return rows;
+    };
+    let frame = runtime.simulation.session().binary_frame();
+    for beacon in crate::app::match_runtime::beacons::draws(state) {
+        if let (Some(row), Some(instance)) = (
+            rows.get_mut(beacon.house),
+            art.tactical_instance(&beacon, frame),
+        ) {
+            row.push(instance);
+        }
+    }
+    rows
 }
 
 /// Active PLACE cells. Tactical6D5030 suppresses the building ghost outside
@@ -952,25 +1032,37 @@ pub(super) fn build_sidebar_instances(state: &mut AppState) -> SidebarInstances 
         .as_ref()
         .map(|csf| csf.text("TXT_HOLD"))
         .unwrap_or_else(|| std::borrow::Cow::Borrowed("On Hold"));
+    // SuperClass::NameReadiness6CC2B0: native drain state labels share the
+    // same status-strip/text owner as ordinary Ready and Hold.
+    let charging_text = state
+        .process_assets
+        .csf
+        .as_ref()
+        .map(|csf| csf.text("TXT_CHARGING"))
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("Charging"));
+    let active_text = state
+        .process_assets
+        .csf
+        .as_ref()
+        .map(|csf| csf.text("TXT_FIRESTORM_ON"))
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("Firestorm On"));
+    let status_labels = crate::app::presentation::sidebar_build::CameoStatusLabels {
+        ready: ready_text.as_ref(),
+        hold: hold_text.as_ref(),
+        charging: charging_text.as_ref(),
+        active: active_text.as_ref(),
+    };
     let ready_tint = {
         let theme = crate::app::presentation::sidebar_render::current_sidebar_theme(state);
         crate::render::sidebar_text::side_highlight_color(theme)
     };
     let cameo_layers = view
         .as_ref()
-        .map(|v| build_sidebar_cameo_instances(state, v, ready_text.as_ref(), hold_text.as_ref()))
+        .map(|v| build_sidebar_cameo_instances(state, v, status_labels))
         .unwrap_or_default();
     let mut text_layers = view
         .as_ref()
-        .map(|v| {
-            build_sidebar_text_instances(
-                state,
-                v,
-                ready_text.as_ref(),
-                hold_text.as_ref(),
-                ready_tint,
-            )
-        })
+        .map(|v| build_sidebar_text_instances(state, v, status_labels, ready_tint))
         .unwrap_or_default();
     // Credits counter shares the GAME.FNT sidebar-text layer: gamemd draws it
     // with the same BitFont on the sidebar surface, in the same packed side

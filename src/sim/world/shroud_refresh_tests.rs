@@ -8,7 +8,7 @@ use crate::sim::intern::InternedId;
 use crate::sim::movement::locomotor::MovementLayer;
 use crate::sim::occupancy::CellListInsertion;
 use crate::sim::vision::{assert_native_cell_history, discovery_corpus, native_map_cell_fixture};
-use crate::sim::world::TechnoDiscoveryHistory;
+use crate::sim::world::{FrameEffects, TechnoDiscoveryHistory};
 use crate::util::save_codec;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -56,7 +56,7 @@ fn actor(
             "E1"
         });
     let mut entity = GameEntity::new_at_frame_for_test(
-        sim.allocate_stable_id(),
+        sim.substrate.allocate_stable_id(),
         cell.0,
         cell.1,
         0,
@@ -596,7 +596,7 @@ fn native_trigger_reveal_whole_area_histories_match_original_cache_and_residents
             actors.insert(name, id);
         }
         let config = vision::VisionConfig::new(
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
             Some((
                 input["size"][0].as_i64().unwrap() as i32,
                 input["size"][1].as_i64().unwrap() as i32,
@@ -1327,5 +1327,597 @@ fn listed_shroud_edge_updates_survive_their_callbacks() {
             listed["visits"] = complete["visits"].clone();
         }
         assert_eq!(&listed, complete, "record {index}");
+    }
+}
+
+/// Horizontal_Step's tail (`0x004CF55D..0x004CF5EC`): a selected enemy
+/// aircraft drops out of the player's selection once it flies over the
+/// player's shroud (`MapClass::IsShrouded @ 0x00586360` at its Location);
+/// over mapped ground it stays selected, and the player's own aircraft is
+/// never deselected.
+#[test]
+fn a_selected_enemy_aircraft_is_deselected_over_the_players_shroud() {
+    let (mut sim, rules, registry, player, enemy_house) = shroud_selection_fixture(true);
+    let own = sim
+        .spawn_object_with_overlay_registry("HORNET", "Americans", 6, 12, 0, &rules, &registry)
+        .unwrap();
+    let enemy = sim
+        .spawn_object_with_overlay_registry("HORNET", "Russians", 8, 15, 0, &rules, &registry)
+        .unwrap();
+    let flights = [(own, player, 12), (enemy, enemy_house, 15)];
+    let tracks = move_east_selected(&mut sim, &rules, &registry, &flights, 600);
+    for (id, track) in [own, enemy].into_iter().zip(tracks) {
+        assert!(
+            track.selected_over_mapped_ground,
+            "{id}: over mapped ground it stays selected"
+        );
+        assert!(track.reached_shroud, "{id}: it flies into the shroud");
+    }
+    assert!(
+        !selected(&sim, enemy),
+        "over the player's shroud it leaves the selection"
+    );
+    assert!(
+        selected(&sim, own),
+        "the player's own aircraft stays selected"
+    );
+}
+
+/// Foot PerCellProcess's step (`0x004D8DA7..0x004D8DF5`): a selected enemy
+/// infantryman walking into the player's shroud leaves the player's
+/// selection at the first cell he arrives at there; over mapped ground he
+/// stays selected. (A walker's own sight keeps the player's own Location
+/// mapped, so the owner test shows only on the fliers above.)
+#[test]
+fn a_selected_enemy_infantryman_is_deselected_walking_into_the_players_shroud() {
+    let (mut sim, rules, registry, _, enemy_house) = shroud_selection_fixture(true);
+    // The player keeps an object, so his house stays in the game.
+    sim.spawn_object_with_overlay_registry("ENGINEER", "Americans", 6, 12, 0, &rules, &registry)
+        .unwrap();
+    let enemy = sim
+        .spawn_object_with_overlay_registry("ENGINEER", "Russians", 8, 15, 0, &rules, &registry)
+        .unwrap();
+    let [track] = move_east_selected(
+        &mut sim,
+        &rules,
+        &registry,
+        &[(enemy, enemy_house, 15)],
+        4000,
+    )
+    .try_into()
+    .ok()
+    .unwrap();
+    assert!(
+        track.selected_over_mapped_ground,
+        "over mapped ground he stays selected"
+    );
+    assert!(track.reached_shroud, "he walks into the shroud");
+    assert!(
+        !selected(&sim, enemy),
+        "in the player's shroud he leaves the selection"
+    );
+}
+
+/// Jumpjet Process's deselect (`0x0054B07D..0x0054B10C`): a selected enemy
+/// jumpjet drops out of the player's selection once it flies over the
+/// player's shroud; over mapped ground it stays selected, and the player's
+/// own jumpjet is never deselected.
+#[test]
+fn a_selected_enemy_jumpjet_is_deselected_over_the_players_shroud() {
+    let (mut sim, rules, registry, player, enemy_house) = shroud_selection_fixture(true);
+    let own = sim
+        .spawn_object_with_overlay_registry("JUMPJET", "Americans", 6, 12, 0, &rules, &registry)
+        .unwrap();
+    let enemy = sim
+        .spawn_object_with_overlay_registry("JUMPJET", "Russians", 8, 15, 0, &rules, &registry)
+        .unwrap();
+    let flights = [(own, player, 12), (enemy, enemy_house, 15)];
+    let tracks = move_east_selected(&mut sim, &rules, &registry, &flights, 600);
+    for (id, track) in [own, enemy].into_iter().zip(tracks) {
+        assert!(
+            track.selected_over_mapped_ground,
+            "{id}: over mapped ground it stays selected"
+        );
+        assert!(track.reached_shroud, "{id}: it flies into the shroud");
+    }
+    assert!(
+        !selected(&sim, enemy),
+        "over the player's shroud it leaves the selection"
+    );
+    assert!(
+        selected(&sim, own),
+        "the player's own jumpjet stays selected"
+    );
+}
+
+/// Jumpjet Process's discovery (`0x0054B112..0x0054B166`), in a campaign,
+/// where a Cell put discovers an object only off the player's shroud
+/// (`0x0047E953..0x0047E9DC`): an enemy jumpjet put down in the shroud stays
+/// undiscovered until it flies over ground the player has mapped, where the
+/// player discovers it while it is still airborne.
+#[test]
+fn a_campaign_enemy_jumpjet_is_discovered_flying_over_mapped_ground() {
+    use crate::sim::command::{Command, CommandEnvelope};
+    let (mut sim, rules, registry, _, enemy_house) = shroud_selection_fixture(false);
+    let enemy = sim
+        .spawn_object_with_overlay_registry("JUMPJET", "Russians", 30, 15, 0, &rules, &registry)
+        .unwrap();
+    let discovered = |sim: &Simulation| {
+        sim.substrate
+            .entities
+            .get(enemy)
+            .unwrap()
+            .discovery
+            .discovered_by_current_house()
+    };
+    assert!(
+        !discovered(&sim),
+        "put down in the shroud, it is undiscovered"
+    );
+    let grid = sim.path_grid.clone();
+    let order = CommandEnvelope::new(
+        enemy_house,
+        sim.session.tick(),
+        Command::Move {
+            entity_id: enemy,
+            target_rx: 8,
+            target_ry: 15,
+        },
+    );
+    sim.advance_tick(&[order], Some(&rules), grid.as_deref(), Some(&registry), 67);
+    // MapClass::IsShrouded at the jumpjet's Location, height-projected.
+    let over_shroud = |sim: &Simulation| {
+        let entity = sim.substrate.entities.get(enemy).unwrap();
+        let terrain = sim.resolved_terrain.as_ref().unwrap();
+        crate::sim::vision::point_is_shrouded(
+            &sim.fog,
+            &crate::map::resolved_terrain::NativeCellQuery::canonical(terrain),
+            sim.session.current_house().unwrap(),
+            crate::sim::movement::ground_pose::object_location(entity, Some(terrain)),
+        )
+    };
+    let mut flew_over_shroud = false;
+    let mut discovered_in_flight = false;
+    for _ in 0..600 {
+        let due = sim.take_due_commands();
+        sim.advance_tick(&due, Some(&rules), grid.as_deref(), Some(&registry), 67);
+        if !discovered(&sim) {
+            assert!(
+                over_shroud(&sim),
+                "over mapped ground it is discovered the same frame"
+            );
+            flew_over_shroud = true;
+            continue;
+        }
+        let entity = sim.substrate.entities.get(enemy).unwrap();
+        discovered_in_flight = crate::sim::movement::air_movement::current_fly_height(
+            entity,
+            sim.resolved_terrain.as_ref(),
+        ) > 0
+            && !over_shroud(&sim);
+        break;
+    }
+    assert!(flew_over_shroud, "it flew undiscovered over the shroud");
+    assert!(
+        discovered_in_flight,
+        "the player discovers it in flight over mapped ground"
+    );
+}
+
+/// A skirmish (or campaign) scene whose player (Americans) has mapped the
+/// west of the map only: the 12-cell radius around (6, 12).
+fn shroud_selection_fixture(
+    skirmish: bool,
+) -> (
+    Simulation,
+    crate::rules::ruleset::RuleSet,
+    crate::rules::overlay_types::OverlayTypeRegistry,
+    crate::sim::intern::InternedId,
+    crate::sim::intern::InternedId,
+) {
+    let (mut sim, rules, registry) = crate::sim::world::entry_test_fixture::fixture_with_rules("");
+    sim.session.set_game_mode(
+        crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(skirmish),
+    );
+    sim.session.game_options_mut_for_test().short_game = false;
+    for (side, name) in ["Americans", "Russians"].into_iter().enumerate() {
+        let house = sim.interner.intern(name);
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                house, side as u8, None, true, 0, 10,
+            ));
+    }
+    let player = sim.interner.get("Americans").unwrap();
+    let enemy = sim.interner.get("Russians").unwrap();
+    sim.session.set_current_house_for_test(Some(player));
+    sim.fog = FogState::new(33, 33);
+    sim.fog.ensure_viewer(player);
+    // MapClass::RevealArea's final0/final1 pair maps the cells with no
+    // sustained sight source.
+    let config = sim.sight_reveal_config(&rules);
+    for final_pass in [false, true] {
+        let _ = sim.reveal_area(
+            &[player],
+            (6, 12),
+            0,
+            12,
+            None,
+            final_pass,
+            &config,
+            UninitContext::default(),
+            crate::sim::vision::MapRevealProjection::Transient,
+            Some(player),
+        );
+    }
+    (sim, rules, registry, player, enemy)
+}
+
+fn selected(sim: &Simulation, id: u64) -> bool {
+    sim.substrate
+        .entities
+        .get(id)
+        .unwrap()
+        .selection
+        .is_selected()
+}
+
+/// What one mover did on its way east.
+struct EastTrack {
+    /// It crossed the player's mapped ground (cells 10..=14), and was
+    /// selected on every frame there.
+    selected_over_mapped_ground: bool,
+    /// It reached cell 24, inside the shroud.
+    reached_shroud: bool,
+}
+
+/// Select each `(object, owner, row)` mover, order it east to (30, row), and
+/// run the production tick until every one reaches cell 24 (`frames` at
+/// most).
+fn move_east_selected(
+    sim: &mut Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    flights: &[(u64, crate::sim::intern::InternedId, u16)],
+    frames: u32,
+) -> Vec<EastTrack> {
+    use crate::sim::command::{Command, CommandEnvelope};
+    for &(id, ..) in flights {
+        sim.substrate
+            .entities
+            .get_mut(id)
+            .unwrap()
+            .selection
+            .set_selected_for_test(true);
+    }
+    let orders: Vec<_> = flights
+        .iter()
+        .map(|&(id, owner, row)| {
+            CommandEnvelope::new(
+                owner,
+                sim.session.tick(),
+                Command::Move {
+                    entity_id: id,
+                    target_rx: 30,
+                    target_ry: row,
+                },
+            )
+        })
+        .collect();
+    let grid = sim.path_grid.clone();
+    sim.advance_tick(&orders, Some(rules), grid.as_deref(), Some(registry), 67);
+    let mut tracks: Vec<_> = flights
+        .iter()
+        .map(|_| EastTrack {
+            selected_over_mapped_ground: true,
+            reached_shroud: false,
+        })
+        .collect();
+    let mut over_mapped = vec![false; flights.len()];
+    for _ in 0..frames {
+        if tracks.iter().all(|track| track.reached_shroud) {
+            break;
+        }
+        let due = sim.take_due_commands();
+        sim.advance_tick(&due, Some(rules), grid.as_deref(), Some(registry), 67);
+        for (index, &(id, ..)) in flights.iter().enumerate() {
+            let rx = sim.substrate.entities.get(id).unwrap().position.rx();
+            if (10..=14).contains(&rx) {
+                over_mapped[index] = true;
+                tracks[index].selected_over_mapped_ground &= selected(sim, id);
+            }
+            tracks[index].reached_shroud |= rx >= 24;
+        }
+    }
+    for (track, seen) in tracks.iter_mut().zip(over_mapped) {
+        track.selected_over_mapped_ground &= seen;
+    }
+    tracks
+}
+
+/// The original no-edge MakeEnemy executes both visitors and the real
+/// ReReveal/UpdateReveal methods. Only RTTI/type lookup, anger and map-walk
+/// transport are substituted; the corpus does not execute camera production
+/// or native cells. The retail flight/deploy test covers those Rust producers.
+#[test]
+fn no_edge_make_enemy_matches_native_human_source_controls() {
+    use crate::sim::superweapon::chronosphere_tests::world_with;
+    let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/shroud_current_sight.json",
+    ))
+    .unwrap();
+    let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art() else {
+        return;
+    };
+    let controls = corpus["alliance_human_controls"].as_array().unwrap();
+    assert_eq!(controls.len(), 5);
+    for row in controls {
+        let (rules, mut sim, player) = world_with(rules.clone(), 64, &[]);
+        sim.session.set_current_house_for_test(Some(player));
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        let computer = sim.interner.get("Russians").unwrap();
+        sim.fog = vision::FogState::new(64, 64);
+        let id = sim
+            .spawn_object("SPYP", "Americans", 40, 40, 0, &rules)
+            .unwrap();
+        assert!(sim.entities().get(id).unwrap().sight.is_zero());
+        // Supplied native camera cache, before its current position changes.
+        sim.refresh_object_sight(id, &rules, 6, crate::sim::world::FrameEffects::default());
+        assert!(sim.fog.sight_is_latched(id, player));
+        let input = &row["inputs"];
+        let entity = sim.substrate.entities.get_mut(id).unwrap();
+        entity.position.set_rx_for_test(41);
+        entity
+            .discovery
+            .set_discovered_by_current_house_for_test(input["discovered"].as_bool().unwrap());
+        entity
+            .lifecycle
+            .set_in_limbo_for_test(input["limbo"].as_bool().unwrap());
+        entity.set_in_playfield(input["in_playfield"].as_bool().unwrap());
+        sim.houses
+            .get_mut(&player)
+            .unwrap()
+            .set_multiplay_passive_for_test(input["passive"].as_bool().unwrap());
+        let (_, calls) = trace_reveal_calls(|| {
+            sim.make_enemy(
+                computer,
+                player,
+                &rules,
+                None,
+                FrameEffects::default(),
+                false,
+            );
+        });
+        assert_eq!(
+            u8::from(sim.fog.sight_is_latched(id, player)),
+            row["latch"].as_u64().unwrap() as u8,
+            "{input}"
+        );
+        let cache = sim.fog.sight_admission(id, player).unwrap();
+        assert_eq!(
+            i64::from(cache.radius),
+            row["cached_radius"].as_i64().unwrap()
+        );
+        assert_eq!((cache.origin.0, cache.origin.1), (40, 40));
+        let native_area_calls = row["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event[0] == "area")
+            .count();
+        assert_eq!(calls.walks.len(), native_area_calls, "{input}");
+        assert!(sim.house_alliances.as_map().is_empty());
+    }
+}
+
+/// The native constructor arms +24B. The first local House tail visits the
+/// shared map receiver, including border refresh when ordinary sight is held.
+/// Native cell traversal is a recorded boundary; this test runs VERA's cells.
+#[test]
+fn initial_house_sight_matches_original_update_tail() {
+    use crate::rules::ini_parser::IniFile;
+    use crate::sim::superweapon::chronosphere_tests::world_with;
+
+    let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/house_initial_sight.json",
+    ))
+    .unwrap();
+    for row in corpus["cases"].as_array().unwrap() {
+        let input = &row["inputs"];
+        let rules = crate::rules::ruleset::RuleSet::from_ini_with_fixed_art_for_test(
+            &IniFile::from_str(&format!(
+                "[General]\nLeptonsPerSightIncrease=2000\n[Clear]\nBuildable=yes\n\
+             [{}]\n0=SCOUT\n[SCOUT]\nStrength=100\nSight={}\n\
+             Locomotor={{4A582746-9839-11d1-B709-00A024DDAFD1}}\n",
+                if input["building"].as_bool().unwrap() {
+                    "BuildingTypes"
+                } else {
+                    "AircraftTypes"
+                },
+                input["sight"].as_i64().unwrap(),
+            )),
+            &IniFile::from_str("[SCOUT]\nFoundation=1x1\n"),
+        )
+        .expect("supplied source rules and art");
+        let (rules, mut sim, player) = world_with(rules, 64, &[]);
+        sim.fog = vision::FogState::new(64, 64);
+        let other = sim.interner.get("Russians").unwrap();
+        sim.houses
+            .get_mut(&other)
+            .unwrap()
+            .set_multiplay_passive_for_test(true);
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        sim.session.set_current_house_for_test(Some(player));
+        if !input["pending"].as_bool().unwrap() {
+            // Consume the first House visit before the supplied source exists.
+            sim.house_rung(&rules, None, false, FrameEffects::default(), None)
+                .expect("headless outcome waits complete synchronously");
+        }
+        let id = sim
+            .spawn_object("SCOUT", "Americans", 40, 40, 0, &rules)
+            .unwrap_or_else(|| panic!("source placement refused: {input}"));
+        sim.refresh_object_sight(id, &rules, 6, FrameEffects::default());
+        if !input["latched"].as_bool().unwrap() {
+            sim.fog.clear_sight_latch(id, player);
+        }
+        let entity = sim.substrate.entities.get_mut(id).unwrap();
+        entity.position.set_rx_for_test(41);
+        entity
+            .discovery
+            .set_discovered_by_current_house_for_test(input["discovered"].as_bool().unwrap());
+        entity
+            .lifecycle
+            .set_in_limbo_for_test(input["limbo"].as_bool().unwrap());
+        entity.set_in_playfield(input["in_playfield"].as_bool().unwrap());
+        sim.houses
+            .get_mut(&player)
+            .unwrap()
+            .set_multiplay_passive_for_test(input["passive"].as_bool().unwrap());
+        if !input["current"].as_bool().unwrap() {
+            sim.session.set_current_house_for_test(Some(other));
+        }
+        if let Some(startup) = row["startup"].as_object() {
+            // Actual fresh post-map dispatcher; startup's mobile-only pass
+            // must not consume the House's later full pass.
+            let roster = crate::map::houses::HouseRoster::default();
+            let overlays = crate::rules::overlay_types::OverlayTypeRegistry::empty();
+            let (_, calls) = trace_reveal_calls(|| {
+                sim.finalize_scenario_post_map(
+                    crate::sim::scenario_post_map::ScenarioPostMapInput {
+                        map_width: 64,
+                        map_height: 64,
+                        fill_silos: false,
+                        rules: &rules,
+                        overlay_registry: &overlays,
+                        house_roster: &roster,
+                        skirmish_session: None,
+                        campaign_map: None,
+                    },
+                );
+            });
+            let events = startup["events"].as_array().unwrap();
+            assert_eq!(
+                calls.walks.len(),
+                events.iter().filter(|event| event[0] == "area").count(),
+                "startup {input}"
+            );
+            assert_eq!(
+                calls.border_scans.len(),
+                events.iter().filter(|event| event[0] == "border").count(),
+                "startup {input}"
+            );
+            assert!(sim.houses[&player].initial_sight_refresh_pending());
+        }
+        for visit in row["visits"].as_array().unwrap() {
+            let (_, calls) = trace_reveal_calls(|| {
+                sim.house_rung(&rules, None, false, FrameEffects::default(), None)
+                    .expect("headless outcome waits complete synchronously");
+            });
+            let events = visit["events"].as_array().unwrap();
+            assert_eq!(
+                calls.walks.len(),
+                events.iter().filter(|event| event[0] == "area").count(),
+                "{input}"
+            );
+            assert_eq!(
+                calls.border_scans.len(),
+                events.iter().filter(|event| event[0] == "border").count(),
+                "{input}"
+            );
+            for (actual, expected) in calls
+                .border_scans
+                .iter()
+                .zip(events.iter().filter(|event| event[0] == "border"))
+            {
+                assert_eq!(
+                    *actual,
+                    (
+                        (
+                            (expected[1][0].as_i64().unwrap() / 256) as u16,
+                            (expected[1][1].as_i64().unwrap() / 256) as u16,
+                            0
+                        ),
+                        expected[3].as_i64().unwrap() as i32
+                    ),
+                    "{input}"
+                );
+            }
+            assert_eq!(
+                u8::from(sim.fog.sight_is_latched(id, player)),
+                visit["latch"].as_u64().unwrap() as u8,
+                "{input}"
+            );
+            assert_eq!(
+                i64::from(sim.fog.sight_admission(id, player).unwrap().radius),
+                visit["cached_radius"].as_i64().unwrap(),
+                "{input}"
+            );
+            let cached = sim.fog.sight_admission(id, player).unwrap().origin;
+            assert_eq!(
+                (
+                    i64::from(cached.0) * 256,
+                    i64::from(cached.1) * 256,
+                    i64::from(cached.2)
+                ),
+                (
+                    visit["cached_coord"][0].as_i64().unwrap(),
+                    visit["cached_coord"][1].as_i64().unwrap(),
+                    visit["cached_coord"][2].as_i64().unwrap()
+                ),
+                "{input}"
+            );
+            assert_eq!(
+                sim.houses[&player].initial_sight_refresh_pending(),
+                visit["pending"].as_u64().unwrap() != 0,
+                "{input}"
+            );
+        }
+    }
+}
+
+#[test]
+fn initial_house_sight_pending_survives_snapshot_and_current_house_change() {
+    use crate::sim::snapshot::GameSnapshot;
+    let mut sim = Simulation::new();
+    let player = sim.interner.intern("Player");
+    let other = sim.interner.intern("Other");
+    for owner in [player, other] {
+        sim.houses
+            .register(HouseState::new(owner, 0, None, true, 0, 10));
+    }
+    sim.session.set_current_house_for_test(Some(player));
+    sim.scenario_rng = crate::sim::rng::SimRng::new(0);
+    for consumed in [false, true] {
+        if consumed {
+            sim.update_initial_house_sight(player, UninitContext::default());
+        }
+        let before = sim.state_hash();
+        let bytes = GameSnapshot::save(&sim, 0, 0, "initial-house-sight", 0);
+        let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
+        assert_eq!(restored.state_hash(), before);
+        assert_eq!(
+            restored.houses[&player].initial_sight_refresh_pending(),
+            !consumed
+        );
+        assert!(restored.houses[&other].initial_sight_refresh_pending());
+        restored.update_initial_house_sight(other, UninitContext::default());
+        assert_eq!(
+            restored.state_hash(),
+            before,
+            "nonlocal House cannot consume its flag"
+        );
+        restored.update_initial_house_sight(player, UninitContext::default());
+        if !consumed {
+            assert_ne!(restored.state_hash(), before, "pending flag is hashed");
+        }
+        restored.session.set_current_house_for_test(Some(other));
+        restored.update_initial_house_sight(other, UninitContext::default());
+        assert!(!restored.houses[&other].initial_sight_refresh_pending());
+        let after = restored.state_hash();
+        restored.update_initial_house_sight(other, UninitContext::default());
+        assert_eq!(restored.state_hash(), after, "repeat is inert");
     }
 }

@@ -2,10 +2,10 @@
 //!
 //! Not gamemd-derived. gamemd registers its own Yuri's Revenge icon for its window;
 //! the user chose the original Red Alert 2 game icon instead: the red star with the
-//! hammer and sickle built into RA2's `game.exe` (and `Ra2.exe`). No `.ico` file ships
-//! with that design, so the icon group is read out of the executable in the configured
-//! install at startup and no retail art is committed. Without it the platform default
-//! icon stays.
+//! hammer and sickle built into RA2's `game.exe` (and `Ra2.exe`). The icon group is read
+//! out of the executable in the configured install at startup; without it the program's
+//! own icon stays, which the release packages take from the same group
+//! (`.github/release`).
 
 use std::collections::HashMap;
 use std::path::Path;

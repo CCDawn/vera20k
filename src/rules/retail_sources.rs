@@ -7,6 +7,10 @@ use std::sync::Arc;
 
 use crate::assets::asset_manager::AssetManager;
 use crate::rules::ini_parser::IniFile;
+use crate::rules::ini_parser::directives::{
+    DirectiveDiagnostic, DirectiveOptions, include_identity, process_directives,
+};
+use crate::rules::personal_rules::PersonalRules;
 use crate::rules::process_owner::NativeRulesProcessOwner;
 use crate::rules::ruleset::RuleSet;
 use crate::rules::sound_ini::{EvaRegistry, SoundRegistry};
@@ -25,9 +29,77 @@ pub struct IniSourceIdentity {
 pub struct SelectedIni {
     pub ini: IniFile,
     pub source: IniSourceIdentity,
+    /// Physical child snapshots in traversal order (including repeated DAG
+    /// references). Root identity still describes the original root bytes.
+    pub included_sources: Vec<IniSourceIdentity>,
+    pub directive_diagnostics: Vec<DirectiveDiagnostic>,
 }
 
 pub fn select_ini(assets: &AssetManager, name: &str) -> Result<SelectedIni, String> {
+    if crate::rules::ARES_ENABLED {
+        select_ini_with_options(assets, name, DirectiveOptions::default())
+    } else {
+        select_physical_ini(assets, name)
+    }
+}
+
+/// Explicit file-composition probe. Tool callers may inspect extension syntax
+/// independently of the gameplay capability selected at compile time.
+pub fn select_ini_with_options(
+    assets: &AssetManager,
+    name: &str,
+    options: DirectiveOptions,
+) -> Result<SelectedIni, String> {
+    let mut selected = select_physical_ini(assets, name)?;
+    let (expanded, included_sources) = expand_ini_with_assets(assets, selected.ini, name, options)?;
+    selected.ini = expanded.ini;
+    selected.included_sources = included_sources;
+    selected.directive_diagnostics = expanded.diagnostics;
+    Ok(selected)
+}
+
+/// Maps already own their decoded physical INI (including MMX wrappers).
+/// They enter the same traversal/provider instead of selecting a second root.
+pub(crate) fn expand_ini_with_assets(
+    assets: &AssetManager,
+    ini: IniFile,
+    name: &str,
+    options: DirectiveOptions,
+) -> Result<
+    (
+        crate::rules::ini_parser::directives::ExpandedIni,
+        Vec<IniSourceIdentity>,
+    ),
+    String,
+> {
+    let mut included_sources = Vec::new();
+    let expanded = process_directives(
+        ini,
+        name,
+        |reference| {
+            // All references share the production VFS root; do not rebase on the
+            // including document's host directory or open arbitrary host paths.
+            let logical = include_identity(reference);
+            let Some(resolved) = assets.resolve_ref(&logical) else {
+                return Ok(None);
+            };
+            if resolved.bytes.is_empty() {
+                return Ok(None);
+            }
+            let child = select_physical_ini(assets, &logical)?;
+            included_sources.push(child.source);
+            Ok(Some(child.ini))
+        },
+        options,
+    )
+    .map_err(|error| error.to_string())?;
+    for diagnostic in &expanded.diagnostics {
+        log::warn!("INI directive: {diagnostic}");
+    }
+    Ok((expanded, included_sources))
+}
+
+fn select_physical_ini(assets: &AssetManager, name: &str) -> Result<SelectedIni, String> {
     let selected = assets
         .resolve_ref(name)
         .ok_or_else(|| format!("retail INI {name} is unavailable"))?;
@@ -40,6 +112,8 @@ pub fn select_ini(assets: &AssetManager, name: &str) -> Result<SelectedIni, Stri
         .map_err(|error| format!("parse {name} from {}: {error}", selected.source_archive))?;
     Ok(SelectedIni {
         ini,
+        included_sources: Vec::new(),
+        directive_diagnostics: Vec::new(),
         source: IniSourceIdentity {
             logical_name: name.to_owned(),
             source_archive: selected.source_archive.to_owned(),
@@ -84,18 +158,31 @@ pub struct RetailRulesSources {
     pub rulesmd: SelectedIni,
     pub langrule: Option<SelectedIni>,
     pub artmd: SelectedIni,
+    personal_rules: PersonalRules,
 }
 
 impl RetailRulesSources {
     pub fn select(assets: &AssetManager) -> Result<Self, String> {
-        let rulesmd = select_ini(assets, "rulesmd.ini")?;
+        let rulesmd = select_ini(assets, assets.ini_roots().rules())?;
         let langrule = select_ini(assets, "langrule.ini").ok();
-        let artmd = select_ini(assets, "artmd.ini")?;
+        let artmd = select_ini(assets, assets.ini_roots().art())?;
         Ok(Self {
             rulesmd,
             langrule,
             artmd,
+            personal_rules: PersonalRules::default(),
         })
+    }
+
+    /// VERA-only source composition; physical source identities remain intact.
+    /// No extra native Rules pass is introduced by a personal override.
+    pub fn with_personal_rules(mut self, personal_rules: PersonalRules) -> Self {
+        personal_rules.apply_root(&mut self.rulesmd.ini);
+        if let Some(langrule) = self.langrule.as_mut() {
+            personal_rules.apply_base_layer(&mut langrule.ini);
+        }
+        self.personal_rules = personal_rules;
+        self
     }
 
     /// The cold-started native Rules authority alone, without the shell
@@ -105,12 +192,17 @@ impl RetailRulesSources {
         sounds: Arc<SoundRegistry>,
         eva: Arc<EvaRegistry>,
     ) -> Result<NativeRulesProcessOwner, String> {
-        NativeRulesProcessOwner::from_cold_start_sources(
+        NativeRulesProcessOwner::from_named_cold_start_sources(
             self.rulesmd.ini,
             self.langrule.map(|source| source.ini),
             self.artmd.ini,
             sounds,
             eva,
+            [
+                self.rulesmd.source.logical_name,
+                self.artmd.source.logical_name,
+            ],
+            self.personal_rules,
         )
         .map_err(|error| format!("Native rules cold startup failed: {error}"))
     }
@@ -180,6 +272,10 @@ pub fn load_startup_rules(
         .map_err(|error| log::warn!("{error}"))
         .ok()
 }
+
+#[cfg(test)]
+#[path = "ini_root_tests.rs"]
+mod ini_root_tests;
 
 #[cfg(test)]
 mod tests {

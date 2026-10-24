@@ -13,7 +13,6 @@
 //! - Part of sim/ — depends on map/ (resolved terrain for walkability).
 //! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
-use super::native_heap::NativeHeap;
 use super::search_table::SearchTable;
 use super::zone_hierarchy::{MarkedZones, ZoneLevelGraph};
 use super::zone_map::ZoneId;
@@ -70,7 +69,8 @@ type ClosedLayer = SearchTable<PathDescriptor>;
 /// the search goes on where gamemd's corrupts memory. Frequency: searches
 /// reaching more than about 65,000 cells, such as long routes on the 500x500
 /// scale map (about 125,000 cells). Downstream risk: none within VERA.
-type OpenList = NativeHeap<AStarNode, { usize::MAX }>;
+type OpenList = crate::util::native_heap::NativeHeap<AStarNode>;
+const OPEN_LIST_SIZE: usize = usize::MAX;
 
 /// Reusable scratch for `astar_search`. Lives in a thread-local so repeated
 /// repaths share one set of full-map-sized buffers instead of allocating them
@@ -83,11 +83,20 @@ type OpenList = NativeHeap<AStarNode, { usize::MAX }>;
 /// cleared but keeps capacity. Use through `with_pathfind_workspace` only; it
 /// asserts non-reentrancy so a future recursive A* caller fails loudly instead
 /// of silently sharing buffers.
-#[derive(Default)]
 struct PathfindWorkspace {
     ground: ClosedLayer,
     bridge: ClosedLayer,
     open: OpenList,
+}
+
+impl Default for PathfindWorkspace {
+    fn default() -> Self {
+        Self {
+            ground: ClosedLayer::default(),
+            bridge: ClosedLayer::default(),
+            open: OpenList::new(OPEN_LIST_SIZE),
+        }
+    }
 }
 
 impl PathfindWorkspace {
@@ -151,11 +160,6 @@ pub(crate) const MAX_SEARCH_NODES: u32 = 0xFFF7;
 /// ECX,0x2710` at `0x0042A3E2`), whether at the goal or at the blocked-goal
 /// tail.
 const REFUSED_EXPANSION_COUNT: u32 = 10_000;
-
-/// RA2 computes paths in 24-step segments. When a segment is exhausted before
-/// reaching the destination, the pathfinder replans from the current position.
-/// This limits lookahead and makes units adapt to obstacles discovered en route.
-pub const MAX_PATH_SEGMENT_STEPS: usize = 24;
 
 /// Code-2 (friendly moving) cost multipliers of `AStar_compute_edge_cost`
 /// (`0x00429830`). See [`code2_multiplier`].
@@ -502,7 +506,9 @@ fn offer_child(held: &mut Option<AStarNode>, open: &mut OpenList, child: AStarNo
         Some(best) if child.f_cost < best.f_cost => {
             open.push(std::mem::replace(best, child), cheaper);
         }
-        Some(_) => open.push(child, cheaper),
+        Some(_) => {
+            open.push(child, cheaper);
+        }
         None => *held = Some(child),
     }
 }
@@ -1862,7 +1868,7 @@ impl PathGrid {
         &mut self,
         cell_rx: u16,
         cell_ry: u16,
-        foundation: &str,
+        foundation: &crate::rules::foundation::Foundation,
         has_bib: bool,
     ) {
         let foundation_cells =
@@ -2072,27 +2078,6 @@ pub fn find_path(grid: &PathGrid, start: (u16, u16), goal: (u16, u16)) -> Option
 
 /// A path's cells and the movement layer of each cell, index-aligned.
 pub type LayeredPath = (Vec<(u16, u16)>, Vec<MovementLayer>);
-
-/// Truncate a layered path (coords + layers) to at most `max_steps` movement steps.
-pub fn truncate_layered_path(
-    path: Vec<(u16, u16)>,
-    layers: Vec<MovementLayer>,
-    max_steps: usize,
-) -> LayeredPath {
-    debug_assert_eq!(
-        path.len(),
-        layers.len(),
-        "truncate_layered_path: input length mismatch: {} vs {}",
-        path.len(),
-        layers.len()
-    );
-    let max_len: usize = max_steps + 1;
-    if path.len() <= max_len {
-        (path, layers)
-    } else {
-        (path[..max_len].to_vec(), layers[..max_len].to_vec())
-    }
-}
 
 pub(crate) fn find_layered_path_marker(
     grid: &PathGrid,

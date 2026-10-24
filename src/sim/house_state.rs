@@ -11,6 +11,7 @@ use crate::map::playfield::local_to_packed_cell;
 use crate::rules::object_type::ObjectCategory;
 use crate::sim::cell_rect::PlayfieldBounds;
 use crate::sim::economy::Economy;
+use crate::sim::houses::Houses;
 use crate::sim::intern::InternedId;
 use crate::sim::timer::CdTimer;
 use crate::util::native_x87::{NativeF32Bits, NativeF64Bits};
@@ -163,15 +164,12 @@ pub enum HouseOutcomeKind {
     Defeat,
 }
 
-/// Persistent HouseClass result transition.
-///
-/// The countdown is the existing private House+298 CdTimer, shared with
-/// AllowWin-tag teardown. This is a result/exit latch, never a second timer.
-/// The wall-clock Vox drain that follows `exit_ready` belongs to the app.
+/// Read-only result projection. House flags describe a pending result;
+/// ScenarioSession owns the independent request after House's Vox wait.
+/// The countdown remains the sole private House+298 CdTimer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct HouseOutcomeState {
     pub kind: HouseOutcomeKind,
-    pub exit_ready: bool,
 }
 
 /// Persistent HouseClass strategy-emergency state.
@@ -521,6 +519,10 @@ pub struct HouseState {
     side_index: i32,
     /// Country interned ID from map INI `Country=` key (e.g., "Americans", "Russians").
     country: Option<InternedId>,
+    /// Ares3.0 HouseExt+4C: ordered permanent Country plans. Constructor
+    ///10021072 leaves it empty; live factory ownership is a separate source.
+    #[cfg(feature = "ares")]
+    permanent_factory_plans: Vec<crate::rules::ruleset::CountryIdx>,
     /// Native HouseClass `IsHuman` byte.
     is_human: bool,
     /// Native HouseClass `PlayerControl` byte. It differs from `IsHuman` in
@@ -543,12 +545,10 @@ pub struct HouseState {
     /// Stock `Neutral` (Civilian) and `Special` (JP) both set it, and they exist
     /// in every skirmish, so without it the alive set can never shrink to one.
     ///
-    /// Stamped once at house creation, while a `RuleSet` is still in hand, and
-    /// then read straight off the house — the house rung takes
-    /// `rules: Option<&RuleSet>` and never has to resolve the country itself. A
-    /// house built with no rules available is stamped `false`, the INI default
-    /// for `MultiplayPassive=`; there is no runtime fallback, because gamemd has
-    /// none.
+    /// Stamped once at house creation from the country's rules, and then read
+    /// straight off the house, so the house rung never resolves the country
+    /// itself. A house a fixture builds directly keeps `false`, the INI default
+    /// for `MultiplayPassive=`.
     ///
     /// Persisted state, and versioned as such: it is an authoritative input to
     /// the win/loss outcome, so a save that dropped it would reload as an
@@ -591,10 +591,6 @@ pub struct HouseState {
     has_won: bool,
     /// Defeat flag. Note: Flag_To_Lose clears HasWon first.
     has_lost: bool,
-    /// Accepted win/loss transition plus the deterministic SavourDelay target.
-    /// App-owned wall waits and audio teardown are intentionally excluded.
-    #[serde(default)]
-    outcome_state: Option<HouseOutcomeState>,
     /// HouseClass+0x241 map-clear byte folded by the retail multiplayer
     /// checksum. Distinct from the fog owner's+0x240 reveal guard, which
     /// TAction17 reads (6E0FE8) and gap re-admission clears independently.
@@ -611,6 +607,12 @@ pub struct HouseState {
     /// warp-out clears the latch; otherwise that provider sets it.
     #[serde(default)]
     spy_sat_active: bool,
+    /// House+24B: Constructor4F57A7 arms the first local Update's full
+    /// Map4ADCD0 sight pass. Update4F9353 clears it before the callback;
+    /// Fill_In_Data's earlier mobile-only pass leaves it armed. Save/Load
+    /// retains this byte with the House. Executed: house_initial_sight.
+    #[serde(default)]
+    initial_sight_refresh_pending: bool,
     /// The object counts the defeat gate reads (`house_tracking`), written by
     /// the lifecycle authority at construction, deletion, Limbo, Unlimbo and
     /// owner change.
@@ -703,9 +705,10 @@ pub struct HouseState {
     /// House selected by `HouseClass::UpdateAngerNodes`, or native `-1` as None.
     #[serde(default)]
     enemy_house: Option<InternedId>,
-    /// Edge of the playfield where this house spawns paradrop carriers.
-    /// Encoding: 0=N, 1=E, 2=S, 3=W. Launch setup seeds it from the assigned
-    /// start anchor; committed structures refresh it through lifecycle authority.
+    /// House+0x577C, the map edge this house's aircraft come from and leave
+    /// by. Encoding: 0=N, 1=E, 2=S, 3=W. The constructor writes North
+    /// (`0x004F5C79`); only DetermineEdge
+    /// ([`crate::sim::world::Simulation::determine_house_edge`]) changes it.
     waypoint_edge: u8,
     /// End-of-match score-screen statistics (Kills / Losses / Built columns).
     ///
@@ -734,7 +737,7 @@ pub struct HouseState {
     /// House4F57DE..4F57F0 initializes +26C/+270/+274/+278 to -1.
     /// Record_Last_Built4FB6B0 writes before DontScore; Building discovery
     /// 44D601 also writes its owner's building slot outside ScenarioInit.
-    /// Executed controls: tag_lifecycle --build-type-events (Steam3e81a617).
+    /// Executed controls: tag_lifecycle --build-type-events (Steam gamemd).
     #[serde(default)]
     last_built_types: LastBuiltTypes,
     /// Successful scored factory deliveries by category and native Type
@@ -824,12 +827,11 @@ pub struct HouseState {
     ///   production bias).
     ///
     /// No clearing writer exists anywhere: once set it stays set for the rest
-    /// of the match (save/load carries the raw House block). The
-    /// `Mission_Guard` arm (ii) reader is implemented
-    /// (`techno_ai/mission_handlers.rs`, AI houses only); the
-    /// `AI_Choose_Unit` reader belongs to the deferred AI lane, which is why
-    /// AI-house miners take a VERA-internal re-scan bridge instead of the
-    /// native Guard park (`miner_system::handle_going_to_idle`).
+    /// of the match (save/load carries the raw House block). Both readers are
+    /// ported: `Mission_Guard` arm (ii) in `techno_ai/mission_handlers.rs`,
+    /// which keeps an AI-house miner parked on Guard
+    /// (`miner_system::handle_going_to_idle`), and `AI_Choose_Unit` in
+    /// `ai_unit_choice`.
     /// Persisted and hashed (schema v132).
     #[serde(default)]
     harvester_no_ore: bool,
@@ -894,7 +896,7 @@ struct HouseSuperWeaponTargets {
     defense_frame: i32,
     /// House+54EC: constructor4F5A77 writes1; active Execute35 stores the
     /// signed Action+90 at6DE1F1. AI target pickers read it independently of
-    /// the scripted target cell. Steam gamemd3e81a617..08600.
+    /// the scripted target cell. Steam gamemd.
     #[serde(default = "default_super_target_kind")]
     preferred_kind: i32,
 }
@@ -1021,7 +1023,7 @@ impl HouseState {
     /// MultiplayPassive from the House's country ([`resolve_multiplay_passive`]).
     pub(crate) fn resolve_multiplay_passive(
         &mut self,
-        rules: Option<&crate::rules::ruleset::RuleSet>,
+        rules: &crate::rules::ruleset::RuleSet,
         country: Option<&str>,
     ) {
         self.multiplay_passive = resolve_multiplay_passive(rules, country);
@@ -1359,6 +1361,32 @@ impl HouseState {
         self.country
     }
 
+    #[cfg(feature = "ares")]
+    pub(crate) fn permanent_factory_plans(&self) -> &[crate::rules::ruleset::CountryIdx] {
+        &self.permanent_factory_plans
+    }
+
+    ///10021130 checks membership before appending. Selling/capture/loss does
+    /// not revoke a plan, and this append does not write tech-recheck/timers.
+    #[cfg(feature = "ares")]
+    pub(crate) fn acquire_factory_plan(&mut self, country: crate::rules::ruleset::CountryIdx) {
+        if !self.permanent_factory_plans.contains(&country) {
+            self.permanent_factory_plans.push(country);
+        }
+    }
+
+    /// House.ReadINI500CC5 ->100244C9..10024516 appends without a dedupe
+    /// guard. Only the scenario reader invokes this; CreateHouses does not.
+    #[cfg(feature = "ares")]
+    pub(crate) fn read_scenario_factory_plan(
+        &mut self,
+        country: Option<crate::rules::ruleset::CountryIdx>,
+    ) {
+        if let Some(country) = country {
+            self.permanent_factory_plans.push(country);
+        }
+    }
+
     pub const fn is_human(&self) -> bool {
         self.is_human
     }
@@ -1414,6 +1442,14 @@ impl HouseState {
 
     pub const fn spy_sat_active(&self) -> bool {
         self.spy_sat_active
+    }
+
+    pub(crate) const fn initial_sight_refresh_pending(&self) -> bool {
+        self.initial_sight_refresh_pending
+    }
+
+    pub(super) fn take_initial_sight_refresh(&mut self) -> bool {
+        std::mem::take(&mut self.initial_sight_refresh_pending)
     }
 
     pub const fn tracking(&self) -> &crate::sim::house_tracking::HouseTracking {
@@ -1539,7 +1575,7 @@ impl HouseState {
         );
     }
 
-    pub(crate) fn native_scenario_name(&self) -> Option<&str> {
+    pub fn native_scenario_name(&self) -> Option<&str> {
         self.native_scenario_name.as_deref()
     }
 
@@ -1784,7 +1820,7 @@ impl HouseState {
     }
 
     /// Active Execute77/78/79 stores the full signed Action+90 at
-    /// 6DF38E/6DF3B8/6DF3E2 (Steam gamemd 3e81a617..08600). These are the
+    /// 6DF38E/6DF3B8/6DF3E2 (Steam gamemd). These are the
     /// existing ReadScenarioINI500B40 fields +5660/+5664/+5668, independent
     /// of the live AI-trigger selector's +565C ratio. No timer or RNG write.
     pub(crate) fn set_aircraft_team_ratio(&mut self, value: i32) {
@@ -1916,7 +1952,7 @@ impl HouseState {
     }
 
     /// House50DA50, reached by TAction1416E44C0: clear the alert and restore
-    /// its constructor frame (-100). Original Steam gamemd3e81a617..08600,
+    /// its constructor frame (-100). Original Steam gamemd,
     /// instruction reading. Native also clears +54F8, which currently retains
     /// its constructor zero here (ai_fire's secondary-cell residual).
     pub(crate) fn clear_super_weapon_defense(&mut self) {
@@ -2301,8 +2337,8 @@ impl HouseState {
             .unwrap_or(0)
     }
 
-    /// Active offline EventClass house-scan eligibility.
-    #[cfg(any(test, feature = "test-support"))]
+    /// `Execute_DoList 0x0064C4FB..0x0064C50D` admits a registered House
+    /// when either IsHuman or PlayerControl is set, in every session mode.
     pub const fn event_dispatch_eligible(&self) -> bool {
         self.is_human || self.player_control
     }
@@ -2343,7 +2379,7 @@ impl HouseState {
 
     /// Active TAction74/75 stores only House+1F2 at6DF2FA/6DF339.
     /// The House team timer, selector RNG and existing Teams remain with
-    /// ai_team_creation. Steam3e81a617; trigger_action_values --ai-activation.
+    /// ai_team_creation. Steam gamemd; trigger_action_values --ai-activation.
     pub(crate) fn set_ai_triggers_active(&mut self, active: bool) {
         self.ai_activation.ai_triggers_active = active;
     }
@@ -2379,7 +2415,7 @@ impl HouseState {
     }
 
     /// Execute13 6DEB18 -> shared House selector6E45E0 ->6DEB41 writes
-    /// only House+1EF=1 (Steam gamemd 3e81a617..08600). This neither
+    /// only House+1EF=1 (Steam gamemd). This neither
     /// co-enables the other activation bytes nor immediately creates a team.
     pub(crate) fn enable_scripted_autocreate(&mut self) {
         self.ai_activation.autocreate_allowed = true;
@@ -2440,7 +2476,14 @@ impl HouseState {
     }
 
     pub const fn outcome(&self) -> Option<HouseOutcomeState> {
-        self.outcome_state
+        let kind = if self.has_won {
+            HouseOutcomeKind::Victory
+        } else if self.has_lost {
+            HouseOutcomeKind::Defeat
+        } else {
+            return None;
+        };
+        Some(HouseOutcomeState { kind })
     }
 
     /// Read the sole House+298 countdown in the native signed frame domain.
@@ -2459,10 +2502,6 @@ impl HouseState {
         if !skip_timer {
             self.allow_win_timer.start(frame, savour_frames);
         }
-        self.outcome_state = Some(HouseOutcomeState {
-            kind: HouseOutcomeKind::Victory,
-            exit_ready: false,
-        });
         true
     }
 
@@ -2482,10 +2521,6 @@ impl HouseState {
         if !skip_timer {
             self.allow_win_timer.start(frame, savour_frames);
         }
-        self.outcome_state = Some(HouseOutcomeState {
-            kind: HouseOutcomeKind::Defeat,
-            exit_ready: false,
-        });
         true
     }
 
@@ -2494,33 +2529,31 @@ impl HouseState {
         self.allow_win_timer.resume(frame);
     }
 
-    /// House4F85BE/4F86FE: exact zero on+298 admits the result's Vox wait.
-    /// Campaign Win also requires AllowWin-tags+27C<=0; Lose does not.
-    pub(crate) fn advance_outcome_savour(&mut self, frame: i32, game_mode_nonzero: bool) -> bool {
-        let Some(outcome) = self.outcome_state.as_mut() else {
-            return false;
-        };
-        if self.allow_win_timer.expired(frame)
-            && (outcome.kind == HouseOutcomeKind::Defeat
-                || game_mode_nonzero
-                || self.allow_win_tags <= 0)
-        {
-            outcome.exit_ready = true;
+    /// HouseClass::Update4F85BE/4F86FE admits the whole-Vox wait on
+    /// exact zero of+298. Campaign victory also requires AllowWin+27C<=0.
+    pub(crate) fn pending_outcome(
+        &self,
+        frame: i32,
+        game_mode_nonzero: bool,
+    ) -> Option<HouseOutcomeKind> {
+        let kind = self.outcome()?.kind;
+        (self.allow_win_timer.expired(frame)
+            && (kind == HouseOutcomeKind::Defeat || game_mode_nonzero || self.allow_win_tags <= 0))
+            .then_some(kind)
+    }
+
+    /// House4F8657 clears Won only after the Vox wait. The defeat path
+    /// 4F8780..4F87BB deliberately retains Lost; neither owns session flags.
+    pub(crate) fn complete_outcome(&mut self, kind: HouseOutcomeKind) {
+        if kind == HouseOutcomeKind::Victory {
+            self.has_won = false;
         }
-        outcome.exit_ready
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn supply_outcome_state_for_test(
-        &mut self,
-        won: bool,
-        lost: bool,
-        state: Option<HouseOutcomeState>,
-        timer: CdTimer,
-    ) {
+    pub(crate) fn supply_result_flags_for_test(&mut self, won: bool, lost: bool, timer: CdTimer) {
         self.has_won = won;
         self.has_lost = lost;
-        self.outcome_state = state;
         self.allow_win_timer = timer;
     }
 
@@ -2543,6 +2576,8 @@ impl HouseState {
             initial_techno_records: Vec::new(),
             side_index: side_index.into(),
             country,
+            #[cfg(feature = "ares")]
+            permanent_factory_plans: Vec::new(),
             is_human,
             player_control: is_human,
             difficulty: HouseDifficulty::Normal,
@@ -2556,11 +2591,11 @@ impl HouseState {
             to_die: false,
             has_won: false,
             has_lost: false,
-            outcome_state: None,
             allow_win_tags: 0,
             allow_win_timer: CdTimer::default(),
             map_is_clear: false,
             spy_sat_active: false,
+            initial_sight_refresh_pending: true,
             tracking: Default::default(),
             tech_recheck: true,
             self_heal_infantry: 0,
@@ -2609,10 +2644,10 @@ impl crate::sim::world::Simulation {
     /// internal House identity. Only fully initialized scenario Houses take
     /// this path; generated preconsumed and partial diagnostic rows retain
     /// their explicit internal-key projection in the map constructor owner.
-    pub(crate) fn scenario_house_named(&self, requested: &str) -> Option<InternedId> {
+    pub(crate) fn scenario_house_named(houses: &Houses, requested: &str) -> Option<InternedId> {
         let index = crate::map::houses::find_house_index(
-            self.houses.order().iter().map(|owner| {
-                self.houses
+            houses.order().iter().map(|owner| {
+                houses
                     .get(owner)
                     .expect("registered House array entry")
                     .native_scenario_name()
@@ -2620,7 +2655,7 @@ impl crate::sim::world::Simulation {
             }),
             requested,
         )?;
-        Some(self.houses.order()[index])
+        Some(houses.order()[index])
     }
 }
 
@@ -2767,21 +2802,18 @@ pub fn house_state_for_owner_mut<'a>(
     houses.get_mut(&id)
 }
 
-/// Resolve an owner's ore-income `IncomeMult` (parts-per-million; 1_000_000 = 1.0×) by
-/// routing through its country: `HouseState.country` (InternedId) -> country name ->
-/// `RuleSet::country_income_ppm`. An owner with no house, no country, or an unknown
-/// country resolves to the neutral 1.0 (no income change) — so stock YR (all countries
-/// 1.0, the key commented out) is the identity.
-pub fn income_ppm_for_owner(
+/// Resolve the live owner's HouseType+148 float through its current country.
+/// Unknown diagnostic owners/countries use the constructor's neutral1.0.
+pub fn income_mult_for_owner(
     houses: &crate::sim::houses::Houses,
     interner: &crate::sim::intern::StringInterner,
     rules: &crate::rules::ruleset::RuleSet,
     owner: &str,
-) -> i64 {
+) -> crate::util::native_x87::NativeF32Bits {
     house_state_for_owner(houses, owner, interner)
         .and_then(|h| h.country)
-        .map(|c| rules.country_income_ppm(interner.resolve(c)))
-        .unwrap_or(crate::rules::ruleset::INCOME_PPM_SCALE)
+        .map(|c| rules.country_income_mult(interner.resolve(c)))
+        .unwrap_or(crate::util::native_x87::NativeF32Bits::ONE)
 }
 
 /// Map side name string to numeric index.
@@ -2825,28 +2857,19 @@ pub fn resolve_house_side_index(
 /// Resolve a house's `MultiplayPassive` fact from its country/house-type rules.
 ///
 /// The RuleSet identity owner resolves missing Country to entry0 and known
-/// names through its shared alias lookup. Missing rules or an unresolved
-/// constructor retain the reader's false default.
+/// names through its shared alias lookup. An unresolved constructor retains
+/// the reader's false default.
 pub fn resolve_multiplay_passive(
-    rules: Option<&crate::rules::ruleset::RuleSet>,
+    rules: &crate::rules::ruleset::RuleSet,
     country: Option<&str>,
 ) -> bool {
-    let Some(rules) = rules else {
-        return false;
-    };
     let key = rules.scenario_country_name(country);
     key.is_some_and(|key| rules.country_multiplay_passive(key))
 }
 
 /// Resolve a house type's `WallOwner=` permission. Missing data keeps the native
 /// constructor default of `true`; an absent `Country=` binds to registry entry zero.
-pub fn resolve_wall_owner(
-    rules: Option<&crate::rules::ruleset::RuleSet>,
-    country: Option<&str>,
-) -> bool {
-    let Some(rules) = rules else {
-        return true;
-    };
+pub fn resolve_wall_owner(rules: &crate::rules::ruleset::RuleSet, country: Option<&str>) -> bool {
     let key = rules.scenario_country_name(country);
     key.is_none_or(|key| rules.country_wall_owner(key))
 }
@@ -2859,7 +2882,9 @@ fn native_edge_distance(anchor: (u16, u16), reference: (i32, i32)) -> i32 {
     ])
 }
 
-/// HouseClass-style playfield edge selection for a committed anchor cell.
+/// `HouseClass::DetermineEdge`'s edge choice (`0x0050DCAF..0x0050DEC1`) from
+/// its anchor cell; [`crate::sim::world::Simulation::determine_house_edge`]
+/// finds the anchor.
 ///
 /// The four asymmetric reference points live in the map's LocalSize frame and
 /// must be skewed into cell-grid coordinates before comparison. Strictly-better
@@ -3077,10 +3102,9 @@ mod outcome_tests {
             if row["initial"][0] == 1 {
                 house.flag_to_die(frame);
             }
-            house.supply_outcome_state_for_test(
+            house.supply_result_flags_for_test(
                 row["initial"][1] == 1,
                 row["initial"][2] == 1,
-                None,
                 CdTimer::started(
                     row["initial_timer"][0].as_i64().unwrap() as i32,
                     row["initial_timer"][1].as_i64().unwrap() as i32,
@@ -3140,8 +3164,8 @@ mod outcome_tests {
     fn gsi_01_04_savour_gates_exact_frame_and_defeat_restarts_pending_victory() {
         let mut house = HouseState::new(Default::default(), 0, None, true, 0, 10);
         assert!(house.accept_win_result(100, 90, false));
-        assert!(!house.advance_outcome_savour(189, true));
-        assert!(house.advance_outcome_savour(190, true));
+        assert!(!house.pending_outcome(189, true).is_some());
+        assert!(house.pending_outcome(190, true).is_some());
 
         let mut replaced = HouseState::new(Default::default(), 0, None, true, 0, 10);
         assert!(replaced.accept_win_result(100, 90, false));
@@ -3149,7 +3173,7 @@ mod outcome_tests {
         assert!(!replaced.has_won);
         assert!(replaced.has_lost);
         assert_eq!(
-            replaced.outcome_state.expect("defeat outcome").kind,
+            replaced.outcome().expect("defeat outcome").kind,
             HouseOutcomeKind::Defeat
         );
         assert_eq!(
@@ -3171,22 +3195,22 @@ mod outcome_tests {
         house.supply_allow_win_tag_state(1, paused);
         assert!(house.accept_win_result(100, 90, true));
         assert_eq!(house.outcome_timer(), paused, "67 must not write a timer");
-        assert!(!house.advance_outcome_savour(1000, false));
+        assert!(!house.pending_outcome(1000, false).is_some());
         house.resume_result_timer(1000);
         assert_eq!(house.outcome_timer().duration(), 60);
         assert!(
-            !house.advance_outcome_savour(1060, false),
+            !house.pending_outcome(1060, false).is_some(),
             "AllowWin count blocks Win"
         );
         house.removed_allow_win_tag(1060);
-        assert!(!house.advance_outcome_savour(1119, false));
-        assert!(house.advance_outcome_savour(1120, false));
+        assert!(!house.pending_outcome(1119, false).is_some());
+        assert!(house.pending_outcome(1120, false).is_some());
 
         let mut loss = HouseState::new(Default::default(), 0, None, true, 0, 10);
         loss.supply_allow_win_tag_state(5, crate::sim::timer::CdTimer::default());
         assert!(loss.accept_lose_result(0, 90, true));
         assert!(
-            loss.advance_outcome_savour(0, false),
+            loss.pending_outcome(0, false).is_some(),
             "68 preserves expired ctor timer; no AllowWin gate"
         );
     }
@@ -3334,10 +3358,10 @@ mod multiplay_passive_tests {
     #[test]
     fn named_country_resolves_its_own_multiplay_passive() {
         let rules = rules_with_country_order("Americans", "Neutral");
-        assert!(resolve_multiplay_passive(Some(&rules), Some("Neutral")));
-        assert!(!resolve_multiplay_passive(Some(&rules), Some("Americans")));
+        assert!(resolve_multiplay_passive(&rules, Some("Neutral")));
+        assert!(!resolve_multiplay_passive(&rules, Some("Americans")));
         // Case-insensitive, like every other country lookup.
-        assert!(resolve_multiplay_passive(Some(&rules), Some("neutral")));
+        assert!(resolve_multiplay_passive(&rules, Some("neutral")));
     }
 
     #[test]
@@ -3347,22 +3371,25 @@ mod multiplay_passive_tests {
         // does not fall back to the house's own section name — with `Neutral`
         // sitting at entry 1, a section-name fallback would answer `true` here.
         let americans_first = rules_with_country_order("Americans", "Neutral");
-        assert!(!resolve_multiplay_passive(Some(&americans_first), None));
+        assert!(!resolve_multiplay_passive(&americans_first, None));
 
         // Flip the registry order and the same absent key now follows entry 0.
         let neutral_first = rules_with_country_order("Neutral", "Americans");
-        assert!(resolve_multiplay_passive(Some(&neutral_first), None));
+        assert!(resolve_multiplay_passive(&neutral_first, None));
     }
 
     #[test]
     fn missing_rules_or_unknown_country_is_not_passive() {
         let rules = rules_with_country_order("Americans", "Neutral");
-        assert!(!resolve_multiplay_passive(None, Some("Neutral")));
-        assert!(!resolve_multiplay_passive(None, None));
         assert!(!resolve_multiplay_passive(
-            Some(&rules),
-            Some("Nonexistent")
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            Some("Neutral")
         ));
+        assert!(!resolve_multiplay_passive(
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            None
+        ));
+        assert!(!resolve_multiplay_passive(&rules, Some("Nonexistent")));
     }
 }
 

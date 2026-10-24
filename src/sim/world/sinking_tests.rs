@@ -27,7 +27,7 @@ fn fixture(relative_z: i32) -> (Simulation, RuleSet, u64) {
     let owner = sim.interner.intern("Americans");
     sim.houses
         .register(HouseState::new(owner, 0, None, false, 0, 10));
-    let id = sim.allocate_stable_id();
+    let id = sim.substrate.allocate_stable_id();
     let mut entity = GameEntity::test_default(id, "TEST", "Americans", 113, 59);
     entity.set_type_ref_for_test(sim.interner.intern("TEST"));
     entity.set_owner_for_test(owner);
@@ -142,7 +142,13 @@ fn sinking_state_is_hashed_and_survives_snapshot() {
     // at that same cursor; this test does not assert saved Scenario retention.
     sim.scenario_rng = SimRng::new(0);
     let active_hash = sim.state_hash();
-    sim.sinking_edge_sounds(id, &rules);
+    Simulation::sinking_edge_sounds(
+        &sim.interner,
+        &mut sim.substrate,
+        &mut sim.sound_events,
+        id,
+        &rules,
+    );
     assert_ne!(
         sim.state_hash(),
         active_hash,
@@ -290,7 +296,13 @@ fn native_sinking_sound_readers_and_reachable_edges_match() {
         sim.scenario_rng = SimRng::new(1);
         sim.mapgen_rng = SimRng::new(1);
         sim.sound_events.clear_for_test();
-        sim.sinking_edge_sounds(id, &rules);
+        Simulation::sinking_edge_sounds(
+            &sim.interner,
+            &mut sim.substrate,
+            &mut sim.sound_events,
+            id,
+            &rules,
+        );
         let events: Vec<_> = sim
             .sound_events
             .iter()
@@ -398,7 +410,13 @@ fn load_preserves_sinking_edge_and_resets_shared_foot_sound_bytes() {
         );
         let rng = loaded.rng_state();
         assert!(loaded.sound_events.is_empty());
-        loaded.sinking_edge_sounds(id, &rules);
+        Simulation::sinking_edge_sounds(
+            &loaded.interner,
+            &mut loaded.substrate,
+            &mut loaded.sound_events,
+            id,
+            &rules,
+        );
         assert_eq!(
             loaded.sound_events.len(),
             row["events"].as_array().unwrap().len()
@@ -431,7 +449,7 @@ fn retained_health_one_ship_is_illegal_as_firer_and_target() {
          [AP]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
     ))
     .unwrap();
-    let firer_id = sim.allocate_stable_id();
+    let firer_id = sim.substrate.allocate_stable_id();
     let mut firer = GameEntity::test_default(firer_id, "TEST", "Russians", 112, 59);
     firer.set_type_ref_for_test(sim.interner.intern("TEST"));
     firer.set_owner_for_test(sim.interner.intern("Russians"));
@@ -515,7 +533,7 @@ fn retained_ship_skips_process_but_keeps_its_head_and_runs_sinking_ai() {
     // A second Stun (Unit setter, Path[0] = -1, Stop_Driver) clears the
     // destination, retaining the committed head.
     sim.techno_death_stun(id, UninitContext::with_rules(&rules));
-    sim.advance_live_object_turn(id, Some(&rules), ObjectAiCtx::default())
+    sim.advance_live_object_turn(id, &rules, ObjectAiCtx::default())
         .unwrap();
     let hull = sim.substrate.entities.get(id).unwrap();
     assert_eq!(

@@ -9,13 +9,14 @@
 //! foundation centre, turn it South, raise the walls, then install it
 //! (deselect, reciprocal link, walls-up sound). A step that waits on a turn or
 //! the track re-checks it at the next visit.
+//! Original entry and state3 waiting controls: `tools/spatial_oracle/bunker_entry.md`.
 //!
 //! sim/ only — never render/ui/audio/net.
 use crate::map::entities::EntityCategory;
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::cell_kernel::CellQueryPoint;
-use crate::sim::docking::bunker_link::{self, BunkerLink};
+use crate::sim::docking::bunker_link;
 use crate::sim::movement;
 use crate::sim::movement::ScatterFlags;
 use crate::sim::movement::ground_pose::object_get_coords;
@@ -38,12 +39,9 @@ const OCCUPY_SCAN_POINT: CellQueryPoint = CellQueryPoint { x: 0x80, y: 0x80 };
 /// Install progress for a tank bunker: UpdateBunker's `+0x718`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum BunkerState {
-    /// State 0 with no candidate.
+    /// State 0: wait for contact zero to stop in a bunker cell.
     #[default]
     Idle,
-    /// State 0 with a candidate: waiting for it to stop in a bunker cell
-    /// ([`arrived_and_stopped`]), then scatter the occupy cells' objects.
-    ArriveWait,
     /// State 1: waiting for the occupy cells to clear, then face the building.
     ClearWait,
     /// State 2: turning the unit to face the building.
@@ -65,36 +63,19 @@ pub enum BunkerState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct BunkerRuntime {
     state: BunkerState,
-    /// Candidate unit during ArriveWait..WallsUp; `None` when Idle/Occupied
-    /// (Occupied tracks the occupant via `GameEntity.bunker_occupant`).
-    installing_unit: Option<u64>,
 }
 
 impl BunkerRuntime {
-    /// The install machine's state.
+    /// The install machine's state; production reads only the transitions.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn state(&self) -> BunkerState {
         self.state
-    }
-
-    /// The unit the machine is installing.
-    pub(crate) fn installing_unit(&self) -> Option<u64> {
-        self.installing_unit
-    }
-
-    /// The entry adapter's record of the bunker's DOCK_NOW sender, in place of
-    /// radio contact 0: an idle bunker starts installing `unit`.
-    pub(crate) fn dock_now(&mut self, unit: u64) {
-        if self.state == BunkerState::Idle {
-            self.state = BunkerState::ArriveWait;
-            self.installing_unit = Some(unit);
-        }
     }
 
     /// Install state 5's end (`0x00459301..0x00459337`): the links are made,
     /// so the bunker is occupied and installs no one.
     pub(crate) fn occupy(&mut self) {
         self.state = BunkerState::Occupied;
-        self.installing_unit = None;
     }
 
     /// Install a fixture's state.
@@ -103,17 +84,10 @@ impl BunkerRuntime {
         self.state = state;
     }
 
-    /// Install a fixture's installing unit.
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn set_installing_unit_for_test(&mut self, unit: Option<u64>) {
-        self.installing_unit = unit;
-    }
-
     /// An empty, idle bunker (seeded at spawn for `Bunker=yes` buildings).
     pub fn idle() -> Self {
         Self {
             state: BunkerState::Idle,
-            installing_unit: None,
         }
     }
 }
@@ -139,13 +113,13 @@ pub(crate) fn update_bunker(
     let Some(unit_id) = bunker_partner(sim, building_id) else {
         // 0x00458E7E..0x00458E98: state 0, then Queue_Mission(Guard, 0).
         bunker_link::reset_bunker_idle(&mut sim.substrate, building_id);
-        bunker_link::queue_guard(sim, building_id);
+        bunker_link::queue_guard(sim, building_id, rules);
         return;
     };
 
     match state {
         // State 0 (0x00458EAF..0x0045904B).
-        BunkerState::ArriveWait => {
+        BunkerState::Idle => {
             if arrived_and_stopped(sim, building_id, unit_id) {
                 scatter_occupy_cell_objects(
                     sim,
@@ -155,12 +129,7 @@ pub(crate) fn update_bunker(
                     unit_id,
                     frame_effects,
                 );
-                set_state(
-                    &mut sim.substrate,
-                    building_id,
-                    BunkerState::ClearWait,
-                    Some(unit_id),
-                );
+                set_state(&mut sim.substrate, building_id, BunkerState::ClearWait);
             }
         }
         // State 1 (0x00458FA9..0x004590F9).
@@ -169,12 +138,7 @@ pub(crate) fn update_bunker(
                 if let Some(f) = install_facing(sim, building_id, unit_id) {
                     turn_unit(&sim.session, &mut sim.substrate, unit_id, f);
                 }
-                set_state(
-                    &mut sim.substrate,
-                    building_id,
-                    BunkerState::TurnToBuilding,
-                    Some(unit_id),
-                );
+                set_state(&mut sim.substrate, building_id, BunkerState::TurnToBuilding);
             }
         }
         // State 2 (0x00459101..0x004591D5).
@@ -190,69 +154,39 @@ pub(crate) fn update_bunker(
                 );
                 // Building4591AF..4591C4 ignores Force_Track's return and
                 // enters state3, including when both raw cells are equal.
-                set_state(
-                    &mut sim.substrate,
-                    building_id,
-                    BunkerState::TrackStep,
-                    Some(unit_id),
-                );
+                set_state(&mut sim.substrate, building_id, BunkerState::TrackStep);
             }
         }
         // State 3 (0x004591D6..0x0045923E).
         BunkerState::TrackStep => {
-            settle_completed_install_track(
-                sim,
-                rules,
-                registry,
-                building_id,
-                unit_id,
-                frame_effects,
-            );
             if arrived_and_stopped(sim, building_id, unit_id) {
                 turn_unit(&sim.session, &mut sim.substrate, unit_id, SOUTH_FACING);
-                set_state(
-                    &mut sim.substrate,
-                    building_id,
-                    BunkerState::TurnSouth,
-                    Some(unit_id),
-                );
+                set_state(&mut sim.substrate, building_id, BunkerState::TurnSouth);
             }
         }
         // State 4 (0x0045923F..0x00459300): wall slots 10 and 11.
         BunkerState::TurnSouth => {
             if !is_turning(sim, unit_id) {
                 bunker_link::emit_bunker_wall_anim(sim, building_id, true, rules);
-                set_state(
-                    &mut sim.substrate,
-                    building_id,
-                    BunkerState::WallsUp,
-                    Some(unit_id),
-                );
+                set_state(&mut sim.substrate, building_id, BunkerState::WallsUp);
             }
         }
         // State 5 (0x00459301..0x00459373).
         BunkerState::WallsUp => {
             bunker_link::install_bunker_link(sim, building_id, unit_id, rules);
         }
-        BunkerState::Idle | BunkerState::Occupied => {}
+        BunkerState::Occupied => {}
     }
 }
 
-/// UpdateBunker's object (`0x00458E5B..0x00458E7C`): the bunker's linked item
-/// (`+0x2E4`, its occupant), else its radio contact 0, when that is a Unit
-/// (vt+0x2C == 1). VERA's entry adapter keeps no radio contact; its DOCK_NOW
-/// sender stands in for contact 0 while that unit still approaches this
-/// bunker ([`bunker_link::begin_entry`], [`bunker_link::cancel_approach`]).
+/// UpdateBunker's object (458E5B..458E7C): occupant +2E4, otherwise
+/// radio contact zero. Only a Unit proceeds through the state machine.
 fn bunker_partner(sim: &Simulation, building_id: u64) -> Option<u64> {
     let building = sim.substrate.entities.get(building_id)?;
-    let partner = building.bunker.occupant().or_else(|| {
-        let unit_id = building.bunker_runtime?.installing_unit?;
-        sim.substrate
-            .entities
-            .get(unit_id)
-            .is_some_and(|unit| unit.bunker.link() == BunkerLink::Approaching(building_id))
-            .then_some(unit_id)
-    })?;
+    let partner = building
+        .bunker
+        .occupant()
+        .or(building.radio_contacts.slot(0))?;
     sim.substrate
         .entities
         .get(partner)
@@ -260,58 +194,11 @@ fn bunker_partner(sim: &Simulation, building_id: u64) -> Option<u64> {
         .then_some(partner)
 }
 
-/// The contact-free entry adapter can leave the forced destination retained
-/// after the track has retired with no NavCom (Drive's terminal arrival gate
-/// requires one). Is_Moving then stays true even at the exact foundation
-/// centre. Finish that adapter-owned move through the locomotor's Stop_Moving;
-/// Unit's null destination setter intentionally does nothing with null NavCom.
-/// never move the object or alter a still-active track to satisfy the wait.
-fn settle_completed_install_track(
-    sim: &mut Simulation,
-    rules: &RuleSet,
-    registry: Option<&OverlayTypeRegistry>,
-    building_id: u64,
-    unit_id: u64,
-    effects: FrameEffects<'_>,
-) {
-    let Some(building) = sim.substrate.entities.get(building_id) else {
-        return;
-    };
-    let centre = object_get_coords(building, sim.resolved_terrain.as_ref());
-    let completed = sim.substrate.entities.get(unit_id).is_some_and(|unit| {
-        let Some(loco) = unit.locomotor.as_ref() else {
-            return false;
-        };
-        let Some(family) = movement::track_process::TrackFamily::from_kind(loco.active_kind())
-        else {
-            return false;
-        };
-        unit.navigation.nav_com().is_none()
-            && object_get_coords(unit, sim.resolved_terrain.as_ref()) == centre
-            && loco.track_head(family).is_none()
-            && loco
-                .track_progress(family)
-                .is_some_and(|track| track.turn_index() == -1)
-            && loco.track_destination(family) == Some(centre)
-    });
-    if completed {
-        if let Err(cause) = sim.locomotor_stop_moving(unit_id, Some(rules), registry, effects) {
-            log::warn!("Bunker install track completion {unit_id}: {cause}");
-        }
-    }
-}
-
-fn set_state(
-    substrate: &mut ObjectSubstrate,
-    building_id: u64,
-    state: BunkerState,
-    unit: Option<u64>,
-) {
+fn set_state(substrate: &mut ObjectSubstrate, building_id: u64, state: BunkerState) {
     if let Some(b) = substrate.entities.get_mut(building_id)
         && let Some(rt) = b.bunker_runtime.as_mut()
     {
         rt.state = state;
-        rt.installing_unit = unit;
     }
 }
 
@@ -418,8 +305,7 @@ fn scatter_occupy_cell_objects(
 }
 
 /// Building459069..4590F9 reads both virtual GetCoords, computes the full
-/// facing word and adds0x7FFF before Facing::Set. Steam gamemd SHA256
-/// 3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600;
+/// facing word and adds0x7FFF before Facing::Set. Steam gamemd;
 /// executed controls: tools/spatial_oracle/locomotor_force_track.bunker_install.json.
 /// The shared coordinate and direction owners retain sub-cell/foundation
 /// offsets; matching raw cells (or matching coordinates) do not skip the turn.
@@ -456,7 +342,7 @@ fn start_install_force_track(
         0x1C0 => 0x46,
         _ => 0x45,
     };
-    sim.force_track(unit_id, track, head, Some(rules), registry, frame_effects);
+    sim.force_track(unit_id, track, head, rules, registry, frame_effects);
     // Building4591AF calls Force_Track, then4591BE explicitly sets Foot's
     // applied fraction. The generic locomotor admission does not own speed.
     if let Some(unit) = sim.substrate.entities.get_mut(unit_id) {
@@ -469,6 +355,7 @@ fn start_install_force_track(
 mod tests {
     use super::*;
     use crate::sim::combat::Health;
+    use crate::sim::docking::bunker_link::BunkerLink;
     use crate::sim::game_entity::GameEntity;
     use crate::sim::world::RevealOutcome;
 
@@ -550,13 +437,30 @@ mod tests {
             .unwrap()
     }
 
+    fn prepare_install(substrate: &mut ObjectSubstrate, building: u64, state: BunkerState) {
+        substrate
+            .entities
+            .get_mut(building)
+            .unwrap()
+            .radio_contacts
+            .set_slot(0, 1);
+        substrate
+            .entities
+            .get_mut(1)
+            .unwrap()
+            .radio_contacts
+            .set_slot(0, building);
+        set_state(substrate, building, state);
+    }
+
+    /// Original UpdateBunker state3 reads Drive Is_Moving; a retained
+    /// destination remains movement even with no NavCom/head/track selector.
+    /// The joined bunker_entry corpus executes this prepared counterexample.
     #[test]
-    fn bunker_completed_track_without_navcom_clears_stale_move_before_turning() {
-        use crate::sim::components::{DriveCoord, TrackProgress};
+    fn bunker_install_waits_for_retained_move_without_navcom() {
+        use crate::sim::components::TrackProgress;
         use crate::sim::movement::track_process::TrackFamily;
 
-        // Reproduces save_tick3036_1792426331: LTNK 773 at the NATBNK
-        // centre, no head/selector/NavCom, but a nonnull Drive destination.
         let rules = rules_with_foundation("2x2");
         let mut sim = Simulation::new();
         spawn_bunker(&mut sim, 2);
@@ -569,73 +473,35 @@ mod tests {
         assert!(matches!(sim.reveal(2), RevealOutcome::Revealed { .. }));
         spawn_tank_on(&mut sim, 1, 11, 11);
         let centre = object_get_coords(sim.substrate.entities.get(2).unwrap(), None);
-        let frame = sim.session.binary_frame();
         let unit = sim.substrate.entities.get_mut(1).unwrap();
         unit.position.put_location(centre);
         unit.body_facing = movement::FacingClass::new(0x6000, 5);
-        unit.bunker
-            .set_bunker_link_for_test(BunkerLink::Approaching(2));
         let loco = unit.locomotor.as_mut().unwrap();
         loco.store_track_destination(TrackFamily::Drive, Some(centre));
         loco.store_track_head(TrackFamily::Drive, None);
         loco.store_track_progress(TrackFamily::Drive, TrackProgress::for_test(-1, 0, false, 0));
-        set_state(&mut sim.substrate, 2, BunkerState::TrackStep, Some(1));
-        assert_eq!(
-            movement::motion_query::is_moving(sim.substrate.entities.get(1).unwrap()),
-            Some(true)
-        );
+        prepare_install(&mut sim.substrate, 2, BunkerState::TrackStep);
 
-        update_bunker(&mut sim, &rules, None, 2, FrameEffects::default());
-        assert_eq!(rt(&sim, 2).state(), BunkerState::TurnSouth);
-        let unit = sim.substrate.entities.get(1).unwrap();
-        assert_eq!(
-            object_get_coords(unit, None),
-            centre,
-            "completion never teleports the tank"
-        );
-        assert_eq!(unit.bunker.link(), BunkerLink::Approaching(2));
-        assert_eq!(movement::motion_query::is_moving(unit), Some(false));
-        assert_eq!(unit.body_facing.destination(), SOUTH_FACING);
-        sim.session.set_binary_frame_for_test(frame + 100);
-        update_bunker(&mut sim, &rules, None, 2, FrameEffects::default());
-        assert_eq!(rt(&sim, 2).state(), BunkerState::WallsUp);
-        update_bunker(&mut sim, &rules, None, 2, FrameEffects::default());
-        assert_eq!(rt(&sim, 2).state(), BunkerState::Occupied);
-
-        // A live segment must not be cut short even if its current sample
-        // touches the centre. Keep the head/selector and the waiting state.
-        set_state(&mut sim.substrate, 2, BunkerState::TrackStep, Some(1));
-        let unit = sim.substrate.entities.get_mut(1).unwrap();
-        unit.bunker
-            .set_bunker_link_for_test(BunkerLink::Approaching(2));
-        let loco = unit.locomotor.as_mut().unwrap();
-        loco.store_track_destination(TrackFamily::Drive, Some(centre));
-        loco.store_track_head(
-            TrackFamily::Drive,
-            Some(DriveCoord {
-                x: centre.x + 1,
-                ..centre
-            }),
-        );
-        loco.store_track_progress(
-            TrackFamily::Drive,
-            TrackProgress::for_test(0x44, 1, false, 0),
-        );
         update_bunker(&mut sim, &rules, None, 2, FrameEffects::default());
         assert_eq!(rt(&sim, 2).state(), BunkerState::TrackStep);
+        let unit = sim.substrate.entities.get(1).unwrap();
+        assert_eq!(object_get_coords(unit, None), centre);
+        assert_eq!(unit.navigation.nav_com(), None);
+        assert_eq!(
+            unit.locomotor
+                .as_ref()
+                .unwrap()
+                .track_destination(TrackFamily::Drive),
+            Some(centre)
+        );
+        assert_eq!(movement::motion_query::is_moving(unit), Some(true));
+        assert_eq!(unit.body_facing.destination(), 0x6000);
     }
 
-    #[test]
-    fn retail_tank_bunker_entry_completes_through_full_world_frames() {
-        use crate::sim::command::{Command, CommandEnvelope};
-
-        let Some(mut rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
-        else {
-            return;
-        };
-        let Some((_, mut assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
-            return;
-        };
+    /// Retail rules with the Tank Bunker's wall anims bound to TEMPERATE.
+    fn retail_bunker_rules() -> Option<RuleSet> {
+        let mut rules = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()?;
+        let (_, mut assets) = crate::rules::retail_ini_fixture::retail_assets()?;
         crate::map::theater::load_theater(&mut assets, "TEMPERATE").unwrap();
         let wall_names = [
             "NATBNK_A",
@@ -652,7 +518,49 @@ mod tests {
             rules.bind_anim_class_assets(&wall_names, &assets, "TEM", "TEMPERATE"),
             0
         );
-        for start in [
+        Some(rules)
+    }
+
+    /// The Americans' NATBNK at (10, 10) and a light tank at `start`, with
+    /// the player's Enter order on it queued for the next frame.
+    fn retail_bunker_entry(rules: &RuleSet, start: (u16, u16)) -> (Simulation, u64, u64) {
+        use crate::sim::command::{Command, CommandEnvelope};
+
+        let mut sim = crate::sim::arena_fixture::rival_arena(rules, 0x458E50);
+        sim.intern_rule_type_ids(rules);
+        sim.resolve_type_handles(rules);
+        sim.set_input_delay_ticks(0);
+        sim.session.set_binary_frame_for_test(1);
+        let bunker = sim
+            .spawn_object("NATBNK", "Americans", 10, 10, 0, rules)
+            .unwrap();
+        let tank = sim
+            .spawn_object("LTNK", "Americans", start.0, start.1, 0, rules)
+            .unwrap();
+        let owner = sim.interner.intern("Americans");
+        sim.queue_command(CommandEnvelope::new(
+            owner,
+            sim.session.tick() + 1,
+            Command::clicked_mission(
+                tank,
+                crate::sim::mission::MissionType::Enter,
+                crate::sim::combat::TargetKind::Entity(bunker),
+            ),
+        ));
+        (sim, bunker, tank)
+    }
+
+    /// Entry from every side, with serial path searches and with the batched
+    /// ones real matches run (`movement::path_batch`). Batched, the tank's
+    /// request at the end of its install track heads for its own cell and
+    /// runs in the same call, so its Find_Path failure stops the tank and the
+    /// walls rise (#2448).
+    #[test]
+    fn retail_tank_bunker_entry_completes_through_full_world_frames() {
+        let Some(rules) = retail_bunker_rules() else {
+            return;
+        };
+        let starts = [
             (6, 6),
             (10, 6),
             (14, 6),
@@ -661,27 +569,17 @@ mod tests {
             (10, 14),
             (6, 14),
             (6, 10),
-        ] {
-            let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x458E50);
-            sim.intern_rule_type_ids(&rules);
-            sim.resolve_type_handles(&rules);
-            sim.set_input_delay_ticks(0);
-            sim.session.set_binary_frame_for_test(1);
-            let bunker = sim
-                .spawn_object("NATBNK", "Americans", 10, 10, 0, &rules)
-                .unwrap();
-            let tank = sim
-                .spawn_object("LTNK", "Americans", start.0, start.1, 0, &rules)
-                .unwrap();
-            let owner = sim.interner.intern("Americans");
-            sim.queue_command(CommandEnvelope::new(
-                owner,
-                sim.session.tick() + 1,
-                Command::EnterBunker {
-                    unit_id: tank,
-                    bunker_id: bunker,
-                },
-            ));
+        ];
+        for (batched, start) in [false, true]
+            .into_iter()
+            .flat_map(|batched| starts.map(|start| (batched, start)))
+        {
+            let (mut sim, bunker, tank) = retail_bunker_entry(&rules, start);
+            if batched {
+                sim.overlay_grid = Some(crate::sim::overlay_grid::OverlayGrid::new(32, 32));
+                sim.batch_path_searches();
+            }
+            let case = format!("{start:?}, {}", if batched { "batched" } else { "serial" });
 
             let mut trace = Vec::new();
             let mut previous = None;
@@ -707,7 +605,7 @@ mod tests {
                     }
                     assert!(
                         step <= 64,
-                        "entry from {start:?} jumped {step} leptons in one frame"
+                        "entry from {case} jumped {step} leptons in one frame"
                     );
                 }
                 previous_xy = xy;
@@ -730,12 +628,12 @@ mod tests {
             let unit = sim.substrate.entities.get(tank).unwrap();
             assert!(
                 slide_samples >= 3,
-                "entry from {start:?} must drive through intermediate positions"
+                "entry from {case} must drive through intermediate positions"
             );
             assert_eq!(
                 rt(&sim, bunker).state(),
                 BunkerState::Occupied,
-                "entry from {start:?} stalled: {trace:#?}; position={:?} moving={:?} nav={:?}",
+                "entry from {case} stalled: {trace:#?}; position={:?} moving={:?} nav={:?}",
                 object_get_coords(unit, sim.resolved_terrain.as_ref()),
                 movement::motion_query::is_moving(unit),
                 unit.navigation.nav_com()
@@ -749,13 +647,359 @@ mod tests {
             assert_eq!(building.bunker.occupant(), Some(tank));
             assert!(
                 building.building_art.anim_slots()[10].is_some(),
-                "front wall animation"
+                "entry from {case}: front wall animation"
             );
             assert!(
                 building.building_art.anim_slots()[11].is_some(),
-                "rear wall animation"
+                "entry from {case}: rear wall animation"
             );
         }
+    }
+
+    /// Issue #2235: a Rocketeer hovering over the bunker must not keep the
+    /// tank out. The air unit takes off, flies to the bunker's cell and holds
+    /// there (BalloonHover); the tank's Enter order follows.
+    #[test]
+    fn retail_tank_bunker_entry_with_a_rocketeer_over_the_bunker() {
+        use crate::sim::command::{Command, CommandEnvelope};
+
+        let Some(mut rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
+        else {
+            return;
+        };
+        let Some((_, mut assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        crate::map::theater::load_theater(&mut assets, "TEMPERATE").unwrap();
+        let wall_names = ["NATBNK_A", "NATBNK_B", "NATBNK_AD", "NATBNK_BD"].map(str::to_owned);
+        assert_eq!(
+            rules.bind_anim_class_assets(&wall_names, &assets, "TEM", "TEMPERATE"),
+            0
+        );
+        let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x458E50);
+        sim.intern_rule_type_ids(&rules);
+        sim.resolve_type_handles(&rules);
+        sim.set_input_delay_ticks(0);
+        sim.session.set_binary_frame_for_test(1);
+        let bunker = sim
+            .spawn_object("NATBNK", "Americans", 10, 10, 0, &rules)
+            .unwrap();
+        let rocketeer = sim
+            .spawn_object("JUMPJET", "Americans", 14, 10, 0, &rules)
+            .unwrap();
+        let owner = sim.interner.intern("Americans");
+        sim.queue_command(CommandEnvelope::new(
+            owner,
+            sim.session.tick() + 1,
+            Command::Move {
+                entity_id: rocketeer,
+                target_rx: 10,
+                target_ry: 10,
+            },
+        ));
+        let mut airborne = false;
+        for _ in 0..400 {
+            let commands = sim.take_due_commands();
+            let grid = sim.path_grid_snapshot();
+            sim.advance_tick(&commands, Some(&rules), grid.as_deref(), None, 33);
+            let Some(flyer) = sim.substrate.entities.get(rocketeer) else {
+                break;
+            };
+            airborne |= flyer.position.rx().abs_diff(10) <= 1
+                && flyer.position.ry().abs_diff(10) <= 1
+                && crate::sim::movement::air_movement::current_fly_height(
+                    flyer,
+                    sim.resolved_terrain.as_ref(),
+                ) > 0;
+            if airborne
+                && sim.substrate.occupancy.get(10, 10).is_none_or(|cell| {
+                    cell.iter_layer(movement::locomotor::MovementLayer::Ground)
+                        .all(|entry| entry.entity_id != rocketeer)
+                })
+            {
+                break;
+            }
+        }
+        let flyer_over = sim.substrate.entities.get(rocketeer).is_some_and(|flyer| {
+            flyer.position.rx().abs_diff(10) <= 1 && flyer.position.ry().abs_diff(10) <= 1
+        });
+        assert!(
+            airborne && flyer_over,
+            "the Rocketeer must hold over the bunker before the tank is ordered in"
+        );
+
+        let tank = sim
+            .spawn_object("LTNK", "Americans", 6, 10, 0, &rules)
+            .unwrap();
+        sim.queue_command(CommandEnvelope::new(
+            owner,
+            sim.session.tick() + 1,
+            Command::clicked_mission(
+                tank,
+                crate::sim::mission::MissionType::Enter,
+                crate::sim::combat::TargetKind::Entity(bunker),
+            ),
+        ));
+        let mut trace = Vec::new();
+        let mut previous = None;
+        for _ in 0..600 {
+            let commands = sim.take_due_commands();
+            let grid = sim.path_grid_snapshot();
+            sim.advance_tick(&commands, Some(&rules), grid.as_deref(), None, 33);
+            let state = rt(&sim, bunker).state();
+            if previous != Some(state) {
+                let unit = sim.substrate.entities.get(tank).unwrap();
+                let flyer = sim.substrate.entities.get(rocketeer).unwrap();
+                trace.push(format!(
+                    "frame={} state={state:?} tank=({},{}) mission={:?} moving={:?} nav={:?} \
+                     flyer=({},{}) z={:?} listed={:?}",
+                    sim.session.binary_frame(),
+                    unit.position.rx(),
+                    unit.position.ry(),
+                    unit.mission.current(),
+                    movement::motion_query::is_moving(unit),
+                    unit.navigation.nav_com(),
+                    flyer.position.rx(),
+                    flyer.position.ry(),
+                    flyer.position.exact_z_leptons(),
+                    sim.substrate.occupancy.get(10, 10).map(|cell| cell
+                        .iter_layer(movement::locomotor::MovementLayer::Ground)
+                        .map(|entry| entry.entity_id)
+                        .collect::<Vec<_>>()),
+                ));
+                previous = Some(state);
+            }
+            if state == BunkerState::Occupied {
+                break;
+            }
+        }
+        assert_eq!(
+            rt(&sim, bunker).state(),
+            BunkerState::Occupied,
+            "entry under a hovering Rocketeer stalled: {trace:#?}"
+        );
+        assert_eq!(
+            sim.substrate.entities.get(tank).unwrap().bunker.link(),
+            BunkerLink::Installed(bunker)
+        );
+    }
+
+    /// Issue #2235 matrix driver: the air unit owned by `air_owner` flies to
+    /// the bunker's cell and hovers there (BalloonHover); once it holds, the
+    /// American tank is ordered in. A hovering jumpjet is off every cell's
+    /// Ground list (it delists through its climb and arrival, see
+    /// `src/sim/occupancy.rs`), so neither the install scans nor the tank's
+    /// cell-entry walk may see it — whatever the air unit's house or
+    /// infantry/vehicle category.
+    fn assert_entry_completes_under_hovering_air(air_type: &str, air_owner: &str) {
+        use crate::sim::command::{Command, CommandEnvelope};
+
+        let Some(mut rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
+        else {
+            return;
+        };
+        let Some((_, mut assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        crate::map::theater::load_theater(&mut assets, "TEMPERATE").unwrap();
+        let wall_names = ["NATBNK_A", "NATBNK_B", "NATBNK_AD", "NATBNK_BD"].map(str::to_owned);
+        assert_eq!(
+            rules.bind_anim_class_assets(&wall_names, &assets, "TEM", "TEMPERATE"),
+            0
+        );
+        let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x458E50);
+        sim.intern_rule_type_ids(&rules);
+        sim.resolve_type_handles(&rules);
+        sim.set_input_delay_ticks(0);
+        sim.session.set_binary_frame_for_test(1);
+        let bunker = sim
+            .spawn_object("NATBNK", "Americans", 10, 10, 0, &rules)
+            .unwrap();
+        let flyer_id = sim
+            .spawn_object(air_type, air_owner, 14, 10, 0, &rules)
+            .unwrap();
+        // The human Americans send the flyer's Move: the DoList skips computer Houses' events
+        // (0x0064C4FB..0x0064C50D), and MegaMission never compares sender and actor
+        // (0x004C71F6..0x004C721F).
+        let sender = sim.interner.intern("Americans");
+        sim.queue_command(CommandEnvelope::new(
+            sender,
+            sim.session.tick() + 1,
+            Command::Move {
+                entity_id: flyer_id,
+                target_rx: 10,
+                target_ry: 10,
+            },
+        ));
+        let mut airborne = false;
+        for _ in 0..400 {
+            let commands = sim.take_due_commands();
+            let grid = sim.path_grid_snapshot();
+            sim.advance_tick(&commands, Some(&rules), grid.as_deref(), None, 33);
+            let Some(flyer) = sim.substrate.entities.get(flyer_id) else {
+                break;
+            };
+            airborne |= flyer.position.rx().abs_diff(10) <= 1
+                && flyer.position.ry().abs_diff(10) <= 1
+                && crate::sim::movement::air_movement::current_fly_height(
+                    flyer,
+                    sim.resolved_terrain.as_ref(),
+                ) > 0;
+            if airborne
+                && sim.substrate.occupancy.get(10, 10).is_none_or(|cell| {
+                    cell.iter_layer(movement::locomotor::MovementLayer::Ground)
+                        .all(|entry| entry.entity_id != flyer_id)
+                })
+            {
+                break;
+            }
+        }
+        let flyer_over = sim.substrate.entities.get(flyer_id).is_some_and(|flyer| {
+            flyer.position.rx().abs_diff(10) <= 1 && flyer.position.ry().abs_diff(10) <= 1
+        });
+        assert!(
+            airborne && flyer_over,
+            "the {air_type} must hold over the bunker before the tank is ordered in"
+        );
+
+        let owner = sim.interner.intern("Americans");
+        let tank = sim
+            .spawn_object("LTNK", "Americans", 6, 10, 0, &rules)
+            .unwrap();
+        sim.queue_command(CommandEnvelope::new(
+            owner,
+            sim.session.tick() + 1,
+            Command::clicked_mission(
+                tank,
+                crate::sim::mission::MissionType::Enter,
+                crate::sim::combat::TargetKind::Entity(bunker),
+            ),
+        ));
+        let mut trace = Vec::new();
+        let mut previous = None;
+        for _ in 0..600 {
+            let commands = sim.take_due_commands();
+            let grid = sim.path_grid_snapshot();
+            sim.advance_tick(&commands, Some(&rules), grid.as_deref(), None, 33);
+            let state = rt(&sim, bunker).state();
+            if previous != Some(state) {
+                let unit = sim.substrate.entities.get(tank).unwrap();
+                let flyer = sim
+                    .substrate
+                    .entities
+                    .get(flyer_id)
+                    .map(|flyer| {
+                        format!(
+                            "flyer=({},{}) z={:?} moving={:?}",
+                            flyer.position.rx(),
+                            flyer.position.ry(),
+                            flyer.position.exact_z_leptons(),
+                            movement::motion_query::is_moving(flyer),
+                        )
+                    })
+                    .unwrap_or_else(|| "flyer=retired".to_owned());
+                trace.push(format!(
+                    "frame={} state={state:?} tank=({},{}) mission={:?} moving={:?} nav={:?} {flyer}",
+                    sim.session.binary_frame(),
+                    unit.position.rx(),
+                    unit.position.ry(),
+                    unit.mission.current(),
+                    movement::motion_query::is_moving(unit),
+                    unit.navigation.nav_com(),
+                ));
+                previous = Some(state);
+            }
+            if state == BunkerState::Occupied {
+                break;
+            }
+        }
+        assert_eq!(
+            rt(&sim, bunker).state(),
+            BunkerState::Occupied,
+            "entry under a hovering {air_type} stalled: {trace:#?}"
+        );
+        assert_eq!(
+            sim.substrate.entities.get(tank).unwrap().bunker.link(),
+            BunkerLink::Installed(bunker)
+        );
+    }
+
+    /// Issue #2235: an enemy Rocketeer hovering over the bunker must not keep
+    /// the tank out (the walk's non-allied arm may only see listed objects).
+    #[test]
+    fn retail_tank_bunker_entry_with_an_enemy_rocketeer_over_the_bunker() {
+        assert_entry_completes_under_hovering_air("JUMPJET", "Russians");
+    }
+
+    /// Issue #2235: a Floating Disc — the issue's second reporter unit, an air
+    /// unit in the Unit category — hovering over the bunker must not keep the
+    /// tank out.
+    #[test]
+    fn retail_tank_bunker_entry_with_a_floating_disc_over_the_bunker() {
+        assert_entry_completes_under_hovering_air("DISK", "Americans");
+    }
+
+    /// The player's DEPLOY on a bunkered tank (the deploy key's or its
+    /// self-click's order) brings it out: the event queues Unload, whose
+    /// bunker head (`0x0073D63B..0x0073D66D`) empties the bunker under it
+    /// (`EmptyBunker @ 0x004595C0`), which queues the tank's Move out.
+    #[test]
+    fn a_bunkered_tank_deploys_out_of_its_bunker() {
+        use crate::sim::command::{Command, CommandEnvelope};
+
+        let Some(rules) = retail_bunker_rules() else {
+            return;
+        };
+        let (mut sim, bunker, tank) = retail_bunker_entry(&rules, (10, 6));
+        for _ in 0..600 {
+            let commands = sim.take_due_commands();
+            let grid = sim.path_grid_snapshot();
+            sim.advance_tick(&commands, Some(&rules), grid.as_deref(), None, 33);
+            if rt(&sim, bunker).state() == BunkerState::Occupied {
+                break;
+            }
+        }
+        assert_eq!(
+            sim.substrate.entities.get(tank).unwrap().bunker.link(),
+            BunkerLink::Installed(bunker)
+        );
+        assert!(sim.can_deploy_slash_unload(tank, &rules));
+        let inside = movement::ground_pose::position_world_xy(
+            &sim.substrate.entities.get(tank).unwrap().position,
+        );
+
+        let owner = sim.interner.intern("Americans");
+        sim.queue_command(CommandEnvelope::new(
+            owner,
+            sim.session.tick() + 1,
+            Command::DeployMcv { entity_id: tank },
+        ));
+        let mut left = false;
+        for _ in 0..300 {
+            let commands = sim.take_due_commands();
+            let grid = sim.path_grid_snapshot();
+            sim.advance_tick(&commands, Some(&rules), grid.as_deref(), None, 33);
+            let unit = sim.substrate.entities.get(tank).unwrap();
+            let xy = movement::ground_pose::position_world_xy(&unit.position);
+            if unit.bunker.link() == BunkerLink::None
+                && sim
+                    .substrate
+                    .entities
+                    .get(bunker)
+                    .unwrap()
+                    .bunker
+                    .occupant()
+                    == None
+                && (xy[0] - inside[0]).abs().max((xy[1] - inside[1]).abs()) > 256
+            {
+                left = true;
+                break;
+            }
+        }
+        assert!(
+            left,
+            "the tank drives out of the bunker it was released from"
+        );
     }
 
     /// The install steps only on the bunker's Repair visits: DOCK_NOW queues
@@ -795,10 +1039,11 @@ mod tests {
         sim.queue_command(CommandEnvelope::new(
             owner,
             sim.session.tick() + 1,
-            Command::EnterBunker {
-                unit_id: tank,
-                bunker_id: bunker,
-            },
+            Command::clicked_mission(
+                tank,
+                MissionType::Enter,
+                crate::sim::combat::TargetKind::Entity(bunker),
+            ),
         ));
 
         let repair = MissionId::from_known(MissionType::Repair);
@@ -826,7 +1071,6 @@ mod tests {
         assert_eq!(
             states,
             [
-                BunkerState::ArriveWait,
                 BunkerState::ClearWait,
                 BunkerState::TurnToBuilding,
                 BunkerState::TrackStep,
@@ -836,18 +1080,18 @@ mod tests {
             ],
             "{changes:?}"
         );
-        for pair in changes[1..].windows(2) {
+        for pair in changes.windows(2) {
             let gap = pair[1].0 - pair[0].0;
             assert!(
                 gap >= 15 && gap % 15 == 0,
                 "steps fall on the 15-frame Repair visits: {changes:?}"
             );
         }
-        for &(_, state, mission) in &changes[1..] {
+        for &(_, state, mission) in &changes {
             assert_eq!(mission, repair, "{state:?} steps in Repair: {changes:?}");
         }
         assert_eq!(
-            changes[6].0 - changes[5].0,
+            changes[5].0 - changes[4].0,
             15,
             "the link follows the walls by one visit: {changes:?}"
         );
@@ -855,6 +1099,163 @@ mod tests {
             sim.substrate.entities.get(tank).unwrap().bunker.link(),
             BunkerLink::Installed(bunker)
         );
+    }
+
+    /// Issue #2231. `UnitClass::ReceiveDamage`'s death arm (result 4,
+    /// `0x00737D69`) clears the dying occupant's bunker before anything else
+    /// in the arm: the unit's bunker link (`+0x2E4`) names a building →
+    /// `BuildingClass::ClearBunker @ 0x00459470`, call site `0x00737D97`,
+    /// ahead of the death-explosion gates (`0x00737DA7`) and the kill-site
+    /// `Death_Announcement` calls (`0x00737DC9`/`0x00737E39`/`0x00737E68`).
+    /// The kill reaches the installed tank through retail `[Super]`
+    /// (`PenetratesBunker=yes`) over the receiver's bunker gate; at the kill
+    /// instant the walls must fall (slots 10/11 cleared, the closing 12/13
+    /// set), the down sound play, both links clear and the bunker runtime
+    /// idle — the despawn safety net alone clears the links but keeps the
+    /// walls up.
+    #[test]
+    fn retail_bunkered_tank_killed_in_place_clears_the_bunkers_walls() {
+        use crate::sim::combat::world_receiver::{ReceiverRun, commit_entities};
+        use crate::sim::combat::{EntityDamageEvent, ReceiverCallFlags};
+        use crate::sim::command::{Command, CommandEnvelope};
+        use crate::sim::world::SimSoundEvent;
+
+        let Some(mut rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
+        else {
+            return;
+        };
+        let Some((_, mut assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        crate::map::theater::load_theater(&mut assets, "TEMPERATE").unwrap();
+        let wall_names = [
+            "NATBNK_A",
+            "NATBNK_B",
+            "NATBNK_AD",
+            "NATBNK_BD",
+            "NATBNK_A2",
+            "NATBNK_B2",
+            "NATBNK_A2D",
+            "NATBNK_B2D",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            rules.bind_anim_class_assets(&wall_names, &assets, "TEM", "TEMPERATE"),
+            0
+        );
+        let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x459470);
+        sim.intern_rule_type_ids(&rules);
+        sim.resolve_type_handles(&rules);
+        sim.set_input_delay_ticks(0);
+        sim.session.set_binary_frame_for_test(1);
+        let bunker = sim
+            .spawn_object("NATBNK", "Americans", 10, 10, 0, &rules)
+            .unwrap();
+        let tank = sim
+            .spawn_object("LTNK", "Americans", 6, 10, 0, &rules)
+            .unwrap();
+        let owner = sim.interner.intern("Americans");
+        sim.queue_command(CommandEnvelope::new(
+            owner,
+            sim.session.tick() + 1,
+            Command::clicked_mission(
+                tank,
+                crate::sim::mission::MissionType::Enter,
+                crate::sim::combat::TargetKind::Entity(bunker),
+            ),
+        ));
+        for _ in 0..600 {
+            let commands = sim.take_due_commands();
+            let grid = sim.path_grid_snapshot();
+            sim.advance_tick(&commands, Some(&rules), grid.as_deref(), None, 33);
+            if rt(&sim, bunker).state() == BunkerState::Occupied {
+                break;
+            }
+        }
+        {
+            let building = sim.substrate.entities.get(bunker).unwrap();
+            assert_eq!(rt(&sim, bunker).state(), BunkerState::Occupied);
+            assert_eq!(building.bunker.occupant(), Some(tank));
+            assert!(
+                building.building_art.anim_slots()[10].is_some(),
+                "front wall up"
+            );
+            assert!(
+                building.building_art.anim_slots()[11].is_some(),
+                "rear wall up"
+            );
+        }
+        sim.sound_events.clear_for_test();
+
+        // The killing blow: retail [Super] penetrates the receiver's bunker
+        // gate (the installed-target arm of TechnoClass::ReceiveDamage).
+        let attacker = sim.spawn_object("E1", "Russians", 9, 9, 0, &rules).unwrap();
+        let source_house = sim
+            .substrate
+            .entities
+            .get(attacker)
+            .map(|entity| entity.owner());
+        let warhead = sim.interner.intern("Super");
+        let event = EntityDamageEvent::direct_receiver(
+            tank,
+            600,
+            0,
+            attacker,
+            source_house,
+            warhead,
+            ReceiverCallFlags {
+                ignore_defenses: false,
+                arg6: false,
+            },
+        );
+        let _ = commit_entities(
+            &mut sim,
+            &mut ReceiverRun::default(),
+            &[event],
+            None,
+            &rules,
+            None,
+        );
+
+        let building = sim.substrate.entities.get(bunker).unwrap();
+        assert_eq!(
+            building.bunker.occupant(),
+            None,
+            "occupant cleared at the kill instant"
+        );
+        assert_eq!(rt(&sim, bunker).state(), BunkerState::Idle);
+        assert!(
+            building.building_art.anim_slots()[10].is_none(),
+            "front wall down"
+        );
+        assert!(
+            building.building_art.anim_slots()[11].is_none(),
+            "rear wall down"
+        );
+        assert!(
+            building.building_art.anim_slots()[12].is_some(),
+            "front wall closing anim"
+        );
+        assert!(
+            building.building_art.anim_slots()[13].is_some(),
+            "rear wall closing anim"
+        );
+        assert_eq!(
+            sim.substrate.entities.get(tank).unwrap().bunker.link(),
+            BunkerLink::None,
+            "the dying unit's link clears before its death frame"
+        );
+        assert_eq!(
+            sim.sound_events
+                .iter()
+                .filter(|event| matches!(event, SimSoundEvent::BunkerWallsDown { .. }))
+                .count(),
+            1,
+            "ClearBunker plays the walls-down sound once"
+        );
+        assert_eq!(sim.bunker_wall_events.len(), 1);
+        assert!(!sim.bunker_wall_events[0].up);
+        assert_eq!(sim.bunker_wall_events[0].building_id, bunker);
     }
 
     #[test]
@@ -906,7 +1307,7 @@ mod tests {
             let building = sim.substrate.entities.get_mut(2).unwrap();
             building
                 .type_facts
-                .set_foundation_for_test(rules.object("NATBNK").unwrap().foundation.clone());
+                .set_foundation_for_test(rules.object("NATBNK").unwrap().foundation.clone().into());
             building
                 .position
                 .put_location(coord(&input["building_location"]));
@@ -916,10 +1317,8 @@ mod tests {
                 integer(&input["initial_facing"]) as u16,
                 integer(&input["rot"]),
             );
-            unit.bunker
-                .set_bunker_link_for_test(BunkerLink::Approaching(2));
             assert!(matches!(sim.reveal(1), RevealOutcome::Revealed { .. }));
-            set_state(&mut sim.substrate, 2, BunkerState::ClearWait, Some(1));
+            prepare_install(&mut sim.substrate, 2, BunkerState::ClearWait);
             update_bunker(&mut sim, &rules, None, 2, FrameEffects::default());
             let unit = sim.substrate.entities.get(1).unwrap();
             assert_eq!(
@@ -1000,7 +1399,15 @@ mod tests {
             .get_mut(2)
             .unwrap()
             .type_facts
-            .set_foundation_for_test(retail.rules.object("NATBNK").unwrap().foundation.clone());
+            .set_foundation_for_test(
+                retail
+                    .rules
+                    .object("NATBNK")
+                    .unwrap()
+                    .foundation
+                    .clone()
+                    .into(),
+            );
         assert!(matches!(sim.reveal(1), RevealOutcome::Revealed { .. }));
         let building = sim.substrate.entities.get(2).unwrap();
         // Steam459164 calls Building447AC0 even when both raw cells match.
@@ -1096,15 +1503,9 @@ mod tests {
         spawn_tank_on(&mut sim, 1, 10, 10); // already on the anchor cell
         assert!(matches!(sim.reveal(2), RevealOutcome::Revealed { .. }));
         assert!(matches!(sim.reveal(1), RevealOutcome::Revealed { .. }));
-        sim.substrate
-            .entities
-            .get_mut(1)
-            .unwrap()
-            .bunker
-            .set_bunker_link_for_test(BunkerLink::Approaching(2));
-        set_state(&mut sim.substrate, 2, BunkerState::ArriveWait, Some(1));
+        prepare_install(&mut sim.substrate, 2, BunkerState::Idle);
 
-        // ArriveWait -> ClearWait (in the bunker's cell, stopped).
+        // State0 -> ClearWait (in the bunker's cell, stopped).
         update_bunker(
             &mut sim,
             &rules,
@@ -1240,7 +1641,7 @@ mod tests {
     fn arrival_waits_for_the_bunker_cell_and_a_stopped_locomotor() {
         let rules = rules();
         for (waiting, next) in [
-            (BunkerState::ArriveWait, BunkerState::ClearWait),
+            (BunkerState::Idle, BunkerState::ClearWait),
             (BunkerState::TrackStep, BunkerState::TurnSouth),
         ] {
             let mut sim = Simulation::new();
@@ -1248,13 +1649,7 @@ mod tests {
             spawn_tank_on(&mut sim, 1, 9, 10);
             assert!(matches!(sim.reveal(2), RevealOutcome::Revealed { .. }));
             assert!(matches!(sim.reveal(1), RevealOutcome::Revealed { .. }));
-            sim.substrate
-                .entities
-                .get_mut(1)
-                .unwrap()
-                .bunker
-                .set_bunker_link_for_test(BunkerLink::Approaching(2));
-            set_state(&mut sim.substrate, 2, waiting, Some(1));
+            prepare_install(&mut sim.substrate, 2, waiting);
             let tick = |sim: &mut Simulation| {
                 update_bunker(
                     sim,
@@ -1308,11 +1703,19 @@ mod tests {
         spawn_bunker(&mut sim, 2);
         spawn_tank_on(&mut sim, 1, 10, 10);
         assert!(matches!(sim.reveal(1), RevealOutcome::Revealed { .. }));
-        // No Approaching marker naming this bunker: the adapter's contact is gone.
-        set_state(&mut sim.substrate, 2, BunkerState::ArriveWait, Some(1));
+        // No radio contact and no installed occupant.
+        set_state(&mut sim.substrate, 2, BunkerState::Idle);
         update_bunker(&mut sim, &rules, None, 2, FrameEffects::default());
         assert_eq!(rt(&sim, 2).state, BunkerState::Idle);
-        assert_eq!(rt(&sim, 2).installing_unit, None);
+        assert_eq!(
+            sim.substrate
+                .entities
+                .get(2)
+                .unwrap()
+                .radio_contacts
+                .slot(0),
+            None
+        );
         assert_eq!(
             sim.substrate.entities.get(2).unwrap().mission.queued(),
             crate::sim::mission::MissionId::from_known(crate::sim::mission::MissionType::Guard)
@@ -1340,13 +1743,7 @@ mod tests {
         assert!(matches!(sim.reveal(2), RevealOutcome::Revealed { .. }));
         assert!(matches!(sim.reveal(1), RevealOutcome::Revealed { .. }));
         assert!(matches!(sim.reveal(3), RevealOutcome::Revealed { .. }));
-        sim.substrate
-            .entities
-            .get_mut(1)
-            .unwrap()
-            .bunker
-            .set_bunker_link_for_test(BunkerLink::Approaching(2));
-        set_state(&mut sim.substrate, 2, BunkerState::ArriveWait, Some(1));
+        prepare_install(&mut sim.substrate, 2, BunkerState::Idle);
 
         update_bunker(&mut sim, &rules, None, 2, FrameEffects::default());
         assert_eq!(rt(&sim, 2).state, BunkerState::ClearWait);

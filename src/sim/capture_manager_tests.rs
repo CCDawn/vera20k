@@ -1616,7 +1616,10 @@ fn an_attack_order_captures_without_damage() {
     let mind = spawn(&mut sim, &rules, "YURI", "YuriCountry", 10, 10);
     let gi = spawn(&mut sim, &rules, "E1", "Americans", 12, 10);
     let health = sim.substrate.entities.get(gi).unwrap().health.current();
-    let owner_id = sim.interner.intern("YuriCountry");
+    // The human Americans send the computer Yuri's order: the DoList skips computer Houses' events
+    // (0x0064C4FB..0x0064C50D), and MegaMission never compares sender and actor
+    // (0x004C71F6..0x004C721F).
+    let owner_id = sim.interner.intern("Americans");
     sim.queue_command(CommandEnvelope::new(
         owner_id,
         sim.session.tick() + 1,
@@ -1977,7 +1980,7 @@ fn a_captive_boarding_an_absorber_is_freed_first() {
     sim.per_cell_process(
         gi,
         crate::sim::movement::PerCellReason::Arrival,
-        Some(&rules),
+        &rules,
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -2035,7 +2038,10 @@ fn an_iron_curtained_target_refuses_the_capture_at_fire_time() {
         crate::sim::superweapon::invulnerability::InvulnKind::IronCurtain,
     );
     let health = sim.substrate.entities.get(gi).unwrap().health.current();
-    let owner_id = sim.interner.intern("YuriCountry");
+    // The human Americans send the computer Yuri's order: the DoList skips computer Houses' events
+    // (0x0064C4FB..0x0064C50D), and MegaMission never compares sender and actor
+    // (0x004C71F6..0x004C721F).
+    let owner_id = sim.interner.intern("Americans");
     sim.queue_command(CommandEnvelope::new(
         owner_id,
         sim.session.tick() + 1,
@@ -2176,7 +2182,9 @@ fn a_due_ivan_bomb_precedes_the_same_turn_mastermind_overload() {
         .simulation_mut()
         .spawn_object("IVAN", "Russians", 48, 48, 0, &rules)
         .expect("retail Ivan supplied at the existing Attach entry");
-    scene.simulation_mut().bomb_attach(ivan, Some(mind), &rules);
+    scene
+        .simulation_mut()
+        .bomb_attach_for_test(ivan, Some(mind), &rules);
     assert!(
         scene
             .simulation()
@@ -2334,6 +2342,6 @@ fn control_link_timer_selection_ports_cleanup_and_snapshot_share_the_manager() {
     assert_eq!(sim.capture_link_coordinates(controller, &rules).len(), 2);
     sim.free_unit(controller, first, &rules, None, FrameEffects::default());
     assert_eq!(sim.capture_link_coordinates(controller, &rules).len(), 1);
-    sim.uninit_with_context(second, UninitContext::new(Some(&rules), None));
+    sim.uninit_with_context(second, UninitContext::new(&rules, None));
     assert!(sim.capture_link_coordinates(controller, &rules).is_empty());
 }

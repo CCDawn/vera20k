@@ -6,7 +6,6 @@ use super::*;
 use crate::assets::csf_file::CsfArg;
 use crate::skirmish_launch::{LaunchHumanRole, LaunchTeam};
 use crate::skirmish_modes::ModeStartEffect;
-use std::time::{Duration, Instant};
 
 use super::super::chat_notice as message;
 
@@ -110,6 +109,25 @@ pub(super) fn request_start(state: &mut AppState) -> anyhow::Result<()> {
         if !mode_start(state, &mode)? {
             return Ok(());
         }
+        // 0x79096A..0x790B18: a clan room starts only with two squads of
+        // equal size; the observer row's node is not counted.
+        if state.match_state.session.network_room().clan {
+            let observer = state
+                .match_state
+                .session
+                .network_observer_row()
+                .and_then(|row| {
+                    launch
+                        .humans
+                        .iter()
+                        .find(|human| human.raw_slot_index == Some(row) && human.is_observer())
+                })
+                .map(|human| human.name.clone());
+            if !crate::app::shell_wol::lobby::clan_teams_even(state, observer.as_deref()) {
+                message(state, "TXT_CLAN_NOSTART", &[]);
+                return Ok(());
+            }
+        }
     } else {
         let capacity_ok = capacity >= humans + launch.ai_player_count;
         if !capacity_ok {
@@ -139,6 +157,9 @@ pub(super) fn request_start(state: &mut AppState) -> anyhow::Result<()> {
         .network_setup()
         .expect("validated setup")
         .clone();
+    if !wol {
+        crate::app::lan_service::prepare_host_timing(state)?;
+    }
     let max_ahead_frames = if wol {
         // Start Game Now derives WOL timing after OnGameStart.
         None
@@ -247,11 +268,25 @@ pub(super) fn request_start(state: &mut AppState) -> anyhow::Result<()> {
             max_ahead_frames,
         },
     );
+    let go_pending = state
+        .match_state
+        .session
+        .network_setup()
+        .map_or_else(Vec::new, |launch| {
+            (0..launch.humans.len())
+                .filter(|source| *source != launch.local_player_index)
+                .collect()
+        });
     if let Some(protocol) = state.frontend.network_setup_protocol.as_mut() {
         protocol.locked = true;
-        // Native host completes even after its600-bucket GO reply wait times
-        // out. Real queue/transfer service completion is supplied separately.
-        protocol.go_deadline = Some(Instant::now() + Duration::from_millis(600 * 16));
+        // The transport starts the native drain only after all GO packets
+        // have entered its existing global send queue.
+        protocol.lan_go = Some(super::super::LanGoWait::HostSending {
+            pending: go_pending,
+        });
+        // Native's offer blocks the dialog until it ends, so Start cannot
+        // follow a pending one; GO drops it.
+        protocol.drop_preview_offer();
     }
     state.frontend.skirmish_preview_texture = None;
     Ok(())

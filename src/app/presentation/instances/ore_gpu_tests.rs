@@ -1,7 +1,8 @@
 //! Original Cell rasters through the production ordinary overlay
 //! atlas, live identity/frame owner and submission. Lifecycle checks use real
 //! retail maps and the bound runtime's ordinary harvest, growth and fire paths.
-use super::{CellOverlayInputs, build_cell_overlay_instances};
+use super::{CellOverlayInputs, build_cell_overlay_bodies};
+use crate::app::presentation::instances::submit_cell_body_sweep;
 use crate::assets::asset_manager::{AssetManager, MediaArchiveMode};
 use crate::headless_scenario::HeadlessScenario;
 use crate::map::lighting::CellLightGrid;
@@ -10,7 +11,6 @@ use crate::render::batch::{BatchRenderer, InstanceBufferPool, SpriteInstance};
 use crate::render::bridge_atlas::{BridgeAtlas, build_bridge_atlas};
 use crate::render::overlay_atlas::{OverlayAtlas, build_overlay_atlas_on_device};
 use crate::render::shroud_buffer::ShroudBuffer;
-use crate::render::tactical_draw_plan::RenderZPolicy;
 use crate::render::terrain_draw::TerrainDrawRenderer;
 use crate::render::terrain_draw_gpu_tests::{
     Gpu, assert_native_color_and_depth, camera, clear, encoded, extent,
@@ -51,16 +51,6 @@ impl Probe {
     ) -> Self {
         let root = PathBuf::from(std::env::var_os("RA2_DIR").expect("physical retail root"));
         let mut assets = AssetManager::new(&root, MediaArchiveMode::STOCK_DIGITAL).unwrap();
-        let mode = crate::rules::ini_parser::IniFile::from_bytes(
-            assets.get_ref("MPBattleMD.ini").unwrap(),
-        )
-        .unwrap();
-        let (_, rules_ini, _, _) = crate::app::loading::init_helpers::load_rules_with_merged_ini(
-            &assets,
-            Some(&mode),
-            Some(&scene.map.ini),
-        )
-        .unwrap();
         let theater =
             crate::map::theater::load_theater(&mut assets, &scene.map.header.theater).unwrap();
         let material_sources = packet["inputs"]["material_sources"].as_array();
@@ -150,10 +140,7 @@ impl Probe {
                 theater.extension,
                 &scene.map.header.theater,
                 registry,
-                &rules.tiberium_types,
-                &rules.crate_rules,
-                &rules_ini,
-                rules.art(),
+                rules,
                 None,
                 &[],
             )
@@ -170,8 +157,6 @@ impl Probe {
                     theater.extension,
                     &scene.map.header.theater,
                     registry,
-                    &rules_ini,
-                    rules.art(),
                     &[],
                 )
                 .expect("production Cell shadow atlas");
@@ -216,6 +201,7 @@ impl Probe {
             crate::map::lighting::parse_lighting(&scene.map.ini),
             2,
             Some((scene.sim().resolved_terrain().unwrap(), scene.sim())),
+            None,
         );
         Self {
             gpu,
@@ -272,6 +258,8 @@ impl Probe {
                 self.size[0],
                 self.size[1],
                 1.0,
+                None,
+                Default::default(),
             );
             let actual_a = self
                 .gpu
@@ -294,9 +282,10 @@ impl Probe {
                 self.live_a.as_ref().map(|(source, _, _)| source),
             );
             let mut instances: Vec<SpriteInstance> = Vec::new();
-            let mut policies: Vec<RenderZPolicy> = Vec::new();
+            let mut draws = Vec::new();
             if piece != CellRasterPiece::Shadow {
-                build_cell_overlay_instances(
+                let mut bodies = Vec::new();
+                build_cell_overlay_bodies(
                     &CellOverlayInputs {
                         entries,
                         atlas,
@@ -314,9 +303,9 @@ impl Probe {
                         origin_y: camera.world_origin_y,
                         world_height: camera.world_height,
                     },
-                    &mut instances,
-                    &mut policies,
+                    &mut bodies,
                 );
+                submit_cell_body_sweep(bodies, &mut instances, &mut draws);
             }
             let mut shadow_instances = Vec::new();
             if piece != CellRasterPiece::Body {
@@ -412,13 +401,14 @@ impl Probe {
                 let clip: [u32; 4] =
                     std::array::from_fn(|i| input["clip"][i].as_u64().unwrap() as u32);
                 pass.set_scissor_rect(clip[0], clip[1], clip[2], clip[3]);
-                crate::app::presentation::render::draw_pooled_overlay_bodies(
+                crate::app::presentation::render::draw_pooled_cell_bodies(
                     &mut pass,
                     batch,
                     &pool,
                     Some(atlas),
+                    None,
                     "cell-overlay-native",
-                    &policies,
+                    &draws,
                 );
             }
             if piece != CellRasterPiece::Body {
@@ -557,7 +547,6 @@ fn assert_retail_wall_profile_reaches_native_raster(
     )
     .unwrap();
     scene.runtime.simulation.batch_path_searches();
-    scene.runtime.simulation.batch_target_scans();
     let owner = scene.sim().session().current_house().unwrap();
     let mut orders: Vec<_> = profile["commands"]
         .as_array()
@@ -989,11 +978,11 @@ fn retail_ore_harvest_publication_matches_original_cell_raster() {
     let order = CommandEnvelope::new(
         owner,
         scene.sim().session().tick(),
-        Command::HarvestCell {
-            entity_id: miner,
-            target_rx: 123,
-            target_ry: 33,
-        },
+        Command::clicked_mission(
+            miner,
+            crate::sim::mission::MissionType::Harvest,
+            crate::sim::combat::TargetKind::Cell(123, 33),
+        ),
     );
     let mut seen = std::collections::BTreeSet::new();
     let mut zero_cargo = None;
@@ -1126,11 +1115,12 @@ fn retail_flat_ore_rows_match_original_color_and_depth() {
     for control in packet["controls"].as_array().unwrap() {
         let xy: [u16; 2] = std::array::from_fn(|i| control["coords"][i].as_i64().unwrap() as u16);
         assert_eq!(
-            registry.flat_tiberium_display_overlay_id(
+            registry.tiberium_display_overlay_id(
                 &scene.runtime.resources.rules.tiberium_types,
                 tib01,
                 xy[0],
-                xy[1]
+                xy[1],
+                0
             ),
             Some(control["display_overlay_id"].as_u64().unwrap() as u8),
             "original signed selector {control}"
@@ -1190,5 +1180,102 @@ fn retail_flat_ore_rows_match_original_color_and_depth() {
             frame: input["state"].as_u64().unwrap() as u8,
         };
         probe.compare(&scene, &[entry], row);
+    }
+}
+
+/// Supplied slope/density priors exercise the production retail atlas,
+/// display selector, CPU clipping, raw depth bank and GPU submission. Native
+/// trailing memory is explicitly zero, matching VERA's safe file boundary;
+/// this is not proof of a stock native heap or live map slope production.
+#[test]
+#[ignore = "requires physical retail art and GPU; original slope rasters with controlled zero tail"]
+fn retail_sloped_ore_rows_match_original_with_zero_tail_boundary() {
+    let root = PathBuf::from(std::env::var_os("RA2_DIR").expect("physical retail root"));
+    let mut scene = crate::headless_scenario::load(&root, "GoldSt.mmx", 0x12345678).unwrap();
+    let packet = crate::test_fixture::json("tools/spatial_oracle/ore_slopes.json");
+    let mut probe = Probe::new(&scene, &packet, Some((123, 33)), None);
+    for at in [(123, 33), (124, 33)] {
+        assert_eq!(
+            scene
+                .sim()
+                .resolved_terrain()
+                .unwrap()
+                .cell(at.0, at.1)
+                .unwrap()
+                .slope_type,
+            0,
+            "physical flat prior before supplied native slope at {at:?}"
+        );
+    }
+    for row in packet["rows"].as_array().unwrap() {
+        let input = &row["input"];
+        let at = (
+            input["coords"][0].as_u64().unwrap() as u16,
+            input["coords"][1].as_u64().unwrap() as u16,
+        );
+        let runtime = &mut scene.runtime;
+        let registry = &runtime.resources.overlay_registry;
+        let id = registry
+            .id_for_name(input["type"].as_str().unwrap())
+            .unwrap();
+        let display = row["display_overlay_id"].as_u64().unwrap() as u8;
+        let key = crate::render::overlay_atlas::OverlaySpriteKey {
+            name: registry.name(display).unwrap().to_owned(),
+            frame: i32::from(input["state"].as_u64().unwrap() as u8),
+        };
+        for batch in &probe.batches {
+            assert!(
+                batch.atlas.get(&key).is_some(),
+                "missing native slope image {key:?}"
+            );
+        }
+        assert_eq!(
+            registry.tiberium_display_overlay_id(
+                &runtime.resources.rules.tiberium_types,
+                id,
+                at.0,
+                at.1,
+                input["slope"].as_u64().unwrap() as u8
+            ),
+            Some(display)
+        );
+        let mut grid = runtime
+            .simulation
+            .overlay_grid_mut_for_test()
+            .take()
+            .unwrap();
+        grid.place_overlay(at.0, at.1, id, input["state"].as_u64().unwrap() as u8);
+        let terrain = runtime
+            .simulation
+            .resolved_terrain_mut_for_test()
+            .as_mut()
+            .unwrap();
+        let cell = terrain.cell_mut_for_test(at.0, at.1).unwrap();
+        assert_eq!(i64::from(cell.level), input["level"].as_i64().unwrap());
+        // Restore the physical flat prior for each admission. Otherwise the
+        // previous row's supplied slope correctly clears ore in Recalc.
+        // Apply this row's native raster prior only after that projection.
+        cell.slope_type = 0;
+        grid.recalculate_runtime_cell(terrain, registry, at);
+        terrain.cell_mut_for_test(at.0, at.1).unwrap().slope_type =
+            input["slope"].as_u64().unwrap() as u8;
+        let supplied = grid.cell(at.0, at.1);
+        assert_eq!(
+            (supplied.overlay_id, supplied.overlay_data),
+            (Some(id), input["state"].as_u64().unwrap() as u8),
+            "declared native cell prior {}",
+            row["name"]
+        );
+        *runtime.simulation.overlay_grid_mut_for_test() = Some(grid);
+        probe.compare(
+            &scene,
+            &[OverlayEntry {
+                rx: at.0,
+                ry: at.1,
+                overlay_id: id,
+                frame: input["state"].as_u64().unwrap() as u8,
+            }],
+            row,
+        );
     }
 }

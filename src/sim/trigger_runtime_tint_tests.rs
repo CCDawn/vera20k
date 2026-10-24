@@ -1,5 +1,4 @@
-//! Original1426E2E60/1436E2EB0/1446E2F00 controls, Steam gamemd.exe
-//! SHA2563e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600.
+//! Original1426E2E60/1436E2EB0/1446E2F00 controls, Steam gamemd.exe.
 //! Reproduce: PYTHONPATH=. python ~/scratch/trigger-tint-controls/native_tint_controls.py
 //! Recalc53AD00 is an observed graphics sink in these30 action controls.
 use super::*;
@@ -30,7 +29,7 @@ fn run(sim: &mut Simulation, action: &RuntimeAction) -> bool {
             input: TagEventInput::default(),
         },
         &mut Vec::new(),
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         FrameEffects::default(),
     )
@@ -124,7 +123,7 @@ fn ordered_tag_rgb_actions_then_the_production_fade_keep_distinct_palette_operat
         None,
         None,
     );
-    sim.classify_map_triggers(None);
+    sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
     sim.session.publish_started();
     sim.session.set_map_width_for_test(32);
     sim.session.set_map_height_for_test(32);
@@ -137,7 +136,7 @@ fn ordered_tag_rgb_actions_then_the_production_fade_keep_distinct_palette_operat
     let frame = sim
         .advance_app_frame(
             &[],
-            Some(&rules),
+            &rules,
             None,
             67,
             TickLane::Ordinary,

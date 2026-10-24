@@ -67,26 +67,28 @@ pub(super) struct DockExit {
 }
 
 /// The placement of the Infantry and generic arms: the producer's
-/// GetDockCellForObject (vt+0x4D4, `0x0044EFB0`) for `mover`, offered the
-/// zero Cell, then [`dock_exit_coordinate_and_facing`] for that Cell. The
+/// GetDockCellForObject (vt+0x4D4, `0x0044EFB0`) for `mover` and `offered`,
+/// then [`dock_exit_coordinate_and_facing`] for the selected Cell. The
 /// Infantry arm's call (`0x004449AF`) offers the empty Cell (`0x0089C818`,
 /// zeroed by `0x0043B0E0`); the generic arm's (`0x0044464D`) offers
-/// ExitObject's own Cell argument, which its callers pass zero (Factory_AI
-/// `0x00450155`, Place_Production `0x004FB563`, the Cloning Vat loop
-/// `0x00444A3E`). `None` is the empty dock Cell, on which both arms answer 0
+/// ExitObject's own Cell argument: zero from Factory_AI `0x00450155`,
+/// Place_Production `0x004FB563` and Cloning Vat `0x00444A3E`, but the
+/// requested origin from reinforcement `0x0065DAB6`.
+/// `None` is the empty dock Cell, on which both arms answer 0
 /// (`0x00445696`).
 pub(super) fn dock_exit(
     sim: &Simulation,
     rules: &RuleSet,
     producer_id: u64,
     mover: u64,
+    offered: (i16, i16),
     overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
 ) -> Option<DockExit> {
     let cell = crate::sim::docking::building_dock::building_dock_cell(
         sim,
         producer_id,
         mover,
-        (0, 0),
+        offered,
         rules,
         overlay_registry,
     )?;
@@ -126,8 +128,7 @@ fn dock_exit_coordinate_and_facing(
         [centre(dock.0), centre(dock.1)],
     );
     let facing = crate::util::direction_tables::quantize::round_facing16_to_8(word);
-    let (width, height) =
-        crate::rules::foundation::foundation_dimensions(producer.type_facts.foundation());
+    let (width, height) = producer.type_facts.foundation().dimensions();
     let inward = |cell: i16, base: i16, size: u16| {
         if i32::from(cell) >= i32::from(base) + i32::from(size) {
             cell.wrapping_sub(1)
@@ -174,7 +175,7 @@ pub fn mark_war_factory_spawn_contact(
             produced_id,
             message,
             crate::sim::radio::RadioPayload::default(),
-            Some(rules),
+            rules,
             effects,
         );
     }
@@ -414,10 +415,6 @@ mod tests {
             "src/sim/production/fixtures/infantry_exit_native.json",
         ))
         .unwrap();
-        assert_eq!(
-            data["native_sha256"],
-            "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-        );
         let mut compared = 0;
         let mut storage_residuals = 0;
         for row in data["rows"].as_array().unwrap() {

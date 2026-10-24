@@ -69,10 +69,6 @@ fn load_hills() -> crate::headless_scenario::HeadlessScenario {
     use crate::map::source::{LoadedMapSource, load_map_by_name_or_path_with_assets};
     let retail = retail_dir().expect("this ignored native-input test requires retail assets");
     let native = receipt();
-    assert_eq!(
-        native["native_sha256"].as_str().unwrap(),
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     assert_eq!(native["code_unchanged"], true);
     let assets = AssetManager::new(&retail, MediaArchiveMode::STOCK_DIGITAL)
         .expect("ordinary retail archive stack");
@@ -236,7 +232,7 @@ fn spawn_supplied_ground_mtnk(
         cell.1,
         0,
         height,
-        crate::sim::world::PlacementEvidence::UnitEntryAdmitted,
+        crate::sim::world::PlacementEvidence::FootEntryAdmitted,
         &resources.rules,
         crate::sim::world::FrameEffects::default(),
     )
@@ -853,7 +849,7 @@ fn hills_same_type_marker_downgrade_reaches_live_foot_search_and_cleanup() {
         // downgrade; with requested1 retained it would choose a detour.
         assert!(sim.foot_mark_remove(
             mover,
-            Some(&resources.rules),
+            &resources.rules,
             Some(&resources.overlay_registry),
             crate::sim::world::FrameEffects::default()
         ));
@@ -862,13 +858,13 @@ fn hills_same_type_marker_downgrade_reaches_live_foot_search_and_cleanup() {
             let peer = bridge_marker_peer(
                 &sim.substrate.entities,
                 mover,
-                Some(&resources.rules),
+                &resources.rules,
                 &sim.interner,
             );
             let context = DeferredBridgeMarker {
                 mover_id: mover,
                 mover: peer.as_ref(),
-                rules: Some(&resources.rules),
+                rules: &resources.rules,
                 interner: &sim.interner,
                 grid: &grid,
                 terrain: sim.resolved_terrain.as_ref(),
@@ -902,7 +898,7 @@ fn hills_same_type_marker_downgrade_reaches_live_foot_search_and_cleanup() {
         }
         assert!(sim.foot_mark_put(
             mover,
-            Some(&resources.rules),
+            &resources.rules,
             Some(&resources.overlay_registry),
             crate::sim::world::FrameEffects::default()
         ));

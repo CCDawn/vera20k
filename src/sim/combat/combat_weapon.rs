@@ -29,11 +29,11 @@
 //! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
 use super::TargetKind;
-use super::armor_index;
 use super::veterancy::RANK_ELITE_U16;
 use crate::map::entities::EntityCategory;
 use crate::map::houses::{HouseAllianceMap, is_allied_with};
 use crate::map::resolved_terrain::{NativeCellQuery, ResolvedTerrainGrid};
+use crate::rules::armor::ArmorId;
 use crate::rules::locomotor_type::SpeedType;
 use crate::rules::object_type::{ObjectType, WEAPON_SLOT_COUNT};
 use crate::rules::ruleset::RuleSet;
@@ -353,6 +353,22 @@ pub(crate) fn weapon_for_index(
     Some((weapon_id, slot))
 }
 
+/// `TechnoClass::IsNotSprayAttack @ 0x0070DD70`: the type's `SprayAttack`
+/// byte at `+0x691`, negated. `GetDeployWeapon @ 0x0070E120` consumes this
+/// full 0/1 result as its `GetWeapon @ 0x0070E140` index.
+pub(crate) fn is_not_spray_attack(obj: &ObjectType) -> bool {
+    !obj.spray_attack
+}
+
+/// `TechnoClass::GetDeployWeapon @ 0x0070E120`: choose slot 1 unless the type
+/// is `SprayAttack`, then forward that index through the sole `GetWeapon`
+/// owner above. The index remains available when the selected WeaponStruct's
+/// WeaponType pointer is null, as it is in native's fixed slot array.
+pub(crate) fn deploy_weapon(obj: &ObjectType, veterancy: u16) -> (i32, Option<(&str, WeaponSlot)>) {
+    let index = if is_not_spray_attack(obj) { 1 } else { 0 };
+    (index, weapon_for_index(obj, veterancy, index))
+}
+
 /// Whether `TechnoClass::GetWeapon @ 0x0070E140` answers slot `index` with the
 /// elite record: an elite object (`VeterancyClass::IsElite`) whose
 /// `EliteWeapon[index]` names a weapon. Callers that read the record's other
@@ -622,6 +638,8 @@ pub(crate) fn passive_scan_class_bits<'r>(
 /// Warhead `+0x149`, which the Verses parse sets (`0x0075DE5A..0x0075DE9A`)
 /// when the exact doubles `Verses[4]` and `Verses[6]` are both `0.0`, read
 /// through slot 0's weapon at the live tier (`0x0051E329..0x0051E343`).
+/// Ares3.0 reader hook75DDCC ->10054410 skips that derivation and clears
+/// the flag at75DE98. The rule owner retains this distinction from its table.
 pub(crate) fn primary_warhead_spares_medium_and_wood(
     rules: &RuleSet,
     obj: &ObjectType,
@@ -630,7 +648,7 @@ pub(crate) fn primary_warhead_spares_medium_and_wood(
     let warhead = primary_for_tier(obj, veterancy)
         .and_then(|id| rules.weapon(id))
         .and_then(|weapon| warhead_of(rules, weapon));
-    verses_is_zero(warhead, 4) && verses_is_zero(warhead, 6)
+    warhead.is_some_and(WarheadType::uses_medium_wood_target_mask)
 }
 
 pub(crate) fn warhead_of<'a>(rules: &'a RuleSet, weapon: &WeaponType) -> Option<&'a WarheadType> {
@@ -639,12 +657,11 @@ pub(crate) fn warhead_of<'a>(rules: &'a RuleSet, weapon: &WeaponType) -> Option<
 
 /// Native `FCOMP Verses[armor], 0.0` (`0x006F3705` / `0x006F3738`): the
 /// double is compared for exact equality with zero.
-fn verses_is_zero(warhead: Option<&WarheadType>, armor: usize) -> bool {
+fn verses_is_zero(warhead: Option<&WarheadType>, armor: ArmorId) -> bool {
     warhead.is_some_and(|warhead| {
-        warhead
-            .verses_f64
-            .get(armor)
-            .is_some_and(|verses| *verses == 0.0)
+        // Ares 3.0 hook10054360 retains numeric zero and secondary-first
+        // ordering. Its independent fire/acquisition flags do not select slots.
+        f64::from_bits(warhead.interaction(armor).multiplier().bits()) == 0.0
     })
 }
 
@@ -827,7 +844,7 @@ fn techno_what_weapon_should_i_use(
     else {
         return 0;
     };
-    let armor = armor_index(&target_obj.armor);
+    let armor = target_obj.armor_id();
     // R @ 0x006F36E3 / S @ 0x006F3716: the only Verses reads, both `== 0.0`.
     if verses_is_zero(secondary_warhead, armor) {
         return 0;
@@ -1180,16 +1197,13 @@ pub(crate) fn is_occupied(entity: &GameEntity, obj: &ObjectType) -> bool {
     entity.category() == EntityCategory::Structure
         && obj.can_be_occupied
         && obj.can_occupy_fire
-        && entity
-            .passenger_role
-            .cargo()
-            .is_some_and(|cargo| !cargo.is_empty())
+        && entity.passenger_role.occupants().count() > 0
 }
 
 /// `BuildingClass @ 0x00458E00` (vt+0x404): half the shorter side of the
 /// type's foundation (width `0x0045EC90`, height `0x0045ECA0(0)`), truncated.
 pub(crate) fn half_foundation(obj: &ObjectType) -> i32 {
-    let (width, height) = crate::rules::foundation::foundation_dimensions(&obj.foundation);
+    let (width, height) = obj.foundation.dimensions();
     i32::from(width.min(height)) / 2
 }
 
@@ -1209,10 +1223,12 @@ pub(crate) fn firing_occupant_id(entity: &GameEntity, obj: &ObjectType) -> Optio
     if !is_occupied(entity, obj) {
         return None;
     }
-    let cargo = entity.passenger_role.cargo()?;
-    cargo
-        .passengers()
-        .get(usize::from(cargo.garrison_fire_index()))
+    let occupants = entity.passenger_role.occupants();
+    // Native452742 uses signed DWORD. Unsafe negative/stale slots are not
+    // representable object references; do not narrow a valid index to u8.
+    occupants
+        .ids()
+        .get(usize::try_from(occupants.fire_index()).ok()?)
         .copied()
 }
 
@@ -1258,7 +1274,6 @@ pub fn get_weapon<'r>(
 mod tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
-    use crate::sim::passenger::PassengerRole;
 
     #[test]
     fn passive_scan_occupied_building_uses_weapon_identity_without_target_fallback() {
@@ -1294,9 +1309,7 @@ mod tests {
                 );
                 inside.veterancy.set_rank_for_test(veterancy);
                 entities.insert(inside);
-                let mut cargo = crate::sim::passenger::PassengerCargo::new(5, 0.0);
-                cargo.board_forced_chain(&[(2, 1.0)]);
-                building.passenger_role = PassengerRole::transport(cargo);
+                building.passenger_role.occupants_mut().add(2);
             }
             entities.insert(building);
             let interner = crate::sim::intern::test_interner();
@@ -1348,7 +1361,7 @@ mod tests {
             );
             assert_eq!(
                 primary_warhead_spares_medium_and_wood(&rules, obj, 0),
-                medium != "0.001"
+                !crate::rules::ARES_ENABLED && medium != "0.001"
             );
             assert!(
                 !primary_warhead_spares_medium_and_wood(&rules, obj, 200),

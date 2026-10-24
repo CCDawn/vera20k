@@ -1,6 +1,6 @@
 [package]
 name = "vera20k-core"
-version = "0.1.0"
+version = "0.2.2"
 edition = "2024"
 description = "VERA20k's GPU-free engine: assets, rules, map, simulation, lockstep and the headless scenario"
 publish = false
@@ -25,6 +25,13 @@ name = "sim-bench"
 path = "bin/sim-bench.rs"
 
 [features]
+# Compile the supported Ares behavior; INIs cannot enable an absent capability.
+ares = []
+# Compile the supported Phobos behavior; INIs cannot enable an absent capability.
+# Independent of `ares`: Phobos itself does not require Ares.
+phobos = []
+# Placeholder: NPatch-specific readers land with their first chain.
+npatch = []
 # The client's Ctrl+Shift dev chord reaches simulation and utility hooks.
 dev-overlays = []
 # Read-only snapshots and opt-in frame timing for the browser dashboard.
@@ -90,6 +97,11 @@ half = { version = "2", default-features = false, features = ["num-traits"] }
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "inline-more"] }
 num-traits = { version = "0.2", features = ["libm"] }
 unicode-ident = "1"
+
+# winit's Wayland decorations (this is winit's cfg) enable tiny-skia's SIMD,
+# which adds bytemuck's aarch64_simd feature to the client build.
+[target.'cfg(all(unix, not(any(target_os = "redox", target_family = "wasm", target_os = "android", target_os = "ios", target_os = "macos"))))'.dev-dependencies]
+bytemuck = { version = "1", default-features = false, features = ["aarch64_simd"] }
 
 [lints]
 workspace = true

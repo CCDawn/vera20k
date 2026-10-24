@@ -105,8 +105,10 @@ pub struct PipelineInputs<'a> {
 /// stage did any work — a stage this configuration skips leaves the grid
 /// untouched, so its boundary looks exactly like the one before it.
 ///
-/// The waypoint slice is empty until `Starts` has run.
-pub type StageObserver<'a> = &'a mut dyn FnMut(Stage, &RmgGrid, &[(u8, u16, u16)]);
+/// Waypoints are empty until Starts. Terrain is the same chronological
+/// accumulator later moved into PipelineOutput: TIBTRE precedes ordinary TREE.
+pub type StageObserver<'a> =
+    &'a mut dyn FnMut(Stage, &RmgGrid, &[(u8, u16, u16)], &[(String, i16, i16)]);
 
 /// What the pipeline collects for the emitter.
 #[derive(Debug, Default)]
@@ -147,6 +149,9 @@ pub fn run_pipeline(
     // Emit-form start positions, filled in once `Starts` has produced them so
     // every later boundary can hand them to the observer.
     let mut waypoints: Vec<(u8, u16, u16)> = Vec::new();
+    // Native RMG constructs TIBTRE at5A2C05 before ordinary TREE at5A48AA.
+    // Borrow this one chronology for progress; final emission moves it intact.
+    let mut terrain: Vec<(String, i16, i16)> = Vec::new();
     let mut structures: Vec<(String, i16, i16)> = Vec::new();
     let mut construction_trace = RmgConstructionTrace::default();
 
@@ -181,9 +186,9 @@ pub fn run_pipeline(
         };
         water::run(&mut ctx, &args);
     }
-    observe(Stage::Water, grid, &waypoints);
+    observe(Stage::Water, grid, &waypoints, &terrain);
     water_finalize::run(grid, inputs.ids, inputs.blocks, rng);
-    observe(Stage::WaterFinalize, grid, &waypoints);
+    observe(Stage::WaterFinalize, grid, &waypoints, &terrain);
 
     // ---- Regions -----------------------------------------------------------
     let mut regions: Regions = {
@@ -197,7 +202,7 @@ pub fn run_pipeline(
         };
         regions::run(&mut ctx)
     };
-    observe(Stage::Regions, grid, &waypoints);
+    observe(Stage::Regions, grid, &waypoints, &terrain);
 
     // ---- Island passes (map types 3 and 4 only) ---------------------------
     // The cliff repair stamps region tags as a side effect, so the pass hands
@@ -276,13 +281,13 @@ pub fn run_pipeline(
             inputs.ids.cliffs.cliff_set.map_or(-1, i32::from),
         );
     }
-    observe(Stage::IslandPasses, grid, &waypoints);
+    observe(Stage::IslandPasses, grid, &waypoints, &terrain);
 
     // ---- Green spread + first recalc --------------------------------------
     green_spread::run(grid, inputs.ids, rng);
-    observe(Stage::GreenSpread, grid, &waypoints);
+    observe(Stage::GreenSpread, grid, &waypoints, &terrain);
     lat_fixup::run(grid, inputs.ids);
-    observe(Stage::RecalcAfterTerrain, grid, &waypoints);
+    observe(Stage::RecalcAfterTerrain, grid, &waypoints, &terrain);
 
     // ---- Starts (needs the zone field) ------------------------------------
     let outcome = {
@@ -325,7 +330,7 @@ pub fn run_pipeline(
         .enumerate()
         .filter_map(|(slot, spot)| spot.map(|(x, y)| (slot as u8, x as u16, y as u16)))
         .collect();
-    observe(Stage::Starts, grid, &waypoints);
+    observe(Stage::Starts, grid, &waypoints, &terrain);
 
     // ---- Tech buildings (map types 1-4; map type 0 places none) -----------
     let tech_placements = {
@@ -345,7 +350,7 @@ pub fn run_pipeline(
         };
         tech_buildings::run_traced(&mut ctx, &args, &mut construction_trace, structures.len())
     };
-    observe(Stage::TechBuildings, grid, &waypoints);
+    observe(Stage::TechBuildings, grid, &waypoints, &terrain);
 
     // ---- Tiberium ----------------------------------------------------------
     let tiberium = {
@@ -369,13 +374,14 @@ pub fn run_pipeline(
         };
         tiberium::run(&mut ctx, &args)
     };
-    observe(Stage::Tiberium, grid, &waypoints);
+    terrain.extend(tiberium.trees);
+    observe(Stage::Tiberium, grid, &waypoints, &terrain);
 
     // ---- Region reset + second recalc -------------------------------------
     scratch.reset_region_ids();
-    observe(Stage::RegionReset, grid, &waypoints);
+    observe(Stage::RegionReset, grid, &waypoints, &terrain);
     lat_fixup::run(grid, inputs.ids);
-    observe(Stage::RecalcAfterTiberium, grid, &waypoints);
+    observe(Stage::RecalcAfterTiberium, grid, &waypoints, &terrain);
 
     // ---- Hills -------------------------------------------------------------
     {
@@ -393,7 +399,7 @@ pub fn run_pipeline(
         };
         hills::run(&mut ctx, &args, inputs.morphable);
     }
-    observe(Stage::Hills, grid, &waypoints);
+    observe(Stage::Hills, grid, &waypoints, &terrain);
 
     // ---- LAT patches → recalc (creates sand-LAT) → trees → rocks ----------
     {
@@ -406,9 +412,9 @@ pub fn run_pipeline(
         };
         lat_patches::run(&mut ctx, inputs.theater, inputs.vegetation);
     }
-    observe(Stage::LatPatches, grid, &waypoints);
+    observe(Stage::LatPatches, grid, &waypoints, &terrain);
     lat_fixup::run(grid, inputs.ids);
-    observe(Stage::RecalcAfterPatches, grid, &waypoints);
+    observe(Stage::RecalcAfterPatches, grid, &waypoints, &terrain);
 
     let trees = {
         let args = TreeArgs {
@@ -426,7 +432,8 @@ pub fn run_pipeline(
         };
         trees::run(&mut ctx, &args)
     };
-    observe(Stage::Trees, grid, &waypoints);
+    terrain.extend(trees);
+    observe(Stage::Trees, grid, &waypoints, &terrain);
 
     // Rocks — temperate theater only.
     if inputs.theater == 0 {
@@ -443,16 +450,13 @@ pub fn run_pipeline(
         };
         rocks::run(&mut ctx, &args);
     }
-    observe(Stage::Rocks, grid, &waypoints);
+    observe(Stage::Rocks, grid, &waypoints, &terrain);
 
     // ---- Final recalc ------------------------------------------------------
     lat_fixup::run(grid, inputs.ids);
-    observe(Stage::RecalcFinal, grid, &waypoints);
+    observe(Stage::RecalcFinal, grid, &waypoints, &terrain);
 
     // ---- Collect outputs for the emitter ----------------------------------
-    let mut terrain: Vec<(String, i16, i16)> = trees;
-    terrain.extend(tiberium.trees);
-
     structures.extend(
         tech_placements
             .into_iter()

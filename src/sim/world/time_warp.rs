@@ -1,6 +1,6 @@
 //! Retained initial Techno records and House50D320/50D440 restoration (130/126).
 //!
-//! Original Steam SHA2563e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600.
+//! Original Steam gamemd.
 //! Native producer/repair execution and original bodies: time-warp-records-plan
 //! and time-warp-restore-placement-native in the local ALL01 evidence packet.
 //! Creation/458A80 placement is instruction-backed, not a rendered parity claim.
@@ -197,7 +197,7 @@ impl Simulation {
             let Some(coord) = coord else {
                 self.uninit_with_context(
                     created,
-                    UninitContext::new(Some(rules), overlay_registry).with_effects(frame_effects),
+                    UninitContext::new(rules, overlay_registry).with_effects(frame_effects),
                 );
                 return false;
             };
@@ -228,7 +228,7 @@ impl Simulation {
                 // the shared owner's repeated lifecycle/queue semantics.
                 self.uninit_with_context(
                     created,
-                    UninitContext::new(Some(rules), overlay_registry).with_effects(frame_effects),
+                    UninitContext::new(rules, overlay_registry).with_effects(frame_effects),
                 );
             }
         }

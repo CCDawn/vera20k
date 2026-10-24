@@ -71,7 +71,7 @@ fn scene(rules: &RuleSet, cursor: &Value) -> (Simulation, Roles) {
     let mut roles = Roles::new();
     for row in native()["constructor_priors"].as_array().unwrap() {
         let position = xyz(&row["position"]);
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         let mut entity = GameEntity::test_default(
             id,
             row["type_id"].as_str().unwrap(),
@@ -485,7 +485,7 @@ fn original_welding_pointer_expiry_and_target_setters_preserve_their_distinct_au
                 sim.assign_target_represented(
                     roles["owner"],
                     target(&roles, requested),
-                    Some(rules),
+                    rules,
                     None,
                     crate::sim::world::FrameEffects::default(),
                 )

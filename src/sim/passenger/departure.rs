@@ -74,7 +74,17 @@ pub fn depart_cargo_head(
     if emptied {
         // Foot4DE710 also calls the empty-hold reset when RemoveFirst returns
         // null. Keep that lifecycle effect before reporting NoCargo.
-        super::remove_gunner(sim, rules, transport_id, removed.map(|(id, _)| id));
+        super::remove_gunner(
+            &sim.interner,
+            &sim.session,
+            &mut sim.scenario_rng,
+            &mut sim.substrate,
+            &mut sim.houses,
+            &mut sim.power_states,
+            rules,
+            transport_id,
+            removed.map(|(id, _)| id),
+        );
     }
     let (passenger_id, passenger_size) = removed.ok_or(DepartureFailure::NoCargo)?;
     if route == DepartureRoute::Hospital
@@ -131,7 +141,7 @@ fn restore_departure(
         // Defensive legacy repair of an already-broken cargo/limbo invariant.
         let _ = sim.techno_limbo_with_context(
             passenger_id,
-            UninitContext::new(Some(rules), registry).with_effects(effects),
+            UninitContext::new(rules, registry).with_effects(effects),
         );
     }
     match route {
@@ -178,7 +188,7 @@ fn restore_departure(
     let _ = sim.add_cargo_passenger_chain(
         transport_id,
         &[(passenger_id, passenger_size)],
-        UninitContext::new(Some(rules), registry).with_effects(effects),
+        UninitContext::new(rules, registry).with_effects(effects),
     );
     if route == DepartureRoute::Absorber {
         // Mission_Unload's failed Unlimbo path first re-adds the passenger,
@@ -199,7 +209,16 @@ fn restore_departure(
         || (route == DepartureRoute::LandedAircraft
             && !matches!(failure, DepartureFailure::GroundReveal(_)))
     {
-        super::receive_gunner(sim, rules, transport_id, passenger_id);
+        super::receive_gunner(
+            &sim.interner,
+            &sim.session,
+            &mut sim.scenario_rng,
+            &mut sim.substrate,
+            &sim.houses,
+            rules,
+            transport_id,
+            passenger_id,
+        );
     }
 }
 

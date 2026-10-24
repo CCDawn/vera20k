@@ -66,7 +66,10 @@ fn frame(s: &mut Scene) -> Sample {
         chrono_sounds: s.sim.sound_events[sounds_before..]
             .iter()
             .filter_map(|event| match event {
-                SimSoundEvent::ChronoTeleport { rx, ry, .. } => Some((*rx, *ry)),
+                SimSoundEvent::ChronoTeleport { world, .. } => {
+                    let (rx, ry, ..) = world.to_cell_sub_z();
+                    Some((rx, ry))
+                }
                 _ => None,
             })
             .collect(),
@@ -208,6 +211,7 @@ fn spawn_returning_cmin(s: &mut Scene, cell: (u16, u16)) -> u64 {
         .set_handler_state(MinerState::ReturnToRefinery.cursor());
     entity.miner.as_mut().unwrap().set_cargo_for_test(vec![
         CargoBale {
+            tiberium_type: crate::rules::tiberium_type::TiberiumTypeId(0),
             resource_type: ResourceType::Ore,
             value: 25,
         };
@@ -284,7 +288,7 @@ fn chrono_miner_visit_on_retail_rules() {
     assert_eq!(credits(&s) - paid_before, 500, "20 ore bales at 25");
 }
 
-/// A refinery order (`Command::MinerReturn`) for a second Chrono Miner that
+/// A refinery order (MEGAMISSION Enter) for a second Chrono Miner that
 /// arrives while the first unloads: the busy refinery becomes its
 /// ArchiveTarget and the Dock arm sends it near the refinery without a HELLO
 /// (`0x00742ED3..0x00742EE9`), so the refinery refuses it nothing; the miner
@@ -303,10 +307,11 @@ fn a_chrono_miner_ordered_to_a_busy_refinery_warps_in_after_it_frees() {
     let second = spawn_returning_cmin(&mut s, (15, 15));
     assert!(s.sim.apply_command(
         "Americans",
-        &crate::sim::command::Command::MinerReturn {
-            entity_id: second,
-            target_refinery_id: Some(s.refinery),
-        },
+        &crate::sim::command::Command::clicked_mission(
+            second,
+            MissionType::Enter,
+            crate::sim::combat::TargetKind::Entity(s.refinery)
+        ),
         Some(&s.rules),
     ));
     let paid_before = credits(&s);

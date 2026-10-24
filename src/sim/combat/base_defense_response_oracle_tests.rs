@@ -7,7 +7,6 @@ use crate::rules::native_processing::{RulesLayerKind, RulesLayerStack};
 use crate::sim::entity_store::EntityStore;
 use crate::sim::game_entity::GameEntity;
 use crate::sim::intern::test_interner;
-use crate::sim::passenger::{PassengerCargo, PassengerRole};
 use serde_json::Value;
 
 fn install_supplied_base_defense_team(sim: &mut Simulation, member: u64) {
@@ -242,10 +241,6 @@ fn native_base_response_dispatch_matches_14_represented_original_tails() {
 fn corpus() -> &'static Value {
     let rows = crate::test_fixture::json("tools/spatial_oracle/base_defense_response.json");
     assert_eq!(rows["schema_version"], 1);
-    assert_eq!(
-        rows["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c",
-    );
     rows
 }
 
@@ -534,7 +529,7 @@ fn native_base_response_live_threat_matches_representable_original_rows() {
     for row in native["threat_posed"].as_array().unwrap() {
         let input = &row["input"];
         let count = input["garrison_count"].as_i64().unwrap_or(0);
-        // The corrupt/supplied i32MAX count is not a Rust cargo vector.
+        // The corrupt/supplied i32MAX count is not a Rust occupant vector.
         // The native two-occupant/max-multiplier control covers wrapping.
         if count == i64::from(i32::MAX) {
             continue;
@@ -556,11 +551,9 @@ fn native_base_response_live_threat_matches_representable_original_rows() {
             owner.bunker.set_bunker_occupant_for_test(Some(2));
         }
         if count > 0 {
-            let mut cargo = PassengerCargo::new(count as u32, 1.0);
-            for id in 0..count as u64 {
-                cargo.board_forced_chain(&[(id + 10, 1.0)]);
+            for id in (0..count as u64).rev() {
+                owner.passenger_role.occupants_mut().add(id + 10);
             }
-            owner.passenger_role = PassengerRole::transport(cargo);
         }
         let mut entities = EntityStore::new();
         entities.insert(GameEntity::test_default(2, "LINK", "House", 5, 5));

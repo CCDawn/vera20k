@@ -20,10 +20,6 @@ fn signed(value: &Value) -> i32 {
 #[test]
 fn original_can_auto_cloak_matches_retail_inputs_and_retained_target_controls() {
     let native = crate::test_fixture::json("tools/spatial_oracle/cloak_target_gate.json");
-    assert_eq!(
-        native["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     let map = crate::test_fixture::checkout_root()
         .join("tools/spatial_oracle/cloak_target_gate/ordinary-sub-cloak.map");
     let Some(retail) =
@@ -53,7 +49,7 @@ fn original_can_auto_cloak_matches_retail_inputs_and_retained_target_controls() 
         );
         assert_eq!(object.strength, signed(&expected["strength"]), "{name}");
         assert_eq!(
-            crate::sim::combat::armor_index(&object.armor),
+            object.armor_id().index(),
             expected["armor"].as_u64().unwrap() as usize,
             "{name}"
         );
@@ -123,7 +119,15 @@ fn original_can_auto_cloak_matches_retail_inputs_and_retained_target_controls() 
         );
     }
     for (name, expected) in inputs["warheads"].as_object().unwrap() {
-        for (index, verse) in rules.warhead(name).unwrap().verses_f64.iter().enumerate() {
+        for index in 0..11 {
+            let verse = f64::from_bits(
+                rules
+                    .warhead(name)
+                    .unwrap()
+                    .interaction(crate::rules::armor::ArmorId::from_index(index))
+                    .multiplier()
+                    .bits(),
+            );
             assert_eq!(
                 verse
                     .to_le_bytes()

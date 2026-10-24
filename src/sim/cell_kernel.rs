@@ -6,6 +6,7 @@
 use crate::map::cell_index::NativeCellIdentity;
 use crate::map::resolved_terrain::NativeCellQuery;
 
+use crate::map::resolved_terrain::ResolvedTerrainGrid;
 #[cfg(any(test, feature = "test-support"))]
 use crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS;
 use crate::util::lepton::{GROUND_LEVEL_HEIGHT_LEPTONS, ground_height_leptons};
@@ -149,8 +150,12 @@ impl crate::sim::world::Simulation {
     /// which truncates toward zero and wraps by row: the real cell, or `None`
     /// for the shared dummy cell off the map, which holds no object. Without
     /// resolved terrain, the truncated cell.
-    pub(crate) fn map_coord_cell(&self, x: i32, y: i32) -> Option<(u16, u16)> {
-        let (rx, ry) = match self.resolved_terrain.as_ref() {
+    pub(crate) fn map_coord_cell(
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        x: i32,
+        y: i32,
+    ) -> Option<(u16, u16)> {
+        let (rx, ry) = match resolved_terrain.as_ref() {
             Some(terrain) => {
                 let cells = NativeCellQuery::canonical(terrain);
                 let cell = cells.lookup_world(x, y);
@@ -251,7 +256,28 @@ impl crate::sim::cell_rect::CellRef<'_> {
     /// ground height, without a bridge-deck rise. A retained Dummy is read now;
     /// later map lookups can change its coordinate without changing identity.
     pub fn center_coordinate(&self) -> Option<crate::sim::components::DriveCoord> {
-        let (x, y, level, slope) = match self {
+        let (x, y, level, slope) = self.packed_ground();
+        cell_own_coords(x, y, level, slope)
+    }
+
+    /// [`Self::center_coordinate`], at Z 0 for a slope byte past the native
+    /// 21-record table (21 and up), where native reads past the table. Every
+    /// read of a cell looked up by coordinate takes this policy.
+    pub(crate) fn get_coords(&self) -> crate::sim::components::DriveCoord {
+        let (x, y, level, slope) = self.packed_ground();
+        cell_own_coords(x, y, level, slope).unwrap_or_else(|| {
+            let point = cell_center(CellCoordinate { x, y }, 0);
+            crate::sim::components::DriveCoord {
+                x: point.x,
+                y: point.y,
+                z: point.z,
+            }
+        })
+    }
+
+    /// The signed packed coordinate, level and slope GetCoords reads.
+    fn packed_ground(&self) -> (i32, i32, u8, u8) {
+        match self {
             Self::Real(cell) => (
                 i32::from(cell.rx as i16),
                 i32::from(cell.ry as i16),
@@ -267,8 +293,7 @@ impl crate::sim::cell_rect::CellRef<'_> {
                     value.slope_type,
                 )
             }
-        };
-        cell_own_coords(x, y, level, slope)
+        }
     }
 }
 

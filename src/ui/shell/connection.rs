@@ -159,8 +159,9 @@ pub struct BarPaint {
 }
 
 /// 0x0064A7B0 for one row. `lag` is the record's age in 16 ms buckets
-/// (`[0x00AFA418]` less the record's last-received bucket; row 0 is 0) and
-/// `age_ticks` the record's millisecond age ×60/1000. Green up to 240,
+/// (`[0x00AFA418]` less peer+C, the elapsed bucket at its latest FrameSync;
+/// row 0 is 0). `age_ticks` is the raw millisecond difference from peer+14,
+/// multiplied by 60 with u32 wrapping before division by 1000. Green up to 240,
 /// yellow up to 480, then red, or blue (with the age as the lag) while the
 /// age is under 420. The fill keeps `100 − lag·100/1200` percent of the
 /// width, at least 6 pixels, inset by 2.
@@ -254,7 +255,7 @@ const TEMPLATE_PLAYER_ORDER: [u16; CONNECTION_ROWS] =
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::shell::in_game_shell::InGameShellSizes;
+    use crate::ui::shell::in_game_shell::allied_fixture_layout as shell;
 
     fn corpus() -> serde_json::Value {
         serde_json::from_str(crate::test_fixture::text(
@@ -269,41 +270,6 @@ mod tests {
         out.extend((0..CONNECTION_ROWS).map(ConnectionControl::Bar));
         out.push(ConnectionControl::Countdown);
         out
-    }
-
-    fn shell(width: i32, height: i32) -> InGameShellLayout {
-        let fixture: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
-            "tools/storage_oracle/in_game_shell_geometry.json",
-        ))
-        .unwrap();
-        let assets = &fixture["assets"]["allied"];
-        let size = |address: &str| {
-            [
-                assets[address]["width"].as_i64().unwrap() as i32,
-                assets[address]["height"].as_i64().unwrap() as i32,
-            ]
-        };
-        InGameShellLayout::new(
-            width,
-            height,
-            InGameShellSizes {
-                background_small: size("00b0fad4"),
-                background_medium: size("00b0fac8"),
-                background_large: size("00b0fa50"),
-                credits: size("00b0fb08"),
-                top: size("00b0f9e0"),
-                radar: size("00b0fa68"),
-                side1: size("00b0fa70"),
-                side2: size("00b0fafc"),
-                side3: size("00b0fa8c"),
-                addon: size("00b0fa48"),
-                bottom_spacer: size("00b0fa3c"),
-                left_cap: size("00b0fa90"),
-                button_background: size("00b0faa8"),
-                right_cap: size("00b0fabc"),
-            },
-        )
-        .unwrap()
     }
 
     /// Every ordinary child lands where original 0x0060B7A0 put it at
@@ -389,25 +355,66 @@ mod tests {
         assert_eq!(page.control_at(&layout, bar2.x + 1, bar2.y + 1), None);
     }
 
-    /// 0x0064A7B0's colour bands, the 1200-bucket empty point and the
-    /// 6-pixel floor.
+    /// Complete64A7B0 supplied both rows' original fill geometry and RGB565
+    /// colors. Cases cover timing bands, the blue threshold and wrapping
+    /// products; the format owner converts our RGB output for comparison.
     #[test]
-    fn bars_shrink_with_lag_and_change_colour_at_the_native_bands() {
-        let rect = RectPx::new(296, 80, 233, 23);
-        let full = bar_paint(rect, 0, 0);
-        assert_eq!(full.fill, RectPx::new(298, 82, 229, 19));
-        assert_eq!(full.fill_rgb, [0, 200, 0]);
-        assert_eq!(full.outline, rect);
-        assert_eq!(bar_paint(rect, 240, 1000).fill_rgb, [0, 200, 0]);
-        let yellow = bar_paint(rect, 420, 1000);
-        assert_eq!(yellow.fill_rgb, [200, 200, 0]);
-        assert_eq!(yellow.fill.w, 233 * 65 / 100 - 4);
-        assert_eq!(bar_paint(rect, 481, 1000).fill_rgb, [200, 0, 0]);
-        let blue = bar_paint(rect, 600, 120);
-        assert_eq!(blue.fill_rgb, [0, 0, 200]);
-        assert_eq!(blue.fill.w, 233 * 90 / 100 - 4);
-        assert_eq!(bar_paint(rect, 1200, 1000).fill.w, 2);
-        assert_eq!(bar_paint(rect, 5000, 1000).fill.w, 2);
+    fn bars_match_executed_native_timing_and_paint() {
+        let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/storage_oracle/lan_wait_bars.json",
+        ))
+        .unwrap();
+        let cases = corpus["cases"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let paint = case["paint"].as_array().unwrap();
+            for row_index in 0..2_u64 {
+                let row_key = row_index.to_string();
+                let native = &case["rows"][row_key.as_str()];
+                let outline = paint
+                    .iter()
+                    .find(|entry| {
+                        entry["row"].as_u64() == Some(row_index) && entry["operation"] == "outline"
+                    })
+                    .unwrap();
+                let fill = paint
+                    .iter()
+                    .find(|entry| {
+                        entry["row"].as_u64() == Some(row_index) && entry["operation"] == "fill"
+                    })
+                    .unwrap();
+                let rect = &outline["rect"];
+                let rect = RectPx::new(
+                    rect[0].as_i64().unwrap() as i32,
+                    rect[1].as_i64().unwrap() as i32,
+                    rect[2].as_i64().unwrap() as i32,
+                    rect[3].as_i64().unwrap() as i32,
+                );
+                // Native does not sample raw time for green/yellow bands;
+                // age is unused there, so zero is an arbitrary input only.
+                let age_ticks = native["age_ticks"].as_u64().unwrap_or(0) as u32;
+                let actual = bar_paint(rect, native["lag"].as_u64().unwrap() as u32, age_ticks);
+                assert_eq!(
+                    actual.outline, rect,
+                    "{} row {row_index}",
+                    case["input"]["name"]
+                );
+                assert_eq!(
+                    serde_json::json!([actual.fill.x, actual.fill.y, actual.fill.w, actual.fill.h]),
+                    fill["rect"],
+                    "{} row {row_index}",
+                    case["input"]["name"]
+                );
+                assert_eq!(
+                    u64::from(
+                        crate::render::native_surface_format::RGB565.pack_rgb8(actual.fill_rgb)
+                    ),
+                    fill["color"].as_u64().unwrap(),
+                    "{} row {row_index}",
+                    case["input"]["name"]
+                );
+            }
+        }
     }
 
     #[test]

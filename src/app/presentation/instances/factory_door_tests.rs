@@ -78,7 +78,7 @@ fn unloading_factory(rules: &RuleSet, product: &str, unload: bool) -> (Simulatio
         crate::sim::world::FrameEffects::default(),
     );
     if unload {
-        sim.queue_order_mission(factory, MissionType::Unload);
+        sim.queue_order_mission(factory, MissionType::Unload, rules);
         sim.advance_tick(&[], Some(rules), None, None, 67);
     }
     (sim, factory)
@@ -210,5 +210,44 @@ fn the_under_door_draws_its_damage_frame_and_shadow_after_the_bib() {
         assert_eq!(body.position, [102.0, 46.0]);
         assert_eq!(body.z_adjust, lifted_z_adjust(0, SHP_DRAW_Z_ADJUST_PX));
         assert_eq!(body.z_gradient, pack_z_gradient(ZGradient::Flat, false));
+    }
+}
+
+/// An unloading factory redraws the product its tether holds, and the
+/// product refuses its own Display slot (`0x0043DAA0`, `0x0073B0B0`); a
+/// factory in another mission does neither.
+#[test]
+fn an_unloading_factory_takes_over_its_products_draw() {
+    use crate::app::presentation::render::draw_plan_lowering::PlannedObjectInstance;
+    use crate::render::tactical_draw_plan::{
+        BlitPolicy, ObjectDraw, SpriteEncoding, TacticalLayer,
+    };
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = &retail.rules;
+    for unload in [false, true] {
+        let (sim, factory) = unloading_factory(rules, "MTNK", unload);
+        let product = sim
+            .entities()
+            .get(factory)
+            .unwrap()
+            .radio_contacts
+            .slot(0)
+            .expect("the product stays in contact");
+        let parent = |id| ObjectDraw {
+            id,
+            layer: TacticalLayer(2),
+            display_order: 0,
+            policy: BlitPolicy::z_read(SpriteEncoding::Voxel),
+        };
+        let mut planned = vec![
+            PlannedObjectInstance::building(parent(factory), Vec::new()),
+            PlannedObjectInstance::object(parent(product), Vec::new()),
+        ];
+        crate::app::presentation::instances::assign_tether_redraws(&sim, &mut planned);
+        let expected: Vec<u64> = if unload { vec![product] } else { Vec::new() };
+        assert_eq!(planned[0].tether_redraws, expected, "unload {unload}");
+        assert_eq!(planned[1].drawn_by_tether, unload, "unload {unload}");
     }
 }

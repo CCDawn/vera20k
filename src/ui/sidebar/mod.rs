@@ -139,10 +139,10 @@ pub enum SidebarAction {
     PlaceStarterBase,
     SpawnTestUnits,
     /// Toggle Repair-mode (cursor stays armed for clicking buildings to repair).
-    /// Mutually exclusive with `ToggleSellMode` and any active `TargetingMode`.
+    /// Clears Sell; pending building placement refuses the transition.
     ToggleRepairMode,
     /// Toggle Sell-mode (cursor stays armed for clicking buildings to sell).
-    /// Mutually exclusive with `ToggleRepairMode` and any active `TargetingMode`.
+    /// Clears Repair; pending building placement refuses the transition.
     ToggleSellMode,
     Deploy,
 }
@@ -180,6 +180,8 @@ pub struct SidebarItem {
     /// only when `is_superweapon=true`. Multiple SWs may share `type_id`
     /// (SidebarImage), but section names are unique.
     pub super_weapon_section: Option<String>,
+    /// Derived native Super display; factories keep their own status owner.
+    pub super_weapon_display: Option<crate::sim::superweapon::SuperWeaponDisplay>,
 }
 
 impl SidebarItem {

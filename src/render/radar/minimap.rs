@@ -298,7 +298,7 @@ impl MinimapRenderer {
         } else {
             // A stale/restore reconcile is not itself an action-40 firing.
             self.radar_tracker.reset_for_load_or_view();
-            self.radar_events.reset_for_load_or_view();
+            self.radar_events.restart_tracker_baseline();
         }
 
         gpu.queue.write_texture(
@@ -348,8 +348,21 @@ impl MinimapRenderer {
         self.last_radar_terrain_dirty_generation = u64::MAX;
         self.installed_playfield_authority = None;
         self.radar_tracker.reset_for_load_or_view();
-        self.radar_events.reset_for_load_or_view();
+        self.radar_events.restart_tracker_baseline();
         self.viewport_state.reset_for_rebuild();
+    }
+
+    pub(crate) fn saved_radar_events(
+        &self,
+    ) -> crate::sim::snapshot::saved_local_view::SavedRadarEvents {
+        self.radar_events.saved()
+    }
+
+    /// Successful Load660840/PostLoad660C50 replaces the live alert array,
+    /// retaining animation while the already-prepared owner has an empty
+    /// review ring and a fresh sighting baseline.
+    pub(crate) fn restore_radar_events(&mut self, events: ClientRadarEvents) {
+        self.radar_events = events;
     }
 
     /// Update the minimap texture with unit dot overlays from the ECS world.
@@ -378,6 +391,10 @@ impl MinimapRenderer {
         resolved_terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
         radar_terrain_dirty_cells: &[(u16, u16)],
         radar_terrain_dirty_generation: u64,
+        beacons: Option<(
+            &crate::render::beacon_art::BeaconArt,
+            &[crate::render::beacon_art::BeaconDraw],
+        )>,
     ) -> Option<u64> {
         let fog_generation = if full_visibility {
             0
@@ -413,7 +430,7 @@ impl MinimapRenderer {
             // view-owner switch must rebuild, not reuse the other client's
             // ordered tracker.
             self.radar_tracker.reset_for_load_or_view();
-            self.radar_events.reset_for_load_or_view();
+            self.radar_events.reset_for_view_change();
         }
         let size: u32 = MINIMAP_WIDTH;
         {
@@ -498,6 +515,9 @@ impl MinimapRenderer {
         // Trigger/action precedes LogicClass: action 40 clears all, forces the
         // reverse Building tail, then mobiles return on ordinary +0x4A0 visits.
         let projection = self.radar_projection_facts();
+        // One isolated query per pass: radar lookups stamp their own copy
+        // of the fallback Cell, never the simulation's.
+        let cells = resolved_terrain.map(crate::map::resolved_terrain::NativeCellQuery::isolated);
         self.radar_tracker.remove_absent_or_ineligible(entities);
         if self.radar_tracker.take_action40_building_tail_pending() {
             for stable_id in entities.keys_sorted().into_iter().rev() {
@@ -522,7 +542,7 @@ impl MinimapRenderer {
                     interner,
                     projection,
                     self.playfield_bounds,
-                    resolved_terrain,
+                    cells.as_ref(),
                 );
                 if let Some(event) = self.radar_tracker.update_object(update, true) {
                     self.create_enemy_sensed_event(event, sim_tick, rules);
@@ -545,7 +565,7 @@ impl MinimapRenderer {
                 interner,
                 projection,
                 self.playfield_bounds,
-                resolved_terrain,
+                cells.as_ref(),
             );
             if let Some(event) = self.radar_tracker.update_object(update, false) {
                 self.create_enemy_sensed_event(event, sim_tick, rules);
@@ -580,6 +600,7 @@ impl MinimapRenderer {
                 rules,
                 interner,
                 projection,
+                cells.as_ref(),
             )
         });
         let rgba: &mut Vec<u8> = &mut self.rgba_scratch;
@@ -621,9 +642,10 @@ impl MinimapRenderer {
         }
 
         // `RadarClass::Update @ 0x00656EC0` composes object pixels, then the
-        // ascending radar-event array, then SpySatellite vision. Rust's SpySat
-        // materialization is already present in the fog/base inputs; the event
-        // outlines must nevertheless remain after object pixels here.
+        // ascending radar-event array, then the beacon loop (`0x00431700` →
+        // `0x00430650` at `0x0065756E`; Ghidra's "SpySatellite" names are
+        // wrong: the receiver is the beacon manager `0x0089C3B0`, gated on the
+        // RDRBEACN counts). The event outlines must remain after object pixels.
         if let Some(surface) = self.native_radar_surface {
             self.radar_events.draw(
                 rgba,
@@ -632,6 +654,21 @@ impl MinimapRenderer {
                 surface.generated_size(),
                 surface.aperture_offset(),
             );
+            // Then the beacons (`0x0065756E -> 0x00431700 -> 0x00430650`),
+            // clipped to the generated surface.
+            for (art, beacon) in beacons
+                .into_iter()
+                .flat_map(|(art, records)| records.iter().map(move |beacon| (art, beacon)))
+            {
+                let center = surface.world_to_surface_pixel(beacon.coord[0], beacon.coord[1], true);
+                art.blit_radar(beacon.house, binary_frame, center, |(x, y), color| {
+                    if let (Ok(x), Ok(y)) = (u32::try_from(x), u32::try_from(y))
+                        && let Some((x, y)) = aperture_pixel(Some(surface), (x, y))
+                    {
+                        set_pixel(rgba, size, x, y, color);
+                    }
+                });
+            }
         }
 
         let consumed_radar_terrain_generation = staged_radar_terrain_update.finish_infallible(

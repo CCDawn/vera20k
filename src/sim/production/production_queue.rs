@@ -21,9 +21,9 @@ use super::production_types::*;
 /// `owner`'s Available_Money, by house name; 0 for a house that does not
 /// exist.
 pub fn credits_for_owner(sim: &Simulation, owner: &str) -> i32 {
-    sim.interner
-        .get(owner)
-        .map_or(0, |id| crate::sim::credit_income::available_money(sim, id))
+    sim.interner.get(owner).map_or(0, |id| {
+        crate::sim::credit_income::available_money(&sim.houses, id)
+    })
 }
 
 /// `owner`'s house, created as a human house holding [`STARTING_CREDITS`]
@@ -117,51 +117,64 @@ pub fn has_build_option_for_owner(sim: &Simulation, rules: &RuleSet, owner: &str
         .any(|o| o.enabled)
 }
 
-/// StripClass::AI6A8DD3 consumes Factory::HasChanged4C9C60, announces a
-/// completed building, and issues mobile PLACE6A8EB8 without releasing its head.
-/// The next frame's input prefix visits Strip before Logic/Factory and appends
-/// PLACE after already accepted OutList events, for that frame's
-/// Event4C710B -> House4FB0E0 tail. Native controls observe completion267/484
-/// and PLACE268/485; admitted SetRally then PLACE inherits the new Archive.
-///
-/// Sidebar6A77B6 visits tabs0..3: Infantry(tab2) precedes Unit/Aircraft(tab3).
-/// Within tab3, native entry-array order and saturated OutList transport remain
-/// recorded residuals; one infantry factory has no cross-category ambiguity.
-pub fn publish_production_changes(sim: &mut Simulation, rules: &RuleSet) {
-    let mut completed = sim.production.factories_mut().take_changed_completed_keys();
-    completed.sort_by_key(|(_, category)| match category {
-        ProductionCategory::Building => 0,
-        ProductionCategory::Defense => 1,
-        ProductionCategory::Infantry => 2,
-        ProductionCategory::Vehicle | ProductionCategory::Aircraft | ProductionCategory::Ship => 3,
-    });
-    for (owner, category) in completed {
-        let Some(type_id) = sim
+/// StripClass::AI6A8DC6 visits the local sidebar's retained Factory links.
+/// HasChanged4C9C60 is consumed before IsComplete4CA130, in entry order; a
+/// remote or absent strip never consumes that Factory's notification. Mobile
+/// completion6A8EB8 emits the existing EventCtor_Place4C6AE0 raw record and
+/// clears the visited cameo request6A8F42 even when OutList's128 slots are full.
+/// The held identity stays with the receiver Event4C710B -> House4FB0E0.
+pub fn publish_production_changes(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    effects: FrameEffects<'_>,
+) {
+    let Some(owner) = sim.session.current_house() else {
+        return;
+    };
+    for &visit in effects.production_factories() {
+        if !sim
             .production
-            .factories()
-            .view(owner, category)
-            .and_then(|factory| factory.object.map(|object| object.type_id))
-        else {
+            .factories_mut()
+            .take_changed_complete(owner, visit)
+        {
             continue;
-        };
+        }
         factory_lifecycle::publish_completion(
             &sim.interner,
             &mut sim.production,
             &mut sim.sound_events,
             rules,
             owner,
-            category,
+            visit.category,
         );
-        if sim.object_type(type_id, rules).is_some_and(|object| {
-            object.category != crate::rules::object_type::ObjectCategory::Building
-        }) {
-            sim.queue_command(crate::sim::command::CommandEnvelope::new(
-                owner,
-                sim.session.tick().saturating_add(1),
-                crate::sim::command::Command::PlaceProducedMobile { category },
-            ));
-        }
+        let Some(record) = sim.encode_place_mobile_record(owner, visit.category, rules) else {
+            continue;
+        };
+        let _ = sim.issue_local_command(crate::sim::command::CommandEnvelope::synchronized(
+            record,
+            sim.session.tick(),
+        ));
+        effects.clear_production_request(visit.type_id);
     }
+}
+
+/// Supply an explicit local strip in headless owner fixtures. App production
+/// uses its actual retained sidebar, never this registry-derived fixture.
+#[cfg(any(test, feature = "test-support"))]
+pub fn publish_production_changes_for_tests(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    owner: InternedId,
+) {
+    let previous = sim.session.current_house();
+    sim.session.set_current_house_for_test(Some(owner));
+    let visits = sim.production.factories().strip_visits_for_test(owner);
+    publish_production_changes(
+        sim,
+        rules,
+        FrameEffects::default().with_production_strip(&visits, &|_| {}),
+    );
+    sim.session.set_current_house_for_test(previous);
 }
 
 /// Exercise the next frame's prefix publication and its event tail in focused owner tests,
@@ -177,11 +190,15 @@ pub fn dispatch_production_changes_for_tests(
         .set_tick_for_test(sim.session.tick().saturating_add(1));
     sim.session
         .set_binary_frame_for_test(sim.session.binary_frame().wrapping_add(1));
-    publish_production_changes(sim, rules);
+    let owners: Vec<_> = sim.houses.iter().map(|(&owner, _)| owner).collect();
+    for owner in owners {
+        publish_production_changes_for_tests(sim, rules, owner);
+    }
     let due = sim.take_due_commands();
+    sim.transfer_local_commands();
     let (_, spawned) = sim.apply_due_commands(
         &due,
-        Some(rules),
+        rules,
         sim.session.tick().saturating_add(1),
         overlay_registry,
         crate::sim::world::FrameEffects::default(),
@@ -199,6 +216,7 @@ pub(in crate::sim) fn exit_produced_object(
     rules: &RuleSet,
     producer_id: u64,
     stable_id: u64,
+    exit_cell: (i16, i16),
     overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     effects: FrameEffects<'_>,
 ) -> crate::sim::ai_base_building::BuildingExit {
@@ -209,7 +227,6 @@ pub(in crate::sim) fn exit_produced_object(
     };
     // Exit443C81 sets Techno+3D5 before RTTI, admission or Unlimbo.
     entity.in_playfield.enter();
-    let owner_id = entity.owner();
     let product_type_id = entity.type_ref();
     let Some(product_type) = sim.object_type(product_type_id, rules) else {
         return BuildingExit::Failed;
@@ -230,11 +247,14 @@ pub(in crate::sim) fn exit_produced_object(
     let Some(kind) = UnitChoiceKind::of(product_type.category) else {
         return BuildingExit::Failed;
     };
-    let Some(producer_type) = sim
-        .substrate
-        .entities
-        .get(producer_id)
-        .and_then(|producer| sim.object_type(producer.type_ref(), rules))
+    let Some((owner_id, producer_type)) =
+        sim.substrate
+            .entities
+            .get(producer_id)
+            .and_then(|producer| {
+                sim.object_type(producer.type_ref(), rules)
+                    .map(|object| (producer.owner(), object))
+            })
     else {
         return BuildingExit::Failed;
     };
@@ -254,9 +274,23 @@ pub(in crate::sim) fn exit_produced_object(
     {
         return BuildingExit::TryLater;
     }
-    ai_base_building::economy_state_machine(sim, rules, owner_id, false);
-    if let Some(house) = sim.houses.get_mut(&owner_id) {
-        house.ai_unit_choices_mut().clear(kind);
+    //443CBC/4440FB use the producer's House, even when a reinforcement
+    //belongs to another House. Hospital/Armory skip this Unit/Infantry
+    //prelude (4440DD..444137); the earlier Aircraft arm always runs it.
+    if kind == UnitChoiceKind::Aircraft || !producer_type.hospital && !producer_type.armory() {
+        ai_base_building::economy_state_machine(
+            &sim.interner,
+            &sim.session,
+            &mut sim.scenario_rng,
+            &mut sim.houses,
+            &sim.power_states,
+            rules,
+            owner_id,
+            false,
+        );
+        if let Some(house) = sim.houses.get_mut(&owner_id) {
+            house.ai_unit_choices_mut().clear(kind);
+        }
     }
     if kind == UnitChoiceKind::Aircraft {
         let airport_bound = product_type.airport_bound;
@@ -271,16 +305,30 @@ pub(in crate::sim) fn exit_produced_object(
         );
     }
     match exit_arm(producer_type) {
-        // RESIDUAL: the refinery arm (`0x00444DE4..0x00444F16`) is not
-        // ported. It places a Unit facing 0xA0 one Cell south-west and one
-        // south of the producer's GetCoords Cell (`0x0089F69C`, `0x0089F698`)
-        // and, placed, snaps its facing and queues Harvest; anything else it
-        // scatters. It answers 0 either way. VERA answers 0 without placing
-        // the object. Trigger: a Refinery= or Weeder= building that produces
-        // Units or Infantry; no retail producer is one
-        // (`retail_producers_take_the_land_naval_and_infantry_arms`). Effect:
-        // the object is abandoned unplaced.
-        ExitArm::Refinery => BuildingExit::Failed,
+        ExitArm::Refinery => {
+            if kind == UnitChoiceKind::Infantry {
+                //444EF8..444F16: a non-Unit scatters with the empty
+                //coordinate, forced=1/noKidding=0, then returns0. Its caller
+                //owns deletion; constructor and Scatter RNG stay spent.
+                if let Err(error) = sim.scatter(
+                    stable_id,
+                    None,
+                    crate::sim::movement::ScatterFlags::new(true, false),
+                    rules,
+                    overlay_registry,
+                    effects,
+                ) {
+                    log::warn!("refinery exit Scatter for {stable_id}: {error}");
+                }
+            }
+            //RESIDUAL: the Unit arm444DF4..444EF5 places at GetCoords Cell
+            //plus the native SW/S offsets, facing0xA0, then queues Harvest;
+            //it also returns0. Ordinary retail producing factories have no
+            //Refinery/Weeder flag. The reinforcement route admits Infantry
+            //only, so it uses the complete non-Unit arm above. GAREFN/NAREFN
+            //themselves do have retail Refinery=yes.
+            BuildingExit::Failed
+        }
         ExitArm::Naval => exit_naval(
             sim,
             rules,
@@ -304,6 +352,7 @@ pub(in crate::sim) fn exit_produced_object(
             arm,
             producer_id,
             stable_id,
+            exit_cell,
             product_type,
             overlay_registry,
             effects,
@@ -315,7 +364,7 @@ pub(in crate::sim) fn exit_produced_object(
 /// requests deferred Unload before finding an exit, then successful Unlimbo
 /// and rally assignment end with Mark(0), Cell center SetLocation, Mark(1).
 /// Original execution on stock GAYARD/DEST and its deferred animation cleanup:
-/// `tools/sidebar_oracle/factory_naval_output.md` (gamemd SHA256 1cdd).
+/// `tools/sidebar_oracle/factory_naval_output.md` (gamemd).
 fn exit_naval(
     sim: &mut Simulation,
     rules: &RuleSet,
@@ -362,7 +411,7 @@ fn exit_naval(
         if let Err(cause) = sim.assign_destination_represented(
             spawned,
             Some(crate::sim::components::NavTargetRef::cell(tx, ty)),
-            Some(rules),
+            rules,
             overlay_registry,
             effects,
         ) {
@@ -378,7 +427,7 @@ fn exit_naval(
     }
     // 44443F..44447A: the explicit outer marks repeat Cell list/raw
     // occupation effects, even though Unlimbo already placed this ship.
-    sim.foot_mark_remove(spawned, Some(rules), overlay_registry, effects);
+    sim.foot_mark_remove(spawned, rules, overlay_registry, effects);
     let coord = crate::sim::movement::target_cell_coord(
         cell.0,
         cell.1,
@@ -387,8 +436,8 @@ fn exit_naval(
             .map(crate::map::resolved_terrain::NativeCellQuery::canonical)
             .as_ref(),
     );
-    sim.foot_set_location_marked(spawned, coord, Some(rules), overlay_registry, effects);
-    sim.foot_mark_put(spawned, Some(rules), overlay_registry, effects);
+    sim.foot_set_location_marked(spawned, coord, rules, overlay_registry, effects);
+    sim.foot_mark_put(spawned, rules, overlay_registry, effects);
     BuildingExit::Placed
 }
 
@@ -474,6 +523,8 @@ fn exit_land(
             rules,
             alternate_id,
             stable_id,
+            //444535 offers the native empty Cell to the alternate.
+            (0, 0),
             overlay_registry,
             effects,
         );
@@ -516,14 +567,14 @@ fn exit_land(
         )?;
         // The native successful suffix44459F..4445C9 re-marks around the
         // second coordinate write. Use the shared Mark/SetLocation owners.
-        let context = crate::sim::world::UninitContext::new(Some(rules), overlay_registry)
-            .with_effects(effects);
+        let context =
+            crate::sim::world::UninitContext::new(rules, overlay_registry).with_effects(effects);
         sim.unmark_entity_remove(spawned, context);
         crate::sim::movement::ground_pose::foot_set_location(
             &mut sim.substrate.entities,
             spawned,
             coord,
-            Some(rules),
+            rules,
             &sim.interner,
         );
         sim.mark_entity_put(spawned, context);
@@ -557,6 +608,7 @@ fn exit_at_dock(
     arm: ExitArm,
     producer_id: u64,
     stable_id: u64,
+    exit_cell: (i16, i16),
     product_type: &crate::rules::object_type::ObjectType,
     overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     effects: FrameEffects<'_>,
@@ -573,7 +625,19 @@ fn exit_at_dock(
             entity.set_archive_target(archive);
         }
     }
-    let Some(exit) = dock_exit(sim, rules, producer_id, stable_id, overlay_registry) else {
+    let offered = if arm == ExitArm::Generic {
+        exit_cell
+    } else {
+        (0, 0)
+    };
+    let Some(exit) = dock_exit(
+        sim,
+        rules,
+        producer_id,
+        stable_id,
+        offered,
+        overlay_registry,
+    ) else {
         return BuildingExit::Failed;
     };
     if arm == ExitArm::Infantry {
@@ -697,7 +761,15 @@ fn exit_cloning_vat_copies(
         ) else {
             continue;
         };
-        let _ = exit_produced_object(sim, rules, vat_id, clone_id, overlay_registry, effects);
+        let _ = exit_produced_object(
+            sim,
+            rules,
+            vat_id,
+            clone_id,
+            (0, 0),
+            overlay_registry,
+            effects,
+        );
     }
 }
 
@@ -744,7 +816,7 @@ fn infantry_exit_tail(
         if let Err(cause) = sim.assign_destination_represented(
             spawned,
             Some(crate::sim::components::NavTargetRef::cell(dock.0, dock.1)),
-            Some(rules),
+            rules,
             overlay_registry,
             effects,
         ) {
@@ -760,7 +832,7 @@ fn infantry_exit_tail(
         spawned,
         crate::sim::radio::RadioMessage::Hello,
         crate::sim::radio::RadioPayload::default(),
-        Some(rules),
+        rules,
         effects,
     ) == crate::sim::radio::RadioResponse::Roger
     {
@@ -770,7 +842,7 @@ fn infantry_exit_tail(
             spawned,
             crate::sim::radio::RadioMessage::TetherBack,
             crate::sim::radio::RadioPayload::default(),
-            Some(rules),
+            rules,
             effects,
         );
     }
@@ -882,7 +954,7 @@ fn generic_exit_tail(
     if let Err(cause) = sim.assign_destination_represented(
         spawned,
         Some(crate::sim::components::NavTargetRef::cell(dock.0, dock.1)),
-        Some(rules),
+        rules,
         overlay_registry,
         effects,
     ) {
@@ -934,7 +1006,7 @@ fn exit_aircraft(
     if !linkable {
         return BuildingExit::Failed;
     }
-    sim.set_object_z(stable_id, 0, Some(rules), overlay_registry, effects);
+    sim.set_object_z(stable_id, 0, rules, overlay_registry, effects);
     let dock_coordinate = |sim: &Simulation| {
         crate::sim::movement::building_dock_coordinate(
             &sim.substrate.entities,
@@ -963,12 +1035,12 @@ fn exit_aircraft(
                 spawned,
                 message,
                 RadioPayload::default(),
-                Some(rules),
+                rules,
                 effects,
             );
         }
         let pad = dock_coordinate(sim);
-        sim.foot_set_location_marked(spawned, pad, Some(rules), overlay_registry, effects);
+        sim.foot_set_location_marked(spawned, pad, rules, overlay_registry, effects);
         sim.substrate.set_aircraft_dock(spawned, Some(producer_id));
         let rally = sim
             .substrate

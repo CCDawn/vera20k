@@ -13,7 +13,7 @@ use crate::rules::ruleset::RuleSet;
 use crate::sim::house_state::HouseState;
 use crate::sim::world::Simulation;
 
-fn arena(rules: &RuleSet) -> Simulation {
+pub(super) fn arena(rules: &RuleSet) -> Simulation {
     let mut sim = Simulation::new();
     for (name, side) in [("Americans", 0), ("Russians", 1)] {
         let owner = sim.intern(name);
@@ -301,7 +301,7 @@ fn the_alt_chord_moves_rather_than_grinds() {
     );
 }
 
-fn retail() -> Option<(
+pub(super) fn retail() -> Option<(
     crate::rules::retail_ini_fixture::RetailBattleRules,
     crate::rules::overlay_types::OverlayTypeRegistry,
 )> {
@@ -501,6 +501,106 @@ fn a_damaged_tank_sent_to_the_depot_is_repaired() {
         }
     }
     assert_eq!(sim.entities().get(tank).unwrap().health.current(), strength);
+}
+
+/// Issue2235's actual pointer overlap, through normal retail flight, shared
+/// picking, cursor/action dispatch and the production bunker install loop.
+#[test]
+fn screen_overlap_with_hovering_rocketeer_keeps_bunker_enter_action() {
+    let Some((retail, registry)) = retail() else {
+        return;
+    };
+    let rules = &retail.rules;
+    let (mut sim, bunker, tank, _) = scene_with(rules, "NATBNK", "Americans");
+    let rocketeer = sim
+        .spawn_object("JUMPJET", "Americans", 24, 19, 0, rules)
+        .expect("Rocketeer");
+    assert!(sim.apply_command(
+        "Americans",
+        &Command::Move {
+            entity_id: rocketeer,
+            target_rx: 23,
+            target_ry: 19,
+        },
+        Some(rules),
+    ));
+    for _ in 0..400 {
+        sim.advance_tick(&[], Some(rules), None, None, 67);
+    }
+    assert_eq!(
+        crate::sim::movement::air_movement::current_fly_height(
+            sim.entities().get(rocketeer).unwrap(),
+            sim.resolved_terrain(),
+        ),
+        500,
+        "the normal Move must establish stock hover height"
+    );
+    let (x, y) =
+        crate::render::locomotor_visual::screen_position(sim.entities().get(bunker).unwrap());
+    // Original6D9CE0 registers Building Location. At this platform point,
+    // Tactical6DA380 prefers the bunker; the old unweighted hover preferred
+    // the Rocketeer and prevented the Enter action before selection repicked.
+    let picked = crate::app::input::entity_pick::hover_target_at_point(
+        &sim,
+        x + 2.,
+        y + 16.,
+        "Americans",
+        true,
+    )
+    .expect("bunker platform target");
+    assert_eq!(picked, hover(bunker));
+    let (air_x, air_y) =
+        crate::render::locomotor_visual::screen_position(sim.entities().get(rocketeer).unwrap());
+    assert_eq!(
+        crate::app::input::entity_pick::hover_target_at_point(
+            &sim,
+            air_x,
+            air_y,
+            "Americans",
+            true,
+        )
+        .map(|hover| hover.stable_id),
+        Some(rocketeer),
+        "a genuinely nearer air target remains selectable"
+    );
+    assert_eq!(
+        cursor_id_for_feedback(capability_cursor_for_hover(
+            &sim,
+            &[tank],
+            Some(tank),
+            &picked,
+            Some(rules),
+            Some(&registry),
+            OrderModifier::Normal,
+            false,
+            false,
+        )),
+        Some(CursorId::Enter)
+    );
+    let mut selected = vec![tank];
+    let orders = entry_orders(
+        &sim,
+        rules,
+        &[tank],
+        &mut selected,
+        &picked,
+        OrderModifier::Normal,
+        false,
+        Some(&registry),
+    )
+    .expect("screen-picked bunker admits the tank");
+    assert_eq!(orders, [enter(tank, bunker)]);
+    assert!(sim.apply_command("Americans", &orders[0], Some(rules)));
+    for _ in 0..1500 {
+        sim.advance_tick(&[], Some(rules), None, None, 67);
+        if sim.entities().get(bunker).unwrap().bunker.occupant() == Some(tank) {
+            break;
+        }
+    }
+    assert_eq!(
+        sim.entities().get(bunker).unwrap().bunker.occupant(),
+        Some(tank)
+    );
 }
 
 /// Each Grizzly over an empty Tank Bunker answers Enter on its own
@@ -964,4 +1064,47 @@ fn a_deployed_gis_alt_over_the_ifv_skips_the_row() {
         action(OrderModifier::Normal),
         Some(crate::sim::world::EntryClickAction::Enter)
     );
+}
+
+/// A player's Harrier or Black Eagle over the player's own Service Depot
+/// (`UnitRepair=yes`, like the Naval Yards): Aircraft What_Action's depot row
+/// (`0x00417DF6..0x00417E78`) takes a human player's base Select over a
+/// UnitRepair building, finds the building type in no retail aircraft's
+/// `Dock=` list (only GAAIRC and AMRADR) and answers NoEnter (0x1F). The
+/// cursor is NoEnter; Aircraft ClickedAction (`0x00417BD0`) passes 0x1F to
+/// Foot ClickedAction (`0x004D74E0`), whose default orders nothing, so the
+/// click orders nothing and no longer selects the depot.
+#[test]
+fn a_players_jet_over_the_players_service_depot_gets_no_enter() {
+    let Some((retail, registry)) = retail() else {
+        return;
+    };
+    let rules = &retail.rules;
+    assert!(rules.object("GADEPT").unwrap().unit_repair);
+    for jet in ["ORCA", "BEAG"] {
+        let (mut sim, depot, _, _) = scene_with(rules, "GADEPT", "Americans");
+        let jet_id = sim
+            .spawn_object(jet, "Americans", 13, 13, 0, rules)
+            .unwrap_or_else(|| panic!("{jet}"));
+        assert_eq!(
+            cursor(&sim, rules, &registry, jet_id, depot),
+            Some(CursorId::NoEnter),
+            "{jet}"
+        );
+        let mut selected = vec![jet_id];
+        assert_eq!(
+            entry_orders(
+                &sim,
+                rules,
+                &[jet_id],
+                &mut selected,
+                &hover(depot),
+                OrderModifier::Normal,
+                false,
+                Some(&registry)
+            ),
+            Some(Vec::new()),
+            "{jet}"
+        );
+    }
 }

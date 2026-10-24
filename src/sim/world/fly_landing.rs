@@ -3,27 +3,41 @@
 //! Native executable corpus: tools/spatial_oracle/fly_landing_phase.*.
 use super::{Simulation, display_layers::DisplayLayer};
 use crate::map::entities::EntityCategory;
+use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::components::{DriveCoord, NavTargetRef};
+use crate::sim::intern::StringInterner;
 use crate::sim::movement::{air_movement, ground_pose, locomotor::MovementLayer};
+use crate::sim::scenario_session::ScenarioSession;
+use crate::sim::world::FrameChannel;
 use crate::sim::world::FrameEffects;
+use crate::sim::world::ObjectSubstrate;
+use crate::sim::world::SimSoundEvent;
 use crate::util::fixed_math::SIM_ZERO;
 
 impl Simulation {
-    pub(crate) fn finish_fly_takeoff_entry(&mut self, id: u64, rules: Option<&RuleSet>) {
-        Self::aircraft_tracker_add(&self.session, &mut self.substrate, id);
-        let Some(e) = self.substrate.entities.get_mut(id) else {
+    pub(crate) fn finish_fly_takeoff_entry(
+        interner: &mut StringInterner,
+        session: &ScenarioSession,
+        substrate: &mut ObjectSubstrate,
+        sound_events: &mut FrameChannel<SimSoundEvent>,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        id: u64,
+        rules: &RuleSet,
+    ) {
+        Self::aircraft_tracker_add(session, substrate, id);
+        let Some(e) = substrate.entities.get_mut(id) else {
             return;
         };
-        air_movement::ensure_fly_secondary_facing(e);
-        if air_movement::current_fly_height(e, self.resolved_terrain.as_ref()) == 0 {
+        e.ensure_fly_secondary_facing();
+        if air_movement::current_fly_height(e, resolved_terrain.as_ref()) == 0 {
             e.body_facing.snap(
                 e.barrel_facing.unwrap().destination(),
-                self.session.binary_frame(),
+                session.binary_frame(),
             );
         }
-        let sound = rules
-            .and_then(|r| self.interner.object_type(e.type_ref(), r))
+        let sound = interner
+            .object_type(e.type_ref(), rules)
             .and_then(|o| o.aux_sound1.as_deref());
         if let Some(sound) = sound {
             let c = ground_pose::position_world_coord(&e.position);
@@ -32,9 +46,8 @@ impl Simulation {
                 y: c.y,
                 z: c.z,
             };
-            let sound_id = self.interner.intern(sound);
-            self.sound_events
-                .emit(super::SimSoundEvent::AircraftPhase { sound_id, world });
+            let sound_id = interner.intern(sound);
+            sound_events.emit(super::SimSoundEvent::AircraftPhase { sound_id, world });
         }
     }
 
@@ -52,7 +65,7 @@ impl Simulation {
     pub(super) fn apply_fly_landing_callback(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) {
@@ -72,7 +85,7 @@ impl Simulation {
         if bridge && height >= crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS {
             height = height.wrapping_sub(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
         }
-        let object = rules.and_then(|r| self.interner.object_type(entity.type_ref(), r));
+        let object = self.interner.object_type(entity.type_ref(), rules);
         let dropship = object.is_some_and(|o| o.is_dropship);
         let carryall =
             entity.category() == EntityCategory::Aircraft && object.is_some_and(|o| o.carryall);
@@ -99,7 +112,7 @@ impl Simulation {
         let base = crate::sim::aircraft::landing_base::landing_base(
             entity,
             &self.substrate.entities,
-            rules.map(|r| (r, &self.interner)),
+            Some((rules, &self.interner)),
         );
         let destination = entity
             .locomotor
@@ -148,27 +161,23 @@ impl Simulation {
                 y: coord.y,
                 z: ground,
             };
-            if let Some(rules) = rules {
-                let animation = if dropship {
-                    Some("DROPLAND")
-                } else if carryall {
-                    Some("CARYLAND")
-                } else {
-                    None
+            let animation = if dropship {
+                Some("DROPLAND")
+            } else if carryall {
+                Some("CARYLAND")
+            } else {
+                None
+            };
+            if let Some(animation) = animation {
+                let name = self.interner.intern(animation);
+                let (rx, ry, sx, sy, z) = world.to_cell_sub_z();
+                let descriptor = crate::sim::components::AnimClassSpawnDescriptor {
+                    loop_count: 1,
+                    draw_flags: 0x600,
+                    ..crate::sim::components::AnimClassSpawnDescriptor::new(name, rx, ry, sx, sy, z)
                 };
-                if let Some(animation) = animation {
-                    let name = self.interner.intern(animation);
-                    let (rx, ry, sx, sy, z) = world.to_cell_sub_z();
-                    let descriptor = crate::sim::components::AnimClassSpawnDescriptor {
-                        loop_count: 1,
-                        draw_flags: 0x600,
-                        ..crate::sim::components::AnimClassSpawnDescriptor::new(
-                            name, rx, ry, sx, sy, z,
-                        )
-                    };
-                    if let Err(error) = self.spawn_anim_at_world(rules, descriptor, world) {
-                        log::debug!("landing animation [{animation}] did not construct: {error}");
-                    }
+                if let Err(error) = self.spawn_anim_at_world(rules, descriptor, world) {
+                    log::debug!("landing animation [{animation}] did not construct: {error}");
                 }
             }
             if self
@@ -225,7 +234,12 @@ impl Simulation {
         fly.finish_landing();
         fly.halt();
         entity.foot_speed.set_speed_fraction(SIM_ZERO);
-        self.foot_neighbors_after_fly_landing(id);
+        Self::foot_neighbors_after_fly_landing(
+            &mut self.substrate,
+            &self.resolved_terrain,
+            &mut self.overlay_grid,
+            id,
+        );
         let entity = self.substrate.entities.get(id).unwrap();
         let destination = entity
             .locomotor
@@ -257,7 +271,7 @@ impl Simulation {
     fn clear_landed_fly_destination(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         frame_effects: FrameEffects<'_>,
     ) {
         let entity = self.substrate.entities.get(id).unwrap();
@@ -270,7 +284,7 @@ impl Simulation {
         let base = crate::sim::aircraft::landing_base::landing_base(
             entity,
             &self.substrate.entities,
-            rules.map(|r| (r, &self.interner)),
+            Some((rules, &self.interner)),
         );
         let entity = self.substrate.entities.get_mut(id).unwrap();
         let begin = entity
@@ -290,7 +304,7 @@ impl Simulation {
     fn clear_fly_foot_destination(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         frame_effects: FrameEffects<'_>,
     ) {
         self.assign_null_destination(id, rules, None, frame_effects);
@@ -307,7 +321,7 @@ impl Simulation {
         &self,
         id: u64,
         destination: NavTargetRef,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
     ) -> bool {
         use crate::rules::locomotor_type::{MovementZone, SpeedType};
         use crate::sim::cell_rect::{
@@ -351,13 +365,15 @@ impl Simulation {
         ) {
             return other == id
                 || e.radio_contacts.slot(0) == Some(other)
-                || rules
-                    .and_then(|r| self.interner.object_type(e.type_ref(), r))
+                || self
+                    .interner
+                    .object_type(e.type_ref(), rules)
                     .is_some_and(|o| o.spawned)
                     && self.substrate.entities.get(other).is_some_and(|o| {
                         o.spawn_manager.is_some()
-                            || rules
-                                .and_then(|r| self.interner.object_type(o.type_ref(), r))
+                            || self
+                                .interner
+                                .object_type(o.type_ref(), rules)
                                 .is_some_and(|o| o.spawned)
                     });
         }
@@ -413,14 +429,14 @@ impl Simulation {
         &mut self,
         id: u64,
         layer: Option<DisplayLayer>,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         frame_effects: FrameEffects<'_>,
     ) {
         use crate::sim::radio::{self, RadioMessage};
         if layer == Some(DisplayLayer::GROUND) {
             self.clear_fly_foot_destination(id, rules, frame_effects);
             radio::broadcast(self, id, RadioMessage::Tether, rules, frame_effects);
-            self.refresh_object_sight(id, rules, 0);
+            self.refresh_object_sight(id, rules, 0, frame_effects);
             //567DA0 updates client fog edges/redraw requests. VERA's
             // ShroudBuffer rebuilds from this owner when its generation
             // changes; there is no second simulation fog-edge authority.
@@ -443,17 +459,22 @@ impl Simulation {
     fn retry_fly_landing(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         frame_effects: FrameEffects<'_>,
     ) -> bool {
         use crate::rules::locomotor_type::{MovementZone, SpeedType};
         use crate::sim::find_nearby_cell::{NearbyArgs, NearbyFootprint, PassabilityArgs};
-        let Some(rules) = rules else {
-            return false;
-        };
         let e = self.substrate.entities.get(id).unwrap();
         let coord = ground_pose::position_world_coord(&e.position);
-        self.begin_fly_takeoff(id, Some(rules));
+        Self::begin_fly_takeoff(
+            &mut self.interner,
+            &self.session,
+            &mut self.substrate,
+            &mut self.sound_events,
+            &self.resolved_terrain,
+            id,
+            rules,
+        );
         if self.map_size_diamond().is_none() {
             return false;
         }
@@ -488,7 +509,17 @@ impl Simulation {
                         .wrapping_add(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
                 }
             }
-            self.move_air_coordinate(id, coord, None, Some(rules));
+            Self::move_air_coordinate(
+                &mut self.interner,
+                &self.session,
+                &mut self.substrate,
+                &mut self.sound_events,
+                &self.resolved_terrain,
+                id,
+                coord,
+                None,
+                rules,
+            );
             true
         } else {
             self.receive_own_health_c4(id, rules, None, frame_effects);
@@ -573,7 +604,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .seed_neighbor_counts_for_tests(input["neighbor_seed"].as_u64().unwrap_or(0) as u8);
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         assert_eq!(id, 1);
         insert_entity(&mut sim, id, EntityCategory::Aircraft);
         let before = &row["before"];
@@ -610,14 +641,22 @@ mod tests {
             Simulation::aircraft_tracker_add(&sim.session, &mut sim.substrate, id);
         }
         sim.add_entity_occupancy(id);
-        sim.submit_entity_display(id, Some(&rules), None);
+        Simulation::submit_entity_display(
+            &sim.interner,
+            &sim.terrain_objects,
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            id,
+            &rules,
+            None,
+        );
         let e = sim.substrate.entities.get_mut(id).unwrap();
         e.position
             .set_exact_z_leptons_for_test(Some(before["coordinates"][2].as_i64().unwrap() as i32));
         if input["blocking_unit"].as_bool().unwrap_or(false)
             || input["reserved"].as_bool().unwrap_or(false)
         {
-            let id = sim.allocate_stable_id();
+            let id = sim.substrate.allocate_stable_id();
             insert_entity(
                 &mut sim,
                 id,
@@ -672,7 +711,12 @@ mod tests {
             e.barrel_facing = Some(facing(0x6000, 0x2000));
             let rng = sim.scenario_rng.logical_state();
             if input["move"].as_bool().unwrap() {
-                sim.move_air_coordinate(
+                Simulation::move_air_coordinate(
+                    &mut sim.interner,
+                    &sim.session,
+                    &mut sim.substrate,
+                    &mut sim.sound_events,
+                    &sim.resolved_terrain,
                     1,
                     DriveCoord {
                         x: 16768,
@@ -680,10 +724,18 @@ mod tests {
                         z: 0,
                     },
                     None,
-                    Some(&rules),
+                    &rules,
                 );
             } else {
-                sim.begin_fly_takeoff(1, Some(&rules));
+                Simulation::begin_fly_takeoff(
+                    &mut sim.interner,
+                    &sim.session,
+                    &mut sim.substrate,
+                    &mut sim.sound_events,
+                    &sim.resolved_terrain,
+                    1,
+                    &rules,
+                );
             }
             let e = sim.substrate.entities.get(1).unwrap();
             let state = e.locomotor.as_ref().unwrap().fly_runtime().unwrap();
@@ -960,7 +1012,7 @@ mod tests {
                         query[0].as_u64().unwrap() as u16,
                         query[1].as_u64().unwrap() as u16
                     ),
-                    Some(&rules)
+                    &rules
                 ),
                 row["result"].as_bool().unwrap(),
                 "{input}"
@@ -979,12 +1031,7 @@ mod tests {
         for row in rows {
             let (mut sim, rules) = fixture(&row);
             let rng = sim.scenario_rng.logical_state();
-            sim.complete_fly_phase(
-                1,
-                Some(&rules),
-                None,
-                crate::sim::world::FrameEffects::default(),
-            );
+            sim.complete_fly_phase(1, &rules, None, crate::sim::world::FrameEffects::default());
             let e = sim.substrate.entities.get(1).unwrap();
             let l = e.locomotor.as_ref().unwrap();
             let f = l.fly_runtime().unwrap();
@@ -1097,7 +1144,7 @@ mod tests {
         let (mut sim, rules) = fixture(row);
         sim.tick_air_movement_with_cell_lists_one(
             1,
-            Some(&rules),
+            &rules,
             None,
             crate::sim::world::FrameEffects::default(),
         )
@@ -1126,7 +1173,7 @@ mod tests {
                 s.session.set_binary_frame_for_test(frame);
                 s.tick_air_movement_with_cell_lists_one(
                     1,
-                    Some(&rules),
+                    &rules,
                     None,
                     crate::sim::world::FrameEffects::default(),
                 )

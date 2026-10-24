@@ -58,16 +58,31 @@ impl super::object_health::ObjectHealthHost for ReceiverHealthHost<'_, '_, '_> {
         )
     }
 
+    fn write_damage(&mut self, damage: i32) {
+        if self.execute_world_callbacks
+            && let Some(writeback) = self.event.damage_writeback
+        {
+            writeback.write(self.world, self.rules, damage);
+        }
+    }
+
     fn invoke(&mut self, callback: super::object_health::HealthCallback) {
         use super::object_health::HealthCallback;
         let id = self.event.target_id;
-        let context =
-            UninitContext::new(Some(self.rules), self.registry).with_effects(self.effects);
+        let context = UninitContext::new(self.rules, self.registry).with_effects(self.effects);
         match callback {
             //5F5486: a heal that changed Strength calls vt+148 Flash(7).
             HealthCallback::Changed => {
                 if self.execute_world_callbacks {
-                    self.world.flash_object(id, 7);
+                    Simulation::flash_object(
+                        &self.world.interner,
+                        &self.world.session,
+                        &self.world.fog,
+                        &self.world.house_alliances,
+                        &mut self.world.substrate,
+                        id,
+                        7,
+                    );
                 }
             }
             HealthCallback::Tag { kind, with_source } => {
@@ -125,7 +140,7 @@ impl super::object_health::ObjectHealthHost for ReceiverHealthHost<'_, '_, '_> {
                         id,
                     );
                     if super::world_receiver::callbacks_enabled(self.world) {
-                        self.world.object_destroy_callback(id, context);
+                        self.world.detach_all(id, true, context);
                     }
                 }
             }
@@ -259,7 +274,7 @@ pub(super) fn commit_receiver_health(
         })
         .flatten();
     let attacker_owner = event.source_house.or(live_source_owner);
-    //Steam3e81a617: Object701DF8 returns before701E12/701E32's live Type
+    //Steam gamemd: Object701DF8 returns before701E12/701E32's live Type
     //reads,701E23/701E61's live Owners and701E68's immediate anger update.
     //This precedes result5/PostMortem exits, feedback sounds and Uncloak.
     //Control-flow evidence: original701DF8..701E71; arithmetic retains the
@@ -309,12 +324,11 @@ pub(super) fn commit_receiver_health(
             && !ty.perma_disguise
         {
             let category = target.category();
-            target
-                .disguise
-                .get_or_insert_with(|| {
-                    crate::sim::cloak_disguise::DisguiseRuntime::new(binary_frame)
-                })
-                .receive_damage_reveal(binary_frame, final_packet, category);
+            target.disguise_mut(binary_frame).receive_damage_reveal(
+                binary_frame,
+                final_packet,
+                category,
+            );
         }
         //Object5's early return skips Techno70202E's independent HP override.
         entered_techno_death |=

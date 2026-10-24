@@ -71,9 +71,11 @@ pub struct SpriteInstance {
     pub z_adjust: f32,
     /// Gradient entry (bits 0-7, `native_z::ZGradient`) plus
     /// `native_z::Z_GRADIENT_ZSHAPE_FLAG` when the fragment shader must
-    /// subtract the BUILDNGZ z-shape at `zshape_origin`.
+    /// subtract an optional depth shape at `zshape_origin`. Linear overlay
+    /// shapes also pack their channel/stride; see `pack_overlay_z_gradient`.
     pub z_gradient: u32,
-    /// World-pixel origin of the z-shape canvas (`native_z::zshape_origin`).
+    /// World-pixel origin of the z-shape canvas (`native_z::zshape_origin`),
+    /// or raw overlay origin adjusted for the frame's encoded file offset.
     pub zshape_origin: [f32; 2],
     /// Selected native palette conversion; default preserves precomposed RGBA.
     pub palette_light: crate::render::palette_light::PaletteLight,
@@ -184,6 +186,26 @@ fn create_r8_texture_view_on_device(
     width: u32,
     height: u32,
 ) -> wgpu::TextureView {
+    create_unorm_texture_view_on_device(
+        device,
+        queue,
+        label,
+        bytes,
+        width,
+        height,
+        wgpu::TextureFormat::R8Unorm,
+    )
+}
+
+pub(crate) fn create_unorm_texture_view_on_device(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+) -> wgpu::TextureView {
     let texture: wgpu::Texture = device.create_texture_with_data(
         queue,
         &wgpu::TextureDescriptor {
@@ -196,7 +218,7 @@ fn create_r8_texture_view_on_device(
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         },
@@ -1319,6 +1341,17 @@ impl BatchRenderer {
         )
     }
 
+    /// Keep an indexed page's existing index plane when its shared palette
+    /// row texture grows. The source bind-group constructor remains shared.
+    pub(crate) fn rebind_indexed_palette(
+        &self,
+        device: &wgpu::Device,
+        page: &mut BatchTexture,
+        palette: &wgpu::TextureView,
+    ) {
+        page.bind_group = self.source_bind_group(device, palette, &page.view);
+    }
+
     fn batch_texture(
         &self,
         device: &wgpu::Device,
@@ -1936,7 +1969,7 @@ impl BatchRenderer {
         );
     }
 
-    fn draw_passthrough_range_bound<'a>(
+    pub(crate) fn draw_passthrough_range_bound<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
         texture: &'a BatchTexture,

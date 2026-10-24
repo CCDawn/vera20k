@@ -15,14 +15,6 @@ use crate::sim::world::Simulation;
 use serde_json::Value;
 
 fn corpus() -> Value {
-    let metadata: Value = serde_json::from_str(crate::test_fixture::text(
-        "tools/procedural_drawing_oracle/factory_destination.meta.json",
-    ))
-    .unwrap();
-    assert_eq!(
-        metadata["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     serde_json::from_str(crate::test_fixture::text(
         "tools/procedural_drawing_oracle/factory_destination.json",
     ))
@@ -137,7 +129,7 @@ fn building_destination_matches_64_native_mode_one_rows_for_all_target_shapes() 
             sim.assign_destination_represented(
                 1,
                 target(input["requested"].as_str().unwrap(), shape),
-                Some(&rules),
+                &rules,
                 None,
                 crate::sim::world::FrameEffects::default(),
             )

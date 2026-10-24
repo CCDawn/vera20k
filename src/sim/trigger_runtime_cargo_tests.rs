@@ -1,5 +1,5 @@
 //! Scenario cargo switches and Unit73838A's production fatal-receiver consumer.
-//! Native control flow: Steam gamemd SHA2563e81a617..08600, Execute97
+//! Native control flow: Steam gamemd, Execute97
 //! 6DD8EE, Execute87 6DDBD5, Basic68A217/68A235/68A5A7 and Unit73838A.
 //! Existing crate/FNPC oracles own numeric values and RNG; these tests do
 //! not substitute a hand-computed placement or timer golden.
@@ -58,7 +58,7 @@ fn action(sim: &mut Simulation, kind: i32, value: i32) {
             input: TagEventInput::default(),
         },
         &mut Vec::new(),
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         FrameEffects::default(),
     ));
@@ -218,12 +218,7 @@ fn live_house_trigger_enables_train_cargo_before_fatal_receiver_and_pickup() {
     let owner = sim.interner.get("Americans").unwrap();
     sim.session.set_binary_frame_for_test(16);
     let previous_rng = rng(&sim);
-    sim.raise_house_tags(
-        owner,
-        Some(&rules),
-        Some(&registry),
-        FrameEffects::default(),
-    );
+    sim.raise_house_tags(owner, &rules, Some(&registry), FrameEffects::default());
     assert!(sim.session.train_crate());
     assert!(sim.trigger_runtime.locals_set.contains(&9));
     assert_eq!(rng(&sim), previous_rng);
@@ -254,11 +249,11 @@ fn live_house_trigger_enables_train_cargo_before_fatal_receiver_and_pickup() {
     let collector = sim
         .spawn_object_at_height("CARGOTRUCK", "Americans", 16, 15, 0, 0, &rules)
         .unwrap();
-    let money = crate::sim::credit_income::available_money(&sim, owner);
+    let money = crate::sim::credit_income::available_money(&sim.houses, owner);
     assert!(sim.pickup_crate_at(
         collector,
         (slot.cell_x, slot.cell_y),
-        Some(&rules),
+        &rules,
         Some(&registry),
         FrameEffects::default()
     ));
@@ -273,7 +268,7 @@ fn live_house_trigger_enables_train_cargo_before_fatal_receiver_and_pickup() {
             .overlay_id
             .is_none()
     );
-    assert!(crate::sim::credit_income::available_money(&sim, owner) > money);
+    assert!(crate::sim::credit_income::available_money(&sim.houses, owner) > money);
     assert!(
         sim.trigger_runtime.dirty[3],
         "native CrateTrigger still feeds event50"

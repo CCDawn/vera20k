@@ -76,11 +76,7 @@ pub(crate) fn open(state: &mut AppState, request: DiplomacyRequest) {
         RequestedState::Diplomacy => {
             App::enter_in_game_menu_state(state, InGameMenuState::Diplomacy);
         }
-        // RESIDUAL: State 9's ShowMissionRestateBriefing is a separate
-        // chain; until it lands the request opens nothing.
-        RequestedState::MissionBriefing => {
-            log::info!("Diplomacy button requested the mission briefing (state 9), not ported");
-        }
+        RequestedState::MissionBriefing => crate::app::input::restate::open(state),
     }
 }
 
@@ -261,8 +257,11 @@ pub(crate) fn view(state: &AppState) -> DiplomacyView {
     let switches = DiplomacyRules {
         allies_allowed: rules.general.allies_allowed,
         quick_coop: mode == SessionMode::Wol
-            && state.frontend.wol.as_ref().and_then(|visit| visit.mode())
-                == Some(crate::ui::wol_shell::WolMode::QuickCoop),
+            && state
+                .match_state
+                .session
+                .network_wol_start()
+                .is_some_and(|terms| terms.quick_coop),
         local_inactive: sim.local_player_defeated(),
         game_mode_nonzero: mode.is_nonzero(),
         listeners: std::array::from_fn(|index| {
@@ -347,8 +346,9 @@ pub(crate) fn mouse(state: &mut AppState, button: MouseButton, pressed: bool) {
             .button
             .press(target);
         if target.is_some() {
-            // Common type2 button 0x0061374B..0x00613771: click at button-down.
-            App::play_skirmish_shell_generic_click_sound(state);
+            // Owner-draw button-down: GUIMainButtonSound (Rules+0x188,
+            // 0x0061374B..0x00613771).
+            App::play_main_menu_button_sound(state);
         }
         match over {
             Some(DiplomacyControl::Chat(row)) => toggle_chat_box(state, row),
@@ -406,8 +406,9 @@ fn press_allies_box(state: &mut AppState, row: usize) {
 /// `Ally 0x00731840`: queue EVENT_ALLY toward `house` for the player's
 /// House. Gates (`0x00731840..0x00731877`): a nonzero GameMode, the
 /// Scenario's FixedAlliance bit (`0x400`) clear, AlliesAllowed and
-/// AllyChangeAllowed. FixedAlliance has no VERA field: no skirmish or LAN
-/// writer sets it (`SpecialClass::Init 0x006B8AE0` clears it).
+/// AllyChangeAllowed. FixedAlliance is set only by a WOL clan game's
+/// Apply_Squad_Alliances (`0x0069B170`); `SpecialClass::Init 0x006B8AE0`
+/// clears it.
 /// RESIDUAL: a full OutList (128 records, `[0xA802C8]`) drops the event
 /// natively; VERA's queue has no such cap.
 pub(crate) fn ally(state: &mut AppState, house: InternedId) {
@@ -420,6 +421,7 @@ pub(crate) fn ally(state: &mut AppState, house: InternedId) {
     let rules = &runtime.resources.rules;
     let sim = &mut runtime.simulation;
     if !sim.session().game_mode_nonzero()
+        || sim.session().fixed_alliance()
         || !rules.general.allies_allowed
         || !rules.general.ally_change_allowed
     {

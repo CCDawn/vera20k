@@ -3,6 +3,7 @@
 //! UI overlays, selection brackets, target lines, and the overlay render index.
 
 pub(crate) mod airstrike_lines;
+pub(crate) mod build_text;
 pub(crate) mod building_anim;
 pub(crate) mod combat_lights;
 pub(crate) mod control_links;
@@ -11,6 +12,7 @@ pub(crate) mod electric_bolts;
 pub(crate) mod fire_effects;
 pub(crate) mod house_ui;
 pub(crate) mod instances;
+pub(crate) mod interpolation;
 pub(crate) mod ion_blasts;
 pub(crate) mod lasers;
 pub(crate) mod line_trails;
@@ -19,6 +21,7 @@ pub(crate) mod overlay_index;
 pub(crate) mod radial_indicators;
 pub(crate) mod radiation_beams;
 pub(crate) mod render;
+pub(crate) mod screen_shake;
 pub(crate) mod selection_brackets;
 pub(crate) mod sidebar_build;
 pub(crate) mod sidebar_gadgets;

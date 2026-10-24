@@ -142,6 +142,7 @@ fn ordinary_repair_children_reach_the_actual_effect_builder_and_gpu_without_muta
         let mut parents = Vec::new();
         build_display_effect_instances(
             &DisplayEffectInputs {
+                interpolation: None,
                 sim: &sim,
                 rules: &rules,
                 camera: view_camera,
@@ -153,6 +154,7 @@ fn ordinary_repair_children_reach_the_actual_effect_builder_and_gpu_without_muta
                 detail,
                 detail_level: 2,
                 lighting: &lighting,
+                retained_anim_intensities: None,
                 house_colors: &house_colors,
                 hidden_super_anims: &hidden,
                 show_hidden: false,
@@ -161,6 +163,7 @@ fn ordinary_repair_children_reach_the_actual_effect_builder_and_gpu_without_muta
             },
             &mut parents,
             &order,
+            Default::default(),
         );
         assert_eq!(
             sim.state_hash(),
@@ -183,7 +186,13 @@ fn ordinary_repair_children_reach_the_actual_effect_builder_and_gpu_without_muta
         RefCell::new(detail)
     };
     let normal = build(&normal_detail(), Some(&atlas));
+    let empty_anim = normal
+        .iter()
+        .find(|parent| parent.parent.id == anim)
+        .expect("the admitted Anim retains its parent without either image frame");
+    assert!(empty_anim.pieces.is_empty() && empty_anim.body_draw.is_none());
     let expected: Vec<_> = std::iter::once(system_id)
+        .chain(std::iter::once(anim))
         .chain(child_ids.iter().copied())
         .collect();
     assert_eq!(
@@ -192,7 +201,7 @@ fn ordinary_repair_children_reach_the_actual_effect_builder_and_gpu_without_muta
             .map(|parent| parent.parent.id)
             .collect::<Vec<_>>(),
         expected,
-        "actual retained System and child slots feed lowering"
+        "actual retained System, empty Anim and child slots feed lowering"
     );
     // Whole ParticleDraw's three-query overflow control supplies the expected
     // shared55AF60 outcomes. An Anim after System must take the middle query;
@@ -352,6 +361,7 @@ fn ordinary_repair_children_reach_the_actual_effect_builder_and_gpu_without_muta
             for layer in &layers {
                 draw_native_object_pass(
                     &mut encoder,
+                    crate::app::render::merge_passes::ObjectDrawPhase::Display,
                     &cv,
                     &dv,
                     &mut terrain,
@@ -595,6 +605,7 @@ fn retained_welding_system_then_particles_matches_original_shared_destination() 
             for index in replay {
                 draw_native_object_pass(
                     &mut encoder,
+                    crate::app::render::merge_passes::ObjectDrawPhase::Display,
                     &cv,
                     &dv,
                     &mut terrain,

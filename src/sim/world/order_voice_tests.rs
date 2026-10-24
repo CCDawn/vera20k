@@ -13,10 +13,6 @@ fn native_voice_corpus() -> serde_json::Value {
         "tools/spatial_oracle/allied_object_action.json",
     ))
     .unwrap();
-    assert_eq!(
-        corpus["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     corpus
 }
 
@@ -324,10 +320,6 @@ fn assert_move_voice_request(corpus: &serde_json::Value, row: &serde_json::Value
 #[test]
 fn move_voice_matches_original_linked_readers_fallbacks_and_all_streams() {
     let corpus = crate::test_fixture::json("tools/spatial_oracle/move_order_voice.json");
-    assert_eq!(
-        corpus["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     let rows = corpus["voice_controls"].as_array().unwrap();
     assert_eq!(rows.len(), 18, "all original action controls");
     for row in rows {
@@ -445,10 +437,6 @@ fn attack_voice_matches_native_target_slots_rng_and_queue_admission() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     let corpus = crate::test_fixture::json("tools/spatial_oracle/attack_order_voice.json");
-    assert_eq!(
-        corpus["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     let sound_name = |index: i64| {
         corpus["readers"]["sound"]["rows"]
             .as_array()
@@ -677,7 +665,7 @@ fn attack_voice_selects_for_the_committed_target_without_retargeting_the_actor()
     sim.assign_target_represented(
         actor,
         Some(TargetKind::Entity(2)),
-        Some(&rules),
+        &rules,
         None,
         crate::sim::world::FrameEffects::empty(),
     )

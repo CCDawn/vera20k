@@ -69,23 +69,18 @@ impl crate::sim::world::Simulation {
         {
             return Ok((false, false));
         }
-        let old_layer = self.entity_display_layer(id, Some(rules));
+        let old_layer = self.entity_display_layer(id, rules);
         let landed = self.advance_fall(
             id,
             rules.general.parachute_max_fall_rate,
-            Some(rules),
+            rules,
             registry,
             effects,
         );
         let mut changed = false;
         if landed {
-            changed = self.per_cell_process(
-                id,
-                super::PerCellReason::Arrival,
-                Some(rules),
-                registry,
-                effects,
-            )?;
+            changed =
+                self.per_cell_process(id, super::PerCellReason::Arrival, rules, registry, effects)?;
             Self::wind_down_parachute_anim(&self.interner, &mut self.substrate, rules, id);
             //5F3FA4..5F3FFA: PerCell can Limbo the object. The landing
             // frame updates and retains FallRate only after that callback.
@@ -107,12 +102,19 @@ impl crate::sim::world::Simulation {
             self.substrate.display.remove(id);
             return Ok((landed, changed));
         }
-        let new_layer = self.entity_display_layer(id, Some(rules));
+        let new_layer = self.entity_display_layer(id, rules);
         if old_layer != new_layer
             && let Some(layer) = new_layer
         {
             //5F4001..5F400E: resubmit only when the live layer changed.
-            self.submit_object_display(id, layer, Some(rules));
+            Self::submit_object_display(
+                &self.interner,
+                &self.terrain_objects,
+                &mut self.substrate,
+                id,
+                layer,
+                rules,
+            );
         }
         if let Some(health) = self
             .substrate
@@ -163,11 +165,11 @@ impl crate::sim::world::Simulation {
     /// RESIDUAL: a bullet takes `Rules+0xBB8` (`BombParachute=`) at the
     /// uncopied coordinate instead; VERA has no parachuted bullets.
     ///
-    /// DRIFT: after the attach native copies the owner's drawer (`vtable+0x1E4`)
-    /// to the anim's `+0xD4` and the owner cell's ground Z adjust (`+0x10A`) to
-    /// `+0xFC`, the pair `set_cell_anim_draw_authority` models for cell anims.
-    /// They are not stored here; the presentation consequence is recorded at
-    /// `build_parachute_instances`.
+    /// Native copies the owner's drawer (`vtable+0x1E4`) to Anim+0xD4; the
+    /// House remap below retains that selection. It also copies the owner's
+    /// Cell+0x10A light intensity to Anim+0xFC, separately from the instance
+    /// ZAdjust at+0x100. Publish the read at this producer boundary; the
+    /// existing lighting owner samples it before later relights.
     pub(crate) fn attach_parachute_anim(
         &mut self,
         rules: &crate::rules::ruleset::RuleSet,
@@ -198,7 +200,14 @@ impl crate::sim::world::Simulation {
                 // Anim+0xD4 (`ObjectClass::Paradrop @ 0x005F5940`,
                 // `0x005F5AFE..0x005F5B19`). Freeze the same house selection
                 // on the attached canopy after construction.
-                self.set_anim_house_remap(anim_id, owner_house);
+                self.substrate
+                    .anims
+                    .set_anim_house_remap(anim_id, owner_house);
+                let owner = self.substrate.entities.get(owner_id)?;
+                self.retain_anim_cell_light(
+                    anim_id,
+                    Some((owner.position.rx(), owner.position.ry())),
+                );
                 Some(anim_id)
             }
             Err(error) => {
@@ -265,7 +274,7 @@ impl crate::sim::world::Simulation {
         &mut self,
         stable_id: u64,
         max_fall_rate: i32,
-        rules: Option<&crate::rules::ruleset::RuleSet>,
+        rules: &crate::rules::ruleset::RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) -> bool {
@@ -297,10 +306,7 @@ impl crate::sim::world::Simulation {
         };
         if crate::sim::movement::air_movement::current_fly_height(entity, terrain) > 0 {
             if !entity.lifecycle.in_limbo() {
-                entity.advance_fall_rate(
-                    max_fall_rate,
-                    rules.map_or(-100, |r| r.general.no_parachute_max_fall_rate),
-                );
+                entity.advance_fall_rate(max_fall_rate, rules.general.no_parachute_max_fall_rate);
             }
             return false;
         }
@@ -340,7 +346,7 @@ mod canopy_tests {
 
         let mut sim = Simulation::new();
         sim.interner = crate::sim::intern::test_interner();
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         sim.substrate
             .entities
             .insert(GameEntity::test_default(id, "E1", "Americans", 10, 11));
@@ -395,7 +401,7 @@ mod canopy_tests {
             sim.advance_fall(
                 id,
                 -3,
-                None,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
                 None,
                 crate::sim::world::FrameEffects::default(),
             );
@@ -403,6 +409,14 @@ mod canopy_tests {
         let lower = sim.anim_owner_coords(id).unwrap().z;
         assert!(lower < 600);
         assert_eq!(sim.anim_absolute_coord(anim_id).unwrap().z, lower + 75);
+        let cell = sim.entities().get(id).unwrap().position;
+        assert!(
+            matches!(sim.lighting_sources.pending().as_ref(),
+            [crate::sim::light_sources::LightingEvent::RetainAnimIntensity {
+                anim, cell: Some(sampled),
+            }] if *anim == anim_id && *sampled == (cell.rx(), cell.ry())),
+            "Paradrop samples once at attachment; descent never resamples"
+        );
     }
 
     /// `0x005F3F9D`: landing zeroes the canopy's remaining loops; it is not

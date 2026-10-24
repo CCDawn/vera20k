@@ -31,6 +31,7 @@ C4Warhead=Super
 1=GACNST
 2=YAPOWR
 3=GAWEAP
+4=NATBNK
 [Warheads]
 0=ChronoBeam
 1=Super
@@ -93,6 +94,9 @@ Power=-50
 Strength=1000
 WeaponsFactory=yes
 Factory=UnitType
+[NATBNK]
+Strength=1000
+Bunker=yes
 [YAPOWR]
 Strength=1000
 Power=150
@@ -724,6 +728,37 @@ fn erase_awards_price_each_cost_by_its_house() {
     assert_eq!(sim.houses[&russians].economy().score(), 450);
 }
 
+/// An erased building of the current player names the Cell of its
+/// foundation centre for the Spacebar ring (`BuildingClass::
+/// Death_Announcement @ 0x0044D760`, called at `0x0071AA3A`): GAPOWR's 2x2
+/// at (12, 10) centres on (13, 11) (`0x00447AC0`). Another house's erased
+/// building names none.
+#[test]
+fn an_erased_player_building_is_remembered_for_spacebar() {
+    let rules = rules();
+    let mut sim = sim(9);
+    let own = spawn(&mut sim, &rules, "GAPOWR", "Americans", 12, 10);
+    let rival = spawn(&mut sim, &rules, "GAPOWR", "Allies2", 20, 10);
+    let red = spawn(&mut sim, &rules, "CLEG", "Russians", 10, 10);
+    let blue = spawn(&mut sim, &rules, "CLEG", "Russians", 18, 10);
+    chain(&mut sim, own, &[red], 1);
+    chain(&mut sim, rival, &[blue], 1);
+    let _ = sim.drain_trigger_effects();
+    for head in [red, blue] {
+        sim.temporal_update_head(
+            head,
+            &rules,
+            None,
+            crate::sim::world::FrameEffects::default(),
+        );
+    }
+    assert!(erased(&sim, own) && erased(&sim, rival));
+    assert_eq!(
+        sim.drain_trigger_effects(),
+        [crate::sim::trigger_runtime::TriggerEffect::RecentEventCell { cell: (13, 11) }]
+    );
+}
+
 /// A warp's start makes a victim that was itself warping let go
 /// (`0x0071B162`), and retargeting drops the previous victim with its
 /// progress: nothing heals and the next warp restarts at Strength * 10.
@@ -791,16 +826,31 @@ fn let_go_hands_over_progress_or_frees_the_target() {
     let c = spawn(&mut sim, &rules, "CLEG", "Russians", 10, 12);
     chain(&mut sim, tank, &[a, b, c], 1234);
 
-    sim.temporal_let_go(b);
+    crate::sim::world::Simulation::temporal_let_go(
+        &mut sim.substrate,
+        &mut sim.houses,
+        &mut sim.power_states,
+        b,
+    );
     assert_eq!((link(&sim, a).next, link(&sim, c).prev), (Some(c), Some(a)));
     assert_eq!(link(&sim, b), TemporalLink::default().with_remaining(0));
 
-    sim.temporal_let_go(a);
+    crate::sim::world::Simulation::temporal_let_go(
+        &mut sim.substrate,
+        &mut sim.houses,
+        &mut sim.power_states,
+        a,
+    );
     assert_eq!(head_of(&sim, tank), Some(c));
     assert_eq!(link(&sim, c).warp_remaining, 1234, "progress inherited");
     assert_eq!(link(&sim, c).prev, None);
 
-    sim.temporal_let_go(c);
+    crate::sim::world::Simulation::temporal_let_go(
+        &mut sim.substrate,
+        &mut sim.houses,
+        &mut sim.power_states,
+        c,
+    );
     assert_eq!(head_of(&sim, tank), None);
     assert!(!entity(&sim, tank).is_warped_out());
 }
@@ -871,7 +921,13 @@ fn the_ifv_borrows_its_gunners_beam() {
     assert_eq!(head_of(&sim, tank), Some(ifv));
     assert_eq!(link(&sim, partner).prev, Some(ifv));
 
-    sim.temporal_remove_gunner(ifv, cleg);
+    crate::sim::world::Simulation::temporal_remove_gunner(
+        &mut sim.substrate,
+        &mut sim.houses,
+        &mut sim.power_states,
+        ifv,
+        cleg,
+    );
     assert!(!entity(&sim, ifv).temporal.has_link());
     assert!(entity(&sim, cleg).temporal.has_link());
     assert!(
@@ -920,10 +976,83 @@ fn a_warped_building_goes_offline() {
     assert_eq!(output(&mut sim), 0, "GetPowerOutput 0x0044E7C7");
     assert_eq!(sim.building_operational_state(plant, &rules), Some(false));
 
-    sim.temporal_let_go(cleg);
+    crate::sim::world::Simulation::temporal_let_go(
+        &mut sim.substrate,
+        &mut sim.houses,
+        &mut sim.power_states,
+        cleg,
+    );
     assert!(entity(&sim, plant).building_online());
     assert_eq!(output(&mut sim), 100);
     assert_eq!(sim.building_operational_state(plant, &rules), Some(true));
+}
+
+/// A Temporal erase freezes a building's slot anims and draws them
+/// translucent (`0x004521C0`: Anim `+0x11A`, `+0x119`). One created while the
+/// building is erased starts frozen but opaque (`0x00451B25`). The release
+/// (`0x00452210`) frees and clears them all.
+#[test]
+fn a_warped_buildings_slot_anims_freeze() {
+    let art_text = ART.replace(
+        "[GAPOWR]\nFoundation=2x2\n",
+        "[GAPOWR]\nFoundation=2x2\nActiveAnim=PWRA\n[PWRA]\nLoopCount=-1\nRate=900\n",
+    );
+    let mut rules = rules_from(&format!("{RULES}[Animations]\n0=PWRA\n"), &art_text);
+    let mut art = crate::rules::art_data::ArtRegistry::from_ini(&IniFile::from_str(&art_text));
+    for (name, frames) in [("WARPAWAY", 20), ("CHRONOSK", 3), ("PWRA", 40)] {
+        art.bind_anim_frame_count_for_test(name, frames);
+    }
+    rules.replace_art_registry_for_test(art);
+    let mut sim = sim(9);
+    let plant = spawn(&mut sim, &rules, "GAPOWR", "Americans", 12, 10);
+    let cleg = spawn(&mut sim, &rules, "CLEG", "Russians", 10, 10);
+    let anim = sim
+        .set_building_anim_slot(plant, 3, false, false, 0, &rules)
+        .expect("ActiveAnim");
+    let mut now = sim.session.binary_frame();
+    let mut play = |sim: &mut Simulation, anim: u64| {
+        for _ in 0..30 {
+            now += 1;
+            sim.session.set_binary_frame_for_test(now);
+            sim.visit_anim(
+                anim,
+                &rules,
+                None,
+                crate::sim::world::FrameEffects::default(),
+            );
+        }
+        sim.anim(anim).unwrap().runtime().current_frame
+    };
+    let start = sim.anim(anim).unwrap().runtime().current_frame;
+    let playing = play(&mut sim, anim);
+    assert_ne!(playing, start, "a live slot anim plays");
+
+    sim.temporal_initiate_warp(
+        cleg,
+        Some(plant),
+        &rules,
+        None,
+        crate::sim::world::FrameEffects::default(),
+    );
+    assert!(sim.anim(anim).unwrap().draw_runtime().forced_translucent);
+    assert_eq!(play(&mut sim, anim), playing, "AI stops at 0x004244A9");
+
+    sim.clear_building_anim_slot(plant, 3);
+    let created = sim
+        .set_building_anim_slot(plant, 3, false, false, 0, &rules)
+        .expect("ActiveAnim");
+    assert!(!sim.anim(created).unwrap().draw_runtime().forced_translucent);
+    let start = sim.anim(created).unwrap().runtime().current_frame;
+    assert_eq!(play(&mut sim, created), start, "created frozen");
+
+    crate::sim::world::Simulation::temporal_let_go(
+        &mut sim.substrate,
+        &mut sim.houses,
+        &mut sim.power_states,
+        cleg,
+    );
+    assert!(!sim.anim(created).unwrap().draw_runtime().forced_translucent);
+    assert_ne!(play(&mut sim, created), start, "the release frees it");
 }
 
 #[test]
@@ -952,7 +1081,12 @@ fn trigger_online_is_independent_of_temporal_and_corrupt_chain_clear_does_not_re
     loaded.resolve_type_handles(&rules);
     assert!(entity(&loaded, building).building_online());
     assert!(entity(&loaded, building).is_warped_out());
-    sim.temporal_let_go(cleg);
+    crate::sim::world::Simulation::temporal_let_go(
+        &mut sim.substrate,
+        &mut sim.houses,
+        &mut sim.power_states,
+        cleg,
+    );
     assert!(
         entity(&sim, building).building_online(),
         "71AC3D forces on without normal callbacks"
@@ -965,6 +1099,89 @@ fn trigger_online_is_independent_of_temporal_and_corrupt_chain_clear_does_not_re
     sim.temporal_update_head(cleg, &rules, None, effects);
     assert!(!entity(&sim, building).is_warped_out());
     assert!(!entity(&sim, building).building_online());
+}
+
+/// House cleanup's71AD40 releases the warp without452210's online store.
+/// A stock immune bridge hut survives the subsequent C4 receiver4423A3.
+#[test]
+fn house_cleanup_leaves_a_warped_bridge_hut_offline_when_it_survives_c4() {
+    use crate::sim::command::Command;
+    use crate::sim::world::HouseBlowupSubset;
+
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = retail.rules;
+    let hut_type = rules.object("CABHUT").unwrap();
+    assert!(hut_type.bridge_repair_hut && hut_type.immune && hut_type.warpable);
+    let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x71ad40);
+    sim.intern_rule_type_ids(&rules);
+    sim.resolve_type_handles(&rules);
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
+    let hut = spawn(&mut sim, &rules, "CABHUT", "Russians", 13, 10);
+    let cleg = spawn(&mut sim, &rules, "CLEG", "Americans", 10, 10);
+    // Keep both sides in the skirmish until the explicit cleanup below.
+    spawn(&mut sim, &rules, "GACNST", "Americans", 24, 16);
+    spawn(&mut sim, &rules, "NACNST", "Russians", 24, 24);
+    let owner = entity(&sim, hut).owner();
+    let health = entity(&sim, hut).health.current();
+    let attacker = entity(&sim, cleg).owner();
+    sim.session.set_current_house_for_test(Some(attacker));
+    sim.fog.mark_visible_for_owner(attacker, 13, 10);
+    assert!(sim.apply_command(
+        "Americans",
+        &Command::Attack {
+            attacker_id: cleg,
+            target_id: hut,
+        },
+        Some(&rules),
+    ));
+    let grid = sim.path_grid_snapshot().unwrap();
+    for _ in 0..120 {
+        sim.advance_tick(&[], Some(&rules), Some(&grid), None, 33);
+        if entity(&sim, hut).is_warped_out() {
+            break;
+        }
+    }
+    assert_eq!(
+        head_of(&sim, hut),
+        Some(cleg),
+        "the ordinary shot starts the warp: fire={:?}, mission={:?}, target={:?}",
+        crate::sim::combat::fire_error_world::FireSubject {
+            world: &sim,
+            rules: &rules,
+            overlay_registry: None,
+            fog: None,
+            firer: entity(&sim, cleg),
+            obj: rules.object("CLEG").unwrap(),
+            target: Some(crate::sim::combat::TargetKind::Entity(hut)),
+            weapon_index: 0,
+        }
+        .fire_error(true),
+        entity(&sim, cleg).mission.current().known(),
+        entity(&sim, cleg).attack_target.target()
+    );
+    assert!(!entity(&sim, hut).building_online());
+    sim.house_blowup(
+        owner,
+        HouseBlowupSubset::All,
+        &rules,
+        None,
+        FrameEffects::default(),
+    );
+    assert_eq!(
+        entity(&sim, hut).health.current(),
+        health,
+        "the immune hut survives"
+    );
+    assert!(!entity(&sim, hut).is_warped_out());
+    assert_eq!(link(&sim, cleg).target, None);
+    assert!(
+        !entity(&sim, hut).building_online(),
+        "71AD40 does not restore a surviving building's online latch"
+    );
+    assert!(sim.go_building_online(hut, &rules, FrameEffects::default()));
 }
 
 /// The fixture with `SILO`, which provides a powered `NukeSpecial`.
@@ -1020,7 +1237,12 @@ fn a_warped_superweapon_building_holds_its_super() {
     }
     assert_eq!(state(&sim), warped, "the time left stays");
 
-    sim.temporal_let_go(cleg);
+    crate::sim::world::Simulation::temporal_let_go(
+        &mut sim.substrate,
+        &mut sim.houses,
+        &mut sim.power_states,
+        cleg,
+    );
     step(&mut sim);
     let (active, held, start, duration) = state(&sim);
     assert!(active && !held && start != -1, "released");
@@ -1100,7 +1322,9 @@ fn erasing_a_superweapon_building_revokes_its_super() {
     let cleg = spawn(&mut sim, &rules, "CLEG", "Russians", 10, 10);
     let americans = sim.interner.get("Americans").unwrap();
     let nuke = sim.interner.get("NukeSpecial").unwrap();
-    let owner = sim.interner.intern("Russians");
+    // Use the registered human sender for this synthetic cross-House order;
+    // keep the actor House AI-controlled and preserve the frame-tail timing.
+    let owner = sim.interner.intern("Americans");
     sim.queue_command(CommandEnvelope::new(
         owner,
         sim.session.tick() + 1,
@@ -1260,7 +1484,9 @@ fn a_chrono_legionnaire_erases_a_tank() {
             rules.general.veteran_cap,
         );
     }
-    let owner = sim.interner.intern("Russians");
+    // Use the registered human sender for this synthetic cross-House order;
+    // keep the actor House AI-controlled and preserve the frame-tail timing.
+    let owner = sim.interner.intern("Americans");
     sim.queue_command(CommandEnvelope::new(
         owner,
         sim.session.tick() + 1,
@@ -1312,6 +1538,149 @@ fn a_chrono_legionnaire_erases_a_tank() {
     );
 }
 
+/// The normal loader must bind both General references before Temporal can
+/// construct them. Synthetic temporal fixtures already supplied frame counts,
+/// which hid missing roots in the production asset closure.
+#[test]
+fn retail_cleg_attack_constructs_sparkles_and_warp_away_from_loaded_assets() {
+    use crate::rules::effect_asset_catalog::tolerant_anim_class_roots;
+    use crate::sim::command::Command;
+
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules_for_map("XMP03T4.MAP")
+    else {
+        return;
+    };
+    let Some((_, mut assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+        return;
+    };
+    crate::map::theater::load_theater(&mut assets, "TEMPERATE").unwrap();
+    let mut rules = retail.rules;
+    let roots = tolerant_anim_class_roots(&rules);
+    rules.bind_anim_class_assets(&roots, &assets, "TEM", "TEMPERATE");
+    for name in [
+        &rules.general.chrono_sparkle1.name,
+        &rules.general.warp_away.name,
+    ] {
+        assert!(
+            rules.art().anim_runtime_config(name).is_some_and(|config| {
+                config.raw_shp_frame_count.is_some_and(|frames| frames > 0)
+            }),
+            "production animation roots must bind [{name}]'s retail SHP"
+        );
+    }
+
+    let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 31);
+    sim.intern_rule_type_ids(&rules);
+    sim.resolve_type_handles(&rules);
+    let tank = sim
+        .spawn_object("MTNK", "Russians", 13, 10, 0, &rules)
+        .unwrap();
+    let cleg = sim
+        .spawn_object("CLEG", "Americans", 10, 10, 64, &rules)
+        .unwrap();
+    let owner = entity(&sim, cleg).owner();
+    sim.session.set_current_house_for_test(Some(owner));
+    sim.fog.mark_visible_for_owner(owner, 13, 10);
+    assert!(sim.apply_command(
+        "Americans",
+        &Command::Attack {
+            attacker_id: cleg,
+            target_id: tank,
+        },
+        Some(&rules)
+    ));
+    let grid = sim.path_grid_snapshot().unwrap();
+    let target_location = location_coord(entity(&sim, tank));
+    let mut saw_sparkle = false;
+    for _ in 0..1000 {
+        sim.advance_tick(&[], Some(&rules), Some(&grid), None, 33);
+        for (&id, anim) in sim.substrate.anims.iter() {
+            let name = sim.interner.resolve(anim.type_id());
+            if name == rules.general.chrono_sparkle1.name {
+                let coord = sim.anim_absolute_coord(id).unwrap();
+                assert_eq!(
+                    coord,
+                    AnimWorldCoord {
+                        x: target_location.x + 0x78,
+                        y: target_location.y + 0x78,
+                        z: target_location.z,
+                    }
+                );
+                saw_sparkle = true;
+            }
+            if name == rules.general.warp_away.name {
+                assert!(saw_sparkle, "the held target sparkles before its erase");
+                assert_eq!(sim.anim_absolute_coord(id), Some(target_location));
+                assert!(erased(&sim, tank));
+                return;
+            }
+        }
+    }
+    panic!("ordinary retail CLEG attack never produced its erase animation");
+}
+
+/// Issue #2231. `TemporalClass::Update`'s erase clears a bunkered target's
+/// bunker: `0x0071AA90` calls `BuildingClass::ClearBunker` (`0x00459470`)
+/// when the erased object's bunker link (`+0x2E4`) names a building, before
+/// FreeSlaves (`0x0071AA95`). A stock warp never holds an installed unit —
+/// the Temporal arm of the detonation (`0x0046946B..0x004694A5`) retargets
+/// the firer at its bunker — so the chain is admitted by fixture ([`chain`]);
+/// the erase itself is the production head update. After it the walls are
+/// down (one walls-down anim and sound), both links clear and the bunker
+/// runtime idles; without the call the UnInit safety net clears the links
+/// but leaves the walls up.
+#[test]
+fn erasing_a_bunkered_tank_clears_its_bunker() {
+    use crate::sim::docking::bunker_install::{BunkerRuntime, BunkerState};
+
+    let rules = rules();
+    let (mut sim, _grid) = arena(11, &rules);
+    let bunker = spawn(&mut sim, &rules, "NATBNK", "Americans", 10, 10);
+    let tank = spawn(&mut sim, &rules, "HTNK", "Americans", 11, 10);
+    let cleg = spawn(&mut sim, &rules, "CLEG", "Russians", 12, 10);
+    if let Some(building) = sim.substrate.entities.get_mut(bunker) {
+        building.bunker_runtime = Some(BunkerRuntime::idle());
+    }
+    // Occupied walls, as UpdateBunker's install leaves them.
+    crate::sim::docking::bunker_link::install_bunker_link(&mut sim, bunker, tank, &rules);
+    crate::sim::docking::bunker_link::emit_bunker_wall_anim(&mut sim, bunker, true, &rules);
+    assert_eq!(entity(&sim, bunker).bunker.occupant(), Some(tank));
+    assert_eq!(
+        entity(&sim, tank).bunker.link(),
+        crate::sim::docking::bunker_link::BunkerLink::Installed(bunker)
+    );
+    sim.sound_events.clear_for_test();
+
+    // One step of Damage 8 erases (Strength is not consulted; the chain's
+    // remaining warp is the fixture's).
+    chain(&mut sim, tank, &[cleg], 8);
+    sim.temporal_update_head(cleg, &rules, None, FrameEffects::default());
+
+    assert!(erased(&sim, tank), "the bunkered tank is erased");
+    let building = entity(&sim, bunker);
+    assert_eq!(building.bunker.occupant(), None);
+    assert_eq!(
+        building.bunker_runtime.map(|runtime| runtime.state()),
+        Some(BunkerState::Idle)
+    );
+    assert_eq!(
+        sim.bunker_wall_events
+            .iter()
+            .filter(|event| !event.up && event.building_id == bunker)
+            .count(),
+        1,
+        "one walls-down anim on the erase"
+    );
+    assert_eq!(
+        sim.sound_events
+            .iter()
+            .filter(|event| matches!(event, SimSoundEvent::BunkerWallsDown { .. }))
+            .count(),
+        1,
+        "ClearBunker plays the walls-down sound once"
+    );
+}
+
 /// Infantry51BF59 admits its Inviso Bullet into the live Logic list. Fire
 /// 468670 places it at the target; its later Bullet AI detonates it, after
 /// both pre-existing objects have had their turns. The target's next Temporal
@@ -1330,7 +1699,9 @@ fn a_legionnaires_inviso_bullet_warps_after_existing_object_turns() {
             let cleg = spawn(&mut sim, &rules, "CLEG", "Russians", 10, 10);
             (cleg, spawn(&mut sim, &rules, "HTNK", "Americans", 13, 10))
         };
-        let owner = sim.interner.intern("Russians");
+        // Use the registered human sender for this synthetic cross-House order;
+        // keep the actor House AI-controlled and preserve the frame-tail timing.
+        let owner = sim.interner.intern("Americans");
         sim.queue_command(CommandEnvelope::new(
             owner,
             sim.session.tick() + 1,
@@ -1382,7 +1753,9 @@ fn only_temporal_fire_reaches_a_warped_target() {
         None,
         crate::sim::world::FrameEffects::default(),
     );
-    let owner = sim.interner.intern("Russians");
+    // Use the registered human sender for this synthetic cross-House order;
+    // keep the actor House AI-controlled and preserve the frame-tail timing.
+    let owner = sim.interner.intern("Americans");
     sim.queue_command(CommandEnvelope::new(
         owner,
         sim.session.tick() + 1,
@@ -1415,7 +1788,9 @@ fn moving_releases_the_target() {
     let (mut sim, grid) = arena(12, &rules);
     let cleg = spawn(&mut sim, &rules, "CLEG", "Russians", 10, 10);
     let tank = spawn(&mut sim, &rules, "HTNK", "Americans", 13, 10);
-    let owner = sim.interner.intern("Russians");
+    // Use the registered human sender for this synthetic cross-House order;
+    // keep the actor House AI-controlled and preserve the frame-tail timing.
+    let owner = sim.interner.intern("Americans");
     sim.queue_command(CommandEnvelope::new(
         owner,
         sim.session.tick() + 1,
@@ -1532,7 +1907,12 @@ fn a_warp_in_progress_survives_a_snapshot() {
     assert_ne!(
         {
             let mut other = restored;
-            other.temporal_let_go(b);
+            crate::sim::world::Simulation::temporal_let_go(
+                &mut other.substrate,
+                &mut other.houses,
+                &mut other.power_states,
+                b,
+            );
             other.state_hash()
         },
         hash,
@@ -1646,7 +2026,12 @@ fn a_warped_object_runs_none_of_its_ai_phases() {
         "no bill"
     );
     // Released, the building repairs again.
-    sim.temporal_let_go(cleg2);
+    crate::sim::world::Simulation::temporal_let_go(
+        &mut sim.substrate,
+        &mut sim.houses,
+        &mut sim.power_states,
+        cleg2,
+    );
     sim.object_ai_visit_one(plant, Some(&rules), ctx);
     assert!(entity(&sim, plant).health.current() > 300);
 }
@@ -1712,7 +2097,9 @@ fn stop_retains_the_legionnaires_victim_until_attack_dispatch() {
     let (mut sim, grid) = arena(23, &rules);
     let tank = spawn(&mut sim, &rules, "HTNK", "Americans", 13, 10);
     let cleg = spawn(&mut sim, &rules, "CLEG", "Russians", 10, 10);
-    let owner = sim.interner.intern("Russians");
+    // Use the registered human sender for this synthetic cross-House order;
+    // keep the actor House AI-controlled and preserve the frame-tail timing.
+    let owner = sim.interner.intern("Americans");
     let step = |sim: &mut Simulation| {
         let commands = sim.take_due_commands();
         sim.advance_tick(&commands, Some(&rules), Some(&grid), None, 33);
@@ -1739,7 +2126,7 @@ fn stop_retains_the_legionnaires_victim_until_attack_dispatch() {
     assert!(sim.apply_command_with_overlays(
         "Russians",
         &Command::Stop { entity_id: cleg },
-        Some(&rules),
+        &rules,
         None,
         crate::sim::world::FrameEffects::default(),
     ));
@@ -1817,7 +2204,12 @@ fn a_released_mover_does_not_resume_its_order() {
         "the order ends"
     );
     let frozen_at = entity(&sim, tank).position.rx();
-    sim.temporal_let_go(cleg);
+    crate::sim::world::Simulation::temporal_let_go(
+        &mut sim.substrate,
+        &mut sim.houses,
+        &mut sim.power_states,
+        cleg,
+    );
     for _ in 0..150 {
         step(&mut sim);
     }
@@ -1982,7 +2374,7 @@ fn a_warped_building_cannot_be_captured() {
         sim.run_walk_boundary(
             engineer,
             head,
-            Some(&rules),
+            &rules,
             None,
             crate::sim::world::FrameEffects::default(),
         );
@@ -1998,7 +2390,7 @@ fn a_warped_building_cannot_be_captured() {
             !sim.run_completed_walk_step(
                 engineer,
                 head,
-                Some(&rules),
+                &rules,
                 None,
                 crate::sim::world::FrameEffects::default()
             )
@@ -2022,7 +2414,12 @@ fn a_warped_building_cannot_be_captured() {
         ),
         "refusal clears the building destination and scatters away"
     );
-    sim.temporal_let_go(cleg);
+    crate::sim::world::Simulation::temporal_let_go(
+        &mut sim.substrate,
+        &mut sim.houses,
+        &mut sim.power_states,
+        cleg,
+    );
     enter(&mut sim);
     assert_eq!(entity(&sim, plant).owner(), russians, "captured once free");
     assert!(
@@ -2072,8 +2469,18 @@ fn a_warped_transport_admits_no_one() {
     );
     assert!(!admits(&sim, fortress), "a warped Unit transport");
     assert!(!admits(&sim, reactor), "a warped absorber");
-    sim.temporal_let_go(cleg);
-    sim.temporal_let_go(cleg2);
+    crate::sim::world::Simulation::temporal_let_go(
+        &mut sim.substrate,
+        &mut sim.houses,
+        &mut sim.power_states,
+        cleg,
+    );
+    crate::sim::world::Simulation::temporal_let_go(
+        &mut sim.substrate,
+        &mut sim.houses,
+        &mut sim.power_states,
+        cleg2,
+    );
     assert!(admits(&sim, fortress));
     assert!(admits(&sim, reactor));
 }
@@ -2518,8 +2925,18 @@ fn native_first_head_building_warning_and_release_corpus() {
                     None,
                     FrameEffects::default(),
                 ),
-                "release_firer" => sim.temporal_let_go(attackers[0]),
-                "release_original_head" => sim.temporal_let_go(attackers[1]),
+                "release_firer" => crate::sim::world::Simulation::temporal_let_go(
+                    &mut sim.substrate,
+                    &mut sim.houses,
+                    &mut sim.power_states,
+                    attackers[0],
+                ),
+                "release_original_head" => crate::sim::world::Simulation::temporal_let_go(
+                    &mut sim.substrate,
+                    &mut sim.houses,
+                    &mut sim.power_states,
+                    attackers[1],
+                ),
                 other => panic!("{name}: unknown native phase {other}"),
             }
             let state = &phase["state"];

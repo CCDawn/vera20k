@@ -206,10 +206,9 @@ impl Simulation {
     /// VERA does not retain Object+0x80 or invent a dirty-byte predicate.
     /// Evidence: human-infantry-output-downstream-research/mark-radio.native.json,
     /// SHA256 270a1321e3a5509df0eb58500883737f69af2172726da216f7ca107962391127;
-    /// pinned active-retail gamemd SHA256
-    /// 1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c.
-    pub(crate) fn mark_entity_refresh(&self, id: u64) -> bool {
-        self.substrate
+    /// active-retail gamemd.
+    pub(crate) fn mark_entity_refresh(substrate: &ObjectSubstrate, id: u64) -> bool {
+        substrate
             .entities
             .get(id)
             .is_some_and(|entity| entity.category() != EntityCategory::Structure)
@@ -221,7 +220,7 @@ impl Simulation {
     pub(crate) fn techno_mark_after_object(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         frame_effects: FrameEffects<'_>,
     ) {
         if self
@@ -246,7 +245,7 @@ impl Simulation {
     pub(crate) fn foot_mark_remove(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> bool {
@@ -269,7 +268,7 @@ impl Simulation {
     pub(crate) fn foot_pick_up(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
     ) {
         let Some((cell, layer)) = self.foot_mark_cell(id) else {
@@ -296,7 +295,7 @@ impl Simulation {
     pub(crate) fn foot_mark_put(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> bool {
@@ -309,7 +308,7 @@ impl Simulation {
     pub(super) fn foot_mark_put_observed(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         receive: &mut impl FnMut(&mut Simulation, u64),
         frame_effects: FrameEffects<'_>,
@@ -321,7 +320,7 @@ impl Simulation {
             return false;
         }
         self.techno_mark_after_object(id, rules, frame_effects);
-        self.foot_place_down(id, rules, registry, receive);
+        self.foot_place_down(id, rules, registry, receive, frame_effects);
         #[cfg(any(test, feature = "test-support"))]
         self.trace_lifecycle_for_test(LifecycleTestEvent::CellMarked);
         true
@@ -337,9 +336,10 @@ impl Simulation {
     pub(crate) fn foot_place_down(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         receive: &mut impl FnMut(&mut Simulation, u64),
+        frame_effects: FrameEffects<'_>,
     ) {
         let Some((cell, layer)) = self.foot_mark_cell(id) else {
             return;
@@ -357,7 +357,7 @@ impl Simulation {
         self.discover_cell_put_object(
             id,
             cell,
-            crate::sim::world::UninitContext::new(rules, registry),
+            crate::sim::world::UninitContext::new(rules, registry).with_effects(frame_effects),
         );
         #[cfg(any(test, feature = "test-support"))]
         self.trace_lifecycle_for_test(LifecycleTestEvent::RawOccupationListLinked);

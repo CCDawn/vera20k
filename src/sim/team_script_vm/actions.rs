@@ -17,12 +17,10 @@
 //! `deploy` rows (actions 14, 43, 8 and 9) in `transport_tests`.
 //!
 //! RESIDUALS:
-//! - Actions other than 0, 1, 2, 3, 5, 6, 8, 9, 10, 11, 14, 16, 17, 19, 20, 21, 24, 30, 37, 39, 40, 41, 42, 43,
-//!   46, 47, 49, 50, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63 and 64 are not ported. A team
-//!   that reaches one stays on it, as a native handler that has not
-//!   finished does, and records the first as its refusal; the rest of its
-//!   update runs. Trigger: none of the 163 retail AIMD TeamTypes reaches
-//!   one. Effect: the team idles on that action for good, keeping its
+//! - Actions outside [`action_is_ported`] are not ported. A team that reaches
+//!   one stays on it and records the first as its refusal; the rest of its
+//!   update runs. Trigger: an authored script reaches an unsupported action.
+//!   Effect: the team idles on that action for good, keeping its
 //!   members and its TeamType's `Max=` slot, and nothing else sends those
 //!   units out.
 //! - `Coordinate_Attack` keeps a cell target that only a terrain object
@@ -68,6 +66,7 @@ use super::super_actions::ChronoshiftTarget;
 use super::team_ai::member_is_live_joined;
 use super::{TeamScriptAction, TeamScriptRefusal, TeamScriptState, TeamTarget, script_action_at};
 use crate::sim::find_nearby_cell::{NearbyArgs, NearbyFootprint, PassabilityArgs};
+use crate::sim::intern::StringInterner;
 use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::team_script_vm::TeamScriptVm;
 use crate::sim::world::ObjectSubstrate;
@@ -76,7 +75,7 @@ impl TeamScriptState {
     /// TeamFlash6EF5F0 walks +54/+5D8 head first and writes signed Techno+F0.
     /// Script50 inlines the same loop at6E9CFF..6E9D18. Neither caller asks
     /// TechnoFlash6F9DD0 or filters dead, limbo, disguised or foreign members.
-    /// Original Steam gamemd3e81a617..08600; trigger_flash_team's native
+    /// Original Steam gamemd; trigger_flash_team's native
     /// dispatch/member controls and team_creation's signed countdown rows.
     fn flash_members(&self, entities: &mut EntityStore, frames: i32) {
         for member in self.members() {
@@ -119,6 +118,7 @@ pub(super) const fn action_is_ported(action_id: i32) -> bool {
             | 9
             | 10
             | 11
+            | 12
             | 14
             | 16
             | 17
@@ -126,8 +126,13 @@ pub(super) const fn action_is_ported(action_id: i32) -> bool {
             | 20
             | 21
             | 24
+            | 25
+            | 26
+            | 27
             | 30
+            | 34
             | 37
+            | 38
             | 39
             | 40
             | 41
@@ -366,7 +371,7 @@ impl Simulation {
                 frame_effects,
             ),
             17 => {
-                // Steam3e81a617:6E972C..6E977F destroys the current Script,
+                // Steam gamemd:6E972C..6E977F destroys the current Script,
                 // constructs one from ScriptType::Array8B41CC[argument],
                 // then Reset691590 sets its cursor to-1. It does NOT set
                 // Team+80. Native Current691500 consequently returns -1 on
@@ -394,12 +399,44 @@ impl Simulation {
                     );
                 }
             }
+            // Original gamemd.exe TeamClass::AI Script34, table6E9FFC ->
+            //6E9ACF..6E9B6A: Zone+34 GetCoords, Ground578080, then Map565730
+            // bridge flags100/400. Keep subcell XY even for an object Zone.
+            // FocusOn6D2420 copies the coordinate; Team+80 completes now,
+            // independently of the camera's progress. No House/first gate.
+            34 => {
+                let coord = self
+                    .team_script_vm
+                    .teams
+                    .get(&team_id)
+                    .and_then(|team| team.zone)
+                    .and_then(|zone| self.team_target_coord(zone));
+                if let (Some(coord), Some(terrain)) = (coord, self.resolved_terrain.as_ref()) {
+                    let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+                    let ground =
+                        crate::sim::movement::ground_pose::query_ground_height(&cells, coord)
+                            .expect("authored camera ground query requires a valid native slope");
+                    let cell = cells.lookup_world(coord.x, coord.y);
+                    let on_bridge = cells.flags(cell) & 0x100 != 0
+                        || cells.flags(cells.lookup_world(coord.x, coord.y)) & 0x400 != 0;
+                    let z = crate::sim::movement::ground_pose::z_at_height(ground, 0, on_bridge);
+                    self.publish_trigger_effects(vec![
+                        crate::sim::trigger_runtime::TriggerEffect::CameraAtCoord {
+                            coord: [coord.x, coord.y, z],
+                            velocity: Some(action.argument),
+                        },
+                    ]);
+                }
+                if let Some(team) = self.team_script_vm.teams.get_mut(&team_id) {
+                    team.advance_pending = true;
+                }
+            }
             37 => {
-                //Steam3e81a617:6E954D..6E957A caches Foot+5D8 before
+                //Steam gamemd:6E954D..6E957A caches Foot+5D8 before
                 //vtD4 Limbo and vtF8 UnInit, then marks+80 to advance.
                 //Neither direct deletion nor a damage/RecordKill path is
                 //this action's call. Reuse the complete class lifecycle.
-                let context = crate::sim::world::UninitContext::new(Some(rules), registry)
+                let context = crate::sim::world::UninitContext::new(rules, registry)
                     .with_effects(frame_effects);
                 let mut member = self
                     .team_script_vm
@@ -436,7 +473,7 @@ impl Simulation {
                         .get(&team_id)
                         .and_then(|team| team.next_member_after(current));
                     if self.foot_enter_nearest_occupiable(current, rules, registry, frame_effects) {
-                        self.team_remove_member(team_id, current, true, Some(rules), frame_effects);
+                        self.team_remove_member(team_id, current, true, rules, frame_effects);
                     }
                     member = next;
                 }
@@ -444,12 +481,20 @@ impl Simulation {
                     team.advance_pending = true;
                 }
             }
-            // Steam3e81a617: Script39 at6E9BA1 and Script40 at6E9BBE
-            // call SetLocal689910(argument, true/false), respectively,
-            // then team+80=1 even if the variable index was rejected. The
-            // existing trigger owner keeps dirty admission and timer resets.
-            39 | 40 => {
-                self.set_trigger_variable(false, action.argument, action.action_id == 39);
+            // Retail TeamClass::AI6E9140's active table6E9F74 sends
+            // Script12/38 to6E982B/6E9530 -> SetGlobal689670;39/40 at
+            //6E9BA1/6E9BBE call SetLocal689910. All complete Team+80
+            // even for a rejected or unchanged value. The shared trigger
+            // owner retains dirty admission, linked timers and RNG order.
+            12 | 38 | 39 | 40 => {
+                Self::set_trigger_variable(
+                    &self.session,
+                    &mut self.scenario_rng,
+                    &mut self.trigger_runtime,
+                    matches!(action.action_id, 12 | 38),
+                    action.argument,
+                    matches!(action.action_id, 12 | 39),
+                );
                 if let Some(team) = self.team_script_vm.teams.get_mut(&team_id) {
                     team.advance_pending = true;
                 }
@@ -493,7 +538,7 @@ impl Simulation {
                     team.advance_pending = true;
                 }
             }
-            // Steam gamemd3e81a617: Script20 at6E9683..6E96BC caches
+            // Steam gamemd: Script20 at6E9683..6E96BC caches
             // Foot+5D8 before each ChangeOwner(vt+3D4), resolving the
             // Country through502D30 for every member, then sets Team+80.
             // The class owner can unlink a transferred member; neither
@@ -560,7 +605,50 @@ impl Simulation {
                     team.advance_pending = true;
                 }
             }
-            // Original gamemd1cdd1180,6E9FEC ->6E99E1..6E99FD
+            // `TeamClass::AI` case 25 (`0x006E9901..0x006E9912`): PlayAtPos
+            // `0x00750920` of the raw argument, centred (`0x2000`), volume
+            // 1.0, no handle, then Team+80=1. The argument is a SOUNDMD
+            // ordinal the process catalog resolves.
+            25 => {
+                self.sound_events
+                    .emit(crate::sim::world::SimSoundEvent::VocCenteredIndex {
+                        index: action.argument,
+                    });
+                frame_effects.flush_sound(self, rules);
+                if let Some(team) = self.team_script_vm.teams.get_mut(&team_id) {
+                    team.advance_pending = true;
+                }
+            }
+            // Case 26 (`0x006E9921..0x006E992F`): the full-screen movie
+            // `0x005BF260(argument, -1, 1, 1, 1)`, then Team+80=1. Trigger
+            // action 10 makes the same call inside a bracket this case skips:
+            // mouse hide/show, `0x006842F0` display mode and the `0x0072DDB0`
+            // shell surfaces. VERA's one movie owner presents both alike
+            // (presentation only).
+            26 => {
+                self.publish_trigger_effects(vec![
+                    crate::sim::trigger_runtime::TriggerEffect::FullscreenMovie {
+                        index: action.argument,
+                    },
+                ]);
+                if let Some(team) = self.team_script_vm.teams.get_mut(&team_id) {
+                    team.advance_pending = true;
+                }
+            }
+            // Case 27 (`0x006E993E..0x006E9949`): Theme Queue_Song
+            // `0x00720B20` of the argument, then Team+80=1. Trigger action
+            // 20's ordinal form takes the same Theme request.
+            27 => {
+                self.publish_trigger_effects(vec![
+                    crate::sim::trigger_runtime::TriggerEffect::MusicTheme {
+                        request: crate::sim::trigger_runtime::ThemeRequest::Index(action.argument),
+                    },
+                ]);
+                if let Some(team) = self.team_script_vm.teams.get_mut(&team_id) {
+                    team.advance_pending = true;
+                }
+            }
+            // Original gamemd,6E9FEC ->6E99E1..6E99FD
             // (tools/native_inspect): House+250=4, then Team+80=1.
             // Argument/first are unused; the existing House Strategy timer
             // decides when FireSale/Hunt runs. No direct RNG/timer/detach.
@@ -577,7 +665,13 @@ impl Simulation {
                     team.advance_pending = true;
                 }
             }
-            43 => self.team_action_wait_until_loaded(team_id, rules),
+            43 => Self::team_action_wait_until_loaded(
+                &self.interner,
+                &self.substrate,
+                &mut self.team_script_vm,
+                team_id,
+                rules,
+            ),
             46 => self.team_action_attack_enemy_building(
                 team_id,
                 action.argument,
@@ -669,7 +763,7 @@ impl Simulation {
                         _ => self.foot_enter_battle_bunker(member, rules, registry, frame_effects),
                     };
                     if found {
-                        self.team_remove_member(team_id, member, true, Some(rules), frame_effects);
+                        self.team_remove_member(team_id, member, true, rules, frame_effects);
                     }
                 }
                 if let Some(team) = self.team_script_vm.teams.get_mut(&team_id) {
@@ -794,7 +888,7 @@ impl Simulation {
     /// keeps the action pending; otherwise low16(argument<<13) is compared
     /// with PrimaryFacing::Current and a differing direction goes through
     /// ILocomotion+4C. Completion waits for moving, not the facing timer.
-    /// Native Steam gamemd3e81a617..08600; tools/team_recruit_oracle.py
+    /// Native Steam gamemd; tools/team_recruit_oracle.py
     /// --force-facing. Missing locomotors fault natively; Rust retains the
     /// pending action and reports the invalid state instead.
     fn team_action_force_facing(
@@ -843,7 +937,7 @@ impl Simulation {
     /// target; it does not immediately return to the waypoint in that visit.
     /// Object focus uses CoordinateAttack; Cell/NULL uses CoordinateMove.
     /// No RNG draw, timer write or detach in the handler; its shared setters
-    /// retain member/radio/target cleanup. Steam gamemd3e81a617..08600;
+    /// retain member/radio/target cleanup. Steam gamemd;
     /// original instructions and reader, tools/team_recruit_oracle.py --patrol.
     /// Invalid modded periods whose IDIV faults natively skip scanning here
     /// with an error, retaining normal movement. This safety policy does not
@@ -1148,20 +1242,27 @@ impl Simulation {
     /// member (`0x006E953E`); it reads no other member state. The two retail
     /// Ivan teams (an HTK and three Crazy Ivans) never fill its five seats,
     /// so they wait here for good.
-    fn team_action_wait_until_loaded(&mut self, team_id: u64, rules: &RuleSet) {
-        let Some(team) = self.team_script_vm.teams.get(&team_id) else {
+    fn team_action_wait_until_loaded(
+        interner: &StringInterner,
+        substrate: &ObjectSubstrate,
+        team_script_vm: &mut TeamScriptVm,
+        team_id: u64,
+        rules: &RuleSet,
+    ) {
+        let Some(team) = team_script_vm.teams.get(&team_id) else {
             return;
         };
         let loading = team.members().any(|member| {
-            self.substrate.entities.get(member).is_some_and(|entity| {
-                self.object_type(entity.type_ref(), rules)
+            substrate.entities.get(member).is_some_and(|entity| {
+                interner
+                    .object_type(entity.type_ref(), rules)
                     .is_some_and(|object| {
                         i64::from(object.passengers)
                             > i64::from(entity.passenger_role.passenger_count())
                     })
             })
         });
-        if !loading && let Some(team) = self.team_script_vm.teams.get_mut(&team_id) {
+        if !loading && let Some(team) = team_script_vm.teams.get_mut(&team_id) {
             team.advance_pending = true;
         }
     }
@@ -1257,7 +1358,7 @@ impl Simulation {
                 continue;
             }
             if transport && returns {
-                self.team_remove_member(team_id, member, false, Some(rules), frame_effects);
+                self.team_remove_member(team_id, member, false, rules, frame_effects);
                 self.team_member_clear_target(member, rules);
                 let archive = self
                     .substrate
@@ -1272,7 +1373,7 @@ impl Simulation {
             } else if (transport && matches!(argument, 2 | 3))
                 || (!transport && matches!(argument, 1 | 3))
             {
-                self.team_remove_member(team_id, member, false, Some(rules), frame_effects);
+                self.team_remove_member(team_id, member, false, rules, frame_effects);
                 self.team_member_clear_target(member, rules);
                 self.team_member_set_destination(member, None, rules, registry, frame_effects);
             }
@@ -1345,7 +1446,7 @@ impl Simulation {
                 if unloading {
                     continue;
                 }
-                self.foot_mark_remove(member, Some(rules), registry, frame_effects);
+                self.foot_mark_remove(member, rules, registry, frame_effects);
                 let placeable = crate::sim::build_site::can_place_building_at(
                     self, rules, registry, building, cell, None, None, None,
                 );
@@ -1360,7 +1461,7 @@ impl Simulation {
                         frame_effects,
                     );
                 }
-                self.foot_mark_put(member, Some(rules), registry, frame_effects);
+                self.foot_mark_put(member, rules, registry, frame_effects);
                 if placeable {
                     self.team_member_set_destination(member, None, rules, registry, frame_effects);
                     self.team_member_clear_target(member, rules);
@@ -1662,7 +1763,7 @@ impl Simulation {
     /// mission target unless it had moved off it; a cell target off the
     /// playfield (`0x00578540`) sets leaving-map and clears every member's
     /// destination, one on it clears leaving-map.
-    pub(super) fn team_assign_mission_target(
+    pub(crate) fn team_assign_mission_target(
         &mut self,
         team_id: u64,
         target: Option<TeamTarget>,
@@ -2021,8 +2122,7 @@ impl Simulation {
     /// Later visits retain that target. An absent target or wholly spent
     /// team clears it and finishes; otherwise the existing CoordinateAttack
     /// owner orders the members. No RNG or timer write in this handler.
-    /// Source: original6EC9A0..6ECA64 and6E9605..6E961D in Steam gamemd.exe
-    /// (SHA-256 3e81a617..08600).
+    /// Source: original6EC9A0..6ECA64 and6E9605..6E961D in Steam gamemd.exe.
     /// Terrain targets and retained Dummy identity remain the existing
     /// TeamTarget residuals; ALL01 Nuke_Repair's waypoint364 names a Building.
     fn team_action_attack_waypoint(
@@ -2088,7 +2188,7 @@ impl Simulation {
     /// visits retain the target without another waypoint query. Target plus
     /// any unlimited/positive-ammo member invokes the sole CoordinateAttack;
     /// otherwise AssignMissionTarget(NULL) and +80 advance, in that order.
-    /// Steam3e81a617..08600, original6ECA70..6ECB45 instructions and
+    /// Steam gamemd, original6ECA70..6ECB45 instructions and
     /// team_attack_waypoint_building's bounded control corpus.
     fn team_action_attack_waypoint_building(
         &mut self,
@@ -2485,7 +2585,7 @@ impl Simulation {
                     self,
                     member,
                     crate::sim::radio::RadioMessage::Break,
-                    Some(rules),
+                    rules,
                     frame_effects,
                 );
                 self.team_member_queue_mission(member, MissionType::Attack, rules);

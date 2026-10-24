@@ -15,7 +15,10 @@ mod popups;
 pub(crate) use channels::*;
 pub(crate) use popups::*;
 
-use crate::ui::lan_shell::{LanChatState, LanEditKey, LanListState, apply_chat_length_limit};
+use crate::ui::lan_shell::{
+    LanChatState, LanEditKey, LanListState, PlayerNameMatch, apply_chat_length_limit,
+    saved_player_name_matches,
+};
 use crate::ui::shell::button::ShellButtonInteraction;
 use crate::ui::shell::descriptor::{AnchorRule, DialogId};
 use crate::ui::shell::geom::{RectPx, SHELL_BASE_H, SHELL_BASE_W, ShellScale};
@@ -108,7 +111,7 @@ pub(crate) const IMAGE_BUTTONS: [(u16, &str, &str); 5] = [
 ];
 
 /// Every PCX the lobby's children and list columns draw.
-pub(crate) const PCX_FILES: [&str; 19] = [
+pub(crate) const PCX_FILES: [&str; 40] = [
     "wodact.pcx",
     "wouact.pcx",
     "wouref.pcx",
@@ -128,6 +131,27 @@ pub(crate) const PCX_FILES: [&str; 19] = [
     "wolob.pcx",
     "woloper.pcx",
     "wolvoice.pcx",
+    "number0.pcx",
+    "number1.pcx",
+    "number2.pcx",
+    "number3.pcx",
+    "number4.pcx",
+    "number5.pcx",
+    "number6.pcx",
+    "number7.pcx",
+    "number8.pcx",
+    "number9.pcx",
+    "cooperat.pcx",
+    "comchief.pcx",
+    "stargen.pcx",
+    "general.pcx",
+    "briggenr.pcx",
+    "colonel.pcx",
+    "major.pcx",
+    "lieutena.pcx",
+    "sergeant.pcx",
+    "corporal.pcx",
+    "private.pcx",
 ];
 
 /// List column stops (`0x4A6` at `0x497`): the game list's name column
@@ -144,6 +168,12 @@ pub(crate) const PLAYER_NAME_X: i32 = 0x4E;
 pub(crate) const PLAYER_NAME_W: i32 = 0xA2;
 pub(crate) const PLAYER_ICON_X: i32 = 2;
 pub(crate) const PLAYER_CLAN_X: i32 = 0xAA;
+/// The player list's high-score cells: the rank's hundreds, tens and ones
+/// digits, the co-op image and the badge; and the ladder rank's text.
+pub(crate) const PLAYER_DIGIT_X: [i32; 3] = [0x12, 0x1A, 0x22];
+pub(crate) const PLAYER_COOP_X: i32 = 0x2C;
+pub(crate) const PLAYER_BADGE_X: i32 = 0x3D;
+pub(crate) const PLAYER_RANK_X: i32 = 0xF0;
 
 /// Executed `0x6040B0` help of `0x113`. The lists answer through `0x4E9`
 /// instead (`0x00780E30`, `0x00781090`); the app adapter builds those.
@@ -319,11 +349,87 @@ pub(crate) struct WolPlayerRow {
     pub(crate) icon: Option<(&'static str, &'static str)>,
     /// `"[%hs]"` of the tag, with the clan name as its tooltip.
     pub(crate) clan: Option<(String, String)>,
+    /// `"%d"` of the ladder rank, when the ladder table holds the user.
+    pub(crate) rank: Option<String>,
+    /// The high-score record's images and their x, when the high-score
+    /// table holds the user.
+    pub(crate) score_icons: Vec<(&'static str, i32)>,
+}
+
+/// A high-score record's fields the player list reads (`+0x0C` points,
+/// `+0x10` rank, `+0x14` co-op campaigns), compared unsigned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlayerScore {
+    pub(crate) points: u32,
+    pub(crate) rank: u32,
+    pub(crate) coop: u32,
+}
+
+/// `0x00783B80`: the badge of the high-score points.
+fn badge(points: u32) -> &'static str {
+    match points {
+        2001.. => "comchief.pcx",
+        1501.. => "stargen.pcx",
+        1001.. => "general.pcx",
+        501.. => "briggenr.pcx",
+        251.. => "colonel.pcx",
+        151.. => "major.pcx",
+        81.. => "lieutena.pcx",
+        61.. => "sergeant.pcx",
+        32.. => "corporal.pcx",
+        _ => "private.pcx",
+    }
+}
+
+/// `0x00783C80`'s high-score cells (`0x007845A8..0x007847F0`): the rank's
+/// digits (`0x00783A90`, `number<d>.pcx`) for a rank below 1000, hundreds
+/// from 100 and tens from 10; `cooperat.pcx` once the co-op bits hold every
+/// one of the `campaigns` CoopCampMD campaigns (`0x0049E4F0`); the badge.
+pub(crate) fn score_icons(score: PlayerScore, campaigns: u32) -> Vec<(&'static str, i32)> {
+    const DIGITS: [&str; 10] = [
+        "number0.pcx",
+        "number1.pcx",
+        "number2.pcx",
+        "number3.pcx",
+        "number4.pcx",
+        "number5.pcx",
+        "number6.pcx",
+        "number7.pcx",
+        "number8.pcx",
+        "number9.pcx",
+    ];
+    let rank = score.rank;
+    let mut icons = Vec::with_capacity(5);
+    if rank < 1000 {
+        for (x, (from, digit)) in PLAYER_DIGIT_X.into_iter().zip([
+            (100, rank / 100),
+            (10, rank / 10 % 10),
+            (1, rank % 10),
+        ]) {
+            if rank >= from {
+                icons.push((DIGITS[digit as usize], x));
+            }
+        }
+    }
+    let mask = 1u32.wrapping_shl(campaigns).wrapping_sub(1);
+    if campaigns > 0 && score.coop & mask == mask {
+        icons.push(("cooperat.pcx", PLAYER_COOP_X));
+    }
+    icons.push((badge(score.points), PLAYER_BADGE_X));
+    icons
 }
 
 impl WolPlayerRow {
-    pub(crate) fn from_member(member: &WolMember) -> Self {
+    /// `rank` is the ladder record's rank; `score_icons` come from
+    /// [`score_icons`].
+    pub(crate) fn from_member(
+        member: &WolMember,
+        rank: Option<i32>,
+        score_icons: Vec<(&'static str, i32)>,
+    ) -> Self {
         Self {
+            rank: rank.map(|rank| rank.to_string()),
+            score_icons,
             name: member.name.clone(),
             icon: if member.flags & MEMBER_OPERATOR != 0 {
                 Some(("woloper.pcx", "TXT_OPER"))
@@ -361,8 +467,10 @@ pub(crate) enum WolLobbyAction {
     ObserverChanged(bool),
     /// `0x61F`: WOL Options `0x2BC`.
     Options,
-    /// Buddy List, Clan, Tournament, News and Page run dialogs or web pages
-    /// that are later chains.
+    /// `0x5C2`: the page dialog `0xCF` (`0x0078BA3E`).
+    Page,
+    /// Buddy List, Clan, Tournament and News run dialogs or web pages that
+    /// are later chains.
     Unported(u16),
     Popup(WolPopupAction),
 }
@@ -559,10 +667,29 @@ impl WolLobbyState {
         self.lobby_list.hot_row = None;
     }
 
-    /// `0x00783C80`: a reset list keeps only its top index.
+    /// WOL `0x00783C80` saves selected names before `LB_RESETCONTENT` and
+    /// restores every matching new row afterward (`0x005E5F10` / `0x005E6230`).
     pub(crate) fn replace_players(&mut self, rows: Vec<WolPlayerRow>) {
+        let mut selected_rows = self.selected_players.clone();
+        selected_rows.sort_unstable();
+        selected_rows.dedup();
+        let selected_names = selected_rows
+            .into_iter()
+            .filter_map(|index| self.player_rows.get(index))
+            .map(|row| row.name.clone())
+            .collect::<Vec<_>>();
         self.player_rows = rows;
-        self.selected_players.clear();
+        self.selected_players = self
+            .player_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                selected_names
+                    .iter()
+                    .any(|name| saved_player_name_matches(name, &row.name, PlayerNameMatch::Exact))
+                    .then_some(index)
+            })
+            .collect();
         self.player_list.hot_row = None;
     }
 
@@ -634,7 +761,8 @@ impl WolLobbyState {
                 WolLobbyAction::ObserverChanged(self.observer)
             }
             OPTIONS => WolLobbyAction::Options,
-            BUDDY | CLAN | TOURNAMENT | NEWS | PAGE_BUTTON => WolLobbyAction::Unported(control),
+            PAGE_BUTTON => WolLobbyAction::Page,
+            BUDDY | CLAN | TOURNAMENT | NEWS => WolLobbyAction::Unported(control),
             _ => return None,
         })
     }
@@ -728,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn refills_find_the_selection_by_name_and_reset_player_selection() {
+    fn refills_find_game_and_private_player_selections_by_name() {
         let row = |name: &str| WolGameRow {
             record: 0,
             name: name.into(),
@@ -751,14 +879,28 @@ mod tests {
             name: name.into(),
             icon: None,
             clan: None,
+            rank: None,
+            score_icons: Vec::new(),
         };
         lobby.replace_players(vec![player("x"), player("y"), player("z")]);
         lobby.toggle_player(2);
         lobby.toggle_player(0);
         assert_eq!(lobby.private_targets(), ["x", "z"]);
-        lobby.toggle_player(0);
-        assert_eq!(lobby.private_targets(), ["z"]);
-        lobby.replace_players(vec![player("x")]);
+        lobby.replace_players(vec![
+            player("z"),
+            player("x"),
+            player("x"),
+            player("X"),
+            player("y"),
+        ]);
+        assert_eq!(lobby.selected_players, [0, 1, 2]);
+        assert_eq!(lobby.private_targets(), ["z", "x", "x"]);
+
+        lobby.replace_players(vec![player("x"), player("y")]);
+        assert_eq!(lobby.selected_players, [0]);
+        assert_eq!(lobby.private_targets(), ["x"]);
+
+        lobby.replace_players(vec![player("y")]);
         assert!(lobby.private_targets().is_empty());
     }
 
@@ -785,5 +927,39 @@ mod tests {
             lobby.activate(OBSERVER_IMAGE),
             Some(WolLobbyAction::ObserverChanged(true))
         );
+    }
+
+    #[test]
+    fn score_icons_show_rank_digits_co_op_and_badge() {
+        let score = |points, rank, coop| PlayerScore { points, rank, coop };
+        assert_eq!(
+            score_icons(score(1520, 7, 0), 4),
+            [("number7.pcx", 0x22), ("stargen.pcx", 0x3D)]
+        );
+        assert_eq!(
+            score_icons(score(90, 123, 0xF), 4),
+            [
+                ("number1.pcx", 0x12),
+                ("number2.pcx", 0x1A),
+                ("number3.pcx", 0x22),
+                ("cooperat.pcx", 0x2C),
+                ("lieutena.pcx", 0x3D),
+            ]
+        );
+        // Rank 40 has no hundreds digit; three of four campaigns is no co-op.
+        assert_eq!(
+            score_icons(score(31, 40, 0x7), 4),
+            [
+                ("number4.pcx", 0x1A),
+                ("number0.pcx", 0x22),
+                ("private.pcx", 0x3D),
+            ]
+        );
+        // Rank 0 or 1000 shows no digits; points compare unsigned.
+        assert_eq!(
+            score_icons(score(u32::MAX, 0, 0), 0),
+            [("comchief.pcx", 0x3D)]
+        );
+        assert_eq!(score_icons(score(32, 1000, 0), 4), [("corporal.pcx", 0x3D)]);
     }
 }

@@ -1,7 +1,7 @@
 <img src="docs/images/new-conscirpt-hero-image.png" alt="VERA20K huvudbild" width="100%">
 
 <p align="center" dir="ltr">
-  <strong>Svenska</strong> · <a href="README.zh-CN.md" lang="zh-CN">简体中文</a> · <a href="README.de.md" lang="de">Deutsch</a> · <a href="README.ar.md" lang="ar" dir="rtl">العربية</a> · <a href="README.ru.md" lang="ru">Русский</a> · <a href="README.th.md" lang="th">ไทย</a> · <a href="README.tr.md" lang="tr">Türkçe</a> · <a href="README.md" lang="en">English</a>
+  <strong>Svenska</strong> · <a href="README.zh-CN.md" lang="zh-CN">简体中文</a> · <a href="README.de.md" lang="de">Deutsch</a> · <a href="README.ar.md" lang="ar" dir="rtl">العربية</a> · <a href="README.es.md" lang="es">Español</a> · <a href="README.ru.md" lang="ru">Русский</a> · <a href="README.th.md" lang="th">ไทย</a> · <a href="README.tr.md" lang="tr">Türkçe</a> · <a href="README.md" lang="en">English</a>
 </p>
 <p align="center" dir="ltr">
   <a href="https://github.com/YuriPlanet/vera20k/actions/workflows/macos.yml?query=branch%3Amain" title="Senaste körningen av bibliotekstesterna för macOS (startas manuellt)"><img src="https://github.com/YuriPlanet/vera20k/actions/workflows/macos.yml/badge.svg?branch=main" alt="Bibliotekstester för macOS" height="23" align="middle"></a>
@@ -40,6 +40,38 @@ ska gå.
 - **Flerspelarläge:** Nätverksspel är ännu inte tillgängligt.
 - **Skala:** Slag med 30 spelare och 20 000 enheter har ännu inte demonstrerats.
 
+## Ladda ner och spela
+
+Ladda ner installationsprogrammet för Windows, macOS eller Linux från
+[releasesidan](https://github.com/YuriPlanet/vera20k/releases). Det hittar ditt Yuri's Revenge från
+[Steam](https://store.steampowered.com/app/2229850/) eller
+[EA-appen](https://www.ea.com/games/command-and-conquer/command-and-conquer-the-ultimate-collection)
+och installerar VERA20K i en ny mapp. Dit hamnar även moddar och nytt innehåll framöver, så spelets
+egna filer ändras aldrig.
+
+För att starta skirmish-matcher eller kampanjer i YR för en spelare från en CnCNet-klient, se
+[installationen av offlineklienten](integrations/cncnet/README.md).
+
+## Inställningar
+
+Använd **Options** för ljud och kontroller och **Vera Options** för VERA-specifika funktioner.
+Spelarinställningar, kortkommandon och lobbyval sparas i `VERA.INI`:
+
+- **Windows-installationsprogrammet:** bredvid `vera20k.exe`.
+- **macOS:** `~/Library/Application Support/VERA20k/VERA.INI`.
+- **Linux:** `~/.local/share/VERA20k/VERA.INI` eller i din XDG-datamapp.
+
+I `config.toml` anger du spelmappen och kan välja en annan inställningsmapp.
+
+Om `VERA.INI` saknas skapar VERA filen och importerar befintliga inställningar en gång.
+Om det inte finns några gamla inställningar börjar filen tom och VERA använder inbyggda
+standardvärden tills inställningar sparas. Originalfilerna `RA2MD.INI` och `KeyboardMD.ini`
+läses bara vid import och skrivs aldrig över.
+
+`VERARULES.INI` i samma mapp innehåller valfria ändringar av spelreglerna. Filen innehåller från
+början bortkommenterade exempel och låter uppdrags- och kartregler styra. Se
+[personliga regler](docs/personal-rules.md) för hur du redigerar och åsidosätter dem.
+
 ## Arkitektur
 
 Motorn har tre huvuddelar:
@@ -59,13 +91,11 @@ Pilarna visar dataflödet:
 
 Du behöver:
 
-- **Spelet:** Red Alert 2: Yuri's Revenge.
-- **Rust och Git:** den senaste stabila versionen av [Rust](https://rustup.rs/), installerad med
-  rustup, och [Git](https://git-scm.com/).
+- **Rust och Git:** [Rust](https://rustup.rs/) 1.97 eller senare, installerad med rustup, och
+  [Git](https://git-scm.com/).
 - **Byggverktyg:** på Windows Visual Studios C++-byggverktyg, som Rusts installationsprogram
   erbjuder sig att installera; på macOS `xcode-select --install`; på Debian och Ubuntu
   `sudo apt install build-essential libasound2-dev pkg-config`.
-- **Grafik:** ett grafikkort med Vulkan, DirectX 12 eller Metal.
 
 VERA20K har spelats på Windows, Linux och macOS.
 
@@ -77,6 +107,8 @@ cp config.toml.example config.toml
 cargo run --release --bin vera20k
 ```
 
+Bygget skriver flera GB till `target/`.
+
 ## Så arbetar vi
 
 Större delen av koden skrivs av AI-agenter. De använder Ghidra för att studera originalmotorn,
@@ -86,14 +118,24 @@ portar sedan dess beteende till Rust och kontrollerar det med
 
 ## Anpassning
 
-Valfria funktioner (t.ex. från Ares) ska kunna konfigureras via INI-filer, med möjlighet
-att slå på och av dem i klienten där det är lämpligt.
+VERA20K fungerar som standard precis som originalspelet. Varje ny funktion, även tillägg från
+moddar som Ares, måste vara avstängd tills den slås på med något av följande:
+
+- **En spelarinställning i VERA**, under **Options → Vera Options**, som sparas i avsnittet `[VERA]` i `VERA.INI`.
+- **Ett byggalternativ**, till exempel `--features ares` för de [Ares-tillägg](docs/ares.md) som stöds.
+- **Ett lobbyalternativ i spelet**, som väljs för varje match.
+- **En INI-nyckel**, som sätts av en mod eller en karta.
+
+Inställningar för ljud, grafik och kontroller sparas i `VERA.INI`. Spelreglerna kommer från
+lobbyinställningar, moddar eller kartor.
 
 ## Bidra
 
 All hjälp är välkommen. Du kan skriva kod, refaktorera motorn, testa spelet, dela idéer eller
 spela det sida vid sida med originalet och berätta vad som känns fel. Öppna en PR så tar vi det
-därifrån. Diskussionen sker på [Discord](https://discord.gg/kmjRUn5m5F) och i QQ-gruppen (1097193563).
+därifrån.
+
+Diskussionen sker på [Discord](https://discord.gg/kmjRUn5m5F) och i QQ-gruppen (1097193563).
 
 ## Stöd projektet
 

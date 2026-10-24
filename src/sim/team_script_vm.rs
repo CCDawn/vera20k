@@ -720,7 +720,7 @@ impl TeamScriptState {
     /// The unit choosers' filter (`0x004FEC20..0x004FEC47`): a team still
     /// wants members while its TeamType is `Reinforce=` and it is not full
     /// (`+0x79`), or while it is neither forced (`+0x77`, which only
-    /// reinforcements set: none is ported) nor has been full (`+0x78`).
+    /// reinforcements set: `reinforcements.rs`) nor has been full (`+0x78`).
     pub(crate) const fn wants_members(&self, reinforce: bool) -> bool {
         (reinforce && !self.full_strength) || (!self.forced_active && !self.has_been_full)
     }
@@ -896,7 +896,7 @@ impl TeamScriptVm {
     }
 
     /// TeamType6F1F70: first live registry entry of this exact type, without
-    /// owner, member, formed, health or limbo filtering. Steam3e81a617.
+    /// owner, member, formed, health or limbo filtering. Steam gamemd.
     pub(crate) fn first_team_of_type(&self, id: InternedId) -> Option<&TeamScriptState> {
         self.teams_in_order()
             .find(|team| team.team_type_id() == Some(id))
@@ -1190,12 +1190,28 @@ impl TeamScriptVm {
     /// gamemd.exe Detach70D554..70D57B walks the live Team roster after the Techno
     /// sweep, clearing only matching +3C/+40. Unlike AssignMissionTarget
     /// 6E9050, it issues no member orders and preserves zone/membership.
-    pub(crate) fn detach_target(&mut self, target: TeamTarget) {
+    pub(crate) fn detach_target(
+        &mut self,
+        target: TeamTarget,
+        terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
+    ) {
+        //70D562/70D577 compare Cell pointers too: fixed-stride aliases and
+        //different requests for the shared Dummy identify the same allocation.
+        let matches = |held: TeamTarget| {
+            if let (TeamTarget::Cell { .. }, TeamTarget::Cell { .. }, Some(terrain)) =
+                (held, target, terrain)
+            {
+                held.target_kind().cell_identity(terrain)
+                    == target.target_kind().cell_identity(terrain)
+            } else {
+                held == target
+            }
+        };
         for team in self.teams.values_mut().rev() {
-            if team.mission_target == Some(target) {
+            if team.mission_target.is_some_and(matches) {
                 team.mission_target = None;
             }
-            if team.focus == Some(target) {
+            if team.focus.is_some_and(matches) {
                 team.focus = None;
             }
         }
@@ -1591,6 +1607,8 @@ mod oracle_tests;
 mod path_threat_input_tests;
 #[cfg(test)]
 mod recruit_oracle_tests;
+#[cfg(test)]
+mod group_recruitment_tests;
 #[cfg(test)]
 pub(crate) mod reinforcements_tests;
 

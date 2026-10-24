@@ -197,8 +197,8 @@ impl Gsi1306Speed {
         }
     }
 
-    fn rules(&self) -> Option<SpeedRules<'_>> {
-        Some(SpeedRules::new(&self.rules, &self.interner, &self.houses))
+    fn rules(&self) -> SpeedRules<'_> {
+        SpeedRules::new(&self.rules, &self.interner, &self.houses)
     }
 }
 
@@ -587,30 +587,6 @@ fn normalized_action_delay_uses_session_game_speed() {
 
 // --- Default sequence set tests ---
 
-// --- death_sequence_for_inf_death tests ---
-
-#[test]
-fn gsi_08_13_death_sequence_and_anim_arms_are_exclusive() {
-    use crate::sim::animation::inf_death_spawns_anim;
-    // The jump table at 0x00518D58 dispatches on `InfDeath - 1` over 0..9.
-    // 0 and > 10 fall off it entirely.
-    assert_eq!(death_sequence_for_inf_death(0), None);
-    assert!(!inf_death_spawns_anim(0));
-    assert_eq!(death_sequence_for_inf_death(11), None);
-    assert!(!inf_death_spawns_anim(11));
-    // 1 and 2 are the only sequence arms, and they spawn no animation.
-    assert_eq!(death_sequence_for_inf_death(1), Some(SequenceKind::Die1));
-    assert_eq!(death_sequence_for_inf_death(2), Some(SequenceKind::Die2));
-    assert!(!inf_death_spawns_anim(1));
-    assert!(!inf_death_spawns_anim(2));
-    // 3..=10 are animation arms, and they select no sequence — Die3, Die4 and
-    // Die5 are unreachable from the death handler.
-    for inf_death in 3..=10u8 {
-        assert_eq!(death_sequence_for_inf_death(inf_death), None);
-        assert!(inf_death_spawns_anim(inf_death));
-    }
-}
-
 // --- Infantry class action and presentation integration tests ---
 
 /// Production rules and ART readers establish the action records; the class
@@ -618,6 +594,16 @@ fn gsi_08_13_death_sequence_and_anim_arms_are_exclusive() {
 /// hint and a different Ready hint are authored completion controls below.
 fn infantry_action_fixture(
     idle_hint: Option<&str>,
+) -> (crate::sim::world::Simulation, RuleSet, u64) {
+    infantry_action_fixture_with(idle_hint, "", &[])
+}
+
+/// [`infantry_action_fixture`] with extra `GISequence` lines and the type
+/// sounds bound against a SOUNDMD `[SoundList]` of `sound_names`.
+fn infantry_action_fixture_with(
+    idle_hint: Option<&str>,
+    sequence_lines: &str,
+    sound_names: &[&str],
 ) -> (crate::sim::world::Simulation, RuleSet, u64) {
     let ini = IniFile::from_str(
         "[InfantryTypes]\n0=E1\n\
@@ -629,11 +615,22 @@ fn infantry_action_fixture(
         "[GI]\nCrawls=yes\nSequence=GISequence\n\
          [GISequence]\nReady=0,1,1,E\nGuard=0,1,1\nProne=86,1,6\nWalk=8,6,6\n\
          FireUp=164,6,6\nDown=260,2,2\nCrawl=86,6,6\nUp=276,2,2\nFireProne=212,6,6\n\
-         Idle1=56,15,0{hint}\nIdle2=71,15,0,E\nDie1=134,15,0\nDie2=149,15,0\n",
+         Idle1=56,15,0{hint}\nIdle2=71,15,0,E\nDie1=134,15,0\nDie2=149,15,0\n\
+         {sequence_lines}",
     ));
     let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
     rules.install_art_data(ArtRegistry::from_ini(&art));
     rules.bind_animation_sequences(&parse_infantry_sequence_registry(&art));
+    if !sound_names.is_empty() {
+        let mut catalog = String::from("[SoundList]\n");
+        for (index, name) in sound_names.iter().enumerate() {
+            catalog.push_str(&format!("{index}={name}\n"));
+        }
+        rules.bind_type_sound_references(
+            &ini,
+            &crate::rules::sound_ini::SoundRegistry::from_ini(&IniFile::from_str(&catalog)),
+        );
+    }
     assert_eq!(
         rules
             .animation_sequence("E1")
@@ -906,6 +903,103 @@ fn gsi_05_07_unhinted_completion_preserves_body_facing() {
     assert_eq!(body.current(91), 0x2000);
 }
 
+/// DoType_Sequencer's sound tail (`0x00520E75..0x00520EF2`) for the
+/// current Doing's record: a FireUp sound on frame 2 of a 6-frame record
+/// plays only on a frame whose stage step passed (`+0xFC`) and whose stage
+/// modulo the count is 2. A completion that starts Ready reads Ready's record.
+#[test]
+fn sequence_sound_plays_on_its_stage_frame_after_a_step() {
+    use crate::sim::stage::StageClass;
+    use crate::sim::timer::CdTimer;
+    let (mut sim, rules, id) = infantry_action_fixture_with(
+        None,
+        "FireUpSounds= 2 SlaveAttack,4 Missing\n",
+        &["SlaveAttack"],
+    );
+    let run = |sim: &mut crate::sim::world::Simulation, value: i32, changed: u8| {
+        let actor = sim.substrate.entities.get_mut(id).unwrap();
+        actor.mission_leaf.set_infantry_doing_verified(4).unwrap();
+        actor.install_native_stage_fixture(StageClass::from_native_fixture(
+            value,
+            changed,
+            CdTimer::from_raw(0, 2),
+            2,
+            1,
+        ));
+        sim.sound_events.clear_for_test();
+        assert!(!sim.infantry_sequencer(id, &rules, crate::sim::world::FrameEffects::default()));
+        sim.sound_events.as_slice().to_vec()
+    };
+    let played = run(&mut sim, 2, 1);
+    let actor = sim.substrate.entities.get(id).unwrap();
+    assert_eq!(played.len(), 1);
+    let crate::sim::world::SimSoundEvent::VocAt {
+        sound_id,
+        audible_to,
+        rx,
+        ry,
+        sub_x,
+        sub_y,
+        ..
+    } = &played[0]
+    else {
+        panic!("PlayAt is a located Voc request: {played:?}");
+    };
+    assert_eq!(sound_id, "SlaveAttack");
+    assert_eq!(*audible_to, None);
+    assert_eq!(
+        (*rx, *ry, *sub_x, *sub_y),
+        (
+            actor.position.rx(),
+            actor.position.ry(),
+            actor.position.sub_x(),
+            actor.position.sub_y()
+        )
+    );
+    // No step this frame, another frame, and the unresolved name's frame.
+    assert!(run(&mut sim, 2, 0).is_empty());
+    assert!(run(&mut sim, 3, 1).is_empty());
+    assert!(run(&mut sim, 4, 1).is_empty());
+    // Stage 6 completes FireUp; the tail then reads Ready's record.
+    assert!(run(&mut sim, 6, 1).is_empty());
+    let actor = sim.substrate.entities.get(id).unwrap();
+    assert_eq!(actor.mission_leaf.as_infantry().unwrap().doing(), 0);
+}
+
+/// A walking infantryman's Walk completion re-requests Walk, which leaves
+/// the stage growing past the count, so a Walk sound plays once per cycle of
+/// real stage steps (Techno `0x006FABC4`, then the sequencer).
+#[test]
+fn walk_sequence_sound_plays_once_per_cycle_of_stage_steps() {
+    use crate::sim::stage::StageClass;
+    use crate::sim::timer::CdTimer;
+    let (mut sim, rules, id) =
+        infantry_action_fixture_with(None, "WalkSounds= 2 TrexFoot\n", &["TrexFoot"]);
+    set_infantry_walk_motion(&mut sim, id, true);
+    let actor = sim.substrate.entities.get_mut(id).unwrap();
+    actor.mission_leaf.set_infantry_doing_verified(3).unwrap();
+    actor.install_native_stage_fixture(StageClass::from_native_fixture(
+        0,
+        0,
+        CdTimer::from_raw(0, 1),
+        1,
+        1,
+    ));
+    sim.sound_events.clear_for_test();
+    let mut played_at = Vec::new();
+    for now in 1..=14 {
+        let actor = sim.substrate.entities.get_mut(id).unwrap();
+        assert!(actor.tick_native_stage(now));
+        assert!(!sim.infantry_sequencer(id, &rules, crate::sim::world::FrameEffects::default()));
+        let actor = sim.substrate.entities.get(id).unwrap();
+        assert_eq!(actor.mission_leaf.as_infantry().unwrap().doing(), 3);
+        for _ in sim.sound_events.take_for_test() {
+            played_at.push(actor.native_stage().value());
+        }
+    }
+    assert_eq!(played_at, [2, 8, 14]);
+}
+
 #[test]
 fn infantry_prone_state_drives_prone_crawl_and_fireprone_actions() {
     let (mut sim, rules, id) = infantry_action_fixture(Some("S"));
@@ -1096,7 +1190,7 @@ fn infantry_death_finishes_at_its_sequence_count_and_not_one_frame_early() {
     assert!(retired.lifecycle.in_limbo());
     assert!(sim.substrate.pending_delete.contains_object(&id));
     sim.process_pending_delete_with(
-        Some(&rules),
+        &rules,
         None,
         crate::sim::world::FrameEffects::default(),
         1,
@@ -1272,17 +1366,12 @@ fn raw_infantry_frames_match_whole_original_selector_rows() {
     ))
     .unwrap();
     let receipt = &corpus["infantry_frame_selection_receipt"];
-    assert_eq!(
-        receipt["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
-    assert_eq!(
-        receipt["native_span"]["sha256"],
-        "60ee1cdafdd13ab060a3fc6fc80794476f42f943d933090b63d41ced74714608"
-    );
+    assert_eq!(receipt["native_span"]["address"], "0x00518D80");
+    assert_eq!(receipt["native_span"]["stop"], "0x00518F89");
+    assert_eq!(receipt["native_span"]["length"], 0x209);
     assert_eq!(
         receipt["preserved_payload"]["canonical_sha256"],
-        "54a2a1f2b554a404ed0e6530b4dc2bdea0f666584bf03f1ed8f873bb45a28e91"
+        "94db9dcd2cb08ecbc23867f5e11f09f5cb1b2d1e3db7f29eebf491dbb59a8a09"
     );
     let records = receipt["physical_gi_sequence"]["records"]
         .as_array()

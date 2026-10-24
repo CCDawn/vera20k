@@ -54,7 +54,7 @@ impl PowerHealthSample {
 }
 
 /// Per-House power totals retained until native House+5778 is invalidated.
-/// Original gamemd.exe (SHA2561cdd1180e490...) exposes these same retained
+/// Original gamemd.exe exposes these same retained
 /// values through its IHouse interface, rather than reassessing on a query.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PowerState {
@@ -127,6 +127,13 @@ impl PowerState {
     /// The retained drain (House+53A8).
     pub fn total_drain(&self) -> i32 {
         self.total_drain
+    }
+
+    /// House::Update_Power_And_EVA5018DD..5018E1 adds retained drain
+    /// immediately; it neither clamps nor sets the assessment dirty byte.
+    pub(crate) fn add_building_drain(&mut self, drain: i32) {
+        self.total_drain = self.total_drain.wrapping_add(drain);
+        self.is_low_power = !self.retained_full_power();
     }
 
     /// House+577B.
@@ -399,6 +406,35 @@ pub(crate) fn native_building_power_drain(power: i32) -> i32 {
     if power < 0 { power.wrapping_neg() } else { 0 }
 }
 
+/// BuildingClass::GetPowerDrain44E880: both immediate House registration
+/// and the later assessment read this same live contribution. Health does
+/// not scale drain; a nonzero upgrade count admits all three type slots.
+pub(crate) fn building_power_drain(
+    entity: &GameEntity,
+    rules: &RuleSet,
+    interner: &crate::sim::intern::StringInterner,
+) -> i32 {
+    if entity.is_warped_out() || !entity.building_online() {
+        return 0;
+    }
+    let Some(object) = interner.object_type(entity.type_ref(), rules) else {
+        return 0;
+    };
+    let mut drain = native_building_power_drain(object.power);
+    if entity.gap_generator.supercharged() {
+        drain = drain.wrapping_add(object.extra_power.drain());
+    }
+    let upgrades = entity.building_upgrades();
+    if upgrades.count() != 0 {
+        for type_ref in upgrades.types().iter().flatten() {
+            if let Some(upgrade) = interner.object_type(*type_ref, rules) {
+                drain = drain.wrapping_add(native_building_power_drain(upgrade.power));
+            }
+        }
+    }
+    drain
+}
+
 /// The fields `BuildingClass::Is_Operational_For_Output` (vt+0x350,
 /// `0x004555D0`) reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -462,7 +498,8 @@ fn participates_in_power_accounting(entity: &GameEntity) -> bool {
 /// Building44E85F..44E86A multiplies native signed-health/live-Strength x87
 /// ratio by the signed output contribution and consumes _ftol's low EAX.
 /// Ratio-first PC53/chop arithmetic intentionally differs from integer division.
-/// Drain is always the full rated `|Power|` regardless of health.
+/// Drain is always the full rated `|Power|` regardless of health, plus a
+/// super-charged gap generator's negated `ExtraPower=`.
 ///
 /// `UnitAbsorb`/`InfantryAbsorb` buildings (e.g., Yuri Bio-Reactor) add
 /// `ExtraPower × OccupantCount` to their pre-scaled output when at least
@@ -495,26 +532,43 @@ fn recalculate_power_for_owner(
         // construction-state exclusion.
 
         // A building being warped out gives and takes nothing
-        // (GetPowerOutput `0x0044E7C7`, GetPowerDrain `0x0044E885`). The
-        // drain's online-latch test (`0x0044E88F`) adds nothing while the
-        // warp is the latch's only represented writer.
-        if entity.is_warped_out() {
+        // (GetPowerOutput `0x0044E7C7`, GetPowerDrain `0x0044E885`), nor
+        // does an offline one (Building+660): GetPowerDrain returns 0 before
+        // any addend (`0x0044E88F`), GetPowerOutput after summing a positive
+        // total (`0x0044E855`; a non-positive total is 0 anyway), and
+        // House508D1E's drained-source test repeats that zero output.
+        if entity.is_warped_out() || !entity.building_online() {
             continue;
         }
 
         // Numeric comparison corpus: tools/spatial_oracle/power_health.json.
-        // Still-open native lifecycle inputs: attached upgrade slots and
-        // House campaign registration. The independent Tesla weapon latch
-        // (+661) is not the power-output multiplier at +668.
+        // House campaign registration remains a separate lifecycle input.
+        // The independent Tesla weapon latch (+661) is not the power-output
+        // multiplier at +668.
         // Producer branch: base = max(Power, 0), plus ExtraPower × occupants
         // for InfantryAbsorb/UnitAbsorb buildings (gate is strict on all
         // three conditions, matching gamemd's GetPowerOutput).
         let mut output_contribution: i32 = obj.power.max(0);
-        if obj.absorbs_passengers() && obj.extra_power > 0 {
+        let extra_output = obj.extra_power.output();
+        if obj.absorbs_passengers() && extra_output > 0 {
             let occupants = entity.passenger_role.cargo().map_or(0, |c| c.count()) as i32;
             if occupants > 0 {
                 output_contribution =
-                    output_contribution.wrapping_add(obj.extra_power.wrapping_mul(occupants));
+                    output_contribution.wrapping_add(extra_output.wrapping_mul(occupants));
+            }
+        }
+        // Original44E826..44E84D and44E8B5..44E8DA (Steam gamemd):
+        // a nonzero count admits all three installed Type slots, including
+        // sparse slots beyond the count. Sum before scaling the host's HP;
+        // installed upgrades do not own independent power contributors.
+        // Native controls: spatial_oracle/building_upgrades.json `power`.
+        let upgrades = entity.building_upgrades();
+        if upgrades.count() != 0 {
+            for type_ref in upgrades.types().iter().flatten() {
+                let Some(upgrade) = interner.object_type(*type_ref, rules) else {
+                    continue;
+                };
+                output_contribution = output_contribution.wrapping_add(upgrade.power.max(0));
             }
         }
         if output_contribution > 0 {
@@ -534,7 +588,7 @@ fn recalculate_power_for_owner(
 
         // Drain branch: always full rated value regardless of health.
         // Parser46108A NEG and House508D16 ADD both consume dwords.
-        drained = drained.wrapping_add(native_building_power_drain(obj.power));
+        drained = drained.wrapping_add(building_power_drain(entity, rules, interner));
     }
 
     //508D4A stores the assessment byte;508D79 forces output to zero for
@@ -674,7 +728,8 @@ fn radar_provider_available(
 
 /// House508DF0: a running radar outage (`0x00508E07..0x00508E31`, any
 /// remaining time) denies radar before Scenario FreeRadar (`+0x34A4`), power
-/// and the providers are asked.
+/// and the providers are asked. Returns whether this visit assessed radar,
+/// so the local House can reach the process setter at the same boundary.
 pub(crate) fn assess_house_radar_projection(
     state: &mut PowerState,
     entities: &EntityStore,
@@ -684,7 +739,7 @@ pub(crate) fn assess_house_radar_projection(
     interner: &crate::sim::intern::StringInterner,
     free_radar: bool,
     binary_frame: u32,
-) {
+) -> bool {
     if state.radar_dirty {
         state.radar_dirty = false;
         state.radar_available = state.radar_outage_timer.remaining(binary_frame as i32) == 0
@@ -697,7 +752,9 @@ pub(crate) fn assess_house_radar_projection(
                     owner,
                     interner,
                 ));
+        return true;
     }
+    false
 }
 
 /// Check whether a specific building is functionally active (not disabled by low power).
@@ -952,10 +1009,7 @@ BuildSpeed=0.02
             let input = &row["input"];
             // These native branches have no equivalent Rust lifecycle producers
             // yet. The native corpus records them but cannot prove them migrated.
-            if !input["online"].as_bool().unwrap()
-                || input["warped"].as_bool().unwrap()
-                || input["overpowered"].as_bool().unwrap()
-            {
+            if input["warped"].as_bool().unwrap() || input["overpowered"].as_bool().unwrap() {
                 continue;
             }
             let value = |key: &str| input[key].as_i64().unwrap() as i32;
@@ -972,6 +1026,7 @@ BuildSpeed=0.02
             ));
             let mut store = EntityStore::new();
             let mut building = make_building(1, "TEST", "Owner", value("actual"));
+            building.set_building_online_for_test(input["online"].as_bool().unwrap());
             let occupants = value("occupants") as u32;
             let mut cargo = crate::sim::passenger::PassengerCargo::new(occupants, 0.0);
             cargo.set_passengers_for_test((0..occupants).map(|i| 100 + u64::from(i)).collect());
@@ -1011,7 +1066,61 @@ BuildSpeed=0.02
             );
             compared += 1;
         }
-        assert_eq!(compared, 422);
+        assert_eq!(compared, 423);
+    }
+
+    #[test]
+    fn native_installed_upgrade_power_scales_once_with_host_health() {
+        let corpus = crate::test_fixture::json("tools/spatial_oracle/building_upgrades.json");
+        let rows = corpus["power"].as_array().unwrap();
+        assert_eq!(rows.len(), 6);
+        for row in rows {
+            let input = &row["inputs"];
+            let value = |key: &str| i32::try_from(input[key].as_i64().unwrap()).unwrap();
+            // The oracle seeds native +EE0/+EE4 separately. These controls
+            // use mutually exclusive output/drain so the production Rules
+            // reader can express exactly the same BuildingType with Power=.
+            let power = |output: &str, drain: &str| {
+                let (output, drain) = (value(output), value(drain));
+                assert!(output == 0 || drain == 0);
+                if drain == 0 { output } else { -drain }
+            };
+            let rules = rules_from_ini(&format!(
+                "[BuildingTypes]\n0=HOST\n1=UPGRADE\n2=OTHER\n\
+                 [HOST]\nStrength={}\nPower={}\nUpgrades=3\n\
+                 [UPGRADE]\nPower={}\nPowersUpBuilding=HOST\n\
+                 [OTHER]\nPower=70\nPowersUpBuilding=HOST\n",
+                value("strength"),
+                power("host_power", "host_drain"),
+                power("upgrade_power", "upgrade_drain"),
+            ));
+            let mut host = make_building(1, "HOST", "Owner", value("hp"));
+            host.set_building_upgrades_for_test(
+                i8::try_from(value("count")).unwrap(),
+                [
+                    Some(intern::test_intern("UPGRADE")),
+                    None,
+                    input["other_slot"]
+                        .as_bool()
+                        .unwrap()
+                        .then(|| intern::test_intern("OTHER")),
+                ],
+            );
+            let owner = host.owner();
+            let mut entities = EntityStore::new();
+            entities.insert(host);
+            let mut state = PowerState::default();
+            recalculate_power_for_owner(&mut state, &entities, &rules, owner, &test_interner(), 0);
+            assert_eq!(
+                (state.total_output(), state.total_drain()),
+                (
+                    row["output"].as_i64().unwrap() as i32,
+                    row["drain"].as_i64().unwrap() as i32,
+                ),
+                "{}",
+                row["name"]
+            );
+        }
     }
 
     #[test]

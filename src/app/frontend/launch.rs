@@ -24,6 +24,31 @@ use crate::app::diagnostics::tactical_capture::session::MapCaptureProfile;
 
 const TACTICAL_CAPTURE_FLAG: &str = "--tactical-capture";
 
+/// The installer runs this before normal application startup. Keep its argument
+/// boundary here with the other launch modes: game-folder values must bypass
+/// native substring switches, and Unicode paths must remain OS strings.
+pub fn try_game_data_check<I>(args: I) -> Option<Result<i32>>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    if args.next().as_deref() != Some(OsStr::new("--check-game-data")) {
+        return None;
+    }
+    Some((|| {
+        let game_dir = PathBuf::from(
+            args.next()
+                .context("missing game folder after --check-game-data")?,
+        );
+        let output_dir = PathBuf::from(args.next().context("missing game-data report directory")?);
+        ensure!(
+            args.next().is_none(),
+            "--check-game-data takes a game folder and report directory"
+        );
+        crate::app::game_data_check::check_and_write_report(&game_dir, &output_dir)
+    })())
+}
+
 #[derive(Debug)]
 pub enum AppLaunchMode {
     /// Ordinary launch, carrying whatever the retail switch table decided.

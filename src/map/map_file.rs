@@ -297,12 +297,46 @@ pub struct MapFile {
 }
 
 impl MapFile {
+    /// ReadMap4AD0C5..4AD10A follows ReadWaypoints68BDC0 with a HomeCell
+    /// fallback before the four view bookmarks and object-section consumers.
+    /// Run at authored materialization, after early start-slot admission;
+    /// metadata parsing and live random-map generation do not run this pass.
+    pub(crate) fn initialize_authored_home_waypoint(&mut self) {
+        let home = self.basic.home_cell.unwrap_or(699);
+        let Some(index) = waypoints::waypoint_slot(home) else {
+            // Native SetWaypoint68BF50 would write outside the Scenario.
+            // Keep malformed indexes outside the portable waypoint contract.
+            return;
+        };
+        if waypoints::waypoint_is_defined(home, |index| {
+            self.waypoints
+                .get(&index)
+                .map(|waypoint| (waypoint.rx as i16, waypoint.ry as i16))
+        }) {
+            return;
+        }
+        // ADD/CDQ/SUB/SAR: wrapping i32 sum, divide toward zero, low word.
+        let center = (self.header.width.wrapping_add(self.header.height) as i32 / 2) as u16;
+        self.waypoints.insert(
+            index,
+            Waypoint {
+                index,
+                rx: center,
+                ry: center,
+            },
+        );
+    }
+
     /// Parse a map from raw INI bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self, MapError> {
         Self::from_ini(IniFile::from_bytes(data)?)
     }
 
-    fn from_ini(ini: IniFile) -> Result<Self, MapError> {
+    pub(super) fn from_ini(mut ini: IniFile) -> Result<Self, MapError> {
+        // Read_Scenario_INI6867BE calls ReadCCFile4741F0(checkDigest=1)
+        // before any scenario readers; both matched and stale digests admit
+        // the file. Metadata readers use the unchecked physical INI instead.
+        ini.remove_digest_for_checked_load();
         let header: MapHeader = parse_header(&ini)?;
         let basic: BasicSection = basic::parse_basic_section(&ini);
         let ranking: crate::map::ranking::RankingSection =
@@ -327,7 +361,8 @@ impl MapFile {
             entries: overlays,
             data: overlay_data,
         } = overlay::parse_overlay_packs(&ini);
-        let terrain_objects: Vec<TerrainObject> = overlay::parse_terrain_objects(&ini);
+        let terrain_objects: Vec<TerrainObject> =
+            overlay::parse_terrain_objects(&ini, basic.new_ini_format.unwrap_or(0));
         let smudges: Vec<MapSmudgeEntry> = parse_map_smudges(&ini);
         let waypoints: HashMap<u32, Waypoint> = waypoints::parse_waypoints(&ini);
         let tags: TagMap = tags::parse_tags(&ini);
@@ -684,6 +719,68 @@ mod tests {
 
     const ONE_CELL_ISO_MAP_PACK: &str = "DwALABwBAAIA/////wAAABEAAA==";
     const TWO_PIXEL_PREVIEW_PACK: &str = "CgAGABcBAgMEBQYRAAA=";
+
+    #[test]
+    fn terrain_coordinates_follow_the_basic_format_boundary_and_missing_default() {
+        // Terrain Read_Map_Section71CAE3..71CB44 uses signed format<4
+        // for radix128; ReadBasic68A151 supplies0 when the key is absent.
+        for (basic, expected) in [
+            ("", (2, 2)),
+            ("[Basic]\nNewINIFormat=3\n", (2, 2)),
+            ("[Basic]\nNewINIFormat=4\n", (258, 0)),
+        ] {
+            let text = format!(
+                "[Map]\nSize=0,0,128,128\n\
+                 [Terrain]\n258=TREE01\n\
+                 [IsoMapPack5]\n1={ONE_CELL_ISO_MAP_PACK}\n{basic}"
+            );
+            let map = MapFile::from_bytes(text.as_bytes()).unwrap();
+            let tree = &map.terrain_objects[0];
+            assert_eq!((tree.rx, tree.ry), expected, "{basic:?}");
+            assert_eq!(tree.name, "TREE01");
+        }
+    }
+
+    #[test]
+    fn authored_home_waypoint_is_defined_before_scenario_consumers() {
+        // Original ReadMap4AD0C5..4AD10A controls: missing699 on65x120,
+        // retained14, and missing18 on113x108. These are map Size fields,
+        // not LocalSize or the raster dimensions.
+        for (width, height, basic, waypoints, slot, expected) in [
+            (65, 120, "", "", 699, (92, 92)),
+            (65, 120, "HomeCell=14\n", "14=110100\n", 14, (100, 110)),
+            (113, 108, "HomeCell=18\n", "", 18, (110, 110)),
+            (
+                65,
+                120,
+                "HomeCell=14\nAltHomeCell=18\n",
+                "14=0\n",
+                14,
+                (92, 92),
+            ),
+        ] {
+            let text = format!(
+                "[Map]\nSize=0,0,{width},{height}\nLocalSize=4,7,12,16\n\
+                 [Basic]\n{basic}[Waypoints]\n{waypoints}\
+                 [IsoMapPack5]\n1={ONE_CELL_ISO_MAP_PACK}\n"
+            );
+            let mut map = MapFile::from_bytes(text.as_bytes()).unwrap();
+            if waypoints.is_empty() {
+                assert!(
+                    map.waypoints.is_empty(),
+                    "metadata parsing keeps the authored slots"
+                );
+            }
+            map.initialize_authored_home_waypoint();
+            let home = map.waypoints.get(&slot).expect("materialized HomeCell");
+            assert_eq!((home.rx, home.ry), expected);
+            assert_eq!(home.index, slot);
+            assert!(
+                !map.waypoints.contains_key(&18) || slot == 18,
+                "fallback must not fill an undefined alternate waypoint"
+            );
+        }
+    }
 
     fn full_map_with_preview(preview_sections: &str) -> Vec<u8> {
         format!(

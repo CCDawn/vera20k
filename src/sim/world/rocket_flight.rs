@@ -87,7 +87,7 @@ impl RocketHost for RocketProcessHost<'_> {
         self.sim.foot_set_location_marked(
             self.id,
             DriveCoord { x, y, z },
-            Some(self.rules),
+            self.rules,
             self.registry,
             self.frame_effects,
         );
@@ -113,15 +113,22 @@ impl RocketHost for RocketProcessHost<'_> {
     fn mark(&mut self, put: bool) {
         if put {
             self.sim
-                .foot_mark_put(self.id, Some(self.rules), self.registry, self.frame_effects);
+                .foot_mark_put(self.id, self.rules, self.registry, self.frame_effects);
         } else {
             self.sim
-                .foot_mark_remove(self.id, Some(self.rules), self.registry, self.frame_effects);
+                .foot_mark_remove(self.id, self.rules, self.registry, self.frame_effects);
         }
     }
     fn submit_display(&mut self) {
-        self.sim
-            .submit_entity_display(self.id, Some(self.rules), None);
+        Simulation::submit_entity_display(
+            &self.sim.interner,
+            &self.sim.terrain_objects,
+            &mut self.sim.substrate,
+            &self.sim.resolved_terrain,
+            self.id,
+            self.rules,
+            None,
+        );
     }
     fn tracker_cell(&self) -> (i16, i16) {
         self.owner().air_tracker_cell()
@@ -236,7 +243,7 @@ impl RocketHost for RocketProcessHost<'_> {
     fn uninit(&mut self) {
         self.sim.uninit_with_context(
             self.id,
-            UninitContext::new(Some(self.rules), self.registry).with_effects(self.frame_effects),
+            UninitContext::new(self.rules, self.registry).with_effects(self.frame_effects),
         );
     }
 }

@@ -8,7 +8,7 @@
 use super::audio::{AudioVolume, AudioVolumeOperations, apply_volume};
 use crate::app::persistence::options_profile::RetailOptionsProfile;
 use crate::ui::main_menu_dialogs::options::{
-    LauncherCue, LauncherOptionsEvent, LauncherOptionsLabels, LauncherOptionsPacked,
+    DisplayTarget, LauncherCue, LauncherOptionsEvent, LauncherOptionsLabels, LauncherOptionsPacked,
     LauncherOptionsValues, LauncherParentResult, OptionsDialogState, SidebarSize, Zoom,
     admitted_initial_position, admitted_volume_position,
 };
@@ -34,8 +34,11 @@ pub(crate) fn launcher_values_from_profile(
         full_screen: false,
         original_shape: profile.original_shape,
         yr_original_style: profile.yr_original_style,
+        render_interpolation: profile.render_interpolation,
+        mouse_wheel_zoom: profile.mouse_wheel_zoom,
         shift_queue: profile.shift_queue,
         wol_test_service: profile.wol_test_service,
+        fps_counter: false,
         sidebar: profile.sidebar,
         score_position: admitted_volume_position(profile.score_volume),
         sound_position: admitted_volume_position(profile.sound_volume),
@@ -46,18 +49,30 @@ pub(crate) fn launcher_values_from_profile(
 /// Build one fresh primary snapshot from already-owned platform and text facts.
 /// Child return and initial open both use this same constructor path.
 /// The Full Screen box shows `full_screen`, the window's own state: the
-/// player can also change it with the window's title-bar button.
+/// player can also change it with the window's title-bar button. The FPS
+/// Counter box shows `fps_counter`, the readout's live state, which no profile
+/// stores.
 pub(crate) fn launcher_dialog_from_profile(
     profile: &RetailOptionsProfile,
     labels: LauncherOptionsLabels,
     full_screen: bool,
+    fps_counter: bool,
     launcher_audio_available: bool,
+    displays: Vec<crate::ui::main_menu_dialogs::options::DisplayChoice>,
 ) -> OptionsDialogState {
     let values = LauncherOptionsValues {
         full_screen,
+        fps_counter,
         ..launcher_values_from_profile(profile)
     };
-    OptionsDialogState::new(labels, values, profile.zoom, launcher_audio_available)
+    OptionsDialogState::new(
+        labels,
+        values,
+        profile.zoom,
+        launcher_audio_available,
+        displays,
+        profile.display.clone(),
+    )
 }
 
 /// Concrete effects admitted by one launcher UI frame.
@@ -68,11 +83,16 @@ pub(crate) trait LauncherPreviewOperations: AudioVolumeOperations {
     fn play_cue(&mut self, cue: LauncherCue);
     fn store_zoom(&mut self, zoom: Zoom);
     fn store_sidebar(&mut self, size: SidebarSize);
+    /// Move the window to the picked screen, or hand it back to the system.
+    fn set_display(&mut self, display: DisplayTarget);
     fn set_full_screen(&mut self, full_screen: bool);
     fn store_original_shape(&mut self, original_shape: bool);
     fn store_yr_original_style(&mut self, yr_original_style: bool);
+    fn store_render_interpolation(&mut self, enabled: bool);
+    fn store_mouse_wheel_zoom(&mut self, enabled: bool);
     fn store_shift_queue(&mut self, shift_queue: bool);
     fn store_wol_test_service(&mut self, wol_test_service: bool);
+    fn set_fps_counter(&mut self, shown: bool);
 }
 
 /// Dispatch one already-ordered UI event without an INI write. The three audio
@@ -86,6 +106,7 @@ pub(crate) fn dispatch_launcher_preview_event(
         LauncherOptionsEvent::Cue(cue) => operations.play_cue(cue),
         LauncherOptionsEvent::ZoomSelected(zoom) => operations.store_zoom(zoom),
         LauncherOptionsEvent::SidebarSelected(size) => operations.store_sidebar(size),
+        LauncherOptionsEvent::DisplaySelected(display) => operations.set_display(display),
         LauncherOptionsEvent::FullScreenChanged(full_screen) => {
             operations.set_full_screen(full_screen);
         }
@@ -95,12 +116,19 @@ pub(crate) fn dispatch_launcher_preview_event(
         LauncherOptionsEvent::YrOriginalStyleChanged(yr_original_style) => {
             operations.store_yr_original_style(yr_original_style)
         }
+        LauncherOptionsEvent::RenderInterpolationChanged(enabled) => {
+            operations.store_render_interpolation(enabled);
+        }
+        LauncherOptionsEvent::MouseWheelZoomChanged(enabled) => {
+            operations.store_mouse_wheel_zoom(enabled);
+        }
         LauncherOptionsEvent::ShiftQueueChanged(shift_queue) => {
             operations.store_shift_queue(shift_queue);
         }
         LauncherOptionsEvent::WolTestServiceChanged(wol_test_service) => {
             operations.store_wol_test_service(wol_test_service);
         }
+        LauncherOptionsEvent::FpsCounterChanged(shown) => operations.set_fps_counter(shown),
         LauncherOptionsEvent::ScorePreview(volume) => {
             apply_volume(operations, AudioVolume::Score, volume, true)
         }
@@ -280,6 +308,8 @@ mod tests {
             unit_action_lines: false,
             show_hidden: true,
             yr_original_style: true,
+            render_interpolation: false,
+            mouse_wheel_zoom: true,
             shift_queue: true,
             wol_test_service: true,
             ..RetailOptionsProfile::default()
@@ -288,6 +318,8 @@ mod tests {
         assert!(!booleans.target_lines);
         assert!(booleans.show_hidden);
         assert!(booleans.yr_original_style);
+        assert!(!booleans.render_interpolation);
+        assert!(booleans.mouse_wheel_zoom);
         assert!(booleans.shift_queue);
         assert!(booleans.wol_test_service);
     }

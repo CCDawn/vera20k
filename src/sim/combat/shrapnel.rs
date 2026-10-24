@@ -31,7 +31,7 @@ fn ground_head(
             rx,
             ry,
             crate::sim::movement::locomotor::MovementLayer::Ground,
-            world.terrain_objects.cell_index().get(&(rx, ry)).copied(),
+            world.terrain_objects.members_at((rx, ry)),
         )
         .next()
 }
@@ -338,27 +338,15 @@ pub(super) fn emit_projectile_shrapnel(
                 crate::sim::projectile::cell_target_coord(None, rx as u16, ry as u16),
             )
         } else {
-            match crate::sim::cell_rect::get_cellclass_fallback(
+            let cell = crate::sim::cell_rect::get_cellclass_fallback(
                 world.resolved_terrain.as_ref(),
                 rx,
                 ry,
-            ) {
-                crate::sim::cell_rect::CellRef::Real(cell) => (
-                    ProjectileTarget::Cell {
-                        rx: cell.rx,
-                        ry: cell.ry,
-                    },
-                    crate::sim::projectile::cell_target_coord(
-                        world.resolved_terrain.as_ref(),
-                        cell.rx,
-                        cell.ry,
-                    ),
-                ),
-                crate::sim::cell_rect::CellRef::Dummy { cell } => (
-                    ProjectileTarget::DummyCell,
-                    crate::sim::projectile::dummy_cell_target_coord(&cell),
-                ),
-            }
+            );
+            (
+                ProjectileTarget::of_cell(&cell),
+                crate::sim::projectile::cell_ref_target_coord(&cell),
+            )
         };
         construct(world, target, Some(initial_target_position), Some((rx, ry)));
         emitted += 1;

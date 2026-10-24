@@ -40,6 +40,12 @@ use crate::util::fixed_math::SimFixed;
 use crate::util::native_x87::{NativeF64Bits, X87Chop53};
 
 use super::{Simulation, UninitContext};
+use crate::map::resolved_terrain::ResolvedTerrainGrid;
+use crate::sim::houses::Houses;
+use crate::sim::intern::StringInterner;
+use crate::sim::world::FrameChannel;
+use crate::sim::world::ObjectSubstrate;
+use crate::sim::world::SimSoundEvent;
 
 /// `0x007E9280`, the spread of the sideways spin rate.
 const SIDEWAYS_SPREAD: NativeF64Bits = NativeF64Bits::from_bits(0x3fc3_3333_3333_3333);
@@ -51,7 +57,7 @@ const SPIN_TENTH: NativeF64Bits = NativeF64Bits::from_bits(0x3fb9_9999_9999_999a
 fn spin_rate(draw: i32, spread: NativeF64Bits, floor: Option<NativeF64Bits>) -> SimFixed {
     let unit = X87Chop53::mul(
         X87Chop53::load_i32(draw),
-        X87Chop53::load_f64(crate::sim::rng::RANDOM_RANGED_UNIT_SCALE)
+        X87Chop53::load_f64(crate::util::native_random::RANDOM_RANGED_UNIT_SCALE)
             .expect("the RandomRanged unit scale is a finite constant"),
     );
     let mut value = X87Chop53::mul(
@@ -124,12 +130,11 @@ impl Simulation {
     /// Infantry or `Unsorted::IKnowWhatImDoing` (`[0x00A8E7AC]`) is raised,
     /// and `Detach_All(false)`'s announcement (`0x007258D0`, `dl = 0`).
     ///
-    /// RESIDUAL: the live prefix raises the object's Tag events 0x26 and 0x29
-    /// (`TagClass @ 0x006E53A0`); VERA attaches no Tags to objects. Trigger: a
-    /// tagged campaign aircraft crashes while alive (AirportBound with no
-    /// airfield left). Effect: the map's trigger never hears it. Frequency:
-    /// campaign maps only. The shared A8E7AC caller scope also covers native
-    /// runtime placement/destruction; a raised scope suppresses spin draws.
+    /// Original instructions `0x004DEBD3..0x004DEC5F` raise38 with an
+    /// attacker, then41(NULL), then41(attacker), re-reading the attachment
+    /// and ObjectAlive around synchronous actions. UnInit during a callback
+    /// returns true before the remaining crash work. The shared A8E7AC
+    /// placement/destruction scope suppresses spin draws as natively.
     pub(crate) fn foot_crash(
         &mut self,
         id: u64,
@@ -144,8 +149,36 @@ impl Simulation {
         if current_fly_height(entity, self.resolved_terrain.as_ref()) <= 0 {
             return false;
         }
-        let category = entity.category();
         if entity.health.current() > 0 {
+            let context = UninitContext::new(rules, registry).with_effects(frame_effects);
+            if attacker.is_some() {
+                self.dispatch_object_tag_event(id, 38, Some(id), None, context);
+            }
+            if self
+                .substrate
+                .entities
+                .get(id)
+                .is_some_and(|entity| entity.is_object_alive())
+            {
+                self.dispatch_object_tag_event(id, 41, Some(id), None, context);
+            }
+            if attacker.is_some()
+                && self
+                    .substrate
+                    .entities
+                    .get(id)
+                    .is_some_and(|entity| entity.is_object_alive())
+            {
+                self.dispatch_object_tag_event(id, 41, Some(id), attacker, context);
+            }
+            if self
+                .substrate
+                .entities
+                .get(id)
+                .is_none_or(|entity| !entity.is_object_alive())
+            {
+                return true;
+            }
             // `0x004DEC4C`: RecordKill(attacker) books the kill and the loss
             // for the killer's house (no attacker: the loss alone), then
             // `0x004DEC72` zeroes Health unless a Magnetron lifted the object
@@ -154,8 +187,16 @@ impl Simulation {
                 id,
                 crate::sim::combat::KillSource::Techno(attacker),
                 crate::sim::combat::KillCallback::Terminal,
-                UninitContext::new(Some(rules), registry).with_effects(frame_effects),
+                context,
             );
+            if self
+                .substrate
+                .entities
+                .get(id)
+                .is_none_or(|entity| !entity.is_object_alive())
+            {
+                return true;
+            }
             if let Some(entity) = self.substrate.entities.get_mut(id)
                 && !entity.lift.swap_active()
             {
@@ -169,19 +210,26 @@ impl Simulation {
             self,
             id,
             crate::sim::radio::RadioMessage::Break,
-            Some(rules),
+            rules,
             frame_effects,
         );
         self.techno_death_stun(
             id,
-            UninitContext::new(Some(rules), registry).with_effects(frame_effects),
+            UninitContext::new(rules, registry).with_effects(frame_effects),
         );
         self.kill_passengers(
             id,
             attacker,
-            UninitContext::new(Some(rules), registry).with_effects(frame_effects),
+            UninitContext::new(rules, registry).with_effects(frame_effects),
         );
-        if category != EntityCategory::Infantry && !self.object_placement_scope_active() {
+        // RTTI is read after the synchronous tail calls at 0x004DECA2.
+        if self
+            .substrate
+            .entities
+            .get(id)
+            .is_some_and(|entity| entity.category() != EntityCategory::Infantry)
+            && !self.object_placement_scope_active()
+        {
             let sideways = self.scenario_rng.next_range_i32_inclusive(0, 0x7FFF_FFFE);
             let sign = self.scenario_rng.next_range_i32_inclusive(0, 1);
             let forwards = self.scenario_rng.next_range_i32_inclusive(0, 0x7FFF_FFFE);
@@ -228,7 +276,7 @@ impl Simulation {
     pub(super) fn fly_crash_fall(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> bool {
@@ -270,7 +318,15 @@ impl Simulation {
                 &self.interner,
             );
             self.mark_entity_put(id, context);
-            self.submit_entity_display(id, rules, None);
+            Self::submit_entity_display(
+                &self.interner,
+                &self.terrain_objects,
+                &mut self.substrate,
+                &self.resolved_terrain,
+                id,
+                rules,
+                None,
+            );
         }
         let Some(entity) = self.substrate.entities.get(id) else {
             return false;
@@ -296,20 +352,28 @@ impl Simulation {
             return false;
         }
         self.substrate.aircraft_tracker_remove(id);
-        self.set_object_height(id, 0, Some(rules), overlay_registry, frame_effects);
+        self.set_object_height(id, 0, rules, overlay_registry, frame_effects);
         let bridge_state_changed =
             self.fire_death_weapon(id, rules, overlay_registry, frame_effects);
-        self.play_crash_impact_sound(id, rules);
+        Self::play_crash_impact_sound(
+            &self.interner,
+            &self.substrate,
+            &mut self.sound_events,
+            &self.resolved_terrain,
+            id,
+            rules,
+        );
         self.uninit_with_context(
             id,
-            UninitContext::new(Some(rules), overlay_registry).with_effects(frame_effects),
+            UninitContext::new(rules, overlay_registry).with_effects(frame_effects),
         );
         bridge_state_changed
     }
 
     /// A crashed Jumpjet's impact: State 5's owner work (`AircraftTracker::
     /// Remove @ 0x004135D0`, `0x0054D075`), then its `(0x117C, 0)` notice to
-    /// `UnitClass`'s `INoticeSink` (`0x00746100`). A `Crashable=` type
+    /// the owner's `INoticeSink` (`0x0054D095`). For a Unit (`0x00746100`),
+    /// a `Crashable=` type
     /// (`+0xD95`, `0x0074619D`) answers it (`0x007461A7..0x00746206`):
     /// `SetHeight(0)` (vtable `+0x1CC`), then `Fire_Death_Weapon(0)` for a
     /// `BalloonHover=` type (`0x007461EF`, the Kirov's bomb) or
@@ -320,6 +384,11 @@ impl Simulation {
     /// answers with its falling damage ([`Self::falling_damage`]); the rest
     /// leave the notice unanswered. After it, the drop's credit (`+0x428`,
     /// `+0x42C`) clears (`0x0054D097..0x0054D0A7`).
+    ///
+    /// Aircraft uses its own sink (`0x0041BC30`, constructor secondary
+    /// vtable `0x007E2280` at `0x00413D94`): only a lifted aircraft answers,
+    /// with two C4 impacts and UnInit. It does not use Unit's Crashable arm
+    /// or the Crush warhead of Unit's first falling impact.
     ///
     /// An Infantry owner's notice (the Rocketeer's) keeps the infantryman
     /// instead: [`Simulation::infantry_crash_impact`]. Returns whether the
@@ -334,15 +403,32 @@ impl Simulation {
         let Some(entity) = self.substrate.entities.get(id) else {
             return false;
         };
-        debug_assert_eq!(entity.category(), EntityCategory::Unit);
+        let category = entity.category();
+        debug_assert!(matches!(
+            category,
+            EntityCategory::Unit | EntityCategory::Aircraft
+        ));
+        let lifted = entity.lift.swap_active();
         let (crashable, balloon_hover) = self
             .object_type(entity.type_ref(), rules)
             .map_or((false, false), |object| {
                 (object.crashable, object.balloon_hover)
             });
         self.substrate.aircraft_tracker_remove(id);
-        let bridge_state_changed = if crashable {
-            self.set_object_height(id, 0, Some(rules), overlay_registry, frame_effects);
+        let bridge_state_changed = if category == EntityCategory::Aircraft {
+            if lifted {
+                self.falling_damage(
+                    id,
+                    &rules.bridge_warheads.c4_name,
+                    rules,
+                    overlay_registry,
+                    frame_effects,
+                )
+            } else {
+                false
+            }
+        } else if crashable {
+            self.set_object_height(id, 0, rules, overlay_registry, frame_effects);
             let bridge_state_changed = if balloon_hover {
                 self.fire_death_weapon(id, rules, overlay_registry, frame_effects)
             } else {
@@ -351,7 +437,7 @@ impl Simulation {
             };
             self.uninit_with_context(
                 id,
-                UninitContext::new(Some(rules), overlay_registry).with_effects(frame_effects),
+                UninitContext::new(rules, overlay_registry).with_effects(frame_effects),
             );
             bridge_state_changed
         } else if self
@@ -360,7 +446,13 @@ impl Simulation {
             .get(id)
             .is_some_and(|entity| entity.lift.swap_active())
         {
-            self.falling_damage(id, rules, overlay_registry, frame_effects)
+            self.falling_damage(
+                id,
+                &rules.bridge_warheads.crush_name,
+                rules,
+                overlay_registry,
+                frame_effects,
+            )
         } else {
             // The notice goes unanswered: the wreck rests in State 6.
             false
@@ -372,31 +464,33 @@ impl Simulation {
         bridge_state_changed
     }
 
-    /// A lifted Unit's answer to its Jumpjet's impact notice when its type is
-    /// not `Crashable=` (`UnitClass` `INoticeSink`, the `+0x6AD` arm at
-    /// `0x00746209..0x00746387`, which tests no notice code): its fall hurts
-    /// what it lands on. Returns whether a bullet changed a bridge.
+    /// The shared falling-damage transaction for Unit's lifted, non-Crashable
+    /// notice (`0x00746209..0x00746387`) and Aircraft's lifted notice
+    /// (`0x0041BC30..0x0041BDC0`). Neither body tests the notice code.
+    /// The caller selects the first impact's warhead: Unit uses Crush,
+    /// Aircraft uses C4 (`0x0041BCA0`); both use C4 for the second impact.
+    /// Returns whether a bullet changed a bridge.
     ///
-    /// The damage is the Unit's Health (`CurrentStrengthDamage=`) or its
+    /// The damage is the owner's Health (`CurrentStrengthDamage=`) or its
     /// type's `Strength=`, times `FallingDamageMultiplier=`, through
-    /// `Math::ftol` and floored at zero (`0x0074623A..0x0074625D`). A bullet
-    /// of `[CombatDamage] DeathWeapon=`'s projectile carries it in
-    /// `CrushWarhead=` from the dropping Magnetron (`+0x428`), else the Unit
-    /// itself (`CreateBullet @ 0x0046B050`, `0x0074628A`), and detonates where
-    /// the Unit meets the ground: its GetCoords less its height
-    /// (`0x007462B5..0x007462DA`). The Unit's death is booked for the drop's
-    /// credit ([`Self::record_manipulated_kill`]); a second bullet
-    /// detonates `C4Warhead=` at its GetCoords (`0x00746355..0x00746372`) and
-    /// the Unit is UnInit (`0x00746381`).
+    /// `Math::ftol` and floored at zero (`0x0074623A..0x0074625D`,
+    /// `0x0041BC72..0x0041BC89`). A bullet of `[CombatDamage] DeathWeapon=`'s
+    /// projectile carries it in the selected ground warhead from the dropping
+    /// Magnetron (`+0x428`), else the owner itself (`CreateBullet @ 0x0046B050`,
+    /// calls `0x0074628A` / `0x0041BCBB`). It detonates at GetCoords less the
+    /// owner's height. The death is booked for the drop's credit
+    /// ([`Self::record_manipulated_kill`]); a second bullet detonates C4 at
+    /// GetCoords (`0x00746372` / `0x0041BDA4`), then the owner is UnInit
+    /// (`0x00746381` / `0x0041BDB3`).
     ///
-    /// The first bullet's area usually kills the Unit itself; the booking and
+    /// The first bullet's area usually kills the owner itself; the booking and
     /// the UnInit run all the same, as native's do, so its death is booked
     /// twice (Record_The_Kill, `0x00702D40`, has no first-credit guard). The
     /// second bullet detonates at the coordinates read before the first;
-    /// native reads GetCoords again (`0x0074631A`), which the first bullet
+    /// native reads GetCoords again (`0x0074631A` / `0x0041BD4F`), which the first bullet
     /// leaves unchanged.
     ///
-    /// Create74628A/746355 each constructs an independent Bright1 Bullet
+    /// Each Create (74628A/746355 or 41BCBB/41BD86) constructs a Bright1 Bullet
     /// with no installed WeaponType. It remains in Limbo, but participates
     /// in pointer expiry through its synchronous detonation and destruction.
     /// Native dereferences a missing `DeathWeapon=`; VERA then books the
@@ -404,6 +498,7 @@ impl Simulation {
     fn falling_damage(
         &mut self,
         id: u64,
+        ground_warhead: &str,
         rules: &RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
@@ -439,18 +534,21 @@ impl Simulation {
             .death_weapon
             .as_deref()
             .and_then(|weapon| rules.weapon(weapon));
-        let crush = self.interner.intern(&rules.bridge_warheads.crush_name);
+        let ground_warhead = self.interner.intern(ground_warhead);
         let c4 = self.interner.intern(&rules.bridge_warheads.c4_name);
         let mut bridge_state_changed = false;
-        for (index, (warhead, z)) in [(crush, coords.z.wrapping_sub(height)), (c4, coords.z)]
-            .into_iter()
-            .enumerate()
+        for (index, (warhead, z)) in [
+            (ground_warhead, coords.z.wrapping_sub(height)),
+            (c4, coords.z),
+        ]
+        .into_iter()
+        .enumerate()
         {
             if index == 1 {
                 self.record_manipulated_kill(
                     id,
                     id,
-                    UninitContext::new(Some(rules), registry).with_effects(effects),
+                    UninitContext::new(rules, registry).with_effects(effects),
                 );
             }
             if let Some(weapon) = weapon {
@@ -498,7 +596,7 @@ impl Simulation {
         if self.substrate.entities.contains(id) {
             self.uninit_with_context(
                 id,
-                UninitContext::new(Some(rules), registry).with_effects(effects),
+                UninitContext::new(rules, registry).with_effects(effects),
             );
         }
         bridge_state_changed
@@ -535,18 +633,24 @@ impl Simulation {
     /// `ImpactWaterSound=` else `[AudioVisual] ImpactWaterSound=`, elsewhere
     /// `ImpactLandSound=` likewise, played at the object's Location with no
     /// sound handle.
-    fn play_crash_impact_sound(&mut self, id: u64, rules: &RuleSet) {
-        let Some(entity) = self.substrate.entities.get(id) else {
+    fn play_crash_impact_sound(
+        interner: &StringInterner,
+        substrate: &ObjectSubstrate,
+        sound_events: &mut FrameChannel<SimSoundEvent>,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        id: u64,
+        rules: &RuleSet,
+    ) {
+        let Some(entity) = substrate.entities.get(id) else {
             return;
         };
-        let water = self
-            .resolved_terrain
+        let water = resolved_terrain
             .as_ref()
             .and_then(|terrain| terrain.cell(entity.position.rx(), entity.position.ry()))
             .is_some_and(|cell| {
                 cell.land_type == crate::rules::terrain_rules::LandType::Water.as_index()
             });
-        let object = self.object_type(entity.type_ref(), rules);
+        let object = interner.object_type(entity.type_ref(), rules);
         let sound = if water {
             object
                 .and_then(|object| object.impact_water_sound.clone())
@@ -558,7 +662,7 @@ impl Simulation {
         };
         if let Some(sound_id) = sound {
             let event = super::SimSoundEvent::voc_at(sound_id, &entity.position);
-            self.sound_events.emit(event);
+            sound_events.emit(event);
         }
     }
 
@@ -571,8 +675,15 @@ impl Simulation {
     /// Nothing on the Fly path lowers the latch; besides the constructor only
     /// the Jumpjet Descend touchdown clears it (`0x0054CA12`, a Magnetron drop
     /// that lands).
-    pub(crate) fn crash_edge_sounds(&mut self, id: u64, rules: &RuleSet) {
-        let Some(entity) = self.substrate.entities.get(id) else {
+    pub(crate) fn crash_edge_sounds(
+        interner: &StringInterner,
+        substrate: &mut ObjectSubstrate,
+        sound_events: &mut FrameChannel<SimSoundEvent>,
+        houses: &Houses,
+        id: u64,
+        rules: &RuleSet,
+    ) {
+        let Some(entity) = substrate.entities.get(id) else {
             return;
         };
         if entity.crash.crashing == entity.crash.seen {
@@ -581,40 +692,34 @@ impl Simulation {
         if entity.crash.crashing {
             // Foot4DAD01 releases the shared handle even if its MoveSound
             // latch was already cleared by the preceding tail.
-            self.sound_events
-                .emit(super::SimSoundEvent::ObjectSoundReleased { owner: id });
-            let entity = self.substrate.entities.get(id).expect("checked above");
+            sound_events.emit(super::SimSoundEvent::ObjectSoundReleased { owner: id });
+            let entity = substrate.entities.get(id).expect("checked above");
             let owner = entity.owner();
-            let object = self.object_type(entity.type_ref(), rules);
+            let object = interner.object_type(entity.type_ref(), rules);
             let voice = object.and_then(|object| object.voice_crashing.clone());
             let crashing_sound = object.and_then(|object| object.crashing_sound.clone());
-            let human = self
-                .houses
-                .get(&owner)
-                .is_some_and(|house| house.is_human());
+            let human = houses.get(&owner).is_some_and(|house| house.is_human());
             if let Some(voice) = voice
                 && human
             {
                 let event =
                     super::SimSoundEvent::voc_at_for(voice, Some([owner, owner]), &entity.position);
-                self.sound_events.emit(event);
+                sound_events.emit(event);
             }
             if let Some(sound) = crashing_sound {
                 let world = Self::movement_sound_world(entity);
-                self.sound_events
-                    .emit(super::SimSoundEvent::AnimationStarted {
-                        anim_id: id,
-                        sound_id: sound,
-                        world,
-                    });
+                sound_events.emit(super::SimSoundEvent::AnimationStarted {
+                    anim_id: id,
+                    sound_id: sound,
+                    world,
+                });
             }
         }
-        if let Some(entity) = self.substrate.entities.get_mut(id) {
+        if let Some(entity) = substrate.entities.get_mut(id) {
             // Falling crash edge4DADA9..4DADB7 leaves an active MoveSound's
             // shared handle alone; otherwise it releases the crash sound.
             if !entity.crash.crashing && !entity.move_sound.is_active() {
-                self.sound_events
-                    .emit(super::SimSoundEvent::ObjectSoundReleased { owner: id });
+                sound_events.emit(super::SimSoundEvent::ObjectSoundReleased { owner: id });
             }
             entity.crash.seen = entity.crash.crashing;
         }
@@ -715,8 +820,10 @@ impl Simulation {
 
     /// A passenger dying with its transport: `RecordKill(attacker)` (vtable
     /// `+0xE0`) then UnInit (vtable `+0xF8`), in KillPassengers
-    /// (`0x00707CFF`/`0x00707D09`) and in a dying unit's refused escape
-    /// (`UnitClass::ReceiveDamage 0x00738188..0x0073819B`).
+    /// (`0x00707CFF`/`0x00707D09`), in a dying unit's refused escape
+    /// (`UnitClass::ReceiveDamage 0x00738188..0x0073819B`) and for an
+    /// absorbed passenger that cannot leave its building
+    /// ([`Self::eject_absorbed_passengers`]).
     pub(crate) fn record_kill_and_uninit(
         &mut self,
         victim: u64,

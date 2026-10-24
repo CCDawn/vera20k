@@ -35,7 +35,11 @@ pub(crate) fn apply_action(state: &mut AppState, action: SetupAction) {
                 .as_ref()
                 .is_some_and(|protocol| !protocol.locked)
             {
-                queue(state, NetworkSetupRequest::Leave);
+                // WOL C2 Back's leave (0x7900B8) goes to the lobby's
+                // service once C2 has closed (commit_back).
+                if !(dialog.wol() && dialog.host) {
+                    queue(state, NetworkSetupRequest::Leave);
+                }
                 // C9 Back (0x791E4A..5F) closes only when the leave call
                 // fails; otherwise the channel-left event closes it.
                 if !(dialog.wol() && !dialog.host) {
@@ -73,10 +77,9 @@ pub(crate) fn apply_action(state: &mut AppState, action: SetupAction) {
             super::wol::emote(state);
             Ok(())
         }
+        // 0x00790C8D (C2) and 0x0079235F (C9): the modal page dialog 0xCF.
         SetupAction::Page => {
-            // 0x5C2 runs the modal page dialog 0xCF (0078D120), a later
-            // WOL chain; nothing is invented in its place.
-            log::warn!("WOL page dialog 0xCF is not implemented");
+            crate::app::shell_wol::page::open_page_dialog(state);
             Ok(())
         }
         SetupAction::Chat(text) => {
@@ -105,7 +108,7 @@ pub(crate) fn apply_action(state: &mut AppState, action: SetupAction) {
     state.platform.window.request_redraw();
 }
 
-fn queue(state: &mut AppState, request: NetworkSetupRequest) {
+pub(super) fn queue(state: &mut AppState, request: NetworkSetupRequest) {
     if let Some(protocol) = state.frontend.network_setup_protocol.as_mut() {
         protocol.requests.push(request);
     }
@@ -282,6 +285,11 @@ fn select(state: &mut AppState, control: u16, value: i32) -> anyhow::Result<()> 
         }
     }
     queue(state, NetworkSetupRequest::PublishOptions);
+    if column == SetupColumn::Player {
+        //5EC9F0 ->5DAF30 publishes the changed row bindings independently
+        //of the options' participant array, including kicked/unbound nodes.
+        queue(state, NetworkSetupRequest::PublishRoster);
+    }
     Ok(())
 }
 
@@ -306,7 +314,11 @@ fn accept(state: &mut AppState) -> anyhow::Result<()> {
 }
 
 pub(crate) fn commit_start(state: &mut AppState, agreed_seed: u32) {
-    super::persist_setup_preferences(state);
+    let quick_match = super::quick_match(state);
+    // Quick Match has no setup dialog whose teardown writes settings.
+    if !quick_match {
+        super::persist_setup_preferences(state);
+    }
     if let Some(launch) = state.match_state.session.network_setup()
         && let Err(error) = state
             .frontend
@@ -316,7 +328,11 @@ pub(crate) fn commit_start(state: &mut AppState, agreed_seed: u32) {
         // The dialog has already slid out; a refused start returns to a
         // fresh BB like the failed network StartScenario retry (52E75F).
         log::error!("Cannot admit network country identity: {error}");
-        super::commit_back(state);
+        if quick_match {
+            crate::app::shell_wol::start_aborted(state);
+        } else {
+            super::commit_back(state);
+        }
         return;
     }
     // The host's random map keeps the start staging its generator wrote
@@ -354,6 +370,11 @@ pub(crate) fn commit_start(state: &mut AppState, agreed_seed: u32) {
     };
     match state.match_state.session.freeze_network_start(agreed_seed) {
         Ok(startup) => {
+            if state.match_state.session_mode()
+                == crate::app::match_runtime::session::SessionMode::Wol
+            {
+                crate::app::shell_wol::match_started(state);
+            }
             state.frontend.multiplayer_setup = None;
             state.frontend.network_setup_protocol = None;
             state.frontend.skirmish_preview_texture = None;
@@ -366,7 +387,11 @@ pub(crate) fn commit_start(state: &mut AppState, agreed_seed: u32) {
         }
         Err(error) => {
             log::error!("Could not freeze accepted LAN start: {error:#}");
-            super::commit_back(state);
+            if quick_match {
+                crate::app::shell_wol::start_aborted(state);
+            } else {
+                super::commit_back(state);
+            }
         }
     }
 }
@@ -396,6 +421,7 @@ pub(crate) fn commit_map_selection(
     state: &mut AppState,
     mode_id: i32,
     map_index: usize,
+    row: Option<usize>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         state
@@ -415,6 +441,11 @@ pub(crate) fn commit_map_selection(
         .ok_or_else(|| anyhow::anyhow!("unknown chosen map"))?;
     let file = map.file_name.clone();
     let metadata = super::local_map_metadata(state, &file)?;
+    let mode_changed = state
+        .match_state
+        .session
+        .network_setup()
+        .is_none_or(|launch| launch.mode.id != mode_id);
     let changed = state
         .match_state
         .session
@@ -452,6 +483,10 @@ pub(crate) fn commit_map_selection(
         }
         queue(state, NetworkSetupRequest::Advertise);
     }
+    // Use Map (`0x005E7160`) writes `[0xA8B254]` (0x005E7370), then runs
+    // the mode's slots on LAN and WOL alike.
+    super::note_scenario(state);
+    super::cooperative::map_used(state, mode_changed, row.unwrap_or(0))?;
     queue(state, NetworkSetupRequest::PublishOptions);
     Ok(())
 }

@@ -245,10 +245,9 @@ fn native_flag_result_and_savour_controls() {
             supplied.map_or(-1, |timer| timer[0].as_i64().unwrap() as i32),
             supplied.map_or(0, |timer| timer[2].as_i64().unwrap() as i32),
         );
-        house.supply_outcome_state_for_test(
+        house.supply_result_flags_for_test(
             input["won"].as_i64().unwrap_or(0) != 0,
             input["lost"].as_i64().unwrap_or(0) != 0,
-            None,
             timer,
         );
         sim.houses.register(house);
@@ -261,9 +260,9 @@ fn native_flag_result_and_savour_controls() {
         }
         let skip = input["skip_timer"].as_bool().unwrap_or(false);
         let returned = match input["operation"].as_str().unwrap() {
-            "win" => sim.flag_house_to_win(owner, Some(&rules), skip, Default::default()),
-            "lose" => sim.flag_house_to_lose(owner, Some(&rules), skip, Default::default()),
-            "end" => sim.trigger_house_outcome(69, 0, Some(&rules), Default::default()),
+            "win" => sim.flag_house_to_win(owner, &rules, skip, Default::default()),
+            "lose" => sim.flag_house_to_lose(owner, &rules, skip, Default::default()),
+            "end" => sim.trigger_house_outcome(69, 0, &rules, Default::default()),
             other => panic!("unhandled control {other}"),
         };
         let house = &sim.houses[&owner];
@@ -329,29 +328,18 @@ fn native_house_result_zero_and_allow_win_heads() {
             input["timer"][2].as_i64().unwrap() as i32,
         );
         let mut house = HouseState::new(Default::default(), 0, None, true, 0, 10);
-        house.supply_outcome_state_for_test(
-            won,
-            !won,
-            Some(crate::sim::house_state::HouseOutcomeState {
-                kind: if won {
-                    crate::sim::house_state::HouseOutcomeKind::Victory
-                } else {
-                    crate::sim::house_state::HouseOutcomeKind::Defeat
-                },
-                exit_ready: false,
-            }),
-            timer,
-        );
+        house.supply_result_flags_for_test(won, !won, timer);
         house.supply_allow_win_tag_state(input["allow_win"].as_i64().unwrap() as i32, timer);
-        let ready = house.advance_outcome_savour(
+        let ready = house.pending_outcome(
             input["frame"].as_i64().unwrap() as i32,
             input["game_mode"].as_i64().unwrap() != 0,
         );
-        assert_eq!(ready, row["gate"] == "result_wait", "{name}");
+        assert_eq!(ready.is_some(), row["gate"] == "result_wait", "{name}");
     }
 }
 
 #[derive(serde::Deserialize)]
+#[cfg(not(feature = "ares"))]
 struct NativeGateCase {
     input: serde_json::Value,
     events: Vec<String>,
@@ -365,6 +353,7 @@ struct NativeGateCase {
 /// (a cancelling sum defeats; BuildRefinery's third type counts only when
 /// set).
 #[test]
+#[cfg(not(feature = "ares"))]
 fn native_defeat_gate_corpus() {
     let cases: Vec<NativeGateCase> = serde_json::from_str(crate::test_fixture::text(
         "tools/spatial_oracle/house_defeat_gate.json",
@@ -439,6 +428,117 @@ fn native_defeat_gate_corpus() {
     }
 }
 
+/// Regression for the observed fourth-side opening: construction-to-destruction
+/// MCV tracking, even in limbo, reaches the real House rung. Retail deliberately
+/// considers only the first three BaseUnit slots; Ares considers the fourth too.
+#[test]
+fn fourth_base_unit_survival_reaches_the_production_defeat_gate() {
+    let mut rules = rules(3);
+    rules.general.base_unit_types.push("TANK".into());
+    let (mut sim, houses) = sim_with_houses(&[0]);
+    let owner = houses[0];
+    sim.session.game_options_mut_for_test().short_game = true;
+    let extra_mcv = sim
+        .spawn_object_limbo_at_height("TANK", "house0", 10, 10, 0, 0, &rules)
+        .unwrap();
+    sim.check_defeat(Some(&rules), None);
+    assert_eq!(
+        sim.houses[&owner].is_defeated(),
+        !crate::rules::ARES_ENABLED
+    );
+    if crate::rules::ARES_ENABLED {
+        sim.uninit_with_rules(extra_mcv, &rules);
+        sim.flush_pending_delete();
+        sim.check_defeat(Some(&rules), None);
+        assert!(sim.houses[&owner].is_defeated());
+    }
+}
+
+/// An explicit false on a building must override Ares's building default in
+/// both modes; the retail binary ignores the extension and keeps the building.
+#[test]
+fn explicit_keep_alive_false_reaches_both_production_mode_arms() {
+    for short_game in [false, true] {
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[BuildingTypes]\n0=MARKER\n[MARKER]\nStrength=100\nKeepAlive=no\n",
+        ))
+        .unwrap();
+        let (mut sim, houses) = sim_with_houses(&[0]);
+        sim.session.game_options_mut_for_test().short_game = short_game;
+        sim.spawn_object_limbo_at_height("MARKER", "house0", 10, 10, 0, 0, &rules)
+            .unwrap();
+        sim.check_defeat(Some(&rules), None);
+        assert_eq!(
+            sim.houses[&houses[0]].is_defeated(),
+            crate::rules::ARES_ENABLED
+        );
+    }
+}
+
+/// Rebuild only the native gate's supplied counter/object boundary, then use
+/// the real World presence query and House rung. Parasite input is an allocated
+/// class, not a victim/eater link; this is not a whole parasite lifecycle test.
+#[cfg(feature = "ares")]
+#[test]
+fn ares_normal_defeat_gate_matches_executed_object_array_controls() {
+    let corpus = crate::test_fixture::json("tools/spatial_oracle/ares_house_survival.json");
+    for row in corpus["survival_cases"].as_array().unwrap() {
+        let input = &row["input"];
+        if input["short_game"] != false || input["keep_alive_count"] != 0 {
+            continue;
+        }
+        let rules = rules(3);
+        let (mut sim, houses) = sim_with_houses(&[0, 1]);
+        sim.houses
+            .get_mut(&houses[1])
+            .unwrap()
+            .set_multiplay_passive_for_test(true);
+        sim.session.game_options_mut_for_test().short_game = false;
+        for (class, kind) in [("unit", "TANK"), ("infantry", "CLEG"), ("aircraft", "AIR")] {
+            for object in input["objects"][class].as_array().unwrap() {
+                let owner = if object["owner"] == "ours" {
+                    "house0"
+                } else {
+                    "house1"
+                };
+                let id = sim
+                    .spawn_object_limbo_at_height(kind, owner, 10, 10, 0, 0, &rules)
+                    .unwrap();
+                let entity = sim.substrate.entities.get_mut(id).unwrap();
+                entity
+                    .lifecycle
+                    .set_in_limbo_for_test(object["limbo"].as_bool().unwrap());
+                if object["parasite"] == true {
+                    entity.parasite.allocate_class(100);
+                }
+            }
+        }
+        let int = |key: &str| input[key].as_i64().unwrap_or(0) as i32;
+        let refinery = sim.interner.intern("YAREFN");
+        sim.houses
+            .get_mut(&houses[0])
+            .unwrap()
+            .tracking_mut()
+            .set_for_test(
+                int("buildings"),
+                &[],
+                (
+                    int("active_units"),
+                    int("active_infantry"),
+                    int("active_aircraft"),
+                ),
+                &[(refinery, int("active_yarefn"))],
+            );
+        sim.check_defeat(Some(&rules), None);
+        assert_eq!(
+            sim.houses[&houses[0]].is_defeated(),
+            !row["events"].as_array().unwrap().is_empty(),
+            "{}",
+            input["name"]
+        );
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct NativeBlowupCase {
     input: serde_json::Value,
@@ -453,10 +553,8 @@ struct NativeBlowupCase {
 /// damage = its Health, distance, C4Warhead, no attacker, ignoreDefenses,
 /// no escape, no source house); a captive of another house handed to the
 /// Civilian-side house, or killed when none exists; our own captive spared;
-/// a warped object released first. The trigger-held original owner
-/// (`trigger_owned_elsewhere_dies`) has no VERA state and is skipped. VERA's
-/// deferred deletion never shifts the array; the removal case shows native
-/// re-reading the slot, so the call order is the same.
+/// a warped object released first. The shared registry walk re-reads live
+/// slots after callbacks, matching the native removal case's call order.
 #[test]
 fn native_blowup_subsets_corpus() {
     let cases: Vec<NativeBlowupCase> = serde_json::from_str(crate::test_fixture::text(
@@ -592,9 +690,6 @@ fn native_blowup_all_corpus() {
     for case in cases {
         let input = &case.input;
         let name = input["name"].as_str().unwrap();
-        if name == "trigger_owned_elsewhere_dies" {
-            continue;
-        }
         let sides: Vec<u8> = input["houses"]
             .as_array()
             .unwrap()
@@ -617,6 +712,12 @@ fn native_blowup_all_corpus() {
                 entity.set_owner_for_test(owner);
                 entity.set_type_ref_for_test(sim.interner.intern("TANK"));
                 entity.set_category_for_test(EntityCategory::Unit);
+                if let Some(original) = object["trigger_owner"].as_u64() {
+                    entity.mind_control = MindControlLink::controlled_by_house_for_test(
+                        owner,
+                        houses[original as usize],
+                    );
+                }
                 entity
                     .health
                     .set_for_test(object["health"].as_i64().unwrap_or(100) as i32);

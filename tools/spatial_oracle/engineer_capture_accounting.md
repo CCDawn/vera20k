@@ -8,8 +8,7 @@ read-only observation hooks; it contains no accounting or capture algorithm.
 The primitive Engineer and Construction payloads, and both joined corpora,
 are independent inputs and are not rewritten by this companion.
 
-The active-retail executable is `gamemd.exe`, image base `00400000`, SHA256
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`.
+The active-retail executable is `gamemd.exe`, image base `00400000`.
 The `.meta.json` records the Unicorn versions, native entries, supplied
 boundaries, inherited fixture provenance and the canonical payload hash. The JSON records retail file hashes
 and selected native reader outputs, not retail executable or asset bytes.
@@ -33,6 +32,41 @@ the executable. Default execution checks without writing; `--write` deliberately
 regenerates only this companion and its provenance sidecar. `--output` changes
 only the reference destination through the shared checker.
 
+`--entered-owner` selects the separate `engineer_capture_entered_owner.json`
+comparison:
+
+```sh
+python -m tools.spatial_oracle.engineer_capture_accounting --entered-owner --check
+```
+
+This joins both original building Entered1 calls (`519B53`, `519F44`) to real
+repeatable Tag/Trigger/Event callbacks and Action36 ownership changes. T0 sets
+Global11 after the first callback; T1 requires that flag before the second.
+The four controls change the entrant's owner on neither callback, the first,
+the second, or both. `519F71` then reads the current entrant owner for capture.
+Each control overrides the inherited supplied runtime mode to Skirmish5 before
+target setup, actor construction and command delivery, and records its readback
+after destruction. Native mode selection and complete startup remain excluded;
+the inherited earlier retail type-reader setup remains unchanged.
+Original Foot/Techno ChangeOwner clears its orders without restarting the
+already admitted PerCell continuation. Building ownership/accounting,
+evacuation, Engineer UnInit and deferred destruction execute afterward.
+
+The supplied flat-map class/height plane uses the existing native connectivity
+and Pathfinder producers, since evacuation can enter Scatter/pathfinding after
+Action36 clears the destination. Four human Houses have independent tracking
+storage and explicit Country identities. Definitions, admitted target and
+already paid arrival head are inputs; whole native map loading, ordinary travel,
+full House startup and hardware presentation remain outside these controls.
+The entrant has no Tag. The Rust production regression separately exercises
+ordinary command/movement and the transfer of an inert entrant Tag; that extra
+composition is not claimed as a native golden. Original executable sections,
+required callback/capture/destruction routes, RNG-call completion and the Infantry
+vtable remain checked internally. This fixture retains only the callback-change
+flags, runtime mode and final owner read by the Rust regression, plus its source
+marker; its sidecar records the scope, replay command and payload integrity hash.
+The default accounting comparison below retains its existing observations.
+
 ## Executed controls
 
 The schema version is `1`, kind
@@ -49,7 +83,7 @@ the tested calls, native requested draws and underlying raw advances, the
 existing owner's call/lifecycle trace, observed accounting stores, original
 instruction bytes at the visited accounting sites, instruction count and
 ordered/unique PC hashes. The existing fixture checks every executable section
-against the pinned original PE before execution; the companion requires those
+against the original PE file before execution; the companion requires those
 sections unchanged after each control and no unfinished RNG call. Runtime
 `AC13C8`/`AC13BC` values are observed after the inherited original Object CRT
 startup. They are not supplied accounting answers.

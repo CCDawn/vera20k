@@ -97,7 +97,7 @@ fn bullet_palette_context_ignores_animation_aliases_and_alt_palette() {
         projectile.firers_palette = firer;
         let key = projectile_key("Cannon", &projectile, 0, HouseColorIndex(4));
         assert_eq!(
-            sprite_palette_for_key(&key, Some(art), &effects, &cells),
+            sprite_palette_for_key(&key, Some(art), &effects, &cells, None),
             expected
         );
         assert_eq!(
@@ -328,6 +328,7 @@ fn retail_hills_projectile_assets_match_original_reader_and_physical_bytes() {
         "TEMPERATE",
         Some(rules),
         Some(art),
+        ShpImageKind::Object,
     )
     .unwrap();
     source.draw_offsets = (0, 0);

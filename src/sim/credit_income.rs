@@ -19,10 +19,12 @@ use crate::map::entities::EntityCategory;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::houses::Houses;
 use crate::sim::intern::InternedId;
+use crate::sim::intern::StringInterner;
 #[cfg(any(test, feature = "test-support"))]
 use crate::sim::mission::MissionType;
 use crate::sim::movement::locomotor::MovementLayer;
 use crate::sim::power_system::PowerStates;
+use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::timer::CdTimer;
 use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::Simulation;
@@ -149,8 +151,8 @@ pub(crate) fn spend_money(houses: &mut Houses, owner: InternedId, amount: i32) {
 /// [`Economy::available_money`](crate::sim::economy::Economy::available_money)
 /// of `owner`'s wallet (the money interface's slot `+0x18`,
 /// `Available_Money @ 0x004F6990`); 0 for a house that does not exist.
-pub(crate) fn available_money(sim: &Simulation, owner: InternedId) -> i32 {
-    sim.houses
+pub(crate) fn available_money(houses: &Houses, owner: InternedId) -> i32 {
+    houses
         .get(&owner)
         .map_or(0, |house| house.economy().available_money())
 }
@@ -169,23 +171,25 @@ pub(crate) fn available_money(sim: &Simulation, owner: InternedId) -> i32 {
 /// Capture by a non-passive house from a non-passive house (an engineer
 /// retaking a derrick) grants nothing and leaves the timer running as it was.
 pub(crate) fn produce_cash_on_owner_change(
-    sim: &mut Simulation,
+    interner: &StringInterner,
+    session: &ScenarioSession,
+    substrate: &mut ObjectSubstrate,
+    houses: &mut Houses,
     stable_id: u64,
     old_owner: InternedId,
     new_owner: InternedId,
     rules: &RuleSet,
 ) {
-    let Some(entity) = sim.substrate.entities.get(stable_id) else {
+    let Some(entity) = substrate.entities.get(stable_id) else {
         return;
     };
     if entity.category() != EntityCategory::Structure {
         return;
     }
-    let Some(obj) = sim.interner.object_type(entity.type_ref(), rules) else {
+    let Some(obj) = interner.object_type(entity.type_ref(), rules) else {
         return;
     };
-    let old_passive = sim
-        .houses
+    let old_passive = houses
         .get(&old_owner)
         .is_some_and(|house| house.multiplay_passive());
     if !old_passive || obj.produce_cash_startup == 0 {
@@ -193,26 +197,31 @@ pub(crate) fn produce_cash_on_owner_change(
     }
     let startup = obj.produce_cash_startup;
     let delay = obj.produce_cash_delay;
-    let frame = sim.session.binary_frame();
-    add_credits(&mut sim.houses, new_owner, startup);
-    if let Some(entity) = sim.substrate.entities.get_mut(stable_id) {
+    let frame = session.binary_frame();
+    add_credits(houses, new_owner, startup);
+    if let Some(entity) = substrate.entities.get_mut(stable_id) {
         entity.produce_cash.arm(frame, delay);
     }
 }
 
 ///445FA5..445FC8: every admitted Grand_Opening rearms a nonzero delay,
 /// including the already-placed capture arm. Zero leaves the prior timer.
-pub(crate) fn produce_cash_on_grand_opening(sim: &mut Simulation, id: u64, rules: &RuleSet) {
-    let delay = sim
-        .substrate
+pub(crate) fn produce_cash_on_grand_opening(
+    interner: &StringInterner,
+    session: &ScenarioSession,
+    substrate: &mut ObjectSubstrate,
+    id: u64,
+    rules: &RuleSet,
+) {
+    let delay = substrate
         .entities
         .get(id)
-        .and_then(|entity| sim.object_type(entity.type_ref(), rules))
+        .and_then(|entity| interner.object_type(entity.type_ref(), rules))
         .map_or(0, |object| object.produce_cash_delay);
     if delay != 0
-        && let Some(entity) = sim.substrate.entities.get_mut(id)
+        && let Some(entity) = substrate.entities.get_mut(id)
     {
-        entity.produce_cash.arm(sim.session.binary_frame(), delay);
+        entity.produce_cash.arm(session.binary_frame(), delay);
     }
 }
 
@@ -224,10 +233,10 @@ pub(crate) fn produce_cash_on_grand_opening(sim: &mut Simulation, id: u64, rules
 /// else `Spend_Money(-amount)` (`0x0043FDAA..0x0043FDD1`).
 ///
 /// The two warp gates ahead of the block (`IsWarpingOut` `+0x270` at
-/// `0x0043FD0C`, `IsBeingWarped` `+0x271` at `0x0043FD1E`) jump past it; VERA
-/// has no chrono-warp bytes on a building, so the block always runs.
-/// Residual trigger: a captured derrick inside a Chronosphere warp — the
-/// native timer dies on the skipped frame, VERA's keeps paying.
+/// `0x0043FD0C`, `IsBeingWarped` `+0x271` at `0x0043FD1E`) jump past it. In
+/// VERA the object turn's temporal prologue (`temporal_ai_prologue`) returns
+/// for a warped building before this step, so a timer whose expiry frame
+/// falls inside the warp dies as natively.
 pub(crate) fn produce_cash_step(sim: &mut Simulation, stable_id: u64, rules: &RuleSet) {
     let Some(entity) = sim.substrate.entities.get(stable_id) else {
         return;
@@ -372,7 +381,7 @@ pub(crate) fn attach_drain_anim(sim: &mut Simulation, drainer_id: u64, rules: &R
 
 /// The `+0x1D4` DrainAnim un-init (vt+0xF8) that opens every native break
 /// of a drain link, for `drainer_id`.
-fn remove_drain_anim(sim: &mut Simulation, drainer_id: u64, rules: Option<&RuleSet>) {
+fn remove_drain_anim(sim: &mut Simulation, drainer_id: u64, rules: &RuleSet) {
     if let Some(anim) = sim
         .substrate
         .entities
@@ -387,7 +396,7 @@ fn remove_drain_anim(sim: &mut Simulation, drainer_id: u64, rules: Option<&RuleS
 /// the `DrainAnim`, clear the victim's `DrainingMe`, flag its house's power
 /// recalc, clear the drainer's `DrainTarget`. Also the inline copy in
 /// `TechnoClass::AI_Update @ 0x006FA1DF..0x006FA21E`.
-pub(crate) fn stop_drain(sim: &mut Simulation, drainer_id: u64, rules: Option<&RuleSet>) {
+pub(crate) fn stop_drain(sim: &mut Simulation, drainer_id: u64, rules: &RuleSet) {
     remove_drain_anim(sim, drainer_id, rules);
     let Some(victim_id) = sim
         .substrate
@@ -414,13 +423,9 @@ pub(crate) fn stop_drain(sim: &mut Simulation, drainer_id: u64, rules: Option<&R
 /// dying object drops both halves of any drain link it is part of, the
 /// drainer's DrainAnim first on each side. The killing hit reaches it through
 /// its Destroy's Detach_All broadcast (`0x005F5280`, the receiver's
-/// `object_destroy_callback`), in the same ReceiveDamage and before any draw
+/// `detach_all`), in the same ReceiveDamage and before any draw
 /// the death arm makes, so a falling wreck no longer drains or shows its ray.
-pub(crate) fn clear_drain_links_on_expiry(
-    sim: &mut Simulation,
-    expired_id: u64,
-    rules: Option<&RuleSet>,
-) {
+pub(crate) fn clear_drain_links_on_expiry(sim: &mut Simulation, expired_id: u64, rules: &RuleSet) {
     let Some((drain_target, draining_me)) = sim
         .substrate
         .entities
@@ -483,13 +488,14 @@ pub(crate) fn clear_drain_links_on_expiry(
 ///    refineries `GAREFN`/`NAREFN`/`YAREFN`); a drained `GAPOWR` loses power
 ///    (the `+0x5778` recalc, retained House assessment) but no credits.
 /// 2. Drainer side `0x006FA1C5..0x006FA224`: with `DrainTarget` (`+0x1CC`)
-///    set and `HouseClass::IsAlliedWith(target->Owner, this)` true, stop the
-///    drain inline.
+///    set and the target's house allied with this object's
+///    (`HouseClass::Is_Ally_ByObject @ 0x004F9A90`, asked by the target's
+///    house at `0x006FA1CF`), stop the drain inline.
 pub(crate) fn drain_common_step(sim: &mut Simulation, stable_id: u64, rules: &RuleSet) {
     let Some(entity) = sim.substrate.entities.get(stable_id) else {
         return;
     };
-    let victim_owner = entity.owner();
+    let owner = entity.owner();
     let draining_me = entity.drain.draining_me;
     let drain_target = entity.drain.target;
     let type_ref = entity.type_ref();
@@ -511,11 +517,11 @@ pub(crate) fn drain_common_step(sim: &mut Simulation, stable_id: u64, rules: &Ru
                 .map(|drainer| drainer.owner())
         {
             let mut amount = rules.general.drain_money_amount;
-            let available = available_money(sim, victim_owner);
+            let available = available_money(&sim.houses, owner);
             if available < amount {
                 amount = available;
             }
-            spend_money(&mut sim.houses, victim_owner, amount);
+            spend_money(&mut sim.houses, owner, amount);
             add_credits(&mut sim.houses, drainer_owner, amount);
         }
     }
@@ -526,13 +532,13 @@ pub(crate) fn drain_common_step(sim: &mut Simulation, stable_id: u64, rules: &Ru
             .entities
             .get(victim_id)
             .map(|victim| victim.owner())
-        && crate::map::houses::are_houses_friendly(
+        && crate::map::houses::is_allied_with(
             sim.house_alliances.as_map(),
             sim.interner.resolve(target_owner),
-            sim.interner.resolve(victim_owner),
+            sim.interner.resolve(owner),
         )
     {
-        stop_drain(sim, stable_id, Some(rules));
+        stop_drain(sim, stable_id, rules);
     }
 }
 
@@ -543,7 +549,7 @@ pub(crate) fn drain_common_step(sim: &mut Simulation, stable_id: u64, rules: &Ru
 ///    unit's own cell and stop the drain when it is no longer the target.
 /// 2. `0x007361E9..0x00736204`: a `DrainAnim` (`+0x1D4`) left with no
 ///    `DrainTarget` is removed through Stop_Drain.
-pub(crate) fn drain_unit_ai_step(sim: &mut Simulation, stable_id: u64, rules: Option<&RuleSet>) {
+pub(crate) fn drain_unit_ai_step(sim: &mut Simulation, stable_id: u64, rules: &RuleSet) {
     let Some((target, anim, rx, ry)) = sim.substrate.entities.get(stable_id).map(|entity| {
         (
             entity.drain.target,
@@ -762,7 +768,7 @@ mod tests {
             "still on the ground list"
         );
         sim.session.set_binary_frame_for_test(2);
-        drain_unit_ai_step(&mut sim, disc, Some(&rules));
+        drain_unit_ai_step(&mut sim, disc, &rules);
         assert_eq!(
             sim.entities().get(disc).unwrap().drain.target(),
             Some(refinery)
@@ -772,14 +778,14 @@ mod tests {
             crate::sim::world::UninitContext::with_rules(&rules)
         ));
         sim.session.set_binary_frame_for_test(17);
-        drain_unit_ai_step(&mut sim, disc, Some(&rules));
+        drain_unit_ai_step(&mut sim, disc, &rules);
         assert_eq!(
             sim.entities().get(disc).unwrap().drain.target(),
             Some(refinery),
             "not a recheck frame"
         );
         sim.session.set_binary_frame_for_test(18);
-        drain_unit_ai_step(&mut sim, disc, Some(&rules));
+        drain_unit_ai_step(&mut sim, disc, &rules);
         assert_eq!(sim.entities().get(disc).unwrap().drain.target(), None);
         assert_eq!(
             sim.entities().get(refinery).unwrap().drain.draining_me(),
@@ -1019,6 +1025,41 @@ mod tests {
         );
     }
 
+    /// The drainer side stops the link once the drained building's house is
+    /// allied with the disc's, as the building's house asks it (`0x006FA1CF`,
+    /// `HouseClass::Is_Ally_ByObject @ 0x004F9A90`): the disc's house allying
+    /// the building's alone keeps the link.
+    #[test]
+    fn the_drained_buildings_house_asks_whether_the_drain_stops() {
+        let rules = rules();
+        let linked = |asker: &str, other: &str| {
+            let mut sim = Simulation::with_seed(0x006F_A1CF);
+            house(&mut sim, "YuriCountry", false, 500);
+            house(&mut sim, "Americans", true, 75);
+            let plant = sim
+                .spawn_object("GAPOWR", "Americans", 20, 20, 0, &rules)
+                .expect("power plant spawns");
+            let disk = sim
+                .spawn_object("DISK", "YuriCountry", 21, 21, 0, &rules)
+                .expect("disc spawns");
+            assert!(install_drain_link(
+                &mut sim.substrate,
+                &sim.houses,
+                &mut sim.power_states,
+                disk,
+                plant
+            ));
+            *sim.house_alliances_mut_for_test() = crate::map::houses::HouseAllianceMap::from([(
+                asker.to_ascii_uppercase(),
+                [other.to_ascii_uppercase()].into(),
+            )]);
+            drain_common_step(&mut sim, disk, &rules);
+            sim.substrate.entities.get(disk).unwrap().drain.target == Some(plant)
+        };
+        assert!(linked("YuriCountry", "Americans"));
+        assert!(!linked("Americans", "YuriCountry"));
+    }
+
     /// `TechnoClass::AI_Update @ 0x006FA15D` reads `Type+0x5ED` =
     /// `ResourceDestination`, not `Drainable` (`+0x5EF`): a drained `GAPOWR`
     /// keeps its link (the `Fire_At` gate at `0x006FDF7B` is the `Drainable`
@@ -1161,6 +1202,36 @@ mod tests {
         );
     }
 
+    /// The drain re-check (`0x007361A9..0x00736204`) precedes
+    /// `TemporalClass::Update` (`0x00736204`), so a disc being erased still
+    /// drops a ray left with no link.
+    #[test]
+    fn a_warped_disc_still_drops_a_ray_with_no_link() {
+        let rules = rules();
+        let mut sim = Simulation::with_seed(0x0073_61A9);
+        let _yuri = house(&mut sim, "YuriCountry", false, 500);
+        let _americans = house(&mut sim, "Americans", true, 500);
+        base(&mut sim, &rules, "YuriCountry", 40, 40);
+        base(&mut sim, &rules, "Americans", 4, 4);
+        let disk = sim
+            .spawn_object("DISK", "YuriCountry", 30, 30, 0, &rules)
+            .expect("disc spawns");
+        attach_drain_anim(&mut sim, disk, &rules);
+        let stray = assert_drain_anim(&sim, disk);
+        sim.substrate
+            .entities
+            .get_mut(disk)
+            .unwrap()
+            .set_temporal_for_test(crate::sim::temporal::TemporalState::warped_by_for_test(
+                disk,
+            ));
+        run_ticks(&mut sim, &rules, 1);
+        let disc = sim.entities().get(disk).unwrap();
+        assert!(disc.is_warped_out(), "the fixture keeps the disc warped");
+        assert_eq!(disc.drain.anim, None);
+        assert!(anim_uninited(&sim, stray));
+    }
+
     /// `UnitClass::AI @ 0x007361B3`: every 16th frame the disc re-checks the
     /// building under it and releases the link once it has moved off;
     /// `0x0070FD70` refuses to link a disc that is not over the target.
@@ -1222,7 +1293,7 @@ mod tests {
         attach_drain_anim(&mut sim, disk, &rules);
         let stray = assert_drain_anim(&sim, disk);
         sim.session.set_binary_frame_for_test(5);
-        drain_unit_ai_step(&mut sim, disk, Some(&rules));
+        drain_unit_ai_step(&mut sim, disk, &rules);
         assert_eq!(sim.entities().get(disk).unwrap().drain.anim, None);
         assert!(anim_uninited(&sim, stray));
 

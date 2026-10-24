@@ -29,7 +29,7 @@ fn original_selfheal_tail_and_192_height_rows_retain_art_and_mark_smoke() {
         rules.general.repair_rate_minutes = 1.0;
         rules.general.condition_yellow = 0.5;
         let mut sim = Simulation::new();
-        assert_eq!(sim.allocate_stable_id(), 1);
+        assert_eq!(sim.substrate.allocate_stable_id(), 1);
         let mut entity =
             GameEntity::test_default_of_category(1, "SIGNED", "A", 2, 2, EntityCategory::Structure);
         entity.set_type_ref_for_test(sim.interner.intern("SIGNED"));
@@ -81,7 +81,14 @@ fn original_selfheal_tail_and_192_height_rows_retain_art_and_mark_smoke() {
             .damage_smoke_system_id
             .set_for_test(Some(smoke_id));
         let before_rng = sim.scenario_rng.logical_state();
-        self_heal_step(&mut sim, 1, &rules);
+        self_heal_step(
+            &sim.interner,
+            &sim.session,
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            1,
+            &rules,
+        );
         let entity = sim.substrate.entities.get(1).unwrap();
         assert_eq!(
             entity.health.current(),
@@ -169,7 +176,14 @@ fn production_self_heal_matches_original_signed_cadence_and_increment() {
                 "{row}"
             );
         }
-        self_heal_step(&mut sim, 1, &rules);
+        self_heal_step(
+            &sim.interner,
+            &sim.session,
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            1,
+            &rules,
+        );
         let entity = sim.substrate.entities.get(1).unwrap();
         assert_eq!(
             entity.health.current(),
@@ -187,7 +201,14 @@ fn production_self_heal_matches_original_signed_cadence_and_increment() {
     for row in faults {
         let (mut sim, rules) = fixture(row);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self_heal_step(&mut sim, 1, &rules)
+            self_heal_step(
+                &sim.interner,
+                &sim.session,
+                &mut sim.substrate,
+                &sim.resolved_terrain,
+                1,
+                &rules,
+            )
         }));
         assert!(
             result.is_err(),
@@ -233,7 +254,7 @@ fn building_damage_fire_runs_before_yellow_crossing_selfheal() {
     )).unwrap();
     rules.general.repair_rate_minutes = 1.0;
     let mut sim = Simulation::new();
-    let id = sim.allocate_stable_id();
+    let id = sim.substrate.allocate_stable_id();
     let mut building = GameEntity::test_default_of_category(
         id,
         "B",

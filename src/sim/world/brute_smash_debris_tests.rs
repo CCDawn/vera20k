@@ -152,7 +152,7 @@ fn brute_smash_emits_debris(elite: bool, expected: SmashDebrisExpectation) {
         let output = sim
             .advance_app_frame(
                 &commands,
-                Some(&rules),
+                &rules,
                 None,
                 33,
                 TickLane::Ordinary,
@@ -324,7 +324,7 @@ fn brute_smash_emits_debris(elite: bool, expected: SmashDebrisExpectation) {
                 let commands = sim.take_due_commands();
                 sim.advance_app_frame(
                     &commands,
-                    Some(&rules),
+                    &rules,
                     None,
                     33,
                     TickLane::Ordinary,
@@ -336,7 +336,7 @@ fn brute_smash_emits_debris(elite: bool, expected: SmashDebrisExpectation) {
                     loaded
                         .advance_app_frame(
                             &commands,
-                            Some(&rules),
+                            &rules,
                             None,
                             33,
                             TickLane::Ordinary,
@@ -639,7 +639,7 @@ fn compare_native_smashing_tail(retired: bool, typed: bool) {
             ProjectileTarget::Cell { rx: 10, ry: 20 },
             ProjectileTarget::Entity,
         );
-        let id = world.allocate_stable_id();
+        let id = world.substrate.allocate_stable_id();
         world.admit_projectile(
             id,
             ProjectileSpawn {

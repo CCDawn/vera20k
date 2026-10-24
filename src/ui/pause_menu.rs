@@ -15,6 +15,7 @@
 //! | 3 | abort-mission confirm | the menu's Abort Mission button | see below |
 //! | 5 | Game Controls / Options | the menu's Options button | back to 1 |
 //! | 8 | Diplomacy (dialog 0x73) | the sidebar Diplomacy button, Tab | Return: 0 |
+//! | 9 | mission restate briefing (dialog 0x10C) | the sidebar Diplomacy button in campaign and Cooperative | Return: 0 |
 //!
 //! Two re-entry rules matter to the player and are reproduced here:
 //!
@@ -57,8 +58,7 @@
 /// restricted to the values a stock offline skirmish can reach.
 ///
 /// States deliberately absent: the surrender-and-be-scored state (gated on a
-/// WOL-only mode), the replay state, the campaign mission-restate state, the
-/// multiplayer objectives state.
+/// WOL-only mode), the replay state, the multiplayer objectives state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InGameMenuState {
     /// No modal is open — the mission runs. (gamemd: 0)
@@ -66,6 +66,9 @@ pub enum InGameMenuState {
     Closed,
     /// The in-game menu. (gamemd: 1)
     Menu,
+    /// The WOL tournament Surrender box, ShellMessageBox `0x120` over the
+    /// battlefield. (gamemd: 2)
+    Surrender,
     /// The abort-mission confirmation. (gamemd: 3)
     AbortConfirm,
     /// Game Controls / Options — a child of [`InGameMenuState::Menu`]. (gamemd: 5)
@@ -74,8 +77,13 @@ pub enum InGameMenuState {
     Sound,
     /// Shared Keyboard A3, child of Game Controls (native state4).
     Keyboard,
+    /// The WOL page dialog 0xCF, opened by PageUser. (gamemd: 7) It is a
+    /// compact popup over the live battlefield, not a full-screen shell.
+    Page,
     /// The Diplomacy dialog 0x73. (gamemd: 8)
     Diplomacy,
+    /// The mission restate briefing, dialog 0x10C. (gamemd: 9)
+    MissionBriefing,
     /// Native558DD0 browser nested beneath B5. Its mode has no independent
     /// scenario-state number: native keeps the parent hidden during this call.
     SavedGame(crate::ui::skirmish_shell::SavedSeedMode),
@@ -86,6 +94,14 @@ impl InGameMenuState {
     /// the simulation for exactly this condition.
     pub fn is_open(self) -> bool {
         !matches!(self, Self::Closed)
+    }
+
+    /// The battlefield keeps drawing under this modal: the modal pump's
+    /// Main_Tick still blits the tactical surface (`0x004F4780` only changes
+    /// its copy flag while `g_WSDialogCount` is nonzero), and the popup
+    /// window sits over it.
+    pub fn draws_over_battlefield(self) -> bool {
+        matches!(self, Self::Page | Self::Surrender)
     }
 
     /// Where Escape goes from here.
@@ -109,8 +125,18 @@ impl InGameMenuState {
             // The 0x73 proc resolves its command by GetDlgCtrlID(lParam)
             // (0x006581A7). IDCANCEL names no child window, so the id is 0:
             // neither Return 0x423 nor in its box tables. Escape is ignored.
-            Self::SavedGame(_) | Self::Sound | Self::Diplomacy => self,
+            // The 0x10C proc keys Return the same way (0x0065F710).
+            // The 0xCF loop (0x007759E0 with 0x00623120) runs no
+            // IsDialogMessage, so Escape never reaches the proc.
+            Self::SavedGame(_)
+            | Self::Sound
+            | Self::Diplomacy
+            | Self::MissionBriefing
+            | Self::Page => self,
             Self::Keyboard => Self::Options,
+            // ShellMessageBox's callback 0x005D36A0 answers IDCANCEL with
+            // result 1: no surrender, state 0.
+            Self::Surrender => Self::Closed,
         }
     }
 }
@@ -188,16 +214,16 @@ mod tests {
         assert!(InGameMenuState::AbortConfirm.is_open());
         assert!(InGameMenuState::Options.is_open());
         assert!(InGameMenuState::Diplomacy.is_open());
+        assert!(InGameMenuState::MissionBriefing.is_open());
     }
 
-    /// Dialog 0x73 has no cancel path: only Return closes it.
+    /// Dialogs 0x73 and 0x10C have no cancel path: only Return closes them.
     #[test]
-    fn escape_keeps_the_diplomacy_dialog_open() {
-        assert_eq!(
-            InGameMenuState::Diplomacy.on_escape(),
-            InGameMenuState::Diplomacy
-        );
-        assert!(escape_belongs_to_modal_machine(InGameMenuState::Diplomacy));
+    fn escape_keeps_diplomacy_and_the_briefing_open() {
+        for state in [InGameMenuState::Diplomacy, InGameMenuState::MissionBriefing] {
+            assert_eq!(state.on_escape(), state);
+            assert!(escape_belongs_to_modal_machine(state));
+        }
     }
 
     /// Doing nothing in the abort dialog leaves the modal where it was.

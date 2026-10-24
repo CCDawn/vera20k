@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 
 use crate::map::lighting::{PointLight, point_light_from_object};
 use crate::rules::ruleset::RuleSet;
+use crate::sim::intern::StringInterner;
 use crate::sim::scenario_session::{ScenarioLightingProfile, ScenarioLightingState};
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::Simulation;
 
 /// The palette operation that accompanies a global cell refresh. Native
@@ -32,6 +34,13 @@ impl PaletteUpdate {
 
 #[derive(Debug, Clone)]
 pub enum LightingEvent {
+    /// OverlayMark5FD1ED, ObjectParadrop5F5B29 and SquidGrapple629DE5
+    /// copy signed Cell+10A into Anim+FC. Sample in this ordered stream,
+    /// before a later source/global operation changes the same cell.
+    RetainAnimIntensity {
+        anim: u64,
+        cell: Option<(u16, u16)>,
+    },
     Building {
         id: u64,
         source: Option<PointLight>,
@@ -84,6 +93,37 @@ impl LightingSources {
         self.pending.push(event);
     }
 
+    /// Drops the events no consumer took.
+    pub fn discard_pending(&mut self) {
+        self.pending.clear();
+    }
+
+    /// Native554A60/A80 suppress repeated writes to an already matching48.
+    /// Death44264C and sell449F1E/44A20B disable before destruction effects.
+    pub fn set_building_light_active(&mut self, id: u64, active: bool) {
+        let Some(source) = self.buildings.get_mut(&id) else {
+            return;
+        };
+        if source.active == active {
+            return;
+        }
+        source.active = active;
+        let source = source.clone();
+        self.pending.push(LightingEvent::Building {
+            id,
+            source: Some(source),
+        });
+    }
+
+    /// Building destructor43BD47 disables, destroys, and clears614. Generic
+    /// Limbo is deliberately not used as an invented source-disable callback.
+    pub fn destroy_building_light(&mut self, id: u64) {
+        if self.buildings.remove(&id).is_some() {
+            self.pending
+                .push(LightingEvent::Building { id, source: None });
+        }
+    }
+
     /// Take the outgoing events, oldest first.
     pub fn take_pending(&mut self) -> Vec<LightingEvent> {
         std::mem::take(&mut self.pending)
@@ -91,6 +131,16 @@ impl LightingSources {
 }
 
 impl Simulation {
+    /// Transfer the lighting transaction once, including fresh map creation.
+    pub fn take_lighting_events(&mut self) -> Vec<LightingEvent> {
+        self.lighting_sources.take_pending()
+    }
+
+    pub(crate) fn retain_anim_cell_light(&mut self, anim: u64, cell: Option<(u16, u16)>) {
+        self.lighting_sources
+            .publish(LightingEvent::RetainAnimIntensity { anim, cell });
+    }
+
     /// Preserve the existing eager restore projection while resetting the
     /// outgoing timeline. Native lazy post-load reconstruction remains open.
     /// VERA-only: the light cache, rebuilt from each alive (`+0x90`), unlimboed
@@ -110,7 +160,13 @@ impl Simulation {
             .map(|entity| entity.stable_id())
             .collect();
         for id in ids {
-            self.allocate_building_light(id, rules);
+            Self::allocate_building_light(
+                &self.interner,
+                &self.substrate,
+                &mut self.lighting_sources,
+                id,
+                rules,
+            );
             // This eager compatibility projection must retain saved6EA.
             // Temporal660 alone does not disable614; DisableStuff does.
             if self
@@ -118,30 +174,32 @@ impl Simulation {
                 .get(id)
                 .is_some_and(|entity| !entity.building_art.stuff_enabled())
             {
-                self.set_building_light_active(id, false);
+                self.lighting_sources.set_building_light_active(id, false);
             }
         }
-        self.lighting_sources.pending.clear();
-    }
-
-    pub fn discard_lighting_events(&mut self) {
         self.lighting_sources.pending.clear();
     }
 
     /// Successful Unlimbo440DFD / construction446767 allocates only when614
     /// is null, then calls554A60(0). Parameter conversion is the same existing
     /// map-light conversion; its floating inputs have presentation-only use.
-    pub fn allocate_building_light(&mut self, id: u64, rules: &RuleSet) {
-        if self.lighting_sources.buildings.contains_key(&id) {
+    pub fn allocate_building_light(
+        interner: &StringInterner,
+        substrate: &ObjectSubstrate,
+        lighting_sources: &mut LightingSources,
+        id: u64,
+        rules: &RuleSet,
+    ) {
+        if lighting_sources.buildings.contains_key(&id) {
             return;
         }
-        let Some(entity) = self.entities().get(id) else {
+        let Some(entity) = substrate.entities.get(id) else {
             return;
         };
         if entity.category() != crate::map::entities::EntityCategory::Structure {
             return;
         }
-        let Some(object) = self.interner.object_type(entity.type_ref(), rules) else {
+        let Some(object) = interner.object_type(entity.type_ref(), rules) else {
             return;
         };
         let Some(source) = point_light_from_object(
@@ -153,38 +211,11 @@ impl Simulation {
         ) else {
             return;
         };
-        self.lighting_sources.buildings.insert(id, source.clone());
-        self.lighting_sources.pending.push(LightingEvent::Building {
+        lighting_sources.buildings.insert(id, source.clone());
+        lighting_sources.pending.push(LightingEvent::Building {
             id,
             source: Some(source),
         });
-    }
-
-    /// Native554A60/A80 suppress repeated writes to an already matching48.
-    /// Death44264C and sell449F1E/44A20B disable before destruction effects.
-    pub fn set_building_light_active(&mut self, id: u64, active: bool) {
-        let Some(source) = self.lighting_sources.buildings.get_mut(&id) else {
-            return;
-        };
-        if source.active == active {
-            return;
-        }
-        source.active = active;
-        let source = source.clone();
-        self.lighting_sources.pending.push(LightingEvent::Building {
-            id,
-            source: Some(source),
-        });
-    }
-
-    /// Building destructor43BD47 disables, destroys, and clears614. Generic
-    /// Limbo is deliberately not used as an invented source-disable callback.
-    pub fn destroy_building_light(&mut self, id: u64) {
-        if self.lighting_sources.buildings.remove(&id).is_some() {
-            self.lighting_sources
-                .pending
-                .push(LightingEvent::Building { id, source: None });
-        }
     }
 
     /// Logic55B4C6 and profile53C280->53AD00 must remain in order with source

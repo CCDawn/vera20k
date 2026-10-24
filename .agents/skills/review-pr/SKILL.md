@@ -31,7 +31,9 @@ oracles, scripts) until steps 1 and 2 are clean.
    - New crates come from crates.io at a pinned version. Git, path or registry
      dependencies need a reason.
    - Large JSON or binary additions must be data that a test or tool reads, not
-     encoded payloads.
+     encoded payloads. Hold them to AGENTS.md's test limits (about 20 cases, under
+     100 KB, only asserted fields): ask the contributor to trim, or trim on
+     integration. The guard lists files over 100 KB.
    - Python tools read retail inputs and write only their own outputs: no network,
      subprocess, home-directory or credential access.
 3. **Authenticity.** Choose the 1–3 claims the behavior depends on most.
@@ -39,9 +41,9 @@ oracles, scripts) until steps 1 and 2 are clean.
      `tools.native_oracle.image_bytes()` or with Ghidra. Compare loop order,
      compares, fields read and written, gates, and any RNG, timer or detach calls
      against the Rust. Ghidra names and the PR's prose are leads, not proof.
-   - Each oracle sidecar's `native_sha256` should equal
-     `tools.native_oracle.image_sha256()`. A different retail build is not fake,
-     but its `--check` cannot be reproduced here; say so.
+   - Any `gamemd.exe` release is the same game: sidecars record the replay
+     command, not the executable's hash. Reject a hash of `gamemd.exe` or of a
+     repository source in a payload, sidecar or receipt.
    - INI claims must use the native readers in `src/rules/ini_value.rs` and check
      the retail values in every layer.
    - Goldens must come from native execution or retail bytes and run through
@@ -53,19 +55,33 @@ oracles, scripts) until steps 1 and 2 are clean.
    Report each claim as native-established, Rust-tested or unverified, with the
    addresses you read.
 4. **Integrate, but only with the user's merge authority for this author.**
-   - Fixing conflicts and API skew is our job. Merge fetched `origin/main` into a
-     detached worktree of the PR head.
-   - On a snapshot clash, keep both changelog lines and take the next free
-     `SNAPSHOT_VERSION`.
-   - Check that both crates compile with `--lib --tests`, then run focused tests
-     for the touched modules.
-   - Push to the contributor's branch, and confirm the PR head equals the SHA you
-     pushed.
+   - Steps 2 and 3 are the review; integration only proves the merge compiles.
+     Run no tests. `main` has no automatic CI, so a merge that breaks the build
+     reaches every session.
+     - Read only, no build: PRs that change no Rust (docs, Python, skills, data)
+       and tiny Rust changes (a few lines inside function bodies, no signature,
+       type or module change).
+     - Other Rust changes: compile the merge with `origin/main`,
+       `python -m tools.cargo_run -- check --workspace --lib --tests`.
+   - A PR GitHub reports as mergeable that needs no build merges without a
+     checkout. Fixing conflicts and API skew is our job, and any checkout goes in
+     a reused slot, never a new worktree: each checkout path gets its own Cargo
+     cache, so a worktree per PR rebuilds every dependency and leaves 2–14 GB
+     behind. `python <this skill>/scripts/integration_slot.py claim pr<N>` prints
+     the slot's path (`<main checkout>-wt/integration-<n>`, created on first
+     use). When every slot is held it exits 1 and names the holders; rerun it with
+     `--wait 3600` in the background rather than creating a worktree.
+   - In the slot, `git fetch origin main pull/<N>/head`,
+     `git checkout --detach <PR head SHA>`, then merge `origin/main`.
+   - Push a slot merge to the contributor's branch, and confirm the PR head
+     equals the SHA you pushed.
    - Apply [Contributor attribution](#contributor-attribution) before choosing the
      merge method. Use an explicit `--subject`, `--body-file` and
      `--match-head-commit <actual head SHA>`. Write "Part of #N" unless the PR
      really closes N.
-   - Remove the worktree and fast-forward the main checkout.
+   - Release a claimed slot with `integration_slot.py release pr<N>` once its work is
+     pushed or abandoned (`git merge --abort`); it refuses uncommitted work. Keep
+     the slot's worktree. Fast-forward the main checkout.
 5. **Report** briefly:
    - the malware verdict;
    - any protected-file findings;
@@ -92,8 +108,13 @@ oracles, scripts) until steps 1 and 2 are clean.
 - Before merging, inspect the exact author/account mapping, subject, body and
   trailers the merge will produce, including GitHub's generated defaults. Resolve
   unexpected identities, unrequested personal names and duplicate credit first.
-  If GitHub's squash would replace the contributor with the PR opener, prepare
-  one combined commit and use a merge method that preserves its author.
+- GitHub's squash authors its commit with the account's profile name and default
+  commit email, not the identity on the PR's commits, even when the contributor
+  opened the PR. Squash only when an earlier squash of that account read back
+  with its verified identity. Otherwise keep the identity on the contributor's
+  own commits: rebase-merge a single commit, or prepare one combined commit with
+  that author and rebase-merge it. When the branch is not editable, use a merge
+  commit.
 - After merging, read back the resulting commit and verify the same attribution.
   Report a mismatch and resolve it before further merges. Do not rewrite shared
   history without the user's explicit authorization.

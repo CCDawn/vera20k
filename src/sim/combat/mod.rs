@@ -26,6 +26,7 @@
 
 pub mod aim_coord;
 mod attack_target;
+mod airburst;
 pub(crate) mod base_defense_response;
 pub mod burst;
 pub(crate) mod cell_spread;
@@ -71,6 +72,8 @@ pub(crate) mod receiver_fixture;
 
 #[cfg(test)]
 mod aegis_launch_tests;
+#[cfg(all(test, feature = "ares"))]
+mod ares_armor_tests;
 #[cfg(test)]
 mod bridge_cluster_tests;
 #[cfg(test)]
@@ -113,6 +116,8 @@ mod radiation_beam_tests;
 #[cfg(test)]
 mod shrapnel_chain_tests;
 #[cfg(test)]
+mod screen_shake_tests;
+#[cfg(test)]
 mod unit_damage_response_tests;
 #[cfg(test)]
 mod walk_attack_tests;
@@ -123,17 +128,17 @@ pub(crate) use combat_targeting::build_attacker_snapshot;
 pub(crate) use detonation_anim::projectile_impact_cell;
 pub(crate) use effects::DeathEffects;
 pub use effects::{
-    CombatLightRequest, ExplosionEffect, SmudgeSpawnRequest, TiberiumReductionRequest,
-    UnderAttackEvent, UnitLostEvent,
+    CombatLightRequest, ExplosionEffect, ScreenShakeUpdate, SmudgeSpawnRequest,
+    TiberiumReductionRequest, UnderAttackEvent, UnitLostEvent,
 };
 pub use in_range::can_fire_at_target;
-pub use in_range::{can_fire_at_target_in_query, is_within_range_leptons, lepton_distance_sq_raw};
+pub use in_range::{MaplessTarget, can_fire_at_target_in_query, mapless_in_range};
 pub use object_health::{Health, health_category};
 pub(crate) use projectile_delivery::{FiredBullet, admit_fired_bullet};
-pub use receiver_call::TerrainDamageEvent;
+pub use receiver_call::{DamageWriteback, TerrainDamageEvent};
 pub(crate) use receiver_call::{
     BaseDefenseResponseCallSite, EntityDamageEvent, RAD_NO_ATTACKER, ReceiverCallFlags,
-    wave_post_object_damage,
+    receiver_divisors, wave_post_object_damage,
 };
 pub(crate) use receiver_health::BerserkState;
 pub(crate) use record_kill::{KillCallback, KillRecord, KillSource};
@@ -153,13 +158,15 @@ use attack_target::{attack_world_z_leptons, cell_center_coords, target_coords};
 use projectile_delivery::{
     ProjectileDelivery, bullet_type, classify_projectile_delivery, projectile_arm_delay,
 };
+#[cfg(feature = "phobos")]
+use receiver_call::resolve_receive_damage_with_input;
 use receiver_call::{
     BuildingReceivePrelude, ResolvedReceiveDamage, apply_building_receive_prelude,
     area_near_center_ic_isolation_armed, near_center_ic_isolation_armed,
     postmortem_duration_for_event, receiver_anger_delta, resolve_receive_damage,
 };
 use shrapnel::emit_projectile_shrapnel;
-use techno_death::{ConcreteDeathSmudgePlan, append_selected_death_sounds, throw_debris_for_death};
+use techno_death::{ConcreteDeathSmudgePlan, throw_debris_for_death};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use attack_target::{
@@ -192,7 +199,6 @@ use crate::map::entities::EntityCategory;
 use crate::map::houses::HouseAllianceMap;
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::rules::animation_sequence::SequenceSet;
-use crate::rules::foundation::foundation_dimensions;
 use crate::rules::object_type::ObjectType;
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::{HouseCostFactors, RuleSet};
@@ -281,33 +287,24 @@ impl UnitFacingUpdate {
     }
 }
 
-/// Armor type name → Verses index mapping.
-/// Matches the order defined in warhead_type.rs: none(0), flak(1), plate(2),
-/// light(3), medium(4), heavy(5), wood(6), steel(7), concrete(8),
-/// special_1(9), special_2(10).
-const ARMOR_NAMES: &[&str] = &[
-    "none",
-    "flak",
-    "plate",
-    "light",
-    "medium",
-    "heavy",
-    "wood",
-    "steel",
-    "concrete",
-    "special_1",
-    "special_2",
-];
-
-/// Look up the Verses array index for an armor type name.
-/// Returns 0 ("none") for unrecognized armor strings.
-/// Used by combat_weapon.rs for weapon selection.
-pub fn armor_index(armor: &str) -> usize {
-    // The names are lowercase, so this matches the lowercased armor string.
-    ARMOR_NAMES
-        .iter()
-        .position(|name| name.eq_ignore_ascii_case(armor))
-        .unwrap_or(0)
+/// TechnoClass vt+0x80, whether an object counts as a vehicle, by its class:
+/// a Unit that is not `NonVehicle=` (`0x00746400`, UnitType `+0xE1B`), a
+/// building that is a 1x1 `UndeploysInto=` (`0x00457620` → `0x00465D40`,
+/// [`ObjectType::is_1x1_with_undeploy`]), an aircraft its vt+0x50 calls low
+/// (`0x0041B910`), never an infantryman (`0x004263B0`). `low_flying` is that
+/// vt+0x50 in the caller's own map lookup, asked only for an aircraft.
+pub(crate) fn vehicle_like(
+    class: EntityCategory,
+    non_vehicle: bool,
+    is_1x1_with_undeploy: bool,
+    low_flying: impl FnOnce() -> bool,
+) -> bool {
+    match class {
+        EntityCategory::Unit => !non_vehicle,
+        EntityCategory::Structure => is_1x1_with_undeploy,
+        EntityCategory::Aircraft => low_flying(),
+        EntityCategory::Infantry => false,
+    }
 }
 
 /// Call-local arguments of Building Update's two native FireAt sites.

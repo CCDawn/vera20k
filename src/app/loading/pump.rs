@@ -14,6 +14,14 @@ pub(crate) use render::transfer_progress_draws;
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, feature = "ares"))]
+#[path = "pump/country_loading_tests.rs"]
+mod country_loading_tests;
+
+#[cfg(all(test, feature = "ares"))]
+#[path = "pump/loading_theme_tests.rs"]
+mod loading_theme_tests;
+
 use crate::app::AppState;
 use crate::app::loading::campaign_presentation::CampaignLoadingPresentation;
 use crate::app::loading::composition::{
@@ -411,7 +419,7 @@ impl LoadingRequest {
         progress: &mut dyn LoadingProgressSink,
     ) -> anyhow::Result<PreparedScenarioLoad> {
         let mut initial = self.load_initial_with_assets(ra2_dir, assets, native_rules, progress)?;
-        initial.retain_process_mapgen(mapgen_retention, resident);
+        initial.retain_process_state(mapgen_retention, resident);
         self.prepare_initial(initial)
     }
 
@@ -454,6 +462,8 @@ impl LoadingRequest {
             request: self,
             initial,
             context,
+            #[cfg(feature = "ares")]
+            rules_prefix: None,
         })
     }
 }
@@ -467,6 +477,21 @@ struct PreparedScenarioLoad {
     request: LoadingRequest,
     initial: MapLoadInitial,
     context: FreshScenarioLoadContextDescriptor,
+    #[cfg(feature = "ares")]
+    rules_prefix: Option<crate::rules::process_owner::NativeNonCampaignPrefixPreparation>,
+}
+
+impl PreparedScenarioLoad {
+    #[cfg(feature = "ares")]
+    fn cancel_rules_prefix(&mut self, assets: &mut crate::app::process_assets::ProcessAssets) {
+        if let Some(preparation) = self.rules_prefix.take() {
+            assets
+                .native_rules_mut_with_tile_cache()
+                .0
+                .expect("prepared prefix retains its process owner")
+                .cancel_prepared_noncampaign_scenario_prefix(preparation);
+        }
+    }
 }
 
 #[allow(
@@ -546,6 +571,10 @@ pub(crate) enum NativeLoadingArt {
 pub(crate) struct NativeLoadingScreenState {
     pub variant: NativeLoadingArt,
     local_side_index: i32,
+    #[cfg(feature = "ares")]
+    early_country_loading: Option<EarlyCountryLoading>,
+    #[cfg(feature = "ares")]
+    late_country_loading: Option<crate::rules::country_loading::AresCountryLoading>,
     /// Local player's MP color scheme — source of the progress outline and bar
     /// remap. Derived from the launch session, not the country variant.
     pub color_index: HouseColorIndex,
@@ -563,10 +592,22 @@ pub(crate) struct NativeLoadingScreenState {
     pub atlas: Option<LoadingScreenAtlas>,
     pub composition: Option<LoadingCompositionSnapshot>,
     pub campaign_presentation: Option<super::campaign_presentation::CampaignLoadingPresentation>,
+    campaign_names: Option<crate::rules::campaign_loading::CampaignScenarioNames>,
     /// Native constructs two runtime ColorScheme objects per current `[Colors]`
     /// entry. Capture that pre-load count before the later rules reset.
     runtime_color_scheme_count: usize,
     progress_cadence: NativeLoadingProgressCadence,
+}
+
+/// Two immutable observations, not a second Country owner: Color/PAL are
+/// resolved before Full_Init; the later file/labels are read after E_multi.
+#[cfg(feature = "ares")]
+struct EarlyCountryLoading {
+    country: crate::rules::ruleset::CountryIdx,
+    palette_name: String,
+    palette: Option<crate::assets::pal_file::Palette>,
+    /// `None` keeps the stock AlliedLoad/SovietLoad text color.
+    text_rgb: Option<[f32; 3]>,
 }
 
 impl NativeLoadingScreenState {
@@ -580,6 +621,10 @@ impl NativeLoadingScreenState {
         Self {
             variant: NativeLoadingArt::StockOffline(variant),
             local_side_index,
+            #[cfg(feature = "ares")]
+            early_country_loading: None,
+            #[cfg(feature = "ares")]
+            late_country_loading: None,
             color_index,
             // Static placeholders; replaced by `resolve_player_colors` once rules load.
             backing_rgb: FALLBACK_BACKING_RGB,
@@ -590,6 +635,7 @@ impl NativeLoadingScreenState {
             atlas: None,
             composition: None,
             campaign_presentation: None,
+            campaign_names: None,
             runtime_color_scheme_count: 0,
             progress_cadence,
         }
@@ -601,6 +647,10 @@ impl NativeLoadingScreenState {
             // BeginProgress684620 passes Campaign.CD; color resolver642B30
             // distinguishes exactly zero from all nonzero values.
             local_side_index: cd,
+            #[cfg(feature = "ares")]
+            early_country_loading: None,
+            #[cfg(feature = "ares")]
+            late_country_loading: None,
             color_index: HouseColorIndex(0),
             backing_rgb: FALLBACK_BACKING_RGB,
             text_rgb: [1.0; 3],
@@ -611,6 +661,7 @@ impl NativeLoadingScreenState {
             atlas: None,
             composition: None,
             campaign_presentation: None,
+            campaign_names: None,
             runtime_color_scheme_count: 0,
             progress_cadence: NativeLoadingProgressCadence::SelectedMap,
         }
@@ -647,6 +698,16 @@ impl NativeLoadingScreenState {
         } else {
             log::warn!("Missing loading text color scheme {text_scheme}; using white");
         }
+        // Ares1002F8F0 publishes this signed index once for the loading
+        // attempt; negative resumes the stock side-color branch above.
+        #[cfg(feature = "ares")]
+        if let Some(text_rgb) = self
+            .early_country_loading
+            .as_ref()
+            .and_then(|early| early.text_rgb)
+        {
+            self.text_rgb = text_rgb;
+        }
         self.progress_ramp = *ramps.ramp(self.color_index);
         for row in &mut self.progress_row.participants {
             if let Some(hsv) = scheme_hsv_by_entry(schemes, usize::from(row.color_index.0)) {
@@ -671,6 +732,19 @@ pub(crate) struct LoadingSession {
 }
 
 impl LoadingSession {
+    fn retire(mut self, assets: &mut crate::app::process_assets::ProcessAssets) {
+        #[cfg(feature = "ares")]
+        if let LoadingStage::Prepared(prepared) = &mut self.stage {
+            prepared.cancel_rules_prefix(assets);
+        }
+        if let LoadingStage::AwaitingPeers { result, .. } = &mut self.stage
+            && let Some(manager) = result.asset_manager.take()
+        {
+            assets.return_from_loading(manager);
+        }
+        self.job.retire(assets);
+    }
+
     fn failure_policy(&self) -> LoadingFailurePolicy {
         if self.stage.startup().campaign().is_some() {
             LoadingFailurePolicy::RetryCampaignShell
@@ -760,6 +834,110 @@ impl LoadingJob {
             asset_manager: None,
         }
     }
+}
+
+#[cfg(feature = "ares")]
+fn ordinary_country_loading_index(
+    startup: &LoadingStartup,
+) -> Option<crate::rules::ruleset::CountryIdx> {
+    if matches!(
+        startup,
+        LoadingStartup::Network(_) | LoadingStartup::Campaign(_) | LoadingStartup::Generic { .. }
+    ) || crate::map::rmg::is_seed_selection(startup.selected_map_file())
+    {
+        return None;
+    }
+    let launch = startup.launch_session()?;
+    if launch.local_player().is_observer() {
+        return None;
+    }
+    Some(launch.local_slot().country.index())
+}
+
+#[cfg(feature = "ares")]
+fn bind_early_country_loading(
+    native: &mut NativeLoadingScreenState,
+    startup: &LoadingStartup,
+    owner: &crate::rules::process_owner::NativeRulesProcessOwner,
+    assets: &AssetManager,
+) -> anyhow::Result<()> {
+    let Some(index) = ordinary_country_loading_index(startup) else {
+        return Ok(());
+    };
+    let (country, side) = owner.country_loading(index).ok_or_else(|| {
+        anyhow::anyhow!(
+            "loading Country {} was not allocated by session admission",
+            index.0
+        )
+    })?;
+    let palette_name = country.files().1.to_owned();
+    let palette = if palette_name.is_empty() {
+        None
+    } else {
+        // Original 72ADE0 -> 72AE06/72AEDD leaves a missing Convert null;
+        // DrawLoading 5535C1/5535C7 then skips only the background. Freeze
+        // that absent observation too; a later mount must not reread the PAL.
+        crate::render::loading_screen_chrome::load_named_ui_palette(assets, &palette_name)
+    };
+    let text_rgb = owner
+        .country_loading_text_hsv(index)
+        .map(|hsv| normalize_rgb(hsv_to_rgb(hsv)));
+    native.local_side_index = side;
+    if let Some(text_rgb) = text_rgb {
+        native.text_rgb = text_rgb;
+    }
+    native.early_country_loading = Some(EarlyCountryLoading {
+        country: index,
+        palette_name,
+        palette,
+        text_rgb,
+    });
+    Ok(())
+}
+
+#[cfg(feature = "ares")]
+fn prepare_country_loading_prefix(
+    process_assets: &mut crate::app::process_assets::ProcessAssets,
+    resident: Option<&mut crate::sim::world::Simulation>,
+    prepared: &mut PreparedScenarioLoad,
+    native: &mut NativeLoadingScreenState,
+) -> anyhow::Result<()> {
+    let Some(early) = native.early_country_loading.as_ref() else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        !matches!(
+            prepared.initial.map_source(),
+            crate::map::source::LoadedMapSource::Generated { .. }
+        ),
+        "ordinary Country loading prefix cannot consume a generated-map admission"
+    );
+    let owner = process_assets
+        .native_rules_mut_with_tile_cache()
+        .0
+        .expect("early Country loading retains its process owner");
+    if let Some(resident) = resident {
+        // This runtime is now permanently outgoing, even if later art or map
+        // loading fails. Shell/failure screens retain it only for projection;
+        // it must never restart after its runtime Rules writes are transferred.
+        resident.retire_scenario_started();
+        owner.consume_outgoing_scenario_rules(
+            resident.retire_object_type_tech_levels(),
+            resident.retire_ambient_change_inputs(),
+            resident.retire_building_upgrade_art_names(),
+            resident.retire_voxel_type_damage(),
+        )?;
+    }
+    let preparation = owner.prepare_noncampaign_scenario_prefix();
+    native.late_country_loading = Some(
+        owner
+            .country_loading(early.country)
+            .expect("E_multi preserves an already allocated Country")
+            .0
+            .clone(),
+    );
+    prepared.rules_prefix = Some(preparation);
+    Ok(())
 }
 
 /// Admit a peer's loading milestone into the active immutable source roster.
@@ -892,10 +1070,49 @@ fn lease_loading_assets_and_play_loading_theme(
     now_ms: u64,
 ) -> LoadingSession {
     session.job.asset_manager = process_assets.lease_for_loading();
+    #[cfg(not(feature = "ares"))]
     if let Some(assets) = audio_service_asset_manager(process_assets, Some(&session)) {
         let _ = audio.play_theme("LOADING", assets, now_ms);
     }
+    // Ares683C70 needs the selected map INI. Its one playback occurs at the
+    // consuming Selected->Prepared transition, before the Rules prefix reset.
+    #[cfg(feature = "ares")]
+    let _ = (audio, now_ms);
     session
+}
+
+/// Installed Ares683C70/683D05 select from the already parsed map (campaign)
+/// or the early process Rules/Country/Side authority (other sessions). Called
+/// only by Selected->Prepared, before E_multi and later mode/map type writes.
+#[cfg(feature = "ares")]
+fn play_ares_loading_theme(
+    process_assets: &crate::app::process_assets::ProcessAssets,
+    audio: &mut crate::app::audio_runtime::AppAudioRuntime,
+    startup: &LoadingStartup,
+    scenario: &crate::rules::ini_parser::IniFile,
+    assets: &AssetManager,
+    wall_ms: u64,
+) {
+    let names = if startup.campaign().is_some() {
+        [
+            scenario
+                .section("Basic")
+                .and_then(|section| section.read_name("LoadingTheme", 128))
+                .map(str::to_owned),
+            None,
+        ]
+    } else {
+        startup
+            .launch_session()
+            .and_then(|launch| launch.humans.first())
+            .and_then(|first| {
+                process_assets
+                    .native_rules()
+                    .map(|owner| owner.loading_theme_names(first.slot.country.index()))
+            })
+            .unwrap_or([None, None])
+    };
+    audio.play_ares_loading_theme(names.iter().map(Option::as_deref), assets, wall_ms);
 }
 
 /// The asset manager the audio service polls Theme with: the resident
@@ -995,6 +1212,8 @@ pub(crate) fn clear_loading_state(state: &mut AppState) {
 }
 
 fn reset_loading_presentation(state: &mut AppState) {
+    state.match_state.match_presentation.interpolation.clear();
+    state.renderer.fps_overlay.set_simulation_readout(None);
     state.frontend.loading_screen_atlas = None;
     state.frontend.loading_progress = LoadingProgressState::standard_skirmish();
 }
@@ -1004,13 +1223,7 @@ fn retire_loading_attempt(
     assets: &mut crate::app::process_assets::ProcessAssets,
 ) {
     if let Some(session) = slot.take() {
-        let mut session = session;
-        if let LoadingStage::AwaitingPeers { result, .. } = &mut session.stage
-            && let Some(manager) = result.asset_manager.take()
-        {
-            assets.return_from_loading(manager);
-        }
-        session.job.retire(assets);
+        session.retire(assets);
     }
 }
 
@@ -1058,7 +1271,7 @@ fn pump_loading_after_present(state: &mut AppState) -> LoadingPump {
         return poll_network_load_wait(state, session);
     }
     if session.native_pump_blocked() {
-        session.job.retire(&mut state.process_assets);
+        session.retire(&mut state.process_assets);
         return LoadingPump::Failed(anyhow::anyhow!(
             "native loading renderer was not ready before the first loading pump"
         ));
@@ -1067,6 +1280,7 @@ fn pump_loading_after_present(state: &mut AppState) -> LoadingPump {
     if matches!(session.stage, LoadingStage::Selected(_)) {
         return match prepare_loading_session(
             &mut state.process_assets,
+            &mut state.audio,
             &mut state.frontend.random_map_retention,
             state
                 .match_state
@@ -1101,6 +1315,8 @@ fn pump_loading_after_present(state: &mut AppState) -> LoadingPump {
         request,
         initial,
         context: fresh_scenario_context,
+        #[cfg(feature = "ares")]
+            rules_prefix: mut prepared_rules_prefix,
     } = prepared;
     state
         .frontend
@@ -1142,6 +1358,7 @@ fn pump_loading_after_present(state: &mut AppState) -> LoadingPump {
                 &state.renderer.depth_view,
                 &state.renderer.batch_renderer,
                 &state.renderer.bit_font,
+                &state.renderer.fps_overlay,
                 native,
                 8,
                 render_size,
@@ -1164,10 +1381,22 @@ fn pump_loading_after_present(state: &mut AppState) -> LoadingPump {
         // The outgoing scene no longer advances. Return its live Type and
         // ambient Rules writes before Full_Init's optional prefix Process.
         // Type reset deletes Types but retains the ambient scalar defaults.
-        if let Some(runtime) = state.match_state.sim_runtime.as_mut() {
+        let should_retire_outgoing = {
+            #[cfg(feature = "ares")]
+            {
+                prepared_rules_prefix.is_none()
+            }
+            #[cfg(not(feature = "ares"))]
+            {
+                true
+            }
+        };
+        if should_retire_outgoing && let Some(runtime) = state.match_state.sim_runtime.as_mut() {
             native_rules_owner.consume_outgoing_scenario_rules(
                 runtime.simulation.retire_object_type_tech_levels(),
                 runtime.simulation.retire_ambient_change_inputs(),
+                runtime.simulation.retire_building_upgrade_art_names(),
+                runtime.simulation.retire_voxel_type_damage(),
             )?;
         }
         let load_result = {
@@ -1190,6 +1419,7 @@ fn pump_loading_after_present(state: &mut AppState) -> LoadingPump {
                         depth_view: &state.renderer.depth_view,
                         batch: &state.renderer.batch_renderer,
                         font: &state.renderer.bit_font,
+                        fps_overlay: &state.renderer.fps_overlay,
                         progress: &mut native.progress,
                         progress_row: &native.progress_row,
                         atlas,
@@ -1213,6 +1443,8 @@ fn pump_loading_after_present(state: &mut AppState) -> LoadingPump {
                 progress.native_theater_cache_mismatch,
                 progress.runtime_color_scheme_count,
                 native_rules_owner,
+                #[cfg(feature = "ares")]
+                &mut prepared_rules_prefix,
                 audio,
                 shared_cell_dummy,
                 tile_variant_selector_cache,
@@ -1223,6 +1455,7 @@ fn pump_loading_after_present(state: &mut AppState) -> LoadingPump {
         match load_result {
             Ok(mut result) => {
                 if let Some(native) = native.as_mut() {
+                    result.scenario.campaign_names = native.campaign_names.take();
                     let terminal_raw_percent = native.progress_cadence.terminal_raw_percent();
                     advance_and_present_native_progress(
                         &state.renderer.gpu,
@@ -1230,6 +1463,7 @@ fn pump_loading_after_present(state: &mut AppState) -> LoadingPump {
                         &state.renderer.depth_view,
                         &state.renderer.batch_renderer,
                         &state.renderer.bit_font,
+                        &state.renderer.fps_overlay,
                         native,
                         terminal_raw_percent,
                         render_size,
@@ -1242,6 +1476,18 @@ fn pump_loading_after_present(state: &mut AppState) -> LoadingPump {
             Err(err) => Err(err),
         }
     })();
+    // init borrows the ticket until its actual Rules reset boundary. Any
+    // earlier asset/map validation failure leaves it here for explicit retire;
+    // a consumed ticket's load_scenario already restored its partial Live state.
+    #[cfg(feature = "ares")]
+    if let Some(preparation) = prepared_rules_prefix.take() {
+        state
+            .process_assets
+            .native_rules_mut_with_tile_cache()
+            .0
+            .expect("prepared prefix retains its process owner")
+            .cancel_prepared_noncampaign_scenario_prefix(preparation);
+    }
     match result {
         Ok(result) => {
             if matches!(result.scenario.startup, LoadingStartup::Network(_)) {
@@ -1249,11 +1495,16 @@ fn pump_loading_after_present(state: &mut AppState) -> LoadingPump {
                 let now = (crate::app::match_runtime::frame_pacer::wall_clock_ms() >> 4) as i32;
                 let wait =
                     NetworkLoadWait::new(now, native.progress_row.total_fraction(&native.progress));
-                let raw = native.progress_cadence.terminal_raw_percent() as i32;
+                //69AE90 sends the displayed percent, after random-map
+                //milestones have passed through their existing halving owner.
+                let percent = native
+                    .progress_cadence
+                    .effective_percent(native.progress_cadence.terminal_raw_percent())
+                    as i32;
                 state
                     .match_state
                     .session
-                    .report_network_loading_progress(raw);
+                    .report_network_loading_progress(percent);
                 poll_network_load_wait(
                     state,
                     LoadingSession {
@@ -1330,13 +1581,12 @@ fn ensure_session_job_asset_manager(
                 );
             }
             process_assets.note_lease_ended_without_return();
-            AssetManager::new(
+            process_assets.reconstruct_manager(
                 session
                     .job
                     .ra2_dir
                     .as_deref()
                     .expect("RA2 directory was initialized above"),
-                process_assets.media_archive_mode(),
             )?
         };
         session.job.asset_manager = Some(asset_manager);
@@ -1366,10 +1616,12 @@ fn poll_network_load_wait(state: &mut AppState, mut session: LoadingSession) -> 
         poll,
         NetworkLoadPoll::ReportProgress | NetworkLoadPoll::Complete
     ) {
-        state
-            .match_state
-            .session
-            .report_network_loading_progress(native.progress_cadence.terminal_raw_percent() as i32);
+        state.match_state.session.report_network_loading_progress(
+            native
+                .progress_cadence
+                .effective_percent(native.progress_cadence.terminal_raw_percent())
+                as i32,
+        );
     }
     if matches!(poll, NetworkLoadPoll::Complete | NetworkLoadPoll::TimedOut) {
         let timed_out = if poll == NetworkLoadPoll::TimedOut {
@@ -1399,16 +1651,19 @@ impl LoadingJob {
 /// sink differs: prepaint must swallow raw8 until the first frame is presented.
 fn prepare_loading_session(
     process_assets: &mut crate::app::process_assets::ProcessAssets,
+    audio: &mut crate::app::audio_runtime::AppAudioRuntime,
     mapgen_retention: &mut crate::app::shell_random_map::RandomMapGenerationRetention,
     mut resident: Option<&mut crate::sim::world::Simulation>,
     mut session: LoadingSession,
     before_first_frame: bool,
     configured_ra2_dir: Option<PathBuf>,
 ) -> anyhow::Result<LoadingSession> {
+    #[cfg(not(feature = "ares"))]
+    let _ = audio;
     if let Err(err) =
         ensure_session_job_asset_manager(process_assets, &mut session, configured_ra2_dir)
     {
-        session.job.retire(process_assets);
+        session.retire(process_assets);
         return Err(err);
     }
     let LoadingSession {
@@ -1435,6 +1690,21 @@ fn prepare_loading_session(
                 // an immutable request, while retained catalog fields update.
                 process_assets.reload_campaigns(assets);
             }
+            #[cfg(feature = "ares")]
+            if let Some(native) = native.as_mut() {
+                let early = process_assets
+                    .native_rules()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("loading requires the process-resident Rules owner")
+                    })
+                    .and_then(|owner| {
+                        bind_early_country_loading(native, request.startup(), owner, assets)
+                    });
+                if let Err(err) = early {
+                    job.retire(process_assets);
+                    return Err(err);
+                }
+            }
             let prepared = if !before_first_frame && let Some(native) = native.as_mut() {
                 let mut sink = GatedProgressSink {
                     progress: &mut native.progress,
@@ -1454,12 +1724,38 @@ fn prepare_loading_session(
                     assets,
                     process_assets.native_rules(),
                     mapgen_retention,
-                    resident,
+                    resident.as_deref_mut(),
                     &mut NoopProgressSink,
                 )
             };
             match prepared {
-                Ok(prepared) => LoadingStage::Prepared(prepared),
+                Ok(prepared) => {
+                    #[cfg(feature = "ares")]
+                    play_ares_loading_theme(
+                        process_assets,
+                        audio,
+                        prepared.request.startup(),
+                        &prepared.initial.map_data().ini,
+                        assets,
+                        crate::app::match_runtime::frame_pacer::wall_clock_ms(),
+                    );
+                    #[cfg(feature = "ares")]
+                    let mut prepared = prepared;
+                    #[cfg(feature = "ares")]
+                    if let Some(native) = native.as_mut()
+                        && let Err(err) = prepare_country_loading_prefix(
+                            process_assets,
+                            resident,
+                            &mut prepared,
+                            native,
+                        )
+                    {
+                        prepared.cancel_rules_prefix(process_assets);
+                        job.retire(process_assets);
+                        return Err(err);
+                    }
+                    LoadingStage::Prepared(prepared)
+                }
                 Err(err) => {
                     job.retire(process_assets);
                     return Err(err);
@@ -1508,6 +1804,7 @@ fn prepare_scenario_initial_before_first_frame(state: &mut AppState) -> anyhow::
     };
     state.frontend.loading_session = Some(prepare_loading_session(
         &mut state.process_assets,
+        &mut state.audio,
         &mut state.frontend.random_map_retention,
         state
             .match_state
@@ -1602,7 +1899,7 @@ pub(crate) fn selected_map_start_assignments(
 /// snapshot on the branch (as this used to) dropped the country name, the
 /// special-unit line, the briefing and "Loading..." from every random-map load.
 fn ensure_loading_composition_snapshot(state: &mut AppState) {
-    let snapshot = {
+    let mut snapshot = {
         let Some(session) = state.frontend.loading_session.as_ref() else {
             return;
         };
@@ -1666,6 +1963,10 @@ fn ensure_loading_composition_snapshot(state: &mut AppState) {
         .as_mut()
         .and_then(|session| session.native.as_mut())
     {
+        #[cfg(feature = "ares")]
+        if let Some(country) = native.late_country_loading.as_ref() {
+            snapshot.bind_country_loading(country, state.process_assets.csf.as_ref());
+        }
         native.composition = Some(snapshot);
     }
 }
@@ -1752,6 +2053,10 @@ pub(crate) fn ensure_native_loading_atlas(state: &mut AppState) -> anyhow::Resul
         let assets = loading_asset_manager(session)
             .ok_or_else(|| anyhow::anyhow!("campaign loading lost its asset manager"))?;
         let mut metadata = crate::rules::campaign_loading::CampaignLoadingMetadata::default();
+        let mut names = state.match_state.campaign_names.clone();
+        let csf = state.process_assets.csf.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("campaign loading requires the initialized CSF table")
+        })?;
         // Original Full_Init686D46 opens MISSIONMD for the current filename.
         // Missing keys retain SetDefaults' zero/empty values. Missing metadata
         // suppresses DrawLoading552D60 without inventing a generic screen.
@@ -1767,10 +2072,8 @@ pub(crate) fn ensure_native_loading_atlas(state: &mut AppState) -> anyhow::Resul
                 .expect("campaign loading owns a campaign startup")
                 .scenario();
             metadata.apply_ini(&selected.ini, scenario);
+            names.apply_ini(&selected.ini, scenario, csf);
         }
-        let csf = state.process_assets.csf.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("campaign loading requires the initialized CSF table")
-        })?;
         let presentation = super::campaign_presentation::CampaignLoadingPresentation::new(
             &metadata,
             csf,
@@ -1801,6 +2104,7 @@ pub(crate) fn ensure_native_loading_atlas(state: &mut AppState) -> anyhow::Resul
             .and_then(|session| session.native.as_mut())
             .expect("campaign native session");
         native.campaign_presentation = Some(presentation);
+        native.campaign_names = Some(names);
         native.atlas = atlas;
         log::info!("Native campaign loading atlas ready");
         return Ok(());
@@ -1892,11 +2196,48 @@ pub(crate) fn ensure_native_loading_atlas(state: &mut AppState) -> anyhow::Resul
             },
         )
         .collect();
+    #[cfg(feature = "ares")]
+    let country_background = state
+        .frontend
+        .loading_session
+        .as_ref()
+        .and_then(|session| session.native.as_ref())
+        .and_then(|native| native.late_country_loading.as_ref())
+        .map(|country| {
+            // A template this formatter does not support omits only the
+            // background, like missing custom art; it never fails the screen.
+            country
+                .background_file(width == LoadingScreenWidth::W640)
+                .unwrap_or_else(|| {
+                    log::warn!("Unsupported Country loading printf template; omitting background");
+                    String::new()
+                })
+        });
+    let art = crate::render::loading_screen_chrome::LoadingScreenArtInput {
+        variant,
+        #[cfg(feature = "ares")]
+        background: country_background.as_ref().map(|file| {
+            let early = state
+                .frontend
+                .loading_session
+                .as_ref()
+                .and_then(|session| session.native.as_ref())
+                .and_then(|native| native.early_country_loading.as_ref())
+                .expect("late Country art retains its early palette");
+            crate::render::loading_screen_chrome::LoadingCountryBackground {
+                name: file,
+                palette: early.palette.as_ref(),
+                palette_name: &early.palette_name,
+            }
+        }),
+        #[cfg(not(feature = "ares"))]
+        background: None,
+    };
     let atlas = build_loading_screen_atlas_with_composition(
         &state.renderer.gpu,
         &state.renderer.batch_renderer,
         assets,
-        variant,
+        art,
         width,
         &progress_ramp,
         composition_input,
@@ -2049,7 +2390,7 @@ fn apply_network_loading_disconnects(
     };
     indices
         .iter()
-        .filter_map(|&index| destroy_connection(session, sim, index, ConnectionError::Lost))
+        .filter_map(|&index| destroy_connection(session, sim, index, ConnectionError::Lost, None))
         .collect()
 }
 
@@ -2118,12 +2459,14 @@ pub(crate) fn present_saved_game_loading(state: &mut AppState) {
         return;
     }
     let result = (|| -> anyhow::Result<()> {
-        let output = state
+        let Some(output) = state
             .renderer
             .gpu
-            .surface
-            .get_current_texture()
-            .map_err(|error| anyhow::anyhow!("saved-game loading surface: {error}"))?;
+            .acquire_frame()
+            .map_err(|error| anyhow::anyhow!("saved-game loading surface: {error}"))?
+        else {
+            return Ok(());
+        };
         let mut encoder =
             state
                 .renderer
@@ -2137,6 +2480,12 @@ pub(crate) fn present_saved_game_loading(state: &mut AppState) {
             &mut encoder,
             &output.texture,
         )?;
+        state.renderer.fps_overlay.encode(
+            &state.renderer.gpu,
+            &state.renderer.batch_renderer,
+            &mut encoder,
+            &output.texture,
+        );
         state
             .renderer
             .gpu
@@ -2154,9 +2503,12 @@ pub(crate) fn present_saved_game_loading(state: &mut AppState) {
 /// the first game frame (`0x00683E07..0x00683E1C`, again at
 /// `0x0052EAA1..0x0052EAEB`); the tactical install runs under it.
 pub(crate) fn present_game_mode_blank(state: &AppState) {
-    if let Err(err) =
-        render::present_blank(&state.renderer.gpu, &state.renderer.shell_surface_presenter)
-    {
+    if let Err(err) = render::present_blank(
+        &state.renderer.gpu,
+        &state.renderer.shell_surface_presenter,
+        &state.renderer.batch_renderer,
+        &state.renderer.fps_overlay,
+    ) {
         log::warn!("Game-mode blank frame failed: {err:#}");
     }
 }
@@ -2232,6 +2584,7 @@ fn advance_and_present_native_progress(
     depth_view: &wgpu::TextureView,
     batch: &BatchRenderer,
     font: &BitFont,
+    fps_overlay: &crate::app::diagnostics::fps_overlay::FpsOverlay,
     native: &mut NativeLoadingScreenState,
     raw_percent: u32,
     render_size: [u32; 2],
@@ -2251,6 +2604,7 @@ fn advance_and_present_native_progress(
         depth_view,
         batch,
         font,
+        fps_overlay,
         atlas,
         native.composition.as_ref(),
         native.campaign_presentation.as_ref(),
@@ -2278,6 +2632,7 @@ struct RenderingProgressSink<'a> {
     depth_view: &'a wgpu::TextureView,
     batch: &'a BatchRenderer,
     font: &'a BitFont,
+    fps_overlay: &'a crate::app::diagnostics::fps_overlay::FpsOverlay,
     progress: &'a mut LoadingProgressState,
     progress_row: &'a LoadingProgressRowSnapshot,
     atlas: &'a LoadingScreenAtlas,
@@ -2301,6 +2656,7 @@ impl LoadingProgressSink for RenderingProgressSink<'_> {
                 self.depth_view,
                 self.batch,
                 self.font,
+                self.fps_overlay,
                 self.atlas,
                 self.composition,
                 self.campaign_presentation,

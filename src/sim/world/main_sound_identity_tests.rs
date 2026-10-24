@@ -64,7 +64,7 @@ fn scene(rules: &RuleSet) -> (Simulation, [u64; 2], u64, u64) {
     }
     let owner = sim.interner.get("Local").unwrap();
     let squids = std::array::from_fn(|index| {
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         let mut actor = GameEntity::test_default(id, "SQD", "Local", 10, 10 + index as u16);
         actor.set_owner_for_test(owner);
         actor.set_type_ref_for_test(sim.interner.get("SQD").unwrap());
@@ -89,7 +89,7 @@ fn scene(rules: &RuleSet) -> (Simulation, [u64; 2], u64, u64) {
     sim.assign_target_represented(
         gun,
         Some(TargetKind::Entity(target)),
-        Some(rules),
+        rules,
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -117,15 +117,55 @@ fn presentation_main_service_cannot_change_later_projectile_identity() {
     assert_eq!(quiet.state_hash(), serviced.state_hash());
 
     let (_, quiet_draws) = crate::sim::rng::trace_draws(|| {
-        quiet.tick_move_sound_after_process(quiet_squids[0], 0, Some(&rules));
-        quiet.tick_move_sound_after_process(quiet_squids[1], 0, Some(&rules));
+        Simulation::tick_move_sound_after_process(
+            &quiet.interner,
+            &quiet.session,
+            &quiet.main_rng,
+            &mut quiet.substrate,
+            &mut quiet.sound_events,
+            &quiet.houses,
+            quiet_squids[0],
+            0,
+            &rules,
+        );
+        Simulation::tick_move_sound_after_process(
+            &quiet.interner,
+            &quiet.session,
+            &quiet.main_rng,
+            &mut quiet.substrate,
+            &mut quiet.sound_events,
+            &quiet.houses,
+            quiet_squids[1],
+            0,
+            &rules,
+        );
     });
     let (_, serviced_draws) = crate::sim::rng::trace_draws(|| {
-        serviced.tick_move_sound_after_process(serviced_squids[0], 0, Some(&rules));
+        Simulation::tick_move_sound_after_process(
+            &serviced.interner,
+            &serviced.session,
+            &serviced.main_rng,
+            &mut serviced.substrate,
+            &mut serviced.sound_events,
+            &serviced.houses,
+            serviced_squids[0],
+            0,
+            &rules,
+        );
         // One ordinary inclusive presentation draw between otherwise identical
         // paid Foot visits. No Scenario or MapGen capability is lent.
         let _ = serviced.presentation_main_draws().ranged(0, 1);
-        serviced.tick_move_sound_after_process(serviced_squids[1], 0, Some(&rules));
+        Simulation::tick_move_sound_after_process(
+            &serviced.interner,
+            &serviced.session,
+            &serviced.main_rng,
+            &mut serviced.substrate,
+            &mut serviced.sound_events,
+            &serviced.houses,
+            serviced_squids[1],
+            0,
+            &rules,
+        );
     });
     let rng: Value = serde_json::from_str(crate::test_fixture::text(
         "tools/rmg_oracle/vectors/rng.json",

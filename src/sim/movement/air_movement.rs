@@ -132,19 +132,6 @@ pub(crate) fn fly_speed_facts(
     }
 }
 
-/// Spawn owns Aircraft initialization. Legacy/headless movers may lack the
-/// Secondary controller; initialize it once from the body's heading without
-/// replacing an existing live turn. The body's rate stands in for `ROT=`:
-/// the Aircraft constructor (`0x00413FD2..0x00414015`) gives both
-/// controllers that one value.
-pub fn ensure_fly_secondary_facing(entity: &mut crate::sim::game_entity::GameEntity) {
-    let initial = entity.body_facing.destination();
-    let body = &entity.body_facing;
-    entity
-        .barrel_facing
-        .get_or_insert_with(|| super::FacingClass::with_rate_of(initial, body));
-}
-
 /// Shared represented MoveTo/BeginTakeoff refusal gates. EMP still requires
 /// its missing native owner, and Foot+6A0 paralysis
 /// ([`FootParasite::is_paralyzed`](crate::sim::combat::parasite::FootParasite::is_paralyzed))
@@ -200,6 +187,19 @@ pub fn current_fly_height(
     queried_flight_height(entity, cells.as_ref())
 }
 
+/// Aircraft IFlyControl41B6A0 through its shared live cargo/radio owner.
+/// Read-only locomotor and presentation callers must use the same landing base.
+pub fn aircraft_landing_base(
+    entity: &crate::sim::game_entity::GameEntity,
+    entities: &crate::sim::entity_store::EntityStore,
+    rules_context: Option<(
+        &crate::rules::ruleset::RuleSet,
+        &crate::sim::intern::StringInterner,
+    )>,
+) -> i32 {
+    crate::sim::aircraft::landing_base::landing_base(entity, entities, rules_context)
+}
+
 /// [`current_fly_height`] through the caller's cell query. A draw passes its
 /// isolated query, so a miss stamps its own dummy, not the simulation's.
 pub fn queried_flight_height(
@@ -220,8 +220,9 @@ pub fn queried_flight_height(
 }
 
 /// Object5F5F40: retained Location less the live ground and optional deck.
-/// Both Techno and Terrain queries use the same ground/height boundary.
-pub(crate) fn object_height_in_query(
+/// Techno, Terrain and the Anim draw (DrawIt42310A) queries use the same
+/// ground/height boundary; a draw passes its isolated query.
+pub fn object_height_in_query(
     coord: DriveCoord,
     on_bridge: bool,
     cells: Option<&crate::map::resolved_terrain::NativeCellQuery<'_>>,
@@ -436,12 +437,18 @@ pub(crate) mod tests {
         let mut entity = GameEntity::test_default(1, "ORCA", "Americans", 10, 10);
         entity.locomotor = Some(make_fly_loco());
         sim.substrate.entities.insert(entity);
+        sim.interner = crate::sim::intern::test_interner();
 
-        let ok = sim.move_air_coordinate(
+        let ok = crate::sim::world::Simulation::move_air_coordinate(
+            &mut sim.interner,
+            &sim.session,
+            &mut sim.substrate,
+            &mut sim.sound_events,
+            &sim.resolved_terrain,
             1,
             crate::sim::movement::target_cell_coord(20, 15, None),
             None,
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
         );
         assert!(ok);
 
@@ -490,7 +497,7 @@ pub(crate) mod tests {
         sim.assign_destination_represented(
             id,
             Some(crate::sim::components::NavTargetRef::cell(20, 15)),
-            Some(&rules),
+            &rules,
             None,
             crate::sim::world::FrameEffects::default(),
         )
@@ -535,12 +542,18 @@ pub(crate) mod tests {
         let mut entity = GameEntity::test_default(1, "ORCA", "Americans", 10, 10);
         entity.locomotor = Some(make_fly_loco());
         sim.substrate.entities.insert(entity);
+        sim.interner = crate::sim::intern::test_interner();
 
-        let ok = sim.move_air_coordinate(
+        let ok = crate::sim::world::Simulation::move_air_coordinate(
+            &mut sim.interner,
+            &sim.session,
+            &mut sim.substrate,
+            &mut sim.sound_events,
+            &sim.resolved_terrain,
             1,
             crate::sim::movement::target_cell_coord(10, 10, None),
             None,
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
         );
         assert!(ok);
         // Native MoveTo accepts a nonnull destination even at the owner cell.

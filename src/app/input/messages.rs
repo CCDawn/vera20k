@@ -1,10 +1,8 @@
 //! Chat/system message surface driver (study §3.1): anchors the
 //! `ui::messages::MessageList` to the tactical viewport (x+3 / y / w−14),
 //! posts system messages (insert sound = [AudioVisual] IncomingMessage),
-//! expires rows per frame against a pause-FROZEN clock (contract §4.2 step 8
-//! / §4.3: deadlines resume with remaining lifetime intact after a pause),
-//! and builds the text instances drawn between the sidebar text and the
-//! tooltip (study O10: chat before tooltip).
+//! expires rows on Main_Tick against the advancing process wall clock,
+//! and builds the text instances drawn between sidebar text and tooltip.
 //!
 //! ## Dependency rules
 //! - Part of the app layer — may depend on everything.
@@ -22,21 +20,19 @@ const MESSAGE_RGB_SYSTEM: [f32; 3] = [1.0, 1.0, 1.0];
 const TYPE_SELECT_MESSAGE_TIMEOUT_MS: u64 = 3_840;
 /// The Supers' lines' `0x96` native 16 ms timer buckets.
 const SUPER_WEAPON_MESSAGE_TIMEOUT_MS: u64 = 0x96 * 16;
+/// PlaceBeacon's help lines' `0xE1` buckets (`0x00430D01`, `0x00430D38`).
+const BEACON_HELP_TIMEOUT_MS: u64 = 0xE1 * 16;
 /// Native falls back to runtime color-scheme 3. Rust stores the undoubled
 /// `[Colors]` entry index, so that scheme is entry 1.
 const TYPE_SELECT_FALLBACK_SCHEME_ENTRY: crate::rules::house_colors::HouseColorIndex =
     crate::rules::house_colors::HouseColorIndex(3 / 2);
 
-/// Pause-adjusted message `now` (contract §4.2 step 8 / §4.3): the wall clock
-/// minus every paused span. ALL message deadlines and expiry checks use this
-/// clock — never the raw `tooltips::now_ms` — so a pause freezes the
-/// remaining lifetime of every visible row.
+/// Add_Message5D3DD5 and Manage5D4449 read process timer887338/887340.
+/// Menu/Scenario pause stops polling, not this clock. EnterPause683EB0 and
+/// ExitPause683FB0 only stop/rearm the separate Scenario614 score clock.
+/// Source: original gamemd.exe instructions and message-pause native controls.
 pub(crate) fn message_now_ms(state: &AppState) -> u64 {
-    state
-        .match_state
-        .match_presentation
-        .message_clock
-        .now(crate::app::input::tooltips::now_ms(state))
+    crate::app::input::tooltips::now_ms(state)
 }
 
 /// Original TAction11 6DE0B0..6DE122 resolves its CSF label, selects the
@@ -230,13 +226,17 @@ pub(crate) enum HudMessage {
         other: crate::sim::intern::InternedId,
         formed: bool,
     },
+    /// PlaceBeacon's `TXT_BEACON_HELP1`/`2` for the local House's beacon
+    /// (`0x00430CF9..0x00430D69`): PlayerPtr's scheme `+0x16054`, style
+    /// 4046, `0xE1` buckets, silent 0.
+    BeaconHelp(&'static str),
 }
 
 impl HudMessage {
     fn csf_key(self) -> &'static str {
         match self {
             Self::LowPower => "TXT_LOW_POWER", // original House4F8D4A
-            Self::SuperWeapon(key) => key,
+            Self::SuperWeapon(key) | Self::BeaconHelp(key) => key,
             Self::PlayerDefeated(_) => "TXT_PLAYER_DEFEATED",
             Self::Alliance { formed: true, .. } => "TXT_HAS_ALLIED",
             Self::Alliance { formed: false, .. } => "TXT_AT_WAR",
@@ -251,6 +251,7 @@ impl HudMessage {
                 message_delay_timeout_ms(rules.general.message_delay_minutes)
             }
             Self::SuperWeapon(_) => Some(SUPER_WEAPON_MESSAGE_TIMEOUT_MS),
+            Self::BeaconHelp(_) => Some(BEACON_HELP_TIMEOUT_MS),
         }
     }
 
@@ -409,6 +410,18 @@ pub(crate) fn player_line_rgb(state: &AppState, owner: crate::sim::intern::Inter
     )
 }
 
+/// Network packet colour is a Session priority, converted by69A310 before
+/// TextLabel72A4A0. Keep this in the same message-colour owner as local echoes.
+pub(crate) fn packet_player_line_rgb(state: &AppState, priority: i32) -> [f32; 3] {
+    let Some(rules) = state.rules() else {
+        return MESSAGE_RGB_SYSTEM;
+    };
+    country_message_rgb(
+        crate::rules::color_scheme::scheme_index_for_priority(priority) as i32,
+        &rules.color_schemes,
+    )
+}
+
 /// A chat line: Add_Message with the sender's name as prefix, style 4046,
 /// MessageDelay*900 buckets and silent 0, so IncomingMessage plays once
 /// (`0x0055F0A8..0x0055F104` echo, `0x0048D93A..0x0048D98D` receive).
@@ -433,6 +446,47 @@ pub(crate) fn post_chat_line(state: &mut AppState, name: &str, text: &str, rgb: 
 /// scheme (`0x004E12D0` with `0x00822728`), flags 0x16, MessageDelay*900
 /// (`0x0055EED0..0x0055EF2C`).
 pub(crate) fn post_observer_refusal(state: &mut AppState) {
+    post_grey_row(state, "TXT_OBSERVER_CANT_SEND", true, true);
+}
+
+/// The WOL page sinks in a match (`0x007A92F9..0x007A93B4`): the page line
+/// and, from the ANSI sink, `TXT_HOW_TO_REPLY` under it, each a Grey row
+/// with flags 0x16, `MessageDelay * 900` and silent 0.
+pub(crate) fn post_wol_page_rows(state: &mut AppState, line: &str, reply_hint: bool) {
+    post_grey_row(state, line, false, false);
+    if reply_hint {
+        post_grey_row(state, "TXT_HOW_TO_REPLY", true, false);
+    }
+}
+
+/// A WOL find or page-result row in a match with no window to take it
+/// (`0x007AA5D5..`, `0x007A9800`): the same Grey row, silent 0.
+pub(crate) fn post_wol_result_row(state: &mut AppState, text: &str) {
+    post_grey_row(state, text, false, false);
+}
+
+/// The WOL NetStatus sink's lost connection in a match (`0x007AA7C0..`):
+/// one `TXT_WOL_CONNLOST` row in the same scheme, flags and timeout, with
+/// its sound.
+pub(crate) fn post_wol_connection_lost(state: &mut AppState) {
+    post_grey_row(state, "TXT_WOL_CONNLOST", true, false);
+}
+
+/// Cooperative `+0xA0`'s save result (`0x005C37B7..0x005C381F`):
+/// `TXT_COOP_SAVE_SUCCESS` or `TXT_COOP_SAVE_FAILED`, a Grey row with its
+/// sound.
+pub(crate) fn post_cooperative_save_result(state: &mut AppState, saved: bool) {
+    let key = if saved {
+        "TXT_COOP_SAVE_SUCCESS"
+    } else {
+        "TXT_COOP_SAVE_FAILED"
+    };
+    post_grey_row(state, key, true, false);
+}
+
+/// A row in `GadgetClass::GetColorScheme` (`0x004E12D0`, "Grey"), flags
+/// 0x16, `MessageDelay * 900`; `text` is a CSF key when `localize`.
+fn post_grey_row(state: &mut AppState, text: &str, localize: bool, silent: bool) {
     let Some(rules) = state.rules() else {
         return;
     };
@@ -446,15 +500,16 @@ pub(crate) fn post_observer_refusal(state: &mut AppState) {
             )
             .map(|channel| f32::from(channel) / 255.0)
         });
-    post_localized_message(
+    post_message(
         state,
         &crate::ui::messages::MessagePost {
             prefix: None,
-            text: "TXT_OBSERVER_CANT_SEND",
+            text,
             rgb,
             timeout_ms,
-            silent: true,
+            silent,
         },
+        localize,
     );
 }
 
@@ -527,22 +582,12 @@ fn house_message_rgb(
         .map(|channel| f32::from(channel) / 255.0)
 }
 
-/// Per-frame: feed the pause edge into the clock, then (unpaused, in-game)
-/// re-anchor to the live viewport and expire rows against the FROZEN clock.
-/// While paused the clock accumulates the span and `manage` is skipped — both
-/// halves are required: skipping alone would let wall-time deadlines expire
-/// the instant the game unpauses.
-pub(crate) fn update(state: &mut AppState) -> Option<u64> {
-    if state.frontend.screen != GameScreen::InGame {
-        return None;
-    }
-    let wall = crate::app::input::tooltips::now_ms(state);
-    state
-        .match_state
-        .match_presentation
-        .message_clock
-        .set_paused(state.match_state.paused(), wall);
-    if state.match_state.paused() {
+/// Main_Tick55DDA5 polls Manage only when its offline menu/Scenario holds
+/// permit it. On the first resumed pass, deadlines include the entire hold.
+pub(crate) fn update(state: &mut AppState, main_tick_admitted: bool) -> Option<u64> {
+    if state.frontend.screen != GameScreen::InGame
+        || !poll_is_admitted(main_tick_admitted, state.match_state.main_tick_frozen())
+    {
         return None;
     }
     sync_view(state);
@@ -553,6 +598,12 @@ pub(crate) fn update(state: &mut AppState) -> Option<u64> {
         .message_list
         .manage(now);
     Some(now)
+}
+
+/// A hold created by an already-admitted Logic cannot revoke this pass's
+/// Manage call. An expired hold is released before runtime admission.
+fn poll_is_admitted(main_tick_admitted: bool, currently_frozen: bool) -> bool {
+    main_tick_admitted || !currently_frozen
 }
 
 fn sync_view(state: &mut AppState) {
@@ -576,7 +627,7 @@ fn sync_view(state: &mut AppState) {
 
 /// Prepare one successful offline TextLabel paint, using raw wall time for
 /// typing and the existing sound owner for every MessageCharTyped request.
-/// Expiry remains on the separate pause-aware clock in update().
+/// Expiry uses the same wall clock, but is polled only by admitted Main_Tick passes.
 pub(crate) fn build_message_instances(
     state: &mut AppState,
 ) -> (Vec<SpriteInstance>, Vec<SpriteInstance>) {
@@ -659,6 +710,61 @@ fn message_instances(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timed_release_admission_survives_a_new_pause_in_the_same_logic_pass() {
+        use crate::app::match_runtime::session::SessionMode;
+        use crate::app::match_runtime::sim_tick::{RuntimePassInputs, decide_runtime_pass};
+        let mut sim = crate::sim::world::Simulation::with_seed(0);
+        let decide = |paused| {
+            decide_runtime_pass(RuntimePassInputs {
+                exact_step: false,
+                window_active: true,
+                focus_frozen: false,
+                startup_admitted: true,
+                frame_stepping: false,
+                paused: false,
+                scenario_paused: paused,
+                menu_open: false,
+                session_mode: SessionMode::Campaign,
+                pacer_timing_admits: true,
+                network_wait: false,
+                network_dialog_open: false,
+            })
+        };
+        let blocked = |sim: &crate::sim::world::Simulation| {
+            crate::app::match_runtime::scenario_pause::blocks_main_tick(
+                SessionMode::Campaign,
+                sim.session().scenario_paused(),
+            )
+        };
+        sim.pause_scenario_for_test(1);
+        assert!(!poll_is_admitted(decide(true).run_sim, blocked(&sim)));
+        // Main_Tick releases the timed credit before its admission test.
+        sim.expire_scenario_pause_for_test();
+        let admitted = decide(sim.session().scenario_paused()).run_sim;
+        assert!(admitted);
+        // Action110 can acquire another credit during this admitted Logic.
+        sim.pause_scenario_for_test(1);
+        assert!(blocked(&sim));
+        assert!(poll_is_admitted(admitted, blocked(&sim)));
+        let mut list = crate::ui::messages::MessageList::new(0, 0, 6, 600);
+        list.add_message(
+            &crate::ui::messages::MessagePost {
+                prefix: None,
+                text: "objective",
+                rgb: [1.0; 3],
+                timeout_ms: Some(1_000),
+                silent: true,
+            },
+            0,
+            &|text| text.len() as i32,
+        );
+        if poll_is_admitted(admitted, blocked(&sim)) {
+            assert!(list.manage(1_001));
+        }
+        assert!(list.messages().is_empty());
+    }
 
     fn original_trigger_messages() -> serde_json::Value {
         let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
@@ -844,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    fn house_low_power_native_post_reaches_retail_text_and_pause_aware_expiry() {
+    fn house_low_power_native_post_reaches_retail_text_and_wall_clock_expiry() {
         let Some(retail) =
             crate::rules::retail_ini_fixture::retail_battle_rules_for_map("XMP03T4.MAP")
         else {
@@ -904,12 +1010,10 @@ mod tests {
         );
 
         let mut list = crate::ui::messages::MessageList::new(3, 0, 6, 1_000);
-        let mut clock = crate::ui::messages::PauseAwareClock::default();
         let now = 1_200;
-        let outcome =
-            add_localized_message(&mut list, Some(&csf), &post, clock.now(now), &|text| {
-                text.chars().count() as i32 * 8
-            });
+        let outcome = add_localized_message(&mut list, Some(&csf), &post, now, &|text| {
+            text.chars().count() as i32 * 8
+        });
         assert_eq!(outcome.added, 1);
         assert!(
             outcome.play_sound,
@@ -927,26 +1031,17 @@ mod tests {
         assert_eq!(message_instances(&font, &list, [0.0; 2]).1.len(), 1);
         assert_eq!(list.advance_reveal(now as u32 + 16), 1);
         assert_eq!(message_instances(&font, &list, [0.0; 2]).1.len(), 2);
-        clock.set_paused(true, now + 100);
-        assert!(!list.manage(clock.now(deadline + 20_000)));
-        clock.set_paused(false, deadline + 20_000);
-        let resumed_deadline = deadline + 20_000 + post.timeout_ms.unwrap() - 100;
-        assert!(
-            !list.manage(clock.now(resumed_deadline)),
-            "deadline equality stays visible"
-        );
-        assert!(list.manage(clock.now(resumed_deadline + 1)));
+        // Offline menus skip Manage. Equality still retains the row; a
+        // first resumed poll past the deadline removes it immediately.
+        assert!(!list.manage(deadline));
+        let resumed_wall_ms = deadline + 20_000;
+        assert!(list.manage(resumed_wall_ms));
         assert!(list.messages().is_empty());
 
         // Admission failure cannot play the message-insertion sound.
         list.set_view(3, 0, 0);
-        let rejected = add_localized_message(
-            &mut list,
-            Some(&csf),
-            &post,
-            clock.now(resumed_deadline + 2),
-            &|_| 8,
-        );
+        let rejected =
+            add_localized_message(&mut list, Some(&csf), &post, resumed_wall_ms + 2, &|_| 8);
         assert_eq!(rejected.added, 0);
         assert!(!rejected.play_sound);
     }

@@ -22,7 +22,7 @@ fn run(sim: &mut Simulation, rules: &RuleSet, entry: crate::map::actions::Action
             input: TagEventInput::default(),
         },
         &mut Vec::new(),
-        Some(rules),
+        rules,
         None,
         FrameEffects::default(),
     )
@@ -156,7 +156,7 @@ fn retail_transylv_ambient_action_reaches_native_fade_and_large_flash_request() 
     for row in history["rows"].as_array().unwrap() {
         sim.session
             .set_binary_frame_for_test(row["frame"].as_u64().unwrap() as u32);
-        sim.discard_lighting_events();
+        sim.lighting_sources.discard_pending();
         sim.tick_scenario_lighting_transition(&rules);
         let light = sim.session.lighting();
         assert_eq!(
@@ -345,6 +345,8 @@ fn retail_transylv_ambient_action_reaches_native_fade_and_large_flash_request() 
         .consume_outgoing_scenario_rules(
             sim.retire_object_type_tech_levels(),
             sim.session.lighting_mut().retire_ambient_change_inputs(),
+            sim.retire_building_upgrade_art_names(),
+            sim.retire_voxel_type_damage(),
         )
         .unwrap();
     let next = owner
@@ -367,8 +369,7 @@ fn retail_transylv_ambient_action_reaches_native_fade_and_large_flash_request() 
 
 #[test]
 fn ambient_rate_and_step_match_original_action_bits_and_due_logic_rung() {
-    // Original Steam gamemd.exe SHA256:
-    // 3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600.
+    // Original Steam gamemd.exe.
     // ActionFixture executes ctor6DD000/read6DD5B0/Execute6DD8B0, then
     // Logic55B33D..55B4D7 with current60, target100, timer12/8 at frame20.
     // Relight/redraw are output sinks. These are native outputs, not Rust
@@ -675,6 +676,8 @@ fn ambient_action_values_survive_save_and_transfer_to_retained_rules_at_retireme
                 .session
                 .lighting_mut()
                 .retire_ambient_change_inputs(),
+            restored.retire_building_upgrade_art_names(),
+            restored.retire_voxel_type_damage(),
         )
         .unwrap();
     assert_eq!(
@@ -728,7 +731,7 @@ fn ordered_timer_trigger_updates_live_ambient_inputs_before_the_next_fade() {
         .lighting_mut()
         .set_transition_timer_for_test(CdTimer::started(12, 8));
     sim.session.set_binary_frame_for_test(20);
-    sim.advance_triggers(Some(&rules), Some(&overlays), FrameEffects::default());
+    sim.advance_triggers(&rules, Some(&overlays), FrameEffects::default());
     assert_eq!(
         sim.trigger_runtime
             .action_trace

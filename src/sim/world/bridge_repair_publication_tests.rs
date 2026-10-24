@@ -293,7 +293,7 @@ fn walk_boundary_relinks_current_xyz_and_leaves_the_raw_bit_on_the_head() {
     sim.run_walk_boundary(
         id,
         crossing,
-        Some(&rules),
+        &rules,
         Some(&registry),
         crate::sim::world::FrameEffects::default(),
     );
@@ -486,7 +486,7 @@ pub(in crate::sim::world) fn ready_engineer(
     sim.run_walk_boundary(
         id,
         head,
-        Some(rules),
+        rules,
         Some(registry),
         crate::sim::world::FrameEffects::default(),
     );
@@ -537,9 +537,26 @@ fn engineer_at_intact_cabhut_emits_sound_no_mutation() {
 /// A completed hut repair cancels the hut target of every later engineer
 /// before its next turn. Live vector removal skips the repairer's immediate
 /// successor, which keeps its head until its next turn; a nonconsecutive one
-/// finishes its head in the same frame. Neither repeats the cancelled repair.
+/// finishes its head in the same frame. Neither repeats the cancelled repair:
+/// arriving in the hut with no NavCom, each enters idle mode (`0x0051A08C`),
+/// its tail commences Guard (`0x0051A8C5`), and InfantryAI's building scatter
+/// (`0x0051BCB2`) sends it out of the hut in the same turn.
 #[test]
 fn cancelled_successor_engineers_finish_their_heads_without_repeating_the_repair() {
+    let walked_out = |sim: &Simulation, id: u64| {
+        let e = sim.substrate.entities.get(id).unwrap();
+        assert!(e.lifecycle.object_alive());
+        assert_eq!(
+            e.mission.current(),
+            crate::sim::mission::MissionId::from_known(
+                crate::rules::mission_data::MissionType::Guard
+            )
+        );
+        assert!(matches!(
+            e.navigation.nav_com(),
+            Some(crate::sim::components::NavTargetRef::Cell { rx, ry }) if (rx, ry) != (16, 15)
+        ));
+    };
     for separated in [false, true] {
         let (mut sim, rules, registry, hut) = ready_repair_fixture(Some(231));
         let a = ready_engineer(&mut sim, &rules, &registry, hut);
@@ -553,14 +570,17 @@ fn cancelled_successor_engineers_finish_their_heads_without_repeating_the_repair
         if let Some(separator) = separator {
             assert!(sim.substrate.entities.get(separator).is_some());
         }
-        let successor = sim.substrate.entities.get(b).unwrap();
-        assert!(successor.lifecycle.object_alive(), "separated={separated}");
-        assert_eq!(successor.navigation.nav_com(), None);
-        assert_eq!(
-            successor.locomotor.as_ref().unwrap().step_head().is_some(),
-            !separated,
-            "live vector removal skips only the immediate successor"
-        );
+        if separated {
+            walked_out(&sim, b);
+        } else {
+            let successor = sim.substrate.entities.get(b).unwrap();
+            assert!(successor.lifecycle.object_alive());
+            assert_eq!(successor.navigation.nav_com(), None);
+            assert!(
+                successor.locomotor.as_ref().unwrap().step_head().is_some(),
+                "live vector removal skips only the immediate successor"
+            );
+        }
         assert_eq!(repair_sounds(&sim), [true]);
         assert!(sim.dirty_cells.radar_generation() > 0);
         for p in [(17, 14), (17, 15), (17, 16)] {
@@ -568,25 +588,46 @@ fn cancelled_successor_engineers_finish_their_heads_without_repeating_the_repair
         }
         if !separated {
             repair_frame(&mut sim, &rules, &registry);
-            let successor = sim.substrate.entities.get(b).unwrap();
-            assert!(successor.lifecycle.object_alive());
-            assert_eq!(successor.navigation.nav_com(), None);
-            assert_eq!(successor.locomotor.as_ref().unwrap().step_head(), None);
+            walked_out(&sim, b);
             assert_eq!(repair_sounds(&sim), [true]);
         }
     }
 }
 
+/// A later engineer's repair scatters an infantryman standing still in the
+/// hut (Building `0x004576F0`). An engineer whose hut target a repair
+/// cancelled walks out on arrival (see the test above), so the occupant is
+/// supplied through the lifecycle seam the Jumpjet case below uses.
 #[test]
 fn later_repair_scatters_stationary_hut_occupant_and_processes_it_synchronously() {
     use crate::sim::components::{DriveCoord, NavTargetRef};
     use crate::sim::movement::ground_pose;
     let (mut sim, rules, registry, hut) = ready_repair_fixture(Some(231));
     let first = ready_engineer(&mut sim, &rules, &registry, hut);
-    let waiting = ready_engineer(&mut sim, &rules, &registry, hut);
     repair_frame(&mut sim, &rules, &registry);
     assert!(sim.substrate.entities.get(first).is_none());
-    repair_frame(&mut sim, &rules, &registry);
+    let waiting = sim
+        .construct_object_limbo_at_height(
+            "ENGINEER",
+            "Americans",
+            16,
+            15,
+            0,
+            0,
+            &rules,
+            crate::sim::world::FrameEffects::default(),
+        )
+        .unwrap();
+    sim.substrate
+        .entities
+        .get_mut(waiting)
+        .unwrap()
+        .position
+        .put_location(DriveCoord::cell(16, 15, 0));
+    assert!(matches!(
+        sim.reveal_entity_with_rules(waiting, &rules),
+        crate::sim::world::RevealOutcome::Revealed { .. }
+    ));
     let e = sim.substrate.entities.get(waiting).unwrap();
     assert_eq!(e.locomotor.as_ref().unwrap().walk_is_moving(), Some(false));
     assert_eq!(e.navigation.nav_com(), None);
@@ -599,7 +640,7 @@ fn later_repair_scatters_stationary_hut_occupant_and_processes_it_synchronously(
     sim.run_completed_walk_step(
         last,
         DriveCoord::cell(16, 15, 0),
-        Some(&rules),
+        &rules,
         Some(&registry),
         crate::sim::world::FrameEffects::default(),
     )
@@ -689,7 +730,7 @@ fn hut_repair_scatters_a_jumpjet_occupant_through_its_air_destination_owner() {
     sim.run_completed_walk_step(
         engineer,
         DriveCoord::cell(16, 15, 0),
-        Some(&rules),
+        &rules,
         Some(&registry),
         crate::sim::world::FrameEffects::default(),
     )
@@ -1012,7 +1053,7 @@ fn walk_completion_uses_retained_destination_and_exact_height_tolerance() {
         sim.run_completed_walk_step(
             id,
             head,
-            Some(&rules),
+            &rules,
             Some(&registry),
             crate::sim::world::FrameEffects::default(),
         )
@@ -1248,7 +1289,7 @@ fn repair_queries_unrelated_rocketeer_after_move_and_snapshot_restore() {
                     target_rx: 20,
                     target_ry: 15,
                 },
-                Some(&rules),
+                &rules,
                 Some(&registry),
                 crate::sim::world::FrameEffects::default()
             ));
@@ -1293,7 +1334,7 @@ fn repair_queries_unrelated_rocketeer_after_move_and_snapshot_restore() {
             // adapter no longer touches Jumpjets at all.
             sim.tick_air_movement_with_cell_lists_one(
                 rocketeer,
-                None,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
                 None,
                 crate::sim::world::FrameEffects::default(),
             )
@@ -1432,7 +1473,6 @@ fn repair_queries_unrelated_rocketeer_after_move_and_snapshot_restore() {
 #[test]
 fn jumpjet_query_fields_hash_and_restore_as_one_suspended_instance() {
     use crate::rules::locomotor_type::LocomotorKind;
-    use crate::sim::movement::locomotion::piggyback;
     use crate::sim::{components::DriveCoord, snapshot::GameSnapshot};
     let (mut sim, rules, _) = fixture();
     let id = sim
@@ -1500,10 +1540,7 @@ fn jumpjet_query_fields_hash_and_restore_as_one_suspended_instance() {
         .locomotor
         .as_mut()
         .unwrap();
-    assert_eq!(
-        piggyback::begin(loco, LocomotorKind::Walk, 0),
-        piggyback::BeginOutcome::Installed
-    );
+    assert!(loco.begin_piggyback(LocomotorKind::Walk, 0));
     let saved = GameSnapshot::save(&sim, 0, 0, "jumpjet stash", 0);
     let mut restored = GameSnapshot::load(&saved).unwrap().sim;
     restored.restore_after_snapshot_load().unwrap();
@@ -1532,7 +1569,7 @@ fn jumpjet_query_fields_hash_and_restore_as_one_suspended_instance() {
         .as_mut()
         .unwrap();
     loco.set_piggyback_for_test(serde_json::from_str(&original).unwrap());
-    assert!(piggyback::end(loco).is_some());
+    assert!(loco.end_piggyback().is_some());
     assert_eq!(loco.jumpjet_runtime(), Some(&retained));
 }
 
@@ -1545,7 +1582,7 @@ fn jumpjet_stop_command_keeps_native_moving_and_selected_coordinate() {
     sim.assign_destination_represented(
         id,
         Some(crate::sim::components::NavTargetRef::cell(20, 15)),
-        Some(&rules),
+        &rules,
         None,
         crate::sim::world::FrameEffects::default(),
     )
@@ -1564,7 +1601,7 @@ fn jumpjet_stop_command_keeps_native_moving_and_selected_coordinate() {
     assert!(sim.apply_command_with_overlays(
         "Americans",
         &Command::Stop { entity_id: id },
-        Some(&rules),
+        &rules,
         Some(&registry),
         crate::sim::world::FrameEffects::default()
     ));
@@ -1634,7 +1671,7 @@ fn failed_jumpjet_stop_stock_fatal_receiver_precedes_cache_retirement() {
             .with_phase_for_test(1);
         assert!(sim.jumpjet_stop_moving(
             id,
-            Some(&rules),
+            &rules,
             Some(&registry),
             crate::sim::world::FrameEffects::default()
         ));
@@ -1678,10 +1715,8 @@ fn failed_jumpjet_stop_stock_fatal_receiver_precedes_cache_retirement() {
 /// The accepted setter's timer tail (Foot 0x4D96C2..0x4D9707); callers
 /// supply the Walk destination and head.
 fn accept_destination(sim: &mut Simulation, id: u64, rules: &RuleSet) {
-    let timing = crate::sim::movement::DestinationTiming::from_rules(
-        sim.session.binary_frame(),
-        Some(rules),
-    );
+    let timing =
+        crate::sim::movement::DestinationTiming::from_rules(sim.session.binary_frame(), rules);
     let e = sim.substrate.entities.get_mut(id).unwrap();
     timing.accept(e);
 }

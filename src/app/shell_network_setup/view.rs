@@ -23,7 +23,7 @@ fn label(state: &AppState, key: &str) -> String {
         .unwrap_or(key)
         .to_owned()
 }
-fn choice(state: &AppState, item: SkirmishComboItem) -> SetupChoice {
+pub(crate) fn choice(state: &AppState, item: SkirmishComboItem) -> SetupChoice {
     let value = match item {
         SkirmishComboItem::Country(SkirmishCountryChoice::Random) => -2,
         SkirmishComboItem::Country(SkirmishCountryChoice::Country(country)) => {
@@ -59,15 +59,28 @@ pub(crate) fn view(state: &AppState) -> Option<SetupView> {
     let protocol = state.frontend.network_setup_protocol.as_ref()?;
     let mode = mode_by_id(&state.frontend.skirmish_modes, launch.mode.id)?;
     let host = session.host();
+    let host_name = protocol.wol_host.as_deref();
     let local = launch.humans.get(launch.local_player_index)?;
-    let map_index = launch.selected_map_file.as_deref().and_then(|file| {
-        state
-            .frontend
-            .scenario_catalog
-            .shell_maps()
-            .iter()
-            .position(|map| map.file_name.eq_ignore_ascii_case(file))
-    });
+    let room = session.network_room();
+    // 0x4E5C5B..0x4E5C90, 0x4E5FD5..0x4E6004: a WOL clan room hides every
+    // team combo and the team header 0x794.
+    let clan_room = profile_is_wol(state) && room.clan;
+    // A guest shows its own copy of the map only when it verified, and on
+    // WOL only from a mixfile (0x005E74E0); otherwise its preview is the
+    // host's Preview.bin.
+    let local_map = host || protocol.local_preview();
+    let map_index = launch
+        .selected_map_file
+        .as_deref()
+        .filter(|_| local_map)
+        .and_then(|file| {
+            state
+                .frontend
+                .scenario_catalog
+                .shell_maps()
+                .iter()
+                .position(|map| map.file_name.eq_ignore_ascii_case(file))
+        });
     let capacity = session.network_setup_capacity()?.clamp(0, 8) as usize;
     let observer_row = session.network_observer_row().map(usize::from);
     let row_limit = session.network_row_limit()?;
@@ -77,14 +90,12 @@ pub(crate) fn view(state: &AppState) -> Option<SetupView> {
         capacity
     };
     let cooperative = mode.class.uses_cooperative_setup();
-    let coop = cooperative
-        .then(|| {
-            state
-                .frontend
-                .multiplayer_shell_runtime
-                .cooperative_setup_view()
-        })
-        .flatten();
+    let coop = cooperative.then(|| {
+        state
+            .frontend
+            .multiplayer_shell_runtime
+            .cooperative_setup_view()
+    });
     let mut combos = Vec::with_capacity(40);
     let mut row_icons = std::array::from_fn(|_| None);
     for row in 0..8u8 {
@@ -93,7 +104,7 @@ pub(crate) fn view(state: &AppState) -> Option<SetupView> {
             .iter()
             .enumerate()
             .find(|(_, human)| human.raw_slot_index == Some(row));
-        let ai = launch.opponents.iter().find(|ai| ai.raw_slot_index == row);
+        let ai = session.network_display_ai(row);
         let vacancy = session.network_vacancy(row);
         let is_local = local.raw_slot_index == Some(row);
         let observer = human.is_some_and(|(_, human)| human.is_observer())
@@ -121,7 +132,7 @@ pub(crate) fn view(state: &AppState) -> Option<SetupView> {
         let slot_value = if human.is_some() {
             0
         } else if let Some(ai) = ai {
-            match ai.difficulty {
+            match ai {
                 AiDifficulty::Easy => 4,
                 AiDifficulty::Normal => 5,
                 AiDifficulty::Hard => 6,
@@ -131,6 +142,7 @@ pub(crate) fn view(state: &AppState) -> Option<SetupView> {
                 NetworkVacancy::Open => 2,
                 NetworkVacancy::Closed => 3,
                 NetworkVacancy::OpenObserver => 7,
+                NetworkVacancy::Waiting => 1,
             }
         };
         let slot_label = human
@@ -207,10 +219,10 @@ pub(crate) fn view(state: &AppState) -> Option<SetupView> {
             .into_iter()
             .map(|item| choice(state, item))
             .collect();
-        if let Some(coop) = &coop {
+        if let Some(player_countries) = coop.as_ref().and_then(|coop| coop.player_countries) {
             //5C23B0 rebuilds country entries in the campaign's authored order.
             let mut allowed = Vec::new();
-            if coop.player_countries.len() > 1 {
+            if player_countries.len() > 1 {
                 allowed.push(SetupChoice {
                     value: -2,
                     text: label(state, "GUI:Random"),
@@ -302,7 +314,9 @@ pub(crate) fn view(state: &AppState) -> Option<SetupView> {
             combos.push(SetupCombo {
                 id: column.control(usize::from(row)),
                 enabled: editable && (column != SetupColumn::Team || mode.allies_allowed),
-                visible: visible && (column == SetupColumn::Country || !observer),
+                visible: visible
+                    && (column == SetupColumn::Country || !observer)
+                    && !(column == SetupColumn::Team && clan_room),
                 selected,
                 choices,
             });
@@ -310,7 +324,13 @@ pub(crate) fn view(state: &AppState) -> Option<SetupView> {
         if visible {
             row_icons[usize::from(row)] = Some(SetupRowIcon {
                 country: flag_pcx_for_side_item_data(country).map(str::to_owned),
-                host: human.is_some() && row == 0,
+                // 0x5EA3E0: wolhost.pcx on the human row named [0xA8D610];
+                // a WOL guest learns it from the user list, otherwise the
+                // host is row 0.
+                host: human.is_some_and(|(_, human)| match host_name {
+                    Some(host) => human.name == host,
+                    None => row == 0,
+                }),
                 accepted: ai.is_some()
                     || human.is_some_and(|(index, _)| session.network_player_ready(index)),
             });
@@ -363,6 +383,10 @@ pub(crate) fn view(state: &AppState) -> Option<SetupView> {
         ping_icons,
         host,
         locked: protocol.locked,
+        // C2's lockout (0x78F85E..0x78F907, 0x79132A..0x7913D1): Short Game
+        // checked and disabled in a tournament or clan room.
+        short_game_locked: host && profile_is_wol(state) && room.tournament_or_clan(),
+        team_header: !clan_room,
         accept_enabled: protocol.accept_eligible
             && !session.network_player_ready(launch.local_player_index),
         start_requested: protocol.start_requested
@@ -388,16 +412,20 @@ pub(crate) fn view(state: &AppState) -> Option<SetupView> {
         map_label: super::map_display_name(state)
             .map_or_else(|| label(state, "GUI:None"), str::to_owned),
         selected_map_index: map_index,
+        no_preview: protocol.wol_no_preview().0,
+        preview_hidden: protocol.wol_no_preview().1,
         cooperative,
-        cooperative_description: coop.as_ref().map(|coop| {
-            label(
-                state,
-                &format!(
-                    "NAME:COOPDESC{}{}",
-                    coop.campaign_index + 1,
-                    coop.stage_index + 1
-                ),
-            )
-        }),
+        cooperative_description: coop.as_ref().and_then(|coop| coop.description).map(
+            |(campaign, stage)| {
+                label(
+                    state,
+                    &format!("NAME:COOPDESC{}{}", campaign + 1, stage + 1),
+                )
+            },
+        ),
     })
+}
+
+fn profile_is_wol(state: &AppState) -> bool {
+    state.match_state.session_mode() == crate::app::match_runtime::session::SessionMode::Wol
 }

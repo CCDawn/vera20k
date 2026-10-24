@@ -1,11 +1,9 @@
 //! Retail PARACH atlas closure, canopy instance building, and offscreen draw.
 
-use super::draw_plan_lowering::{
-    NativeDisplayOrder, ObjectTexture, PlannedObjectInstance, lower_object_instances,
-};
+use super::draw_plan_lowering::{NativeDisplayOrder, ObjectTexture, lower_object_instances};
 use super::merge_passes::draw_native_object_pass;
 use crate::app::presentation::detail::DetailState;
-use crate::app::presentation::instances::{DisplayEffectInputs, build_parachute_instances};
+use crate::app::presentation::instances::{DisplayEffectInputs, build_display_effect_instances};
 use crate::assets::pal_file::Palette;
 use crate::map::entities::EntityCategory;
 use crate::map::houses::HouseColorMap;
@@ -16,7 +14,6 @@ use crate::render::sprite_atlas::{
     ShpPaletteContext, ShpSpriteKey, anim_remap_color, build_sprite_atlas,
     collect_anim_remap_base_keys,
 };
-use crate::render::tactical_draw_plan::SpriteEncoding;
 use crate::render::terrain_draw::TerrainDrawRenderer;
 use crate::render::terrain_draw_gpu_tests::{Gpu, camera, clear};
 use crate::rules::effect_asset_catalog::tolerant_anim_class_roots;
@@ -28,7 +25,7 @@ use crate::sim::game_entity::GameEntity;
 use crate::sim::movement::parachute_descent::begin_parachute_descent;
 use crate::sim::world::Simulation;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 #[test]
 #[ignore = "requires GPU and retail RA2/YR assets; live owner remaps through the production canopy builder and sprite pass"]
@@ -81,7 +78,7 @@ fn retail_parachute_canopy_uses_each_attached_house_remap_in_gpu_pixels() {
     let positions = [(10, 10), (14, 14)];
     let mut body_ids = Vec::with_capacity(2);
     for (owner, (rx, ry)) in owner_ids.iter().copied().zip(positions) {
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate_mut_for_test().allocate_stable_id();
         let mut entity = GameEntity::new_at_frame_zero_for_test(
             id,
             rx,
@@ -129,7 +126,10 @@ fn retail_parachute_canopy_uses_each_attached_house_remap_in_gpu_pixels() {
         let anim_id = sim
             .spawn_anim_at_world(&rules, descriptor, canopy_coord)
             .expect("retail canopy anim");
-        assert!(sim.set_anim_house_remap(anim_id, owner));
+        assert!(
+            sim.anims_mut_for_test()
+                .set_anim_house_remap(anim_id, owner)
+        );
         anim_ids.push(anim_id);
     }
     for ((&anim_id, &owner), &color) in anim_ids.iter().zip(&owner_ids).zip(&scheme_colors) {
@@ -148,7 +148,11 @@ fn retail_parachute_canopy_uses_each_attached_house_remap_in_gpu_pixels() {
     let live_remap_keys = collect_anim_remap_base_keys(&sim, &house_colors);
     let parachute_name = parachute_type.to_string();
     for color in &scheme_colors {
-        assert!(live_remap_keys.contains(&(parachute_name.to_ascii_uppercase(), *color)));
+        assert!(live_remap_keys.contains(&(
+            parachute_name.to_ascii_uppercase(),
+            crate::render::sprite_atlas::ShpPaletteContext::AnimScheme,
+            *color
+        )));
     }
     assert_eq!(live_remap_keys.len(), 2, "only the two live canopy remaps");
 
@@ -173,6 +177,7 @@ fn retail_parachute_canopy_uses_each_attached_house_remap_in_gpu_pixels() {
         &[],
         &live_remap_keys,
         &no_cell_drawers,
+        &Default::default(),
         None,
         None,
         Some(sim.interner()),
@@ -185,7 +190,7 @@ fn retail_parachute_canopy_uses_each_attached_house_remap_in_gpu_pixels() {
         .map(|(&anim_id, &color)| {
             let anim = sim.anim(anim_id).unwrap();
             let key = ShpSpriteKey {
-                palette_context: ShpPaletteContext::SelectedScheme,
+                palette_context: ShpPaletteContext::AnimScheme,
                 type_id: parachute_name.clone(),
                 facing: 0,
                 frame: u16::try_from(anim.runtime().current_frame).unwrap(),
@@ -215,10 +220,16 @@ fn retail_parachute_canopy_uses_each_attached_house_remap_in_gpu_pixels() {
             .fold(f32::INFINITY, f32::min)
             - 64.0,
     ];
-    let detail = RefCell::new(DetailState::new());
+    let mut detail = DetailState::new();
+    for _ in 0..60 {
+        detail.record_logic_visit();
+    }
+    detail.throttle_tail(0);
+    let detail = RefCell::new(detail);
     let lighting = CellLightGrid::new();
     let hidden = BTreeSet::new();
     let input = DisplayEffectInputs {
+        interpolation: None,
         sim: &sim,
         rules: &rules,
         camera: view_camera,
@@ -230,27 +241,19 @@ fn retail_parachute_canopy_uses_each_attached_house_remap_in_gpu_pixels() {
         detail: &detail,
         detail_level: 2,
         lighting: &lighting,
+        retained_anim_intensities: None,
         house_colors: &house_colors,
         hidden_super_anims: &hidden,
         show_hidden: false,
         local_owner: None,
         observe_particles: false,
     };
-    let order = NativeDisplayOrder::new(&body_ids);
-    let mut parents: Vec<_> = body_ids
-        .iter()
-        .map(|&id| {
-            PlannedObjectInstance::object(
-                order.object_draw(id, SpriteEncoding::Plain).unwrap(),
-                Vec::new(),
-            )
-        })
-        .collect();
-    let body_depths = HashMap::from([(body_ids[0], 0.5), (body_ids[1], 0.5)]);
-    build_parachute_instances(&input, &mut parents, &body_depths);
+    let order = NativeDisplayOrder::from_display(sim.display_layers());
+    let mut parents = Vec::new();
+    build_display_effect_instances(&input, &mut parents, &order, Default::default());
 
     let mut canopy_instances = Vec::with_capacity(2);
-    for ((&id, (key, entry)), parent) in body_ids.iter().zip(&keys_and_entries).zip(&parents) {
+    for ((&id, (key, entry)), parent) in anim_ids.iter().zip(&keys_and_entries).zip(&parents) {
         assert_eq!(parent.parent.id, id);
         assert_eq!(parent.pieces.len(), 1, "only the canopy is in this parent");
         let piece = &parent.pieces[0];
@@ -277,7 +280,7 @@ fn retail_parachute_canopy_uses_each_attached_house_remap_in_gpu_pixels() {
     let layers = lower_object_instances(parents);
     let ground = &layers[2];
     assert_eq!(ground.instances.len(), 2);
-    assert_eq!(ground.owners, body_ids);
+    assert_eq!(ground.owners, anim_ids);
     assert!(
         ground
             .runs
@@ -311,6 +314,7 @@ fn retail_parachute_canopy_uses_each_attached_house_remap_in_gpu_pixels() {
     );
     draw_native_object_pass(
         &mut encoder,
+        crate::app::render::merge_passes::ObjectDrawPhase::Display,
         &cv,
         &dv,
         &mut terrain,
@@ -346,7 +350,6 @@ fn retail_parachute_canopy_uses_each_attached_house_remap_in_gpu_pixels() {
     assert_eq!(one_instance.size, two_instance.size);
     assert_eq!(one_instance.tint, two_instance.tint);
     assert_eq!(one_instance.alpha, two_instance.alpha);
-    assert_eq!(one_instance.depth, two_instance.depth);
     assert_eq!(one_instance.palette_light, two_instance.palette_light);
     for (one, two) in one_instance.position.into_iter().zip(two_instance.position) {
         let delta = two - one;

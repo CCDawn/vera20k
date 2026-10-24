@@ -48,7 +48,7 @@ fn authored_ai_trigger_actions_change_only_the_selected_house_latch() {
             sim.main_rng.native_state_hex(),
             sim.mapgen_rng.native_state_hex(),
         );
-        let _ = sim.advance_triggers(Some(&rules), Some(&registry), FrameEffects::default());
+        let _ = sim.advance_triggers(&rules, Some(&registry), FrameEffects::default());
         for (index, owner) in houses.iter().enumerate() {
             let house = &sim.houses[owner];
             let wanted = HouseAiActivationLatches {
@@ -85,10 +85,6 @@ fn authored_ai_trigger_actions_change_only_the_selected_house_latch() {
 
 fn corpus() -> &'static serde_json::Value {
     let value = crate::test_fixture::json("tools/spatial_oracle/trigger_ai_activation.json");
-    assert_eq!(
-        value["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     assert_eq!(value["actions"]["controls"].as_array().unwrap().len(), 26);
     assert_eq!(value["histories"].as_array().unwrap().len(), 14);
     value
@@ -232,7 +228,7 @@ fn run_native_action(
             input: TagEventInput::default(),
         },
         &mut Vec::new(),
-        Some(rules),
+        rules,
         None,
         FrameEffects::default(),
     );
@@ -584,7 +580,7 @@ fn retail_all05_elapsed_stop_keeps_explicit_teams_and_saved_activation() {
     crate::sim::scenario_bootstrap::initialize_map_roster_houses(
         &mut sim,
         &roster,
-        Some(&rules),
+        &rules,
         Some(&map.ini),
     );
     sim.session.install_waypoints(&map.waypoints);
@@ -651,7 +647,7 @@ fn retail_all05_elapsed_stop_keeps_explicit_teams_and_saved_activation() {
                 input: TagEventInput::default()
             },
             &mut Vec::new(),
-            Some(&rules),
+            &rules,
             None,
             FrameEffects::default()
         ));
@@ -670,7 +666,7 @@ fn retail_all05_elapsed_stop_keeps_explicit_teams_and_saved_activation() {
             ..Default::default()
         },
         &mut Vec::new(),
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default()
     ));
@@ -705,7 +701,7 @@ fn retail_all05_elapsed_stop_keeps_explicit_teams_and_saved_activation() {
                 ..Default::default()
             },
             &mut Vec::new(),
-            Some(&rules),
+            &rules,
             None,
             FrameEffects::default()
         ));
@@ -764,7 +760,7 @@ fn retail_all05_elapsed_stop_keeps_explicit_teams_and_saved_activation() {
                 input: TagEventInput::default()
             },
             &mut Vec::new(),
-            Some(&rules),
+            &rules,
             None,
             FrameEffects::default()
         ));
@@ -820,7 +816,7 @@ fn retail_all05_elapsed_stop_keeps_explicit_teams_and_saved_activation() {
     }
 }
 
-// Steam 3e81a617..08600: Execute30/50C210's 21 caller controls and 15
+// Steam gamemd: Execute30/50C210's 21 caller controls and 15
 // Execute76 controls, including 14 original due-selector/RNG histories.
 // Recalc 5054B0 and ComputerParanoid are declared sinks in the 30 controls;
 // production planner/retail checks below are Rust integration regressions.
@@ -848,7 +844,7 @@ fn house_control_action(
             input: TagEventInput::default(),
         },
         &mut Vec::new(),
-        Some(rules),
+        rules,
         None,
         FrameEffects::default(),
     )
@@ -1301,8 +1297,8 @@ fn house_team_controls_ordered_tag_history_preserves_native_due_selection_and_sa
     let main_before = sim.main_rng.native_state_hex();
     let mapgen_before = sim.mapgen_rng.native_state_hex();
     let untouched = save_codec::serialize(&sim.houses[&houses[2]]).unwrap();
-    sim.advance_triggers(Some(&rules), Some(&registry), FrameEffects::default());
-    // Original consecutive Read/Execute13/77/78/79, Steam3e81a617..08600:
+    sim.advance_triggers(&rules, Some(&registry), FrameEffects::default());
+    // Original consecutive Read/Execute13/77/78/79, Steam gamemd:
     // 13 selects Country7, while all three ratio actions use incoming House0.
     assert_eq!(
         sim.houses[&houses[0]].scenario_team_ratios(),

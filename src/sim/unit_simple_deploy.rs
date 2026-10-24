@@ -8,7 +8,7 @@ use crate::rules::ruleset::RuleSet;
 use crate::sim::anim_class::AnimWorldCoord;
 use crate::sim::components::{AnimClassSpawnDescriptor, NavTargetRef};
 use crate::sim::game_entity::GameEntity;
-use crate::sim::mission::authority::EntityReadyInputProvider;
+use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::world::{FrameEffects, Simulation};
 
@@ -55,7 +55,7 @@ impl Simulation {
             MissionId::from_known(MissionType::Guard),
             0,
             self.session.binary_frame(),
-            &EntityReadyInputProvider,
+            &LiveReadyInputProvider { rules },
         )
         .map_err(|error| error.to_string())?;
         self.substrate
@@ -144,7 +144,7 @@ impl Simulation {
                         self.assign_destination_represented(
                             id,
                             Some(NavTargetRef::cell(rx as u16, ry as u16)),
-                            Some(rules),
+                            rules,
                             None,
                             effects,
                         )
@@ -204,7 +204,15 @@ impl Simulation {
         }
         // The native updaters request these sounds on every admitted visit,
         // independently of whether this call finished or merely waited.
-        self.emit_deploy_action_sound(id, if deploying { 27 } else { 31 }, rules)
+        Self::emit_deploy_action_sound(
+            &mut self.interner,
+            &self.substrate,
+            self.resolved_terrain.as_ref(),
+            &mut self.sound_events,
+            id,
+            if deploying { 27 } else { 31 },
+            rules,
+        )
     }
 
     fn start_unit_deploy_anim(
@@ -262,7 +270,7 @@ impl Simulation {
             .get_mut(id)
             .expect("same Unit")
             .retain_deploy_anim(anim);
-        self.set_anim_house_remap(anim, remap_house);
+        self.substrate.anims.set_anim_house_remap(anim, remap_house);
         Ok(anim)
     }
 }

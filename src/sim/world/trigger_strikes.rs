@@ -15,7 +15,7 @@ use crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS;
 use crate::util::native_x87::NativeF64Bits;
 
 impl Simulation {
-    /// Execute96 -> ChemMissileAtWP6E38F0..6E3B13, Steam3e81a617..08600.
+    /// Execute96 -> ChemMissileAtWP6E38F0..6E3B13, Steam gamemd.
     /// Literal ChemLauncher (773030 only finds an already allocated type),
     /// null firer, speed20/Bright=false, ground+structural bridge target.
     /// Map586AC0's non-inset LocalSize edge supplies launch XY, Z=0.
@@ -73,7 +73,7 @@ impl Simulation {
             NativeF64Bits::from_bits(0x4059_0000_0000_0000),
             NativeF64Bits::from_bits(0),
         ]);
-        let stable_id = self.allocate_stable_id();
+        let stable_id = self.substrate.allocate_stable_id();
         let native_id = self.next_native_runtime_id();
         if let Some(bullet) = FiredBullet::launched(
             self,
@@ -91,7 +91,7 @@ impl Simulation {
         true
     }
 
-    /// Steam gamemd 3e81a617..08600, Execute95 at6DD9DA ->6E3410..6E35E2.
+    /// Steam gamemd, Execute95 at6DD9DA ->6E3410..6E35E2.
     /// Uses the literal NukePayload, not a Super or the numeric action value.
     /// Constructor speed50/Bright=false, height+20000 and velocity scale-100
     /// are independent of Weapon.Speed and BulletType.DetonationAltitude.
@@ -107,6 +107,7 @@ impl Simulation {
             return false;
         };
         self.launch_nuke_payload_at_cell(rules, cell, Some(50), None)
+            .is_some()
     }
 
     /// Shared descending NukePayload construction for Execute95 6E3410 and
@@ -114,22 +115,21 @@ impl Simulation {
     /// the latter uses Weapon.Speed and constructs a House-owned PSIWARN
     /// attached to the new bullet before Fire. Both use null bullet owner,
     /// Bright=false, structural bridge100, height20000 and scale-100.
+    /// Returns the strike coordinate on a launch: the one-time Super's
+    /// DigSound plays there (`0x006CDCAE`). RESIDUAL: when the one-time
+    /// Super's bullet creation returns null (`0x006CDB93`), native skips the
+    /// PSIWARN, Fire, EVA line and DigSound; VERA still plays them. Only a
+    /// failed bullet creation reaches it.
     pub(crate) fn launch_nuke_payload_at_cell(
         &mut self,
         rules: &RuleSet,
         cell: (i16, i16),
         speed_override: Option<i32>,
         warning_house: Option<InternedId>,
-    ) -> bool {
-        let Some(location) = self.direct_strike_coord(cell) else {
-            return false;
-        };
-        let Some(weapon) = rules.weapon("NukePayload") else {
-            return false;
-        };
-        let Some(warhead) = weapon.warhead.as_deref().and_then(|id| rules.warhead(id)) else {
-            return false;
-        };
+    ) -> Option<DriveCoord> {
+        let location = self.direct_strike_coord(cell)?;
+        let weapon = rules.weapon("NukePayload")?;
+        let warhead = weapon.warhead.as_deref().and_then(|id| rules.warhead(id))?;
         // 6E34D3's Map565730 looks up world XY again. Preserve truncation
         // and the retained Dummy rather than assuming the packed waypoint
         // is always the CellClass that becomes the Bullet's target.
@@ -144,7 +144,7 @@ impl Simulation {
             false,
         )
         .with_installed_weapon(Some(self.interner.intern(&weapon.id)));
-        let stable_id = self.allocate_stable_id();
+        let stable_id = self.substrate.allocate_stable_id();
         let native_id = self.next_native_runtime_id();
         if let Some(owner) = warning_house {
             //43B5E0 uses the target Cell's GetCoords, not this producer's
@@ -193,7 +193,7 @@ impl Simulation {
             admit_fired_bullet(self, rules, weapon, stable_id, bullet);
         }
         // 6E35D1 returns true independently of Fire's Boolean result.
-        true
+        Some(location)
     }
 
     /// Shared coordinate setup in 95's6E3446..6E3495 and 96's6E3917..6E3975.

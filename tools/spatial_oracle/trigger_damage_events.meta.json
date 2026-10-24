@@ -1,6 +1,5 @@
 {
   "schema_version": 1,
-  "native_sha256": "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600",
   "unicorn_binding": "2.1.4",
   "unicorn_core": [
     2,
@@ -61,5 +60,5 @@
     "asset_directory": "No CampaignReader VM is constructed or eager asset directory loaded by this mode"
   },
   "replay_command": "python -m tools.spatial_oracle.tag_lifecycle --damage-events",
-  "payload_sha256": "8fb8be582d0a604344b5772c90257131daddcd90d26e7fe3702842b96cec096e"
+  "payload_sha256": "594bcaa2b9e9a77365163d53afb4aa95afe3484e085fb7eb760ec262cc45edd6"
 }

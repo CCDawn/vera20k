@@ -35,10 +35,7 @@ fn supplied_world(rules: &RuleSet, case: &Value) -> Simulation {
         input["air_range_bonus"]
     );
     assert_eq!(json!(obj.strength), input["strength"]);
-    assert_eq!(
-        json!(crate::sim::combat::armor_index(&obj.armor)),
-        input["armor"]
-    );
+    assert_eq!(json!(obj.armor_id().index()), input["armor"]);
     assert_eq!(
         json!(rules.general.normal_targeting_delay),
         input["normal_delay"]
@@ -199,7 +196,7 @@ fn supply_step(sim: &mut Simulation, rules: &RuleSet, input: &Value) {
         sim.assign_target_represented(
             1,
             None::<TargetKind>,
-            Some(rules),
+            rules,
             None,
             crate::sim::world::FrameEffects::default(),
         )
@@ -331,7 +328,7 @@ fn native_passive_bridge_histories_preserve_timers_rng_assignment_and_cell_list_
             let main = sim.main_rng.logical_state();
             let map = sim.mapgen_rng.logical_state();
             let ids = sim.native_unique_ids.as_ref().unwrap().current_raw();
-            passive_acquire_step(&mut sim, 1, Some(&rules), ObjectAiCtx::default());
+            passive_acquire_step(&mut sim, 1, &rules, ObjectAiCtx::default());
             assert_state(&sim, &step["after"], &format!("{label}/{index} after"));
             assert_eq!(
                 sim.scenario_rng.native_state_hex(),
@@ -568,6 +565,18 @@ pub(super) fn retail_hills_collapsed_scene(
         .get_or_register_for_test(enemy, || {
             let mut house = HouseState::new(enemy, 0, None, true, 0, 10);
             house.initialize_scenario_name("Russians");
+            // The synthetic House is only the acquisition-entry boundary the
+            // passive-scan steps below consume; it must sit the match out.
+            // Its one FV dies inside this fixture, so without MultiplayPassive
+            // the defeat gate (4F8E92..4F8F77) reads the House empty,
+            // MPlayer_Defeated (4FC3DE..4FC6B7) completes the match at the
+            // local house's win, and the savour expiry (4F85BE) later turns
+            // every frame tail terminal — after which the pending-delete
+            // drain (Main_Tick 55DE9F -> 725C70) no longer runs and a
+            // hut-consumed Engineer could never leave storage in its repair
+            // frame. MultiplayPassive is the defeat gate's own skip for
+            // houses that do not participate in the match result.
+            house.make_multiplay_passive();
             house
         });
     if !scenario.runtime.simulation.houses.order().contains(&enemy) {}
@@ -605,7 +614,7 @@ pub(super) fn retail_hills_collapsed_scene(
         passive_acquire_step(
             &mut runtime.simulation,
             source,
-            Some(&runtime.resources.rules),
+            &runtime.resources.rules,
             ObjectAiCtx {
                 overlay_registry: Some(&runtime.resources.overlay_registry),
                 ..Default::default()

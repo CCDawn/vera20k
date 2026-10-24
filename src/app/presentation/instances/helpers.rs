@@ -91,6 +91,13 @@ pub(crate) fn observer_draw_context(
                     .detects_disguise_for_house(observer, cell.0 as u16, cell.1 as u16)
             }),
         drawn_voxel: None,
+        double_thick_building: entity.category() == EntityCategory::Structure
+            && object.zip(rules).is_some_and(|(obj, rules)| {
+                rules
+                    .art()
+                    .resolve_metadata_entry(sim.interner().resolve(entity.type_ref()), &obj.image)
+                    .is_some_and(|art| art.building_double_thick)
+            }),
     }
 }
 
@@ -141,6 +148,13 @@ pub(crate) fn tactical_entity_admission(
 ) -> Option<crate::render::draw_state::DrawDecision> {
     let requires_revealed_anchor = purpose == TacticalEntityPurpose::ScreenSelection;
     if (entity.category() == EntityCategory::Structure && !entity.lifecycle.object_alive())
+        // Tactical6D9985..6D9996 skips the live building while its frozen
+        // FoggedObjectClass is drawn by the separate4D1890 base pass.
+        || (purpose == TacticalEntityPurpose::Drawing
+            && entity.category() == EntityCategory::Structure
+            && !ignore_visibility
+            && local_owner_id
+                .is_some_and(|viewer| fog.is_object_fogged(viewer, entity.stable_id())))
         || entity.lifecycle.in_limbo()
         || entity.passenger_role.is_inside_transport()
         || (requires_revealed_anchor
@@ -204,7 +218,7 @@ fn tactical_bounded_entity_encounter_order(
         .and_then(|owner| sim.interner().get(owner));
 
     compose_tactical_screen_entity_encounter_order(
-        sim,
+        crate::app::input::entity_pick::presented(state, sim),
         (min_x, min_y, max_x, max_y),
         local_owner.as_deref(),
         local_owner_id,
@@ -217,7 +231,7 @@ fn tactical_bounded_entity_encounter_order(
 }
 
 fn compose_tactical_screen_entity_encounter_order(
-    sim: &crate::sim::world::Simulation,
+    source: impl crate::app::input::entity_pick::PickWorld,
     bounds: (f32, f32, f32, f32),
     local_owner: Option<&str>,
     local_owner_id: Option<InternedId>,
@@ -227,6 +241,7 @@ fn compose_tactical_screen_entity_encounter_order(
     bulk_register_live_buildings: bool,
     rules: Option<&crate::rules::ruleset::RuleSet>,
 ) -> Vec<u64> {
+    let sim = source.simulation();
     let (min_x, min_y, max_x, max_y) = bounds;
     let mut candidates = tactical_entity_encounter_order(sim);
     // Band-box preflight has a separate native bulk Building registration
@@ -266,7 +281,7 @@ fn compose_tactical_screen_entity_encounter_order(
                 if !admitted {
                     return false;
                 }
-                let (x, y) = interpolated_screen_position_entity(entity);
+                let (x, y) = source.screen_position(entity);
                 x >= min_x && x <= max_x && y >= min_y && y <= max_y
             })
         })
@@ -407,12 +422,16 @@ pub(crate) fn apply_shape_z_adjust(depth: f32, z_adjust_px: i32, world_height: f
     (depth + z_adjust_px as f32 / world_height.max(1.0)).clamp(0.001, 0.999)
 }
 
-/// Where this entity is drawn, sub-cell offsets and height lift included.
+/// The authoritative anchor, sub-cell offsets and height lift included.
 ///
 /// Thin wrapper over [`crate::render::locomotor_visual::screen_position`],
 /// which is the single owner of the answer. Callers must NOT apply a height
 /// offset of their own on top — doing that in two places is what used to lift
 /// aircraft twice.
+/// Despite its legacy name, this is not the experimental render interpolation:
+/// native comparisons retain this current-state anchor. Live rendering and
+/// picking use `presentation::interpolation` with explicit client state.
+#[cfg(test)]
 pub(crate) fn interpolated_screen_position_entity(
     entity: &crate::sim::game_entity::GameEntity,
 ) -> (f32, f32) {
@@ -422,8 +441,9 @@ pub(crate) fn interpolated_screen_position_entity(
 /// Check whether an entity is visible to the local player based on shroud.
 ///
 /// In standard YR (FogOfWar=false), once a cell is explored it stays fully
-/// visible forever. Friendly entities are always visible. Enemy entities are
-/// visible if the cell they occupy has been explored (revealed).
+/// visible forever. Entities of the local player's allies, as its house
+/// counts them, are always visible (VERA's policy, with no native ally test).
+/// Others are visible if the cell they occupy has been explored (revealed).
 pub(crate) fn is_entity_visible_for_local_owner(
     local_owner: Option<&str>,
     fog: &FogState,
@@ -439,7 +459,7 @@ pub(crate) fn is_entity_visible_for_local_owner(
     let Some(local_owner) = local_owner else {
         return true;
     };
-    if crate::map::houses::are_houses_friendly(alliances, local_owner, owner) {
+    if crate::map::houses::is_allied_with(alliances, local_owner, owner) {
         return true;
     }
     let owner_id = local_owner_id.unwrap_or_default();
@@ -1027,3 +1047,7 @@ mod tests {
         assert_eq!(ground_sort_row(gi, drawn_y) - drawn_y, 216.0);
     }
 }
+
+#[cfg(test)]
+#[path = "building_warp_draw_tests.rs"]
+mod building_warp_draw_tests;

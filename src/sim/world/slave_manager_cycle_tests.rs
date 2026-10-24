@@ -495,7 +495,7 @@ fn deploy_and_undeploy_hand_the_slave_manager_over() {
         .finish_pack_up_for_test();
     sim.visit_building_down(
         yarefn,
-        Some(&rules),
+        &rules,
         None,
         crate::sim::world::FrameEffects::default(),
     );
@@ -661,10 +661,7 @@ fn retail_rules_feed_the_slave_refinery_relocation() {
     let refinery = rules.object("YAREFN").expect("YAREFN");
     assert_eq!(refinery.undeploys_into.as_deref(), Some("SMIN"));
     assert_eq!(refinery.deploy_sound.as_deref(), Some("SlaveMinerUndeploy"));
-    assert_eq!(
-        crate::rules::foundation::foundation_dimensions(&refinery.foundation),
-        (2, 2)
-    );
+    assert_eq!(refinery.foundation.dimensions(), (2, 2));
     let miner = rules.object("SMIN").expect("SMIN");
     assert_eq!(miner.deploys_into.as_deref(), Some("YAREFN"));
 }
@@ -734,7 +731,7 @@ fn an_attacker_of_a_packing_refinery_takes_the_slave_miner() {
         .finish_pack_up_for_test();
     sim.visit_building_down(
         refinery,
-        Some(&rules),
+        &rules,
         None,
         crate::sim::world::FrameEffects::default(),
     );
@@ -874,5 +871,48 @@ fn a_player_cell_order_relocates_a_refinery_with_its_existing_slave_manager() {
             sim.entities().get(slave).unwrap().slave.owner(),
             Some(converted)
         );
+    }
+}
+
+/// FootClass::Mission_AreaGuard starts an idle Slave Miner's hunt
+/// (`0x004D6D69..0x004D6D73`, StartHunt `0x006B0CC0`) on every visit the
+/// Unit kick (`0x00744100`) does not take, so a fresh Area Guard (the G key,
+/// or an AI team's script 11) sends the miner out at once. The kick alone
+/// waits `SlaveMinerKickFrameDelay` (150) after the mission began and, for a
+/// human, needs ore within `SlaveMinerShortScan` (8 cells); this ore is 10
+/// cells away, inside `SlaveMinerLongScan`.
+#[test]
+fn area_guard_starts_an_idle_slave_miners_hunt_at_once() {
+    for human in [true, false] {
+        let mut s = row_scene(&serde_json::json!({
+            "name": "area_guard_hunt",
+            "owner": "unit",
+            "owner_mission": "area_guard",
+            "human": human,
+            "manager_state": 0,
+            "manager_frame_ago": 0,
+            "ore": [[25, 15, 0, 0, 5], [25, 16, 0, 0, 5]],
+        }));
+        assert_eq!(manager_state_of(&s, s.master), ManagerState::Ready);
+        let mut states = vec![ManagerState::Ready];
+        for _ in 0..30 {
+            frame(&mut s);
+            let state = manager_state_of(&s, s.master);
+            if states.last() != Some(&state) {
+                states.push(state);
+            }
+        }
+        // StartHunt (state 1), then state 1 finds the field and drives.
+        assert_eq!(
+            states,
+            [
+                ManagerState::Ready,
+                ManagerState::Scanning,
+                ManagerState::Travelling
+            ],
+            "human {human}"
+        );
+        let miner = s.scene.sim.substrate.entities.get(s.master).unwrap();
+        assert!(miner.navigation.nav_com().is_some(), "human {human}");
     }
 }

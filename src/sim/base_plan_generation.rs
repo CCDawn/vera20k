@@ -7,7 +7,8 @@ use crate::rules::object_type::{ObjectCategory, ObjectType};
 use crate::rules::prerequisite::{Prerequisite, PrerequisiteGroup};
 use crate::rules::ruleset::RuleSet;
 use crate::sim::ai_buildable::{
-    candidate_allowed, country_bit, first_buildable_from_array, first_owner_compatible_harvester,
+    CountryBuildMasks, candidate_allowed, first_buildable_from_array,
+    first_owner_compatible_harvester,
 };
 use crate::sim::base_plan::BasePlanState;
 use crate::sim::house_state::HouseDifficulty;
@@ -30,10 +31,10 @@ pub(crate) fn preflight_recalc(
     side_index: i32,
     difficulty: HouseDifficulty,
 ) -> Result<(), RecalcPreflightError> {
-    let country_index = rules
-        .trigger_house_type_index(country_name)
+    rules
+        .country_index(country_name)
         .ok_or(RecalcPreflightError::UnknownCountry)?;
-    let bit = country_bit(country_index);
+    let bit = rules.country_owner_mask(country_name);
     let has_harvester = first_owner_compatible_harvester(rules, bit).is_some();
     let refinery_counts = if has_harvester {
         &rules.ai_extra_refineries
@@ -75,10 +76,7 @@ pub(crate) fn recalc_base_plan(
 ) {
     debug_assert!(preflight_recalc(rules, country_name, side_index, difficulty).is_ok());
 
-    let country_index = rules
-        .trigger_house_type_index(country_name)
-        .expect("active House country is registered");
-    let bit = country_bit(country_index);
+    let country = CountryBuildMasks::for_country(rules, country_name);
     let mut eligible: Vec<&ObjectType> = rules
         .building_ids
         .iter()
@@ -87,7 +85,7 @@ pub(crate) fn recalc_base_plan(
             recalc_candidate_allowed(
                 candidate,
                 type_tech_levels,
-                bit,
+                country,
                 side_index,
                 tech_level,
                 super_weapons,
@@ -191,7 +189,7 @@ pub(crate) fn recalc_base_plan(
         super_weapons,
     )
     .expect("active Recalc BuildRefinery list resolves a buildable type");
-    let has_harvester = first_owner_compatible_harvester(rules, bit).is_some();
+    let has_harvester = first_owner_compatible_harvester(rules, country.owner_bit()).is_some();
     let duplicate_count = if has_harvester {
         rules.ai_extra_refineries[difficulty.table_index()]
     } else {
@@ -246,13 +244,13 @@ pub(crate) fn recalc_base_plan(
 fn recalc_candidate_allowed(
     candidate: &ObjectType,
     type_tech_levels: &TypeTechLevels,
-    country_bit: u32,
+    country: CountryBuildMasks,
     side_index: i32,
     tech_level: i32,
     super_weapons: bool,
     rules: &RuleSet,
 ) -> bool {
-    candidate_allowed(candidate, country_bit, side_index, super_weapons, rules)
+    candidate_allowed(candidate, country, side_index, super_weapons, rules)
         && candidate.ai_build_this
         && type_tech_levels.get(candidate) <= tech_level
 }
@@ -292,25 +290,46 @@ pub(crate) fn prerequisites_satisfied(
     present: &[&ObjectType],
     rules: &RuleSet,
 ) -> bool {
-    candidate.prerequisite.iter().all(|entry| match *entry {
-        Prerequisite::Building(index) => present.iter().any(|ty| ty.base_plan_type_index == index),
-        Prerequisite::Group(group) => {
-            let family = match group {
-                PrerequisiteGroup::Power => &rules.build_power_types,
-                PrerequisiteGroup::Factory => &rules.build_weapons_types,
-                PrerequisiteGroup::Barracks => &rules.build_barracks_types,
-                PrerequisiteGroup::Radar => &rules.build_radar_types,
-                PrerequisiteGroup::Tech => &rules.build_tech_types,
-                PrerequisiteGroup::Proc => &rules.build_refinery_types,
-            };
-            present.iter().any(|ty| {
-                family
-                    .iter()
-                    .any(|type_id| type_id.eq_ignore_ascii_case(&ty.id))
-            })
+    candidate.prerequisite.iter().all(|entry| {
+        #[cfg(feature = "ares")]
+        if let Some(group) = rules.ares_prerequisite_group(*entry) {
+            // Ares3.0 hook505360 -> ListContainsAll10008370 inspects only
+            // immediate building members. Runtime alternates are unread;
+            // a negative member code cannot match a BuildingType index.
+            return group.members().iter().any(|member| match *member {
+                Prerequisite::Building(index) => {
+                    present.iter().any(|ty| ty.base_plan_type_index == index)
+                }
+                Prerequisite::Group(_) | Prerequisite::GenericGroup(_) => false,
+            });
+        }
+        match *entry {
+            Prerequisite::Building(index) => {
+                present.iter().any(|ty| ty.base_plan_type_index == index)
+            }
+            Prerequisite::Group(group) => {
+                let family = match group {
+                    PrerequisiteGroup::Power => &rules.build_power_types,
+                    PrerequisiteGroup::Factory => &rules.build_weapons_types,
+                    PrerequisiteGroup::Barracks => &rules.build_barracks_types,
+                    PrerequisiteGroup::Radar => &rules.build_radar_types,
+                    PrerequisiteGroup::Tech => &rules.build_tech_types,
+                    PrerequisiteGroup::Proc => &rules.build_refinery_types,
+                };
+                present.iter().any(|ty| {
+                    family
+                        .iter()
+                        .any(|type_id| type_id.eq_ignore_ascii_case(&ty.id))
+                })
+            }
+            Prerequisite::GenericGroup(_) => false,
         }
     })
 }
+
+#[cfg(all(test, feature = "ares"))]
+#[path = "base_plan_generation_ares_tests.rs"]
+mod ares_tests;
 
 #[cfg(test)]
 mod tests {
@@ -427,14 +446,14 @@ mod tests {
              [SuperWeaponTypes]\n0=DISABLED\n[DISABLED]\nType=MultiMissile\nDisableableFromShell=yes\n",
         ))
         .expect("eligibility fixture");
-        let bit = country_bit(rules.trigger_house_type_index("Americans").unwrap());
+        let country = CountryBuildMasks::for_country(&rules, "Americans");
         let allowed = |id: &str, shell_enabled: bool| {
             recalc_candidate_allowed(
                 rules
                     .object_in_category(ObjectCategory::Building, id)
                     .unwrap(),
                 &TypeTechLevels::default(),
-                bit,
+                country,
                 0,
                 5,
                 shell_enabled,
@@ -479,13 +498,18 @@ mod tests {
 
     #[test]
     fn recalc_prerequisites_cover_families_explicit_identity_and_pass_boundary() {
-        let rules = basic_rules(
-            "7=EXPLICIT\n8=ALLREQ\n9=A\n10=B",
-            "[EXPLICIT]\nOwner=Americans\nFoundation=1x1\n\
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[General]\nPrerequisitePower=POW\nPrerequisiteFactory=WEAP\n\
+             PrerequisiteBarracks=BAR\nPrerequisiteRadar=RAD\nPrerequisiteTech=TECH\nPrerequisiteProc=REF\n\
+             [AI]\nBuildPower=POW\nBuildWeapons=WEAP\nBuildBarracks=BAR\n\
+             BuildRadar=RAD\nBuildTech=TECH\nBuildRefinery=REF\n\
+             [BuildingTypes]\n0=CON\n1=POW\n2=REF\n3=BAR\n4=WEAP\n5=RAD\n6=TECH\n\
+             7=EXPLICIT\n8=ALLREQ\n9=A\n10=B\n\
+             [EXPLICIT]\nOwner=Americans\nFoundation=1x1\n\
              [ALLREQ]\nOwner=Americans\nPrerequisite=POWER,FACTORY,BARRACKS,RADAR,TECH,PROC,EXPLICIT\nFoundation=1x1\n\
              [A]\nOwner=Americans\nFoundation=1x1\n\
              [B]\nOwner=Americans\nPrerequisite=A\nFoundation=1x1\n",
-        );
+        )).unwrap();
         let get = |id| {
             rules
                 .object_in_category(ObjectCategory::Building, id)

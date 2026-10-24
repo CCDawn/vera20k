@@ -153,12 +153,13 @@ impl DamageConsequences {
                 crate::sim::docking::bunker_link::release_sell_destroy(
                     world,
                     dead_id,
+                    rules,
                     frame_effects,
                 );
             }
             world.uninit_with_context(
                 dead_id,
-                UninitContext::new(Some(rules), overlay_registry).with_effects(frame_effects),
+                UninitContext::new(rules, overlay_registry).with_effects(frame_effects),
             );
         }
 
@@ -173,7 +174,7 @@ impl DamageConsequences {
                 detonation,
                 world.session.binary_frame(),
                 &world.session.theater(),
-                &rules.radiation,
+                rules,
                 world.resolved_terrain.as_ref(),
                 &mut world.lighting_sources,
             );
@@ -203,14 +204,21 @@ impl DamageConsequences {
         if let DamageDelivery::Ordinary { fire_events, .. } = delivery {
             world.fire_events.emit_all(fire_events);
         }
-        for (die_sound_id, rx, ry) in effects.death_sounds.drain(..) {
+        for (die_sound_id, location) in effects.death_sounds.drain(..) {
             world.sound_events.emit(SimSoundEvent::EntityDied {
                 die_sound_id,
-                rx,
-                ry,
+                world: location,
             });
         }
-        world.dispatch_under_attack_events(&effects.under_attack_events, rules);
+        Simulation::dispatch_under_attack_events(
+            &world.interner,
+            &world.session,
+            &world.house_alliances,
+            &mut world.sound_events,
+            &world.houses,
+            &effects.under_attack_events,
+            rules,
+        );
         world.dispatch_unit_lost_events(&effects.unit_lost_events);
         debug_assert!(effects.smudge_spawn_requests.is_empty());
         if ordinary {
@@ -332,7 +340,7 @@ mod muzzle_anim_tests {
             } else {
                 "TANK"
             });
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         sim.substrate
             .entities
             .insert(GameEntity::new_at_frame_zero_for_test(

@@ -7,6 +7,9 @@ use crate::rules::object_type::{ObjectCategory, ObjectType};
 use crate::rules::ruleset::RuleSet;
 use crate::sim::game_entity::GameEntity;
 use crate::sim::house_state::HouseState;
+use crate::sim::intern::StringInterner;
+use crate::sim::rng::SimRng;
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::Simulation;
 
 /// Type overrides have Infantry → Unit → Building priority, then Building+6F4.
@@ -46,10 +49,15 @@ impl Simulation {
     /// Fresh scenario only, after Post_Map_Init's alliances. Type initialization
     /// registers every SecretLab in global8B41E0, including limbo buildings;
     /// destruction removes it. Stored constructor IDs preserve that order.
-    pub(crate) fn assign_secret_lab_production(&mut self, rules: &RuleSet) {
-        let labs = self.substrate.entities.par_select(|_, entity| {
+    pub(crate) fn assign_secret_lab_production(
+        interner: &mut StringInterner,
+        scenario_rng: &mut SimRng,
+        substrate: &mut ObjectSubstrate,
+        rules: &RuleSet,
+    ) {
+        let labs = substrate.entities.par_select(|_, entity| {
             entity.category() == EntityCategory::Structure
-                && self
+                && interner
                     .object_type(entity.type_ref(), rules)
                     .is_some_and(|object| object.secret_lab().enabled())
         });
@@ -74,10 +82,10 @@ impl Simulation {
         for (index, lab) in labs.into_iter().enumerate() {
             let high =
                 u32::try_from(total - index - 1).expect("secret production list fits native count");
-            let drawn = self.scenario_rng.next_range_u32_inclusive(0, high) as usize;
+            let drawn = scenario_rng.next_range_u32_inclusive(0, high) as usize;
             let (category, name) = choices[drawn];
-            let id = self.interner.intern(name);
-            self.substrate
+            let id = interner.intern(name);
+            substrate
                 .entities
                 .get_mut(lab)
                 .expect("registered lab")
@@ -112,7 +120,13 @@ mod tests {
 
     #[test]
     fn secret_lab_assignment_matches_original_rewards_and_all_three_full_rng_states() {
-        for row in native()["assignment"].as_array().unwrap() {
+        let corpus = native();
+        for row in corpus["assignment"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(corpus["authored_startup"].as_array().unwrap())
+        {
             let mut ini = String::from(
                 "[BuildingTypes]\n0=LAB\n[LAB]\nStrength=100\nSecretLab=yes\n[General]\n",
             );
@@ -174,7 +188,42 @@ mod tests {
             sim.mapgen_rng = SimRng::from_native_state_hex_for_test(
                 row["rng_before"]["mapgen"].as_str().unwrap(),
             );
-            let (_, draws) = trace_draws(|| sim.assign_secret_lab_production(&rules));
+            let (_, draws) = trace_draws(|| {
+                if let Some(gate) = row.get("startup_gate") {
+                    sim.install_session_mode(
+                        crate::sim::scenario_session::ScenarioGameMode::from_game_mode(
+                            gate["game_mode"].as_i64().unwrap() as i32,
+                        ),
+                    );
+                    let overlays = crate::rules::overlay_types::OverlayTypeRegistry::from_ini(
+                        &IniFile::empty(),
+                        None,
+                    );
+                    let roster = crate::map::houses::HouseRoster::default();
+                    // The native control executes the admission gate then,
+                    // only when admitted, the unchanged assignment body.
+                    // No terrain/ore exists in either bounded fixture.
+                    sim.finalize_scenario_post_map(
+                        crate::sim::scenario_post_map::ScenarioPostMapInput {
+                            map_width: 0,
+                            map_height: 0,
+                            fill_silos: false,
+                            rules: &rules,
+                            overlay_registry: &overlays,
+                            house_roster: &roster,
+                            skirmish_session: None,
+                            campaign_map: None,
+                        },
+                    );
+                } else {
+                    Simulation::assign_secret_lab_production(
+                        &mut sim.interner,
+                        &mut sim.scenario_rng,
+                        &mut sim.substrate,
+                        &rules,
+                    );
+                }
+            });
             assert_eq!(
                 draws.len() as u64,
                 row["raw_store_count"].as_u64().unwrap(),
@@ -232,7 +281,12 @@ mod tests {
         .unwrap();
         let mut sim = world(&rules, &["q"]);
         sim.spawn_object("LAB", "H", 10, 10, 0, &rules).unwrap();
-        sim.assign_secret_lab_production(&rules);
+        Simulation::assign_secret_lab_production(
+            &mut sim.interner,
+            &mut sim.scenario_rng,
+            &mut sim.substrate,
+            &rules,
+        );
         let owner = sim.interner.get("H").unwrap();
         assert!(house_grants(
             &sim,

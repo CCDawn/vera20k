@@ -6,8 +6,8 @@
 //! (`0x006FF3C2`). This module is that one owner for VERA: the projectile
 //! origin, the muzzle `AnimClass` and the report sound position all read it.
 //! The app used to recompute a second coordinate in `f32`.
-//! Residual: aimed retail TESLA X is one lepton below original GetFLH in
-//! electric_bolt.json; this subpixel source difference retains the shared owner.
+//! Buildings use GetFLH's identity-matrix arm and one absolute facing turn;
+//! locomotor-backed sources retain their distinct basis and relative turn.
 //!
 //! ## Dependency rules
 //! - Part of sim/ — depends on rules/, util/, sim/combat, sim/movement.
@@ -142,7 +142,7 @@ pub(crate) struct FireSource {
     pub barrel_facing: Option<crate::sim::movement::FacingClass>,
     pub veterancy: u16,
     /// The firing occupant's port, when an occupied building fires.
-    pub garrison_fire_index: Option<u8>,
+    pub garrison_fire_index: Option<i32>,
     /// TarCom (`+0x2B4`) as the shot reads it; a building's fire facings aim
     /// at it.
     pub tar_com: Option<TargetKind>,
@@ -192,26 +192,49 @@ impl From<&AttackerSnapshot> for FireSource {
     }
 }
 
-/// The turret pivot (`TechnoClass` virtual +300, `0x006F3D60`), before any
-/// weapon FLH. Foot's selected Attack line reads this coordinate. Native
-/// translates the locomotor basis by ART `TurretOffset`, rotates the basis
-/// about the turret, then transforms the zero vector; that final rotation
-/// cannot move the pivot. Reuse the existing GetFLH transform with zero FLH
-/// instead of creating another facing/truncation implementation.
+/// The turret pivot, virtual +300 with a weapon index. Foot's selected
+/// Attack line (`0x004DC0C6`) and the Unit target laser (`0x006FF983`) read it
+/// with index 0.
 ///
-/// A source without a locomotor starts from the identity, so its offset is
-/// along world X. The result adds to the same virtual +AC base as GetFLH.
-/// Executed source/ART controls: tools/procedural_drawing_oracle/action_lines.
+/// InfantryClass's override (`0x00521D30`) is GetFLH(index) with a zero base
+/// ([`fire_coordinate`]): an infantryman's line starts at its gun.
 ///
-/// Drive/Ship use the same physical-model and locomotor matrix inputs as
-/// GetFLH, including the translation of a rocking hull.
+/// The TechnoClass body (`0x006F3D60`, Unit and Aircraft) ignores the index:
+/// before any weapon FLH, native translates the locomotor basis by ART
+/// `TurretOffset`, rotates the basis about the turret, then transforms the
+/// zero vector; that final rotation cannot move the pivot. Reuse the existing
+/// GetFLH transform with zero FLH instead of creating another
+/// facing/truncation implementation. A source without a locomotor starts
+/// from the identity, so its offset is along world X. The result adds to the
+/// same virtual +AC base as GetFLH. Executed source/ART controls:
+/// tools/procedural_drawing_oracle/action_lines. Drive/Ship use the same
+/// physical-model and locomotor matrix inputs as GetFLH, including the
+/// translation of a rocking hull.
+///
+/// BuildingClass's override (`0x00453A70`) has no port: neither caller
+/// reaches a building.
 pub fn turret_pivot_coordinate(
     world: &Simulation,
     rules: &RuleSet,
     entity: &GameEntity,
+    weapon_index: i32,
 ) -> Option<ProjectileCoord> {
     let obj = world.interner.object_type(entity.type_ref(), rules)?;
     let source = FireSource::of_entity(entity);
+    if entity.category() == EntityCategory::Infantry {
+        return Some(
+            fire_coordinate(
+                world,
+                rules,
+                &source,
+                obj,
+                weapon_index,
+                entity.weapon_burst.index() as u8,
+                Flh::default(),
+            )
+            .coord,
+        );
+    }
     let base = fire_coordinate_base(world, rules, &source, obj);
     let offset = base.art.map_or(0, |art| art.turret_offset);
     let delta = if entity.locomotor.is_some() {
@@ -285,16 +308,9 @@ pub fn turret_pivot_coordinate(
 /// controls: building_voxel_flh.json.
 ///
 /// A building's base GetFLH is TechnoClass::GetFLH's arm without a locomotor
-/// (`0x006F3C1A`): one turn by vt+0x2A8 ([`building_fire_facings`]) less a
-/// quarter, with no body matrix. RESIDUAL: VERA turns the FLH by that facing
-/// less the authored facing, adds `TurretOffset=`, then turns by the authored
-/// facing less a quarter.
-/// - Trigger: a building shot from its FLH (not a pixel-offset arm), such as
-///   the Tesla Coil's.
-/// - Effect: two sine-table lookups where native makes one, at most a lepton;
-///   a `TurretOffset=` would also be turned (no retail building sets one).
-/// - Frequency: every such shot.
-/// - Downstream risk: the projectile origin is hashed.
+/// (`0x006F3C1A`): identity, world-X TurretOffset, then one turn by vt+0x2A8
+/// ([`building_fire_facings`]) less a quarter. The authored body heading does
+/// not supply a second matrix rotation.
 pub(crate) fn fire_coordinate(
     world: &Simulation,
     rules: &RuleSet,
@@ -410,7 +426,7 @@ struct FireBase<'r> {
     y: i32,
     z: i32,
     facings: crate::util::flh_transform::FlhFacings,
-    locomotor_basis: Option<glam::Mat4>,
+    locomotor_basis: crate::util::flh_transform::FlhBasis,
     /// The aim facing, or a building's vt+0x308 ([`building_fire_facings`]).
     fire_facing: u16,
     art: Option<&'r ArtEntry>,
@@ -539,7 +555,11 @@ fn fire_coordinate_base<'r>(
             body: body_facing16,
             matrix: matrix_facing16,
         },
-        locomotor_basis,
+        locomotor_basis: if snap.category == EntityCategory::Structure {
+            crate::util::flh_transform::FlhBasis::NoLocomotor
+        } else {
+            crate::util::flh_transform::FlhBasis::Locomotor(locomotor_basis)
+        },
         fire_facing,
         art,
     }
@@ -663,7 +683,7 @@ fn flh_world_delta(
     flh: crate::rules::flh::Flh,
     facings: crate::util::flh_transform::FlhFacings,
     burst_index: u8,
-    locomotor_basis: Option<glam::Mat4>,
+    locomotor_basis: crate::util::flh_transform::FlhBasis,
 ) -> Option<(i32, i32, i32)> {
     crate::util::flh_transform::native_flh_world_delta(
         flh.forward,
@@ -733,7 +753,7 @@ fn building_pixel_offset(art: &ArtEntry, snap: &FireSource) -> Option<(i32, i32)
     if let Some(fire_index) = snap.garrison_fire_index {
         return Some(
             art.muzzle_flash_positions
-                .get(usize::from(fire_index))
+                .get(usize::try_from(fire_index).ok()?)
                 .copied()
                 .unwrap_or((0, 0)),
         );
@@ -1125,7 +1145,7 @@ mod tests {
     fn a_stored_firers_exact_height_carries_into_the_fire_coordinate() {
         let rules = rules();
         let mut world = Simulation::new();
-        let id = world.allocate_stable_id();
+        let id = world.substrate.allocate_stable_id();
         let mut gi =
             crate::sim::game_entity::GameEntity::test_default(id, "E1", "Americans", 10, 11);
         gi.position.set_exact_z_leptons_for_test(Some(333));

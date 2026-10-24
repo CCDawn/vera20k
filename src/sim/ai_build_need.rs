@@ -59,7 +59,6 @@ use crate::rules::ruleset::RuleSet;
 use crate::sim::ai_base_building::{choose_building, find_node, node_building, node_satisfied};
 use crate::sim::ai_buildable::{
     first_buildable_from_array, first_owner_compatible, first_owner_compatible_harvester,
-    house_country_bit,
 };
 use crate::sim::ai_unit_choice::UnitChoiceKind;
 use crate::sim::base_plan::{BasePlanNode, unpack_base_plan_cell};
@@ -108,7 +107,7 @@ impl<'r> EconomyTypes<'r> {
                 house.side_index(),
                 super_weapons,
             ),
-            harvester: first_owner_compatible_harvester(rules, house_country_bit(rules, country)),
+            harvester: first_owner_compatible_harvester(rules, rules.country_owner_mask(country)),
         }
     }
 }
@@ -136,7 +135,7 @@ fn can_make_money(sim: &Simulation, rules: &RuleSet, owner: InternedId) -> bool 
     let destinations = tracking.resource_destinations() > 0;
     let gatherers = tracking.resource_gatherers() > 0;
     let war_factories = tracking.war_factories() > 0;
-    let country_bit = house_country_bit(rules, sim.interner.resolve(house.house_type_id()));
+    let country_bit = rules.country_owner_mask(sim.interner.resolve(house.house_type_id()));
     let base = !house.build_const_order().is_empty()
         || first_owner_compatible(
             rules,
@@ -149,7 +148,7 @@ fn can_make_money(sim: &Simulation, rules: &RuleSet, owner: InternedId) -> bool 
     if destinations && gatherers {
         return true;
     }
-    let money = available_money(sim, owner);
+    let money = available_money(&sim.houses, owner);
     let types = EconomyTypes::of(sim, rules, house);
     let price = |object: &ObjectType| sim.cost_of(owner, object, rules);
     let harvester = types.harvester.map_or(i32::MAX, price);
@@ -198,7 +197,7 @@ pub(crate) fn check_build_need(sim: &Simulation, rules: &RuleSet, owner: Interne
     {
         return false;
     }
-    let money = available_money(sim, owner);
+    let money = available_money(&sim.houses, owner);
     let types = EconomyTypes::of(sim, rules, house);
     if house.tracking().resource_destinations() > 0 {
         if refinery_under_construction(sim, rules, house) {
@@ -396,7 +395,8 @@ fn sell_node(
     effects: FrameEffects<'_>,
 ) {
     let node = sim.houses[&owner].base_plan().nodes()[index];
-    let building = node_building(sim, owner, &node).filter(|&id| can_sell_building(sim, rules, id));
+    let building =
+        node_building(&sim.substrate, owner, &node).filter(|&id| can_sell_building(sim, rules, id));
     if let Some(id) = building {
         sell_back(sim, rules, id, SellOrder::Computer, registry, effects);
         let gate = sim

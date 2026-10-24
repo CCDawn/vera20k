@@ -13,7 +13,7 @@
 //! killing hit: ObjectClass::ReceiveDamage's exact-zero Destroy (`0x005F57AF`)
 //! runs Detach_All(1), whose announce visits the victim itself; its
 //! FootClass::PointerExpired forwards from Foot+694 to the eater's
-//! ParasiteClass (`0x004D99AA..0x004D99C6`, `Simulation::object_destroy_callback`).
+//! ParasiteClass (`0x004D99AA..0x004D99C6`, `Simulation::detach_all`).
 //! Ghidra plates on those addresses carry the evidence; retail data:
 //! `[ParasiteDog]`, `[Parasite]`, `[BadTeeth]`, `[DroneJump]`.
 //!
@@ -349,7 +349,7 @@ impl Simulation {
         let frame = self.session.binary_frame();
         // AttachTo629A989..629A9D4 clears old grapple progress and its
         // dedicated animation before the damage timer and CanInfect query.
-        self.reset_parasite_grapple(owner, Some(rules));
+        self.reset_parasite_grapple(owner, rules);
         let Some(state) = self
             .substrate
             .entities
@@ -376,7 +376,7 @@ impl Simulation {
             owner,
             -1,
             victim_coord,
-            Some(rules),
+            rules,
             effects.overlay_registry(),
             effects,
         );
@@ -456,7 +456,7 @@ impl Simulation {
                 }
                 crate::sim::mission::concrete_effects::represented_assign_target(entity, None);
             }
-            self.assign_null_destination(owner, Some(rules), effects.overlay_registry(), effects);
+            self.assign_null_destination(owner, rules, effects.overlay_registry(), effects);
         }
         crate::sim::world::enter_idle_mode(self, owner, rules, effects.overlay_registry(), effects);
     }
@@ -764,7 +764,7 @@ impl Simulation {
                 entity.parasite.paralysis = CdTimer::started(frame as i32, rof.wrapping_mul(3));
             }
             // ExitUnit62A7E0..62A84B, before clearing the victim fields.
-            self.reset_parasite_grapple(owner, Some(rules));
+            self.reset_parasite_grapple(owner, rules);
         } else {
             self.substrate
                 .entities
@@ -787,7 +787,7 @@ impl Simulation {
         &mut self,
         owner: u64,
         expired: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         effects: FrameEffects<'_>,
     ) {
         let frame = self.session.binary_frame();
@@ -804,11 +804,6 @@ impl Simulation {
         }
         let victim = expired;
         let suppressed = state.suppression.remaining(frame as i32) != 0;
-        let Some(rules) = rules else {
-            // A rules-less fixture cannot run Unlimbo; drop the link only.
-            self.substrate.detach_parasite_victim(owner, victim, frame);
-            return;
-        };
         // Owner vtable +0x160 (0x0041BF40): Iron Curtain protects it here.
         let owner_protected = self.substrate.entities.get(owner).is_some_and(|o| {
             crate::sim::superweapon::invulnerability::is_invulnerable(
@@ -934,7 +929,14 @@ impl Simulation {
                 .map(NativeCellQuery::canonical)
                 .as_ref(),
         );
-        let spot = self.place_infantry_in_ground_cell(rules, coords)?;
+        let spot = Self::place_infantry_in_ground_cell(
+            &self.interner,
+            &mut self.scenario_rng,
+            &self.substrate,
+            &self.resolved_terrain,
+            rules,
+            coords,
+        )?;
         if !owner_is_unit {
             let (sub_x, sub_y) = crate::util::lepton::subcell_lepton_offset(Some(spot));
             coords.x = i32::from(adjacent.0) * 256 + sub_x.to_num::<i32>();
@@ -1130,7 +1132,7 @@ impl Simulation {
             owner,
             requested,
             PlacementEvidence::EvaluateMark,
-            Some(rules),
+            rules,
             registry,
         ) else {
             return false;
@@ -1143,7 +1145,7 @@ impl Simulation {
                     placement,
                     logic_eligible: true,
                 },
-                UninitContext::new(Some(rules), registry)
+                UninitContext::new(rules, registry)
                     .with_effects(effects)
                     .with_unlimbo_facing(Some(facing)),
             ),
@@ -1201,7 +1203,7 @@ impl Simulation {
         }
         self.techno_limbo_with_context(
             firer,
-            UninitContext::new(Some(rules), registry).with_effects(effects),
+            UninitContext::new(rules, registry).with_effects(effects),
         );
         let parasite = weapon
             .warhead
@@ -1251,7 +1253,7 @@ impl Simulation {
         &mut self,
         listener: u64,
         expired: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         effects: FrameEffects<'_>,
     ) {
         let Some(eater) = self

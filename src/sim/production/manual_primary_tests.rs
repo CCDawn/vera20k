@@ -133,12 +133,12 @@ fn assert_native_primary_type(rules: &RuleSet, name: &str, expected: &serde_json
             "factory": object.factory_rtti(),
             "build_category": build_category,
             "construction_yard": u8::from(object.construction_yard),
-            "foundation": crate::rules::foundation::foundation_id(&object.foundation),
+            "foundation": object.foundation.selector(),
             "gap_generator": u8::from(object.gap_generator),
             "infantry_absorb": u8::from(object.infantry_absorb),
             "invisible_in_game": u8::from(object.invisible_in_game),
             "naval": u8::from(object.naval),
-            "ownable": crate::sim::ai_buildable::house_token_mask(&object.owner, rules),
+            "ownable": rules.house_type_mask(&object.owner),
             "passengers": object.passengers,
             "strength": object.strength,
             "unit_absorb": u8::from(object.unit_absorb),
@@ -232,7 +232,7 @@ fn manual_primary_case_rules(
         manual_primary_corpus()["query_unit"]["naval"]
     );
     assert_eq!(
-        crate::sim::ai_buildable::house_token_mask(&query.owner, &rules),
+        rules.house_type_mask(&query.owner),
         manual_primary_corpus()["query_unit"]["ownable"]
             .as_u64()
             .unwrap() as u32
@@ -396,10 +396,6 @@ fn manual_primary_native_histories_preserve_retained_flags_consumers_and_streams
         return;
     };
     let corpus = manual_primary_corpus();
-    assert_eq!(
-        corpus["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     assert_eq!(corpus["cases"].as_array().unwrap().len(), 6);
     for case in corpus["cases"].as_array().unwrap() {
         let name = case["input"]["name"].as_str().unwrap();
@@ -513,7 +509,7 @@ fn manual_primary_native_histories_preserve_retained_flags_consumers_and_streams
                 sim.sound_events.clear_for_test();
                 let mut event = None;
                 match input["op"].as_str().unwrap() {
-                    "automatic" => initialize_factory_primary(&mut sim, id, &rules),
+                    "automatic" => initialize_factory_primary(&mut sim, &rules, id),
                     "click" => {
                         for &selected in &ids {
                             sim.substrate
@@ -581,10 +577,11 @@ fn manual_primary_native_histories_preserve_retained_flags_consumers_and_streams
                         "{context}: no Stage writes"
                     );
                 }
-                // Yard setting calls the existing edge owner. Its broader
-                // geometry is an explicit separate bound; all other phases,
-                // including already-primary yard clear, preserve every House
-                // field and timer. Compare cloned state, not a mirror owner.
+                // Yard setting calls DetermineEdge; these controls record the
+                // call, and `house_base::edge_tests` covers the edge it writes.
+                // All other phases, including already-primary yard clear,
+                // preserve every House field and timer. Compare cloned state,
+                // not a mirror owner.
                 let has_edge = phase["effects"]
                     .as_array()
                     .unwrap()

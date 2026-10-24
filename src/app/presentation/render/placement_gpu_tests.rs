@@ -380,12 +380,15 @@ fn paid_refinery_centering_and_free_unit(
     let refinery = scene.sim().interner().get(name).unwrap();
     let rules = &scene.runtime.resources.rules;
     let foundation = rules.object(name).unwrap().foundation.clone();
-    assert_eq!(crate::rules::foundation::foundation_id(&foundation), 12);
+    let selector = match &foundation {
+        crate::rules::foundation::Foundation::Stock(index) => *index,
+        #[cfg(feature = "ares")]
+        _ => panic!("retail fixture must retain a stock foundation"),
+    };
+    assert_eq!(selector, 12);
     assert_eq!(rules.building_free_unit(name), Some("CMIN"));
     assert_eq!(
-        serde_json::json!(crate::rules::foundation::foundation_cell_offsets(
-            &foundation
-        )),
+        serde_json::json!(foundation.cell_offsets()),
         centering["building"]["offsets"]
     );
     ordinary_frame(scene, Some(Command::QueueProduction { type_id: refinery }));
@@ -425,7 +428,7 @@ fn paid_refinery_centering_and_free_unit(
         "limbo paid refinery has no opening miner"
     );
     let preview = |scene: &crate::headless_scenario::HeadlessScenario, cursor| {
-        let origin = placement_origin_at_cursor(&foundation, cursor);
+        let origin = foundation.placement_origin_at_cursor(cursor);
         production::placement_preview_for_owner_with_overlays(
             scene.sim(),
             &scene.runtime.resources.rules,

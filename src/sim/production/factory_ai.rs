@@ -45,8 +45,8 @@
 //! - The try-later branch also copies an uninitialised stack word into the
 //!   timer's middle field (`+0x554`, `0x004501F1`), which no reader uses.
 //! - Mobile products leave through [`exit_produced_object`], the same
-//!   `Exit_Object` arms a human's placement takes. Its residuals: the
-//!   refinery arm and the Infantry arm's Cloning Vat copies.
+//!   `Exit_Object` arms a human's placement takes, including the Infantry
+//!   arm's Cloning Vat copies. Its residual: the refinery arm's Unit exit.
 
 use crate::rules::object_type::ObjectCategory;
 use crate::rules::overlay_types::OverlayTypeRegistry;
@@ -144,7 +144,15 @@ fn exit_finished_object(
         return;
     };
     let is_building = product_type.category == ObjectCategory::Building;
-    let exit = exit_produced_object(sim, rules, building, product, overlay_registry, effects);
+    let exit = exit_produced_object(
+        sim,
+        rules,
+        building,
+        product,
+        (0, 0),
+        overlay_registry,
+        effects,
+    );
     if !is_building && exit == BuildingExit::Placed {
         sim.note_mission_spawned_entities();
     }
@@ -153,7 +161,14 @@ fn exit_finished_object(
             //4501A4 reads after exit. A consumed wall is still retained at
             //its constructor Location until the frame's shared725C70 drain.
             let object = BuiltObject::capture(sim, product);
-            record_last_built(sim, rules, owner, object);
+            record_last_built(
+                &sim.interner,
+                &mut sim.sound_events,
+                &mut sim.houses,
+                rules,
+                owner,
+                object,
+            );
             // CompletedProduction lets the placed object go; the delete
             // finds none to abandon.
             sim.production
@@ -225,7 +240,7 @@ fn start_factory(
     factory_rtti: i32,
     effects: FrameEffects<'_>,
 ) {
-    if crate::sim::credit_income::available_money(sim, owner) <= 10 {
+    if crate::sim::credit_income::available_money(&sim.houses, owner) <= 10 {
         return;
     }
     let Some(object) = ai_base_building::suggest_new_object(sim, rules, owner, factory_rtti) else {
@@ -312,11 +327,10 @@ impl AiPlacementTimer {
 /// `BuildingClass::Detach_All(1) @ 0x0044EBF0`'s factory arm
 /// (`0x0044EC01..0x0044EC21`) and `BuildingClass::ChangeOwner`'s
 /// (`0x004486DF..0x00448701`): the building's factory is abandoned, its
-/// object refunded and destroyed, and deleted. Without rules (fixtures) the
-/// object is destroyed unrefunded.
+/// object refunded and destroyed, and deleted.
 pub(crate) fn detach_all(
     sim: &mut Simulation,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
     building: u64,
     effects: FrameEffects<'_>,
 ) {
@@ -324,33 +338,13 @@ pub(crate) fn detach_all(
         return;
     };
     let owner = factory.owner();
-    match rules {
-        Some(rules) => abandon_production(
-            sim,
-            rules,
-            FactoryHolder::Building(building),
-            owner,
-            effects,
-        ),
-        None => {
-            let holder = FactoryHolder::Building(building);
-            let object = sim
-                .production
-                .factories()
-                .pending_abandonment(holder)
-                .and_then(|abandoned| abandoned.entity_id);
-            sim.production
-                .factories_mut()
-                .reset_for_abandon(holder, sim.session.binary_frame());
-            sim.with_object_placement_scope(|sim| {
-                if let Some(object) = object {
-                    let _ = sim.discard_constructed_limbo(object, rules, effects);
-                }
-                sim.production.factories_mut().finish_abandon(holder);
-            });
-            sim.production.factories_mut().remove_factory(holder);
-        }
-    }
+    abandon_production(
+        sim,
+        rules,
+        FactoryHolder::Building(building),
+        owner,
+        effects,
+    );
 }
 
 #[cfg(test)]

@@ -77,6 +77,11 @@ impl CenteredShapeStrip {
         &self.texture
     }
 
+    /// Number of frames the source SHP carries.
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
     /// `frame` drawn centered on `point`; `None` for a frame the file lacks
     /// or one without pixels.
     pub fn instance(&self, frame: usize, point: (f32, f32), depth: f32) -> Option<SpriteInstance> {
@@ -126,6 +131,25 @@ impl CenteredShapeStrip {
     ) -> Option<Self> {
         let shp = ShpFile::from_bytes(&assets.get(shp_name)?).ok()?;
         let palette = Palette::from_bytes(&assets.get(pal_name)?).ok()?;
+        let strip = Self::from_shp_on_device(device, queue, batch, &shp, &palette)?;
+        log::info!(
+            "{shp_name} strip in {pal_name}: {}x{}, {} frames",
+            strip.atlas_w,
+            strip.atlas_h,
+            strip.frames.len()
+        );
+        Some(strip)
+    }
+
+    /// [`Self::from_assets_on_device`] for a parsed SHP and an already
+    /// built palette, such as a House's ColorScheme Convert.
+    pub(crate) fn from_shp_on_device(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batch: &BatchRenderer,
+        shp: &ShpFile,
+        palette: &Palette,
+    ) -> Option<Self> {
         let atlas_w: u32 = shp
             .frames
             .iter()
@@ -148,7 +172,7 @@ impl CenteredShapeStrip {
         let mut x = 0;
         for (frame_index, frame) in shp.frames.iter().enumerate() {
             let (w, h) = (u32::from(frame.frame_width), u32::from(frame.frame_height));
-            let frame_rgba = shp.frame_to_rgba(frame_index, &palette).ok()?;
+            let frame_rgba = shp.frame_to_rgba(frame_index, palette).ok()?;
             let row = w as usize;
             for py in 0..h {
                 let src = (py * w) as usize;
@@ -168,10 +192,6 @@ impl CenteredShapeStrip {
             });
             x += w;
         }
-        log::info!(
-            "{shp_name} strip in {pal_name}: {atlas_w}x{atlas_h}, {} frames",
-            frames.len()
-        );
         Some(Self {
             texture: batch.create_texture_on_device(
                 device,
@@ -194,18 +214,16 @@ impl CenteredShapeStrip {
         preview: &BuildingPlacementPreview,
     ) -> Vec<SpriteInstance> {
         let mut instances = Vec::with_capacity(preview.cells.len());
-        // Tactical6D5030 walks rectangular foundation bounds with X outer,
-        // Y inner, independently of the row-major admission/sentinel list.
-        // Reordering by color changes stores where sloped cells overlap.
-        for dx in 0..preview.width {
-            for dy in 0..preview.height {
-                let index = usize::from(dy) * usize::from(preview.width) + usize::from(dx);
-                let Some(cell) = preview.cells.get(index) else {
-                    continue;
-                };
-                if let Some(instance) = self.building_placement_instance(*cell) {
-                    instances.push(instance);
-                }
+        //6D5030 / Ares100155C0 walks actual-list bounds X outer/Y inner;
+        //The ordinary preview contains its bit2 active cells, possibly sparse
+        //or outside declared X/Y. Pending-bit4 drawing is a separate residual.
+        //Preserve draw order independently of stock row-major vs Custom
+        //X-first gameplay list order; never regroup by admitted color.
+        let mut active: Vec<_> = preview.cells.iter().collect();
+        active.sort_by_key(|cell| (cell.coord.0 as i16, cell.coord.1 as i16));
+        for cell in active {
+            if let Some(instance) = self.building_placement_instance(*cell) {
+                instances.push(instance);
             }
         }
         // Preserve existing wall auto-fill admission and order; pending marks

@@ -132,6 +132,7 @@ fn retained_ground_history_controls_overlapping_atlas_pixels() {
     );
     draw_native_object_pass(
         &mut encoder,
+        crate::app::render::merge_passes::ObjectDrawPhase::Display,
         &cv,
         &dv,
         &mut terrain,
@@ -299,6 +300,7 @@ fn unit_body_shadow_replay(layer: u8, masked: bool, initial_z: u16) {
     ]);
     let stats = draw_native_object_pass(
         &mut encoder,
+        crate::app::render::merge_passes::ObjectDrawPhase::Display,
         &cv,
         &dv,
         &mut terrain,
@@ -541,6 +543,7 @@ fn tree_transactions_preserve_tmp_shp_voxel_overlap_and_coalesced_order() {
         // Clip both edges; every restarted normal pass must restore this clip.
         let stats = draw_native_object_pass(
             &mut encoder,
+            crate::app::render::merge_passes::ObjectDrawPhase::Display,
             &cv,
             &dv,
             &mut terrain,
@@ -601,8 +604,8 @@ fn tree_transactions_preserve_tmp_shp_voxel_overlap_and_coalesced_order() {
 }
 
 #[test]
-#[ignore = "requires GPU; actual20k ordinary UnitAtlas range remains outside Ground/Air destination planner"]
-fn destination_batching_layer_fences_do_not_plan_ordinary_unit_instances() {
+#[ignore = "requires GPU; 20k offscreen ordinary UnitAtlas draws between two disjoint Ground/Air destination edits"]
+fn offscreen_ordinary_units_neither_fence_nor_split_destination_edits() {
     let gpu = Gpu::new();
     let size = [96, 8];
     let format = wgpu::TextureFormat::Bgra8UnormSrgb;
@@ -709,6 +712,7 @@ fn destination_batching_layer_fences_do_not_plan_ordinary_unit_instances() {
                 let start = std::time::Instant::now();
                 let stats = draw_native_object_pass(
                     &mut encoder,
+                    crate::app::render::merge_passes::ObjectDrawPhase::Display,
                     &cv,
                     &dv,
                     &mut terrain,
@@ -733,8 +737,8 @@ fn destination_batching_layer_fences_do_not_plan_ordinary_unit_instances() {
                     stats,
                     crate::render::terrain_draw::TerrainBatchStats {
                         pieces: 2,
-                        waves: 2,
-                        passes: if read_only { 8 } else { 4 },
+                        waves: 1,
+                        passes: if read_only { 4 } else { 2 },
                         tile_dependencies: if read_only { 0 } else { 2 }
                     }
                 );
@@ -764,7 +768,7 @@ fn destination_batching_layer_fences_do_not_plan_ordinary_unit_instances() {
                 }
             }
             eprintln!(
-                "Layer{layer_index} planner gate: {ordinary_count} offscreen UnitAtlas instances in one run, 2 destination pieces, 2 destination transactions (Ground4passes/2tiledeps, Air8passes/0tiledeps); three warmed encoding samples_us={samples:?} (excludes lowering/upload/submit/wait; not FPS evidence)"
+                "Layer{layer_index} planner gate: {ordinary_count} offscreen UnitAtlas instances in one run, 2 disjoint destination pieces in one transaction (Ground 2 passes/2 tile deps, Air 4 passes/0); three warmed encoding samples_us={samples:?} (excludes lowering/upload/submit/wait; not FPS evidence)"
             );
         }
     }

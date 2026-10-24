@@ -59,9 +59,10 @@ use crate::sim::house_diplomacy::HouseAlliances;
 use crate::sim::house_state::HouseState;
 use crate::sim::houses::Houses;
 use crate::sim::intern::{InternedId, StringInterner};
-use crate::sim::mission::authority::EntityReadyInputProvider;
+use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::production::{SellOrder, sell_back};
+use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::timer::CdTimer;
 use crate::sim::world::Simulation;
 
@@ -109,7 +110,13 @@ fn building_strategy(
     registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     frame_effects: FrameEffects<'_>,
 ) -> i32 {
-    pick_enemy(sim, owner);
+    pick_enemy(
+        &sim.interner,
+        &sim.session,
+        &sim.house_alliances,
+        &mut sim.houses,
+        owner,
+    );
     forget_defeated_enemy(&sim.interner, &sim.house_alliances, &mut sim.houses, owner);
     // `0x004FD77C..0x004FD79B`: a signed IQ (`+0x24C`) compare.
     if sim.session.game_mode_nonzero()
@@ -123,7 +130,7 @@ fn building_strategy(
 
     // Available_Money (IHouse vt+0x18) is a pure read; the block's second
     // query sees the same value.
-    let money = crate::sim::credit_income::available_money(sim, owner);
+    let money = crate::sim::credit_income::available_money(&sim.houses, owner);
     let frame = sim.session.binary_frame() as i32;
     let emergency = sim
         .houses
@@ -181,34 +188,30 @@ fn sell_off_and_hunt(
 }
 
 /// `0x004FD538..0x004FD71E`: see the module doc.
-fn pick_enemy(sim: &mut Simulation, owner: InternedId) {
-    if !ENEMY_SEARCH_TIMER.expired(sim.session.binary_frame() as i32)
-        || !sim.session.game_mode_nonzero()
-    {
+fn pick_enemy(
+    interner: &StringInterner,
+    session: &ScenarioSession,
+    house_alliances: &HouseAlliances,
+    houses: &mut Houses,
+    owner: InternedId,
+) {
+    if !ENEMY_SEARCH_TIMER.expired(session.binary_frame() as i32) || !session.game_mode_nonzero() {
         return;
     }
-    let Some(house) = sim.houses.get(&owner) else {
+    let Some(house) = houses.get(&owner) else {
         return;
     };
     if house.enemy_house().is_some() || house.multiplay_passive() || house.base_origin() == (0, 0) {
         return;
     }
-    let first = sim.houses.order().iter().copied().find(|&peer| {
+    let first = houses.order().iter().copied().find(|&peer| {
         peer != owner
-            && sim
-                .houses
+            && houses
                 .get(&peer)
                 .is_some_and(|peer| !peer.multiplay_passive() && !peer.is_defeated())
     });
     if let Some(peer) = first {
-        update_anger_nodes(
-            &mut sim.houses,
-            sim.house_alliances.as_map(),
-            &sim.interner,
-            owner,
-            peer,
-            1,
-        );
+        update_anger_nodes(houses, house_alliances.as_map(), interner, owner, peer, 1);
     }
 }
 
@@ -321,7 +324,7 @@ pub(crate) fn all_to_hunt(
     registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     frame_effects: FrameEffects<'_>,
 ) {
-    // Steam3e81a617..08600:501400 captures count once;50141D/501423
+    // Steam gamemd:501400 captures count once;50141D/501423
     // re-read the array and its indexed object after callbacks. Storage
     // snapshots hide intervening removals from this existing registry.
     let count = sim.substrate.entities.techno_registry_len();
@@ -370,13 +373,13 @@ pub(crate) fn all_to_hunt(
             );
             continue;
         }
-        sim.leave_team(id, false, Some(rules), frame_effects);
+        sim.leave_team(id, false, rules, frame_effects);
         let _ = sim.mission_queue_exact(
             id,
             hunt,
             0,
             sim.session.binary_frame(),
-            &EntityReadyInputProvider,
+            &LiveReadyInputProvider { rules },
         );
     }
     if let Some(house) = sim.houses.get_mut(&owner) {

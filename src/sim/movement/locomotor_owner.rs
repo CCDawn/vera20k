@@ -146,7 +146,7 @@ fn end_piggyback(entity: &mut GameEntity) -> PiggybackEnd {
     let restored = entity
         .locomotor
         .as_mut()
-        .is_some_and(|locomotor| locomotor.end_piggyback());
+        .is_some_and(|locomotor| locomotor.end_piggyback().is_some());
     if restored {
         // END transfers the controller without moving Object+9C.
         entity.position.put_z(physical.z);
@@ -165,7 +165,7 @@ impl crate::sim::world::Simulation {
     /// (`0x004D9309..0x004D937C`) and the Unit setter's pad arm
     /// (`0x0074250E..0x0074258A`, which asks `Is_Piggybacking` first; the
     /// gates include the stash).
-    pub(crate) fn try_end_piggyback(&mut self, id: u64, rules: Option<&RuleSet>) -> bool {
+    pub(crate) fn try_end_piggyback(&mut self, id: u64, rules: &RuleSet) -> bool {
         self.substrate
             .entities
             .get(id)
@@ -179,7 +179,7 @@ impl crate::sim::world::Simulation {
     /// 0x0054DABB`, `Queue_Mission(Harvest, 0)`), before the transfer
     /// natively; the two touch separate state. Returns whether the stash
     /// became active.
-    pub(crate) fn end_admitted_piggyback(&mut self, id: u64, rules: Option<&RuleSet>) -> bool {
+    pub(crate) fn end_admitted_piggyback(&mut self, id: u64, rules: &RuleSet) -> bool {
         let Some(entity) = self.substrate.entities.get_mut(id) else {
             return false;
         };
@@ -191,8 +191,8 @@ impl crate::sim::world::Simulation {
                 .houses
                 .get(&entity.owner())
                 .is_some_and(|house| !house.is_human());
-            let gatherer = rules
-                .and_then(|rules| self.object_type(entity.type_ref(), rules))
+            let gatherer = self
+                .object_type(entity.type_ref(), rules)
                 .is_some_and(|object| object.resource_gatherer);
             if computer && gatherer {
                 let now = self.session.binary_frame();
@@ -203,7 +203,7 @@ impl crate::sim::world::Simulation {
                     ),
                     0,
                     now,
-                    &crate::sim::mission::authority::EntityReadyInputProvider,
+                    &crate::sim::mission::authority::LiveReadyInputProvider { rules },
                 );
             }
         }
@@ -234,10 +234,24 @@ impl crate::sim::world::Simulation {
             .and_then(|entity| entity.locomotor.as_ref().map(|loco| loco.active_kind()));
         match kind {
             Some(crate::rules::locomotor_type::LocomotorKind::Drive) => {
-                self.track_apply_occupation(id, super::track_process::TrackFamily::Drive, put);
+                Self::track_apply_occupation(
+                    &mut self.substrate,
+                    &self.path_grid,
+                    &self.resolved_terrain,
+                    id,
+                    super::track_process::TrackFamily::Drive,
+                    put,
+                );
             }
             Some(crate::rules::locomotor_type::LocomotorKind::Ship) => {
-                self.track_apply_occupation(id, super::track_process::TrackFamily::Ship, put);
+                Self::track_apply_occupation(
+                    &mut self.substrate,
+                    &self.path_grid,
+                    &self.resolved_terrain,
+                    id,
+                    super::track_process::TrackFamily::Ship,
+                    put,
+                );
             }
             Some(crate::rules::locomotor_type::LocomotorKind::Hover) => {
                 Self::hover_mark_all_occupation_bits(

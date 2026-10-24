@@ -45,10 +45,11 @@ fn boarded_transport(sim: &mut Simulation, rules: &RuleSet, kind: &str) -> (u64,
     assert!(
         sim.apply_command(
             "Americans",
-            &Command::EnterTransport {
-                passenger_id: passenger,
-                transport_id: carrier
-            },
+            &Command::clicked_mission(
+                passenger,
+                crate::sim::mission::MissionType::Enter,
+                crate::sim::combat::TargetKind::Entity(carrier)
+            ),
             Some(rules),
         ),
         "board failed: passenger={:?} transport={:?} admitted={}",
@@ -113,7 +114,7 @@ fn boarded_transport(sim: &mut Simulation, rules: &RuleSet, kind: &str) -> (u64,
 /// Supplied intact-deck scene; the ordinary Mark owner relayers the transport
 /// around its initial Location. Collapse below will use the real producer.
 fn put_on_deck(sim: &mut Simulation, rules: &RuleSet, id: u64, water: bool) {
-    sim.foot_mark_remove(id, Some(rules), None, FrameEffects::default());
+    sim.foot_mark_remove(id, rules, None, FrameEffects::default());
     let cell = sim
         .resolved_terrain
         .as_mut()
@@ -136,7 +137,7 @@ fn put_on_deck(sim: &mut Simulation, rules: &RuleSet, id: u64, water: bool) {
         z: BRIDGE_DECK_HEIGHT_LEPTONS,
         ..at
     });
-    assert!(sim.foot_mark_put(id, Some(rules), None, FrameEffects::default()));
+    assert!(sim.foot_mark_put(id, rules, None, FrameEffects::default()));
     assert_eq!(
         sim.substrate.occupancy.listed_layer(CELL.0, CELL.1, id),
         Some(MovementLayer::Bridge)
@@ -335,7 +336,7 @@ fn vanished_structural_deck_per_cell_arms_the_same_object_fall() {
     sim.per_cell_process(
         id,
         PerCellReason::Arrival,
-        Some(&rules),
+        &rules,
         None,
         FrameEffects::default(),
     )

@@ -1,5 +1,5 @@
-# cargo-about configuration for the third-party notices shipped in release
-# archives (THIRD_PARTY_LICENSES.html). Every accepted license is compatible
+# cargo-about configuration for the third-party notices shipped in the release
+# installers (THIRD_PARTY_LICENSES.html). Every accepted license is compatible
 # with VERA20k's GPLv3; the release fails when a crate needs any other. Where a
 # crate offers a choice, the first accepted license in this order is used.
 accepted = [

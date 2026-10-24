@@ -21,6 +21,7 @@ pub mod layout;
 pub mod menu_page;
 pub mod modal;
 pub mod pause_menu;
+pub mod restate;
 pub mod saved_file_input;
 pub mod saved_games;
 pub mod slide;

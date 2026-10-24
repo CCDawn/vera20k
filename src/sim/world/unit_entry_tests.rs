@@ -350,9 +350,16 @@ fn a_crusher_meets_a_terrain_object_with_its_weapon() {
         sim.substrate
             .mission_assign_exact(90, crate::sim::mission::MissionId::from_raw(5), 100)
             .unwrap();
-        sim.terrain_objects
-            .cell_index_mut_for_test()
-            .insert((11, 10), 900);
+        crate::sim::terrain_spawn::construct_terrain_objects(
+            &mut sim,
+            &[crate::map::overlay::TerrainObject {
+                rx: 11,
+                ry: 10,
+                name: "TREE01".into(),
+            }],
+            &rules,
+            false,
+        );
         let cell = sim
             .resolved_terrain
             .as_ref()

@@ -191,7 +191,7 @@ fn compare_original_body_pixels(join_viewport: bool) {
     gi.lifecycle
         .set_object_alive_for_test(actor["alive"].as_bool().unwrap());
     sim.entities_mut_for_test().insert(gi);
-    sim.submit_object_display(1, DisplayLayer::GROUND, Some(&rules));
+    sim.submit_object_display_for_test(1, DisplayLayer::GROUND, Some(&rules));
     let order = NativeDisplayOrder::from_display(sim.display_layers());
     let mut light_grid = CellLightGrid::new();
     light_grid.insert_profiled_light(
@@ -237,6 +237,7 @@ fn compare_original_body_pixels(join_viewport: bool) {
             &[],
             &HashSet::new(),
             &HashSet::new(),
+            &Default::default(),
             None,
             None,
             Some(sim.interner()),
@@ -336,7 +337,14 @@ fn compare_original_body_pixels(join_viewport: bool) {
             assert_eq!(parent.policy.render_z, RenderZPolicy::ReadOnly);
             let extra = body_extra_light(gi, &rules, &sim, None);
             let light = body_palette_light(&light_grid, (10, 20), extra);
-            let (tint, light) = techno_effect_light(gi, [1.; 3], light, &sim);
+            let (tint, light) = techno_effect_light(
+                gi,
+                [1.; 3],
+                light,
+                &sim,
+                None,
+                crate::app::presentation::lighting::TechnoDraw::Shape,
+            );
             let word = shp_colour_word(gi, &sim, &rules, || input["shrouded"].as_bool().unwrap());
             let light = light.with_colour_word(if parent.policy.ors_colour_word(entry.extended) {
                 word
@@ -430,6 +438,7 @@ fn compare_original_body_pixels(join_viewport: bool) {
             };
             draw_native_object_pass(
                 &mut encoder,
+                crate::app::render::merge_passes::ObjectDrawPhase::Display,
                 &cv,
                 &dv,
                 &mut terrain,

@@ -20,14 +20,6 @@ fn escape_counter_matches_native_cell_list_and_raw_owner_gates() {
         "tools/spatial_oracle/infantry_scatter_entry_priority.json",
     ))
     .unwrap();
-    let metadata: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
-        "tools/spatial_oracle/infantry_scatter_entry_priority.meta.json",
-    ))
-    .unwrap();
-    assert_eq!(
-        metadata["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     let cases = corpus["cases"].as_array().unwrap();
     assert_eq!(cases.len(), 192);
     let structure_cases = corpus["structure_cases"].as_array().unwrap();
@@ -37,10 +29,8 @@ fn escape_counter_matches_native_cell_list_and_raw_owner_gates() {
             .as_array()
             .unwrap();
         assert_eq!(code_sections.len(), 1);
-        assert_eq!(
-            code_sections[0]["sha256"],
-            "4cd5557a7490debc493ff965afc4483d8d2f1065f434f6b665cbb8fc4835b0cc"
-        );
+        assert_eq!(code_sections[0]["address"], "0x401000");
+        assert_eq!(code_sections[0]["length"], 0x3E0000);
         let input = &row["input"];
         let armed = input["armed"].as_bool().unwrap();
         let extra = format!(

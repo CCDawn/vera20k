@@ -179,13 +179,17 @@ impl StartupSplashPresentation {
     }
 }
 
+/// Draw and present the splash. Returns whether it reached the screen: a
+/// surface with no frame to give this time leaves the hold unarmed for the
+/// next redraw.
 pub(crate) fn render_and_present(
     gpu: &GpuContext,
     batch: &BatchRenderer,
     presenter: &ShellSurfacePresenter,
     depth: &wgpu::TextureView,
+    fps_overlay: &crate::app::diagnostics::fps_overlay::FpsOverlay,
     splash: &StartupSplashPresentation,
-) -> Result<()> {
+) -> Result<bool> {
     batch.update_camera(
         gpu,
         gpu.config.width as f32,
@@ -196,10 +200,12 @@ pub(crate) fn render_and_present(
         crate::render::batch::DepthAxis::NONE,
     );
 
-    let output = gpu
-        .surface
-        .get_current_texture()
-        .context("acquire startup splash surface")?;
+    let Some(output) = gpu
+        .acquire_frame()
+        .context("acquire startup splash surface")?
+    else {
+        return Ok(false);
+    };
     let source_view = presenter.source_render_view();
     let mut encoder = gpu
         .device
@@ -239,9 +245,10 @@ pub(crate) fn render_and_present(
         );
     }
     presenter.encode_present(&mut encoder, &output.texture);
+    fps_overlay.encode(gpu, batch, &mut encoder, &output.texture);
     gpu.queue.submit(std::iter::once(encoder.finish()));
     output.present();
-    Ok(())
+    Ok(true)
 }
 
 /// The size the splash is composed at and where it sits in the window. The two

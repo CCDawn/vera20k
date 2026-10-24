@@ -35,6 +35,28 @@ pub(crate) struct PlatformState {
     /// the OS drops the clip on alt-tab. Presentation-only — never serialized or
     /// read by the deterministic simulation.
     pub(crate) cursor_confined: bool,
+    /// Whether the last confinement call actually holds the OS pointer in the
+    /// client area: `ClipCursor` on Windows, an accepted Confined grab
+    /// elsewhere. winit 0.30.12 refuses Confined on macOS and pure Wayland, so
+    /// there the pointer stays free while `cursor_confined` is on. Only
+    /// `input::cursor`'s confinement calls write it. Presentation-only.
+    pub(crate) pointer_held: std::cell::Cell<bool>,
+    /// Whether the OS pointer is inside the window's client area, from winit's
+    /// enter/leave edges. Outside it the system owns the pointer — the title bar
+    /// and resize border need the system arrow, which `DefWindowProc` installs
+    /// for every non-client `WM_SETCURSOR` hit — so VERA draws no mouse.shp
+    /// there and asks for a visible OS cursor. A clipped (`cursor_confined`)
+    /// pointer cannot leave, so this only moves while the lock is off.
+    /// Presentation-only — never serialized or read by the deterministic
+    /// simulation.
+    pub(crate) pointer_in_client: bool,
+    /// The last visibility handed to `Window::set_cursor_visible`, so a steady
+    /// frame does not re-issue it. winit's call is not free on Windows: it runs
+    /// `refresh_os_cursor`, which clears any OS cursor clip winit does not itself
+    /// own, so repeating it per frame would tear `cursor_confined` down every
+    /// frame. `show_os_cursor_only_without_game_cursor` is the only writer and
+    /// re-asserts the clip after each transition. Presentation-only.
+    pub(crate) os_cursor_visible: Option<bool>,
     /// Live message-pump modifiers for focused shell controls. Gameplay keeps
     /// its separate paused-input admission snapshot.
     pub(crate) live_modifiers: winit::keyboard::ModifiersState,
@@ -48,8 +70,8 @@ pub(crate) struct PlatformState {
     /// the frame counter, input, AI, map logic and per-tick update all stop.
     /// Only the message pump keeps running. Starts true — a window that never
     /// reports an activation edge must keep running. Whether a clear flag
-    /// freezes the match is `focus_freeze_active`; input admission reads this
-    /// flag directly.
+    /// freezes the match is `focus_freeze_active`; input admission and the
+    /// `WM_ACTIVATEAPP` audio-output gate read this flag directly.
     pub(crate) window_active: bool,
     /// `[gameplay] pause_on_focus_loss`: whether a deactivated window freezes
     /// the match the way native does. Off, the match runs on in the background.
@@ -72,6 +94,12 @@ pub(crate) struct PlatformState {
     /// A sealed capture's exact surface. Present only in capture runs, which
     /// keep it through match launch and never zoom or go full screen.
     pub(crate) capture_client_size: Option<PhysicalSize<u32>>,
+    /// Whether the windowed window still has to be put on the Display choice's
+    /// screen. Set when the window comes back from full screen, because winit
+    /// restores the placement it saved on entry and does that on its own
+    /// thread, so the choice is re-asserted over the next passes until the
+    /// window is really there. Presentation-only, never serialized.
+    pub(crate) recenter_windowed: bool,
 }
 
 impl PlatformState {
@@ -86,6 +114,9 @@ impl PlatformState {
         Self {
             window,
             cursor_confined: true,
+            pointer_held: std::cell::Cell::new(false),
+            pointer_in_client: true,
+            os_cursor_visible: None,
             live_modifiers: winit::keyboard::ModifiersState::empty(),
             held_modifier_keys: Default::default(),
             window_active: true,
@@ -94,14 +125,17 @@ impl PlatformState {
             frame_pacer: LocalFramePacer::new(),
             game_config,
             capture_client_size,
+            recenter_windowed: false,
         }
     }
 
     /// Is the match frozen because the window is not the foreground?
     ///
     /// True only while the window is deactivated and `pause_on_focus_loss` is
-    /// configured; the single gate for the simulation, the message clock and
-    /// the focus-edge audio stop.
+    /// configured; the single gate for the simulation and the message clock.
+    /// The audio stop is deliberately not part of it: gamemd gates its primary
+    /// output on the activation edge itself, so that gate follows
+    /// [`Self::window_active`] alone.
     pub(crate) fn focus_freeze_active(&self) -> bool {
         self.pause_on_focus_loss && !self.window_active
     }

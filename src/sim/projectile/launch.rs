@@ -14,10 +14,9 @@ use super::native_math::{
 use super::{ProjectileCoord, ProjectileVelocity};
 use crate::sim::rng::SimRng;
 use crate::util::direction_tables::{facing16_from_angle, radians_from_facing16};
+use crate::util::native_random::RANDOM_RANGED_UNIT_SCALE;
 
 const POSITIVE_HEIGHT_ANGLE: NativeF64Bits = NativeF64Bits::from_bits(0x3fe9_21d9_f4d3_7c12);
-/// `[0x007E3570]` = 1/0x7FFFFFFE, the scatter angle draw's bound.
-const INVERSE_DRAW_SPAN: NativeF64Bits = NativeF64Bits::from_bits(0x3e00_0000_0040_0000);
 /// `[0x007E3CC0]` = 2π.
 const TWO_PI: NativeF64Bits = NativeF64Bits::from_bits(0x4019_21fb_5444_2d18);
 /// `[0x007E44D0]`, the radial fan's π.
@@ -415,7 +414,7 @@ fn scatter_delta(
     trig: &TrigTable,
 ) -> ProjectileCoord {
     let angle = radians_from_facing16(facing16_from_angle(X::mul(
-        X::mul(X::load_i32(raw), d(INVERSE_DRAW_SPAN)),
+        X::mul(X::load_i32(raw), d(RANDOM_RANGED_UNIT_SCALE)),
         d(TWO_PI),
     )));
     offset_along(point, angle, magnitude, trig)
@@ -443,6 +442,29 @@ pub(crate) fn missile_launch_velocity(scale: NativeF64Bits) -> ProjectileVelocit
         store(X::mul(X::mul(cosine, cosine), scale)),
         store(X::mul(X::mul(cosine, sine), scale)),
         store(X::mul(sine, scale)),
+    ])
+}
+
+/// Airburst469FA0..46A0D5 (center repeats46A172..28A): signed Speed/10,
+/// one Scenario RandomRanged(0,32), then the original sine/cosine table.
+/// Tiny horizontal components are retained: the literal pitch is near3π/2,
+/// not exactly a vertical vector. Native execution: projectile_oracle/airburst.
+pub(crate) fn airburst_launch_velocity(speed: i32, rng: &mut SimRng) -> ProjectileVelocity {
+    const PITCH: NativeF64Bits = NativeF64Bits::from_bits(0x4012_d989_1049_ee22);
+    const TURN: NativeF64Bits = NativeF64Bits::from_bits(0xbf19_222d_989f_5e57);
+    let draw = rng.next_range_i32_inclusive(0, 32) as u8;
+    let angle = i32::from((u16::from(draw) << 8) as i16) - 0x3fff;
+    let heading = round(X::mul(X::load_i32(angle), d(TURN)));
+    let trig = TrigTable::embedded();
+    let sine = round(trig.sin_from_table(heading));
+    let cosine = round(trig.cos_from_table(heading));
+    let speed = X::load_i32(speed / 10);
+    // 469FEC computes sin first, but 46A07D..46A092 copy the later cos
+    // product to Fire's vector X (+88), and the saved sin product to Y (+90).
+    ProjectileVelocity::from_native([
+        store(X::mul(X::mul(trig.cos_from_table(d(PITCH)), cosine), speed)),
+        store(X::mul(X::mul(trig.cos_from_table(d(PITCH)), sine), speed)),
+        store(X::mul(trig.sin_from_table(d(PITCH)), speed)),
     ])
 }
 

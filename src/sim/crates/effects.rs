@@ -16,9 +16,12 @@ use crate::rules::object_type::ObjectCategory;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::combat::veterancy;
 use crate::sim::components::DriveCoord;
+use crate::sim::houses::Houses;
 use crate::sim::intern::InternedId;
+use crate::sim::intern::StringInterner;
 use crate::sim::movement::ground_pose::position_world_coord;
 use crate::sim::rng::SimRng;
+use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::world::FrameEffects;
 use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::Simulation;
@@ -27,7 +30,7 @@ use crate::util::native_x87::{MaskedX87Chop53 as X87, NativeF64Bits, distance_3d
 
 /// Which `Techno` double a multiplier crate raises.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Multiplier {
+pub(crate) enum Multiplier {
     /// `Techno+0x158`, the Armor arm `0x00482E53..0x00482E79`.
     Armor,
     /// `Techno+0x160`, the Firepower arm `0x00483222..0x00483248`.
@@ -35,8 +38,9 @@ pub(super) enum Multiplier {
 }
 
 /// The object's crate multipliers, `Techno+0x158` (armor) and `Techno+0x160`
-/// (firepower). The constructor seeds both doubles to 1.0; the Armor and
-/// Firepower arms ([`apply_multiplier_crate`]) are their only writers, and an
+/// (firepower). Under Ares, firepower retains the Ext+80 permanent baseline
+/// separately from derived Techno+160. The constructor seeds both baselines
+/// to 1.0; the Armor and Firepower arms ([`apply_multiplier_crate`]) are their only writers, and an
 /// arm skips a multiplier that is not exactly 1.0, so each changes at most
 /// once per object. The receiver's damage build reads the armor multiplier;
 /// `FireAt`'s damage build folds in the firepower one
@@ -47,6 +51,10 @@ pub(crate) struct CrateMultipliers {
     armor: NativeF64Bits,
     #[serde(default = "one")]
     firepower: NativeF64Bits,
+    /// Ares derived Techno+160; None retains the permanent Ext+80 baseline.
+    #[cfg(feature = "ares")]
+    #[serde(default)]
+    attached_firepower: Option<NativeF64Bits>,
 }
 
 fn one() -> NativeF64Bits {
@@ -59,6 +67,8 @@ impl Default for CrateMultipliers {
         Self {
             armor: NativeF64Bits::ONE,
             firepower: NativeF64Bits::ONE,
+            #[cfg(feature = "ares")]
+            attached_firepower: None,
         }
     }
 }
@@ -69,9 +79,23 @@ impl CrateMultipliers {
         self.armor
     }
 
-    /// `Techno+0x160`.
+    /// Effective Techno+160, read by both FireAt and EstimateDamage.
     pub(crate) const fn firepower(self) -> NativeF64Bits {
+        #[cfg(feature = "ares")]
+        if let Some(value) = self.attached_firepower {
+            return value;
+        }
         self.firepower
+    }
+
+    /// Permanent firepower crate baseline (Ares Ext+80), never an AE product.
+    pub(crate) const fn crate_firepower(self) -> NativeF64Bits {
+        self.firepower
+    }
+
+    #[cfg(feature = "ares")]
+    pub(crate) fn set_attached_firepower(&mut self, value: NativeF64Bits) {
+        self.attached_firepower = (value != self.firepower).then_some(value);
     }
 
     /// Install a fixture's armor multiplier.
@@ -84,6 +108,10 @@ impl CrateMultipliers {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_firepower_multiplier_for_test(&mut self, value: NativeF64Bits) {
         self.firepower = value;
+        #[cfg(feature = "ares")]
+        {
+            self.attached_firepower = None;
+        }
     }
 }
 
@@ -116,13 +144,17 @@ fn ground_members_in_radius(
 /// multiply, `0x00482E6D..0x00482E79`). Returns the owners of the changed
 /// objects, in native visit order; the arm announces when one of them is the
 /// local player (`vt+0x3C` then `0x0050B6F0`, `0x00482E7F..0x00482E8D`).
-pub(super) fn apply_multiplier_crate(
+pub(crate) fn apply_multiplier_crate(
     substrate: &mut ObjectSubstrate,
+    rules: &RuleSet,
+    interner: &StringInterner,
     center: DriveCoord,
     radius: i32,
     magnitude: NativeF64Bits,
     which: Multiplier,
 ) -> Vec<InternedId> {
+    #[cfg(not(feature = "ares"))]
+    let _ = (rules, interner);
     let mut changed_owners = Vec::new();
     for id in ground_members_in_radius(substrate, center, radius) {
         let Some(entity) = substrate.entities.get_mut(id) else {
@@ -137,6 +169,13 @@ pub(super) fn apply_multiplier_crate(
         }
         *slot =
             X87::store_f64_masked_chop(X87::mul(X87::load_f64(magnitude), X87::load_f64(*slot)));
+        // Installed Firepower2@1005F997 writes Ext+80, then1005F99D
+        //aggregates before the recipient callback/next actor. Armor remains
+        //neutral-only in the attachment admission gate.
+        #[cfg(feature = "ares")]
+        if matches!(which, Multiplier::Firepower) {
+            entity.recompute_ares_attached_stats(rules, interner);
+        }
         let owner = entity.owner();
         if !changed_owners.contains(&owner) {
             changed_owners.push(owner);
@@ -159,7 +198,8 @@ fn ordered_less(a: f64, b: f64) -> bool {
 /// The promotion anim and EVA follow from the next `AI_Update` sample, as for
 /// a kill promotion.
 pub(super) fn apply_veteran_crate(
-    sim: &mut Simulation,
+    interner: &StringInterner,
+    substrate: &mut ObjectSubstrate,
     rules: &RuleSet,
     center: DriveCoord,
     radius: i32,
@@ -171,8 +211,8 @@ pub(super) fn apply_veteran_crate(
     if !ordered_less(0.0, magnitude) {
         return;
     }
-    for id in ground_members_in_radius(&sim.substrate, center, radius) {
-        let Some(entity) = sim.substrate.entities.get(id) else {
+    for id in ground_members_in_radius(&*substrate, center, radius) {
+        let Some(entity) = substrate.entities.get(id) else {
             continue;
         };
         // `Object+0x74`: ObjectClass::Mark sets it on PUT and clears it on
@@ -181,13 +221,13 @@ pub(super) fn apply_veteran_crate(
         if !entity.lifecycle.cell_marked() {
             continue;
         }
-        if !sim
+        if !interner
             .object_type(entity.type_ref(), rules)
             .is_some_and(|object| object.trainable)
         {
             continue;
         }
-        let entity = sim.substrate.entities.get_mut(id).expect("checked above");
+        let entity = substrate.entities.get_mut(id).expect("checked above");
         let mut level = 0_i32;
         loop {
             if veterancy::raw_is_veteran(entity.veterancy.raw()) {
@@ -207,34 +247,36 @@ pub(super) fn apply_veteran_crate(
     }
 }
 
-/// The HealBase arm's building loop `0x00482C18..0x00482C9C`: every building
-/// of the actor's house receives `Health - Type.Strength` (zero or negative)
-/// through `ReceiveDamage(&amount, 0, C4Warhead=, NULL, 1, 1, NULL)`, in
-/// `BuildingClass::Array` order (construction order here).
+/// The HealBase arm's live Logic loop `0x00482C18..0x00482C9C`: each
+/// same-house Techno receives `Health - Type.Strength` through
+/// `ReceiveDamage(&amount, 0, C4Warhead=, NULL, 1, 1, NULL)`. Each receiver
+/// finishes before the next live slot, collector owner, type and health read.
 pub(super) fn apply_heal_base_crate(
     sim: &mut Simulation,
     rules: &RuleSet,
     registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-    owner: InternedId,
+    collector: u64,
     frame_effects: FrameEffects<'_>,
 ) {
-    let buildings: Vec<(u64, i32)> = sim
-        .substrate
-        .entities
-        .iter_sorted()
-        .filter(|(_, entity)| {
-            entity.category() == EntityCategory::Structure && entity.owner() == owner
-        })
-        .filter_map(|(id, entity)| {
-            let strength = sim.object_type(entity.type_ref(), rules)?.strength;
-            Some((id, entity.health.current().wrapping_sub(strength)))
-        })
-        .collect();
     let warhead = sim.interner.intern(&rules.bridge_warheads.c4_name);
-    for (id, amount) in buildings {
-        if !sim.substrate.entities.contains(id) {
+    let mut index = 0;
+    while let Some(&id) = sim.logic_order().get(index) {
+        index += 1;
+        // Non-Techno Logic members have their own stores. The native loop
+        // tests the collector's Techno bit, not the recipient's category.
+        let Some(entity) = sim.substrate.entities.get(id) else {
+            continue;
+        };
+        let Some(collector) = sim.substrate.entities.get(collector) else {
+            break;
+        };
+        if entity.owner() != collector.owner() {
             continue;
         }
+        let Some(object_type) = sim.object_type(entity.type_ref(), rules) else {
+            continue;
+        };
+        let amount = entity.health.current().wrapping_sub(object_type.strength);
         sim.commit_direct_damage_receiver(
             rules,
             registry,
@@ -301,14 +343,17 @@ pub(super) enum UnitCrateOutcome {
 /// (a rules-data-only divergence), including when every goodie is a forbidden
 /// base unit. When a candidate exists, retain the original full-array draws.
 pub(super) fn choose_unit_crate_type<'r>(
-    sim: &mut Simulation,
+    interner: &StringInterner,
+    session: &ScenarioSession,
+    scenario_rng: &mut SimRng,
+    houses: &Houses,
     rules: &'r RuleSet,
     owner: InternedId,
     preempted: bool,
 ) -> Option<&'r crate::rules::object_type::ObjectType> {
-    use crate::sim::ai_buildable::{first_owner_compatible, house_country_bit};
-    let house = sim.houses.get(&owner)?;
-    let country_bit = house_country_bit(rules, sim.interner.resolve(house.house_type_id()));
+    use crate::sim::ai_buildable::first_owner_compatible;
+    let house = houses.get(&owner)?;
+    let country_bit = rules.country_owner_mask(interner.resolve(house.house_type_id()));
     let mut chosen = None;
     if preempted {
         chosen = first_owner_compatible(
@@ -320,7 +365,7 @@ pub(super) fn choose_unit_crate_type<'r>(
     }
     if chosen.is_none() {
         let tracked = |category: EntityCategory, type_id: &str| -> i32 {
-            sim.interner
+            interner
                 .get(type_id)
                 .map_or(0, |type_id| house.tracking().owned_count(category, type_id))
         };
@@ -354,8 +399,8 @@ pub(super) fn choose_unit_crate_type<'r>(
     if chosen.is_some() {
         return chosen;
     }
-    let human = house.is_controlled_by_human(sim.session.game_mode_nonzero());
-    let bases = sim.session.game_options().bases;
+    let human = house.is_controlled_by_human(session.game_mode_nonzero());
+    let bases = session.game_options().bases;
     let ids = rules.type_array_ids(ObjectCategory::Vehicle);
     let eligible = |candidate: &crate::rules::object_type::ObjectType| {
         let is_base_unit = rules
@@ -375,9 +420,7 @@ pub(super) fn choose_unit_crate_type<'r>(
     }
     let count = i32::try_from(ids.len()).unwrap_or(i32::MAX);
     loop {
-        let index = sim
-            .scenario_rng
-            .next_range_i32_inclusive(0, count.wrapping_sub(1));
+        let index = scenario_rng.next_range_i32_inclusive(0, count.wrapping_sub(1));
         let Some(candidate) = usize::try_from(index)
             .ok()
             .and_then(|index| ids.get(index))
@@ -480,6 +523,6 @@ pub(super) fn place_unit_crate(
             return UnitCrateOutcome::Placed;
         }
     }
-    sim.discard_constructed_limbo(id, Some(rules), frame_effects);
+    sim.discard_constructed_limbo(id, rules, frame_effects);
     UnitCrateOutcome::FellBackToMoney
 }

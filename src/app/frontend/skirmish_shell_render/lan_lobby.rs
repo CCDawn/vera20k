@@ -194,7 +194,7 @@ pub(crate) fn render_lan_lobby(
             atlas,
             players,
             &lobby.player_list,
-            false,
+            true,
             scale,
         );
         list_controls(&mut controls, atlas, chat, &lobby.chat.list, false, scale);

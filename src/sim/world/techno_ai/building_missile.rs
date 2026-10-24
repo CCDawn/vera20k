@@ -15,8 +15,10 @@
 //!   is deleted, which also removes the warning anim, and no take-off anim
 //!   plays): VERA admits every bullet, and the silo's coordinate is on the
 //!   map.
-//! - The missile's `Trailer=` smoke (`[NKMSLUP] Trailer=NUKEPUFF`): VERA's
-//!   bullets spawn no trailer anims.
+//!
+//! The missile's `Trailer=` smoke (`[NKMSLUP] Trailer=NUKEPUFF`) comes from
+//! the shared Bullet AI's trailer (`0x00466826..0x004668B8`,
+//! `ProjectileStore::trailer`), not from this handler.
 //!
 //! EVIDENCE BOUNDS: `tools.superweapon_oracle` supplies GetFLH (`vt+0xB0`)
 //! and the silo's coordinate, so the missile's origin rests on the shared
@@ -194,13 +196,16 @@ fn launch_missile(
         Flh::default(),
     )
     .coord;
-    let bullet_id = sim.allocate_stable_id();
+    let bullet_id = sim.substrate.allocate_stable_id();
     let native_unique_id = sim.next_native_runtime_id();
     if let Some(warning) = warning {
         sim.substrate
             .set_anim_attached_bullet(warning, Some(bullet_id));
     }
     let velocity = crate::sim::projectile::launch::missile_launch_velocity(MISSILE_VELOCITY_SCALE);
+    // The target is the CellClass `Map[NukeTarget]` gives (`0x0044CAB0..0x0044CAB5`,
+    // then CreateBullet at `0x0044CAED`): the shared dummy for a cell off the map.
+    let target = ProjectileTarget::looked_up_cell(sim.resolved_terrain.as_ref(), rx, ry);
     let payload = ProjectilePayload::new(
         weapon.damage,
         sim.interner.intern(&warhead.id),
@@ -216,7 +221,7 @@ fn launch_missile(
         rules,
         native_unique_id,
         id,
-        ProjectileTarget::Cell { rx, ry },
+        target,
         payload,
         MISSILE_SPEED,
         origin,

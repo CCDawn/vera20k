@@ -1,8 +1,8 @@
 //! The Magnetron's lift: an `IsLocomotor=` warhead installs its `Locomotor=`
-//! class on the ground vehicle it hits, and the firer holds it aloft until it
-//! lets it drop.
+//! class on the ground vehicle or landed aircraft it hits, and the firer
+//! holds it aloft until it lets it drop.
 //!
-//! gamemd-derived (instruction reading; YR 1.001, SHA-256 `1cdd1180…4298c`):
+//! gamemd-derived (instruction reading; YR 1.001):
 //! - the detonation's locomotor arm, `BulletClass::DetonateAtCoord`
 //!   `0x004694CB..0x00469700` ([`Simulation::locomotor_detonation`]);
 //! - `TechnoClass::ImbueLocomotor @ 0x00710000`
@@ -38,10 +38,16 @@
 //!
 //! Ledger: the arm, Imbue and the release draw no random number of their
 //! own; their callees keep theirs (Jumpjet `Stop_Moving`'s placement draws
-//! nothing for a Unit). Timers: Foot's destination timers through the class
-//! setter, and the mission timers of Imbue's `ResetOrdersToGuard` and queued
-//! missions. Detaches: none; the held object's Stun skips `Detach_All`
-//! (`0x006FCD79`).
+//! nothing for a Unit, while an Aircraft takes its non-Unit arm, which draws
+//! Scenario RNG; the native comparison checks that stream). Timers: Foot's
+//! destination timers through the class setter, and the mission timers of
+//! Imbue's `ResetOrdersToGuard` and queued missions. Detaches: none; the held
+//! object's Stun skips `Detach_All` (`0x006FCD79`).
+//!
+//! Bounded original execution for landed Aircraft, installed-locomotor
+//! destination routing, release and restoration is recorded in
+//! `tools/spatial_oracle/magnetron_aircraft_lift.md`. Its supplied altitude
+//! and settled-state controls do not claim a complete native flight.
 
 use crate::map::entities::EntityCategory;
 use crate::rules::locomotor_type::LocomotorKind;
@@ -53,7 +59,7 @@ use crate::sim::combat::{
 };
 use crate::sim::components::{DriveCoord, NavTargetRef};
 use crate::sim::lifecycle_request::{LifecycleRequest, UninitReason};
-use crate::sim::mission::authority::EntityReadyInputProvider;
+use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::movement::locomotor::MovementLayer;
 use crate::sim::occupancy::CellObjectMember;
@@ -267,17 +273,12 @@ impl Simulation {
     /// before the rest are tested: no target object, a Unit target still in
     /// its war factory ([`Self::unit_in_contact_war_factory`]), a target not in the
     /// Ground layer (`vt+0x78`), not a Foot, Iron Curtained (`vt+0x160`), not
-    /// a Unit, already lifted, or one whose type's `Size=` the shot does not
-    /// exceed (`FCOMP` at `0x004696BD`, so equal refuses). Then
+    /// a Unit or Aircraft (`0x0046967E..0x0046969C`), already lifted, or one
+    /// whose type's `Size=` the shot does not exceed (`FCOMP` at `0x004696BD`,
+    /// so equal refuses). Then
     /// [`Self::imbue_locomotor`] (`0x004696FB`).
     ///
-    /// RESIDUAL: native also admits an Aircraft (`0x00469699`), a landed one
-    /// being in the Ground layer, and imbues it. VERA refuses it: its Jumpjet
-    /// host serves Unit and Infantry owners only. Trigger: a Magnetron firing
-    /// at a landed aircraft. Effect: VERA's shot does nothing; native's lift
-    /// and drop of an aircraft are untraced. Frequency: uncommon.
-    ///
-    /// Native execution (`gamemd` 3e81a617…d308600, FPCW 0x0E3F) confirms
+    /// Native execution (`gamemd`, FPCW 0x0E3F) confirms
     /// FILD Bullet strength then FCOMP current Type+0x380 Size at `0x004696BD`:
     /// strength 1 vs Size 1.5 refuses; strength 2 vs 1.5 accepts; equality
     /// and unordered comparisons refuse. The `ReadDouble` owner preserves
@@ -313,7 +314,7 @@ impl Simulation {
         }
         let in_factory = object.is_some_and(|id| self.unit_in_contact_war_factory(id, rules));
         if firer.lift.target().is_some() {
-            self.release_locomotor(owner, false, Some(rules), registry, effects);
+            self.release_locomotor(owner, false, rules, registry, effects);
         }
         let Some(victim_id) = object.filter(|_| !in_factory) else {
             return;
@@ -332,7 +333,10 @@ impl Simulation {
                 victim.invulnerability.as_ref(),
                 frame,
             )
-            && victim.category() == EntityCategory::Unit
+            && matches!(
+                victim.category(),
+                EntityCategory::Unit | EntityCategory::Aircraft
+            )
             && !victim.lift.swap_active()
             && self
                 .object_type(victim.type_ref(), rules)
@@ -386,7 +390,7 @@ impl Simulation {
         crate::sim::spawn_manager::kill_all_spawns_with_context(
             self,
             target,
-            UninitContext::new(Some(rules), registry).with_effects(effects),
+            UninitContext::new(rules, registry).with_effects(effects),
         );
         let naval_eater = self
             .substrate
@@ -420,11 +424,9 @@ impl Simulation {
                 .is_some_and(|locomotor| locomotor.is_overridden())
         {
             if crate::sim::movement::locomotor_owner::piggyback_end_admitted(entity) {
-                self.end_admitted_piggyback(target, Some(rules));
+                self.end_admitted_piggyback(target, rules);
             } else {
-                if let Err(cause) =
-                    self.locomotor_stop_moving(target, Some(rules), registry, effects)
-                {
+                if let Err(cause) = self.locomotor_stop_moving(target, rules, registry, effects) {
                     log::debug!("lifted gatherer {target} Stop_Moving: {cause}");
                 }
                 let _ = self
@@ -435,7 +437,7 @@ impl Simulation {
                     MissionId::from_known(MissionType::Stop),
                     0,
                     now,
-                    &EntityReadyInputProvider,
+                    &LiveReadyInputProvider { rules },
                 );
             }
             return;
@@ -445,7 +447,7 @@ impl Simulation {
             target,
             -1,
             DriveCoord { x: 0, y: 0, z: 0 },
-            Some(rules),
+            rules,
             registry,
             effects,
         );
@@ -479,7 +481,7 @@ impl Simulation {
             .get(firer)
             .is_some_and(|entity| entity.lift.target().is_some())
         {
-            self.release_locomotor(firer, false, Some(rules), registry, effects);
+            self.release_locomotor(firer, false, rules, registry, effects);
         }
         if self
             .substrate
@@ -487,7 +489,7 @@ impl Simulation {
             .get(target)
             .is_some_and(|entity| entity.lift.target().is_some())
         {
-            self.release_locomotor(target, true, Some(rules), registry, effects);
+            self.release_locomotor(target, true, rules, registry, effects);
         }
         let Some(entity) = self.substrate.entities.get_mut(target) else {
             return;
@@ -506,7 +508,7 @@ impl Simulation {
         if let Err(error) = self.assign_destination_represented(
             target,
             Some(NavTargetRef::object(firer)),
-            Some(rules),
+            rules,
             registry,
             effects,
         ) {
@@ -515,7 +517,7 @@ impl Simulation {
         if let Some(entity) = self.substrate.entities.get_mut(target) {
             entity.selection.deselect();
         }
-        self.leave_team(target, false, Some(rules), effects);
+        self.leave_team(target, false, rules, effects);
         let Some(entity) = self.substrate.entities.get_mut(target) else {
             return;
         };
@@ -527,14 +529,14 @@ impl Simulation {
                 .is_some_and(|contact| contact.category() == EntityCategory::Structure)
         });
         if building_contact {
-            crate::sim::radio::broadcast_break(self, target, Some(rules), effects);
+            crate::sim::radio::broadcast_break(self, target, rules, effects);
         }
         let _ = self.mission_queue_exact(
             target,
             MissionId::from_known(MissionType::Guard),
             1,
             now,
-            &EntityReadyInputProvider,
+            &LiveReadyInputProvider { rules },
         );
         let hunts = self.substrate.entities.get(target).is_some_and(|entity| {
             self.houses.get(&entity.owner()).is_some_and(|house| {
@@ -550,7 +552,7 @@ impl Simulation {
                 MissionId::from_known(MissionType::Hunt),
                 0,
                 now,
-                &EntityReadyInputProvider,
+                &LiveReadyInputProvider { rules },
             );
         }
     }
@@ -582,7 +584,7 @@ impl Simulation {
         &mut self,
         firer: u64,
         clear_target: bool,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) {
@@ -650,7 +652,7 @@ impl Simulation {
         &mut self,
         listener: u64,
         expired: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) {
@@ -842,17 +844,21 @@ impl Simulation {
             let Some(owner) = self.substrate.entities.get(id) else {
                 return;
             };
-            let location = crate::sim::movement::ground_pose::position_world_coord(&owner.position);
+            // `0x0054CCDE..0x0054CD14`: at the crashing jumpjet's Location.
+            let location = crate::sim::movement::ground_pose::object_location(
+                owner,
+                self.resolved_terrain.as_ref(),
+            );
             if let Some(entity) = self.substrate.entities.get(victim) {
                 crate::sim::movement::bump_crush::emit_crush_kill_sounds_at(
                     entity,
-                    (location.x / 256, location.y / 256),
+                    location,
                     rules,
                     &mut self.interner,
                     &mut self.sound_events,
                 );
             }
-            let context = UninitContext::new(Some(rules), registry).with_effects(effects);
+            let context = UninitContext::new(rules, registry).with_effects(effects);
             if !self.record_manipulated_kill(victim, id, context) {
                 self.record_the_kill(
                     victim,
@@ -861,7 +867,7 @@ impl Simulation {
                     context,
                 );
             }
-            self.apply_lifecycle_request_with_rules(
+            self.apply_lifecycle_request(
                 LifecycleRequest::Uninit {
                     stable_id: victim,
                     reason: UninitReason::Crush,
@@ -920,6 +926,7 @@ impl Simulation {
                     return false;
                 };
                 AreaDamageReceiver::Terrain(TerrainDamageEvent {
+                    damage_writeback: None,
                     stable_id: tree.stable_id(),
                     rx: tree.cell().0,
                     ry: tree.cell().1,
@@ -962,7 +969,7 @@ impl Simulation {
         self.record_manipulated_kill(
             id,
             id,
-            UninitContext::new(Some(rules), registry).with_effects(effects),
+            UninitContext::new(rules, registry).with_effects(effects),
         );
     }
 }
@@ -993,3 +1000,7 @@ impl crate::sim::world::ObjectSubstrate {
 #[cfg(test)]
 #[path = "locomotor_lift_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "locomotor_lift_native_tests.rs"]
+mod native_tests;

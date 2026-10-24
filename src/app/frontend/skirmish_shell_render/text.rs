@@ -448,18 +448,9 @@ fn push_combo_face_label_draw(
     state: &AppState,
     label: &str,
     rect: RectPx,
-    covering_overlays: &[RectPx],
     scale: ShellScale,
 ) {
-    push_combo_face_label_draw_with_color(
-        out,
-        state,
-        label,
-        rect,
-        SHELL_LABEL_TEXT_RGB,
-        covering_overlays,
-        scale,
-    );
+    push_combo_face_label_draw_with_color(out, state, label, rect, SHELL_LABEL_TEXT_RGB, scale);
 }
 
 fn push_combo_face_label_draw_with_color(
@@ -468,13 +459,9 @@ fn push_combo_face_label_draw_with_color(
     label: &str,
     rect: RectPx,
     color: [f32; 3],
-    covering_overlays: &[RectPx],
     scale: ShellScale,
 ) {
     let text_rect = combo_face_text_draw_rect(rect, scale);
-    if text_covered_by_overlay(text_rect, covering_overlays) {
-        return;
-    }
     let fit_width = combo_face_text_fit_width(rect, scale);
     let label = truncate_owner_draw_label(&state.renderer.bit_font, label, fit_width);
     push_text_draw(
@@ -643,14 +630,6 @@ pub(super) fn build_shell_text_draws(
     let mut shell_draws: Vec<ShellTextDraw> = Vec::new();
     let bare_instances: Vec<SpriteInstance> = Vec::new();
     let scale = layout.scale;
-    let mut covering_overlays = Vec::new();
-    if let Some(dropdown) = shell
-        .open_combo_dropdown
-        .and_then(|open| combo_dropdown_rect(shell, layout, maps, open.id))
-    {
-        covering_overlays.push(dropdown);
-    }
-
     if !sliding {
         push_right_panel_text_draws(&mut shell_draws, state, layout, shell);
     }
@@ -727,7 +706,6 @@ pub(super) fn build_shell_text_draws(
         state,
         &country_choice_label(state, shell.player_country_random, shell.player_country),
         layout.rows.side_combos[0],
-        &covering_overlays,
         scale,
     );
     if !shell.player_color_claimed {
@@ -737,7 +715,6 @@ pub(super) fn build_shell_text_draws(
             state,
             &random_color,
             layout.color_combos[0],
-            &covering_overlays,
             scale,
         );
     }
@@ -746,7 +723,6 @@ pub(super) fn build_shell_text_draws(
         state,
         &combo_item_label(state, SkirmishComboItem::Start(shell.player_start_position)),
         layout.rows.start_combos[0],
-        &covering_overlays,
         scale,
     );
     push_combo_face_label_draw_with_color(
@@ -757,7 +733,6 @@ pub(super) fn build_shell_text_draws(
         // The local Team combo greys with the mode's AlliesAllowed gate; every
         // other local-row face is unconditionally live.
         combo_face_text_color(!combo_enabled(shell, maps, SkirmishComboId::Team(0))),
-        &covering_overlays,
         scale,
     );
 
@@ -776,7 +751,6 @@ pub(super) fn build_shell_text_draws(
             state,
             &row_type,
             layout.rows.ai_type_combos[idx],
-            &covering_overlays,
             scale,
         );
         let sibling_text_color = opponent_sibling_combo_text_color(opponent);
@@ -786,7 +760,6 @@ pub(super) fn build_shell_text_draws(
             &country_choice_label(state, opponent.country_random, opponent.country),
             layout.rows.side_combos[row],
             sibling_text_color,
-            &covering_overlays,
             scale,
         );
         if !opponent.color_claimed {
@@ -797,7 +770,6 @@ pub(super) fn build_shell_text_draws(
                 &random_color,
                 layout.color_combos[row],
                 sibling_text_color,
-                &covering_overlays,
                 scale,
             );
         }
@@ -807,7 +779,6 @@ pub(super) fn build_shell_text_draws(
             &combo_item_label(state, SkirmishComboItem::Start(opponent.start_position)),
             layout.rows.start_combos[row],
             sibling_text_color,
-            &covering_overlays,
             scale,
         );
         push_combo_face_label_draw_with_color(
@@ -818,11 +789,22 @@ pub(super) fn build_shell_text_draws(
             // Row-active alone does not decide the Team face: the mode's
             // AlliesAllowed gate greys it as well.
             combo_face_text_color(!combo_enabled(shell, maps, SkirmishComboId::Team(row))),
-            &covering_overlays,
             scale,
         );
     }
 
+    (shell_draws, bare_instances)
+}
+
+/// The open ComboDropWin's row captions, painted after every dialog text and
+/// the popup's own frame.
+pub(super) fn build_dropdown_text_draws(
+    state: &AppState,
+    layout: &SkirmishShellLayout,
+    shell: &SkirmishShellState,
+    maps: &[MapMenuEntry],
+) -> Vec<ShellTextDraw> {
+    let mut shell_draws = Vec::new();
     if let Some(open) = shell
         .open_combo_dropdown
         .filter(|open| combo_enabled(shell, maps, open.id))
@@ -856,8 +838,7 @@ pub(super) fn build_shell_text_draws(
             );
         }
     }
-
-    (shell_draws, bare_instances)
+    shell_draws
 }
 
 /// The right panel's button captions.
@@ -1218,21 +1199,31 @@ pub(super) fn push_choose_map_modal_text_draws(
         );
     }
     let geometry = modal.map_geometry(layout);
-    for (visible, record_idx) in modal
+    for (visible, (index, record_idx)) in modal
         .filtered_record_indices
         .iter()
+        .enumerate()
         .skip(modal.map_top_index)
         .take(geometry.visible_rows)
         .enumerate()
     {
-        let Some(record) = state.frontend.scenario_catalog.records().get(*record_idx) else {
+        let label = match &modal.row_labels {
+            Some(labels) => labels.get(index).map(String::as_str),
+            None => state
+                .frontend
+                .scenario_catalog
+                .records()
+                .get(*record_idx)
+                .map(|record| record.display_name.as_str()),
+        };
+        let Some(label) = label else {
             continue;
         };
         let row = geometry.row(visible);
         push_text_draw(
             out,
             state,
-            &record.display_name,
+            label,
             rect_to_text_rect(RectPx::new(
                 row.x + list_text_inset(scale),
                 row.y,
@@ -1612,17 +1603,6 @@ pub(super) fn push_saved_browser_prompt_text<I>(
 mod tests {
     use super::*;
     use crate::ui::skirmish_shell::COMBO_DROPDOWN_ROW_H;
-
-    #[test]
-    fn combo_face_text_under_open_dropdown_is_suppressed() {
-        let dropdown = RectPx::new(23, 96, 149, 92);
-        let covered_combo_text = RectPx::new(25, 123, 129, 24);
-        let clear_combo_text = RectPx::new(25, 71, 129, 24);
-
-        assert!(text_covered_by_overlay(covered_combo_text, &[dropdown]));
-        assert!(!text_covered_by_overlay(clear_combo_text, &[dropdown]));
-        assert!(!text_covered_by_overlay(covered_combo_text, &[]));
-    }
 
     /// `0x105` hides a text an open list touches; that is exact only while
     /// every list ends in the gap between rows.

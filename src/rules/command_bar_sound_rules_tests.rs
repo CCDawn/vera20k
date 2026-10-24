@@ -1,5 +1,5 @@
 //! Command-bar Rules references through the existing pass and fixed-catalog owners.
-//! Original gamemd SHA2561cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c:
+//! Original gamemd:
 //! constructor665892/665898=-1; AudioVisual669423..6694B6 reads GUIOpenSound
 //! then GUICloseSound with ReadString128/VocFind7514D0/current-ID retention.
 //! SidebarInput6D091A/6D0860 consumes them separately from shell combo cues.
@@ -223,6 +223,24 @@ fn lan_player_left_uses_fixed_catalog_and_retains_failed_later_reads() {
         rules.bind_type_sound_references(processed.ini(), &sounds);
         assert_eq!(rules.general.player_left_sound(), expected, "{text:?}");
     }
+}
+
+#[test]
+fn retail_startup_rules_bind_the_main_menu_options_changed_cue() {
+    // Rules+6B4 (66A868..66A8AE) from the shell's startup rules: RULESMD
+    // [AudioVisual] OptionsChanged=OptionsChanged, bound in SOUNDMD.
+    let Some((_, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+        return;
+    };
+    assert_eq!(GeneralRules::default().options_changed_sound(), None);
+    let owner = crate::rules::retail_ini_fixture::retail_rules_owner(&assets);
+    let processed = owner.startup_compatibility_projection().unwrap();
+    let mut rules = RuleSet::from_processed_rules(&processed).unwrap();
+    owner.bind_type_audio_references(&mut rules, &processed);
+    assert_eq!(
+        rules.general.options_changed_sound(),
+        Some("OptionsChanged")
+    );
 }
 
 #[test]
@@ -521,4 +539,18 @@ fn physical_command_bar_sounds_use_current_battle_rules_and_fixed_sound_catalog(
             ((0, 0), (0, 0), 0)
         );
     }
+}
+
+#[test]
+fn retail_battle_place_beacon_sound_binds_through_the_audio_visual_pass() {
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    // Constructor6658E6 starts Rules+1CC at -1; AudioVisual669BA8 reads the
+    // physical RULESMD value and no later Battle/map pass overrides it.
+    assert_eq!(GeneralRules::default().place_beacon_sound, None);
+    assert_eq!(
+        retail.rules.general.place_beacon_sound.as_deref(),
+        Some("BeaconPlaced")
+    );
 }

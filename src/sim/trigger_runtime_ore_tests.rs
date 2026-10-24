@@ -1,4 +1,4 @@
-//! Steam gamemd.exe3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600:
+//! Steam gamemd.exe:
 //! seven original59/57B790 executions observed109 ordered480A80(centre,1)
 //! sinks (real/Dummy, signed extremes, primary versus tail waypoint).
 //! Thirteen original86 controls pin the raw low-byte store. They do not
@@ -40,7 +40,7 @@ fn run(
             input: TagEventInput::default(),
         },
         &mut Vec::new(),
-        rules,
+        rules.unwrap_or(crate::rules::ruleset::RuleSet::empty_for_test()),
         registry,
         FrameEffects::default(),
     )
@@ -309,10 +309,10 @@ fn counted_tag_pauses_drivers_preserves_saved_gate_and_reenables_due_timers() {
         None,
         None,
     );
-    sim.classify_map_triggers(None);
+    sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
     waypoints(&mut sim, &[(0, (8, 9)), (1, (8, 8))]);
     sim.session.publish_started();
-    sim.advance_triggers(Some(&rules), Some(registry), FrameEffects::default());
+    sim.advance_triggers(&rules, Some(registry), FrameEffects::default());
     assert!(!sim.ore_growth_config.grows());
     assert!(sim.trigger_runtime.logic_tags.is_empty());
     assert!(
@@ -331,7 +331,7 @@ fn counted_tag_pauses_drivers_preserves_saved_gate_and_reenables_due_timers() {
     let frame = sim
         .advance_app_frame(
             &[],
-            Some(&rules),
+            &rules,
             Some(registry),
             67,
             TickLane::Ordinary,
@@ -363,7 +363,7 @@ fn counted_tag_pauses_drivers_preserves_saved_gate_and_reenables_due_timers() {
     let frame = restored
         .advance_app_frame(
             &[],
-            Some(&rules),
+            &rules,
             Some(registry),
             134,
             TickLane::Ordinary,

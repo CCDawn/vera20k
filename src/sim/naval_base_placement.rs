@@ -29,9 +29,9 @@ pub(crate) fn find_naval_base_placement(
     // the first pointer. Keep the two calls independent even though ordinary
     // immutable Rules yield the same type both times.
     let width_type = first_buildable_shipyard(rules, sim, house)?;
-    let width = crate::rules::foundation::foundation_dimensions(&width_type.foundation).0;
+    let width = width_type.foundation.dimensions().0;
     let height_type = first_buildable_shipyard(rules, sim, house)?;
-    let height = crate::rules::foundation::foundation_dimensions(&height_type.foundation).1;
+    let height = height_type.foundation.dimensions().1;
 
     // The native fallback is literal `(0,0)` and reaches normal FNPC/MapClass
     // admission rather than becoming an early Rust-side failure.
@@ -140,7 +140,8 @@ mod tests {
     #[test]
     fn raw_ground_occupation_in_the_yard_rect_moves_the_site() {
         let ini = IniFile::from_str(
-            "[Countries]\n0=Americans\n1=Russians\n[General]\nShipyard=GAYARD\n\
+            "[Countries]\n0=Americans\n1=Russians\n[Russians]\nParentCountry=Russians\n\
+             [General]\nShipyard=GAYARD\n\
              [BuildingTypes]\n0=GAYARD\n[GAYARD]\nOwner=Russians\nNaval=yes\n\
              [Water]\nFloat=100%\n",
         );

@@ -41,7 +41,7 @@ impl MindScene {
         assert_eq!(rules.bridge_warheads.c4_name, "Super");
         let super_wh = rules.warhead(&rules.bridge_warheads.c4_name).unwrap();
         assert_eq!(
-            super_wh.verses_f64[crate::sim::combat::armor_index(&object.armor)],
+            f64::from_bits(super_wh.interaction(object.armor_id()).multiplier().bits()),
             1.0
         );
         let spark = rules.combat_damage.default_spark_system.as_deref().unwrap();
@@ -99,8 +99,11 @@ impl MindScene {
             let actor = sim.entities().get(id).unwrap();
             sim.fog
                 .mark_visible_for_owner(owner, actor.position.rx(), actor.position.ry());
+            // The human owner sends the computer tanks' Guard too: the DoList skips computer
+            // Houses' events (0x0064C4FB..0x0064C50D), and MegaMission never compares sender and
+            // actor (0x004C71F6..0x004C721F).
             sim.queue_command(CommandEnvelope::new(
-                enemy,
+                owner,
                 1,
                 Command::Guard {
                     entity_id: id,
@@ -153,7 +156,7 @@ impl MindScene {
             .sim
             .advance_app_frame(
                 &commands,
-                Some(&self.rules),
+                &self.rules,
                 None,
                 33,
                 TickLane::Ordinary,

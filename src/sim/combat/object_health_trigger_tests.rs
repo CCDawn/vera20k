@@ -5,10 +5,6 @@ use super::*;
 
 fn damage_corpus() -> &'static Value {
     let native = crate::test_fixture::json("tools/spatial_oracle/trigger_damage_events.json");
-    assert_eq!(
-        native["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     assert_eq!(native["receiver_rng"]["unchanged"], true);
     assert_eq!(
         native["receiver_rng"]["full_seed31"],

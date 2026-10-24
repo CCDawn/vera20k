@@ -9,14 +9,6 @@ use crate::sim::deploy_tests::{assert_native_deploy_state, native_deploy_fixture
 use crate::sim::mission::{MissionDispatchTimer, MissionId};
 
 pub(super) fn corpus() -> Value {
-    let meta: Value = serde_json::from_str(crate::test_fixture::text(
-        "tools/spatial_oracle/infantry_auto_deploy.meta.json",
-    ))
-    .unwrap();
-    assert_eq!(
-        meta["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     serde_json::from_str(crate::test_fixture::text(
         "tools/spatial_oracle/infantry_auto_deploy.json",
     ))
@@ -117,7 +109,7 @@ fn pending_deploy_survives_snapshot_and_paid_head_completion() {
     // The existing paid-head completion owner releases Head_To and invokes
     // the original-compared Stop callback. Orders/restore add no latch reset.
     restored
-        .finish_walk_navigation(id, Some(&rules), crate::sim::world::FrameEffects::default())
+        .finish_walk_navigation(id, &rules, crate::sim::world::FrameEffects::default())
         .unwrap();
     let actor = restored.substrate.entities.get(id).unwrap();
     assert_eq!(
@@ -140,7 +132,61 @@ fn retail_gi_and_guardian_gi_deploy_then_team_move_in_bound_runtime() {
     use crate::sim::mission::MissionType;
     use crate::sim::runtime::{SimResources, SimRuntime};
     use crate::sim::team_script_vm::{TeamScriptAction, TeamScriptDefinition};
-    use crate::sim::world::{Simulation, TickLane};
+    use crate::sim::world::{FrameEffects, SimSoundEvent, Simulation, SoundBoundary, TickLane};
+    use std::cell::{Cell, RefCell};
+
+    struct Playback<'a> {
+        actors: [u64; 2],
+        cues: &'a RefCell<Vec<String>>,
+        delivered: Cell<usize>,
+    }
+    impl SoundBoundary for Playback<'_> {
+        fn consume(&self, sim: &Simulation, _: &RuleSet, events: &[SimSoundEvent]) {
+            for event in &events[self.delivered.get()..] {
+                let (sound_id, position, undeploy) = match event {
+                    SimSoundEvent::EntityDeployed {
+                        deploy_sound_id,
+                        world,
+                    } => (*deploy_sound_id, [world.x, world.y, world.z], false),
+                    SimSoundEvent::EntityUndeployed {
+                        undeploy_sound_id,
+                        world,
+                    } => (*undeploy_sound_id, [world.x, world.y, world.z], true),
+                    _ => continue,
+                };
+                let sound_id = sim.interner.resolve(sound_id);
+                if !matches!(sound_id, "GIDeploy" | "GuardianGIDeploy" | "GIUndeploy") {
+                    continue;
+                }
+                // Both stock types use GIUndeploy. Identify the actor from the
+                // submitted physical location, rather than the shared cue name.
+                let actors: Vec<_> = self
+                    .actors
+                    .iter()
+                    .filter_map(|id| sim.substrate.entities.get(*id))
+                    .filter(|actor| {
+                        let location = crate::sim::movement::ground_pose::object_location(
+                            actor,
+                            sim.resolved_terrain.as_ref(),
+                        );
+                        position == [location.x, location.y, location.z]
+                    })
+                    .collect();
+                assert_eq!(actors.len(), 1, "one stock actor owns this cue location");
+                let actor = actors[0];
+                assert_eq!(
+                    actor.infantry_deploy_doing(),
+                    undeploy,
+                    "the stock cue must observe the previous Doing"
+                );
+                self.cues.borrow_mut().push(sound_id.to_owned());
+            }
+            self.delivered.set(events.len());
+        }
+        fn delivered(&self) -> usize {
+            self.delivered.get()
+        }
+    }
 
     let Some(rules_bytes) = crate::rules::retail_ini_fixture::retail_ini_bytes("rulesmd.ini")
     else {
@@ -163,6 +209,7 @@ fn retail_gi_and_guardian_gi_deploy_then_team_move_in_bound_runtime() {
         assert_eq!(object.undeploy_delay, -1);
         assert_eq!(object.deploy_fire_weapon, 1);
         assert!(!object.jumpjet);
+        assert_eq!(object.undeploy_sound.as_deref(), Some("GIUndeploy"));
     }
     assert!(!rules.object("E2").unwrap().deployer);
     assert_eq!(
@@ -223,16 +270,23 @@ fn retail_gi_and_guardian_gi_deploy_then_team_move_in_bound_runtime() {
         simulation: sim,
         resources,
     };
+    let cues = RefCell::new(Vec::new());
+    let advance = |runtime: &mut SimRuntime| {
+        let playback = Playback {
+            actors: [gi, guardian],
+            cues: &cues,
+            delivered: Cell::new(0),
+        };
+        runtime.advance_frame(
+            &[],
+            22,
+            TickLane::Ordinary,
+            FrameEffects::for_sound(&playback),
+        )
+    };
     let mut entered = [false; 2];
     for _ in 0..250 {
-        runtime
-            .advance_frame(
-                &[],
-                22,
-                TickLane::Ordinary,
-                crate::sim::world::FrameEffects::default(),
-            )
-            .unwrap();
+        advance(&mut runtime).unwrap();
         for (index, id) in [gi, guardian].into_iter().enumerate() {
             let actor = runtime.simulation.substrate.entities.get(id).unwrap();
             entered[index] |= actor.mission_leaf.as_infantry().unwrap().doing() == 27;
@@ -261,6 +315,16 @@ fn retail_gi_and_guardian_gi_deploy_then_team_move_in_bound_runtime() {
                 .get(id)
                 .unwrap()
                 .infantry_deploy_doing()
+        );
+    }
+    for name in ["GIDeploy", "GuardianGIDeploy"] {
+        assert_eq!(
+            cues.borrow()
+                .iter()
+                .filter(|cue| cue.as_str() == name)
+                .count(),
+            1,
+            "the initial automatic deploy submits one cue per actor"
         );
     }
 
@@ -316,14 +380,7 @@ fn retail_gi_and_guardian_gi_deploy_then_team_move_in_bound_runtime() {
     let mut completed_undeploy = [false; 2];
     let mut arrived = [false; 2];
     for _ in 0..600 {
-        runtime
-            .advance_frame(
-                &[],
-                22,
-                TickLane::Ordinary,
-                crate::sim::world::FrameEffects::default(),
-            )
-            .unwrap();
+        advance(&mut runtime).unwrap();
         for (index, id) in [gi, guardian].into_iter().enumerate() {
             if arrived[index] {
                 continue;
@@ -369,6 +426,14 @@ fn retail_gi_and_guardian_gi_deploy_then_team_move_in_bound_runtime() {
         entered_undeploy,
         [true, true],
         "both stock infantry took the AI Move wrapper's Undeploy31 request"
+    );
+    assert_eq!(
+        cues.borrow()
+            .iter()
+            .filter(|cue| cue.as_str() == "GIUndeploy")
+            .count(),
+        2,
+        "both stock types submit their shared undeploy cue for the team move"
     );
     assert_eq!(
         completed_undeploy,

@@ -12,9 +12,12 @@
 //!
 //! 1. Radius. `TechnoClass::Threat_Range @ 0x00707E60` (vtable `+0x31C`) turns
 //!    the mission's mask into a lepton radius — that part lives in
-//!    [`super::threat_range`]. A zero radius means "no cutoff of the scan's
-//!    own", and the *walk* is then bounded by
-//!    `wider weapon range + 1 + AirRangeBonus` cells (`0x006F90C8..0x006F9148`).
+//!    [`super::threat_range`]; a healer on Guard takes 0x200 instead
+//!    (`0x006F9024..0x006F903E`). A zero radius means "no cutoff of the scan's
+//!    own". The walk then uses the current weapon's range for a
+//!    non-Gattling turreted type, GuardRange for an underwater, organic,
+//!    self-healing type, or the wider of weapon slots 0/1 otherwise. It adds
+//!    one cell and AirRangeBonus (`0x006F9068..0x006F9148`).
 //! 2. Airborne pre-pass. A mask with the AA bit (`4`) sweeps the airborne
 //!    bucket grid first (`0x006F91A7`), evaluating **every** airborne object in
 //!    reach — aircraft and jumpjets — with the Unit and Infantry class bits
@@ -92,8 +95,7 @@ use super::combat_weapon::{
     resolve_weapon_index, techno_target_facts, weapon_damage_value, what_weapon_should_i_use,
 };
 use super::threat_mask::{self, InfantryScanner};
-use super::threat_range::{ScanRange, max_weapon_range, scan_range};
-use super::{armor_index, is_within_range_leptons, lepton_distance_sq_raw};
+use super::threat_range::{ScanRange, scan_range};
 use crate::map::cell_index::{NativeCellIdentity, square_ring_cells};
 use crate::map::entities::EntityCategory;
 use crate::map::houses::HouseAllianceMap;
@@ -168,11 +170,6 @@ impl RetargetAfterStop {
     }
 }
 
-/// `TechnoClass::Evaluate_Candidate @ 0x006F7D1F`'s Verses floor, `DAT_007F4E38`
-/// — a `float` `0.02` widened to double, so the comparison is against
-/// `0.019999999552965164` and an authored `Verses=2%` (exactly `0.02` as a
-/// double) is *above* it and passes.
-pub(crate) const VERSES_FLOOR: f64 = 0.02f32 as f64;
 /// The five weights of `TechnoClass::Calculate_Threat_Score @ 0x0070CD10`, in
 /// the order the native body loads them.
 #[derive(Debug, Clone, Copy)]
@@ -449,8 +446,12 @@ fn threat_score(
         entities,
         interner,
     ) {
-        let verses =
-            load_threat_double(selected.warhead.verses_f64[armor_index(&scorer_type.armor)]);
+        let verses = ScoreX87::load_f64(
+            selected
+                .warhead
+                .interaction(scorer_type.armor_id())
+                .multiplier(),
+        );
         let mut term = ScoreX87::mul(coeff_b, verses);
         if candidate
             .attack_target
@@ -473,8 +474,12 @@ fn threat_score(
     // A: the scorer's selected weapon against the candidate, retained for the
     // native range term below.
     if let Some(selected) = scorer_weapon {
-        let verses =
-            load_threat_double(selected.warhead.verses_f64[armor_index(&candidate_type.armor)]);
+        let verses = ScoreX87::load_f64(
+            selected
+                .warhead
+                .interaction(candidate_type.armor_id())
+                .multiplier(),
+        );
         score = spill_threat_double(ScoreX87::add(ScoreX87::mul(coeff_a, verses), score));
     }
 
@@ -578,27 +583,25 @@ fn is_early_return_ring(ring: i32, radius: i32) -> bool {
 
 /// Walk bound in cells, `iStack_34` in `Greatest_Threat`.
 ///
-/// A non-zero `Threat_Range` result is itself the bound, truncated to cells
-/// toward zero (`0x006F9042..0x006F904D`). A zero
-/// one — plain Guard on a type with no `GuardRange=` — bounds the walk at
-/// `wider weapon range + 1 + AirRangeBonus` cells instead, which is a SEARCH
-/// bound, deliberately wider than the acceptance the candidate gate applies.
+/// A non-zero radius (`Threat_Range`'s, or a Guard healer's 0x200) is itself
+/// the bound, truncated to cells toward zero (`0x006F9042..0x006F904D`). A zero
+/// one — plain Guard on a type with no `GuardRange=` — selects a range:
+/// `GetWeaponRange(CurrentWeaponNumber)` for a non-Gattling type with
+/// `TurretCount > 0` (`0x006F9068..0x006F908E`), else `GuardRange` for an
+/// underwater, organic, self-healing type (`0x006F9090..0x006F90DC`), else
+/// the wider range of weapon slots 0/1. The selected range and AirRangeBonus
+/// each truncate to cells toward zero, then the bound adds both and one cell.
+/// This bounds the SEARCH; the candidate's own InRange still gates acceptance.
 /// An occupied building replaces that prior bound with one ring beyond its
 /// reach (`0x006F917D..0x006F91A7`; tools/garrison_oracle/weapon_range.json).
-///
-/// RESIDUAL: the bound's two other arms are not ported: a turreted type
-/// without `+0xCD5` takes `GetWeaponRange(CurrentWeaponNumber)`
-/// (`0x006F9068..0x006F908E`), and a type with `+0xD69`, `+0xD97` and
-/// `+0xD14` takes `+0x5B8` (`0x006F9090..0x006F90DC`). Trigger: plain Guard
-/// without `GuardRange=` on such a type (an IFV's gunner slot among them).
-/// Effect: the ring walk stops at a different ring. Frequency: every such
-/// scan. Risk: a candidate the native walk reaches is missed, or the reverse.
 fn scan_radius_cells(
     scanner: &GameEntity,
     obj: &ObjectType,
     rules: &RuleSet,
     range: ScanRange,
     weapon_ranges: [i32; 2],
+    entities: &EntityStore,
+    interner: &StringInterner,
 ) -> i32 {
     if is_occupied(scanner, obj) {
         return occupied_reach_cells(obj, rules).wrapping_add(1);
@@ -606,9 +609,24 @@ fn scan_radius_cells(
     match range {
         ScanRange::Hard(leptons) => lepton_to_cell(leptons),
         ScanRange::CanFireAt => {
-            let weapon_cells = max_weapon_range(weapon_ranges).to_num::<i32>();
-            let air_bonus_cells = obj.air_range_bonus.map_or(0, |bonus| bonus.to_num::<i32>());
-            weapon_cells + 1 + air_bonus_cells
+            let leptons = if obj.turret_count > 0 && !obj.is_gattling {
+                super::combat_weapon::weapon_range(
+                    scanner,
+                    obj,
+                    scanner.current_weapon_number(),
+                    entities,
+                    rules,
+                    interner,
+                )
+            } else if obj.underwater && obj.organic && obj.self_healing {
+                obj.guard_range.map_or(0, |range| range.to_bits() >> 8)
+            } else {
+                weapon_ranges[0].max(weapon_ranges[1])
+            };
+            let air_bonus = obj.air_range_bonus.map_or(0, |bonus| bonus.to_bits() >> 8);
+            lepton_to_cell(leptons)
+                .wrapping_add(lepton_to_cell(air_bonus))
+                .wrapping_add(1)
         }
         // Mask 0 computes no walk bound because it runs no walk — the jump at
         // `0x006F8FE2` skips `iStack_34` along with the rings.
@@ -708,8 +726,6 @@ struct ScanContext<'a> {
     /// VERA-only: the draws so far, so side-by-side scoring can tell which
     /// candidate drew ([`flat_scores`]).
     scenario_draws: std::cell::Cell<u32>,
-    /// VERA-only: [`ThreatScanOutcome`]'s `met_idle_disguise`.
-    met_idle_disguise: std::cell::Cell<bool>,
 }
 
 impl ScanContext<'_> {
@@ -964,10 +980,7 @@ impl ScanContext<'_> {
         capture
             || (self.attacker_obj.occupier
                 && self.fire_world.is_some_and(|world| {
-                    let (Some(scanner), Some(cargo)) = (
-                        self.entities.get(self.attacker.stable_id),
-                        candidate.passenger_role.cargo(),
-                    ) else {
+                    let Some(scanner) = self.entities.get(self.attacker.stable_id) else {
                         return false;
                     };
                     crate::sim::passenger::can_dock_occupier_garrison(
@@ -975,7 +988,7 @@ impl ScanContext<'_> {
                         candidate,
                         self.attacker_obj,
                         candidate_obj,
-                        cargo,
+                        candidate.passenger_role.occupants(),
                         self.rules,
                         world,
                     )
@@ -1098,9 +1111,6 @@ pub(crate) struct ThreatScanOutcome {
     /// The Scenario stream after the scan's draws, `None` when it drew
     /// nothing ([`ScanContext::computer_detects_disguise`]).
     scenario_rng: Option<SimRng>,
-    /// The scan refused a disguised candidate only because it was not
-    /// blinking: a blink starting later would have it roll.
-    met_idle_disguise: bool,
 }
 
 impl ThreatScanOutcome {
@@ -1111,16 +1121,6 @@ impl ThreatScanOutcome {
     /// The Scenario stream the scan left, for the caller to commit.
     pub(crate) fn take_scenario_rng(&mut self) -> Option<SimRng> {
         self.scenario_rng.take()
-    }
-
-    /// The scan drew from the Scenario stream.
-    pub(crate) const fn drew_scenario_rng(&self) -> bool {
-        self.scenario_rng.is_some()
-    }
-
-    /// See [`Self::met_idle_disguise`]'s field.
-    pub(crate) const fn met_idle_disguise(&self) -> bool {
-        self.met_idle_disguise
     }
 
     pub(crate) const fn target(&self) -> Option<u64> {
@@ -1250,7 +1250,6 @@ pub(crate) fn greatest_threat(
                 foot_wrapper_entered: false,
                 collected: None,
                 scenario_rng: None,
-                met_idle_disguise: false,
             };
         }
     };
@@ -1259,7 +1258,6 @@ pub(crate) fn greatest_threat(
         foot_wrapper_entered,
         collected,
         scenario_rng: ctx.scenario_rng.take(),
-        met_idle_disguise: ctx.met_idle_disguise.get(),
     };
     // Base GreatestThreat6F8F80..6F8FA5 clears these two lists, retaining
     // history. Class returns before the base must preserve the prior lists.
@@ -1286,7 +1284,14 @@ pub(crate) fn greatest_threat(
     } else {
         [0, 0]
     };
-    let range = scan_range(attacker_obj, mask, weapon_ranges);
+    // `0x006F9024..0x006F903E`: a healer on mission Guard (`+0xAC == 5`).
+    let range = scan_range(
+        attacker_obj,
+        mask,
+        weapon_ranges,
+        healer,
+        scanner.mission.current().known(),
+    );
     let flags = threat_mask::flags_for(mask);
 
     // `TEST AL,0x3 ; JZ 0x006F9B6E @ 0x006F8FE0`: a mask without bit 0 or 1
@@ -1373,14 +1378,21 @@ pub(crate) fn greatest_threat(
         },
         scenario_rng: Default::default(),
         scenario_draws: Default::default(),
-        met_idle_disguise: Default::default(),
     };
 
     if flat {
         return result(global_list_scan(&ctx, flags, scanner_zone), collected, &ctx);
     }
 
-    let radius = scan_radius_cells(scanner, attacker_obj, rules, range, weapon_ranges);
+    let radius = scan_radius_cells(
+        scanner,
+        attacker_obj,
+        rules,
+        range,
+        weapon_ranges,
+        entities,
+        interner,
+    );
     if radius <= 0 {
         // `for (r = 0; r < radius; r++)` never executes.
         return result(None, collected, &ctx);
@@ -1753,9 +1765,9 @@ fn flat_scores(
             let draws = ctx.scenario_draws.get();
             let (score, stamped) = dummy.detached_stamps(|| flat_score(ctx, walk, candidate));
             let drew = ctx.scenario_draws.get() != draws;
-            (score, stamped, drew, ctx.met_idle_disguise.replace(false))
+            (score, stamped, drew)
         });
-        if scored.iter().all(|&(_, stamped, _, _)| !stamped) {
+        if scored.iter().all(|&(_, stamped, _)| !stamped) {
             #[cfg(any(test, feature = "test-support"))]
             FLAT_WALKS_SIDE_BY_SIDE.set(FLAT_WALKS_SIDE_BY_SIDE.get() + 1);
             // Whether a candidate draws does not depend on the stream: the
@@ -1764,10 +1776,7 @@ fn flat_scores(
             return scored
                 .into_iter()
                 .zip(candidates)
-                .map(|((score, _, drew, met_idle_disguise), candidate)| {
-                    if met_idle_disguise {
-                        ctx.met_idle_disguise.set(true);
-                    }
+                .map(|((score, _, drew), candidate)| {
                     if drew {
                         flat_score(ctx, walk, candidate)
                     } else {
@@ -1898,7 +1907,8 @@ fn scan_cell_for_target(
 fn walk_cell_list(ctx: &ScanContext<'_>, rx: u16, ry: u16, layer: MovementLayer) -> Option<u64> {
     let terrain = ctx
         .fire_world
-        .and_then(|world| world.terrain_objects.cell_index().get(&(rx, ry)).copied());
+        .into_iter()
+        .flat_map(|world| world.terrain_objects.members_at((rx, ry)));
     let mut held = None;
     for member in ctx.cells.cell_objects(rx, ry, layer, terrain) {
         let CellObjectMember::Entity(id) = member else {
@@ -2022,7 +2032,9 @@ fn evaluate_candidate(
     // G4 `0x006F7D19..0x006F7D4F`: a scanner with no weapon in the selected
     // slot skips the floor test (`test ebp,ebp ; je 0x6f7d55 @ 0x006F7D1B`).
     if let Some(selected) = &selected
-        && selected.warhead.verses_f64[armor_index(&candidate_obj.armor)] <= VERSES_FLOOR
+        // Ares10054270 replaces only the native numeric floor; a missing
+        // selected weapon still skips this gate as in the original caller.
+        && !selected.warhead.interaction(candidate_obj.armor_id()).can_passively_acquire()
     {
         return None;
     }
@@ -2261,18 +2273,12 @@ fn evaluate_candidate(
                         &ctx.los,
                     )
                 }
-                None => is_within_range_leptons(
-                    lepton_distance_sq_raw(
-                        ctx.attacker.pos_rx,
-                        ctx.attacker.pos_ry,
-                        ctx.attacker.sub_x,
-                        ctx.attacker.sub_y,
-                        candidate.position.rx(),
-                        candidate.position.ry(),
-                        candidate.position.sub_x(),
-                        candidate.position.sub_y(),
-                    ),
-                    selected.weapon.range_leptons,
+                None => super::in_range::mapless_in_range(
+                    ctx.scanner,
+                    super::in_range::MaplessTarget::Techno(candidate),
+                    selected.weapon,
+                    ctx.rules,
+                    ctx.interner,
                 ),
             },
             _ => unarmed_range_ok(),
@@ -2289,11 +2295,9 @@ fn evaluate_candidate(
     }
 
     // The class gate, `0x006F821A..0x006F824A`.
-    if !threat_mask::admits_class(
-        walk.flags,
-        candidate.category(),
-        vehicle_like(ctx, candidate, candidate_obj),
-    ) {
+    if !threat_mask::admits_class(walk.flags, candidate.category(), || {
+        vehicle_like(ctx, candidate, candidate_obj)
+    }) {
         return None;
     }
 
@@ -2346,13 +2350,6 @@ fn evaluate_candidate(
     ) {
         crate::sim::cloak_disguise::DisguiseGateOutcome::Accept => {}
         crate::sim::cloak_disguise::DisguiseGateOutcome::Reject => {
-            if candidate_disguised_to_attacker
-                && !ctx.attacker_obj.detect_disguise
-                && blink == 0
-                && !ctx.standing.human
-            {
-                ctx.met_idle_disguise.set(true);
-            }
             return None;
         }
         crate::sim::cloak_disguise::DisguiseGateOutcome::AiDetectionRoll => {
@@ -2415,9 +2412,9 @@ fn evaluate_candidate(
     // building gate below, including from the human reject (6F85F0..85F6).
     if ctx.standing.team.is_none()
         && ctx.standing.human
+        && !vehicle_like(ctx, candidate, candidate_obj)
         && building
         && !ctx.engineer
-        && !candidate_obj.is_1x1_with_undeploy()
         && (!is_armed(candidate, candidate_obj)
             || super::threat_posed::live_threat_posed(
                 candidate,
@@ -2540,10 +2537,7 @@ fn evaluate_candidate(
             needs_engineer: candidate_obj.needs_engineer,
             factory: candidate_obj.has_factory(),
             can_be_occupied: candidate_obj.can_be_occupied,
-            occupants: candidate
-                .passenger_role
-                .cargo()
-                .map_or(0, |cargo| cargo.count() as i32),
+            occupants: candidate.passenger_role.occupants().count(),
             armed: is_armed(candidate, candidate_obj),
         },
     )?;
@@ -2623,21 +2617,21 @@ fn quarry_terms(mask: u32, score: i32, all_to_hunt: bool, facts: QuarryFacts) ->
     Some(score)
 }
 
-/// The candidate's `vt+0x80`: a 1x1 building with `UndeploysInto=`
-/// (`0x00457620` → `0x00465D40`), an aircraft low enough to count as on the
-/// floor (`0x0041B910` → vt+0x50), or a Unit that is not `NonVehicle=`
-/// (`0x00746400`, UnitType `+0xE1B`). Infantry answer false (`0x004263B0`).
+/// The candidate's `vt+0x80` ([`super::vehicle_like`]), its vt+0x50 asked
+/// through the scan's map.
 fn vehicle_like(ctx: &ScanContext<'_>, candidate: &GameEntity, obj: &ObjectType) -> bool {
-    match candidate.category() {
-        EntityCategory::Structure => obj.is_1x1_with_undeploy(),
-        EntityCategory::Aircraft => crate::sim::movement::air_movement::is_low_flying(
-            candidate,
-            ctx.terrain,
-            Some((ctx.rules, ctx.interner)),
-        ),
-        EntityCategory::Unit => !obj.non_vehicle,
-        EntityCategory::Infantry => false,
-    }
+    super::vehicle_like(
+        candidate.category(),
+        obj.non_vehicle,
+        obj.is_1x1_with_undeploy(),
+        || {
+            crate::sim::movement::air_movement::is_low_flying(
+                candidate,
+                ctx.terrain,
+                Some((ctx.rules, ctx.interner)),
+            )
+        },
+    )
 }
 
 /// EvaluateCandidate6F8682..6F86FE: both complete Map565730 lookups precede
@@ -2698,7 +2692,7 @@ mod tests {
     #[test]
     fn occupied_scan_bound_matches_original_override_slice() {
         super::super::garrison_oracle_tests::for_each_native_case(
-            |case, scanner, object, _, rules, _| {
+            |case, scanner, object, entities, rules, interner| {
                 let previous = case["input"]["previous_ring"].as_i64().unwrap() as i32;
                 assert_eq!(
                     i64::from(scan_radius_cells(
@@ -2707,6 +2701,8 @@ mod tests {
                         rules,
                         ScanRange::Hard(previous * 256),
                         [0, 0],
+                        entities,
+                        interner,
                     )),
                     case["ring_bound_cells"].as_i64().unwrap(),
                     "{}",
@@ -2714,6 +2710,258 @@ mod tests {
                 );
             },
         );
+    }
+
+    /// Executes the bound selected by the native Greatest_Threat interior
+    /// slice, with supplied type/weapon/cargo state. This corpus does not
+    /// execute the later cell walk or the occupied-building override.
+    #[test]
+    fn scan_bound_matches_original_weapon_selection_slice() {
+        use crate::sim::passenger::{PassengerCargo, PassengerRole};
+        use serde_json::Value;
+
+        let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/threat_scan_bound.json",
+        ))
+        .unwrap();
+        let rows = corpus["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 65);
+        // The corpus supplies runtime leptons, not authored INI values.
+        // ReadRange treats exactly -1 cell as "retain default"; a half-lepton
+        // lower value avoids that sentinel and still truncates to raw -256.
+        let cells = |leptons: &Value| {
+            let raw = leptons.as_i64().unwrap();
+            if raw == -256 {
+                -256.5 / 256.0
+            } else {
+                raw as f64 / 256.0
+            }
+        };
+        let enabled = |value: &Value| {
+            value
+                .as_bool()
+                .unwrap_or_else(|| value.as_i64().unwrap() != 0)
+        };
+        for row in rows {
+            let input = &row["input"];
+            let name = input["name"].as_str().unwrap();
+            let mut infantry = String::new();
+            let mut vehicles = String::from("0=TRN\n");
+            let mut sections = String::new();
+            let mut expected_weapon_ranges = Vec::new();
+            let mut weapons = |owner: &str, spec: &Value, turreted: bool| {
+                let mut keys = String::new();
+                for (slot, key) in [
+                    ("slot0", if turreted { "Weapon1" } else { "Primary" }),
+                    ("slot1", if turreted { "Weapon2" } else { "Secondary" }),
+                    ("slot2", "Weapon3"),
+                    (
+                        "elite_slot0",
+                        if turreted {
+                            "EliteWeapon1"
+                        } else {
+                            "ElitePrimary"
+                        },
+                    ),
+                    (
+                        "elite_slot1",
+                        if turreted {
+                            "EliteWeapon2"
+                        } else {
+                            "EliteSecondary"
+                        },
+                    ),
+                    ("elite_slot2", "EliteWeapon3"),
+                ] {
+                    // Non-turreted types expose only Primary/Secondary. Their
+                    // supplied third native slot is deliberately not consulted.
+                    if !turreted && matches!(slot, "slot2" | "elite_slot2") {
+                        continue;
+                    }
+                    if spec[slot].is_number() {
+                        expected_weapon_ranges.push((
+                            format!("{owner}{slot}"),
+                            spec[slot].as_i64().unwrap() as i32,
+                        ));
+                        keys += &format!("{key}={owner}{slot}\n");
+                        sections += &format!(
+                            "[{owner}{slot}]\nDamage=10\nWarhead=WH\nRange={}\n",
+                            cells(&spec[slot]),
+                        );
+                    }
+                }
+                keys
+            };
+            let turret_count = input["turret_count"].as_i64().unwrap();
+            let transport_weapons = weapons("TRN", &input["weapons"], turret_count > 0);
+            let open_topped = enabled(&input["open_topped"]);
+            let mut types = format!(
+                "[TRN]\nStrength=100\nTurretCount={turret_count}\nWeaponCount=3\n\
+                 OpenTopped={open_topped}\nIsGattling={}\nUnderwater={}\nOrganic={}\n\
+                 SelfHealing={}\nGuardRange={}\nAirRangeBonus={}\n{transport_weapons}",
+                enabled(&input["is_gattling"]),
+                enabled(&input["underwater"]),
+                enabled(&input["organic"]),
+                enabled(&input["self_healing"]),
+                cells(&input["guard_range"]),
+                cells(&input["air_range_bonus"]),
+            );
+            let riders = input["passengers"].as_array().unwrap();
+            for (index, rider) in riders.iter().enumerate() {
+                let kind = format!("P{index}");
+                let turret_count = rider["turret_count"].as_i64().unwrap();
+                let keys = weapons(&kind, rider, turret_count > 0);
+                if rider["class"] == "unit" {
+                    vehicles += &format!("{}={kind}\n", index + 1);
+                } else {
+                    infantry += &format!("{index}={kind}\n");
+                }
+                types += &format!(
+                    "[{kind}]\nStrength=100\nTurretCount={turret_count}\nWeaponCount=3\n{keys}"
+                );
+            }
+            let rules = RuleSet::from_ini(&IniFile::from_str(&format!(
+                "[InfantryTypes]\n{infantry}[VehicleTypes]\n{vehicles}{types}{sections}\
+                 [WH]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n"
+            )))
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            for (weapon, expected) in expected_weapon_ranges {
+                assert_eq!(
+                    rules
+                        .weapon(&weapon)
+                        .unwrap_or_else(|| panic!("{name}: missing supplied weapon {weapon}"))
+                        .range_leptons,
+                    expected,
+                    "{name}: supplied {weapon} runtime range",
+                );
+            }
+            let object = rules.object("TRN").unwrap();
+            for (field, parsed) in [
+                ("guard_range", object.guard_range),
+                ("air_range_bonus", object.air_range_bonus),
+            ] {
+                assert_eq!(
+                    parsed.map_or(0, |range| range.to_bits() >> 8),
+                    input[field].as_i64().unwrap() as i32,
+                    "{name}: supplied {field} runtime range",
+                );
+            }
+            let configure = |entity: &mut GameEntity, spec: &Value| {
+                entity
+                    .veterancy
+                    .set_rank_for_test((spec["veterancy"].as_f64().unwrap() * 100.0) as u16);
+                entity.set_gunner_selection_for_test(
+                    spec["current_weapon"].as_i64().unwrap() as i32,
+                    -1,
+                );
+            };
+            let mut entities = EntityStore::new();
+            let mut cargo = PassengerCargo::new(5, 100.0);
+            for (index, rider) in riders.iter().enumerate().rev() {
+                let id = 10 + index as u64;
+                let category = if rider["class"] == "unit" {
+                    EntityCategory::Unit
+                } else {
+                    EntityCategory::Infantry
+                };
+                let mut passenger = GameEntity::test_default_of_category(
+                    id,
+                    &format!("P{index}"),
+                    "Test",
+                    0,
+                    0,
+                    category,
+                );
+                configure(&mut passenger, rider);
+                passenger.passenger_role = PassengerRole::inside_for_test(1, open_topped);
+                entities.insert(passenger);
+                cargo.board_forced_chain(&[(id, 1.0)]);
+            }
+            let mut scanner = GameEntity::test_default(1, "TRN", "Test", 0, 0);
+            configure(&mut scanner, input);
+            scanner.passenger_role = PassengerRole::transport(cargo);
+            let interner = test_interner();
+            let ranges = std::array::from_fn(|index| {
+                super::super::combat_weapon::weapon_range(
+                    &scanner,
+                    object,
+                    index as i32,
+                    &entities,
+                    &rules,
+                    &interner,
+                )
+            });
+            let range = match input["threat_range"].as_i64().unwrap() {
+                0 => ScanRange::CanFireAt,
+                leptons => ScanRange::Hard(leptons as i32),
+            };
+            assert_eq!(
+                i64::from(scan_radius_cells(
+                    &scanner, object, &rules, range, ranges, &entities, &interner,
+                )),
+                row["ring_bound_cells"].as_i64().unwrap(),
+                "{name}",
+            );
+        }
+    }
+
+    /// Supplied gunner state through SetGunnerWeapon, then the production
+    /// Guard scanner: a slot beyond 0/1 can reach a target their ring bound
+    /// would never visit. Candidate acceptance still uses the selected weapon.
+    #[test]
+    fn guarding_ifv_scans_to_its_selected_gunners_range() {
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[VehicleTypes]\n0=FV\n1=TARGET\n\
+             [FV]\nStrength=200\nArmor=light\nTurretCount=4\nWeaponCount=3\n\
+             Weapon1=SHORT\nWeapon2=MEDIUM\nWeapon3=LONG\n\
+             [TARGET]\nStrength=200\nArmor=heavy\nPrimary=SHORT\nThreatPosed=10\n\
+             [WeaponTypes]\n0=SHORT\n1=MEDIUM\n2=LONG\n\
+             [SHORT]\nRange=4\nDamage=10\nROF=20\nProjectile=SHOT\nWarhead=AP\n\
+             [MEDIUM]\nRange=6\nDamage=10\nROF=20\nProjectile=SHOT\nWarhead=AP\n\
+             [LONG]\nRange=12\nDamage=10\nROF=20\nProjectile=SHOT\nWarhead=AP\n\
+             [SHOT]\nInviso=yes\nAG=yes\nAA=no\n\
+             [AP]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
+        ))
+        .unwrap();
+        let object = rules.object("FV").unwrap();
+        assert!(object.guard_range.is_none());
+        for (slot, distance, expected) in [(2, 9, true), (0, 9, false), (2, 13, false)] {
+            let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 17);
+            sim.intern_rule_type_ids(&rules);
+            sim.resolve_type_handles(&rules);
+            let ifv = sim
+                .spawn_object("FV", "Americans", 10, 16, 0, &rules)
+                .unwrap();
+            let target = sim
+                .spawn_object("TARGET", "Russians", 10 + distance, 16, 0, &rules)
+                .unwrap();
+            sim.substrate
+                .entities
+                .get_mut(ifv)
+                .unwrap()
+                .set_gunner_weapon(slot, object);
+            let pick = sim.greatest_threat_represented(
+                &rules,
+                None,
+                ifv,
+                super::super::ScanMission::Guard,
+                None,
+            );
+            assert_eq!(
+                pick,
+                expected.then_some(target),
+                "gunner slot {slot}, target {distance} cells away",
+            );
+            assert_eq!(
+                sim.substrate
+                    .entities
+                    .get(ifv)
+                    .unwrap()
+                    .current_weapon_number(),
+                slot,
+                "the scan only reads gunner selection",
+            );
+        }
     }
 
     #[test]
@@ -2860,3 +3108,7 @@ mod disguise_tests;
 #[cfg(test)]
 #[path = "greatest_threat_unarmed_tests.rs"]
 mod unarmed_tests;
+
+#[cfg(test)]
+#[path = "greatest_threat_healer_guard_tests.rs"]
+mod healer_guard_tests;

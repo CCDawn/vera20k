@@ -82,6 +82,7 @@ pub(crate) fn native_in_game_shell_active(state: &AppState) -> bool {
                 | crate::ui::pause_menu::InGameMenuState::Options
                 | crate::ui::pause_menu::InGameMenuState::SavedGame(_)
                 | crate::ui::pause_menu::InGameMenuState::Diplomacy
+                | crate::ui::pause_menu::InGameMenuState::MissionBriefing
         )
         && (matches!(
             state.match_state.match_presentation.in_game_menu,
@@ -310,6 +311,9 @@ pub(super) enum ShellFrameCursor {
 
 #[derive(Default)]
 pub(super) struct ShellFrameOverlay {
+    /// A dialog background from the score art's atlas (`SCRBK` under
+    /// BC6), drawn before the parent art.
+    pub score_backdrop: Option<SpriteInstance>,
     /// Shared ProgressScreen atlas draws, retained by the frontend owner.
     pub progress_meter: Vec<SpriteInstance>,
     /// Map thumbnail from the shared preview cache, below ordinary controls.
@@ -397,6 +401,10 @@ pub(super) fn render_shell_frame(
         1.0,
         crate::render::batch::DepthAxis::NONE,
     );
+    let backdrop_buffer = overlay
+        .score_backdrop
+        .as_ref()
+        .and_then(|instance| batch.create_instance_buffer(gpu, &[*instance]));
     let background_buffer = batch.create_instance_buffer(gpu, &instances);
     let control_buffer = batch.create_instance_buffer(gpu, &controls);
     let preview_buffer = overlay
@@ -446,6 +454,11 @@ pub(super) fn render_shell_frame(
     // Both targets are at least frame-sized (the presenter's is the
     // window's); the frame is their top-left corner.
     pass.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
+    if let (Some((buffer, count)), Some(art)) =
+        (&backdrop_buffer, state.frontend.campaign_score_art.as_ref())
+    {
+        batch.draw_with_buffer_passthrough(&mut pass, &art.texture, buffer, *count);
+    }
     if let (Some((buffer, count)), Some(background_texture)) =
         (&background_buffer, background_texture)
     {

@@ -103,11 +103,32 @@
 //! - rules/ does NOT depend on (outside tests): sim/, render/, ui/, audio/, net/
 
 pub mod airstrike;
+pub mod phobos_radiation;
+pub mod phobos_shields;
+/// Whether this binary includes the supported Ares extensions. INIs cannot change it.
+pub const ARES_ENABLED: bool = cfg!(feature = "ares");
+/// Whether this binary includes the supported Phobos extensions. INIs cannot change it.
+pub const PHOBOS_ENABLED: bool = cfg!(feature = "phobos");
+/// Whether this binary includes NPatch-specific behavior. A placeholder: no
+/// chain reads it yet, and builds without the feature keep every stock path.
+pub const NPATCH_ENABLED: bool = cfg!(feature = "npatch");
+pub(crate) mod ares_prerequisites;
+pub(crate) mod ares_armor;
+pub(crate) mod ares_emp;
+pub(crate) mod ares_warhead;
+pub mod armor;
+pub mod alpha_image_assets;
+pub mod country_loading;
+#[cfg(test)]
+mod ares_manual_control_tests;
+pub mod compatibility;
 pub mod animation_sequence;
 pub mod art_data;
 pub mod bridge_warheads;
+pub mod building_extra_power;
 pub mod building_light;
 pub mod building_rubble;
+pub mod building_upgrade;
 pub mod buildup_asset_catalog;
 pub mod campaign_loading;
 #[cfg(test)]
@@ -117,6 +138,10 @@ pub mod color_add;
 pub mod color_scheme;
 pub mod combat_damage;
 pub mod crate_rules;
+#[cfg(test)]
+mod country_parent_tests;
+#[cfg(test)]
+mod country_veterancy_tests;
 pub mod effect_asset_catalog;
 pub mod error;
 pub mod flh;
@@ -135,11 +160,14 @@ pub mod mind_control_rules;
 pub mod missile_spawn;
 pub mod mission_data;
 pub mod movies;
+pub mod native_ini_hash;
 pub mod native_processing;
 pub mod object_type;
+pub mod object_image;
 pub mod overlay_types;
 pub mod particle_system_type;
 pub mod particle_type;
+pub mod personal_rules;
 pub mod powerups;
 pub mod prerequisite;
 pub mod process_owner;
@@ -166,7 +194,7 @@ pub mod voxel_anim_type;
 pub mod voxel_asset_catalog;
 pub mod voxel_frame_catalog;
 pub mod warhead_type;
-#[cfg(test)]
+#[cfg(all(test, not(feature = "ares")))]
 mod warhead_verses_tests;
 pub mod weapon_type;
 

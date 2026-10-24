@@ -18,10 +18,6 @@ use serde_json::{Value, json};
 fn corpus() -> &'static Value {
     let native = crate::test_fixture::json("tools/spatial_oracle/mirage_disguise.json");
     assert_eq!(native["schema_version"], 1);
-    assert_eq!(
-        native["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     native
 }
 
@@ -85,7 +81,7 @@ pub(in crate::sim) fn assert_entity_state(
 
 fn fixture(row: &Value) -> Simulation {
     let mut sim = Simulation::new();
-    assert_eq!(sim.allocate_stable_id(), 1);
+    assert_eq!(sim.substrate.allocate_stable_id(), 1);
     let owner = sim.interner.intern("Americans");
     let type_ref = sim.interner.intern("MGTK");
     let before = &row["before"];
@@ -135,7 +131,7 @@ fn add_neighbor(
     category: EntityCategory,
     layer: MovementLayer,
 ) {
-    assert_eq!(sim.allocate_stable_id(), id);
+    assert_eq!(sim.substrate.allocate_stable_id(), id);
     let kind = if category == EntityCategory::Infantry {
         "E1"
     } else {

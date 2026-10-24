@@ -149,6 +149,52 @@ impl MixData {
     }
 }
 
+/// A file's bytes holding a share of their storage instead of a borrow of the
+/// archive, so a reader on another thread can keep reading them (a theme song
+/// streamed by the audio device) without a copy.
+#[derive(Clone)]
+pub struct SharedBytes(MixData);
+
+impl From<Arc<[u8]>> for SharedBytes {
+    fn from(bytes: Arc<[u8]>) -> Self {
+        let len = bytes.len();
+        Self(MixData {
+            bytes: MixBytes::Owned(bytes),
+            start: 0,
+            len,
+        })
+    }
+}
+
+impl SharedBytes {
+    /// Fault a mapped file's pages in on a short-lived thread, so a reader
+    /// streaming it (a theme song on the audio device) doesn't wait on the
+    /// disk mid-play. `StreamPlayer__PlayFile @ 0x00407B60` likewise buffers
+    /// seconds of file ahead of its decoder. Owned bytes are already in memory.
+    pub fn read_ahead(&self) {
+        if !matches!(self.0.bytes, MixBytes::Mapped(_)) {
+            return;
+        }
+        let bytes = self.clone();
+        // A failed spawn only loses the warm-up; the reader still faults pages
+        // in itself.
+        let _ = std::thread::Builder::new()
+            .name("asset-read-ahead".into())
+            .spawn(move || {
+                let touched = bytes.chunks(4096).fold(0u8, |sum, page| sum ^ page[0]);
+                std::hint::black_box(touched);
+            });
+    }
+}
+
+impl std::ops::Deref for SharedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
 impl MixArchive {
     /// Parse a MIX archive from raw bytes.
     ///
@@ -271,6 +317,12 @@ impl MixArchive {
         }
 
         Some(&data[start..end])
+    }
+
+    /// [`Self::get_by_id`] as a share of the archive storage.
+    pub fn get_shared_by_id(&self, id: i32) -> Option<SharedBytes> {
+        let index: usize = self.entries.binary_search_by_key(&id, |e| e.id).ok()?;
+        self.entry_view(&self.entries[index]).map(SharedBytes)
     }
 
     /// Parse a child MIX archive directly from an entry without copying its bytes.

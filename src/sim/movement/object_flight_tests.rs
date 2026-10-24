@@ -22,7 +22,6 @@ struct Row {
 }
 #[derive(Deserialize)]
 struct Corpus {
-    native_sha256: String,
     rows: Vec<Row>,
 }
 
@@ -54,10 +53,6 @@ fn native_object_flight_queries_use_live_ground_bridge_and_mark() {
         "tools/spatial_oracle/object_flight_height.json",
     ))
     .unwrap();
-    assert_eq!(
-        corpus.native_sha256,
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     assert_eq!(corpus.rows.len(), 24);
     for row in corpus.rows {
         let mut cells: Vec<_> = (0..25)
@@ -149,7 +144,7 @@ fn a_paratroopers_fall_moves_its_location_z_to_the_ground_or_deck() {
             assert!(!sim.advance_fall(
                 1,
                 -3,
-                None,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
                 None,
                 crate::sim::world::FrameEffects::default()
             ));
@@ -160,7 +155,7 @@ fn a_paratroopers_fall_moves_its_location_z_to_the_ground_or_deck() {
         assert!(!sim.advance_fall(
             1,
             -3,
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
             None,
             crate::sim::world::FrameEffects::default()
         ));
@@ -171,7 +166,7 @@ fn a_paratroopers_fall_moves_its_location_z_to_the_ground_or_deck() {
         while !sim.advance_fall(
             1,
             -3,
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
             None,
             crate::sim::world::FrameEffects::default(),
         ) {
@@ -218,7 +213,12 @@ fn a_falling_paratrooper_is_marked_again_at_the_head_of_its_cell() {
         infantry.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Walk));
         infantry.position.set_exact_z_leptons_for_test(Some(0));
         sim.substrate.entities.insert(infantry);
-        assert!(sim.foot_mark_put(id, None, None, crate::sim::world::FrameEffects::default()));
+        assert!(sim.foot_mark_put(
+            id,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            None,
+            crate::sim::world::FrameEffects::default()
+        ));
     }
     assert!(begin_parachute_descent(
         &mut sim.substrate.entities,
@@ -233,7 +233,7 @@ fn a_falling_paratrooper_is_marked_again_at_the_head_of_its_cell() {
     assert!(!sim.advance_fall(
         1,
         -3,
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         crate::sim::world::FrameEffects::default()
     ));

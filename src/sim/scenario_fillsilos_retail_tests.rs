@@ -66,17 +66,18 @@ fn fresh_fill_silos_credits_reach_a_real_spy_entry() {
         assert_eq!(rules.tiberium_types.types()[0].value, 25);
         let sim = scene.sim();
         let player = sim.session.current_house().unwrap();
-        let computer = sim.scenario_house_named("Computer").unwrap();
+        let computer =
+            crate::sim::world::Simulation::scenario_house_named(&sim.houses, "Computer").unwrap();
         assert_eq!(sim.houses[&computer].tracking().storage_capacity(), 1);
         assert_eq!(sim.houses[&player].tracking().storage_capacity(), 0);
         assert_eq!(
-            crate::sim::house_state::income_ppm_for_owner(
+            crate::sim::house_state::income_mult_for_owner(
                 &sim.houses,
                 &sim.interner,
                 rules,
                 sim.interner.resolve(computer),
             ),
-            1_000_000
+            crate::util::native_x87::NativeF32Bits::ONE
         );
         let target = sim
             .entities()

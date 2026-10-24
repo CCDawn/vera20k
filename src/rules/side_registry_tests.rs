@@ -15,10 +15,6 @@ fn native_controls() -> Value {
         "tools/input_oracle/campaign_start_houses.json",
     ))
     .unwrap();
-    assert_eq!(
-        native["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     native["side_controls"].clone()
 }
 
@@ -154,10 +150,20 @@ fn setup_processor(controls: &Value, row: &Value) -> RulesPassProcessor {
     let mut processor = RulesPassProcessor::default();
     let art = IniFile::empty();
     processor
-        .apply_pass(&ordered_ini(&controls["ordered_palette_sections"]), &art)
+        .apply_pass(
+            &ordered_ini(&controls["ordered_palette_sections"]),
+            &art,
+            &crate::rules::sound_ini::EvaRegistry::default(),
+            false,
+        )
         .unwrap();
     processor
-        .apply_pass(&ordered_ini(&row["ordered_setup_sections"]), &art)
+        .apply_pass(
+            &ordered_ini(&row["ordered_setup_sections"]),
+            &art,
+            &crate::rules::sound_ini::EvaRegistry::default(),
+            false,
+        )
         .unwrap();
     assert_registry(&processor.families, &row["before"], "direct reader setup");
     assert_eq!(

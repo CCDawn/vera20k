@@ -19,12 +19,13 @@
 //!
 //! RESIDUAL: the spin (`0x004CE5A0`). Power_Off (`0x004CFD20`) starts it on
 //! a moving Fly, with two Scenario draws, and then the unpowered fall
-//! (`Simulation::fly_crash_fall`) drops it. Nothing in VERA powers off an
-//! aircraft (native: EMP), so both are dormant.
+//! (`Simulation::fly_crash_fall`) drops it. Both are unreachable natively:
+//! only an EMP powers off an aircraft, and EMPulseClass's constructor
+//! (`0x004C52B0`) has no caller or pointer in the executable (rulesmd's
+//! `[EMPuls]` says it is disabled in code).
 //!
-//! RESIDUAL: Horizontal_Step's deselect (`0x004CF55D..0x004CF5EC`): a
-//! selected aircraft of a house no human controls is deselected (vt+0x150)
-//! over shroud, or fog while fog is on. Selection is the client's.
+//! Horizontal_Step ends by deselecting another house's object over the
+//! player's shroud ([`Simulation::deselect_over_player_shroud`]).
 
 use super::Simulation;
 use crate::map::entities::EntityCategory;
@@ -135,9 +136,9 @@ pub(crate) fn fly_map_edge(
 impl Simulation {
     /// The type's FlightLevel of live object `id`
     /// ([`air_movement::type_flight_level`]).
-    fn fly_type_flight_level(&self, id: u64, rules: Option<&RuleSet>) -> i32 {
+    fn fly_type_flight_level(&self, id: u64, rules: &RuleSet) -> i32 {
         let entity = self.substrate.entities.get(id).expect("Fly owner");
-        air_movement::type_flight_level(entity, rules.map(|rules| (rules, &self.interner)))
+        air_movement::type_flight_level(entity, Some((rules, &self.interner)))
     }
 
     /// One Process visit of a Fly object on the map:
@@ -159,7 +160,7 @@ impl Simulation {
     pub(super) fn fly_process(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> AirMovementTickStats {
@@ -168,7 +169,7 @@ impl Simulation {
         let Some(entity) = self.substrate.entities.get_mut(id) else {
             return stats;
         };
-        air_movement::ensure_fly_secondary_facing(entity);
+        entity.ensure_fly_secondary_facing();
         let living = entity.health.current() > 0;
         let Some(state) = entity
             .locomotor
@@ -179,10 +180,7 @@ impl Simulation {
         };
         state.restore_flight_level(flight_level);
         let in_phase = state.has_phase_callback();
-        if living
-            && !in_phase
-            && rules.is_some_and(|rules| self.mission_ready_to_commence(id, rules))
-        {
+        if living && !in_phase && self.mission_ready_to_commence(id, rules) {
             let _ = self
                 .substrate
                 .mission_commence_exact(id, self.session.binary_frame());
@@ -239,7 +237,7 @@ impl Simulation {
     fn fly_update_flight_motion(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> bool {
@@ -299,7 +297,7 @@ impl Simulation {
     fn fly_flight_step(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) {
@@ -308,7 +306,7 @@ impl Simulation {
         let Some(entity) = self.substrate.entities.get(id) else {
             return;
         };
-        let object = rules.and_then(|rules| self.interner.object_type(entity.type_ref(), rules));
+        let object = self.interner.object_type(entity.type_ref(), rules);
         let dropship = object.is_some_and(|object| object.is_dropship);
         let location = ground_pose::object_location(entity, self.resolved_terrain.as_ref());
         let speed = air_movement::current_fly_speed(
@@ -351,11 +349,8 @@ impl Simulation {
             destination.x.wrapping_sub(placed.x),
             destination.y.wrapping_sub(placed.y),
         );
-        let height = air_movement::update_fly_height(
-            entity,
-            terrain,
-            rules.map(|rules| (rules, &self.interner)),
-        );
+        let height =
+            air_movement::update_fly_height(entity, terrain, Some((rules, &self.interner)));
         if height.descended() {
             Self::fly_landing_drift(
                 &self.interner,
@@ -366,7 +361,7 @@ impl Simulation {
             );
         }
         let terrain = self.resolved_terrain.as_ref();
-        let rules_context = rules.map(|rules| (rules, &self.interner));
+        let rules_context = Some((rules, &self.interner));
         let entity = self.substrate.entities.get_mut(id).unwrap();
         let facts = air_movement::fly_speed_facts(entity, distance, terrain, rules_context);
         if let Some(state) = entity
@@ -464,7 +459,7 @@ impl Simulation {
         substrate: &mut ObjectSubstrate,
         resolved_terrain: &Option<ResolvedTerrainGrid>,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
     ) {
         let Some(entity) = substrate.entities.get(id) else {
             return;
@@ -487,9 +482,7 @@ impl Simulation {
                     NavTargetRef::Object { id } => substrate.entities.get(id),
                 })
                 .filter(|building| building.category() == EntityCategory::Structure)
-                .and_then(|building| {
-                    rules.and_then(|rules| interner.object_type(building.type_ref(), rules))
-                })
+                .and_then(|building| interner.object_type(building.type_ref(), rules))
                 .is_some_and(|object| object.helipad);
         if entering_helipad {
             return;
@@ -577,7 +570,7 @@ impl Simulation {
         id: u64,
         coord: DriveCoord,
         may_slow: bool,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) -> i32 {
@@ -585,10 +578,10 @@ impl Simulation {
         let Some(entity) = self.substrate.entities.get(id) else {
             return 0;
         };
-        let object = rules.and_then(|rules| self.interner.object_type(entity.type_ref(), rules));
+        let object = self.interner.object_type(entity.type_ref(), rules);
         let aircraft = entity.category() == EntityCategory::Aircraft;
         let strafe = aircraft
-            && rules.zip(object).is_some_and(|(rules, object)| {
+            && object.is_some_and(|object| {
                 crate::sim::combat::combat_weapon::aircraft_strafes(
                     rules,
                     object,
@@ -611,19 +604,17 @@ impl Simulation {
         let mut aim = coord;
         if !hunter_seeker && let Some(building) = self.fly_building_at(coord) {
             if entity.radio_contacts.contains(building) {
-                if let Some(dock) = rules.and_then(|rules| {
-                    crate::sim::movement::building_dock_coordinate(
-                        &self.substrate.entities,
-                        building,
-                        Some(id),
-                        self.resolved_terrain.as_ref(),
-                        rules,
-                        &self.interner,
-                    )
-                }) {
+                if let Some(dock) = crate::sim::movement::building_dock_coordinate(
+                    &self.substrate.entities,
+                    building,
+                    Some(id),
+                    self.resolved_terrain.as_ref(),
+                    rules,
+                    &self.interner,
+                ) {
                     aim = dock;
                 }
-            } else if aircraft && let Some(rules) = rules {
+            } else if aircraft {
                 aim = self
                     .aircraft_find_attack_cell(id, Some(NavTargetRef::object(building)), rules)
                     .and_then(|cell| {
@@ -674,7 +665,7 @@ impl Simulation {
                             entity,
                             &self.substrate.entities,
                             frame,
-                            rules.map_or(0, |rules| rules.general.pose_dir),
+                            rules.general.pose_dir,
                         )
                         .wrapping_shl(13)
                     } else {
@@ -719,7 +710,7 @@ impl Simulation {
             entity,
             distance,
             self.resolved_terrain.as_ref(),
-            rules.map(|rules| (rules, &self.interner)),
+            Some((rules, &self.interner)),
         )
         .slow;
         let arrival = !hunter_seeker && air_movement::fly_may_slow(state.landing(), cruise, &slow);
@@ -733,7 +724,7 @@ impl Simulation {
             entity.body_facing.set(primary, frame);
         }
         if let Some(secondary) = secondary {
-            air_movement::ensure_fly_secondary_facing(entity);
+            entity.ensure_fly_secondary_facing();
             if let Some(facing) = entity.barrel_facing.as_mut() {
                 facing.set(secondary, frame);
             }
@@ -750,6 +741,8 @@ impl Simulation {
         if land {
             self.begin_fly_landing(id, rules, registry, frame_effects);
         }
+        // 0x004CF55D..0x004CF5EC: the owner test is 0x0050B6F0.
+        self.deselect_over_player_shroud(id, Self::house_is_human_player);
         distance
     }
 
@@ -776,7 +769,7 @@ impl Simulation {
     fn fly_playfield_latch(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) {

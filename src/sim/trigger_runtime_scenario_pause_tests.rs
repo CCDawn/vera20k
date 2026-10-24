@@ -15,7 +15,7 @@ fn action(sim: &mut Simulation, kind: i32, value: i32) -> Vec<TriggerEffect> {
             input: TagEventInput::default()
         },
         &mut effects,
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
         FrameEffects::default(),
     ));
@@ -142,9 +142,13 @@ fn counted_logic_tag_emits_pause_requests_in_authored_order() {
         None,
         None,
     );
-    sim.classify_map_triggers(None);
+    sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
     sim.session.publish_started();
-    let effects = sim.advance_triggers(None, None, FrameEffects::default());
+    let effects = sim.advance_triggers(
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+        None,
+        FrameEffects::default(),
+    );
     assert_eq!(
         effects,
         [
@@ -173,14 +177,14 @@ fn pause_lock_is_synchronous_and_explicit_unlock_keeps_native_prior_gate() {
     assert!(sim.session.input_locked());
     action(&mut sim, 47, 0);
     assert!(!sim.session.input_locked());
-    sim.expire_scenario_pause();
+    sim.session.expire_scenario_pause();
     assert!(!sim.session.input_locked());
 
     action(&mut sim, 46, 0);
     action(&mut sim, 110, 2);
     action(&mut sim, 47, 0);
     // B054CC=1 skips the restore write; it does not force35A2 back to1.
-    sim.expire_scenario_pause();
+    sim.session.expire_scenario_pause();
     assert!(!sim.session.input_locked());
     assert!(!sim.session.scenario_paused());
 }
@@ -212,7 +216,8 @@ fn chrono_and_timed_trigger_share_one_counter_and_preserve_the_outer_lock() {
     assert!(sim.session.scenario_paused());
     assert!(sim.session.input_locked());
     assert!(
-        sim.expire_scenario_pause()
+        sim.session
+            .expire_scenario_pause()
             .contains(&TriggerEffect::ScenarioResume)
     );
     assert!(!sim.session.scenario_paused());
@@ -233,7 +238,7 @@ fn scenario_services_replay_between_production_frames() {
         let runtime = || {
             let mut sim = Simulation::with_seed(0);
             sim.initialize_trigger_definitions(&map, &Default::default(), None, None);
-            sim.classify_map_triggers(None);
+            sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
             sim.session.publish_started();
             sim.hash_state_every(std::num::NonZeroU64::MIN);
             SimRuntime::from_simulation(sim)

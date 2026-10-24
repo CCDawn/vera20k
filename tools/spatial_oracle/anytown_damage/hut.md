@@ -4,7 +4,7 @@ Six bounded executions of original active-retail `gamemd.exe` cover the two
 authored Anytown huts, (85,58) and (89,51), with a healthy, first-damaged or
 collapsed middle row. The original `anytown_hut.py --write` and a separate `--check` process
 both exited 0. The canonical native payload SHA256 is
-`4b1f825f1300048af10cb3eef0b55e9f5a675d44bb7e49e17b33af9c768b51a3`.
+`51a58c909583e7f362c6237257905df5148b4a850ffb03de4fd411f5230bbaa3`.
 
 This establishes original `574000 → 5749C0 → 575BA0 → 57CCF0` lookup,
 selection, extent, sweep, retries, primitive effects and animation requests for
@@ -38,12 +38,10 @@ and a zeroed TacticalDisplay object are supplied. Original map startup
 `561710/5617A0/5617C0/5617E0`, after the inherited CRT/WinMain FPU setup,
 derives `ABDE88=104`; animation Z is the signed cell level times that value.
 
-The executable SHA256 is
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`.
 Every measured call asserts the entire mapped original `.text` remains SHA256
 `4cd5557a7490debc493ff965afc4483d8d2f1065f434f6b665cbb8fc4835b0cc`.
-No instruction is patched. The metadata pins every imported repository Python
-source; the payload pins all 24 physical input files plus absent LANGRULE.
+No instruction is patched. The payload pins all 24 physical input files plus
+absent LANGRULE.
 
 ## Native outcomes
 
@@ -92,7 +90,7 @@ are not asserted to be a Boolean success contract for `574000` or the walker.
 
 The frozen external `caller_startup.asm` contains original instruction slices,
 without relying on the current Ghidra names. [`hut_callsite_bytes.json`](hut_callsite_bytes.json)
-checks 15 critical call targets directly against the pinned original PE. The concrete caller addresses are **Bomb `438982`**
+checks 15 critical call targets directly against the original PE. The concrete caller addresses are **Bomb `438982`**
 and **Building update `44031B`**, both calling `574000`. The nearby `43896A`
 and `440301` call **wood/low `574C20`**, not the concrete driver.
 
@@ -145,7 +143,7 @@ identity handling. The original unprojected payload hash must match even on
 canonical JSON/gzip; copied `animation_inputs.layers[*].source_lines` become
 hashes, while all native reader results, traces and state remain exact.
 [`hut_receipt.json`](hut_receipt.json) records this promotion's independent
-write/check and its source/artifact identities; the common package validator
+write/check and its artifact identities; the common package validator
 also checks that receipt.
 
 [`hut_test_vectors.json`](hut_test_vectors.json) is the uncompressed Rust test
@@ -162,8 +160,8 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python -m tools.spatial_oracle.anytown_da
 ## Replay
 
 Use the Python/Unicorn environment described in [native_oracle.md](../../native_oracle.md), with
-Unicorn 2.1.4 and liblzo2. From a VERA20k repository containing the pinned shared
-owners, provide the matching original executable and the two separate local
+Unicorn 2.1.4 and liblzo2. From a VERA20k repository checkout, provide the
+original retail executable and the two separate local
 asset directories described by
 [retail_manifest.json](retail_manifest.json). Keep LANGRULE absent.
 No proprietary map, TMP, SHP or INI body is duplicated into this packet.
@@ -178,7 +176,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python -m tools.spatial_oracle.anytown_da
 
 `--check` re-executes all six native cases and compares the complete published
 payload and provenance without writing. `--write` republishes the pinned native
-reference and rejects a changed original payload. Source paths are portable and
-relative to the repository. Every original external packet remains unchanged.
+reference and rejects a changed original payload. Every original external
+packet remains unchanged.
 This is evidence packaging; neither the replay nor the package receipt
 establishes a Rust, production or complete hut-lifecycle comparison.

@@ -73,10 +73,9 @@
 //!   its Chronosphere warp-out (60 frames). Effect: VERA keeps the object
 //!   frozen until the chain lets go; native thaws it once its warp-in ends,
 //!   or when the chain lets go before the warp.
-//! - `Mark(2)` at warp start and release (vtable `+0x124`) and the building's
-//!   animation-slot translucency/fades (`0x004521C0`/`0x00452210`, Anim+119,
-//!   distinct from the power pause at+19E) are presentation; their independent online latch is
-//!   [`GameEntity::building_online`].
+//! - `Mark(2)` at warp start and release (vtable `+0x124`) is presentation.
+//!   A building's online latch and slot-anim freeze (`0x004521C0`/`0x00452210`)
+//!   are `ObjectSubstrate::set_building_online_for_temporal`.
 //! - House `+0x1FC`, set at a building's warp start (`0x0071B13A`), release
 //!   (`0x0071AC49`, `0x0071AD17`) and erase (`0x0071AA60`), asks the House
 //!   update for the Super passes (`0x004F92F6`, `0x004F92FD`). VERA tests a
@@ -138,6 +137,9 @@ use crate::rules::object_type::ObjectType;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::anim_class::AnimWorldCoord;
 use crate::sim::game_entity::GameEntity;
+use crate::sim::houses::Houses;
+use crate::sim::power_system::PowerStates;
+use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::{FrameEffects, Simulation, UninitContext};
 
 /// `SumChainDamage @ 0x0071AB10` recurses while the depth is at most this
@@ -292,8 +294,8 @@ pub(crate) enum TemporalShotTarget {
 }
 
 impl Simulation {
-    fn temporal_link(&self, attacker: u64) -> Option<&TemporalLink> {
-        self.substrate
+    fn temporal_link(substrate: &ObjectSubstrate, attacker: u64) -> Option<&TemporalLink> {
+        substrate
             .entities
             .get(attacker)
             .and_then(|entity| entity.temporal.link.as_ref())
@@ -367,7 +369,7 @@ impl Simulation {
                 }
             }
         };
-        if self.temporal_link(firer).is_none() {
+        if Self::temporal_link(&self.substrate, firer).is_none() {
             return;
         }
         self.temporal_initiate_warp(firer, victim, rules, registry, effects);
@@ -394,7 +396,7 @@ impl Simulation {
                 crate::sim::spawn_manager::kill_all_spawns_with_context(
                     self,
                     target,
-                    UninitContext::new(Some(rules), registry).with_effects(effects),
+                    UninitContext::new(rules, registry).with_effects(effects),
                 );
             }
             if self
@@ -407,7 +409,12 @@ impl Simulation {
             }
         }
         // 0x0071AF4D..0x0071AF61: the attacker drops its previous victim.
-        self.temporal_release_if_warping(attacker);
+        Self::temporal_release_if_warping(
+            &mut self.substrate,
+            &mut self.houses,
+            &mut self.power_states,
+            attacker,
+        );
         let Some(target) = target else {
             return;
         };
@@ -443,11 +450,12 @@ impl Simulation {
                 if let Some(link) = self.substrate.temporal_link_mut(attacker) {
                     link.warp_remaining = strength.wrapping_mul(10);
                 }
-                self.temporal_warp_start_notice(target, rules);
+                self.temporal_warp_start_notice(target, rules, registry, effects);
             }
             Some(head) => {
                 // 0x0071B0D1..0x0071B0E4: insert right after the head.
-                let head_next = self.temporal_link(head).and_then(|link| link.next);
+                let head_next =
+                    Self::temporal_link(&self.substrate, head).and_then(|link| link.next);
                 if let Some(link) = self.substrate.temporal_link_mut(attacker) {
                     link.prev = Some(head);
                     link.next = head_next;
@@ -462,10 +470,7 @@ impl Simulation {
                 }
             }
         }
-        // 0x0071B0EA sets `+0x270`, which the head above stands for; a
-        // building's independent online latch is forced off (`0x004521C0`).
-        self.substrate
-            .set_building_online_for_temporal(target, false);
+        // 0x0071B0EA sets `+0x270`, which the head above stands for.
         // 0x0071B0FC..0x0071B10B: a gattling victim winds down one tick.
         if self
             .substrate
@@ -476,14 +481,24 @@ impl Simulation {
         {
             self.gattling_update(target, rules, 1, effects);
         }
-        // 0x0071B14E..0x0071B162: a victim that was itself warping lets go.
+        // 0x0071B110..0x0071B13A: a building marks its House's power, then
+        // forces its independent online latch off and freezes its slot anims
+        // (`0x004521C0`), then marks the House's Super passes.
         if let Some(owner) = self.substrate.entities.get(target).and_then(|entity| {
             (entity.category() == EntityCategory::Structure).then_some(entity.owner())
         }) {
             Self::invalidate_house_power(&self.houses, &mut self.power_states, owner, false); //71B126, before release
+            self.substrate
+                .set_building_online_for_temporal(target, false); //71B12F
             self.houses.request_house_tech_tree_recheck(owner); //71B13A
         }
-        self.temporal_release_if_warping(target);
+        // 0x0071B14E..0x0071B162: a victim that was itself warping lets go.
+        Self::temporal_release_if_warping(
+            &mut self.substrate,
+            &mut self.houses,
+            &mut self.power_states,
+            target,
+        );
         // 0x0071B16D: ObjectClass::Deselect.
         if let Some(entity) = self.substrate.entities.get_mut(target) {
             entity.selection.deselect();
@@ -495,23 +510,31 @@ impl Simulation {
     /// gated on the player's own house, which the app applies); a building
     /// that is not `Insignificant=` and not a 1x1 undeployer (`vtable+0x80`,
     /// `0x00465D40`, as on the damage path) notifies its house it is under
-    /// attack.
-    fn temporal_warp_start_notice(&mut self, target: u64, rules: &RuleSet) {
+    /// attack (`0x0071B0CA`), whose call ends by raising event 6 on that
+    /// House's Tags ([`Self::raise_house_attacked_tags`]).
+    fn temporal_warp_start_notice(
+        &mut self,
+        target: u64,
+        rules: &RuleSet,
+        registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        effects: FrameEffects<'_>,
+    ) {
         let Some(entity) = self.substrate.entities.get(target) else {
             return;
         };
         let Some(object) = self.object_type(entity.type_ref(), rules) else {
             return;
         };
-        match entity.category() {
-            EntityCategory::Unit if object.harvester => {}
+        let notify_house = match entity.category() {
+            EntityCategory::Unit if object.harvester => false,
             EntityCategory::Structure
                 if !object.insignificant && !object.is_1x1_with_undeploy() =>
             {
                 // HouseNotify owns the deployed-miner subtype.
+                true
             }
             _ => return,
-        }
+        };
         // The radar cell is the victim's GetCoords (vt+0x48): a building's
         // foundation centre (`0x00447AC0`; NotifyUnderAttack `0x004F94AE`,
         // `0x004F950E`, `0x004F956A`).
@@ -527,7 +550,13 @@ impl Simulation {
             owner: entity.owner(),
             victim_type: entity.type_ref(),
         };
-        self.dispatch_under_attack_events(&[event], rules);
+        if notify_house {
+            self.notify_house_under_attack(event, rules, registry, effects);
+            return;
+        }
+        // Temporal71B04C/71B05F's harvester branch calls radar/EVA directly, with
+        // no House Tags, and also completes before returning to the warp.
+        self.submit_under_attack_warning(event, rules, effects);
     }
 
     /// `TemporalClass::CanWarpTarget @ 0x0071AE50`: a `Warpable=` type, not
@@ -561,7 +590,7 @@ impl Simulation {
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) {
-        let Some(link) = self.temporal_link(head).cloned() else {
+        let Some(link) = Self::temporal_link(&self.substrate, head).cloned() else {
             return;
         };
         // 0x0071A76B..0x0071A790: a head with a predecessor releases everyone.
@@ -595,7 +624,12 @@ impl Simulation {
                     .open_topped_warp_distance
                     .wrapping_mul(256)
             {
-                self.temporal_let_go(head);
+                Self::temporal_let_go(
+                    &mut self.substrate,
+                    &mut self.houses,
+                    &mut self.power_states,
+                    head,
+                );
                 return;
             }
         }
@@ -617,7 +651,7 @@ impl Simulation {
     /// `SumChainDamage @ 0x0071AB10`: this attacker's damage plus the chain
     /// below it, recursing while the depth is at most [`CHAIN_DEPTH_LIMIT`].
     fn temporal_chain_damage(&self, attacker: u64, depth: i32, rules: &RuleSet) -> i32 {
-        let rest = match self.temporal_link(attacker).and_then(|link| link.next) {
+        let rest = match Self::temporal_link(&self.substrate, attacker).and_then(|link| link.next) {
             Some(next) if depth <= CHAIN_DEPTH_LIMIT => {
                 self.temporal_chain_damage(next, depth.wrapping_add(1), rules)
             }
@@ -692,17 +726,75 @@ impl Simulation {
             return;
         };
         if category == EntityCategory::Structure {
+            // Temporal71A9A0..71A9A7: only positive true Occupants count
+            // calls KillOccupants(NULL), ahead of Cargo disposal/bunker release.
+            if self
+                .substrate
+                .entities
+                .get(target)
+                .is_some_and(|entity| entity.passenger_role.occupants().count() > 0)
+            {
+                crate::sim::passenger::garrison_eject::kill_building_occupants(
+                    self,
+                    target,
+                    UninitContext::new(rules, registry).with_effects(effects),
+                );
+            }
+            // TemporalClass::Update (0x0071A9AC..0x0071A9DC) scalar-deletes Cargo
+            // before the parent's kill/UnInit. This private erase runs inside
+            // the admitted live object pass, whose active GameState is 1.
+            self.scalar_delete_building_cargo(
+                target,
+                UninitContext::new(rules, registry).with_effects(effects),
+                1,
+            );
             // 0x0071A9EE..0x0071AA15: a Tank Bunker releases its occupant
-            // (`0x004593A0`). Garrison occupants and absorbed passengers go
-            // in the UnInit below (module residual).
-            crate::sim::docking::bunker_link::release_sell_destroy(self, target, effects);
+            // (`0x004593A0`) after the synchronous Cargo destructors.
+            crate::sim::docking::bunker_link::release_sell_destroy(self, target, rules, effects);
+        }
+        // 0x0071AA90: the erased object's own bunker link (`+0x2E4`) names a
+        // building — `BuildingClass::ClearBunker @ 0x00459470`, ahead of
+        // FreeSlaves (`0x0071AA95`). A stock warp never holds an installed
+        // unit (the detonation's Temporal arm retargets the firer at its
+        // bunker, `0x0046946B..0x004694A5`), so this arm sleeps until a
+        // caller admits the chain.
+        if let Some(bunker) = self
+            .substrate
+            .entities
+            .get(target)
+            .and_then(|entity| entity.bunker.link().installed_in())
+            && self
+                .substrate
+                .entities
+                .get(bunker)
+                .is_some_and(|building| building.category() == EntityCategory::Structure)
+        {
+            crate::sim::docking::bunker_link::clear_bunker(self, bunker, rules, effects);
         }
         // 0x0071AA95..0x0071AAA7: an erased master's slaves pass to the
         // attacker's house (FreeSlaves, no supplied house). Its UnInit and
         // owner-change callbacks share this object turn's map inputs.
         self.free_slaves(target, Some(head), None, rules, registry, effects);
-        if category != EntityCategory::Structure
-            && let Some(entity) = self.substrate.entities.get(target)
+        if category == EntityCategory::Structure {
+            // 0x0071AA3A vtable +0x3B8: `BuildingClass::Death_Announcement @
+            // 0x0044D760`. A current player's building (`0x0050B6F0`) pushes
+            // the Cell of its +4C coordinate (`0x00447E90`, no requester)
+            // onto the Spacebar ring (`0x00660B80`); no EVA, no radar event.
+            if let Some(entity) = self.substrate.entities.get(target)
+                && self.house_is_human_player(entity.owner())
+                && let Ok(coord) = self.navigation_target_coordinate(
+                    crate::sim::components::NavTargetRef::Object { id: target },
+                    None,
+                    rules,
+                )
+            {
+                self.publish_trigger_effects(vec![
+                    crate::sim::trigger_runtime::TriggerEffect::RecentEventCell {
+                        cell: ((coord.x / 256) as i16, (coord.y / 256) as i16),
+                    },
+                ]);
+            }
+        } else if let Some(entity) = self.substrate.entities.get(target)
             && let Some(object) = self.object_type(entity.type_ref(), rules)
             && let Some(event) = crate::sim::combat::death_announcement_event(
                 object,
@@ -712,9 +804,10 @@ impl Simulation {
                 entity.owner(),
             )
         {
-            // 0x0071AAB5 vtable +0x3B8: Death_Announcement. A bunkered unit's
-            // own release (`0x00459470`) is left to UnInit: the detonation
-            // redirects to the bunker, so no stock warp holds one.
+            // 0x0071AAB5 vtable +0x3B8: Death_Announcement. A bunkered
+            // unit's own release already ran above (`0x0071AA90`); no stock
+            // warp holds an installed unit, because the detonation redirects
+            // to the bunker.
             self.dispatch_unit_lost_events(&[event]);
         }
         // vtable +0xE0 Record_The_Kill(Owner): experience, kill and score.
@@ -722,13 +815,13 @@ impl Simulation {
             target,
             crate::sim::combat::KillSource::Techno(Some(head)),
             crate::sim::combat::KillCallback::Terminal,
-            UninitContext::new(Some(rules), registry).with_effects(effects),
+            UninitContext::new(rules, registry).with_effects(effects),
         );
         let target_owner = self.substrate.entities.get(target).map(GameEntity::owner);
         // vtable +0xF8 UnInit: no death effects, no survivors.
         self.uninit_with_context(
             target,
-            UninitContext::new(Some(rules), registry).with_effects(effects),
+            UninitContext::new(rules, registry).with_effects(effects),
         );
         //71AA5A..71AA60 requests the owner's House tail; the actual late
         //Building destructor separately calls hold/revoke43BEF0.
@@ -802,14 +895,18 @@ impl Simulation {
     /// Ordinary Stop only clears TarCom; the due Attack handler invokes this
     /// before its cadence draw. Native deadline/LetGo controls are retained in
     /// `tools/spatial_oracle/temporal_stop.json`.
-    pub(crate) fn temporal_release_if_warping(&mut self, attacker: u64) {
-        if self
-            .substrate
+    pub(crate) fn temporal_release_if_warping(
+        substrate: &mut ObjectSubstrate,
+        houses: &mut Houses,
+        power_states: &mut PowerStates,
+        attacker: u64,
+    ) {
+        if substrate
             .entities
             .get(attacker)
             .is_some_and(|entity| entity.temporal.is_warping_someone())
         {
-            self.temporal_let_go(attacker);
+            Self::temporal_let_go(substrate, houses, power_states, attacker);
         }
     }
 
@@ -817,49 +914,48 @@ impl Simulation {
     /// progress to the next attacker, a lone head frees the target (a building
     /// comes back online), a chained link unlinks. LetGo never idles its own
     /// attacker.
-    pub(crate) fn temporal_let_go(&mut self, attacker: u64) {
-        let Some(link) = self.temporal_link(attacker).cloned() else {
+    pub(crate) fn temporal_let_go(
+        substrate: &mut ObjectSubstrate,
+        houses: &mut Houses,
+        power_states: &mut PowerStates,
+        attacker: u64,
+    ) {
+        let Some(link) = Self::temporal_link(substrate, attacker).cloned() else {
             return;
         };
         match link.prev {
             None => {
                 if let Some(next) = link.next {
                     if let Some(target) = link.target {
-                        self.substrate.set_temporal_head(target, Some(next));
+                        substrate.set_temporal_head(target, Some(next));
                     }
-                    if let Some(next_link) = self.substrate.temporal_link_mut(next) {
+                    if let Some(next_link) = substrate.temporal_link_mut(next) {
                         next_link.prev = None;
                         next_link.warp_remaining = link.warp_remaining;
                     }
                 } else if let Some(target) = link.target {
-                    self.substrate.set_temporal_head(target, None);
-                    self.substrate
-                        .set_building_online_for_temporal(target, true); //71AC3D
-                    if let Some(owner) = self.substrate.entities.get(target).and_then(|entity| {
+                    substrate.set_temporal_head(target, None);
+                    substrate.set_building_online_for_temporal(target, true); //71AC3D
+                    if let Some(owner) = substrate.entities.get(target).and_then(|entity| {
                         (entity.category() == EntityCategory::Structure).then_some(entity.owner())
                     }) {
-                        Self::invalidate_house_power(
-                            &self.houses,
-                            &mut self.power_states,
-                            owner,
-                            false,
-                        ); //71AC36
-                        self.houses.request_house_tech_tree_recheck(owner); //71AC49
+                        Self::invalidate_house_power(&*houses, power_states, owner, false); //71AC36
+                        houses.request_house_tech_tree_recheck(owner); //71AC49
                     }
                 }
             }
             Some(prev) => {
                 if let Some(next) = link.next
-                    && let Some(next_link) = self.substrate.temporal_link_mut(next)
+                    && let Some(next_link) = substrate.temporal_link_mut(next)
                 {
                     next_link.prev = Some(prev);
                 }
-                if let Some(prev_link) = self.substrate.temporal_link_mut(prev) {
+                if let Some(prev_link) = substrate.temporal_link_mut(prev) {
                     prev_link.next = link.next;
                 }
             }
         }
-        self.substrate.temporal_clear_fields(attacker);
+        substrate.temporal_clear_fields(attacker);
     }
 
     /// `ClearLinkedList @ 0x0071ADE0`: frees the target, then walks Next and
@@ -873,7 +969,9 @@ impl Simulation {
     ) {
         // A link without a target faults natively (`0x0071ADE9` writes
         // through it); VERA stops, which also ends any walk of a cycle.
-        let Some(target) = self.temporal_link(attacker).and_then(|link| link.target) else {
+        let Some(target) =
+            Self::temporal_link(&self.substrate, attacker).and_then(|link| link.target)
+        else {
             return;
         };
         self.substrate.set_temporal_head(target, None);
@@ -882,7 +980,9 @@ impl Simulation {
         if let Some(stored) = self.substrate.temporal_link_mut(attacker) {
             stored.target = None;
         }
-        if let Some(next) = self.temporal_link(attacker).and_then(|link| link.next) {
+        if let Some(next) =
+            Self::temporal_link(&self.substrate, attacker).and_then(|link| link.next)
+        {
             if let Some(next_link) = self.substrate.temporal_link_mut(next)
                 && next_link.prev == Some(attacker)
             {
@@ -891,7 +991,9 @@ impl Simulation {
             self.temporal_clear_linked_list(next, rules, effects);
         }
         // Prev is read again after the Next walk (`0x0071AE12`).
-        if let Some(prev) = self.temporal_link(attacker).and_then(|link| link.prev) {
+        if let Some(prev) =
+            Self::temporal_link(&self.substrate, attacker).and_then(|link| link.prev)
+        {
             if let Some(prev_link) = self.substrate.temporal_link_mut(prev)
                 && prev_link.next == Some(attacker)
             {
@@ -913,24 +1015,21 @@ impl Simulation {
         rules: &RuleSet,
         effects: FrameEffects<'_>,
     ) {
-        let Some(target) = self.temporal_link(attacker).map(|link| link.target) else {
+        let Some(target) = Self::temporal_link(&self.substrate, attacker).map(|link| link.target)
+        else {
             return;
         };
         if let Some(target) = target {
+            //71AD40 clears only +270/+278 here. Unlike ClearWarp71ACD0,
+            //it never calls ForceOnline452210 or dirties the target House.
             self.substrate.set_temporal_head(target, None);
-            self.substrate
-                .set_building_online_for_temporal(target, true); //ClearWarp71AD0B
-            if let Some(owner) = self.substrate.entities.get(target).and_then(|entity| {
-                (entity.category() == EntityCategory::Structure).then_some(entity.owner())
-            }) {
-                Self::invalidate_house_power(&self.houses, &mut self.power_states, owner, false); //ClearWarp71AD04
-                self.houses.request_house_tech_tree_recheck(owner); //71AD17
-            }
             if let Some(stored) = self.substrate.temporal_link_mut(attacker) {
                 stored.target = None;
             }
         }
-        if let Some(next) = self.temporal_link(attacker).and_then(|link| link.next) {
+        if let Some(next) =
+            Self::temporal_link(&self.substrate, attacker).and_then(|link| link.next)
+        {
             if let Some(next_link) = self.substrate.temporal_link_mut(next)
                 && next_link.prev == Some(attacker)
             {
@@ -938,7 +1037,9 @@ impl Simulation {
             }
             self.temporal_clear_linked_list(next, rules, effects);
         }
-        if let Some(prev) = self.temporal_link(attacker).and_then(|link| link.prev) {
+        if let Some(prev) =
+            Self::temporal_link(&self.substrate, attacker).and_then(|link| link.prev)
+        {
             if let Some(prev_link) = self.substrate.temporal_link_mut(prev)
                 && prev_link.next == Some(attacker)
             {
@@ -952,26 +1053,28 @@ impl Simulation {
     /// `TechnoClass::PointerExpired`'s forward (`0x00707B34` ->
     /// `0x0071AB60`), outside the removal gate: the attacker's own expiry lets
     /// go; its target's expiry clears the link and idles the attacker without
-    /// relinking the chain. `rules` is absent only for a rules-less UnInit
-    /// (fixtures; production passes the frame's rules), which has no idle
-    /// selector, so the idle is skipped there.
+    /// relinking the chain.
     pub(crate) fn temporal_pointer_expired(
         &mut self,
         listener: u64,
         expired: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         effects: FrameEffects<'_>,
     ) {
-        let Some(target) = self.temporal_link(listener).map(|link| link.target) else {
+        let Some(target) = Self::temporal_link(&self.substrate, listener).map(|link| link.target)
+        else {
             return;
         };
         if expired == listener {
-            self.temporal_let_go(listener);
+            Self::temporal_let_go(
+                &mut self.substrate,
+                &mut self.houses,
+                &mut self.power_states,
+                listener,
+            );
         } else if target == Some(expired) {
             self.substrate.temporal_clear_fields(listener);
-            if let Some(rules) = rules {
-                self.temporal_owner_idle(listener, rules, effects);
-            }
+            self.temporal_owner_idle(listener, rules, effects);
         }
     }
 
@@ -981,11 +1084,17 @@ impl Simulation {
     /// (`0x00746557`).
     /// Returns whether the manager moved, so the passenger owner can run
     /// the callback's conditional burst/GetROF/rearm continuation.
-    pub(crate) fn temporal_remove_gunner(&mut self, ifv: u64, gunner: u64) -> bool {
-        if !self.substrate.temporal_move_link(ifv, gunner) {
+    pub(crate) fn temporal_remove_gunner(
+        substrate: &mut ObjectSubstrate,
+        houses: &mut Houses,
+        power_states: &mut PowerStates,
+        ifv: u64,
+        gunner: u64,
+    ) -> bool {
+        if !substrate.temporal_move_link(ifv, gunner) {
             return false;
         }
-        self.temporal_release_if_warping(gunner);
+        Self::temporal_release_if_warping(substrate, houses, power_states, gunner);
         true
     }
 
@@ -1093,8 +1202,8 @@ impl Simulation {
                 // Infantry51BB81..51BBC0 runs the ordinary Teleport's extra
                 // Process even in Limbo. Its71930C..719322 early arm calls the
                 // existing TimerCheck owner; FootAI's later Limbo gate remains.
-                // Native execution: infantry_teleport_prologue.json (Steam3e81a617).
-                self.process_teleport(id, Some(rules), ctx);
+                // Native execution: infantry_teleport_prologue.json (Steam gamemd).
+                self.process_teleport(id, rules, ctx);
             }
             if self
                 .substrate
@@ -1136,7 +1245,7 @@ impl Simulation {
             // Each frozen class calls virtual +3C8 (Infantry51BBEF), not
             // the Techno base write set. Its reached tail also clears a
             // Tesla Trooper's automatic charging intent at51B33F.
-            let _ = self.assign_target_represented(id, None, Some(rules), registry, ctx.effects);
+            let _ = self.assign_target_represented(id, None, rules, registry, ctx.effects);
         }
         let clears_destination = category != EntityCategory::Structure
             && self
@@ -1145,7 +1254,7 @@ impl Simulation {
                 .get(id)
                 .is_some_and(|entity| entity.navigation.nav_com().is_some());
         if clears_destination {
-            self.assign_null_destination(id, Some(rules), registry, ctx.effects);
+            self.assign_null_destination(id, rules, registry, ctx.effects);
         }
         true
     }
@@ -1327,3 +1436,7 @@ fn location_coord(entity: &GameEntity) -> AnimWorldCoord {
 #[cfg(test)]
 #[path = "temporal_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "temporal_cargo_disposal_tests.rs"]
+mod cargo_disposal_tests;

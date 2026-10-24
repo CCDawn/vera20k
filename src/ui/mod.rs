@@ -8,6 +8,7 @@
 //! - ui/ does NOT depend on: assets/, render/, audio/, net/
 
 pub mod campaign_score_shell;
+pub(crate) mod coop_score_shell;
 pub mod campaign_shell;
 pub mod gadget;
 pub mod game_screen;
@@ -25,11 +26,17 @@ pub mod sidebar;
 pub mod single_player_shell;
 pub mod skirmish_shell;
 pub mod tooltips;
+pub(crate) mod wol_buddy;
 pub(crate) mod wol_chat;
 pub(crate) mod wol_lobby;
 pub mod wol_login;
+pub(crate) mod wol_my_info;
 pub(crate) mod wol_options;
+pub(crate) mod wol_page;
+pub(crate) mod wol_persona;
+pub(crate) mod wol_quick_match;
 pub mod wol_shell;
+pub(crate) mod wol_verify;
 // pub mod skirmish;
 // pub mod dialog;
 // pub mod settings;

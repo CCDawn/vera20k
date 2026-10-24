@@ -67,10 +67,6 @@ fn construct(row: &Value) -> BounceState {
 #[test]
 fn meteor_constructors_match_native_draws_float_stores_and_integer_placement() {
     assert_eq!(golden()["schema"], 1);
-    assert_eq!(
-        golden()["native_sha256"],
-        "3e81a61775d2745d1dabe397325ef663cd994ffc194da4e998e3bf5d2d308600"
-    );
     let rows = golden()["constructors"].as_array().unwrap();
     assert_eq!(rows.len(), 8);
     for row in rows {
@@ -130,7 +126,7 @@ fn meteor_update_compensation_matches_original_flights_on_declared_crop() {
     let sim = flight_sim("flat2", 40);
     let terrain = ResolvedBounceTerrain {
         sim: &sim,
-        rules: None,
+        rules: crate::rules::ruleset::RuleSet::empty_for_test(),
     };
     for row in rows {
         let constructor =

@@ -18,6 +18,8 @@
 //! ## Dependency rules
 //! - Part of rules/ — no dependencies on sim/, render/, ui/, etc.
 
+use crate::rules::ares_armor::AresWarheadVerses;
+use crate::rules::armor::{ArmorId, ArmorInteraction};
 use crate::rules::ini_parser::IniSection;
 use crate::rules::ini_value::{PERCENT_SCALE, crt_atoi, parse_leading_f64};
 use crate::util::native_x87::X87Chop53;
@@ -30,6 +32,11 @@ use crate::util::native_x87::X87Chop53;
 pub struct WarheadType {
     /// Section name in rules.ini (e.g., "AP", "HE", "SA").
     pub id: String,
+    /// The resolved `Particle=` pointer at WarheadTypeClass+0x140. Constructor
+    /// 0x0075CF4D starts null; ReadINI @0x0075D4BE retains it for an empty
+    /// ReadString and stores ParticleSystemTypeClass::FindOrAllocate's answer
+    /// @0x00644890 for a nonempty name (`none`/`<none>` resolve null).
+    pub particle_system: Option<String>,
     /// Damage effectiveness per armor type, full f64 precision (gamemd stores
     /// Verses as a `double[11]` at warhead+0xA0 and keeps full precision through
     /// the damage kernel — the single float exception). Index order: 0=none,
@@ -38,12 +45,20 @@ pub struct WarheadType {
     /// on each admitted rules layer without `Verses=`. The process registry
     /// retains the result when that layer has no section for this warhead.
     pub verses_f64: [f64; 11],
+    /// Immutable view of the separately retained Ares WH extension.
+    ares_verses: Option<AresWarheadVerses>,
+    ares: Option<crate::rules::ares_warhead::AresWarheadRules>,
     /// Splash radius in cells (0 = direct hit only). Native `CellSpread=` is a
     /// **float** at `WarheadTypeClass+0x124` (ReadDouble `0x005283d0` called at
     /// `0x0075d3e6`, `FSTP float ptr` at `0x0075d3eb`, key string
     /// `0x00847ea0`), widened exactly to f64. Its splash scan reads are in
     /// `sim::combat::cell_spread`.
     pub cell_spread_f64: f64,
+    /// Native binary32 `CellInset=` at `WarheadTypeClass+0x128`, read by
+    /// `WarheadTypeClass::ReadINI @ 0x0075D3A0` after `CellSpread` and defaulted
+    /// to the constructor's zero. Kept as f32 because the native field is a
+    /// float and `TriggersCellInset @ 0x006F7660` subtracts it from CellSpread.
+    pub cell_inset_f32: f32,
     /// Damage fraction at maximum spread distance. Native `PercentAtMax=` is
     /// a **float** at `WarheadTypeClass+0x12C` (ReadDouble at `0x0075d424`,
     /// `FSTP float ptr` at `0x0075d429`, key string `0x00847e84`), widened to
@@ -59,19 +74,17 @@ pub struct WarheadType {
     /// at `0x0075d47c`, key string `0x00847e54`).
     pub delay_kill_at_max_f64: f64,
     /// Whether this warhead can damage walls/bridges (Wall=yes).
-    /// NO-DIFF (GSI-08.33) — pass 1's three "unparsed effect flags" have no
-    /// gameplay consumer in gamemd either, and its stock-authorship claim was
-    /// inverted. `WarheadTypeClass::ReadINI @ 0x0075D3A0` does store `Sparky=`
-    /// (`+0x14A`), `Bullets=` (`+0x17A`), `Deform=` (`+0x98`) and
-    /// `DeformThreshhold=` (`+0x100`), but exhaustive displacement sweeps find
-    /// `Sparky`, `Deform` and `DeformThreshhold` reaching only
-    /// `WarheadTypeClass::Compute_CRC @ 0x0075DEC0`, and `Bullets` reaching
-    /// nothing at all. `Apply_area_damage @ 0x00489280`, which owns every
-    /// warhead effect on ore, walls, bridges, barrels and the rocker, never
-    /// touches any of them. `Deform` is Tiberian Sun cell-height deformation
-    /// with its consumer deleted. And all 28 stock `Sparky=` entries are `no`,
-    /// including `[Fire]` and `[Fire2]` — the opposite of "most fire weapons are
-    /// Sparky". Parsing them here would add fields nothing can read.
+    /// `Sparky=`, `Bullets=`, `Deform=` and `DeformThreshhold=` are retained
+    /// from their WarheadTypeClass ReadINI fields; their gameplay effects are
+    /// outside these state-retention issues. `Sparky` has one consumer:
+    /// `BuildingClass::ReceiveDamage @ 0x00442230` tests it for each
+    /// foundation cell of its NowYellow/NowRed loop (`0x00442785`) and, by
+    /// Scenario `RandomRanged` draws (`0x004427C0`, `0x00442804`), may build
+    /// one of Rules' `OnFire` anims (`+0xB78`) there. That arm is dormant:
+    /// the constructor stores `false` (`0x0075CF77`), and all 28 stock
+    /// `Sparky=` entries are `no`, including `[Fire]` and `[Fire2]`. The
+    /// `Apply_area_damage @ 0x00489280` helper does not read the retained
+    /// metadata above.
     ///
     /// The field itself is `WarheadTypeClass+0x144` (ReadINI `0x0075d508`,
     /// key string `0x0081ac58`).
@@ -95,6 +108,12 @@ pub struct WarheadType {
     /// `WarheadTypeClass+0x179` (ReadINI `0x0075d9f2`, key string
     /// `0x00847cc8`).
     pub affects_allies: bool,
+    /// Phobos `AffectsOwner`; `None` falls back to [`Self::affects_allies`].
+    pub affects_owner: Option<bool>,
+    /// Phobos `AffectsEnemies`, default true.
+    pub affects_enemies: bool,
+    /// Phobos `AffectsNeutral`, default true.
+    pub affects_neutral: bool,
     /// Psychic-damage immunity selector (distinct from Psychedelic).
     /// `WarheadTypeClass+0x178` (ReadINI `0x0075d9d2`, key string
     /// `0x00847cd8`).
@@ -103,9 +122,41 @@ pub struct WarheadType {
     /// The original engine selects by `damage / 25`, clamped to list length.
     /// Example: ["XGRYSML1","EXPLOSML","EXPLOMED","EXPLOLRG","TWLT070"].
     pub anim_list: Vec<String>,
-    /// Infantry death animation variant (InfDeath= in rules.ini, 0–10).
-    /// Maps to Die1–Die5 infantry sequences. Default 1 (standard rifle death).
-    pub inf_death: u8,
+    /// `InfDeath=`: the arm of `InfantryClass::ReceiveDamage`'s death ladder
+    /// (`0x00517FA0`, `world::infantry_death`) this warhead's kill takes. A
+    /// signed dword at `WarheadTypeClass+0x120`: the constructor stores
+    /// [`Self::DEFAULT_INF_DEATH`] (`0x0075CF14`), and ReadINI reads
+    /// `INIClass::ReadInt @ 0x005276D0` over the current value with no clamp
+    /// (`0x0075D75D..0x0075D771`, key string `0x00847D88`). The ladder's table
+    /// (`0x00518D58`) takes 1..=10; any other value, the default 0 included,
+    /// UnInits the infantryman inside the killing call with neither sequence
+    /// nor anim (`0x005185C8` -> `0x00518B9A`). Retail `[CometWH]` (the
+    /// Prism Tank's beam and fragments) and `[GrandCannonWH]` keep the 0.
+    pub inf_death: i32,
+    /// Retained native metadata: `Deform=` is a double at WarheadTypeClass+
+    /// 0x98, read by ReadDouble @0x005283D0 from ReadINI @0x0075D78D over the
+    /// constructor's 0.0 (`0x0075CED8`).
+    pub deform_f64: f64,
+    /// Exact native key spelling is `DeformThreshhold=`. ReadInt
+    /// @0x005276D0 at ReadINI @0x0075D7A7 stores the signed value at +0x100;
+    /// constructor default is 0 (`0x0075CEF8`) and there is no post-read clamp.
+    pub deform_threshold: i32,
+    /// `Bullets=` at +0x17A, ReadBool @0x005295F0 called from ReadINI
+    /// @0x0075DA01; constructor default false (`0x0075D04A`).
+    pub bullets: bool,
+    /// `Veinhole=` at +0x17B, ReadBool @0x005295F0 called from ReadINI
+    /// @0x0075DA1B; constructor default false (`0x0075D050`).
+    pub veinhole: bool,
+    /// `ShakeXlo/ShakeXhi/ShakeYlo/ShakeYhi`, signed `ReadInt` fields at
+    /// WarheadTypeClass+0x17C/+0x180/+0x184/+0x188. ReadINI @0x0075D3A0
+    /// reads them in Xlo, Xhi, Ylo, Yhi order, each with the current field as
+    /// default; the constructor @0x0075CED0 initializes all four to zero.
+    /// BulletClass::DetonateAtCoord @0x004690B0 uses each nonzero pair to
+    /// conditionally draw and write its axis before the special/damage chain.
+    pub shake_x_lo: i32,
+    pub shake_x_hi: i32,
+    pub shake_y_lo: i32,
+    pub shake_y_hi: i32,
 
     // --- Bool fields (verified offsets from WarheadTypeClass::ReadINI) ---
     /// Conventional warhead — no special effects. `WarheadTypeClass+0x14D`,
@@ -265,11 +316,12 @@ pub struct WarheadType {
     /// fallback General.MetallicDebris SHP path on each admitted hit. This
     /// differs from TechnoType debris, which belongs to the death receiver.
     ///
-    /// RESIDUAL: the authored nonempty typed-warhead arm469D40..469E18
-    /// still lacks VoxelAnim emission. Its budget request precedes that arm;
-    /// a nonempty list must not instead produce fallback metallic SHPs.
-    /// Stock Brute's empty typed list does not exercise this residual. General
-    /// Airburst child emission469EBA..46A28A is a separate later mechanism.
+    /// `combat::world_receiver`'s `emit_warhead_debris` owns both arms after
+    /// their one budget: a nonempty list throws its VoxelAnims through the
+    /// typed selector Techno deaths share (`throw_typed_debris`,
+    /// `0x00469D40..0x00469E18`), an empty one the MetallicDebris SHPs.
+    /// General Airburst child emission (`0x00469EBA..0x0046A28A`) is a
+    /// separate later mechanism.
     pub debris_types: Vec<String>,
     /// Per-type debris count cap.
     ///
@@ -287,15 +339,74 @@ pub struct WarheadType {
     /// -> warhead `+0x1C4`. Native RAISES this to `min_debris` when it is
     /// lower (`0x0075DAE0`); it never lowers `min_debris` to meet it.
     pub max_debris: i32,
+    /// Phobos warhead shield overrides (`Shield.Penetrate`,
+    /// `Shield.AffectTypes`, `Shield.Penetrate.Types`, absorb/pass and
+    /// received-damage bounds). Phobos `WarheadTypeExt` reads them after the
+    /// stock keys; a build without the capability carries only the defaults.
+    #[cfg(feature = "phobos")]
+    pub shield: crate::rules::phobos_shields::ShieldWarheadRules,
 }
 
 impl WarheadType {
+    pub(crate) fn ares_rules(&self) -> Option<&crate::rules::ares_warhead::AresWarheadRules> {
+        self.ares.as_ref()
+    }
+    pub(crate) fn bind_ares_rules(
+        &mut self,
+        rules: Option<&crate::rules::ares_warhead::AresWarheadRules>,
+    ) {
+        self.ares = rules.cloned();
+    }
+
+    /// `InfDeath=`'s constructor value (`0x0075CF14`, the zeroed EBX of
+    /// `0x0075CED0`): what a warhead whose sections name no `InfDeath=` keeps.
+    pub(crate) const DEFAULT_INF_DEATH: i32 = 0;
+
+    pub fn interaction(&self, armor: ArmorId) -> ArmorInteraction {
+        #[cfg(feature = "ares")]
+        {
+            self.ares_verses
+                .as_ref()
+                .expect("Ares build requires its retained warhead extension")
+                .interaction(armor)
+        }
+        #[cfg(not(feature = "ares"))]
+        {
+            ArmorInteraction::retail(crate::util::native_x87::NativeF64Bits::from_bits(
+                self.verses_f64[armor.index()].to_bits(),
+            ))
+        }
+    }
+
+    /// WH+149 controls an Infantry passive-target class shortcut. The
+    /// installed Ares75DDCC hook skips its native derivation and clears it;
+    /// effective extension entries must never reintroduce that shortcut.
+    pub fn uses_medium_wood_target_mask(&self) -> bool {
+        #[cfg(feature = "ares")]
+        {
+            false
+        }
+        #[cfg(not(feature = "ares"))]
+        {
+            self.verses_f64[4] == 0.0 && self.verses_f64[6] == 0.0
+        }
+    }
+
+    pub(crate) fn install_ares_verses(&mut self, state: Option<&AresWarheadVerses>) {
+        self.ares_verses = state.cloned();
+    }
+
+    pub(crate) fn ares_verses_hash_state(&self) -> Option<&AresWarheadVerses> {
+        self.ares_verses.as_ref()
+    }
+
     /// Parse a WarheadType from a rules.ini section.
     pub fn from_ini_section(id: &str, section: &IniSection) -> Self {
         let verses_f64 = read_verses(section, [1.0; 11]);
 
         // Float fields (`FSTP dword` at `0x0075D3E6`, `0x0075D424`, `0x0075D477`).
         let cell_spread_f64 = f64::from(section.read_float("CellSpread", 0.0));
+        let cell_inset_f32 = section.read_float("CellInset", 0.0);
         let percent_at_max_native = section.read_float("PercentAtMax", 1.0);
         let percent_at_max_f64 = f64::from(percent_at_max_native);
         let delay_kill_at_max_f64 = f64::from(section.read_float("DelayKillAtMax", 1.0));
@@ -323,8 +434,12 @@ impl WarheadType {
 
         Self {
             id: id.to_string(),
+            particle_system: None,
             verses_f64,
+            ares_verses: cfg!(feature = "ares").then(AresWarheadVerses::default),
+            ares: None,
             cell_spread_f64,
+            cell_inset_f32,
             percent_at_max_f64,
             causes_delay_kill: section.read_bool("CausesDelayKill", false),
             delay_kill_frames: section.read_int("DelayKillFrames", 5),
@@ -334,12 +449,27 @@ impl WarheadType {
             fire: section.read_bool("Fire", false),
             penetrates_bunker: section.read_bool("PenetratesBunker", false),
             affects_allies: section.read_bool("AffectsAllies", true),
+            affects_owner: section
+                .is_present("AffectsOwner")
+                .then(|| section.read_bool("AffectsOwner", false)),
+            affects_enemies: section.read_bool("AffectsEnemies", true),
+            affects_neutral: section.read_bool("AffectsNeutral", true),
             psychic_damage: section.read_bool("PsychicDamage", false),
             // Conventional, AnimList and EMEffect keep the constructor's false
             // and empty values (`0x0075CF89`, `0x0075CFB3`): the ordered Rules
             // processor owns those reads and RuleSet publishes its result.
             anim_list: Vec::new(),
-            inf_death: section.read_int("InfDeath", 1).clamp(0, 10) as u8,
+            inf_death: section.read_int("InfDeath", Self::DEFAULT_INF_DEATH),
+            deform_f64: section.read_double("Deform", 0.0),
+            deform_threshold: section.read_int("DeformThreshhold", 0),
+            bullets: section.read_bool("Bullets", false),
+            veinhole: section.read_bool("Veinhole", false),
+            // ReadInt current defaults fold each projected Rules pass; there
+            // is no post-read clamp in WarheadTypeClass::ReadINI @0x0075D3A0.
+            shake_x_lo: section.read_int("ShakeXlo", 0),
+            shake_x_hi: section.read_int("ShakeXhi", 0),
+            shake_y_lo: section.read_int("ShakeYlo", 0),
+            shake_y_hi: section.read_int("ShakeYhi", 0),
 
             // Bool fields — all default false
             conventional: false,
@@ -379,6 +509,8 @@ impl WarheadType {
             debris_maximums,
             min_debris,
             max_debris,
+            #[cfg(feature = "phobos")]
+            shield: crate::rules::phobos_shields::ShieldWarheadRules::from_section(section),
         }
     }
 }
@@ -408,23 +540,28 @@ pub(crate) fn read_verses(section: &IniSection, current: [f64; 11]) -> [f64; 11]
 /// unconditionally performs eleven strchr calls and faults on a null strtok
 /// result; this recovery is deliberately not described as native equivalence.
 fn verses_from_tokens(tokens: &[&str]) -> [f64; 11] {
-    // Nearest-rounded host multiplication by the original 0.01 changes retail
-    // HE's integer damage by one for several armor classes.
-    let scale = X87Chop53::load_f64(PERCENT_SCALE).expect("finite original constant");
     let mut out = [1.0_f64; 11];
     for (i, token) in tokens.iter().take(11).enumerate() {
-        out[i] = if token.contains('%') {
-            let scaled = X87Chop53::mul(X87Chop53::load_i32(crt_atoi(token)), scale);
-            f64::from_bits(
-                X87Chop53::store_f64(scaled)
-                    .expect("signed32 percentage is finite")
-                    .bits(),
-            )
-        } else {
-            parse_leading_f64(token)
-        };
+        out[i] = verses_value(token);
     }
     out
+}
+
+/// Numeric token read shared by native Verses75DDCC and Ares100523E0.
+/// A percentage uses signed32 atoi and PC53/chop multiplication, not a
+/// nearest-rounded host product; nonpercent input uses the CRT prefix reader.
+pub(crate) fn verses_value(token: &str) -> f64 {
+    if token.contains('%') {
+        let scale = X87Chop53::load_f64(PERCENT_SCALE).expect("finite original constant");
+        let scaled = X87Chop53::mul(X87Chop53::load_i32(crt_atoi(token)), scale);
+        f64::from_bits(
+            X87Chop53::store_f64(scaled)
+                .expect("signed32 percentage is finite")
+                .bits(),
+        )
+    } else {
+        parse_leading_f64(token)
+    }
 }
 
 #[cfg(test)]
@@ -513,6 +650,22 @@ mod tests {
         assert_eq!(wh.delay_kill_at_max_f64, 1.0);
         assert_eq!(wh.prone_damage_f64, 1.0);
         assert!(!wh.wall);
+    }
+
+    /// `InfDeath=` (`+0x120`): the constructor's 0 (`0x0075CF14`) when no
+    /// layer names it, else ReadInt's value with no clamp
+    /// (`0x0075D75D..0x0075D771`).
+    #[test]
+    fn inf_death_reads_unclamped_over_the_constructor_zero() {
+        let ini = IniFile::from_str(
+            "[Unset]\nFixtureOnly=1\n[Brute]\nInfDeath=10\n[High]\nInfDeath=11\n\
+             [Negative]\nInfDeath=-2\n",
+        );
+        let read = |id| WarheadType::from_ini_section(id, ini.section(id).unwrap()).inf_death;
+        assert_eq!(read("Unset"), 0);
+        assert_eq!(read("Brute"), 10);
+        assert_eq!(read("High"), 11);
+        assert_eq!(read("Negative"), -2);
     }
 
     #[test]

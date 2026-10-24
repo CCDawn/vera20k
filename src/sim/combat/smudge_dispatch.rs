@@ -192,8 +192,10 @@ pub(crate) fn dispatch_anim_middle_marks(
     anim_middle_marks(marks, &mut sink, rng);
 }
 
-/// gamemd's anim scorch-vs-crater 50/50: draw `RandomRanged(0, 0x7FFFFFFE)`,
-/// then choose scorch when `roll * 2^-31 < 0.5`, i.e. `roll < 0x4000_0000`.
+/// gamemd's anim scorch-vs-crater 50/50 (`AnimClass::Middle`,
+/// `0x00425080..0x004250AB`): draw `RandomRanged(0, 0x7FFFFFFE)`, then choose
+/// scorch when `draw * [0x007E3570] < 0.5` (`[0x007E1738]`), i.e.
+/// `draw < 0x4000_0000`.
 ///
 /// This is NOT a single high-bit test. The ranged draw masks to 31 bits and
 /// rejects a masked `0x7FFF_FFFF` (one extra cursor advance), and the accepted
@@ -201,7 +203,7 @@ pub(crate) fn dispatch_anim_middle_marks(
 /// and the accepted set must match the engine, or the shared scenario cursor
 /// and the per-roll scorch/crater outcome drift.
 const SMUDGE_5050_RANGED_HIGH: u32 = 0x7FFF_FFFE;
-const SMUDGE_SCORCH_ACCEPT_BELOW: u32 = 0x4000_0000;
+const SMUDGE_SCORCH_ACCEPT_BELOW: u32 = crate::util::native_random::unit_draw_threshold(0.5);
 fn rng_below_half_normalized(rng: &mut SimRng) -> bool {
     rng.next_range_u32_inclusive(0, SMUDGE_5050_RANGED_HIGH) < SMUDGE_SCORCH_ACCEPT_BELOW
 }
@@ -219,8 +221,8 @@ pub(crate) fn try_dispatch_building_destruction_smudges(
     rx: u16,
     ry: u16,
     building_z: i32,
-    foundation_w: u8,
-    foundation_h: u8,
+    foundation_w: u16,
+    foundation_h: u16,
     art: &ArtRegistry,
     smudge_types: &SmudgeTypeRegistry,
     smudge_grid: &mut SmudgeGrid,
@@ -460,6 +462,19 @@ mod tests {
             rng_below_half_normalized(&mut rng),
             "draw2 below 2^30 selects scorch"
         );
+    }
+
+    /// The executed coin (`0x00425096..0x004250AB`) at its boundary draws:
+    /// under chop, draw `0x3FFFFFFF` scorches.
+    #[test]
+    fn scorch_coin_takes_the_native_boundary_draws() {
+        for (band, draw, passed) in crate::util::native_random::native_gate_rows("scorch") {
+            assert_eq!(
+                draw < SMUDGE_SCORCH_ACCEPT_BELOW,
+                passed,
+                "band {band:e}, draw {draw:#x}"
+            );
+        }
     }
 }
 
@@ -752,8 +767,8 @@ mod dispatch_tests {
                     (int(&location[0]) / 256) as u16,
                     (int(&location[1]) / 256) as u16,
                     int(&location[2]) as i32,
-                    int(&size[0]) as u8,
-                    int(&size[1]) as u8,
+                    int(&size[0]) as u16,
+                    int(&size[1]) as u16,
                     &art,
                     &registry,
                     &mut map.smudges,

@@ -289,11 +289,11 @@ impl Simulation {
         Ok(())
     }
 
-    pub(super) fn construct_spotlight(&mut self, parent_id: u64, rules: Option<&RuleSet>) {
+    pub(super) fn construct_spotlight(&mut self, parent_id: u64, rules: &RuleSet) {
         let Some(parent) = self.substrate.entities.get(parent_id).filter(|e| {
             e.category() == EntityCategory::Structure
-                && rules
-                    .and_then(|r| self.object_type(e.type_ref(), r))
+                && self
+                    .object_type(e.type_ref(), rules)
                     .map_or(e.building_light.spotlight_capable(), |o| o.has_spotlight)
                 && e.building_light.light().is_none()
         }) else {
@@ -301,7 +301,7 @@ impl Simulation {
         };
         let p = raw(parent);
         let facing = parent.body_facing_current(self.session.binary_frame());
-        let params = rules.map_or_else(SpotlightRules::default, |r| r.general.spotlight);
+        let params = rules.general.spotlight;
         let coord = initial_endpoint(p, facing, params.location_radius);
         // ObjectUnlimbo5F4F34 queries the coordinate before entry1AC. This
         // class inherits4264C0 (always0) and GetType4369E0 (null), so it
@@ -316,7 +316,7 @@ impl Simulation {
             }
         }
         let pivot = initial_endpoint(p, facing, params.movement_radius.wrapping_neg());
-        let id = self.allocate_stable_id();
+        let id = self.substrate.allocate_stable_id();
         let native_id = self.next_native_runtime_id();
         let light = Spotlight {
             stable_id: id,
@@ -341,7 +341,14 @@ impl Simulation {
             .unwrap()
             .building_light
             .attach(id);
-        self.submit_object_display(id, DisplayLayer::AIR, rules);
+        Self::submit_object_display(
+            &self.interner,
+            &self.terrain_objects,
+            &mut self.substrate,
+            id,
+            DisplayLayer::AIR,
+            rules,
+        );
         self.register_spotlight_logic(id);
     }
     pub(super) fn destroy_spotlight_for_parent(&mut self, parent: u64, context: UninitContext<'_>) {

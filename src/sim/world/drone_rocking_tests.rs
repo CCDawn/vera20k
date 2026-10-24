@@ -14,7 +14,7 @@ fn ordinary_frame(sim: &mut Simulation, rules: &RuleSet) -> Vec<super::SimFireEv
     let output = sim
         .advance_app_frame(
             &commands,
-            Some(rules),
+            rules,
             None,
             33,
             TickLane::Ordinary,
@@ -52,7 +52,12 @@ impl DroneScene {
         assert!(parasite.parasite);
         assert_eq!(parasite.paralyzes, 0);
         assert_eq!(
-            parasite.verses_f64[crate::sim::combat::armor_index(&tank_type.armor)],
+            f64::from_bits(
+                parasite
+                    .interaction(tank_type.armor_id())
+                    .multiplier()
+                    .bits()
+            ),
             1.0
         );
         let jump = rules.weapon("DroneJump").unwrap();
@@ -279,10 +284,13 @@ fn stock_infested_tank_moves_and_fires_while_its_body_is_rocking() {
     scene.first_bite();
     scene.assert_impulse();
     let target = scene.sim.substrate.entities.get(scene.tank).unwrap();
-    let house = target.owner();
     let before = crate::sim::movement::ground_pose::position_world_coord(&target.position);
+    // The human Americans send the computer tank's Move: the DoList skips computer Houses' events
+    // (0x0064C4FB..0x0064C50D), and MegaMission never compares sender and actor
+    // (0x004C71F6..0x004C721F).
+    let sender = scene.sim.interner.get("Americans").unwrap();
     scene.sim.queue_command(CommandEnvelope::new(
-        house,
+        sender,
         scene.sim.session.tick() + 1,
         Command::Move {
             entity_id: scene.tank,
@@ -324,15 +332,10 @@ fn stock_infested_tank_moves_and_fires_while_its_body_is_rocking() {
         .sim
         .spawn_object("AMCV", "Americans", 22, 24, 0, &scene.rules)
         .expect("ordinary AMCV Unlimbo along the tank's acquired aim");
-    let house = scene
-        .sim
-        .substrate
-        .entities
-        .get(scene.tank)
-        .unwrap()
-        .owner();
+    // The human Americans send this order too.
+    let sender = scene.sim.interner.get("Americans").unwrap();
     scene.sim.queue_command(CommandEnvelope::new(
-        house,
+        sender,
         scene.sim.session.tick() + 1,
         Command::Attack {
             attacker_id: scene.tank,

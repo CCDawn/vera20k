@@ -136,7 +136,7 @@ fn fixture(input: &serde_json::Value) -> (Simulation, RuleSet) {
     sim.scenario_rng = SimRng::new(31);
     sim.session.set_binary_frame_for_test(frame);
     let [x, y] = ints(&input["cell"], [60, 64]);
-    assert_eq!(sim.allocate_stable_id(), AIRCRAFT);
+    assert_eq!(sim.substrate.allocate_stable_id(), AIRCRAFT);
     insert_entity(&mut sim, AIRCRAFT, EntityCategory::Aircraft);
     let entity = sim.substrate.entities.get_mut(AIRCRAFT).unwrap();
     entity.lifecycle.set_object_alive_for_test(true);
@@ -217,7 +217,15 @@ fn fixture(input: &serde_json::Value) -> (Simulation, RuleSet) {
     fly.set_current_speed_for_test(SimFixed::from_num(input["speed"].as_f64().unwrap_or(1.0)));
     Simulation::aircraft_tracker_add(&sim.session, &mut sim.substrate, AIRCRAFT);
     sim.add_entity_occupancy(AIRCRAFT);
-    sim.submit_entity_display(AIRCRAFT, Some(&rules), None);
+    Simulation::submit_entity_display(
+        &sim.interner,
+        &sim.terrain_objects,
+        &mut sim.substrate,
+        &sim.resolved_terrain,
+        AIRCRAFT,
+        &rules,
+        None,
+    );
 
     let owner = sim.substrate.entities.get(AIRCRAFT).unwrap().owner();
     if input["target"].is_array() {
@@ -267,7 +275,7 @@ fn fixture(input: &serde_json::Value) -> (Simulation, RuleSet) {
         building.lifecycle.set_object_alive_for_test(true);
         building
             .type_facts
-            .set_foundation_for_test(format!("{width}x{height}"));
+            .set_foundation_for_test(format!("{width}x{height}").into());
         building.position.set_exact_z_leptons_for_test(Some(0));
         building
             .radio_contacts
@@ -386,7 +394,7 @@ fn stop_fixture(input: &serde_json::Value) -> (Simulation, RuleSet) {
         structure.lifecycle.set_object_alive_for_test(true);
         structure
             .type_facts
-            .set_foundation_for_test(format!("{width}x{height}"));
+            .set_foundation_for_test(format!("{width}x{height}").into());
         structure.position.set_exact_z_leptons_for_test(Some(0));
         sim.substrate.entities.insert(structure);
         if flag(building, "limbo", false) {
@@ -496,7 +504,7 @@ fn fly_process_matches_native_frames() {
             let ((), idle_calls) = crate::sim::aircraft::record_idle_calls_for_test(|| {
                 sim.tick_air_movement_with_cell_lists_one(
                     AIRCRAFT,
-                    Some(&rules),
+                    &rules,
                     None,
                     crate::sim::world::FrameEffects::default(),
                 )
@@ -739,7 +747,7 @@ fn fly_death_stun_matches_native_rows() {
         sim.clear_lifecycle_test_events_for_test();
         sim.techno_death_stun(
             AIRCRAFT,
-            crate::sim::world::UninitContext::new(Some(&rules), None),
+            crate::sim::world::UninitContext::new(&rules, None),
         );
         let orders: Vec<_> = sim
             .lifecycle_test_events_for_test()

@@ -84,14 +84,12 @@ fn seed_queue(
                 }
             })
             .collect();
-        let mut heap = vec![0];
-        heap.extend(
-            prepared["heap_indices"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|i| i.as_u64().unwrap() as u32),
-        );
+        let heap = prepared["heap_indices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i.as_u64().unwrap() as u32)
+            .collect();
         let bitmap = prepared["bitmap"]
             .as_array()
             .unwrap()
@@ -101,8 +99,7 @@ fn seed_queue(
         return (
             NativeTiberiumQueue {
                 entries,
-                heap,
-                capacity,
+                heap: NativeHeap::from_native_slots(heap, capacity as usize),
             },
             bitmap,
         );
@@ -125,18 +122,16 @@ fn seed_queue(
         };
         count
     ];
-    let mut heap = vec![0];
-    if selected {
-        heap.extend(
-            input["pre_heap_indices"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|i| i.as_u64().unwrap() as u32),
-        );
+    let heap = if selected {
+        input["pre_heap_indices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i.as_u64().unwrap() as u32)
+            .collect()
     } else {
-        heap.push(0);
-    }
+        vec![0]
+    };
     let bitmap = if selected {
         input["pre_bitmap"]
             .as_array()
@@ -150,8 +145,7 @@ fn seed_queue(
     (
         NativeTiberiumQueue {
             entries,
-            heap,
-            capacity,
+            heap: NativeHeap::from_native_slots(heap, capacity as usize),
         },
         bitmap,
     )
@@ -160,7 +154,7 @@ fn seed_queue(
 fn queue_state(queue: &NativeTiberiumQueue, bitmap: &BTreeSet<(u16, u16)>) -> Value {
     json!({"array_count": queue.array_len(),
         "entries": queue.entries.iter().map(|e| json!({"cell":[e.rx,e.ry],"priority_bits":e.priority_bits})).collect::<Vec<_>>(),
-        "heap_indices": &queue.heap[1..],
+        "heap_indices": queue.heap.as_slice(),
         "bitmap_cells": bitmap.iter().map(|&(x,y)| [x,y]).collect::<Vec<_>>()})
 }
 
@@ -670,7 +664,12 @@ fn compare_case(row: &Value) {
             }
             other => panic!("unhandled native entry {other}"),
         });
-        constructors.publish_overlay_constructions(constructed);
+        Simulation::publish_overlay_constructions(
+            &mut constructors.native_unique_ids,
+            &mut constructors.load_objects,
+            &mut constructors.substrate,
+            constructed,
+        );
         if matches!(
             input["entry"].as_str().unwrap(),
             "spread_processor" | "spread_driver" | "growth_then_spread_driver"
@@ -703,7 +702,7 @@ fn compare_case(row: &Value) {
         if let Some(expected) = row["after_drains"].get(step) {
             compare_dummy(&terrain, &expected["state"], name);
             constructors.process_pending_delete_with(
-                None,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
                 None,
                 crate::sim::world::FrameEffects::default(),
                 1,

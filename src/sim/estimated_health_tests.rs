@@ -40,6 +40,7 @@ fn actual_object_ai_recovers_each_category_on_binary_frame_mask() {
         entity.health.set_for_test(100);
         entity.estimated_health = EstimatedHealth::from_raw(-100);
         sim.substrate.entities.insert(entity);
+        sim.interner = crate::sim::intern::test_interner();
         sim.set_logic_order_for_test(vec![1]);
         sim.session.set_tick_for_test(4);
         sim.session.set_binary_frame_for_test(3);
@@ -115,6 +116,7 @@ fn active_tube_bypasses_recovery_until_ordinary_ai_resumes() {
             },
         ));
         sim.substrate.entities.insert(entity);
+        sim.interner = crate::sim::intern::test_interner();
         sim.set_logic_order_for_test(vec![1]);
         sim.session.set_binary_frame_for_test(4);
         sim.object_ai_stage(None);
@@ -150,7 +152,7 @@ fn save_restore_preserves_negative_reservations_and_ai_continuation() {
     use crate::sim::snapshot::GameSnapshot;
 
     let mut sim = Simulation::new();
-    let id = sim.allocate_stable_id();
+    let id = sim.substrate.allocate_stable_id();
     let mut entity = GameEntity::test_default(id, "E1", "Americans", 5, 5);
     entity.set_category_for_test(EntityCategory::Infantry);
     entity.lifecycle.set_in_limbo_for_test(false);
