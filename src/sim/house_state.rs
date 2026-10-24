@@ -564,6 +564,14 @@ pub struct HouseState {
     /// byte, so it stays out of the retail-state concerns entirely.
     #[serde(default)]
     command_driven: bool,
+    /// Fork-only tier mark (`docs/superai.md`): which Super-AI treatment a
+    /// command-driven house launched with, so the driver rebuild (fresh
+    /// launch and saved-game restore alike) recovers the exact tier instead
+    /// of guessing from the build-time scale. `None` for every native house
+    /// and pre-mark saves, which fall back to the scale heuristic. Like the
+    /// flag above it stays out of every native-state concern.
+    #[serde(default)]
+    super_tier: Option<crate::super_ai::SuperAiDifficulty>,
     /// The HouseType's `Cost*Mult=`, projected from the rules at creation.
     /// Like the flag above it is the type's, so it is left out of the state
     /// hash.
@@ -1030,10 +1038,12 @@ impl HouseState {
 
     /// Fork-only: hand this house's decisions to the external command-layer
     /// driver (`docs/superai.md`); the native AI rungs stand down for it and
-    /// the launch's tier treatment supplies its opening credits. Not a gamemd
-    /// port.
-    pub fn make_command_driven(&mut self) {
+    /// the launch's tier treatment supplies its opening credits. The tier
+    /// mark rides along so the driver rebuild recovers it later. Not a
+    /// gamemd port.
+    pub fn make_command_driven(&mut self, tier: crate::super_ai::SuperAiDifficulty) {
         self.command_driven = true;
+        self.super_tier = Some(tier);
     }
 
     /// Player control (`+0x1ED`): Create_Houses (`688109..10F`) grants it to
@@ -1381,6 +1391,13 @@ impl HouseState {
     /// rungs read this to stand down for a command-layer-driven house.
     pub const fn command_driven(&self) -> bool {
         self.command_driven
+    }
+
+    /// The fork-only Super-AI tier this command-driven house launched with
+    /// (fork-only, `docs/superai.md`); `None` for native houses and saves
+    /// written before the mark existed.
+    pub const fn super_tier(&self) -> Option<crate::super_ai::SuperAiDifficulty> {
+        self.super_tier
     }
 
     pub const fn country_cost_mults(&self) -> CountryCostMults {
@@ -2532,6 +2549,7 @@ impl HouseState {
             difficulty_biases: HouseDifficultyBiases::default(),
             multiplay_passive: false,
             command_driven: false,
+            super_tier: None,
             country_cost_mults: CountryCostMults::default(),
             country_speed_mults: CountrySpeedMults::default(),
             is_defeated: false,

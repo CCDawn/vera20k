@@ -1,9 +1,12 @@
-# Super AI — fork development plan
+# 超级AI (Super AI) — fork development plan
 
 This branch group (`superai/*`) is a fork-only feature line: a command-layer
-"super AI" player and a headless win-rate bench. It tracks upstream
-`YuriPlanet/vera20k` `main` and keeps its footprint outside `src/sim/` (two
-documented exceptions, below). Licensed GPL like the rest of the tree.
+"super AI" player and a headless win-rate bench. The project's public name is
+**超级AI / Super AI**; the in-game rows stay English (`Super AI`,
+`Super AI MAX`) because the retail font carries no CJK glyphs. It tracks
+upstream `YuriPlanet/vera20k` `main` and keeps its footprint outside
+`src/sim/` (two documented exceptions, below). Licensed GPL like the rest of
+the tree.
 
 ## Positioning
 
@@ -14,19 +17,32 @@ determinism, replays and upstream merges intact.
 
 ## Difficulty tiers
 
-| Tier   | Strength sources                                             |
-|--------|--------------------------------------------------------------|
-| Fair   | None. Decisions only. Baseline for win-rate measurement.     |
-| Brutal | Fair + the native Hard AI's opening grant plus a recurring   |
-|        | credit bonus (+1000 per 600 ticks in the bench harness).     |
-| Super  | Brutal + per-house build times scaled ×0.5 (fast build).     |
+| Tier     | Strength sources                                             |
+|----------|--------------------------------------------------------------|
+| Fair     | None. Decisions only. Baseline for win-rate measurement.     |
+| Brutal   | Fair + the native Hard AI's opening grant plus a recurring   |
+|          | credit bonus (+1000 per 600 ticks in the bench harness).     |
+| Super    | Brutal + per-house build times scaled ×0.5 (fast build).     |
+| Unlimited| Super's whole treatment plus a per-tick wallet floor topped   |
+|          | up to 1,000,000 (`UNLIMITED_WALLET_FLOOR`). Spectacle tier    |
+|          | for watching the strategy spend without an economy behind    |
+|          | it — strength claims never cite it.                           |
 
 The tier treatment is applied by the harness (`apply_super_ai_tier` in
 `headless_scenario.rs` plus the bench's drip), not by the strategy: Brutal and
 Super re-use `native_ai_opening_grant` — the same kernel behind retail
 `[General] MultiplayerAICM=400,0,0`'s Hard row — so the grant itself is a
-native calculation, and the recurring drip goes through `Economy::add_credits`,
-the entry native credit actions already use.
+native calculation, and the recurring drip and the Unlimited floor both go
+through `Economy::add_credits`, the entry native credit actions already use.
+The launch's `sim_tick` applies the same rules as the bench every ordinary
+tick, so the tier behaves identically in-game and headless. The tier a house
+launched with rides the house itself (`HouseState::super_tier`), so the driver
+rebuild — fresh launch and saved-game restore alike — recovers it exactly;
+saves written before the mark fall back to the build-scale heuristic.
+
+The Unlimited floor deliberately cannot wedge the strategy: the
+income-recovery cancel rule (below) fires only when the wallet genuinely
+cannot finish the queued item, and a topped-up wallet finishes anything.
 
 The build-speed multiplier is simulation-side by nature (INI mods change the
 same native parameters). Super tier therefore allows exactly one minimal
@@ -39,9 +55,11 @@ Nothing else in `src/sim/` may depend on super-AI code.
 
 ## In-game selection and the command-driven house
 
-The Super AI is selectable before the match. The skirmish lobby offers a
-**Super AI** opponent row (persisted as its own slot code) that packs the
-native Hard difficulty plus a `super_tier` marker on the launch slot.
+The Super AI is selectable before the match. The skirmish lobby offers two
+fork-only opponent rows — **Super AI** (persisted as its own slot code) and
+**Super AI MAX** (Unlimited: the same treatment plus the wallet floor) — each
+packing the native Hard difficulty plus a `super_tier` marker on the launch
+slot.
 `populate_launch_houses` turns a marked slot into a **command-driven
 house**: it keeps the tier treatment above (Hard row grant, Super build
 scale) and sets `command_driven`, and the native AI's decision loops
@@ -49,9 +67,11 @@ scale) and sets `command_driven`, and the native AI's decision loops
 locomotor lifts) stand down for that house — the native AI and the
 command layer must not both drive one house. The app's match loop then
 rebuilds one `SuperAi` per command-driven non-passive non-human house on
-every runtime install (fresh match and saved game) and merges its orders
+every runtime install (fresh match and saved game, tier read back from
+`HouseState::super_tier`) and merges its orders
 into the tick's command stream on the Ordinary lane, including the
-Brutal/Super credit drip the bench harness applies. An ordinary computer
+Brutal/Super credit drip and the Unlimited floor the bench harness
+applies. An ordinary computer
 slot is untouched: native AI, native grants, no drip.
 
 Targeting is alliance-aware (both directions, in-game diplomacy can be
@@ -283,6 +303,89 @@ Weather Controller, four war factories, an IFV and a Guardian GI all
 stand; a Russian house driven until its Soviet radar stands with zero
 Allied radars in the base; and a superweapons-off Battle driven past
 the battle lab with no superweapon ever built or granted.
+
+The base-guns slice arms the perimeter with retail defense structures:
+a defense limb between the ladder walk and the growth tail queues the
+side's three guns — the basic pillbox up to a quota of two, anti-air
+while the enemy actually fields aircraft (the same
+`AIR_THREAT_TYPES` the roster wheel reads), and the heavy tower once
+the side's own radar stands, capped at two each. The radar gate is
+load-bearing: the native `can_build` answers Yes without prerequisites
+for a house no human controls (the quirk that forced the radar
+side-scoping), so the AI checks the radar's standing count itself
+instead of trusting the cameo the Prism Tower and Tesla Coil would
+light up early — their retail `Prerequisite=` chains name the radar.
+Names come from retail INI, not guesswork: Allied Pillbox `GAPILL`,
+Patriot `NASAM`, Prism Tower `ATESLA`; Soviet Sentry `NALASR`, Flak
+Cannon `NAFLAK`, Tesla Coil `[TESLA]` (`NATSLA` is only its firing-anim
+prefix); Yuri's Gatling Cannon `YAGGUN` serves both the pillbox and the
+AA slots, the Psychic Tower `YAPSYT` waits behind `NAPSIS`. Guns ride
+the same yard-centered ring scan as every other structure and the same
+cameo admission, so a gun this house cannot field falls through to the
+next limb — and each gun queues only from a wallet that can pay for it
+outright: a broke base that queues a 1500-credit tower parks it in the
+one building slot at zero progress forever (observed: factories stuck at
+three while the Prism Tower held the queue for the rest of the game),
+starving the growth tail behind it. Poor bases expand; rich bases arm.
+The fair_growth regression now requires two perimeter guns
+standing in its end census.
+
+The income-recovery rule fixes a total freeze observed in live play:
+after the first marches traded away, a counter-raid razed the
+refineries — and from that moment nothing was ever built again. The
+mechanism is a three-way wedge: the single structure queue held an
+expensive climb piece (the 5000-credit Weather Controller) that the now
+-zero income could never finish and nothing ever cancelled, so the
+refinery rebuild never got the slot; and with the climb piece still in
+the queue the climb's credit throttle held the barracks and war-factory
+queues closed too. The rule: while no refinery stands, cancel every
+queued structure that is not itself the economy (refinery, power
+plant) — the native ABANDON (`HouseClass::Abandon_Production @
+0x004FAA10`, issued as `Command::CancelProductionByType`). The freed
+slot goes straight back to the ladder's refinery step (a standing-count
+ladder re-enters razed steps by itself), and with the climb piece gone
+the throttle reopens and the unit queues resume from banked credits
+while the refinery rebuilds. The check runs ahead of the ladder walk on
+purpose: the wedged state it fixes is exactly the one where the queue
+is busy and the ladder never runs.
+
+The heroes-and-air slice completes the roster the situation slice left
+starved. **Rotation replaces first-fit** in the mix wheel's pick: the
+deficit role's buildable entry with the fewest standing units claims the
+slot. First-fit starved every entry listed behind a rival — a whole game
+passed without Tanya while the cheaper Ghost and Sniper held her role's
+slots — and plain rotation still starved her under attrition (ties break
+by roster order, and every death reset the tie to the cheap entries at
+the top), so each hero now leads his role in the table: the hero claims
+the fresh slot and the rebuild after he falls, his retail `BuildLimit=1`
+darkening his own cameo once he stands, and the cheaper entries rotate
+behind him. Every entry whose retail `Prerequisite=` carries real weight
+now carries it as a standing building gate (`needs`): the AI house's
+`CanBuild` skips prerequisite chains (the quirk behind the radar
+side-scoping), so the Mirage Tank, Battle Fortress, Tanya, Boris, Yuri
+Prime, the Siege Chopper, the Kirov and the Floating Disk wait for their
+battle labs here instead of fielding unearned tier-3 units, and the
+Robot Tank waits for a Robot Control Center the ladder never builds (its
+retail prerequisite names one; fielding robots without it produces inert
+tanks). **Air power splits by its retail tab**: the Kirov `ZEP`, Siege
+Chopper `SCHP` and Floating Disk `DISK` are `VehicleTypes` —
+war-factory aircraft that ride the vehicle roster with a lab gate —
+while only the Allied side owns an aircraft-tab factory
+(`Factory=AircraftType` on `GAAIRC`/`AMRADR`, the same building the
+ladder's radar step raises). The Allied wing tops up to four jets on its
+own Aircraft-category queue (Korea's Black Eagle `BEAG` first, the
+shared Intruder `ORCA` behind), sorted by the native `can_build` gate —
+the cameo's draw brightness knows nothing of country locks, and a
+cameo-sorted pick queued a Black Eagle an Americans house can never
+produce, wedging the wing for a whole game (observed). Idle jets fly a
+coordinated sortie against the top enemy priority target on a 900-tick
+cooldown — they return, land and rearm natively while it holds. The
+fair_growth census now requires a standing Tanya and at least one jet
+alongside the earlier growth facts. Residuals: the specialist ground
+units still do not march with attack waves (core-type dispatch only, as
+before), and sorties' in-flight behavior under the command layer's
+Attack order rides the native aircraft mission machinery untested until
+the next live session.
 
 ## Upstream sync
 

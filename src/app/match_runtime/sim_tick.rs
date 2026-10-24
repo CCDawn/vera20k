@@ -1017,16 +1017,26 @@ fn advance_one_simulation_frame(
             };
             // Fork-only Super-AI opponents (`docs/superai.md`): the command
             // layer drives each command-driven house — its orders merge into
-            // this frame's commands, and the tier's recurring credit bonus
-            // (+1000 per 600 ticks, the same drip the bench applies) rides
-            // along. Ordinary lane only, like every other command source.
+            // this frame's commands — and the tier's credit support rides
+            // along: Brutal/Super take the recurring bonus (+1000 per 600
+            // ticks, the same drip the bench applies), Unlimited tops its
+            // wallet up to `UNLIMITED_WALLET_FLOOR` every tick. Ordinary
+            // lane only, like every other command source.
             let mut due_commands = due_commands;
             if tick_lane == TickLane::Ordinary && !state.match_state.super_players.is_empty() {
                 let tick = sim.session().tick();
                 let mut super_players = std::mem::take(&mut state.match_state.super_players);
                 for ai in super_players.iter_mut() {
                     due_commands.extend(ai.orders(rt, u32::try_from(tick).unwrap_or(u32::MAX)));
-                    if ai.difficulty() != crate::super_ai::SuperAiDifficulty::Fair
+                    if ai.difficulty() == crate::super_ai::SuperAiDifficulty::Unlimited {
+                        let owner = rt.simulation.interner.resolve(ai.house()).to_string();
+                        let wallet =
+                            crate::sim::production::credits_for_owner(&rt.simulation, &owner);
+                        let floor = crate::super_ai::UNLIMITED_WALLET_FLOOR;
+                        if wallet < floor {
+                            rt.grant_house_credits(ai.house(), floor - wallet);
+                        }
+                    } else if ai.difficulty() != crate::super_ai::SuperAiDifficulty::Fair
                         && tick > 0
                         && tick % 600 == 0
                     {

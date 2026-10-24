@@ -1535,9 +1535,10 @@ fn ai_row_type_from_persisted(value: i32) -> SkirmishAiRowType {
         4 => SkirmishAiRowType::Hard,
         5 => SkirmishAiRowType::Normal,
         6 => SkirmishAiRowType::Easy,
-        // Fork-only Super AI row; an upstream build reading this save falls
+        // Fork-only Super AI rows; an upstream build reading this save falls
         // back to the None row rather than misreading it as a native one.
         7 => SkirmishAiRowType::SuperAI,
+        8 => SkirmishAiRowType::SuperAIUnlimited,
         _ => SkirmishAiRowType::None,
     }
 }
@@ -1548,9 +1549,10 @@ fn persisted_row_type(value: SkirmishAiRowType) -> i32 {
         SkirmishAiRowType::Hard => 4,
         SkirmishAiRowType::Normal => 5,
         SkirmishAiRowType::Easy => 6,
-        // Fork-only code beyond the native 4/5/6; the reader above knows it,
-        // and an upstream build falls back to the None row on it.
+        // Fork-only codes beyond the native 4/5/6; the reader above knows
+        // them, and an upstream build falls back to the None row on them.
         SkirmishAiRowType::SuperAI => 7,
+        SkirmishAiRowType::SuperAIUnlimited => 8,
     }
 }
 

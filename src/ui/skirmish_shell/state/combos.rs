@@ -243,6 +243,7 @@ pub fn combo_items(
             SkirmishAiRowType::Normal,
             SkirmishAiRowType::Hard,
             SkirmishAiRowType::SuperAI,
+            SkirmishAiRowType::SuperAIUnlimited,
         ]
         .into_iter()
         .map(SkirmishComboItem::AiType)

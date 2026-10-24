@@ -202,8 +202,11 @@ fn parse_args() -> Result<Args, String> {
                     "fair" => vera20k_core::super_ai::SuperAiDifficulty::Fair,
                     "brutal" => vera20k_core::super_ai::SuperAiDifficulty::Brutal,
                     "super" => vera20k_core::super_ai::SuperAiDifficulty::Super,
+                    "unlimited" => vera20k_core::super_ai::SuperAiDifficulty::Unlimited,
                     other => {
-                        return Err(format!("unknown super tier {other}: fair, brutal or super"));
+                        return Err(format!(
+                            "unknown super tier {other}: fair, brutal, super or unlimited"
+                        ));
                     }
                 }
             }

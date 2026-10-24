@@ -102,11 +102,17 @@ impl MatchState {
                         state.command_driven() && !state.multiplay_passive() && !state.is_human()
                     })
                     .map(|(&house, state)| {
-                        let tier = if state.native_build_time_scale().is_some() {
-                            crate::super_ai::SuperAiDifficulty::Super
-                        } else {
-                            crate::super_ai::SuperAiDifficulty::Brutal
-                        };
+                        // The house carries its launch tier mark; saves from
+                        // before the mark fall back to the build-scale
+                        // heuristic (a scale marks Super, a scale-less
+                        // command-driven house is Brutal).
+                        let tier = state.super_tier().unwrap_or(
+                            if state.native_build_time_scale().is_some() {
+                                crate::super_ai::SuperAiDifficulty::Super
+                            } else {
+                                crate::super_ai::SuperAiDifficulty::Brutal
+                            },
+                        );
                         crate::super_ai::SuperAi::new(house, tier)
                     })
                     .collect()

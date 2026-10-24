@@ -1803,7 +1803,7 @@ pub fn populate_launch_houses(
         // grant here replaces this pass's `apply_skirmish_ai_opening_credits`
         // for the house, which skips command-driven houses.
         if let Some(tier) = slot.super_tier {
-            house.make_command_driven();
+            house.make_command_driven(tier);
             apply_super_ai_tier_to_house(&mut house, rules, tier);
         }
         sim.houses.register(house);
@@ -1844,7 +1844,9 @@ pub(crate) fn native_ai_opening_grant(coefficient: i32, money: i32) -> i32 {
 /// `[General] MultiplayerAICM` HARD row regardless of the house's own native
 /// difficulty — and Super additionally halves the house's production build
 /// times (`HouseState::set_native_build_time_scale`, 0.5f32), the fork's one
-/// documented simulation-side exception. Fair takes nothing: the tier exists
+/// documented simulation-side exception. Unlimited takes Super's whole
+/// treatment (the per-tick wallet floor the driver adds is a launch-loop
+/// grant, not house state). Fair takes nothing: the tier exists
 /// so strength claims can cite exactly what a pure decision layer achieves.
 ///
 /// The one owner of the tier kernel; the headless harness
@@ -1868,8 +1870,13 @@ pub(crate) fn apply_super_ai_tier_to_house(
         .unwrap_or(0);
     let grant = native_ai_opening_grant(coefficient, state.economy().available_money());
     state.economy_mut().add_credits(grant);
-    if tier == SuperAiDifficulty::Super {
-        // 0.5f32: build twice as fast as the native chain.
+    if matches!(
+        tier,
+        SuperAiDifficulty::Super | SuperAiDifficulty::Unlimited
+    ) {
+        // 0.5f32: build twice as fast as the native chain. Unlimited is
+        // Super's treatment plus the per-tick wallet floor the driver
+        // rebuild applies (`UNLIMITED_WALLET_FLOOR`).
         state.set_native_build_time_scale(crate::util::native_x87::NativeF32Bits::from_bits(
             0x3F00_0000,
         ));
