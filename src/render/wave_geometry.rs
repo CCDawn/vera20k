@@ -57,6 +57,19 @@ pub(crate) struct PolygonSpans {
 /// Original polygon63F080 and edge63F2E0. Wave0/3 supply convex six-/
 /// four-point polygons. Top-chain orientation, initial skip and the right-side
 /// minus-one are preserved before clipping; GPU triangulation would differ.
+///
+/// The Wave0 birth and terminal-decay projections degenerate to an out-and-
+/// back slit `[c, source, d, d, source, c]` once fade_in reaches fade_out
+/// (point-blank fire collapses it entirely), and a slit side whose source
+/// vertex is the vertical extreme re-ascends past the maximum vertex. Native
+/// expects exactly that:63F080 walks each side until the index63F267/63F2CC
+/// equals the maximum, its unbounded63F2E0 writes land in the
+/// `count*8+0x640` allocation at63F1DF, and the75FA90/7602E0 raster consumes
+/// exactly the first count rows. Emission is therefore clamped at count
+/// instead of asserting convex coverage: the consumed rows stay byte-identical
+/// (convex polygons are corpus-pinned; a slit side's first count rows are its
+/// ascending chain), and the never-read overshoot is dropped rather than
+/// indexed out of bounds.
 pub(crate) fn polygon_spans(points: &[[i32; 2]]) -> PolygonSpans {
     let mut minimum = 0;
     let mut maximum = 0;
@@ -134,7 +147,11 @@ pub(crate) fn polygon_spans(points: &[[i32; 2]]) -> PolygonSpans {
                 end[0] = end[0].wrapping_sub(1);
             }
             span_edge(start, end, skip, |x| {
-                spans.rows[row][side] = x;
+                //63F080 writes the whole walked chain into slack the raster
+                //never reads; only the first count rows are consumed.
+                if row < spans.rows.len() {
+                    spans.rows[row][side] = x;
+                }
                 row += 1;
             });
             index = following;
@@ -143,7 +160,6 @@ pub(crate) fn polygon_spans(points: &[[i32; 2]]) -> PolygonSpans {
                 break;
             }
         }
-        assert_eq!(row, spans.rows.len(), "native convex polygon edge coverage");
     }
     spans
 }
