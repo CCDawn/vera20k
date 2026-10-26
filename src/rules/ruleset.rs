@@ -7206,6 +7206,7 @@ impl RuleSet {
         for kind in &self.voxel_anim_types {
             kind.damage.hash(&mut hasher);
         }
+        self.combat_damage.flame_damage().hash(&mut hasher);
         (
             self.combat_damage.flame_damage2(),
             &self.bridge_warheads.c4_name,
