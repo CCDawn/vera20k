@@ -90,6 +90,7 @@ pub(crate) fn fallback_map_load_result() -> init::MapLoadResult {
             sw_sidebar_ui: crate::rules::phobos_sw_sidebar::SuperWeaponSidebarUi::default(),
             #[cfg(feature = "phobos")]
             sw_sidebar_art: None,
+            outcome_banner_side_art: None,
             software_cursor: None,
             overlay_names: BTreeMap::new(),
             overlay_radar_colors: HashMap::new(),
@@ -214,6 +215,7 @@ pub(crate) fn install_world_presentation(
             .sw_sidebar
             .configure(assets.sw_sidebar_ui, significance);
     }
+    state.match_state.match_presentation.outcome_banner_side_art = assets.outcome_banner_side_art;
     // GAME.FNT is process artwork, so retain the established process fallback
     // when optional font preparation did not produce a replacement.
     if let Some(ref fnt) = assets.fnt_file {

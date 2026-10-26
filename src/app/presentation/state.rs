@@ -43,6 +43,11 @@ pub(crate) struct MatchPresentationState {
     pub(crate) bridge_atlas: Option<BridgeAtlas>,
     pub(crate) sidebar_cameo_atlas: Option<SidebarCameoAtlas>,
     pub(crate) sidebar_chrome: Option<SidebarChromeSet>,
+    /// This match's Ares `GraphicalText.Image/Palette` overlay art, rebuilt
+    /// with the incoming world like the sidebar chrome. `None` keeps the
+    /// process InitGame GRFXTXT art.
+    pub(crate) outcome_banner_side_art:
+        Option<crate::app::presentation::outcome_banner::OutcomeBannerArt>,
     pub(crate) software_cursor: Option<crate::app::presentation::render::SoftwareCursor>,
     pub(crate) terrain_grid: Option<TerrainGrid>,
     /// Overlay entries from map for per-frame instance generation.

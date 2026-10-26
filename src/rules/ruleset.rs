@@ -8587,6 +8587,22 @@ impl RuleSet {
             .filter_map(|extension| extension.parachute_anim.as_ref()?.as_deref())
     }
 
+    /// `[Side] GraphicalText.Image=` (SideExt `+0x1F8`) and
+    /// `[Side] GraphicalText.Palette=` (`+0x218`).
+    /// `Game_LoadUI_LoadSideData` (`0x1002F4A0`) loads each into its own
+    /// tactical-overlay slot, and `TacticalClass_DrawOverlay_GraphicalText`
+    /// (`0x1002FAD0`, patch site `0x6D4E79`) reads them through `0x1002DF10` /
+    /// `0x1002DF00`, which fall back to InitGame's literal `GRFXTXT` files per
+    /// slot. `None` when the installed build has no SideExt for this index.
+    #[cfg(feature = "ares")]
+    pub fn side_graphical_text(&self, side: i32) -> Option<(Option<&str>, Option<&str>)> {
+        let extension = self.side_extension(side)?;
+        Some((
+            extension.graphical_text_image.as_deref(),
+            extension.graphical_text_palette.as_deref(),
+        ))
+    }
+
     /// Return the country's effective side after its optional `Side=`
     /// override has superseded `[Sides]` membership.
     pub fn country_side_index(&self, id: &str) -> Option<SideIdx> {

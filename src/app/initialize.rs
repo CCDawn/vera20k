@@ -949,6 +949,7 @@ impl App {
                     bridge_atlas: None,
                     sidebar_cameo_atlas: None,
                     sidebar_chrome: None,
+                    outcome_banner_side_art: None,
                     software_cursor: startup_software_cursor,
                 },
                 match_audio: Default::default(),

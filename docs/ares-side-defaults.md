@@ -21,14 +21,20 @@ while a side's own section can replace them:
 | `ParaDrop.Aircraft` | `PDPLANE` resolved at SideExt initialization; `none` falls back to `PDPLANE` | paradrop plane |
 | `Parachute.Anim` | unset: the existing `[General] Parachute=` / NPSE `VehicleParachute=` owner; `none`: `PARACH` | attached canopy |
 | `ToolTipColor` | `164,210,255` | in-game tooltip text/border |
+| `GraphicalText.Image` + `GraphicalText.Palette` | unset: InitGame's literal `GRFXTXT.SHP` / `.PAL` | victory/defeat banner (`app::presentation::outcome_banner`) |
 | `MessageTextColor` | runtime ColorScheme 21 (`[Colors]` entry 10) | map-action 11 message |
 | `Sidebar.MixFileIndex` | 1 | sidebar MIX |
 | `Sidebar.YuriFileNames` | no | sidebar filenames |
 | `EVA.Tag` | index 0 (Allied) | EVA queue |
 
 The SideExt reader also retains `HunterSeeker`, the seven campaign and
-multiplayer score-screen filenames, four score themes, `GraphicalText.*` and
-`DialogBackground.*`. Those values have no consumer in this chain yet.
+multiplayer score-screen filenames, four score themes and `DialogBackground.*`;
+those have no consumer in this chain yet. `GraphicalText.*` is consumed by the
+victory/defeat banner: `Game_LoadUI_LoadSideData` (`0x1002F4A0`) loads the
+local side's two files into the overlay slots through the writer at
+`0x1002ECC0`, and the draw hook `0x1002FAD0` (patch site `0x6D4E79`) reads each
+slot through `0x1002DF00` / `0x1002DF10`, which fall back to InitGame's literal
+`GRFXTXT` surface per slot.
 
 ## Reader semantics
 
@@ -76,8 +82,8 @@ same build as `tools/rules_oracle/ares_side_sidebar.py`):
 
 ## Residuals
 
-- **Score screens and themes**, `GraphicalText.*` and `DialogBackground.*`
-  are retained but not drawn; those are separate UI mechanisms.
+- **Score screens and themes** and `DialogBackground.*` are retained but not
+  drawn; those are separate UI mechanisms.
 - **HunterSeeker** is retained but the Hunter Seeker superweapon launch is
   not ported, so it has no effect.
 - **Vehicle entries in `ParaDrop.Types`** are retained but the passenger

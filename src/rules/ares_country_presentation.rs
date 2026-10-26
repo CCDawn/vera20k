@@ -124,9 +124,8 @@ impl AresCountryPresentation {
     /// (`0x10008CC0`), then `ListIndex`.
     pub(crate) fn read_common(&mut self, section: &crate::rules::ini_parser::IniSection) {
         self.random_weight = section.read_ares_int("RandomSelectionWeight", self.random_weight);
-        if let Some(weight) = section.read_ares_int_value("AIRandomSelectionWeight") {
-            self.ai_random_weight = Some(weight);
-        }
+        self.ai_random_weight =
+            section.read_ares_nullable_int("AIRandomSelectionWeight", self.ai_random_weight);
         self.list_index = section.read_ares_int("ListIndex", self.list_index);
     }
 
