@@ -26,8 +26,8 @@ mod launcher_options;
 pub(crate) use launcher_options::render_launcher_options;
 mod modals;
 mod network_failure;
-pub(crate) use network_failure::render_network_failure;
 pub(crate) use modals::render_saved_game_loading;
+pub(crate) use network_failure::render_network_failure;
 mod preview;
 mod text;
 

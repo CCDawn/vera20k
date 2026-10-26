@@ -2099,7 +2099,10 @@ impl MatchSession {
         }
     }
 
-    pub(crate) fn request_beacon(&mut self, record: crate::net::lan_messages::ingame::BeaconRecord) {
+    pub(crate) fn request_beacon(
+        &mut self,
+        record: crate::net::lan_messages::ingame::BeaconRecord,
+    ) {
         if let Some(network) = self.network.as_mut()
             && matches!(network.phase, NetworkPhase::Frozen { .. })
         {
@@ -2880,6 +2883,7 @@ mod tests {
                 start_position: crate::skirmish_launch::LaunchStartPosition::Auto,
                 team: crate::skirmish_launch::LaunchTeam::None,
                 difficulty: crate::skirmish_launch::AiDifficulty::Easy,
+                super_tier: None,
             });
         launch.ai_player_count = 1;
         launch.rebuild_house_roster();

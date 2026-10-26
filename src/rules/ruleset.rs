@@ -6384,8 +6384,14 @@ impl RuleSet {
             b"phobos-shield-types-v1".hash(&mut hasher);
             self.shield_types.hash(&mut hasher);
             self.shield_globals.apply_armor_mult.hash(&mut hasher);
-            self.shield_globals.condition_yellow.to_bits().hash(&mut hasher);
-            self.shield_globals.condition_red.to_bits().hash(&mut hasher);
+            self.shield_globals
+                .condition_yellow
+                .to_bits()
+                .hash(&mut hasher);
+            self.shield_globals
+                .condition_red
+                .to_bits()
+                .hash(&mut hasher);
             self.shield_globals.pips.hash(&mut hasher);
             self.shield_globals.pips_building.hash(&mut hasher);
             self.shield_globals.pips_background.hash(&mut hasher);

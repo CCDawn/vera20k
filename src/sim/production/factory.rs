@@ -1369,6 +1369,35 @@ impl FactoryRegistry {
             && factory.object.is_some()
     }
 
+    /// Fork (docs/superai.md): a command-driven AI house owns no local
+    /// sidebar strip, so the strip-visited `take_changed_complete` above
+    /// never reaches its factories — this owner-scoped variant reproduces
+    /// the pre-strip-scan `take_changed_completed_keys` body for the one
+    /// house, in the same holder insertion order.
+    pub(crate) fn take_changed_completed_for_owner(
+        &mut self,
+        owner: InternedId,
+    ) -> Vec<ProductionCategory> {
+        let order: Vec<FactoryHolder> = self
+            .holders_insertion_ordered()
+            .into_iter()
+            .filter_map(|(holder, _)| {
+                matches!(holder, FactoryHolder::House(house, _) if house == owner).then_some(holder)
+            })
+            .collect();
+        let mut completed = Vec::new();
+        for holder in order {
+            let factory = self.factories.get_mut(&holder).expect("retained Factory");
+            if std::mem::take(&mut factory.changed)
+                && factory.progress >= PRODUCTION_STEPS
+                && factory.object.is_some()
+            {
+                completed.push(factory.category);
+            }
+        }
+        completed
+    }
+
     /// Headless fixtures explicitly supply a strip; ordinary frame effects
     /// never infer one from Factory state. Fixture ordering is category order.
     #[cfg(any(test, feature = "test-support"))]

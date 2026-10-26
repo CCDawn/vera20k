@@ -157,9 +157,11 @@ impl QuickMatchGlobals {
 /// Co-op (mode 2), which every runner path treats alike except the lobby
 /// prefix, the game channel's tournament and the load's start points.
 pub(crate) fn mode_active(state: &AppState) -> bool {
-    state.frontend.wol.as_ref().is_some_and(|visit| {
-        matches!(visit.mode, Some(WolMode::QuickMatch | WolMode::QuickCoop))
-    })
+    state
+        .frontend
+        .wol
+        .as_ref()
+        .is_some_and(|visit| matches!(visit.mode, Some(WolMode::QuickMatch | WolMode::QuickCoop)))
 }
 
 /// `[0xA8B244] == 2`: Quick Co-op.

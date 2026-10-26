@@ -158,6 +158,60 @@ pub fn publish_production_changes(
     }
 }
 
+/// Fork (docs/superai.md): a command-driven AI house is driven through the
+/// command layer like a player but owns no local sidebar strip — the strip
+/// publication above delivers only the current house's visited factory
+/// links, so a completed mobile would hold its factory at Done forever and
+/// wedge the house's whole production (observed on the merged tree: a fair
+/// tier froze at one power plant, two refineries and one war factory with
+/// 17 700 credits while `Vehicle:CMIN` and `Infantry:E1` heads sat complete
+/// in the queue for 10 000 ticks). This publishes every command-driven
+/// house's completions from Factory state on each Ordinary frame — the
+/// pre-strip-scan unconditional publication, scoped to the houses that
+/// lost their player — in that scan's category order, through the same raw
+/// PLACE record the strip path issues. `encode_place_mobile_record`
+/// answers None for a Building head, whose placement stays with the
+/// driver's own `PlaceReadyBuilding` command.
+pub fn publish_command_driven_production(sim: &mut Simulation, rules: &RuleSet) {
+    let driven: Vec<_> = sim
+        .houses
+        .iter()
+        .filter(|(_, house)| house.command_driven())
+        .map(|(&owner, _)| owner)
+        .collect();
+    for owner in driven {
+        let mut completed = sim
+            .production
+            .factories_mut()
+            .take_changed_completed_for_owner(owner);
+        completed.sort_by_key(|category| match category {
+            super::ProductionCategory::Building => 0,
+            super::ProductionCategory::Defense => 1,
+            super::ProductionCategory::Infantry => 2,
+            super::ProductionCategory::Vehicle
+            | super::ProductionCategory::Aircraft
+            | super::ProductionCategory::Ship => 3,
+        });
+        for category in completed {
+            factory_lifecycle::publish_completion(
+                &sim.interner,
+                &mut sim.production,
+                &mut sim.sound_events,
+                rules,
+                owner,
+                category,
+            );
+            let Some(record) = sim.encode_place_mobile_record(owner, category, rules) else {
+                continue;
+            };
+            let _ = sim.issue_local_command(crate::sim::command::CommandEnvelope::synchronized(
+                record,
+                sim.session.tick(),
+            ));
+        }
+    }
+}
+
 /// Supply an explicit local strip in headless owner fixtures. App production
 /// uses its actual retained sidebar, never this registry-derived fixture.
 #[cfg(any(test, feature = "test-support"))]

@@ -1136,7 +1136,7 @@ fn advance_one_simulation_frame(
                 for ai in super_players.iter_mut() {
                     due_commands.extend(ai.orders(rt, u32::try_from(tick).unwrap_or(u32::MAX)));
                     if ai.difficulty() == crate::super_ai::SuperAiDifficulty::Unlimited {
-                        let owner = rt.simulation.interner.resolve(ai.house()).to_string();
+                        let owner = rt.simulation.interner().resolve(ai.house()).to_string();
                         let wallet =
                             crate::sim::production::credits_for_owner(&rt.simulation, &owner);
                         let floor = crate::super_ai::UNLIMITED_WALLET_FLOOR;

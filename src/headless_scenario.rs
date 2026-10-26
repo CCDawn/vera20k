@@ -159,12 +159,21 @@ impl HeadlessScenario {
         house: InternedId,
         tier: crate::super_ai::SuperAiDifficulty,
     ) {
+        let state = self
+            .runtime
+            .simulation
+            .houses
+            .get_mut(&house)
+            .expect("the tier applies to a house the launch created");
+        // The launch path marks the house command-driven (the native AI
+        // stands down; the fork's completion publication serves it) before
+        // the tier math. A hand-built battle session reaches the same
+        // state through here, so the flag rides along even for Fair,
+        // whose tier math alone would take nothing and leave the house
+        // unmarked.
+        state.make_command_driven(tier);
         crate::sim::scenario_bootstrap::apply_super_ai_tier_to_house(
-            self.runtime
-                .simulation
-                .houses
-                .get_mut(&house)
-                .expect("the tier applies to a house the launch created"),
+            state,
             &self.runtime.resources.rules,
             tier,
         );

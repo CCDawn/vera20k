@@ -1406,10 +1406,9 @@ fn drain_match_requests(state: &mut AppState) {
                 }
             }
             NetworkLoadingRequest::Beacon(record) => {
-                if let Ok(message) = crate::net::lan_messages::ingame::BeaconMessage::new(
-                    &local_name(state),
-                    record,
-                ) {
+                if let Ok(message) =
+                    crate::net::lan_messages::ingame::BeaconMessage::new(&local_name(state), record)
+                {
                     let peers: Vec<_> =
                         super::match_runtime::network_match::nodes(&state.match_state.session)
                             .into_iter()

@@ -245,7 +245,8 @@ impl Simulation {
         let sw_type_id = self.interner.intern(name);
         // Script actions are synchronous authoritative producers. Capture the
         // current ticket now; the shared finalizer still consumes it once.
-        let selection = self.paid_super_weapon_selection(owner)
+        let selection = self
+            .paid_super_weapon_selection(owner)
             .filter(|selection| selection.destination == sw_type_id);
         self.fire_super_weapon_selected(
             rules,

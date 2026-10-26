@@ -49,10 +49,10 @@ mod target_laser_gpu_tests;
 pub(crate) use draw_passes::{draw_bridge_shadows, draw_pooled_cell_bodies};
 pub(crate) mod draw_plan_lowering;
 mod merge_passes;
+pub(crate) mod minimap_transaction;
 mod object_stages;
 #[cfg(test)]
 mod object_stages_gpu_tests;
-pub(crate) mod minimap_transaction;
 
 use anyhow::Result;
 #[cfg(feature = "telemetry-dashboard")]

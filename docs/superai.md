@@ -387,6 +387,102 @@ before), and sorties' in-flight behavior under the command layer's
 Attack order rides the native aircraft mission machinery untested until
 the next live session.
 
+The slot-priority slice answers the fair_growth census the engine fix
+exposed (the end state was alive but unfinished: zero defenses, two
+factories, no IFV, no Tanya, no jets, credits pinned near two). Three
+rules move. **Guns before the ladder**: the defense limb now runs
+ahead of the ladder walk, not behind it — the walk doubles as the
+rebuild scan (a destroyed late rung re-arms every slot-free tick), so
+in its old position the guns were dead code that never once ran. The
+limb's own wallet gate already keeps a poor base expanding instead of
+arming; the move only fixes who sees the slot first. **The superweapon
+rung is once-per-game**: `sw_ever_stood` latches the first storm
+standing and a razed one never rebuilds — the observed GAWEAT rebuild
+loop held the one serialized structure slot to the end of the game and
+starved both the guns and the expansion behind it. **Gun banking**:
+while any gun below its cap is wanted (the limb's own conditions,
+mirrored), the three unit queues bank their purchases the way a tech
+climb does — each item waits for its own full cost — so the wallet
+refills past the gun's full-cost gate instead of the queues drinking
+every credit as it arrives. The hero commission completes it: once the
+battle lab stands the hero takes the next infantry specialist slot
+outright (`hero_issued` latches the first commission) instead of
+waiting for a whole-role deficit window the rotation may never open.
+The mix's own buildable test moves from the cameo to the native
+`can_build` gate: the draw brightness knows nothing of country locks,
+so a cameo-sorted pick handed an Americans house the Germans-only Tank
+Destroyer — the item parked at zero progress forever and wedged the
+vehicle queue for the rest of the game (observed).
+The war-factory rally correction gains per-factory pacing: a desired
+ring cell the base's own later buildings occupy (the crowded yard
+ring once four factories and the guns stand) gets its SetRally
+refused at apply time, and the unpaced re-issue loop — one of the
+only early returns in the chain — then ate every command tick for
+the rest of the game (observed: the freeze began as the ring filled;
+every jet-commission precondition held and the branch below never
+ran). One attempt per factory per window caps the wedge.
+The deploy branch loses its unconditional empty return: with a
+deployable MCV standing and the deploy attempts spent (or pacing
+between retries) it returned nothing every tick, so a second AMCV
+that appeared mid-run froze the whole command chain — 24000 ticks of
+empty queue, unspent wallet and an unbuilt army while every
+jet-commission precondition held (observed; pinned by the census
+instrumentation: yard alive to the last tick, AMCV standing, freeze
+from tick 17464). The MCV now waits and the chain runs on.
+The ready-building placement branch gains a dropped-dispatch guard
+of the wave branch's `launched`-list class: a `PlaceReadyBuilding`
+order the command layer keeps dropping leaves its building ready
+forever, and as the first return in the one-command chain it
+re-issued every tick and starved every branch below — a whole
+24000-tick stretch ran with an empty queue, a fat wallet and no
+production at all (observed; the census instrumentation pinned it:
+every jet-commission precondition held from tick 17464 yet the
+branch never ran). Three strikes on the same still-ready type now
+pause that type's placement for a while; the pause lifts and the
+placement retries into a possibly-changed base.
+The first jet gets the same existence commission ahead of the vehicle
+branch: the air branch sits last in the one-command budget and its
+banked gate lost every wallet race to the cheaper ground items (a
+whole 42000-tick census passed at zero jets), so once the radar the
+ladder raised stands as the Airforce Command the first jet queues
+outright — keeping only the tech-climb bank — and top-ups stay in the
+ordinary branch.
+The zero-jet reading that motivated that commission was itself two
+stacked counting blind spots, not an admission fault. Pad aircraft
+file under their own `Aircraft` entity category — outside both the
+census's Unit/Infantry pair and `count_combat_of_type`'s — so a living
+wing read zero everywhere: the census could not see jets however many
+stood, and the commission/top-up branches re-issued the first jet
+forever. The per-type command histogram that looked like mass
+admission refusal (`QueueProduction:ORCA` ≈ 17 700 against an empty
+queue) was that re-issue running into the native pad limit: four
+AMRADR docks banked at its grand opening, `PadAircraft=ORCA,BEAG`,
+`pads >= docks` refuses the fifth — the same refusal an extra click
+earns a human player. Both counters now read the wing through
+`count_aircraft_of_type` (Aircraft category; the Rocketeer stays under
+Infantry where the engine files it), the census counts jets the same
+way, and fair_growth goes green with the wing standing, ending early
+(~870 s of the 42000-tick budget). The census keeps the diagnostic
+layer built on the way — per-type command tally, banked docks, a live
+post-drive enqueue probe and the grand-opening trace — for the next
+regression that needs them.
+
+## Command-driven production publication
+
+Upstream `44f14000a` routed automatic mobile delivery through the local
+sidebar's strip visits (`publish_production_changes` serves only the
+current house's visited factory links). A command-driven house owns no
+strip, so its completed mobiles held their factories at Done forever and
+wedged the whole house (observed on the merged tree: a fair tier froze at
+one power plant, two refineries and one war factory with 17 700 credits
+while `Vehicle:CMIN` and `Infantry:E1` heads sat complete for 10 000
+ticks). The fork hook `publish_command_driven_production`
+(`src/sim/production/production_queue.rs`, called from
+`admit_frame_commands` next to the strip publication) re-issues the
+pre-strip-scan unconditional publication — from Factory state, through the
+same raw PLACE record — scoped to houses whose `HouseState::command_driven`
+is set. Upstream houses keep the strip path untouched.
+
 ## Upstream sync
 
 `superai/base` merges `origin/main` regularly; each pillar lands on its own

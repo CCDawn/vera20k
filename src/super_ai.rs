@@ -144,6 +144,19 @@ const AIR_WING_TARGET: usize = 4;
 /// reroutes the wing for nothing.
 const AIRSTRIKE_RETRY_TICKS: u32 = 900;
 
+/// Placement strikes: three `PlaceReadyBuilding` orders consumed while
+/// the item still sits ready means the command layer keeps dropping the
+/// site it picked — the branch then pauses that type's placement for
+/// [`PLACE_PAUSE_TICKS`] so the one-command budget runs past the wedge.
+const PLACE_STRIKES: u32 = 3;
+const PLACE_PAUSE_TICKS: u32 = 900;
+
+/// Ticks before a war factory's rally correction is re-attempted: a
+/// desired ring cell the base's own buildings occupy gets the SetRally
+/// refused, and without pacing the re-issue loop starved the whole
+/// command chain (observed).
+const RALLY_RETRY_TICKS: u32 = 900;
+
 /// Combat-slot wheels: past the core, every Nth issued combat slot goes
 /// to the roster mix and the rest back to the core type. A live-count
 /// gate measures the war, not the build program — under attrition the
@@ -324,6 +337,10 @@ struct Opening {
     vehicles: &'static [RosterEntry],
     /// Infantry the barracks mixes in past its core soldier.
     infantry: &'static [RosterEntry],
+    /// The side's hero (retail `BuildLimit=1`): commissioned directly at
+    /// the first specialist slot once the battle lab stands, instead of
+    /// waiting for a whole-role deficit window in the rotation.
+    hero: &'static str,
 }
 
 const OPENINGS: [Opening; 3] = [
@@ -335,6 +352,7 @@ const OPENINGS: [Opening; 3] = [
         war_factory: "GAWEAP",
         radar: "GAAIRC",
         battle_lab: "GATECH",
+        hero: "TANY",
         harvester: Some("CMIN"),
         main_tank: "MTNK",
         tier2_tank: "SREF",
@@ -426,6 +444,7 @@ const OPENINGS: [Opening; 3] = [
         war_factory: "NAWEAP",
         radar: "NARADR",
         battle_lab: "NATECH",
+        hero: "BORIS",
         harvester: Some("HARV"),
         main_tank: "HTNK",
         tier2_tank: "APOC",
@@ -519,6 +538,7 @@ const OPENINGS: [Opening; 3] = [
         // satisfies no prerequisite.
         radar: "NAPSIS",
         battle_lab: "YATECH",
+        hero: "YURIPR",
         harvester: None,
         main_tank: "LTNK",
         tier2_tank: "MIND",
@@ -622,6 +642,27 @@ pub struct SuperAi {
     /// Earliest tick the air wing may fly its next sortie; see
     /// [`AIRSTRIKE_RETRY_TICKS`]. Pinned state, never read from the runtime.
     next_airstrike_tick: u32,
+    /// Whether a superweapon has ever stood. The ladder's superweapon rung
+    /// is once-per-game: a razed 5000-credit storm never rebuilds, because
+    /// the observed rebuild held the one building slot to the end of the
+    /// game and starved the expansion and the guns behind it. Pinned state,
+    /// never read from the runtime.
+    sw_ever_stood: bool,
+    /// Whether the hero's commission has issued at least once; the
+    /// reservation hands the hero the first specialist slot past the lab.
+    /// Pinned state, never read from the runtime.
+    hero_issued: bool,
+    /// The tick a war factory's rally correction may be re-attempted.
+    /// Pinned state, never read from the runtime.
+    rally_gate: std::collections::HashMap<u64, u32>,
+    /// How many `PlaceReadyBuilding` orders this type consumed while
+    /// still sitting ready (a placement the command layer keeps
+    /// dropping). Pinned state, never read from the runtime.
+    place_stuck: std::collections::HashMap<InternedId, u32>,
+    /// The tick a wedged type's placement pause lifts: while paused the
+    /// ready item is skipped so the orders chain runs past it. Pinned
+    /// state, never read from the runtime.
+    place_pause_until: std::collections::HashMap<InternedId, u32>,
     /// Combat production slots issued since deploy — vehicles and infantry
     /// each. Pinned state driving the specialist wheels; see
     /// [`SPECIALIST_EVERY_VEHICLE`].
@@ -643,6 +684,11 @@ impl SuperAi {
             order_gate: std::collections::HashMap::new(),
             next_airstrike_tick: 0,
             next_sw_fire_tick: 0,
+            sw_ever_stood: false,
+            hero_issued: false,
+            place_stuck: std::collections::HashMap::new(),
+            place_pause_until: std::collections::HashMap::new(),
+            rally_gate: std::collections::HashMap::new(),
             vehicle_slots: 0,
             infantry_slots: 0,
         }
@@ -685,15 +731,46 @@ impl SuperAi {
                     Command::DeployMcv { entity_id: mcv },
                 )];
             }
-            return Vec::new();
+            // Fork: attempts spent or pacing between them, the MCV waits —
+            // it must not starve every branch below. Returning empty here
+            // froze the whole game when a second AMCV appeared mid-run and
+            // burned the attempts: every tick returned nothing while the
+            // wallet piled up unspent and the army died unrebuilt
+            // (observed: 24000 frozen ticks from the census). At the
+            // opening this fall-through is inert — no yard, no factories,
+            // nothing ready: every branch below has nothing to issue.
         }
         let Some(opening) = self.opening(sim) else {
             return Vec::new();
         };
+        // The ladder's superweapon rung is once-per-game: remember the
+        // first one standing, so a razed storm never rebuilds (see the
+        // walk below for the starvation that motivated the latch).
+        if self.count_structures_of_type(sim, opening.super_weapon_building) >= 1 {
+            self.sw_ever_stood = true;
+        }
 
-        // Place one completed building next to the construction yard.
-        let ready = crate::sim::production::ready_buildings_for_owner(sim, rules, &owner).pop();
-        if let Some(ready) = ready
+        // Place one completed building next to the construction yard. A
+        // placement the command layer keeps dropping (the ring-scan site
+        // failing admission at apply time) leaves the building ready
+        // forever, and this branch — the first return in the chain —
+        // then re-issues it every tick and starves every branch below
+        // it: a whole 24000-tick stretch ran with an empty queue, a fat
+        // wallet and no jet while some ready item soaked up every
+        // command (observed; the wave branch's `launched` list guards
+        // the same dropped-dispatch class). Three strikes on the same
+        // still-ready type pauses that type's placement so production
+        // continues; the pause lifts and placement retries.
+        let ready_stock = crate::sim::production::ready_buildings_for_owner(sim, rules, &owner);
+        // A type absent from the ready stock placed or drained: its
+        // strike count starts over.
+        self.place_stuck
+            .retain(|type_id, _| ready_stock.iter().any(|item| item.type_id == *type_id));
+        self.place_pause_until.retain(|_, until| tick < *until);
+        if let Some(ready) = ready_stock
+            .iter()
+            .filter(|item| !self.place_pause_until.contains_key(&item.type_id))
+            .last()
             && let Some(ty) = rules.object(sim.interner.resolve(ready.type_id))
             && let Some(center) = self.structure_center(sim, opening.construction_yard)
             && let Some((rx, ry)) = find_site_around(
@@ -705,6 +782,13 @@ impl SuperAi {
                 self.house,
             )
         {
+            let stuck = self.place_stuck.entry(ready.type_id).or_insert(0);
+            *stuck += 1;
+            if *stuck >= PLACE_STRIKES {
+                self.place_stuck.remove(&ready.type_id);
+                self.place_pause_until
+                    .insert(ready.type_id, tick + PLACE_PAUSE_TICKS);
+            }
             return vec![CommandEnvelope::new(
                 self.house,
                 at,
@@ -1008,73 +1092,46 @@ impl SuperAi {
                     || name == opening.super_weapon_building
             }
         });
+        // Any battle tank standing gates the perimeter guns and the
+        // expansion rungs past the opening. The tier-2 tank counts once
+        // the lab stands, so the death of the first tanks never freezes
+        // the base at its opening size.
+        let any_tank = self.count_units_of_type(sim, opening.main_tank)
+            + self.count_units_of_type(sim, opening.tier2_tank)
+            > 0;
+        // A gun still below its cap while the yard stands and tanks roll.
+        // While one is wanted the unit queues bank their purchases the way
+        // a tech climb does — each item waits for its own full cost — so
+        // the wallet refills past the gun's full-cost gate in the defense
+        // limb instead of the queues drinking every credit (observed:
+        // credits pinned near two for a whole game with zero defenses
+        // standing). Mirrors the limb's own conditions exactly: a gun the
+        // limb would not arm never banks the army either.
+        let guns_wanted = any_tank
+            && self
+                .structure_center(sim, opening.construction_yard)
+                .is_some()
+            && (self.count_structures_of_type(sim, opening.defense_basic) < BASIC_DEFENSE_TARGET
+                || self.count_structures_of_type(sim, radar_name) >= 1
+                    && self.count_structures_of_type(sim, opening.defense_heavy)
+                        < HEAVY_DEFENSE_CAP
+                || self.enemy_air_count(sim) > 0
+                    && self.count_structures_of_type(sim, opening.defense_aa) < AA_DEFENSE_CAP);
         if self
             .structure_center(sim, opening.construction_yard)
             .is_some()
             && !building_busy
         {
-            let ladder = [
-                (opening.power, 1),
-                (opening.refinery, 1),
-                (opening.barracks, 1),
-                (opening.war_factory, 1),
-                (opening.refinery, REFINERY_TARGET),
-                (opening.power, 2),
-                (opening.war_factory, 2),
-                // Tech before the expansion finishes: the radar class is the
-                // battle lab's `RADAR` prerequisite, and the lab unlocks the
-                // tier-2 tank the vehicle queue switches to (retail
-                // `Prerequisite=GAWEAP,GATECH` and its side's twins). Two
-                // factories fund the climb; the third completes the expansion
-                // once the tier is secure.
-                (radar_name, 1),
-                (opening.battle_lab, 1),
-                // The superweapon step follows the lobby toggle for free:
-                // every retail one is `DisableableFromShell=yes`, so its
-                // cameo stays dark while superweapons are off (CanBuild
-                // refuses the building) and the step falls through to the
-                // expansion without occupying a slot.
-                (opening.super_weapon_building, 1),
-                (opening.power, POWER_TARGET),
-                (opening.war_factory, WAR_FACTORY_TARGET),
-            ];
-            // The first five steps are the opening; the expansion beyond
-            // them waits for a battle tank to leave the factory —
-            // expanding production must not starve the pipeline it expands.
-            // The tier-2 tank counts once the lab stands, so the death of
-            // the first tanks never freezes the base at its opening size.
-            const OPENING_STEPS: usize = 5;
-            let any_tank = self.count_units_of_type(sim, opening.main_tank)
-                + self.count_units_of_type(sim, opening.tier2_tank)
-                > 0;
-            for (index, (name, target)) in ladder.iter().enumerate() {
-                if index >= OPENING_STEPS && !any_tank {
-                    break;
-                }
-                if self.count_structures_of_type(sim, name) >= *target {
-                    continue;
-                }
-                if let Some(ty) = rules.object(*name)
-                    && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
-                    // Read-only lookup: every retail type name is interned at
-                    // rules load; a miss would only skip this candidate.
-                    && let Some(type_id) = sim.interner.get(*name)
-                {
-                    return vec![CommandEnvelope::new(
-                        self.house,
-                        at,
-                        Command::QueueProduction { type_id },
-                    )];
-                }
-            }
-
-            // The defense limb: the base's own guns. Anti-air answers air
-            // that actually fields, the heavy tower waits behind the radar
-            // its prerequisite names, and the pillbox quota holds the
-            // perimeter once tanks roll. Placement rides the same
-            // yard-centered ring scan every other building uses, so the
-            // guns land on the base's crowded edge; Yuri's Gatling Cannon
-            // serves both the AA and the pillbox slots.
+            // The defense limb runs before the ladder walk. Behind it the
+            // guns are dead code: the walk doubles as the rebuild scan, so
+            // a destroyed late rung re-arms every slot-free tick and the
+            // guns never once ran (observed: a whole game at zero defenses
+            // behind a superweapon rebuild). Anti-air answers air that
+            // actually fields, the heavy tower waits behind the radar its
+            // prerequisite names, and the pillbox quota holds the perimeter
+            // once tanks roll. Placement rides the same yard-centered ring
+            // scan every other building uses; Yuri's Gatling Cannon serves
+            // both the AA and the pillbox slots.
             if any_tank {
                 let defenses = [
                     (
@@ -1118,6 +1175,66 @@ impl SuperAi {
                             Command::QueueProduction { type_id },
                         )];
                     }
+                }
+            }
+
+            let ladder = [
+                (opening.power, 1),
+                (opening.refinery, 1),
+                (opening.barracks, 1),
+                (opening.war_factory, 1),
+                (opening.refinery, REFINERY_TARGET),
+                (opening.power, 2),
+                (opening.war_factory, 2),
+                // Tech before the expansion finishes: the radar class is the
+                // battle lab's `RADAR` prerequisite, and the lab unlocks the
+                // tier-2 tank the vehicle queue switches to (retail
+                // `Prerequisite=GAWEAP,GATECH` and its side's twins). Two
+                // factories fund the climb; the third completes the expansion
+                // once the tier is secure.
+                (radar_name, 1),
+                (opening.battle_lab, 1),
+                // The superweapon step follows the lobby toggle for free:
+                // every retail one is `DisableableFromShell=yes`, so its
+                // cameo stays dark while superweapons are off (CanBuild
+                // refuses the building) and the step falls through to the
+                // expansion without occupying a slot.
+                (opening.super_weapon_building, 1),
+                (opening.power, POWER_TARGET),
+                (opening.war_factory, WAR_FACTORY_TARGET),
+            ];
+            // The first five steps are the opening; the expansion beyond
+            // them waits for a battle tank to leave the factory —
+            // expanding production must not starve the pipeline it expands.
+            // The tier-2 tank counts once the lab stands, so the death of
+            // the first tanks never freezes the base at its opening size.
+            const OPENING_STEPS: usize = 5;
+            for (index, (name, target)) in ladder.iter().enumerate() {
+                if index >= OPENING_STEPS && !any_tank {
+                    break;
+                }
+                // The superweapon is a once-per-game rung: once one has
+                // stood, a razed storm does not rebuild — the 5000-credit
+                // replacement would hold the one building slot to the end
+                // of the game (observed) and starve the expansion and the
+                // guns behind it.
+                if *name == opening.super_weapon_building && self.sw_ever_stood {
+                    continue;
+                }
+                if self.count_structures_of_type(sim, name) >= *target {
+                    continue;
+                }
+                if let Some(ty) = rules.object(*name)
+                    && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
+                    // Read-only lookup: every retail type name is interned at
+                    // rules load; a miss would only skip this candidate.
+                    && let Some(type_id) = sim.interner.get(*name)
+                {
+                    return vec![CommandEnvelope::new(
+                        self.house,
+                        at,
+                        Command::QueueProduction { type_id },
+                    )];
                 }
             }
 
@@ -1211,12 +1328,21 @@ impl SuperAi {
                     )
                 })
                 .find(|&(id, desired)| {
-                    sim.substrate
-                        .entities
-                        .get(id)
-                        .is_some_and(|factory| factory.rally_cell() != Some(desired))
+                    sim.substrate.entities.get(id).is_some_and(|factory| {
+                        factory.rally_cell() != Some(desired)
+                            && self.rally_gate.get(&id).is_none_or(|&next| tick >= next)
+                    })
                 })
         {
+            // Fork: pace each factory's correction — a desired cell the
+            // base's own later buildings occupy (the crowded ring around
+            // the yard) gets its SetRally refused at apply time, and an
+            // unpaced re-issue looped here every tick and starved every
+            // branch below for the rest of the game (observed: the
+            // freeze began as the fourth factory and the guns filled the
+            // ring). One attempt per factory per window; the wedge then
+            // costs a tick per window instead of all of them.
+            self.rally_gate.insert(factory_id, tick + RALLY_RETRY_TICKS);
             return vec![CommandEnvelope::new(
                 self.house,
                 at,
@@ -1225,6 +1351,51 @@ impl SuperAi {
                     ry: desired.1,
                     producer_ids: vec![factory_id],
                 },
+            )];
+        }
+
+        // The wing's first-jet commission. The air branch sits last in the
+        // one-command budget — it only fires while both ground queues hold
+        // an item — and there its 1200-credit banked gate loses every
+        // wallet race to the cheaper ground items that re-arm the moment
+        // they complete: a whole 42000-tick game passed with zero jets
+        // while the wing's own factory (the Airforce Command, the same
+        // building the ladder's radar step raised) stood ready (observed).
+        // Once that factory stands the first jet queues outright — the
+        // same existence commission the hero gets — keeping only the
+        // tech-climb bank so the lab climb keeps its income, and waiting
+        // for its money natively otherwise. Top-ups to the wing target
+        // stay in the ordinary low-priority branch below.
+        let aircraft_busy = queue.iter().any(|item| {
+            item.queue_category == crate::sim::production::ProductionCategory::Aircraft
+        });
+        let wing: usize = opening
+            .aircraft
+            .iter()
+            .map(|&jet| self.count_aircraft_of_type(sim, jet))
+            .sum();
+        if !aircraft_busy
+            && wing == 0
+            && self.owns_structure_of_type(sim, radar_name)
+            && let Some(name) = opening.aircraft.iter().copied().find(|&name| {
+                // `can_build`, not the cameo: the draw brightness knows
+                // nothing of country locks, so the Korea-first table would
+                // commission a Black Eagle an Americans house can never
+                // produce (the same trap the top-up branch below guards).
+                rules.object(name).is_some_and(|ty| {
+                    crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                        == crate::sim::production::CanBuild::Yes
+                })
+            })
+            && let Some(ty) = rules.object(name)
+            && !(tech_climb_busy
+                && crate::sim::production::credits_for_owner(sim, &owner) < ty.cost)
+            && let Some(type_id) = sim.interner.get(name)
+        {
+            return vec![CommandEnvelope::new(
+                self.house,
+                at,
+                Command::QueueProduction { type_id },
             )];
         }
 
@@ -1286,13 +1457,14 @@ impl SuperAi {
             && let Some(name) = vehicle_want
             && let Some(ty) = rules.object(name)
             && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
-            // While a tech-climb piece is under construction the unit
-            // queues spend only banked credits — an item waits until its
-            // own cost sits in the bank, so the incoming ore flow stays
-            // with the radar or lab instead of splitting three ways and
-            // stretching the climb over a tank's build time each. Miners
-            // are the income source itself and queue unconditionally.
-            && !(tech_climb_busy
+            // While a tech-climb piece or a wanted gun claims the income
+            // flow the unit queues spend only banked credits — an item
+            // waits until its own cost sits in the bank, so the incoming
+            // ore flow stays with the radar, lab or gun instead of
+            // splitting three ways and stretching the wait over a tank's
+            // build time each. Miners are the income source itself and
+            // queue unconditionally.
+            && !((tech_climb_busy || guns_wanted)
                 && !economy_first
                 && crate::sim::production::credits_for_owner(sim, &owner) < ty.cost)
             && let Some(type_id) = sim.interner.get(name)
@@ -1319,10 +1491,28 @@ impl SuperAi {
         let infantry_want = if self.infantry_slots < CORE_BEFORE_SPECIALISTS as u32 {
             Some(opening.basic_infantry)
         } else if self.infantry_slots % SPECIALIST_EVERY_INFANTRY == SPECIALIST_EVERY_INFANTRY - 1 {
-            // The same mix over the infantry roster, the core soldier
-            // keeping the line rolling once every share is met.
-            self.army_pick(sim, rules, opening.infantry)
-                .or(Some(opening.basic_infantry))
+            // The hero's commission: once the battle lab stands the hero
+            // takes the next specialist slot outright instead of waiting
+            // for a whole-role deficit window (observed: Tanya never once
+            // fielded while AntiAir and AntiArmor absorbed every slot and
+            // the role-mates met the share). `BuildLimit=1` darkens the
+            // hero's own cameo once fielded, so after the first commission
+            // the reservation yields to the ordinary rotation; a fallen
+            // hero re-lights the cameo and the reservation re-arms the
+            // replacement.
+            if !self.hero_issued
+                && self.count_structures_of_type(sim, opening.battle_lab) >= 1
+                && rules.object(opening.hero).is_some_and(|ty| {
+                    crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
+                })
+            {
+                Some(opening.hero)
+            } else {
+                // The same mix over the infantry roster, the core soldier
+                // keeping the line rolling once every share is met.
+                self.army_pick(sim, rules, opening.infantry)
+                    .or(Some(opening.basic_infantry))
+            }
         } else {
             Some(opening.basic_infantry)
         };
@@ -1332,11 +1522,15 @@ impl SuperAi {
             && let Some(ty) = rules.object(name)
             && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
             // The same banked-credits gate: soldiers wait for their own
-            // cost while a tech-climb piece claims the income flow.
-            && !(tech_climb_busy
+            // cost while a tech-climb piece or a wanted gun claims the
+            // income flow.
+            && !((tech_climb_busy || guns_wanted)
                 && crate::sim::production::credits_for_owner(sim, &owner) < ty.cost)
             && let Some(type_id) = sim.interner.get(name)
         {
+            if name == opening.hero {
+                self.hero_issued = true;
+            }
             self.infantry_slots += 1;
             return vec![CommandEnvelope::new(
                 self.house,
@@ -1345,7 +1539,8 @@ impl SuperAi {
             )];
         }
 
-        // The air wing's own queue. Only the Allied side fields aircraft-tab
+        // The air wing's top-up queue (busy/wing standings above, at the
+        // first-jet commission). Only the Allied side fields aircraft-tab
         // types at retail (`Factory=AircraftType` on GAAIRC/AMRADR — the
         // same building the ladder's radar step already raised), so Soviet
         // and Yuri tables are empty and this branch sleeps. The wing tops
@@ -1353,14 +1548,6 @@ impl SuperAi {
         // shared Intruder behind (the cameo's country gate skips whichever
         // this house may not take) — on its own category queue, so it
         // never competes with the ground queues for their factory slots.
-        let aircraft_busy = queue.iter().any(|item| {
-            item.queue_category == crate::sim::production::ProductionCategory::Aircraft
-        });
-        let wing: usize = opening
-            .aircraft
-            .iter()
-            .map(|&jet| self.count_combat_of_type(sim, jet))
-            .sum();
         if !aircraft_busy
             && wing < AIR_WING_TARGET
             && let Some(name) = opening.aircraft.iter().copied().find(|&name| {
@@ -1376,7 +1563,7 @@ impl SuperAi {
                 })
             })
             && let Some(ty) = rules.object(name)
-            && !(tech_climb_busy
+            && !((tech_climb_busy || guns_wanted)
                 && crate::sim::production::credits_for_owner(sim, &owner) < ty.cost)
             && let Some(type_id) = sim.interner.get(name)
         {
@@ -1493,6 +1680,27 @@ impl SuperAi {
                         crate::map::entities::EntityCategory::Unit
                             | crate::map::entities::EntityCategory::Infantry
                     )
+                    && sim.interner.resolve(entity.type_ref()) == type_name
+            })
+            .count()
+    }
+
+    /// How many of the house's aircraft — the engine files pad jets under
+    /// `Aircraft`, outside `count_combat_of_type`'s vehicle/infantry pair —
+    /// are exactly this retail type name. The wing's standing reads it: a
+    /// Unit/Infantry-only count reads zero for a living wing and the
+    /// first-jet commission would re-fire forever.
+    fn count_aircraft_of_type(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        type_name: &str,
+    ) -> usize {
+        sim.substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Aircraft
                     && sim.interner.resolve(entity.type_ref()) == type_name
             })
             .count()
@@ -1618,8 +1826,18 @@ impl SuperAi {
                 if standing >= pick.map_or(usize::MAX, |(_, best)| best) {
                     continue;
                 }
+                // `can_build`, not the cameo: the draw brightness knows
+                // nothing of country locks, so a cameo-sorted pick handed
+                // an Americans house the Germans-only Tank Destroyer —
+                // the item parked at zero progress forever and wedged the
+                // vehicle queue for the rest of the game (observed).
+                // `can_build` runs the country gate the same way it sorts
+                // the radar pair and the jet table; the `needs` gate above
+                // still carries the prerequisites the AI house's quirk
+                // would skip.
                 let buildable = rules.object(entry.name).is_some_and(|ty| {
-                    crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
+                    crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                        == crate::sim::production::CanBuild::Yes
                 });
                 if buildable {
                     pick = Some((entry, standing));
@@ -2078,9 +2296,68 @@ mod tests {
     ) -> u32 {
         use crate::sim::world::{FrameEffects, TickLane};
 
+        // The launch path marks the driven house command-driven (the native
+        // AI stands down and the fork's completion publication serves it);
+        // a hand-built battle session skips the launch, so the driver marks
+        // its own house here — same owner, same tier as `SuperAi::new`.
+        scenario.apply_super_ai_tier(ai.house, ai.difficulty);
         let mut tick = 0u32;
         while tick < budget && !done(scenario) {
             let orders = ai.orders(&scenario.runtime, tick);
+            scenario
+                .runtime
+                .advance_frame(
+                    &orders,
+                    crate::headless_scenario::SIM_TICK_MS,
+                    TickLane::Ordinary,
+                    FrameEffects::default(),
+                )
+                .expect("simulation frame failed");
+            tick += 1;
+        }
+        tick
+    }
+
+    /// [`drive_until`] plus a per-tick label of what `orders` returned:
+    /// the census prints the tally, so a starved run names its command
+    /// eater outright instead of one hypothesis per 22-minute rerun.
+    fn drive_until_tallied(
+        scenario: &mut crate::headless_scenario::HeadlessScenario,
+        ai: &mut SuperAi,
+        budget: u32,
+        done: impl Fn(&crate::headless_scenario::HeadlessScenario) -> bool,
+        tally: &mut std::collections::BTreeMap<String, u32>,
+    ) -> u32 {
+        use crate::sim::world::{FrameEffects, TickLane};
+        scenario.apply_super_ai_tier(ai.house, ai.difficulty);
+        let mut tick = 0u32;
+        while tick < budget && !done(scenario) {
+            let orders = ai.orders(&scenario.runtime, tick);
+            let label = orders.first().map_or_else(
+                || "empty".to_string(),
+                |env| {
+                    if let crate::sim::command::Command::QueueProduction { type_id } = &env.payload
+                    {
+                        // Which type the queue branch kept issuing tells
+                        // whether admission ever landed: a type issued
+                        // thousands of times with none standing was refused
+                        // at apply, not starved by the mix.
+                        format!(
+                            "QueueProduction:{}",
+                            scenario.sim().interner.resolve(*type_id)
+                        )
+                    } else {
+                        let debug = format!("{:?}", env.payload);
+                        debug
+                            .split(['{', '('])
+                            .next()
+                            .unwrap_or("payload")
+                            .trim()
+                            .to_string()
+                    }
+                },
+            );
+            *tally.entry(label).or_insert(0) += 1;
             scenario
                 .runtime
                 .advance_frame(
@@ -2526,6 +2803,23 @@ mod tests {
                 .count()
         };
 
+        // The engine files pad aircraft under their own category — the
+        // Unit/Infantry pair above reads zero for a living jet, and the
+        // census would report the wing empty however many stood.
+        let aircraft = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == human
+                        && entity.category() == crate::map::entities::EntityCategory::Aircraft
+                        && scenario.sim().interner.resolve(entity.type_ref()) == name
+                })
+                .count()
+        };
+
         // End-state counts are war reports, not build logs: by 42000 ticks
         // the enemy has razed factories (observed: a ladder-complete base
         // read GAWEAP=1 mid-rebuild), so the assertion asks what stood at
@@ -2541,39 +2835,155 @@ mod tests {
             guardian: usize,
             tanya: usize,
             jets: usize,
+            amradr: usize,
+            gairc: usize,
+            /// The construction yard's standing count at the final census
+            /// and the last tick one stood: orders() returns empty every
+            /// tick with no yard (no opening table resolves), so a yard
+            /// that fell pins the freeze tick.
+            yard: usize,
+            yard_last_tick: u32,
+            /// Own undeployed MCVs: the deploy branch likewise returns
+            /// empty every tick once its attempts are spent.
+            mcv: usize,
+            /// End-state producer counts (assigned, not maxed).
+            barracks_end: usize,
+            factories_end: usize,
+            amradr_end: usize,
+            /// The house's banked AirportDocks, max seen and final: an
+            /// AirportBound jet's admission dies at `pads >= docks`, and a
+            /// standing AMRADR whose grand opening never ran banks none.
+            docks_max: i32,
+            docks_end: i32,
+            /// The first standing AMRADR's entity id, to cross-reference
+            /// the grand-opening trace.
+            amradr_id: Option<u64>,
+            /// First tick every first-jet-commission precondition held:
+            /// an aircraft factory standing, some jet `can_build`-Yes and
+            /// the 1200-credit cost banked. `None` at failure means no
+            /// window ever opened; `Some` with zero jets means the orders
+            /// chain never reached the commission branch.
+            commission_ready: Option<u32>,
         }
         let seen = std::cell::RefCell::new(Seen::default());
-        let tick = drive_until(&mut scenario, &mut ai, 42000, |scenario| {
-            let mut seen = seen.borrow_mut();
-            seen.superweapon = seen.superweapon.max(structures(scenario, "GAWEAT"));
-            seen.factories = seen.factories.max(structures(scenario, "GAWEAP"));
-            seen.refineries = seen.refineries.max(structures(scenario, "GAREFN"));
-            seen.power = seen.power.max(structures(scenario, "GAPOWR"));
-            // The three Allied defense classes in one perimeter reading —
-            // the pillbox quota alone satisfies it, AA/heavy only add.
-            seen.defenses = seen.defenses.max(
-                structures(scenario, "GAPILL")
-                    + structures(scenario, "NASAM")
-                    + structures(scenario, "ATESLA"),
-            );
-            seen.ifv = seen.ifv.max(units(scenario, "FV"));
-            seen.guardian = seen.guardian.max(units(scenario, "GGI"));
-            // The hero surfaces through the rotation once the battle lab
-            // stands; the jet wing rides its own aircraft queue behind the
-            // radar (the Airforce Command is both).
-            seen.tanya = seen.tanya.max(units(scenario, "TANY"));
-            seen.jets = seen
-                .jets
-                .max(units(scenario, "ORCA") + units(scenario, "BEAG"));
-            seen.superweapon >= 1
-                && seen.factories >= 4
-                && seen.defenses >= 2
-                && seen.ifv >= 1
-                && seen.guardian >= 1
-                && seen.tanya >= 1
-                && seen.jets >= 1
-        });
+        let mut command_tally = std::collections::BTreeMap::new();
+        // Grand_Opening trace for the whole drive: whether the AMRADR's
+        // first opening ever ran decides between "docks never banked" and
+        // "admission refuses with docks banked".
+        crate::sim::building_art::start_grand_opening_trace();
+        let tick = drive_until_tallied(
+            &mut scenario,
+            &mut ai,
+            42000,
+            |scenario| {
+                let mut seen = seen.borrow_mut();
+                seen.superweapon = seen.superweapon.max(structures(scenario, "GAWEAT"));
+                seen.factories = seen.factories.max(structures(scenario, "GAWEAP"));
+                seen.refineries = seen.refineries.max(structures(scenario, "GAREFN"));
+                seen.power = seen.power.max(structures(scenario, "GAPOWR"));
+                seen.amradr = seen.amradr.max(structures(scenario, "AMRADR"));
+                seen.gairc = seen.gairc.max(structures(scenario, "GAAIRC"));
+                seen.yard = structures(scenario, "GACNST");
+                if seen.yard > 0 {
+                    seen.yard_last_tick = scenario.sim().session().tick() as u32;
+                }
+                // End-state (not max) producer counts: admission refusals
+                // correlate with which producers still stood at the end.
+                seen.barracks_end = structures(scenario, "GAPILE");
+                seen.factories_end = structures(scenario, "GAWEAP");
+                seen.amradr_end = structures(scenario, "AMRADR");
+                let docks = scenario
+                    .sim()
+                    .houses
+                    .get(&human)
+                    .map_or(0, |house| house.tracking().airport_docks());
+                seen.docks_max = seen.docks_max.max(docks);
+                seen.docks_end = docks;
+                if seen.amradr_id.is_none() && seen.amradr_end > 0 {
+                    seen.amradr_id = scenario
+                        .sim()
+                        .substrate
+                        .entities
+                        .iter_sorted()
+                        .find(|(_, entity)| {
+                            entity.owner() == human
+                                && entity.category()
+                                    == crate::map::entities::EntityCategory::Structure
+                                && scenario.sim().interner.resolve(entity.type_ref()) == "AMRADR"
+                        })
+                        .map(|(id, _)| id);
+                }
+                seen.mcv = seen.mcv.max(units(scenario, "AMCV"));
+                // The three Allied defense classes in one perimeter reading —
+                // the pillbox quota alone satisfies it, AA/heavy only add.
+                seen.defenses = seen.defenses.max(
+                    structures(scenario, "GAPILL")
+                        + structures(scenario, "NASAM")
+                        + structures(scenario, "ATESLA"),
+                );
+                seen.ifv = seen.ifv.max(units(scenario, "FV"));
+                seen.guardian = seen.guardian.max(units(scenario, "GGI"));
+                // The hero surfaces through the rotation once the battle lab
+                // stands; the jet wing rides its own aircraft queue behind the
+                // radar (the Airforce Command is both).
+                seen.tanya = seen.tanya.max(units(scenario, "TANY"));
+                seen.jets = seen
+                    .jets
+                    .max(aircraft(scenario, "ORCA") + aircraft(scenario, "BEAG"));
+                if seen.commission_ready.is_none() {
+                    let rules = &scenario.runtime.resources.rules;
+                    let jet_ok = ["ORCA", "BEAG"].iter().any(|&name| {
+                        rules.object(name).is_some_and(|ty| {
+                            crate::sim::production::can_build(
+                                scenario.sim(),
+                                rules,
+                                human,
+                                ty,
+                                false,
+                                false,
+                            ) == crate::sim::production::CanBuild::Yes
+                        })
+                    });
+                    let factory =
+                        structures(scenario, "AMRADR") + structures(scenario, "GAAIRC") > 0;
+                    let credits = crate::sim::production::credits_for_owner(
+                        scenario.sim(),
+                        scenario.sim().interner.resolve(human),
+                    );
+                    if jet_ok && factory && credits >= 1200 {
+                        seen.commission_ready = Some(scenario.sim().session().tick() as u32);
+                    }
+                }
+                seen.superweapon >= 1
+                    && seen.factories >= 4
+                    && seen.defenses >= 2
+                    && seen.ifv >= 1
+                    && seen.guardian >= 1
+                    && seen.tanya >= 1
+                    && seen.jets >= 1
+            },
+            &mut command_tally,
+        );
+        let opening_trace = crate::sim::building_art::take_grand_opening_trace();
         let seen = seen.into_inner();
+        // One live admission probe with the end-state world standing: the
+        // direct enqueue bypasses the orders chain, so its verdict separates
+        // "the chain never asked" from "the sim refuses outright".
+        let probe_orca = {
+            let runtime = &mut scenario.runtime;
+            let owner = runtime.simulation.interner.resolve(human).to_string();
+            crate::sim::production::enqueue_by_type(
+                &mut runtime.simulation,
+                &runtime.resources.rules,
+                &owner,
+                "ORCA",
+                crate::sim::world::FrameEffects::default(),
+                false,
+            )
+        };
+        let amradr_opened = opening_trace
+            .iter()
+            .any(|&(id, _)| seen.amradr_id == Some(id));
         // The census names the vehicle line's every member and the queue's
         // current items: which gate held the mix back is a question about
         // counts (miners, core tanks, army size) and the queue's contents,
@@ -2595,6 +3005,19 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",")
         };
+        // The ready stock names what placement has finished but not yet
+        // placed — a stuck entry here is the placement wedge itself.
+        let ready_names = |scenario: &crate::headless_scenario::HeadlessScenario| {
+            crate::sim::production::ready_buildings_for_owner(
+                scenario.sim(),
+                &scenario.runtime.resources.rules,
+                scenario.sim().interner.resolve(human),
+            )
+            .iter()
+            .map(|item| scenario.sim().interner.resolve(item.type_id).to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+        };
         // One combined assertion with the full census: a slow retail test
         // must explain its whole end state in one panic, not one fact per
         // rerun.
@@ -2608,7 +3031,10 @@ mod tests {
                 && seen.jets >= 1,
             "growth slice incomplete at tick {tick}: GAWEAT={} GAWEAP={} refineries={} \
              power={} defenses={} FV={} GGI={} TANY={} jets={} credits={} miners={} MTNK={} \
-             SREF={} E1={} queue=[{}]",
+             SREF={} E1={} queue=[{}] AMRADR={} GAAIRC={} commission_ready={:?} \
+             ready=[{}] yard={} yard_last_tick={} mcv={} \
+             barracks_end={} factories_end={} amradr_end={} docks_max={} docks_end={} \
+             probe_orca={} trace_len={} amradr_opened={} tally={:?}",
             seen.superweapon,
             seen.factories,
             seen.refineries,
@@ -2627,6 +3053,22 @@ mod tests {
             units(&scenario, "SREF"),
             units(&scenario, "E1"),
             queue_names(&scenario),
+            seen.amradr,
+            seen.gairc,
+            seen.commission_ready,
+            ready_names(&scenario),
+            seen.yard,
+            seen.yard_last_tick,
+            seen.mcv,
+            seen.barracks_end,
+            seen.factories_end,
+            seen.amradr_end,
+            seen.docks_max,
+            seen.docks_end,
+            probe_orca,
+            opening_trace.len(),
+            amradr_opened,
+            command_tally,
         );
     }
 

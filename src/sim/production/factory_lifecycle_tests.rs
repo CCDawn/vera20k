@@ -2470,6 +2470,62 @@ fn a_captured_factory_loses_its_rally_point() {
     assert_eq!(sim.substrate.entities.get(1).unwrap().rally_cell(), None);
 }
 
+/// Fork (docs/superai.md): a command-driven AI house owns no sidebar
+/// strip, so the strip publication never visits its factories — the
+/// frame-driven fork publication must deliver a completed mobile through
+/// the same raw PLACE record. Regression: on the merged tree the house's
+/// completed `Infantry:E1` head held at Done forever and froze its whole
+/// production while credits piled up.
+#[test]
+fn command_driven_completion_publishes_without_a_strip() {
+    let (mut sim, rules, owner) = world(0xfac7_0031);
+    super::tests::install_infantry_delivery_fixture_map(&mut sim);
+    sim.houses
+        .get_mut(&owner)
+        .unwrap()
+        .make_command_driven(crate::super_ai::SuperAiDifficulty::Fair);
+    assert!(enqueue_by_type(
+        &mut sim,
+        &rules,
+        "Americans",
+        "E1",
+        crate::sim::world::FrameEffects::default(),
+        false,
+    ));
+    let produced = held_id(&sim, owner, ProductionCategory::Infantry);
+    assert!(
+        sim.production
+            .factories_mut()
+            .test_arm_ready(owner, ProductionCategory::Infantry)
+    );
+    let grid = crate::sim::pathfinding::PathGrid::new(64, 64);
+    sim.install_fixture_path_grid(Some(&grid));
+    super::publish_command_driven_production(&mut sim, &rules);
+    sim.session
+        .set_tick_for_test(sim.session.tick().saturating_add(1));
+    sim.session
+        .set_binary_frame_for_test(sim.session.binary_frame().wrapping_add(1));
+    let due = sim.take_due_commands();
+    sim.transfer_local_commands();
+    let (_, spawned) = sim.apply_due_commands(
+        &due,
+        &rules,
+        sim.session.tick().saturating_add(1),
+        None,
+        crate::sim::world::FrameEffects::default(),
+    );
+    assert!(spawned, "the issued PLACE executes");
+    assert!(
+        !sim.substrate
+            .entities
+            .get(produced)
+            .unwrap()
+            .lifecycle
+            .in_limbo(),
+        "E1 delivered without any strip visit"
+    );
+}
+
 #[test]
 fn ready_manager_is_refunded_and_disposed_by_another_buildings_produce() {
     let (mut sim, rules, owner) = world(0xfac7_0011);

@@ -420,6 +420,9 @@ impl Simulation {
         effects: FrameEffects<'_>,
     ) -> Vec<CommandEnvelope> {
         crate::sim::production::publish_production_changes(self, rules, effects);
+        // Fork (docs/superai.md): command-driven AI houses own no local
+        // strip; publish their completions from Factory state too.
+        crate::sim::production::publish_command_driven_production(self, rules);
         for command in commands {
             if Self::command_uses_frame_ingress(
                 &command.payload,

@@ -1305,13 +1305,17 @@ impl FogState {
     }
 
     pub(crate) fn forget_fogged_live_object(&mut self, id: u64) {
-        self.fogged_live_objects.retain(|(_, candidate)| *candidate != id);
+        self.fogged_live_objects
+            .retain(|(_, candidate)| *candidate != id);
     }
 
     /// Building4519A8..B2 copies its fog flag to a replacement slot Anim.
     pub(crate) fn inherit_object_fog(&mut self, parent: u64, child: u64) {
-        let viewers: Vec<_> = self.fogged_live_objects.iter()
-            .filter_map(|&(viewer, id)| (id == parent).then_some(viewer)).collect();
+        let viewers: Vec<_> = self
+            .fogged_live_objects
+            .iter()
+            .filter_map(|&(viewer, id)| (id == parent).then_some(viewer))
+            .collect();
         for viewer in viewers {
             self.set_object_fogged(viewer, child, true);
         }

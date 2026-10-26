@@ -255,10 +255,7 @@ pub(crate) fn dispatch_mission(
             spyplane_mission::overfly(sim, id, rules, ctx.effects)
         }
         Some(
-            MissionType::Capture
-            | MissionType::Sabotage
-            | MissionType::Eaten
-            | MissionType::Rescue,
+            MissionType::Capture | MissionType::Sabotage | MissionType::Eaten | MissionType::Rescue,
         ) => return None,
         _ => MISSION_STUB_FRAMES,
     };

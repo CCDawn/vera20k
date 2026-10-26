@@ -266,6 +266,24 @@ pub(crate) fn trace_grand_opening_calls<T>(run: impl FnOnce() -> T) -> (T, Vec<(
     (result, calls)
 }
 
+/// Start the [`trace_grand_opening_calls`] collection without wrapping a
+/// closure: a long headless drive that cannot lend its loop body a closure
+/// still owes the trace a [`take_grand_opening_trace`].
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn start_grand_opening_trace() {
+    GRAND_OPENING_CALLS.with_borrow_mut(|trace| {
+        assert!(trace.is_none(), "nested Grand_Opening traces");
+        *trace = Some(Vec::new());
+    });
+}
+
+/// Take and stop the trace started by [`start_grand_opening_trace`]; an
+/// unstarted one reads as empty.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn take_grand_opening_trace() -> Vec<(u64, bool)> {
+    GRAND_OPENING_CALLS.with_borrow_mut(|trace| trace.take().unwrap_or_default())
+}
+
 impl Simulation {
     fn building_anim_world_coord(
         &self,

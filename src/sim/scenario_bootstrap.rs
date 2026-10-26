@@ -2093,10 +2093,7 @@ pub(crate) fn apply_super_ai_tier_to_house(
 /// Fork-only: a command-driven house skips too (`docs/superai.md`) — its
 /// opening grant comes from the Super-AI tier treatment
 /// ([`apply_super_ai_tier_to_house`]) instead of the native loop.
-pub fn apply_skirmish_ai_opening_credits(
-    houses: &mut crate::sim::houses::Houses,
-    rules: &RuleSet,
-) {
+pub fn apply_skirmish_ai_opening_credits(houses: &mut crate::sim::houses::Houses, rules: &RuleSet) {
     for house in houses.values_mut() {
         if house.is_human() || house.multiplay_passive() || house.command_driven() {
             continue;
@@ -5806,6 +5803,7 @@ mod tests {
                     start_position,
                     team: LaunchTeam::None,
                     difficulty: crate::skirmish_launch::AiDifficulty::Easy,
+                    super_tier: None,
                 },
             )
             .collect();

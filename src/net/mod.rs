@@ -17,14 +17,14 @@
 // Future modules - uncomment as implemented:
 // pub mod protocol;
 
-pub mod lockstep;
-pub mod event_packet;
 pub mod command_exchange;
-pub mod reliable;
-pub mod udp;
-pub mod live_commands;
+pub mod event_packet;
 pub mod global;
+pub mod live_commands;
+pub mod lockstep;
 #[cfg(test)]
 mod lockstep_sim_convergence_tests;
+pub mod reliable;
+pub mod udp;
 
 pub mod lan_messages;
