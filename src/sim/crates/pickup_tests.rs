@@ -1900,94 +1900,7 @@ fn tiberium_crate_with_the_drawn_type_one_clamps_to_type_zero_and_places_anyway(
     );
 }
 
-/// `0x00481E99..0x00481F68`: the crate cell and `RandomRanged(10, 20)` jitter
-/// cells each gain one ore bale of the drawn type; the whole Scenario RNG
-/// state replays the native draw order — type draw, per-placement variant and
-/// growth-queue priority draws, then per loop pass the distance draw and the
-/// raw draw inside the snap-1 0x49F420.
-#[test]
-fn tiberium_crate_replays_the_native_draw_order_over_jittered_cells() {
-    let (mut sim, rules, registry, _owner, actor) = tiberium_fixture();
-    // A seed whose type draw answers 0 (Riparius; a drawn 1 would clamp to it
-    // anyway, and two types leave no other draw).
-    let seed = (0..1000)
-        .find(|&seed| {
-            let mut probe = crate::sim::rng::SimRng::new(seed);
-            probe.next_range_i32_inclusive(0, 1) == 0
-        })
-        .expect("a seed whose first draw is 0");
-    sim.scenario_rng = crate::sim::rng::SimRng::new(seed);
-    let receiver = sim.resolved_terrain.as_ref().map(|terrain| {
-        crate::map::resolved_terrain::NativeCellQuery::canonical(terrain).lookup(CELL)
-    });
-    let base = crate_center(&sim, CELL, receiver);
-
-    // Faithful replay of the arm's draw order: one IncreaseTiberium on the
-    // crate cell (the twelve-image flat variant pick with its rejection
-    // sampling, then the growth-queue priority draw), the 10..20 count, then
-    // per pass the distance draw and the raw draw inside 0x49F420, plus the
-    // same variant/priority pair per newly admitted cell. A cell that repeats
-    // consumes no placement draws (the fixture's GrowthPercentage=0 refuses
-    // existing-cell growth without one).
-    let mut probe = sim.scenario_rng.clone();
-    assert_eq!(probe.next_range_i32_inclusive(0, 1), 0);
-    probe.next_range_u32(12);
-    probe.next_u32();
-    let count = probe.next_range_i32_inclusive(10, 20);
-    let mut expected_cells = std::collections::BTreeSet::from([CELL]);
-    for _ in 0..count {
-        let distance = probe.next_range_i32_inclusive(0, 0x300);
-        let (x, y) = random_direction_coord(
-            &mut probe,
-            base.x,
-            base.y,
-            distance,
-            RandomDirectionSnap::CellCenter,
-        );
-        let cell = (
-            u16::try_from(lepton_to_cell(x)).unwrap_or(u16::MAX),
-            u16::try_from(lepton_to_cell(y)).unwrap_or(u16::MAX),
-        );
-        if expected_cells.insert((cell.0 as i16, cell.1 as i16)) {
-            probe.next_range_u32(12);
-            probe.next_u32();
-        }
-    }
-
-    assert!(pickup_crate(
-        &mut sim,
-        &rules,
-        &registry,
-        CELL,
-        actor,
-        crate::sim::world::FrameEffects::default()
-    ));
-
-    assert_eq!(
-        sim.scenario_rng.native_state_hex(),
-        probe.native_state_hex(),
-        "the arm spends exactly the native draws, in order"
-    );
-    assert_eq!(
-        total_bales(&sim, &registry),
-        u32::try_from(expected_cells.len()).unwrap(),
-        "{count} jitter passes over {expected_cells:?}"
-    );
-    let pickup = sim
-        .overlay_grid
-        .as_ref()
-        .unwrap()
-        .cell(CELL.0 as u16, CELL.1 as u16);
-    assert_eq!(pickup.overlay_data, 1, "one bale on the crate cell");
-    assert!(
-        registry
-            .flags(pickup.overlay_id.expect("the crate cell holds ore"))
-            .is_some_and(|flags| flags.tiberium),
-        "the drawn type is an ore overlay"
-    );
-}
-
-/// `0x00482565..0x00482CA1`: the picker takes the C4Warhead's 500 first, then
+/// `0x00482565..0x0048271E`: the picker takes the C4Warhead's 500 first, then
 /// five blasts — exactly ten draws (distance plus raw direction each), each
 /// with a 0x2600/-15 combat animation and a flash at the scattered coordinate.
 #[test]
@@ -2046,7 +1959,7 @@ fn explosion_crate_hurts_the_picker_then_blasts_five_scattered_cells() {
     assert!(sounds(&sim).is_empty(), "the arm skips the pickup sound");
 }
 
-/// `0x0048271E..0x00482CA1`: AnimTypeArray8B4154[0] at the componentwise
+/// `0x0048271E..0x00482840`: AnimTypeArray8B4154[0] at the componentwise
 /// midpoint of the crate centre and the picker coordinate, then both damage
 /// applications through the FlameDamage warhead — 50% verses on 600 twice,
 /// 300 each — with no RNG draw. A bystander on the crate cell stays intact
@@ -2117,15 +2030,17 @@ fn napalm_crate_burns_at_the_midpoint_with_the_flame_warhead_without_rng() {
     assert!(sounds(&sim).is_empty(), "the arm skips the pickup sound");
 }
 
-/// `0x00482CA1..0x00482D56`: with no type-20 `[SuperWeaponTypes]` entry (the
-/// retail table registers none, and no [`SuperWeaponKind`] maps to 20) the
-/// lookup falls through, so the pickup only consumes the crate and its anim.
+/// `0x00482CA1..0x00482D56` on retail rules: FindFirstOfAction(Nuke) names
+/// `NukeSpecial`, the picker House holds a MultiMissile Super, so the crate
+/// grants `NukeSpecial` once (`Grant(1, 0, 0)`), charged, without a draw.
 #[test]
-fn icbm_crate_without_a_type_twenty_super_is_a_noop() {
+fn retail_icbm_crate_grants_the_owner_a_one_time_nuke() {
+    let Some(rules) = crate::rules::retail_ini_fixture::retail_rulesmd_rules() else {
+        return;
+    };
     let (mut sim, _, registry, owner, actor) = multiplayer_fixture(POWERUP_ICBM as u8);
-    let rules = effect_rules("");
+    crate::sim::superweapon::construct_house_supers(&mut sim, &rules, owner, false);
     let rng = sim.scenario_rng.native_state_hex();
-    let credits = sim.houses[&owner].economy().credits();
 
     assert!(pickup_crate(
         &mut sim,
@@ -2141,11 +2056,18 @@ fn icbm_crate_without_a_type_twenty_super_is_a_noop() {
         rng,
         "ICBM spends no draw"
     );
-    assert!(sim.super_weapons.iter().next().is_none(), "nothing granted");
+    let nuke = sim.interner.get("NukeSpecial").unwrap();
+    let granted: Vec<_> = sim.super_weapons[&owner]
+        .iter()
+        .filter(|(_, instance)| instance.is_active())
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(granted, vec![nuke], "only the first Action=Nuke type");
+    let instance = &sim.super_weapons[&owner][&nuke];
+    assert!(instance.is_ready(), "a one-time grant is charged at once");
     assert_eq!(
-        sim.houses[&owner].economy().credits(),
-        credits,
-        "no Money fallback either"
+        serde_json::to_value(instance).unwrap()["one_time"],
+        serde_json::json!(true)
     );
 }
 

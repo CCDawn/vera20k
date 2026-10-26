@@ -1146,6 +1146,27 @@ pub(crate) fn super_types_with_type(
         .map(String::as_str)
 }
 
+/// `SuperWeaponTypeClass::FindFirstOfAction @ 0x006CEEB0`: the first
+/// `[SuperWeaponTypes]` entry whose `Action=` (`+0xBC`) is `action`, or none.
+/// An absent `Action=` keeps the constructor's action 0, `None`.
+pub(crate) fn first_super_type_with_action<'a>(
+    rules: &'a RuleSet,
+    action: &str,
+) -> Option<&'a str> {
+    rules
+        .super_weapon_order
+        .iter()
+        .find(|name| {
+            rules.super_weapon(name).is_some_and(|sw| {
+                sw.action
+                    .as_deref()
+                    .unwrap_or("None")
+                    .eq_ignore_ascii_case(action)
+            })
+        })
+        .map(String::as_str)
+}
+
 /// `owner`'s Super of `type_name` is granted (`+0x6D`) and, in PC53/chop, its
 /// remaining charge over its recharge time is not above `1.0f - [General]
 /// AIMinorSuperReadyPercent=` (`FCOMPP`, `TEST AH,0x1`, so an unordered

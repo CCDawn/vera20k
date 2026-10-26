@@ -378,18 +378,15 @@ pub(super) fn apply_gas_crate(
     magnitude: NativeF64Bits,
     frame_effects: FrameEffects<'_>,
 ) {
-    // `0x00481DE7..0x00481E06` walks the 0x8874C4 array for "GAS" through the
-    // `strcasecmp` finder 0x75E4A0. That array is the WarheadType array by
-    // high-confidence inference, not direct disassembly proof: retail
-    // registers exactly one Gas-named type (`[Warheads] 7=Gas`, while the
-    // `[Particles]` table has no GAS) and the found slot flows into
-    // Apply_area_damage's warhead parameter, mirroring the Explosion arm's
-    // Rules+0xFA8 C4Warhead. `rules.warhead` is the same case-insensitive
-    // name search over the parsed warheads.
+    // `0x00481DE7..0x00481E06` walks the 0x8874C4 WarheadType array for
+    // "GAS" through the `strcasecmp` finder 0x75E4A0; the WarheadType
+    // factory 0x75E3B0 (which reads `FlameDamage=`) scans and allocates into
+    // the same array. `rules.warhead` is the same case-insensitive name
+    // search over the parsed warheads.
     let Some(warhead) = rules.warhead("GAS") else {
-        // Unpinned: native indexes the finder's slot without a null test, so a
-        // ruleset without the name reads outside the array; VERA refuses the
-        // damage rather than inventing a warhead and still runs the anim tail.
+        // 0x75E4A0 returns NULL for a missing name (0x75E4D3), and
+        // Apply_area_damage returns on a null warhead (0x004892D7), so all
+        // nine calls are inert; the anim tail still runs.
         return;
     };
     let warhead_ref = sim.interner.intern(&warhead.id);
@@ -409,6 +406,8 @@ pub(super) fn apply_gas_crate(
             crate::map::resolved_terrain::NativeCellQuery::canonical(terrain).lookup(target)
         });
         let centre = super::pickup::crate_center(sim, target, receiver);
+        // RESIDUAL: native passes affectsTiberium=0 (0x00481E17, 0x00481E71);
+        // apply_area_damage hard-codes 1. Dormant: retail [Gas] sets no Tiberium=.
         crate::sim::combat::world_receiver::apply_area_damage(
             sim,
             rules,
@@ -563,34 +562,34 @@ pub(super) fn apply_explosion_crate(
 ) {
     // `0x00482572`: Rules+0xFA8. A null C4Warhead leaves ReceiveDamage
     // (701BF6), SelectAnim (48A4FF), Flash (48A652) and Apply_area_damage
-    // (4892D7) each inert natively; VERA keeps the arm a no-op too.
-    let Some(warhead) = rules.warhead(&rules.bridge_warheads.c4_name) else {
-        return;
-    };
-    let warhead_ref = sim.interner.intern(&warhead.id);
+    // (4892D7) each inert natively, but the five passes still spend their
+    // ten draws.
+    let c4 = rules
+        .warhead(&rules.bridge_warheads.c4_name)
+        .map(|warhead| (warhead, sim.interner.intern(&warhead.id)));
     let amount = magnitude_amount(magnitude);
-    // `0x0048258D..0x004825A2`. Native's amount is an in/out parameter the
-    // receiver rewrites before the loop reads it again; VERA's direct
-    // receiver returns no value, so the loop keeps the pre-receive amount
-    // (unpinned: the writeback is only observable through a receiver that
-    // edits its caller's packet, which this path does not model).
-    sim.commit_direct_damage_receiver(
-        rules,
-        registry,
-        crate::sim::combat::EntityDamageEvent::direct_receiver(
-            actor_id,
-            amount,
-            0,
-            crate::sim::combat::RAD_NO_ATTACKER,
-            None,
-            warhead_ref,
-            crate::sim::combat::ReceiverCallFlags {
-                ignore_defenses: true,
-                arg6: false,
-            },
-        ),
-        frame_effects,
-    );
+    // `0x0048258D..0x004825A2`. The blasts read the pre-receive copy at
+    // `[esp+0x1C]` (`0x004825A1`, `0x0048263E`), never the receiver's
+    // in/out amount.
+    if let Some((_, warhead_ref)) = c4 {
+        sim.commit_direct_damage_receiver(
+            rules,
+            registry,
+            crate::sim::combat::EntityDamageEvent::direct_receiver(
+                actor_id,
+                amount,
+                0,
+                crate::sim::combat::RAD_NO_ATTACKER,
+                None,
+                warhead_ref,
+                crate::sim::combat::ReceiverCallFlags {
+                    ignore_defenses: true,
+                    arg6: false,
+                },
+            ),
+            frame_effects,
+        );
+    }
     for _ in 0..5 {
         // `0x004825AA..0x004825C2` and the 0x49F420 copy: one distance draw,
         // one raw direction draw, no cell snap.
@@ -602,6 +601,9 @@ pub(super) fn apply_explosion_crate(
             distance,
             crate::sim::combat::inviso_scatter::RandomDirectionSnap::Preserve,
         );
+        let Some((warhead, warhead_ref)) = c4 else {
+            continue;
+        };
         let scattered = crate::sim::projectile::ProjectileCoord::new(x, y, center.z);
         crate::sim::combat::world_receiver::apply_area_damage(
             sim,
@@ -616,9 +618,10 @@ pub(super) fn apply_explosion_crate(
         // `0x0048A4F0` selection feeding the combat constructor shape
         // `spawn_combat_explosion_anim` owns (`0x2600`/`-15`, Start at
         // construction). The same owners serve TAction42's DoExplosionAt.
-        let land = crate::sim::combat::detonation_anim::land_at(sim, scattered);
+        // `0x0048267D` passes the constant LandType 0 (Clear), so the
+        // water-splash branch never fires here.
         if let Some(effect) = crate::sim::combat::detonation_anim::effect(
-            sim, rules, warhead, amount, land, scattered, scattered,
+            sim, rules, warhead, amount, 0, scattered, scattered,
         ) {
             crate::sim::world::damage_consequences::admit_explosion_effect(sim, rules, effect);
         }
@@ -634,7 +637,7 @@ pub(super) fn apply_explosion_crate(
     }
 }
 
-/// The Napalm arm `0x0048271E..0x00482986`: `AnimTypeArray8B4154[0]` at the
+/// The Napalm arm `0x0048271E..0x00482840`: `AnimTypeArray8B4154[0]` at the
 /// componentwise midpoint of the crate centre and the picker coordinate, the
 /// picker's `ReceiveDamage(&buf, 0, FlameDamage, NULL, 1, 0, NULL)`, then one
 /// `Apply_area_damage(mid, ftol(magnitude), 0, FlameDamage, 1, 0)`. No RNG
@@ -662,9 +665,7 @@ pub(super) fn apply_napalm_crate(
         return;
     };
     if let Some(fire_anim) = rules.anim_type_name_by_index(0) {
-        // The constructor argument row is unpinned: VERA uses the
-        // dispatcher's own non-combat pair (`0x600` flags, zAdjust 0), the
-        // same shape as the shared pickup tail and TAction41.
+        // `0x004827C9..0x004827E3`: AnimClass(type, &mid, 0, 1, 0x600, 0, 0).
         sim.spawn_named_anim(
             rules,
             fire_anim,
@@ -718,32 +719,30 @@ pub(super) fn apply_napalm_crate(
     );
 }
 
-/// The first `[SuperWeaponTypes]` entry whose `Type=` word (`+0xBC`) the
-/// ICBM arm searches for at `0x00482CB8` through `0x006CEEB0`.
-const ICBM_SUPER_TYPE: i32 = 20;
-
-/// The ICBM arm `0x00482CA1..0x00482D56`: grant the first type-20 super once
-/// (`Grant(supers[type], 1, 0, 0)`) and add its cameo. Retail `[SuperWeaponTypes]`
-/// registers twelve entries, `NukeSpecial` through `PsychicRevealSpecial`, and
-/// no type-20 weapon — the ICBM rows above it are commented-out TS lineage —
-/// so the lookup falls through and the arm is the shared anim tail alone.
-/// [`SuperWeaponKind::native_index`] maps the twelve retail kinds to 0..=11
-/// (plus Ares' 0x101 and the constructor's -1), so no expressible ruleset
-/// reaches the grant body today; it is kept for a future type-20 kind.
+/// The ICBM arm `0x00482CA1..0x00482D56`. `FindFirstOfAction(20)` at
+/// `0x00482CB8` names the first type whose `Action=` is Nuke (retail
+/// `NukeSpecial`). A scan of the picker House's Supers for one whose type's
+/// `Type=` (`+0xB4`) is 0, MultiMissile, gates the grant
+/// (`0x00482CC9..0x00482D07`; the matched index is discarded), then
+/// `Grant(1, 0, 0)` runs on the found type's own Super (`+0x98`,
+/// `0x00482D0D..0x00482D20`). No RNG and no sound.
 pub(super) fn apply_icbm_crate(sim: &mut Simulation, rules: &RuleSet, owner: InternedId) {
-    let Some(type_name) =
-        crate::sim::superweapon::super_types_with_type(rules, ICBM_SUPER_TYPE).next()
+    // The House constructor holds one Super per registered type, so a
+    // registered MultiMissile type is the scan's admission.
+    if crate::sim::superweapon::super_types_with_type(rules, 0)
+        .next()
+        .is_none()
+    {
+        return;
+    }
+    let Some(type_name) = crate::sim::superweapon::first_super_type_with_action(rules, "Nuke")
     else {
+        // Unpinned: native dereferences the null type here (`0x00482D0D`).
         return;
     };
     let Some(type_id) = sim.interner.get(type_name) else {
         return;
     };
-    // Unpinned gate simplification: native scans the house's Supers instances
-    // for one whose `+0xB4` word is 0 and discards the matched index, then
-    // grants by the type's own `+0x98` index. The house constructor holds one
-    // Super per registered type, so the existing grant owner's instance
-    // lookup is the same admission here.
     crate::sim::superweapon::trigger_grant_super(
         &sim.interner,
         &sim.session,
@@ -755,8 +754,8 @@ pub(super) fn apply_icbm_crate(sim: &mut Simulation, rules: &RuleSet, owner: Int
         type_id,
         true,
     );
-    // `0x00482D2B..0x00482D4F`: `AddCameo(0x1F, ...)` on the current player.
-    // VERA models no sidebar cameo list (unpinned skip).
+    // `0x00482D2D..0x00482D4C`: a successful grant adds the current player's
+    // cameo (`AddCameo(0x1F, ..)`); the sidebar projects active Supers.
 }
 
 /// What the Unit arm `0x00482041..0x00482461` did.

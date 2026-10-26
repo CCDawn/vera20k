@@ -803,7 +803,7 @@ fn continued_process_keeps_the_rules_class_type_pointers() {
 
 /// ReadCombatDamage66C2A1..66C2CF retains the `FlameDamage=` Warhead at
 /// Rules+F84 (retail authors `FlameDamage=Fire`), beside FlameDamage2 at +F88;
-/// the crate Napalm arm reads the former (`0x0048277B`, `0x004827A8`). An
+/// the crate Napalm arm reads the former (`0x00482803`, `0x00482827`). An
 /// omitted key keeps the constructor null, and `none` keeps it null too.
 #[test]
 fn combat_damage_flame_warhead_pointer_publishes() {
