@@ -576,11 +576,9 @@ impl TerrainDrawRenderer {
                 //displaced words from the live destination, so a wave must
                 //observe every earlier draw's completed output (a later wave
                 //must observe this one) and later readers must not share this
-                //batch. upload() is incremental per chunk (it sorts and
-                //re-writes only the work staged since the last upload), so the
-                //per-frame cost stays linear in total operations: one real
-                //upload plus one snapshot/blend pass pair per wave, which the
-                //pile-on scaling diagnostic bounds (magnetic_wave_gpu_tests).
+                //batch. upload() sorts and writes only the work staged since
+                //the last upload, so the per-frame cost stays linear in total
+                //operations: one upload and one snapshot/blend pass per wave.
                 gpu.upload(device, queue, viewport.zoom, size);
             }
             let first = gpu.active;
