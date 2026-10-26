@@ -52,7 +52,7 @@ pub(crate) fn post_trigger_message(state: &mut AppState, csf_key: &str) {
         .and_then(|owner| runtime.simulation.houses().get(&owner))
         .map_or(0, |house| i32::from(house.side_index()));
     let rules = &runtime.resources.rules;
-    let rgb = trigger_message_rgb(&rules.color_schemes, side);
+    let rgb = trigger_message_rgb(&rules.color_schemes, side, rules.skirmish_colors());
     let timeout = message_delay_timeout_ms(rules.general.message_delay_minutes);
     post_localized_message(
         state,
@@ -82,13 +82,14 @@ fn message_delay_buckets(delay: crate::util::native_x87::NativeF64Bits) -> i32 {
 fn trigger_message_rgb(
     schemes: &[crate::rules::color_scheme::ColorSchemeEntry],
     side: i32,
+    skirmish_colors: crate::rules::skirmish_colors::SkirmishColorMode,
 ) -> [f32; 3] {
     let priority = match side {
         0 => 2,
         1 => 1,
         _ => 5,
     };
-    let entry = crate::rules::color_scheme::scheme_entry_for_priority(priority);
+    let entry = skirmish_colors.entry_for_priority(priority);
     crate::rules::color_scheme::scheme_hsv_by_entry(schemes, entry)
         .map(crate::rules::color_scheme::hsv_to_rgb)
         .unwrap_or([255; 3])
@@ -417,7 +418,7 @@ pub(crate) fn packet_player_line_rgb(state: &AppState, priority: i32) -> [f32; 3
         return MESSAGE_RGB_SYSTEM;
     };
     country_message_rgb(
-        crate::rules::color_scheme::scheme_index_for_priority(priority) as i32,
+        rules.skirmish_colors().scheme_index_for_priority(priority) as i32,
         &rules.color_schemes,
     )
 }
@@ -904,7 +905,11 @@ mod tests {
             let expected = crate::rules::color_scheme::hsv_to_rgb(scheme.hsv)
                 .map(|channel| f32::from(channel) / 255.0);
             assert_eq!(
-                trigger_message_rgb(&rules.color_schemes, row["side"].as_i64().unwrap() as i32),
+                trigger_message_rgb(
+                    &rules.color_schemes,
+                    row["side"].as_i64().unwrap() as i32,
+                    crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
+                ),
                 expected,
                 "{row}"
             );

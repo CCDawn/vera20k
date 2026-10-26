@@ -1630,6 +1630,25 @@ pub struct GeneralRules {
     /// building starts only after the held one is placed.
     #[cfg(feature = "phobos")]
     pub building_production_queue: bool,
+    /// Phobos `[General] AIFireSale=` (default true): whether a computer
+    /// house on its last legs (`0x004FD879..0x004FD904`, no live
+    /// `Factory=` building) sells every building.
+    #[cfg(feature = "phobos")]
+    pub ai_fire_sale: bool,
+    /// Phobos `[General] AIFireSaleDelay=` in frames (default 0): the first
+    /// last-legs tick starts this timer instead of selling; the sale waits
+    /// until it completes. Non-positive sells at once.
+    #[cfg(feature = "phobos")]
+    pub ai_fire_sale_delay: i32,
+    /// Phobos `[General] AIAllToHunt=` (default true): whether the same
+    /// last-legs block sends every techno to hunt.
+    #[cfg(feature = "phobos")]
+    pub ai_all_to_hunt: bool,
+    /// Phobos `[General] GatherWhenMCVDeploy=` (default true): whether a
+    /// computer house's yard deploy runs
+    /// `HouseClass::MoveGroundForcesToBase @ 0x0050C920` (`0x00739926`).
+    #[cfg(feature = "phobos")]
+    pub gather_when_mcv_deploy: bool,
     /// `Rules+0xD78`, `[General] HarvesterTooFarDistance=` in cells: a
     /// refinery farther than this is approached before the dock is reserved.
     /// `RulesClass::ReadGeneral` reads it through `CCINIClass::ReadInt
@@ -2251,8 +2270,8 @@ impl DetailRules {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PrismSupportRules {
     /// `PrismSupportModifier=` (`Rules+0x49C`), the percent each supporter
-    /// adds to the shot: `ftol(ReadDouble(key, current) x 100)`, so a pass
-    /// with a `[General]` section and no key multiplies it by 100 again.
+    /// adds to the shot. Original gamemd uses the scaled integer as the
+    /// ReadDouble default; Ares converts that default back to a fraction.
     pub modifier: i32,
     /// `PrismSupportMax=` (`Rules+0x4A0`), the supporters one shot recruits.
     pub max: i32,
@@ -2281,9 +2300,23 @@ impl PrismSupportRules {
     /// `fmul qword 100.0` (`0x0067116E`) on the value ReadDouble returns, then
     /// ftol (`0x007C5F00`), under the game's masked chop control word, which
     /// also chops ReadDouble's own percent product: a modded `35%` reads 34.
+    /// Ares fixes the default's units before that read (see below).
     pub(crate) fn read_pass(self, general: &crate::rules::ini_parser::IniSection) -> Self {
         use crate::util::native_x87::{MaskedX87Chop53 as X87, NativeF64Bits};
-        let percent = general.read_double("PrismSupportModifier", f64::from(self.modifier));
+        let current = f64::from(self.modifier);
+        // Ares RulesClass_Addition_General_PrismSupportModifier @ 0x1005D040,
+        // hook0x00671152: FILD Rules+49C; FDIV 100.0; pass that fraction to
+        // ReadDouble. Without this, each keyless map/mode multiplies the
+        // retained percentage by another 100 (original ReadGeneral67114F).
+        #[cfg(feature = "ares")]
+        let current = f64::from_bits(
+            X87::store_f64_masked_chop(X87::div(
+                X87::load_f64(NativeF64Bits::from_bits(current.to_bits())),
+                X87::load_f64(NativeF64Bits::from_bits(100.0_f64.to_bits())),
+            ))
+            .bits(),
+        );
+        let percent = general.read_double("PrismSupportModifier", current);
         let modifier = X87::ftol_i32_low_masked(X87::mul(
             X87::load_f64(NativeF64Bits::from_bits(percent.to_bits())),
             X87::load_f64(NativeF64Bits::from_bits(100.0_f64.to_bits())),
@@ -2633,6 +2666,14 @@ impl Default for GeneralRules {
             maximum_queued_objects: 5,
             #[cfg(feature = "phobos")]
             building_production_queue: false,
+            #[cfg(feature = "phobos")]
+            ai_fire_sale: true,
+            #[cfg(feature = "phobos")]
+            ai_fire_sale_delay: 0,
+            #[cfg(feature = "phobos")]
+            ai_all_to_hunt: true,
+            #[cfg(feature = "phobos")]
+            gather_when_mcv_deploy: true,
             harvester_too_far_distance: 5,
             approach_target_reset_multiplier: 1,
             chrono_harv_too_far_distance: 50,
@@ -3904,6 +3945,14 @@ impl GeneralRules {
             maximum_queued_objects: general.read_int("MaximumQueuedObjects", 5),
             #[cfg(feature = "phobos")]
             building_production_queue: general.read_bool("BuildingProductionQueue", false),
+            #[cfg(feature = "phobos")]
+            ai_fire_sale: general.read_bool("AIFireSale", true),
+            #[cfg(feature = "phobos")]
+            ai_fire_sale_delay: general.read_int("AIFireSaleDelay", 0),
+            #[cfg(feature = "phobos")]
+            ai_all_to_hunt: general.read_bool("AIAllToHunt", true),
+            #[cfg(feature = "phobos")]
+            gather_when_mcv_deploy: general.read_bool("GatherWhenMCVDeploy", true),
             harvester_too_far_distance: general.read_int("HarvesterTooFarDistance", 5),
             approach_target_reset_multiplier: general.read_int("ApproachTargetResetMultiplier", 1),
             chrono_harv_too_far_distance: general.read_int("ChronoHarvTooFarDistance", 50),
@@ -4310,6 +4359,10 @@ pub struct RuleSet {
     #[cfg(feature = "phobos")]
     phobos_super_weapon_metadata:
         BTreeMap<String, crate::rules::superweapon_type::PhobosSuperWeaponAvailability>,
+    /// Phobos `[GlobalControls] AllowParallelAIQueues=` and the
+    /// `ForbidParallelAIQueues.*` category switches.
+    #[cfg(feature = "phobos")]
+    parallel_ai_queues: crate::rules::phobos_parallel_ai_queues::ParallelAiQueueRules,
     /// Rules-driven terrain land-type semantics keyed by TMP land byte.
     pub terrain_rules: TerrainRules,
     /// Native `[Tiberiums]` definitions in GameMD type order.
@@ -4367,6 +4420,10 @@ pub struct RuleSet {
     #[cfg(feature = "phobos")]
     pub(crate) placement_preview_globals:
         crate::rules::phobos_placement_preview::PlacementPreviewGlobals,
+    /// Phobos `[General] SkirmishUnlimitedColors=`: the player-colour
+    /// conversion every launcher and loading-screen consumer reads.
+    #[cfg(feature = "phobos")]
+    pub(crate) skirmish_color_mode: crate::rules::skirmish_colors::SkirmishColorMode,
     /// Radar event visual parameters (ping rectangles on minimap).
     pub radar_event_config: RadarEventConfig,
     /// All superweapon types indexed by ID (e.g., "LightningStormSpecial" → SuperWeaponType).
@@ -5025,6 +5082,15 @@ impl RuleSet {
                     .ares_super_weapon_metadata
                     .insert(name.to_ascii_uppercase(), metadata);
             }
+            for (name, presentation) in processed.super_weapon_presentation_states() {
+                if let Some(sw) = rules
+                    .super_weapons
+                    .values_mut()
+                    .find(|sw| sw.id.eq_ignore_ascii_case(name))
+                {
+                    sw.presentation = presentation.clone();
+                }
+            }
             for (name, supers) in processed.additional_super_weapon_states() {
                 if let Some(building) = rules.object_list.iter_mut().find(|object| {
                     object.category == ObjectCategory::Building
@@ -5272,6 +5338,14 @@ impl RuleSet {
         }
         for sw in self.super_weapons.values_mut() {
             let section = ini.section(&sw.id);
+            #[cfg(feature = "ares")]
+            {
+                // SWTypeExt::LoadFromINI10033522 -> NullableIdx<Voc>
+                // 1000E9D0: successful names/none set presence; unknown
+                // retains. Read against fixed SOUNDMD, in rules-pass order.
+                sw.presentation.sound =
+                    section.and_then(|section| sounds.read_ares_reference(section, "SW.Sound"));
+            }
             // Original6CEB74..6CEBD8 keeps each current Voc ID when
             // ReadString128 or FindIndex7514D0 finds no replacement.
             sw.special_sound =
@@ -5283,15 +5357,9 @@ impl RuleSet {
                 // Ares NullableIdx<VocClass>: unknown retains the previous
                 // resolved cue; an explicit none sentinel clears it. The
                 // retained type INI owns the ordered read history.
-                delivery.activation_sound = ini.section(&sw.id).and_then(|section| {
-                    section.read_string_with("SW.ActivationSound", 2048, None, |current, name| {
-                        if crate::rules::ini_parser::is_native_none_type_name(name) {
-                            None
-                        } else {
-                            sounds.get(name).map(|entry| entry.id.clone()).or(current)
-                        }
-                    })
-                });
+                delivery.activation_sound = section
+                    .and_then(|section| sounds.read_ares_reference(section, "SW.ActivationSound"))
+                    .flatten();
             }
         }
         for object in &mut self.object_list {
@@ -5545,6 +5613,8 @@ impl RuleSet {
         #[cfg(feature = "phobos")]
         let placement_preview_globals =
             crate::rules::phobos_placement_preview::PlacementPreviewGlobals::from_ini(ini);
+        #[cfg(feature = "phobos")]
+        let skirmish_color_mode = crate::rules::skirmish_colors::SkirmishColorMode::from_ini(ini);
         #[cfg(feature = "phobos")]
         let radiation = {
             let mut radiation = radiation;
@@ -5910,6 +5980,9 @@ impl RuleSet {
             ares_super_weapon_metadata: BTreeMap::new(),
             #[cfg(feature = "phobos")]
             phobos_super_weapon_metadata: BTreeMap::new(),
+            #[cfg(feature = "phobos")]
+            parallel_ai_queues:
+                crate::rules::phobos_parallel_ai_queues::ParallelAiQueueRules::from_ini(ini),
             ares_prerequisite_alternates: HashSet::new(),
             terrain_rules,
             tiberium_types,
@@ -5933,6 +6006,8 @@ impl RuleSet {
             digital_display_globals,
             #[cfg(feature = "phobos")]
             placement_preview_globals,
+            #[cfg(feature = "phobos")]
+            skirmish_color_mode,
             radar_event_config,
             super_weapons,
             super_weapon_order,
@@ -6396,6 +6471,22 @@ impl RuleSet {
         &self.placement_preview_globals
     }
 
+    /// The player-colour conversion this rules load selects.
+    ///
+    /// A build without the `phobos` feature reads no
+    /// `[General] SkirmishUnlimitedColors=` and always answers the vanilla
+    /// eight-priority table, so callers need no `cfg`.
+    pub fn skirmish_colors(&self) -> crate::rules::skirmish_colors::SkirmishColorMode {
+        #[cfg(feature = "phobos")]
+        {
+            self.skirmish_color_mode
+        }
+        #[cfg(not(feature = "phobos"))]
+        {
+            crate::rules::skirmish_colors::SkirmishColorMode::VANILLA
+        }
+    }
+
     /// Look up a projectile by ID (case-insensitive, gamemd parity).
     pub fn projectile(&self, id: &str) -> Option<&ProjectileType> {
         Self::lookup_ci(&self.projectiles, id)
@@ -6536,12 +6627,19 @@ impl RuleSet {
         {
             b"phobos-super-availability-v1".hash(&mut hasher);
             self.phobos_super_weapon_metadata.hash(&mut hasher);
+            self.parallel_ai_queues.hash_into(&mut hasher);
         }
         #[cfg(feature = "ares")]
         {
             b"ares-side-sidebar-v1".hash(&mut hasher);
             b"ares-super-availability-v1".hash(&mut hasher);
             self.ares_super_weapon_metadata.hash(&mut hasher);
+            b"ares-weapon-ammo-v1".hash(&mut hasher);
+            self.weapons
+                .iter()
+                .map(|(id, weapon)| (id.to_ascii_uppercase(), weapon.ammo_cost()))
+                .collect::<BTreeMap<_, _>>()
+                .hash(&mut hasher);
             self.object_list
                 .iter()
                 .filter(|object| !object.additional_super_weapons().is_empty())
@@ -6592,6 +6690,8 @@ impl RuleSet {
             self.digital_display_globals.hash(&mut hasher);
             b"phobos-placement-preview-v1".hash(&mut hasher);
             self.placement_preview_globals.hash(&mut hasher);
+            b"phobos-skirmish-colors-v1".hash(&mut hasher);
+            self.skirmish_color_mode.hash(&mut hasher);
             self.object_list
                 .iter()
                 .map(|object| {
@@ -7037,6 +7137,20 @@ impl RuleSet {
             "Ares.SuperWeaponMoney".hash(&mut hasher);
             superweapon_money.hash(&mut hasher);
         }
+        #[cfg(feature = "ares")]
+        {
+            let default = crate::rules::superweapon_type::AresSuperWeaponPresentation::default();
+            let presentation: BTreeMap<_, _> = self
+                .super_weapons
+                .iter()
+                .filter(|(_, sw)| sw.presentation != default)
+                .map(|(id, sw)| (id.to_ascii_uppercase(), &sw.presentation))
+                .collect();
+            if !presentation.is_empty() {
+                "Ares.SuperWeaponPresentation".hash(&mut hasher);
+                presentation.hash(&mut hasher);
+            }
+        }
         let deliveries = self
             .super_weapons
             .iter()
@@ -7203,6 +7317,14 @@ impl RuleSet {
         self.general.weapon_nullify_anim.hash(&mut hasher);
         #[cfg(feature = "phobos")]
         self.general.building_production_queue.hash(&mut hasher);
+        #[cfg(feature = "phobos")]
+        {
+            b"phobos-ai-dehardcode-v1".hash(&mut hasher);
+            self.general.ai_fire_sale.hash(&mut hasher);
+            self.general.ai_fire_sale_delay.hash(&mut hasher);
+            self.general.ai_all_to_hunt.hash(&mut hasher);
+            self.general.gather_when_mcv_deploy.hash(&mut hasher);
+        }
         self.combat_damage.splash_list.hash(&mut hasher);
         self.combat_damage.death_weapon.hash(&mut hasher);
         // The live family order is independent of HashMap iteration and may
@@ -7935,6 +8057,14 @@ impl RuleSet {
     ) -> Option<&crate::rules::superweapon_type::PhobosSuperWeaponAvailability> {
         self.phobos_super_weapon_metadata
             .get(&id.to_ascii_uppercase())
+    }
+
+    /// The `[GlobalControls]` parallel AI queue switches (Phobos extension).
+    #[cfg(feature = "phobos")]
+    pub fn parallel_ai_queues(
+        &self,
+    ) -> &crate::rules::phobos_parallel_ai_queues::ParallelAiQueueRules {
+        &self.parallel_ai_queues
     }
 
     /// A superweapon type's `SuperWeaponTypeClass` array index (its
@@ -11912,6 +12042,28 @@ DefaultSparkSystem=SparkSys
         IniFile::from_str(&text)
     }
 
+    #[cfg(feature = "phobos")]
+    #[test]
+    fn ai_dehardcode_keys_default_and_read_general() {
+        let defaults = GeneralRules::default();
+        assert!(defaults.ai_fire_sale);
+        assert_eq!(defaults.ai_fire_sale_delay, 0);
+        assert!(defaults.ai_all_to_hunt);
+        assert!(defaults.gather_when_mcv_deploy);
+
+        let read = GeneralRules::from_ini(&ini_with_general(
+            "AIFireSale=no\nAIFireSaleDelay=450\nAIAllToHunt=no\nGatherWhenMCVDeploy=no",
+        ));
+        assert!(!read.ai_fire_sale);
+        assert_eq!(read.ai_fire_sale_delay, 450);
+        assert!(!read.ai_all_to_hunt);
+        assert!(!read.gather_when_mcv_deploy);
+
+        let partial = GeneralRules::from_ini(&ini_with_general("AIFireSaleDelay=-3"));
+        assert!(partial.ai_fire_sale && partial.ai_all_to_hunt && partial.gather_when_mcv_deploy);
+        assert_eq!(partial.ai_fire_sale_delay, -3);
+    }
+
     #[test]
     fn sparking_probability_defaults_and_override() {
         // Stock INI omits both keys -> the verified RulesClass ctor defaults
@@ -13656,6 +13808,40 @@ Projectile=Invisible
             (model.increment, model.increment_bonus, model.bonus_cap),
             (0, NativeF64Bits::ONE, NativeF64Bits::POSITIVE_ZERO)
         );
+    }
+
+    #[cfg(feature = "phobos")]
+    #[test]
+    fn parallel_ai_queue_switches_default_the_gate_on_and_read_global_controls() {
+        // Phobos RulesExt constructs AllowParallelAIQueues { true }.
+        let empty = RuleSet::from_ini(&IniFile::from_str("")).unwrap();
+        let controls = empty.parallel_ai_queues();
+        assert!(controls.allows_parallel());
+        assert!(!controls.forbids_category(ObjectCategory::Building, false));
+
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[GlobalControls]\nAllowParallelAIQueues=no\n\
+             ForbidParallelAIQueues.Infantry=yes\nForbidParallelAIQueues.Navy=yes\n",
+        ))
+        .unwrap();
+        let controls = rules.parallel_ai_queues();
+        assert!(!controls.allows_parallel());
+        assert!(controls.forbids_category(ObjectCategory::Infantry, false));
+        assert!(!controls.forbids_category(ObjectCategory::Vehicle, false));
+        assert!(controls.forbids_category(ObjectCategory::Vehicle, true));
+        assert!(!controls.forbids_category(ObjectCategory::Aircraft, false));
+        assert!(!controls.forbids_category(ObjectCategory::Building, false));
+    }
+
+    #[cfg(feature = "phobos")]
+    #[test]
+    fn techno_forbid_parallel_ai_queues_reads_per_type() {
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[InfantryTypes]\n0=BLOCK\n1=OPEN\n[BLOCK]\nForbidParallelAIQueues=yes\n[OPEN]\n",
+        ))
+        .unwrap();
+        assert!(rules.object("BLOCK").unwrap().forbid_parallel_ai_queues);
+        assert!(!rules.object("OPEN").unwrap().forbid_parallel_ai_queues);
     }
 }
 

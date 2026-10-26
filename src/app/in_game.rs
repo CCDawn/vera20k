@@ -403,7 +403,7 @@ impl App {
         }
         if next == InGameMenuState::Menu {
             state.match_state.match_presentation.pause_menu_has_saves =
-                !state.persistence.repository.browser_entries().is_empty();
+                state.persistence.repository.has_browser_entry();
             crate::app::input::pause_menu::on_open(state);
         }
         if next == InGameMenuState::AbortConfirm {

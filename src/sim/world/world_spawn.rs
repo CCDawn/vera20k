@@ -2802,7 +2802,15 @@ impl Simulation {
                 .anchor_first_node(pack_base_plan_cell(i32::from(rx), i32::from(ry)));
             house.anchor_base_plan((rx, ry));
             house.enable_ai_deploy_latches();
-            self.move_ground_forces_to_base(owner_id, rules, registry, frame_effects);
+            // Phobos `[General] GatherWhenMCVDeploy=` skips the native
+            // regroup (hook at `0x739920`) while keeping every earlier write.
+            #[cfg(feature = "phobos")]
+            let gather = rules.general.gather_when_mcv_deploy;
+            #[cfg(not(feature = "phobos"))]
+            let gather = true;
+            if gather {
+                self.move_ground_forces_to_base(owner_id, rules, registry, frame_effects);
+            }
         }
 
         // 0x00739956: a Slave Miner's manager moves to its refinery (the

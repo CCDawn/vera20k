@@ -519,6 +519,25 @@ fn begin_loading_plays_loading_theme_and_polls_theme_through_the_lease() {
 }
 
 #[test]
+fn presentation_wait_retirement_returns_the_process_asset_lease() {
+    let mut assets = crate::app::process_assets::ProcessAssets::new(
+        crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+        false,
+    );
+    assets.return_from_loading(AssetManager::from_loose_root_for_test(&std::env::temp_dir()));
+    let mut session = LoadingSession::from_request(LoadingRequest::generic_map_load("pending"));
+    let mut result = super::super::transitions::fallback_map_load_result();
+    result.asset_manager = assets.lease_for_loading();
+    session.stage = LoadingStage::PreparingPresentation {
+        result: Box::new(result),
+    };
+    assert!(assets.is_leased() && !assets.is_available());
+    assert!(loading_asset_manager(&session).is_some());
+    session.retire(&mut assets);
+    assert!(assets.is_available() && !assets.is_leased());
+}
+
+#[test]
 fn loading_replacement_and_terminal_retirement_preserve_cache_and_admission_order() {
     let dir = std::env::temp_dir().join(format!("vera20k-loading-owner-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1856,9 +1875,10 @@ fn selected_native_gate_preserves_metadata_and_raw_progress_cadence() {
             Some(LoadingArtVariant::Americans),
             0,
             HouseColorIndex(0),
-            LoadingProgressRowSnapshot::from_launch_session(&test_launch_session(
-                LaunchCountry::America,
-            )),
+            LoadingProgressRowSnapshot::from_launch_session(
+                &test_launch_session(LaunchCountry::America),
+                crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
+            ),
             cadence,
         );
         native.runtime_color_scheme_count = 16;
@@ -1902,9 +1922,10 @@ fn native_loading_state_keeps_the_full_player_progress_ramp() {
         Some(LoadingArtVariant::Americans),
         0,
         HouseColorIndex(1),
-        LoadingProgressRowSnapshot::from_launch_session(&test_launch_session(
-            LaunchCountry::America,
-        )),
+        LoadingProgressRowSnapshot::from_launch_session(
+            &test_launch_session(LaunchCountry::America),
+            crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
+        ),
         NativeLoadingProgressCadence::SelectedMap,
     );
     native.resolve_player_colors(
@@ -2042,7 +2063,10 @@ fn native_loading_percentage_controls_and_completion_match_original() {
                 human
             })
             .collect();
-        let mut rows = LoadingProgressRowSnapshot::from_launch_session(&launch);
+        let mut rows = LoadingProgressRowSnapshot::from_launch_session(
+            &launch,
+            crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
+        );
         let mut local = LoadingProgressState::standard_skirmish();
         for update in row["updates"].as_array().unwrap() {
             let index = update[0].as_u64().unwrap() as usize;
@@ -2205,7 +2229,10 @@ fn held_network_sink_sends_rmg_display_progress_and_services_the_same_source_row
             Some(LoadingArtVariant::Americans),
             0,
             HouseColorIndex(0),
-            LoadingProgressRowSnapshot::from_launch_session(session.network_setup().unwrap()),
+            LoadingProgressRowSnapshot::from_launch_session(
+                session.network_setup().unwrap(),
+                crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
+            ),
             NativeLoadingProgressCadence::RandomMapHalved,
         )
     };

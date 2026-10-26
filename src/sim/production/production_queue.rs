@@ -296,6 +296,20 @@ pub(in crate::sim) fn exit_produced_object(
         );
         if let Some(house) = sim.houses.get_mut(&owner_id) {
             house.ai_unit_choices_mut().clear(kind);
+            // Phobos `BuildingClass_KickOutUnit_UnitType/InfantryType/
+            // AircraftType` (`0x444119`, `0x444131`, `0x443CCA`) clears the
+            // house's factory slot at this prefix, before FreeRadio and
+            // placement retries can leave the product held.
+            #[cfg(feature = "phobos")]
+            if rules.parallel_ai_queues().allows_parallel() {
+                let slot = crate::sim::ai_base_building::AiFactorySlot::for_product(
+                    product_type.category,
+                    producer_type.naval,
+                );
+                house
+                    .ai_production_mut()
+                    .clear_parallel_factory(slot, producer_id);
+            }
             // NPSE 2.0 C2EF95 (aircraft), C3395E/C3397F (vehicle),
             // C2F184 (infantry): release at this prefix, before later
             // placement/FreeRadio retries can leave the object held.

@@ -664,6 +664,12 @@ pub struct ObjectType {
     /// the start skips. Clearing a building choice leaves its base-plan node
     /// unsatisfied, so the planner can select the same capped type again.
     pub aibuild_limit: i32,
+    /// Phobos `ForbidParallelAIQueues=` (default false): while Ares'
+    /// `[GlobalControls] AllowParallelAIQueues=` is on, a computer house that
+    /// already has a factory building for this type's category does not start
+    /// another one for this type.
+    #[cfg(feature = "phobos")]
+    pub forbid_parallel_ai_queues: bool,
     /// `[BuildingTypes] AIPlanningCount=` — the NPSE count of plan nodes a
     /// computer house's base plan gives this building. The techno reader
     /// extension chain reads it with the current field as its default and
@@ -1985,6 +1991,10 @@ pub struct ObjectType {
     /// it true while InvisibleInGame is set; the ordered Rules owner retains
     /// that write across layers. Live rejection can test both bytes separately.
     pub invisible: bool,
+
+    /// ObjectTypeClass::ObjectTypeClass stores +0x231=1 at 0x005F7168;
+    /// ReadINI retains ReadBool("LegalTarget", current) at 0x005F94AE..0x005F94C2.
+    pub legal_target: bool,
 
     /// `InvisibleInGame=yes` on BuildingType. Logical-only buildings (e.g., bridge
     /// anchors) that should not receive C4 or other interaction cursors.
@@ -3427,6 +3437,8 @@ impl ObjectType {
             } else {
                 i32::MAX
             },
+            #[cfg(feature = "phobos")]
+            forbid_parallel_ai_queues: section.read_bool("ForbidParallelAIQueues", false),
             ai_planning_count: if crate::rules::NPATCH_ENABLED {
                 building_int(section, category, "AIPlanningCount") & 0xFF
             } else {
@@ -3958,6 +3970,7 @@ impl ObjectType {
             can_c4: section.read_bool("CanC4", category == ObjectCategory::Building),
             eligible_for_delay_kill: section.read_bool("EligibleForDelayKill", false),
             invisible: section.read_bool("Invisible", false),
+            legal_target: section.read_bool("LegalTarget", true),
             invisible_in_game: section.read_bool("InvisibleInGame", false),
             place_anywhere: section.read_bool("PlaceAnywhere", false),
             to_tile: section.read_name("ToTile", 0x3c).map(str::to_owned),

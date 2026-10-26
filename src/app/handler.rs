@@ -326,41 +326,21 @@ fn show_menu_bar_and_dock_after_full_screen() {
     }
 }
 
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_some() {
-            return;
-        }
-        // Asked once AppKit has launched and activated the app; macOS keeps a
-        // chooser from any other process behind the app the player was using.
-        if std::mem::take(&mut self.ask_for_game_folder) && !super::app_bundle::ensure_game_folder()
-        {
-            log::info!("No game folder chosen; exiting");
-            event_loop.exit();
-            return;
-        }
-        log::info!("Application resumed — creating window and GPU context");
-        let capture_dimensions = match (self.shell_capture.as_ref(), self.tactical_capture.as_ref())
-        {
-            (Some(session), None) => Some((session.request().width(), session.request().height())),
-            (None, Some(session)) => Some((session.request().width(), session.request().height())),
-            (None, None) => None,
-            (Some(_), Some(_)) => {
-                log::error!("Shell and tactical capture modes are mutually exclusive");
-                event_loop.exit();
-                return;
+impl App {
+    fn accept_initialization_step(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        result: anyhow::Result<super::initialize::InitializationStep>,
+    ) {
+        match result {
+            Ok(super::initialize::InitializationStep::Pending(job)) => {
+                self.pending_initialization = Some(job);
+                event_loop.set_control_flow(ControlFlow::Poll);
             }
-        };
-        match Self::initialize(
-            event_loop,
-            capture_dimensions,
-            self.startup_options,
-            self.spawn_request.is_some() || self.replay_request.is_some(),
-            self.replay_request
-                .as_ref()
-                .map(|request| request.retail_dir.as_path()),
-        ) {
-            Ok(mut state) => {
+            Ok(super::initialize::InitializationStep::Ready(state, events)) => {
+                let mut state = *state;
+                // Resizes may have arrived while startup owned the renderer.
+                Self::follow_window_size(&mut state);
                 if let Some(request) = self.replay_request.take() {
                     let loading = crate::app::loading::pump::LoadingRequest::replay(
                         request
@@ -397,11 +377,21 @@ impl ApplicationHandler for App {
                 }
                 // Clip the cursor to the window on first launch (
                 // default). A focus regain re-applies it if the OS dropped it.
-                crate::app::input::cursor::apply_cursor_confinement(&state);
+                let window_id = state.platform.window.id();
                 self.state = Some(state);
+                for event in events {
+                    self.window_event(event_loop, window_id, event);
+                }
+                if let Some(state) = self.state.as_ref() {
+                    crate::app::input::cursor::apply_cursor_confinement(state);
+                }
+                #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+                crate::web::status(self.state.as_ref().and_then(|state| state.frontend.main_menu_shell_error.as_deref()).unwrap_or("Ready"));
                 log::info!("Initialization complete");
             }
             Err(err) => {
+                #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+                crate::web::status(&format!("Startup failed: {err:#}"));
                 log::error!("Failed to initialize: {:#}", err);
                 if self.spawn_request.is_some() || self.replay_request.is_some() {
                     self.startup_failure = Some(format!("CnCNet initialization failed: {err:#}"));
@@ -416,8 +406,78 @@ impl ApplicationHandler for App {
             }
         }
     }
+}
+
+impl ApplicationHandler for App {
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+        if let Some(job) = self.pending_initialization.as_mut() {
+            job.admit_event_loop_turn();
+        }
+    }
+
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.state.is_some() || self.pending_initialization.is_some() {
+            return;
+        }
+        // Asked once AppKit has launched and activated the app; macOS keeps a
+        // chooser from any other process behind the app the player was using.
+        if std::mem::take(&mut self.ask_for_game_folder) && !super::app_bundle::ensure_game_folder()
+        {
+            log::info!("No game folder chosen; exiting");
+            event_loop.exit();
+            return;
+        }
+        log::info!("Application resumed — creating window and GPU context");
+        let capture_dimensions = match (self.shell_capture.as_ref(), self.tactical_capture.as_ref())
+        {
+            (Some(session), None) => Some((session.request().width(), session.request().height())),
+            (None, Some(session)) => Some((session.request().width(), session.request().height())),
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                log::error!("Shell and tactical capture modes are mutually exclusive");
+                event_loop.exit();
+                return;
+            }
+        };
+        let result = Self::initialize(
+            event_loop,
+            capture_dimensions,
+            self.startup_options,
+            self.spawn_request.is_some() || self.replay_request.is_some(),
+            self.replay_request
+                .as_ref()
+                .map(|request| request.retail_dir.as_path()),
+        );
+        let result = if capture_dimensions.is_some() {
+            result.and_then(super::initialize::InitializationStep::finish_synchronously)
+        } else {
+            result
+        };
+        self.accept_initialization_step(event_loop, result);
+    }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if let Some(job) = &mut self.pending_initialization {
+            if job.window_id() == _id {
+                if matches!(event, WindowEvent::CloseRequested) {
+                    self.pending_initialization = None;
+                    event_loop.exit();
+                } else if matches!(
+                    &event,
+                    WindowEvent::Focused(_)
+                        | WindowEvent::Occluded(_)
+                        | WindowEvent::Resized(_)
+                        | WindowEvent::CursorEntered { .. }
+                        | WindowEvent::CursorLeft { .. }
+                        | WindowEvent::CursorMoved { .. }
+                ) {
+                    // The normal platform/input owners receive these edges
+                    // once the state exists. No startup-only focus authority.
+                    job.defer_window_event(event);
+                }
+            }
+            return;
+        }
         let shell_capture_active = self.shell_capture.is_some();
         let tactical_capture_active = self.tactical_capture.is_some();
         // Set while this call re-dispatches a touch's mouse events: those carry
@@ -1599,6 +1659,23 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // `resumed` and `about_to_wait` may share the first event-loop turn.
+        // A newly created continuation must wait for new_events, otherwise
+        // its work is joined to the preceding slice without servicing input.
+        if self
+            .pending_initialization
+            .as_ref()
+            .is_some_and(|job| !job.may_resume())
+        {
+            event_loop.set_control_flow(ControlFlow::Poll);
+            return;
+        }
+        if let Some(job) = self.pending_initialization.take() {
+            self.accept_initialization_step(event_loop, job.advance());
+            // One completed startup slice per event-loop pass, including the
+            // final admission. Ordinary input starts only with the full state.
+            return;
+        }
         let shell_scroll_wake = if let Some(state) = self.state.as_mut() {
             Self::follow_window_full_screen(state);
             // cursor lock: the OS drops the clip on focus loss /

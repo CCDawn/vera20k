@@ -104,6 +104,7 @@
 
 pub mod airstrike;
 pub mod digital_display;
+pub mod phobos_parallel_ai_queues;
 #[cfg(feature = "phobos")]
 pub mod phobos_placement_preview;
 pub mod phobos_radiation;
@@ -186,6 +187,7 @@ pub mod retail_sources;
 pub(crate) mod rules_type_references;
 pub mod ruleset;
 pub mod shp_vehicle_sequence;
+pub mod skirmish_colors;
 pub mod smudge_type;
 pub mod sound_ini;
 pub mod superweapon_targeting;

@@ -15,12 +15,11 @@ use crate::render::bridge_atlas::{self, BridgeAtlas};
 use crate::render::gpu::GpuContext;
 use crate::render::overlay_assets::{render_overlay_names, resolve_overlay_name_for_render};
 use crate::render::overlay_atlas::{self, OverlayAtlas};
-use crate::rules::color_scheme::{
-    ColorSchemeEntry, scheme_entry_by_name, scheme_entry_for_priority,
-};
+use crate::rules::color_scheme::{ColorSchemeEntry, scheme_entry_by_name};
 use crate::rules::house_colors::{DEFAULT_SCHEME_ENTRY, HouseColorIndex};
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
+use crate::rules::skirmish_colors::SkirmishColorMode;
 use crate::sim::scenario_bootstrap::normalized_launch_slots;
 use crate::skirmish_launch::SkirmishLaunchSession;
 
@@ -28,6 +27,7 @@ pub(crate) fn house_color_map_for_launch_session(
     session: &SkirmishLaunchSession,
     house_roster: &HouseRoster,
     schemes: &[ColorSchemeEntry],
+    skirmish_colors: SkirmishColorMode,
 ) -> HouseColorMap {
     // Active-retail CreateHouses @ 0x6882D1..0x68837D constructs Neutral and
     // Special even without [Houses]. Each looks up literal "LightGrey" with
@@ -57,9 +57,11 @@ pub(crate) fn house_color_map_for_launch_session(
         }
     }
     for slot in normalized_launch_slots(session) {
-        // `slot.color_index` is the gamemd color *priority* (lobby slot order);
-        // resolve it to a `[Colors]` entry index via the priority LUT + /2 doubling.
-        let entry = scheme_entry_for_priority(slot.color_index as i32) as u8;
+        // `slot.color_index` is the colour priority gamemd hands
+        // `Game_GetLinkedColor` (0x69A310); resolve it to a `[Colors]` entry
+        // index. The vanilla build divides the priority table's odd index by
+        // two; Phobos SkirmishUnlimitedColors makes the index itself the entry.
+        let entry = skirmish_colors.entry_for_priority(slot.color_index as i32) as u8;
         colors.insert(slot.owner_name, HouseColorIndex(entry));
     }
     colors
@@ -776,6 +778,7 @@ mod tests {
             &test_session(),
             &roster_with_neutral_and_playable(),
             &schemes,
+            SkirmishColorMode::VANILLA,
         );
 
         // CreateHouses overrides Neutral's authored color. Players resolve their
@@ -789,6 +792,47 @@ mod tests {
         assert!(!colors.contains_key("Americans"));
     }
 
+    /// Phobos SkirmishUnlimitedColors: the spawner's colour index is the
+    /// `[Colors]` entry. Twelve entries let both conversions stay in range, so
+    /// the two modes differ only in the conversion itself.
+    #[test]
+    fn launch_color_map_addresses_any_colors_entry_when_unlimited() {
+        let mut ini = String::from("[Colors]\n");
+        for index in 0..12 {
+            ini.push_str(&format!("C{index}=0,{},{}\n", index + 1, 255));
+        }
+        let schemes = crate::rules::color_scheme::parse_color_schemes(&IniFile::from_str(&ini));
+        let mut session = test_session();
+        session.local_player_mut().slot.color_index = 6;
+
+        let vanilla = house_color_map_for_launch_session(
+            &session,
+            &roster_with_neutral_and_playable(),
+            &schemes,
+            SkirmishColorMode::VANILLA,
+        );
+        // YR's table sends priority 6 to runtime scheme 17, entry 8.
+        assert_eq!(vanilla.get("Player"), Some(&HouseColorIndex(8)));
+
+        let unlimited = house_color_map_for_launch_session(
+            &session,
+            &roster_with_neutral_and_playable(),
+            &schemes,
+            SkirmishColorMode::UNLIMITED,
+        );
+        assert_eq!(unlimited.get("Player"), Some(&HouseColorIndex(6)));
+
+        // An index past YR's eight colours still names an entry.
+        session.local_player_mut().slot.color_index = 11;
+        let beyond_eight = house_color_map_for_launch_session(
+            &session,
+            &roster_with_neutral_and_playable(),
+            &schemes,
+            SkirmishColorMode::UNLIMITED,
+        );
+        assert_eq!(beyond_eight.get("Player"), Some(&HouseColorIndex(11)));
+    }
+
     #[test]
     fn launch_color_map_remaps_neutral_oil_without_authored_houses() {
         let Some(rules) = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini") else {
@@ -800,7 +844,12 @@ mod tests {
         let map = IniFile::from_str("[Structures]\n0=Neutral,CAOILD,256,168,78,64,None,0,0,0\n");
         let roster = crate::map::houses::parse_house_roster(&map, &schemes, None);
         assert!(roster.houses.is_empty());
-        let colors = house_color_map_for_launch_session(&test_session(), &roster, &schemes);
+        let colors = house_color_map_for_launch_session(
+            &test_session(),
+            &roster,
+            &schemes,
+            SkirmishColorMode::VANILLA,
+        );
         assert_eq!(colors.get("Neutral"), Some(&HouseColorIndex(2)));
         assert_eq!(colors.get("Special"), Some(&HouseColorIndex(2)));
         assert_eq!(colors.get("Player"), Some(&HouseColorIndex(5)));
@@ -818,7 +867,12 @@ mod tests {
             ),
         ] {
             let schemes = crate::rules::color_scheme::parse_color_schemes(&IniFile::from_str(ini));
-            let colors = house_color_map_for_launch_session(&test_session(), &roster, &schemes);
+            let colors = house_color_map_for_launch_session(
+                &test_session(),
+                &roster,
+                &schemes,
+                SkirmishColorMode::VANILLA,
+            );
             for name in ["Neutral", "Special", "nEuTrAl"] {
                 assert_eq!(colors.get(name), Some(&HouseColorIndex(expected)));
             }
@@ -855,6 +909,7 @@ mod tests {
                 &session,
                 &roster_with_neutral_and_playable(),
                 &schemes,
+                SkirmishColorMode::VANILLA,
             );
             assert_eq!(colors.get("Neutral"), Some(&HouseColorIndex(2)));
             assert_eq!(colors.get(expected_key), Some(&HouseColorIndex(5)));
@@ -862,6 +917,7 @@ mod tests {
             let row =
                 crate::app::loading::progress_row::LoadingProgressRowSnapshot::from_launch_session(
                     &session,
+                    crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
                 );
             assert_eq!(row.local_label(), handle);
             assert_eq!(

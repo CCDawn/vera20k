@@ -40,8 +40,8 @@ pub struct SelectedIni {
 }
 
 pub fn select_ini(assets: &AssetManager, name: &str) -> Result<SelectedIni, String> {
-    if crate::rules::ARES_ENABLED {
-        select_ini_with_options(assets, name, DirectiveOptions::default())
+    if crate::rules::ARES_ENABLED || crate::rules::PHOBOS_ENABLED {
+        select_ini_with_options(assets, name, DirectiveOptions::production())
     } else {
         select_physical_ini(assets, name)
     }
@@ -96,9 +96,9 @@ pub(crate) fn expand_ini_with_assets(
                 }
                 Err(error) => return Err(error.to_string()),
             };
-            if resolved.bytes.is_empty() {
-                return Ok(None);
-            }
+            // An existing zero-byte file is present, not missing: Phobos loads
+            // it through `CCFileClass`/`ReadCCFile` and Ares also keeps the
+            // read. Only an unresolved reference answers `None`.
             // Charge every physical read, including repeated DAG references,
             // before parsing. Resolution enforces the remaining budget before
             // reading or retaining the first loose snapshot, not afterwards.

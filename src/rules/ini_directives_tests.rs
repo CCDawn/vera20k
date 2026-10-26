@@ -26,9 +26,10 @@ fn expand(root: &str, files: &[(&str, &str)]) -> ExpandedIni {
 
 #[test]
 fn ini_directives_total_reference_budget_rejects_before_loading_an_oversized_list() {
+    // Distinct files: a repeated name is read once per root load.
     let mut root = String::from("[#include]\n");
     for index in 0..MAX_INCLUDE_REFERENCES {
-        root.push_str(&format!("{index}=child.ini\n"));
+        root.push_str(&format!("{index}=child{index}.ini\n"));
     }
     let mut loads = 0;
     let exact = process_directives(
@@ -43,7 +44,7 @@ fn ini_directives_total_reference_budget_rejects_before_loading_an_oversized_lis
     .unwrap();
     assert_eq!(loads, 1024);
     assert_eq!(text(&exact.ini, "Unit", "Value").as_deref(), Some("child"));
-    root.push_str("1024=child.ini\n");
+    root.push_str("1024=child1024.ini\n");
     let error = process_directives(
         IniFile::from_str(&root),
         "root.ini",
@@ -56,20 +57,23 @@ fn ini_directives_total_reference_budget_rejects_before_loading_an_oversized_lis
 }
 
 #[test]
-fn ini_directives_physical_byte_budget_counts_repeated_children() {
+fn ini_directives_physical_byte_budget_counts_every_included_file() {
     use crate::map::source::test_support::TestDirectory;
     use crate::rules::retail_sources::select_ini_with_options;
     let root = TestDirectory::new("include-byte-budget");
     let mut child = vec![b' '; 1024 * 1024];
     let prefix = b"[Unit]\nValue=x\n; ";
     child[..prefix.len()].copy_from_slice(prefix);
-    root.write("child.ini", &child);
+    // Distinct files: a repeated name is read once per root load.
     let mut parent = String::from("[#include]\n");
-    for index in 0..32 {
-        parent.push_str(&format!("{index}=child.ini\n"));
+    for index in 0..33 {
+        root.write(&format!("child{index}.ini"), &child);
+        if index < 32 {
+            parent.push_str(&format!("{index}=child{index}.ini\n"));
+        }
     }
     root.write("exact.ini", parent.as_bytes());
-    parent.push_str("32=child.ini\n");
+    parent.push_str("32=child32.ini\n");
     root.write("over.ini", parent.as_bytes());
     let assets = crate::assets::asset_manager::AssetManager::from_loose_root_for_test(root.path());
     let exact = select_ini_with_options(&assets, "exact.ini", DirectiveOptions::default()).unwrap();
@@ -82,7 +86,10 @@ fn ini_directives_physical_byte_budget_counts_repeated_children() {
 }
 
 #[test]
-fn ini_directives_ares_nested_descendants_and_later_includes_override_parents() {
+fn ini_directives_ares_nested_descendants_follow_stored_list_order() {
+    // Ares reads `[#include]` through GetKeyName(section, index) 0x00526CC0 in
+    // stored entry order, not numeric key order: `10=late.ini` precedes
+    // `2=early.ini`, so early.ini (and its base.ini) is the later read.
     let root = "[#include]\n10=late.ini\n2=early.ini\n[Unit]\nOwner=root\n";
     let result = expand(
         root,
@@ -99,8 +106,8 @@ fn ini_directives_ares_nested_descendants_and_later_includes_override_parents() 
         ],
     );
     assert!(result.diagnostics.is_empty());
-    assert_eq!(text(&result.ini, "Unit", "Owner").as_deref(), Some("late"));
-    assert_eq!(text(&result.ini, "Unit", "Value").as_deref(), Some("late"));
+    assert_eq!(text(&result.ini, "Unit", "Owner").as_deref(), Some("base"));
+    assert_eq!(text(&result.ini, "Unit", "Value").as_deref(), Some("early"));
     assert_eq!(text(&result.ini, "Unit", "Nested").as_deref(), Some("base"));
     assert_eq!(
         text(&result.ini, "Unit", "Inherited").as_deref(),
@@ -125,9 +132,12 @@ fn ini_directives_ares_documented_included_strength_overrides_root() {
 }
 
 #[test]
-fn ini_directives_dollar_include_retains_current_document_priority() {
+fn ini_directives_phobos_included_files_are_read_after_the_document() {
+    // Phobos CCINIClass_Load_Inheritance at 0x00474230 merges each listed file
+    // into the already-loaded document; "the one read later will overwrite the
+    // value" (Phobos docs, Include files), so included values win.
     let result = expand(
-        "[$Include]\n0=child.ini\n[Unit]\nValue=root\n",
+        "[$Include]\n0=child.ini\n[Unit]\nValue=root\nRootOnly=yes\n",
         &[
             (
                 "child.ini",
@@ -137,9 +147,13 @@ fn ini_directives_dollar_include_retains_current_document_priority() {
         ],
     );
     assert!(result.diagnostics.is_empty());
-    assert_eq!(text(&result.ini, "Unit", "Value").as_deref(), Some("root"));
-    assert_eq!(text(&result.ini, "Unit", "Other").as_deref(), Some("child"));
+    assert_eq!(text(&result.ini, "Unit", "Value").as_deref(), Some("base"));
+    assert_eq!(text(&result.ini, "Unit", "Other").as_deref(), Some("base"));
     assert_eq!(text(&result.ini, "Unit", "Deep").as_deref(), Some("yes"));
+    assert_eq!(
+        text(&result.ini, "Unit", "RootOnly").as_deref(),
+        Some("yes")
+    );
 }
 
 #[test]
@@ -156,7 +170,10 @@ fn ini_directives_phobos_section_wins_instead_of_combining_lists() {
 }
 
 #[test]
-fn ini_directives_numeric_and_ordinal_key_order_including_ties() {
+fn ini_directives_include_list_keeps_stored_entry_order() {
+    // Both native readers walk stored entries: Ares GetKeyName(section, index)
+    // 0x00526CC0 and Phobos `section->EntryIndex` iteration. Keys are only
+    // names, so numeric-looking values never reorder the list.
     let root = "[#include]\nz=z.ini\na=a.ini\n10=ten.ini\n2=two.ini\n01=one.ini\n1=tie.ini\n2147483648=overflow.ini\n";
     let mut reads = Vec::new();
     process_directives(
@@ -172,20 +189,23 @@ fn ini_directives_numeric_and_ordinal_key_order_including_ties() {
     assert_eq!(
         reads,
         [
+            "z.ini",
+            "a.ini",
+            "ten.ini",
+            "two.ini",
             "one.ini",
             "tie.ini",
-            "two.ini",
-            "ten.ini",
-            "overflow.ini",
-            "a.ini",
-            "z.ini"
+            "overflow.ini"
         ]
     );
 }
 
 #[test]
-fn ini_directives_shared_dag_child_is_revisited_in_order() {
-    let root = "[#include]\n0=left.ini\n1=right.ini\n";
+fn ini_directives_ares_reads_a_shared_child_once_per_root_load() {
+    // Ares.dll CCINIClass_ReadCCFile1 (hook 0x474200) records every file read
+    // and CCINIClass_ReadCCFile2 (0x474314) skips a recorded name, clearing the
+    // record only when the outermost read returns.
+    let root = "[#include]\n0=left.ini\n1=right.ini\n2=left.ini\n";
     let files = [
         ("left.ini", "[#include]\n0=shared.ini\n[Unit]\nValue=left\n"),
         (
@@ -207,12 +227,85 @@ fn ini_directives_shared_dag_child_is_revisited_in_order() {
         DirectiveOptions::default(),
     )
     .unwrap();
-    assert_eq!(reads, ["left.ini", "shared.ini", "right.ini", "shared.ini"]);
+    assert_eq!(reads, ["left.ini", "shared.ini", "right.ini"]);
     assert_eq!(
         text(&result.ini, "Unit", "Value").as_deref(),
         Some("shared")
     );
+    assert_eq!(text(&result.ini, "Unit", "Other").as_deref(), Some("right"));
     assert!(result.diagnostics.is_empty());
+}
+
+#[test]
+fn ini_directives_phobos_includes_each_physical_file_once() {
+    // Phobos Hooks.INIInheritance.cpp keeps `SavedIncludes` for the whole root
+    // load, so a shared child and a repeated entry are read once.
+    let root = "[$Include]\n0=left.ini\n1=right.ini\n2=left.ini\n";
+    let files = [
+        ("left.ini", "[$Include]\n0=shared.ini\n[Unit]\nValue=left\n"),
+        (
+            "right.ini",
+            "[$Include]\n0=shared.ini\n[Unit]\nOther=right\n",
+        ),
+        ("shared.ini", "[Unit]\nValue=shared\n"),
+    ];
+    let mut reads = Vec::new();
+    let result = process_directives(
+        IniFile::from_str(root),
+        "root.ini",
+        |name| {
+            reads.push(name.to_owned());
+            Ok(Some(IniFile::from_str(
+                files.iter().find(|(key, _)| *key == name).unwrap().1,
+            )))
+        },
+        DirectiveOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(reads, ["left.ini", "shared.ini", "right.ini"]);
+    assert_eq!(
+        text(&result.ini, "Unit", "Value").as_deref(),
+        Some("shared")
+    );
+    assert_eq!(text(&result.ini, "Unit", "Other").as_deref(), Some("right"));
+    assert!(result.diagnostics.is_empty());
+}
+
+#[test]
+fn ini_directives_phobos_missing_file_is_fatal_even_when_not_strict() {
+    // Phobos CCINIClass_Load_Inheritance calls Debug::FatalErrorAndExit for a
+    // listed file that does not exist; Ares only skips it.
+    let error = process_directives(
+        IniFile::from_str("[$Include]\n0=missing.ini\n"),
+        "root.ini",
+        |_| Ok(None),
+        DirectiveOptions::default(),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.kind, DiagnosticKind::IncludeMissing);
+    assert_eq!(error.reference_chain, ["root.ini", "missing.ini"]);
+}
+
+#[test]
+fn ini_directives_phobos_dialect_leaves_ares_include_inert() {
+    // With Phobos -Include active, Phobos.cpp restores the vanilla bytes at
+    // 0x474200/0x474314, so a document without `$Include` never reads its
+    // `[#include]` list.
+    let options = DirectiveOptions {
+        ares: false,
+        phobos: true,
+        ..Default::default()
+    };
+    let result = process_directives(
+        IniFile::from_str("[#include]\n0=child.ini\n[Unit]\nValue=root\n"),
+        "root.ini",
+        |_| panic!("an active Phobos dialect must not read [#include]"),
+        options,
+    )
+    .unwrap();
+    assert!(result.diagnostics.is_empty());
+    assert_eq!(text(&result.ini, "Unit", "Value").as_deref(), Some("root"));
 }
 
 #[test]
@@ -554,7 +647,15 @@ fn ini_directives_production_selection_obeys_build_capability() {
     use crate::map::source::test_support::TestDirectory;
     use crate::rules::retail_sources::select_ini;
 
-    for directive in ["#include", "$Include"] {
+    // VERA has no -Include launch switch: a combined build keeps [#include]
+    // for documents without [$Include].
+    let options = DirectiveOptions::production();
+    assert_eq!(options.phobos, crate::rules::PHOBOS_ENABLED);
+    assert_eq!(options.ares, crate::rules::ARES_ENABLED);
+    for (directive, expected) in [
+        ("#include", crate::rules::ARES_ENABLED),
+        ("$Include", crate::rules::PHOBOS_ENABLED),
+    ] {
         let dir = TestDirectory::new("ini-directives-capability");
         let root = format!(
             "[{directive}]\n0=child.ini\n[Child]\n$Inherits=Base\nOwn=root\n[Base]\nInherited=parent\n"
@@ -565,20 +666,21 @@ fn ini_directives_production_selection_obeys_build_capability() {
             crate::assets::asset_manager::AssetManager::from_loose_root_for_test(dir.path());
         let selected = select_ini(&assets, "root.ini").unwrap();
         assert!(selected.directive_diagnostics.is_empty());
-        assert_eq!(
-            selected.included_sources.len(),
-            usize::from(crate::rules::ARES_ENABLED)
-        );
+        assert_eq!(selected.included_sources.len(), usize::from(expected));
         assert_eq!(
             text(&selected.ini, "Included", "Value").as_deref(),
-            crate::rules::ARES_ENABLED.then_some("child")
+            expected.then_some("child")
         );
+        // `[Base]` is authored in the root document, so inheritance resolves
+        // even when the included file is not read. A build with neither
+        // capability never enters the directive owner.
+        let any_capability = crate::rules::ARES_ENABLED || crate::rules::PHOBOS_ENABLED;
         assert_eq!(
             text(&selected.ini, "Child", "Inherited").as_deref(),
-            crate::rules::ARES_ENABLED.then_some("parent")
+            any_capability.then_some("parent")
         );
         assert_eq!(text(&selected.ini, "Child", "Own").as_deref(), Some("root"));
-        if !crate::rules::ARES_ENABLED {
+        if !crate::rules::ARES_ENABLED && !crate::rules::PHOBOS_ENABLED {
             assert_eq!(
                 selected.ini.content_hash(),
                 IniFile::from_str(&root).content_hash()
@@ -631,8 +733,14 @@ fn ini_directives_probe_missing_empty_and_strict_policy() {
     dir.write("good.ini", b"[Unit]\nValue=good\n");
     let assets = crate::assets::asset_manager::AssetManager::from_loose_root_for_test(dir.path());
     let selected = select_ini_with_options(&assets, "root.ini", Default::default()).unwrap();
-    assert_eq!(selected.directive_diagnostics.len(), 2);
-    assert_eq!(selected.included_sources.len(), 1);
+    // An existing zero-byte file is present and is loaded; only the unresolved
+    // name is reported missing.
+    assert_eq!(selected.directive_diagnostics.len(), 1);
+    assert_eq!(
+        selected.directive_diagnostics[0].kind,
+        DiagnosticKind::IncludeMissing
+    );
+    assert_eq!(selected.included_sources.len(), 2);
     assert_eq!(
         text(&selected.ini, "Unit", "Value").as_deref(),
         Some("good")
@@ -754,22 +862,19 @@ fn ini_directives_reach_the_existing_ordered_type_processor_and_fixed_art() {
         )
         .unwrap();
     let (rules, _, art, _) = loaded.into_parts();
-    if crate::rules::ARES_ENABLED {
+    // This fixture uses `[#include]` only, so the Ares capability expands it.
+    let ares_include = crate::rules::ARES_ENABLED;
+    if ares_include {
         assert_eq!(rules.object("TEST").unwrap().strength, 100);
     } else {
         assert!(rules.object("TEST").is_none());
     }
     assert_eq!(
         rules.production.build_speed.bits(),
-        f64::from(if crate::rules::ARES_ENABLED {
-            0.9_f32
-        } else {
-            0.7_f32
-        })
-        .to_bits()
+        f64::from(if ares_include { 0.9_f32 } else { 0.7_f32 }).to_bits()
     );
     assert_eq!(
         art.section_or_empty("TEST").read_bool("Voxel", false),
-        crate::rules::ARES_ENABLED
+        ares_include
     );
 }

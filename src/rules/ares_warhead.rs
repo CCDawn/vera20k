@@ -153,6 +153,9 @@ impl AttachEffectRules {
     pub(crate) fn armor_multiplier(&self) -> NativeF64Bits {
         self.armor
     }
+    pub(crate) fn rof_multiplier(&self) -> NativeF64Bits {
+        self.rof
+    }
     pub(crate) fn cloakable(&self) -> bool {
         self.cloakable
     }
@@ -162,10 +165,10 @@ impl AttachEffectRules {
     pub(crate) fn initial_delay(&self) -> i32 {
         self.initial_delay
     }
-    /// Warhead and self effects share speed, firepower, armor and cloak
-    /// aggregates. ROF and Temporal consumers remain separate mechanisms.
+    /// Warhead and self effects share the stat/cloak aggregates. Temporal
+    /// animation visibility remains a separate mechanism.
     pub(crate) fn visual_combat_path(&self) -> bool {
-        self.rof == NativeF64Bits::ONE && !self.temporal_hides_anim
+        !self.temporal_hides_anim
     }
     #[cfg(feature = "ares")]
     pub(crate) fn read_pass(&mut self, section: &IniSection, animation: Option<Option<String>>) {

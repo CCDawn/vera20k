@@ -449,6 +449,19 @@ impl ProcessAssets {
         self.manager.as_ref()
     }
 
+    /// Field-level split borrow for a scenario rescan: the scan registers loose
+    /// YRO archives, and its PKT titles resolve through the process CSF. Both
+    /// fields live on this owner, so the pair is borrowed together.
+    #[cfg(feature = "verax")]
+    pub(crate) fn scenario_rescan_sources(
+        &mut self,
+    ) -> (
+        Option<&mut AssetManager>,
+        Option<&crate::assets::csf_file::CsfFile>,
+    ) {
+        (self.manager.as_mut(), self.csf.as_ref())
+    }
+
     /// Field-level split borrow: the resident manager and the terrain-variant
     /// cache live on the same owner, and the RMG preview path needs both at
     /// once.

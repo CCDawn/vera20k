@@ -490,10 +490,52 @@ pub(super) fn abandon_production(
     owner: InternedId,
     effects: FrameEffects<'_>,
 ) {
+    // Phobos `FactoryClass_AbandonProduction_Phobos 0x4CA07A` nulls the
+    // house's category pointer for a forbidden category or product, without
+    // checking which factory abandoned it.
+    #[cfg(feature = "phobos")]
+    clear_abandoned_parallel_factory(sim, rules, holder, owner);
     if let Some(abandoned) = sim.production.factories().pending_abandonment(holder) {
         settle_abandoned(sim, rules, owner, holder, abandoned, effects);
     }
     sim.production.factories_mut().remove_factory(holder);
+}
+
+#[cfg(feature = "phobos")]
+fn clear_abandoned_parallel_factory(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    holder: FactoryHolder,
+    owner: InternedId,
+) {
+    let FactoryHolder::Building(_) = holder else {
+        return;
+    };
+    if !rules.parallel_ai_queues().allows_parallel() {
+        return;
+    }
+    let product = sim
+        .production
+        .factories()
+        .pending_abandonment(holder)
+        .and_then(|abandoned| rules.object(sim.interner.resolve(abandoned.type_id)))
+        .map(|object| {
+            (
+                object.category,
+                object.naval,
+                object.forbid_parallel_ai_queues,
+            )
+        });
+    let Some((category, naval, forbidden)) = product else {
+        return;
+    };
+    if !forbidden && !rules.parallel_ai_queues().forbids_category(category, naval) {
+        return;
+    }
+    let slot = crate::sim::ai_base_building::AiFactorySlot::for_product(category, naval);
+    if let Some(house) = sim.houses.get_mut(&owner) {
+        house.ai_production_mut().set_parallel_factory(slot, None);
+    }
 }
 
 /// The AbandonProduction refund: the object's Cost_Of for its owner now, less the

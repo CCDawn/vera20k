@@ -47,11 +47,19 @@ pub(crate) struct LoadingProgressParticipant {
 pub(crate) struct LoadingProgressRowSnapshot {
     pub participants: Vec<LoadingProgressParticipant>,
     pub local_player_index: usize,
+    /// The player-colour conversion this snapshot resolved its participants
+    /// with. The map markers repeat the conversion when they look up the
+    /// per-colour atlas rows, so they read it here instead of resolving the
+    /// same priority twice.
+    pub skirmish_colors: crate::rules::skirmish_colors::SkirmishColorMode,
 }
 
 impl LoadingProgressRowSnapshot {
     /// Redraw643C0B..36 iterates source nodes, not color-sorted Houses.
-    pub fn from_launch_session(session: &SkirmishLaunchSession) -> Self {
+    pub fn from_launch_session(
+        session: &SkirmishLaunchSession,
+        skirmish_colors: crate::rules::skirmish_colors::SkirmishColorMode,
+    ) -> Self {
         Self {
             participants: session
                 .humans
@@ -65,9 +73,7 @@ impl LoadingProgressRowSnapshot {
                         super::pump::loading_art_variant_from_launch_country(human.slot.country)
                     },
                     color_index: crate::rules::house_colors::HouseColorIndex(
-                        crate::rules::color_scheme::scheme_entry_for_priority(i32::from(
-                            human.slot.color_index,
-                        )) as u8,
+                        skirmish_colors.entry_for_priority(i32::from(human.slot.color_index)) as u8,
                     ),
                     backing_rgb: super::pump::FALLBACK_BACKING_RGB,
                     ramp: super::pump::FALLBACK_PROGRESS_RAMP,
@@ -76,6 +82,7 @@ impl LoadingProgressRowSnapshot {
                 })
                 .collect(),
             local_player_index: session.local_player_index,
+            skirmish_colors,
         }
     }
 
@@ -301,7 +308,10 @@ mod tests {
         launch.humans[0].slot.color_index = 6;
         launch.humans.push(guest);
         launch.local_player_index = 1;
-        let mut rows = LoadingProgressRowSnapshot::from_launch_session(&launch);
+        let mut rows = LoadingProgressRowSnapshot::from_launch_session(
+            &launch,
+            crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
+        );
         assert_eq!(
             rows.participants
                 .iter()

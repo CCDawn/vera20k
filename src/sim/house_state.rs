@@ -181,13 +181,33 @@ pub struct HouseOutcomeState {
 ///
 /// The emergency block of `HouseClass::AI_Building_Strategy @ 0x004FD7A0`
 /// (`sim::house_strategy`) steps the mode; All_To_Hunt sets the latch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HouseStrategyEmergencyState {
     mode: i32,
     all_to_hunt_bias: bool,
     last_building_attack_frame: i32,
     #[serde(default = "last_attacker_house_index_default")]
     last_attacker_house_index: i32,
+    /// Phobos HouseExt `AIFireSaleDelayTimer` (persisted): None until the
+    /// first last-legs tick with a positive `[General] AIFireSaleDelay=`.
+    #[cfg(feature = "phobos")]
+    #[serde(default)]
+    ai_fire_sale_delay_timer: Option<CdTimer>,
+}
+
+impl std::hash::Hash for HouseStrategyEmergencyState {
+    fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
+        self.mode.hash(hasher);
+        self.all_to_hunt_bias.hash(hasher);
+        self.last_building_attack_frame.hash(hasher);
+        self.last_attacker_house_index.hash(hasher);
+        // Phobos extension state; keep the native-only hash while unset.
+        #[cfg(feature = "phobos")]
+        if let Some(timer) = self.ai_fire_sale_delay_timer {
+            b"phobos-ai-fire-sale-delay-v1".hash(hasher);
+            timer.hash(hasher);
+        }
+    }
 }
 
 const fn last_attacker_house_index_default() -> i32 {
@@ -214,6 +234,8 @@ impl Default for HouseStrategyEmergencyState {
             all_to_hunt_bias: false,
             last_building_attack_frame: 0,
             last_attacker_house_index: last_attacker_house_index_default(),
+            #[cfg(feature = "phobos")]
+            ai_fire_sale_delay_timer: None,
         }
     }
 }
@@ -272,6 +294,17 @@ impl HouseStrategyEmergencyState {
         }
 
         false
+    }
+
+    /// Phobos HouseExt `AIFireSaleDelayTimer`, None until first armed.
+    #[cfg(feature = "phobos")]
+    pub(crate) const fn ai_fire_sale_delay_timer(&self) -> Option<CdTimer> {
+        self.ai_fire_sale_delay_timer
+    }
+
+    #[cfg(feature = "phobos")]
+    pub(crate) fn start_ai_fire_sale_delay(&mut self, frame: i32, delay: i32) {
+        self.ai_fire_sale_delay_timer = Some(CdTimer::started(frame, delay));
     }
 
     #[cfg(any(test, feature = "test-support"))]

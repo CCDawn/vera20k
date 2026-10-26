@@ -1,7 +1,7 @@
 # Ares builtin AttachEffect
 
 The `ares` feature enables ordinary ground-victim and type-owned self effects,
-with ordered Foot speed, Techno firepower/armor and temporary cloakability. Without
+with ordered Foot speed, Techno firepower/armor/ROF and temporary cloakability. Without
 the feature there is no attachment vector, update,
 damage pre-effect or animation root in the game. Ares snapshots include the new
 state in the automatic snapshot layout digest; old layouts are rejected.
@@ -174,10 +174,8 @@ DiscardOnEntry restore the baseline through the shared attachment lifecycle.
 Both baseline and effective armor are saved, hashed and validated on restore;
 the added saved field is Ares-only. Default-build state and hashes are unchanged.
 
-The current chain admits only identity ROF multipliers with
-TemporalHidesAnim disabled. Other nonneutral aggregate consumers,
-Temporal hide behavior and airborne
-half-distance collection remain later mechanisms, not silently visual-only
+The current chain admits effects with TemporalHidesAnim disabled. Temporal
+hide behavior and airborne half-distance collection remain later mechanisms, not silently visual-only
 effects. Their active callers keep the wider compatibility goal open. The
 shared collector retains its documented fractional-distance rounding residual.
 No explicit RNG draw or timer is added beyond actual positive-duration visits;
@@ -221,3 +219,29 @@ CloakSkipTimer producers, passive-generator height admission, and building
 cloak AI still need their own chains. Configurations using those mechanisms
 are not established as equivalent by this change. No new RNG draws are added;
 effect animations retain the existing constructor and detach lifecycle.
+
+## Attached reload time
+
+The same attachment owner folds `AttachEffect.ROFMultiplier` from the shared
+descriptor reader (`0x10058AF4`, descriptor+28). Installed Ares
+`TechnoExt::RecalculateStats` (`0x10046184..0x1004618B`) starts at one and
+spills binary64 after each ordered factor, then commits Ext+78 at
+`0x10046130..0x10046134`. The derived value is saved, hashed and checked
+against the canonical entries on restore. It uses the existing creation,
+expiry and DiscardOnEntry recomputation boundaries, including self effects.
+
+The shared `TechnoClass::GetROF` port consumes it at the installed
+`TechnoClass_GetROF_AttachEffect` hook (`0x10047A40`, original site `0x6FD0BF`):
+after loading weapon ROF, before multiplying House bias and adding jitter.
+Applying it to the final integer reload would give different results. The
+building hook (`0x10047A60`, site `0x6FCFA4`) bypasses the original Ammo>1
+return. Sonic/live-particle and mid-burst returns do not reach the ROF hook.
+FireAt, C4 and gunner handover all use the existing snapshot/query owner.
+Application and expiry never rewrite an already-running rearm timer, matching
+the [Ares reload sampling rule](https://ares-developers.github.io/Ares-docs/new/attacheffect.html).
+
+Two focused regressions cover four executed native numeric controls, the
+feature-off stock results/RNG, and a real Bullet/FireAt/ObjectAI expiry plus
+save/restore chain. No mod assets, native harness or execution corpus is added.
+This does not implement the separately documented MobileFire=no stop-rearm
+caller; the selected ground weapon caller uses MobileFire's default yes.

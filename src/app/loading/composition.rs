@@ -1290,7 +1290,8 @@ mod tests {
         );
         assert_eq!(
             crate::app::loading::progress_row::LoadingProgressRowSnapshot::from_launch_session(
-                &session
+                &session,
+                crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
             )
             .local_label(),
             "Player"

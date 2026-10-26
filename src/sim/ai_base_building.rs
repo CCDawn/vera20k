@@ -101,6 +101,12 @@ pub struct HouseAiProduction {
     /// of any Factory's lifetime; this House production owner retains them.
     #[serde(default)]
     parallel_reservations: [i32; 5],
+    /// Phobos HouseExt `Factory_BuildingType`/`Factory_InfantryType`/
+    /// `Factory_VehicleType`/`Factory_NavyType`/`Factory_AircraftType`:
+    /// the factory building the house currently uses for each category, in
+    /// `AiFactorySlot` order. None is Phobos' null pointer.
+    #[serde(default)]
+    parallel_factories: [Option<u64>; 5],
 }
 
 impl Default for HouseAiProduction {
@@ -112,6 +118,7 @@ impl Default for HouseAiProduction {
             building_choice: -1,
             naval_allowed: true,
             parallel_reservations: [0; 5],
+            parallel_factories: [None; 5],
         }
     }
 }
@@ -125,6 +132,64 @@ impl Hash for HouseAiProduction {
         if self.parallel_reservations != [0; 5] {
             b"npse-parallel-reservations-v1".hash(hasher);
             self.parallel_reservations.hash(hasher);
+        }
+        // Phobos extension state; keep the older hash while unset.
+        if self.parallel_factories != [None; 5] {
+            b"phobos-parallel-ai-factories-v1".hash(hasher);
+            self.parallel_factories.hash(hasher);
+        }
+    }
+}
+
+/// Phobos' per-house factory building pointers, one slot per producing
+/// building category (`HouseExt::Factory_*Type`).
+#[cfg(feature = "phobos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AiFactorySlot {
+    Building,
+    Infantry,
+    Vehicle,
+    Navy,
+    Aircraft,
+}
+
+#[cfg(feature = "phobos")]
+impl AiFactorySlot {
+    const fn index(self) -> usize {
+        match self {
+            Self::Building => 0,
+            Self::Infantry => 1,
+            Self::Vehicle => 2,
+            Self::Navy => 3,
+            Self::Aircraft => 4,
+        }
+    }
+
+    /// The slot a producing building's `Factory=` RTTI and `Naval=` select
+    /// (`pThis->Type->Factory`/`Naval` in `0x4502F4`).
+    pub(crate) const fn for_producer(factory_rtti: i32, naval: bool) -> Option<Self> {
+        match factory_rtti {
+            7 => Some(Self::Building),
+            16 => Some(Self::Infantry),
+            40 => Some(if naval { Self::Navy } else { Self::Vehicle }),
+            3 => Some(Self::Aircraft),
+            _ => None,
+        }
+    }
+
+    /// The slot a produced object's category and `Naval=` select.
+    pub(crate) const fn for_product(category: ObjectCategory, naval: bool) -> Self {
+        match category {
+            ObjectCategory::Building => Self::Building,
+            ObjectCategory::Infantry => Self::Infantry,
+            ObjectCategory::Vehicle => {
+                if naval {
+                    Self::Navy
+                } else {
+                    Self::Vehicle
+                }
+            }
+            ObjectCategory::Aircraft => Self::Aircraft,
         }
     }
 }
@@ -169,6 +234,30 @@ impl HouseAiProduction {
         let counter = self.parallel_slot_mut(category, naval);
         *counter = counter.wrapping_sub(1).max(0);
     }
+    /// Phobos `BuildingClass_Update_Factory_Phobos @ 0x4502F4` remembers the
+    /// first factory building of a category; a second one consults it.
+    #[cfg(feature = "phobos")]
+    pub(crate) fn parallel_factory(&self, slot: AiFactorySlot) -> Option<u64> {
+        self.parallel_factories[slot.index()]
+    }
+
+    #[cfg(feature = "phobos")]
+    pub(crate) fn set_parallel_factory(&mut self, slot: AiFactorySlot, building: Option<u64>) {
+        self.parallel_factories[slot.index()] = building;
+    }
+
+    /// `BuildingClass_KickOutUnit_*` (`0x444119`, `0x444131`, `0x443CCA`,
+    /// `0x44531F`) clear the pointer only while it still names the same
+    /// factory building. `FactoryClass_AbandonProduction` (`0x4CA07A`) has no
+    /// such test and uses [`Self::set_parallel_factory`] instead.
+    #[cfg(feature = "phobos")]
+    pub(crate) fn clear_parallel_factory(&mut self, slot: AiFactorySlot, building: u64) {
+        let entry = &mut self.parallel_factories[slot.index()];
+        if *entry == Some(building) {
+            *entry = None;
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) const fn mode(&self) -> i32 {
         self.mode

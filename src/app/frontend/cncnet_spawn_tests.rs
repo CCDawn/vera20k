@@ -231,6 +231,19 @@ fn client_campaign_uses_human_difficulty_and_not_catalog_index() {
     );
 }
 
+/// `[MPColors] Color=` carries the client's colour index: YR's eight
+/// priorities, or a `[Colors]` entry when a Phobos build admits
+/// SkirmishUnlimitedColors.
+#[test]
+fn spawn_colour_index_width_follows_the_phobos_capability() {
+    assert!(SpawnRequest::parse(SKIRMISH).is_ok());
+    let beyond_eight = SKIRMISH.replacen("Color=2", "Color=9", 1);
+    assert_eq!(
+        SpawnRequest::parse(&beyond_eight).is_ok(),
+        crate::rules::PHOBOS_ENABLED
+    );
+}
+
 #[test]
 fn rejects_network_sessions_unsupported_extensions_and_invalid_assignments() {
     for append in [

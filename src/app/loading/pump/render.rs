@@ -24,7 +24,6 @@ use crate::render::shell_surface_present::ShellSurfacePresenter;
 use crate::render::shell_text::{
     ScissorRect, ShellAlign, ShellTextDraw, TextRect, draw_in_rect_scaled,
 };
-use crate::rules::color_scheme::scheme_entry_for_priority;
 use crate::ui::shell::geom::ShellScale;
 
 const BACKGROUND_DEPTH: f32 = 0.90;
@@ -128,10 +127,10 @@ pub(crate) fn transfer_progress_draws(
     } else {
         i32::from(local.slot.color_index)
     };
-    let color = HouseColorIndex(scheme_entry_for_priority(priority) as u8);
     let rules = state
         .rules()
         .ok_or_else(|| anyhow::anyhow!("map transfer has no color schemes"))?;
+    let color = HouseColorIndex(rules.skirmish_colors().entry_for_priority(priority) as u8);
     let rgb = house_text_rgb(&rules.color_schemes, color).map(|byte| f32::from(byte) / 255.0);
     let ramp = *rules.house_color_ramps.ramp(color);
     if state.frontend.loading_screen_atlas.is_none() {
@@ -523,6 +522,7 @@ fn build_native_loading_instances(
     campaign: Option<&CampaignLoadingPresentation>,
     base_origin: [i32; 2],
     scale: ShellScale,
+    skirmish_colors: crate::rules::skirmish_colors::SkirmishColorMode,
 ) -> Vec<SpriteInstance> {
     let mut instances = Vec::with_capacity(12);
     if let Some(campaign) = campaign {
@@ -577,7 +577,8 @@ fn build_native_loading_instances(
         // region-sized surface before blitting it.
         if let Some(prepared) = composition.preview.as_ref() {
             for marker in &composition.markers {
-                let color_key = scheme_entry_for_priority(i32::from(marker.color_priority)) as u8;
+                let color_key =
+                    skirmish_colors.entry_for_priority(i32::from(marker.color_priority)) as u8;
                 let Some(entry) = atlas.mmpb_markers.get(&color_key).copied() else {
                     continue;
                 };
@@ -749,6 +750,7 @@ fn build_native_loading_frame_plan(
         campaign,
         loading_base_origin(authored),
         scale,
+        progress_row.skirmish_colors,
     );
     let mut text_draws = build_native_loading_text_draws(
         font,

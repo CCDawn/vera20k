@@ -364,6 +364,16 @@ impl App {
             .skirmish_shell_state
             .pressed_owner_draw_button = None;
         crate::ui::skirmish_shell::clear_status_help_text(&mut state.frontend.skirmish_shell_state);
+        // VeraX: Skirmish rescans the game directory each time the chooser
+        // opens, so a map copied after launch appears without a restart. A
+        // network lobby keeps its launch snapshot, because the map list is
+        // local and peers must still compare the same catalog.
+        #[cfg(feature = "verax")]
+        let current_record_index = if state.frontend.shell_route.network_setup() {
+            current_record_index
+        } else {
+            Self::reload_skirmish_catalog(state, current_record_index)
+        };
         let layout = Self::skirmish_choose_map_layout(state);
         state.frontend.skirmish_shell_state.choose_map_modal =
             Some(crate::ui::skirmish_shell::ChooseMapModalState::open(
@@ -390,6 +400,88 @@ impl App {
                 &layout,
             ));
         Self::list_cooperative_campaigns(state, false);
+    }
+
+    /// VeraX map hot reload: re-run the retail Choose Map scan over the game
+    /// directory and replace the catalog.
+    ///
+    /// The scan registers loose YRO archives; `register_loose_yro_archive`
+    /// skips names the manager already knows, so rescanning the same
+    /// process-sticky manager neither duplicates archives nor loses its CRC
+    /// cache. An empty or failed scan keeps the launch list.
+    #[cfg(feature = "verax")]
+    fn reload_skirmish_catalog(
+        state: &mut AppState,
+        current_record_index: Option<usize>,
+    ) -> Option<usize> {
+        let Some(ra2_dir) = state
+            .platform
+            .game_config
+            .as_ref()
+            .map(|config| config.paths.ra2_dir.clone())
+        else {
+            return current_record_index;
+        };
+        let selected_file = current_record_index
+            .and_then(|index| state.frontend.scenario_catalog.records().get(index))
+            .map(|record| record.file_name.clone());
+        let (assets, csf) = state.process_assets.scenario_rescan_sources();
+        let Some(assets) = assets else {
+            return current_record_index;
+        };
+        let Some(records) = Self::scan_skirmish_records(&ra2_dir, assets, csf) else {
+            return current_record_index;
+        };
+        let remapped =
+            Self::remap_record_index(selected_file.as_deref(), current_record_index, &records);
+        state.frontend.scenario_catalog =
+            crate::app::scenario_catalog::ScenarioCatalog::from_records(records);
+        remapped
+    }
+
+    /// One Choose Map scan through the process manager. `None` leaves the
+    /// caller's catalog untouched: no Skirmish scenarios or an unreadable
+    /// directory is a failed reload, not an empty map list.
+    #[cfg(feature = "verax")]
+    fn scan_skirmish_records(
+        ra2_dir: &std::path::Path,
+        assets: &mut crate::assets::asset_manager::AssetManager,
+        csf: Option<&crate::assets::csf_file::CsfFile>,
+    ) -> Option<Vec<crate::map::skirmish_scenarios::SkirmishScenarioRecord>> {
+        match crate::map::scenario_sources::list_skirmish_scenario_records_with_assets(
+            ra2_dir, assets, csf,
+        ) {
+            Ok(records) if !records.is_empty() => Some(records),
+            Ok(_) => {
+                log::warn!("VeraX map reload found no Skirmish scenarios; keeping the launch list");
+                None
+            }
+            Err(error) => {
+                log::warn!("VeraX map reload could not scan the game directory: {error:#}");
+                None
+            }
+        }
+    }
+
+    /// Keep the selected map across a rescan by file name. A removed map falls
+    /// back to the nearest surviving index; a network list or a still-valid
+    /// index is unchanged.
+    #[cfg(feature = "verax")]
+    fn remap_record_index(
+        selected_file: Option<&str>,
+        previous: Option<usize>,
+        records: &[crate::map::skirmish_scenarios::SkirmishScenarioRecord],
+    ) -> Option<usize> {
+        if records.is_empty() {
+            return None;
+        }
+        selected_file
+            .and_then(|name| {
+                records
+                    .iter()
+                    .position(|record| record.file_name.eq_ignore_ascii_case(name))
+            })
+            .or_else(|| previous.map(|index| index.min(records.len() - 1)))
     }
 
     /// Cooperative fills Choose Map's list itself (`+0x4C`), on the network
@@ -961,7 +1053,7 @@ impl App {
             .skirmish_shell_state
             .choose_map_modal
             .as_mut()
-            && modal.statics.hover(&text, std::time::Instant::now())
+            && modal.statics.hover(&text, crate::util::time::Instant::now())
         {
             state.platform.window.request_redraw();
         }
@@ -1386,5 +1478,101 @@ mod tests {
             Some(ShellKey::Escape)
         );
         assert_eq!(App::shell_key_for_code(KeyCode::Space), None);
+    }
+
+    /// A loose map the chooser lists: the retail `.yrm` branch reads
+    /// `[Basic] Name=` from the file itself.
+    #[cfg(feature = "verax")]
+    fn write_loose_map(dir: &std::path::Path, file_name: &str, display_name: &str) {
+        std::fs::write(
+            dir.join(file_name),
+            format!("[Basic]\nName={display_name}\nGameMode=standard\n"),
+        )
+        .expect("write loose map");
+    }
+
+    #[cfg(feature = "verax")]
+    fn synthetic_record(file_name: &str) -> crate::map::skirmish_scenarios::SkirmishScenarioRecord {
+        let ini =
+            crate::rules::ini_parser::IniFile::from_str(&format!("[Basic]\nName={file_name}\n"));
+        crate::map::skirmish_scenarios::SkirmishScenarioRecord::concrete_from_ini(
+            0,
+            crate::map::skirmish_scenarios::SkirmishScenarioSource::LooseYrm(file_name.to_string()),
+            file_name,
+            &ini,
+        )
+    }
+
+    /// VeraX map hot reload: the app rescans the same process manager when the
+    /// chooser opens, so a map copied after launch must appear without a
+    /// restart and without duplicating the rows already listed.
+    #[cfg(feature = "verax")]
+    #[test]
+    fn rescan_lists_a_map_copied_after_launch_without_duplicating_rows() {
+        use crate::assets::asset_manager::test_support::audio_test_install;
+        use crate::assets::asset_manager::{AssetManager, MediaArchiveMode};
+
+        let install = audio_test_install("verax-map-reload");
+        write_loose_map(install.path(), "ALPHA.YRM", "Alpha");
+        let mut assets = AssetManager::new(install.path(), MediaArchiveMode::STOCK_DIGITAL)
+            .expect("synthetic install");
+
+        let launch =
+            App::scan_skirmish_records(install.path(), &mut assets, None).expect("launch scan");
+        assert_eq!(
+            launch
+                .iter()
+                .filter(|record| record.file_name.eq_ignore_ascii_case("ALPHA.YRM"))
+                .count(),
+            1
+        );
+
+        write_loose_map(install.path(), "BRAVO.YRM", "Bravo");
+        let reloaded = App::scan_skirmish_records(install.path(), &mut assets, None)
+            .expect("rescan through the same manager");
+        assert_eq!(
+            reloaded
+                .iter()
+                .filter(|record| record.file_name.eq_ignore_ascii_case("ALPHA.YRM"))
+                .count(),
+            1,
+            "rescanning must not duplicate the launch rows"
+        );
+        assert_eq!(
+            reloaded
+                .iter()
+                .filter(|record| record.file_name.eq_ignore_ascii_case("BRAVO.YRM"))
+                .count(),
+            1,
+            "the copied map is listed without restarting"
+        );
+    }
+
+    /// The chooser's selection is a list index; the rescan may move it, so the
+    /// selected file name must win over the stale index.
+    #[cfg(feature = "verax")]
+    #[test]
+    fn selection_follows_the_file_not_the_stale_index() {
+        let records = [
+            synthetic_record("ALPHA.YRM"),
+            synthetic_record("BRAVO.YRM"),
+            synthetic_record("CHARLIE.YRM"),
+        ];
+        assert_eq!(
+            App::remap_record_index(Some("CHARLIE.YRM"), Some(0), &records),
+            Some(2)
+        );
+        assert_eq!(App::remap_record_index(None, Some(2), &records), Some(2));
+
+        let shorter = [synthetic_record("ALPHA.YRM"), synthetic_record("BRAVO.YRM")];
+        assert_eq!(
+            App::remap_record_index(Some("CHARLIE.YRM"), Some(2), &shorter),
+            Some(1),
+            "a removed map falls back to a surviving index"
+        );
+        assert_eq!(
+            App::remap_record_index(Some("BRAVO.YRM"), Some(0), &[]),
+            None
+        );
     }
 }

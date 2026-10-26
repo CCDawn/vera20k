@@ -126,7 +126,7 @@ pub struct LoadedMap {
 }
 
 pub fn read_map_ini_for_metadata(path: &Path) -> Option<IniFile> {
-    map_file::ini_from_file_bytes(std::fs::read(path).ok()?).ok()
+    map_file::ini_from_file_bytes(crate::util::file_system::read(path).ok()?).ok()
 }
 
 /// Physical INI plus the exact source bytes used by shell map verification.
@@ -144,16 +144,16 @@ struct MapInput<'a> {
 
 fn local_map_path(ra2_dir: &Path, map_name: &str) -> Result<PathBuf> {
     let direct = PathBuf::from(map_name);
-    if direct.is_absolute() && direct.exists() {
+    if direct.is_absolute() && crate::util::file_system::exists(&direct) {
         return Ok(direct);
     }
     let in_ra2 = ra2_dir.join(map_name);
-    if in_ra2.exists() {
+    if crate::util::file_system::exists(&in_ra2) {
         return Ok(in_ra2);
     }
     for ext in MAP_EXTENSIONS {
         let candidate = ra2_dir.join(format!("{map_name}.{ext}"));
-        if candidate.exists() {
+        if crate::util::file_system::exists(&candidate) {
             return Ok(candidate);
         }
     }
@@ -168,11 +168,24 @@ fn read_loose_map_input(path: &Path) -> Result<MapInput<'static>> {
 }
 
 fn read_loose_map_input_bounded(path: &Path, limit: Option<usize>) -> Result<MapInput<'static>> {
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    let file = std::fs::File::open(path)?;
-    file.take(limit.map_or(u64::MAX, |limit| limit as u64 + 1))
-        .read_to_end(&mut bytes)?;
+    #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+    let bytes = {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let file = std::fs::File::open(path)?;
+        file.take(limit.map_or(u64::MAX, |limit| limit as u64 + 1))
+            .read_to_end(&mut bytes)?;
+        bytes
+    };
+    #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+    let bytes = {
+        let shared = crate::util::file_system::read_shared(path)?;
+        anyhow::ensure!(
+            limit.is_none_or(|limit| shared.len() <= limit),
+            "map exceeds transfer size limit"
+        );
+        shared.to_vec()
+    };
     anyhow::ensure!(
         limit.is_none_or(|limit| bytes.len() <= limit),
         "map exceeds transfer size limit"
@@ -227,7 +240,7 @@ fn expand_map_ini_with_options(
     strict: bool,
     logical_name: Option<&str>,
 ) -> Result<IniFile> {
-    if !crate::rules::ARES_ENABLED {
+    if !(crate::rules::ARES_ENABLED || crate::rules::PHOBOS_ENABLED) {
         return Ok(ini);
     }
     let name = match source {
@@ -242,7 +255,7 @@ fn expand_map_ini_with_options(
         name,
         crate::rules::ini_parser::directives::DirectiveOptions {
             strict,
-            ..Default::default()
+            ..crate::rules::ini_parser::directives::DirectiveOptions::production()
         },
     )
     .map_err(anyhow::Error::msg)?;
@@ -490,6 +503,12 @@ pub struct LoadedTransferAsset {
     pub content: TransferContent,
 }
 
+/// Whether this build's gameplay selection will expand includes after the
+/// transfer is installed, as the directive owner selects them.
+fn include_expansion_will_run(ini: &IniFile) -> bool {
+    crate::rules::ini_parser::directives::DirectiveOptions::production().expands_includes(ini)
+}
+
 fn decode_transfer(bytes: &[u8], resource: TransferResource) -> Result<TransferContent> {
     if resource == TransferResource::Preview {
         anyhow::ensure!(bytes.len() >= 128, "preview header missing");
@@ -531,7 +550,7 @@ fn decode_transfer(bytes: &[u8], resource: TransferResource) -> Result<TransferC
         let mut options = crate::map::rmg::RmgOptions::default();
         options.apply_sed(&ini);
         options.normalize();
-    } else if !(crate::rules::ARES_ENABLED && ini.section("#include").is_some()) {
+    } else if !include_expansion_will_run(&ini) {
         map_file::MapFile::from_ini(ini.clone())?;
     }
     Ok(TransferContent::Scenario(ini))
@@ -605,7 +624,7 @@ fn install_received_asset_with_limits(
             std::fs::rename(&stage, &path)
         })();
         if result.is_err() {
-            let _ = std::fs::remove_file(&stage);
+            let _ = crate::util::file_system::remove_file(&stage);
         }
         result?;
     }
@@ -694,7 +713,7 @@ fn load_map_from_path_with_source(path: &Path) -> Result<LoadedMap> {
 pub fn try_load_mmx(ra2_dir: &Path, names: &[&str]) -> Result<LoadedMap> {
     for &name in names {
         let path: PathBuf = ra2_dir.join(name);
-        if path.exists() {
+        if crate::util::file_system::exists(&path) {
             match load_map_from_path_with_source(&path) {
                 Ok(loaded) => {
                     log::info!("Loaded map from {}", name);
@@ -1387,13 +1406,14 @@ mod tests {
         let metadata =
             load_map_ini_by_name_or_path_with_assets(dir.path(), "Arena.map", &assets).unwrap();
         assert_eq!(loaded.map.ini.content_hash(), metadata.ini.content_hash());
+        let ares_include = crate::rules::ARES_ENABLED;
         assert_eq!(
             loaded
                 .map
                 .ini
                 .section_or_empty("Unit")
                 .read_int("Strength", 0),
-            if crate::rules::ARES_ENABLED { 250 } else { 0 }
+            if ares_include { 250 } else { 0 }
         );
         assert_eq!(
             loaded
@@ -1409,7 +1429,7 @@ mod tests {
                 .ini
                 .section_or_empty("Basic")
                 .read_name("Name", 128),
-            crate::rules::ARES_ENABLED.then_some("Included name")
+            ares_include.then_some("Included name")
         );
         assert_eq!(
             serde_json::to_value(&loaded.source).unwrap(),

@@ -1,6 +1,44 @@
-//! Include/inheritance traversal adapted from baixiong443's ra2-mono IniFile.
-//! This is a VERA extension policy, not executable Ares/Phobos equivalence.
-//! Keep the native byte parser and ordered Rules processing as their owners.
+//! Include and inheritance traversal over the native INI store.
+//!
+//! Native references:
+//! - Ares.dll exports `CCINIClass_ReadCCFile1` and `CCINIClass_ReadCCFile2`,
+//!   hooked at gamemd `0x00474200` and `0x00474314` (the start and return tail
+//!   of `CCINIClass::ReadCCFile` `0x004741F0`). The first records the name of
+//!   every file read during the root load. The tail reads the `[#include]` keys
+//!   through `INIClass::GetKeyCount` `0x00526960`, `INIClass::GetKeyName`
+//!   `0x00526CC0` and `INIClass::ReadString` `0x00528A10` in stored entry order
+//!   and calls `ReadCCFile` into the same INI for each existing file whose name
+//!   is not yet recorded (case-insensitive `_stricmp` `0x007CDA90`). A missing
+//!   file is skipped. The record clears only when the outermost read returns,
+//!   so each file is read once per root load.
+//! - Phobos `src/Misc/Hooks.INIInheritance.cpp` hooks `CCINIClass_Load_Inheritance`
+//!   at `0x00474230`: after the current file loads, every `$Include` entry is
+//!   merged with `ReadCCFile(file, false, false)`. Each physical file name is
+//!   included once per root load (`SavedIncludes`), and a missing file calls
+//!   `Debug::FatalErrorAndExit`. `src/Phobos.cpp` restores the vanilla bytes at
+//!   `0x474200`/`0x474314` for `-Include`, so a launch that uses `$Include`
+//!   leaves `[#include]` inert.
+//!
+//! VERA reads the current document before its included files and recurses
+//! depth-first in stored list order; a later read overwrites earlier values.
+//!
+//! RESIDUAL: natively every included file merges into the same INI, so its
+//! list joins one shared include section. Ares walks that section with one
+//! index shared by every nesting level (Ares.dll `CCINIClass_ReadCCFile2`
+//! `0x10064660`), and Phobos re-walks it skipping saved names, so a parent's
+//! remaining entries are read before a child's own list, and a child entry
+//! that reuses a parent's key name resolves through the shared section.
+//! Phobos also iterates the section's `EntryIndex`, gamemd's CRC lookup index,
+//! where VERA keeps stored order. Matching either needs the native same-INI
+//! `ReadCCFile` merge, which `IniFile::merge` does not model. Trigger: nested
+//! include lists; effect: which sibling or descendant value wins; frequency:
+//! mods that nest includes; no RNG, timer or detach.
+//!
+//! `$Inherits` expansion runs after includes; its policy here is the VERA
+//! adaptation from baixiong443's ra2-mono `IniFile`, not a native directive
+//! claim. The raw byte parser and deserializer never load other files:
+//! expansion is an opted-in source-selection step, selected by compile
+//! features for gameplay and available to read-only probes for both dialects.
 
 use super::IniFile;
 use std::collections::HashSet;
@@ -8,14 +46,45 @@ use std::collections::HashSet;
 const ARES: &str = "#include";
 const PHOBOS: &str = "$Include";
 const INHERITS: &str = "$Inherits";
-// Extension safety policy: depth alone cannot bound a wide/repeated DAG.
+/// Ares `CCINIClass_ReadCCFile2` reads each include name through `ReadString`
+/// `0x00528A10` into a `0x80`-byte buffer, so longer names keep 127 bytes.
+const ARES_INCLUDE_NAME_CAPACITY: usize = 0x80;
+// Extension safety policy: native has no depth limit, and depth alone cannot
+// bound a wide/repeated DAG.
 const MAX_INCLUDE_REFERENCES: usize = 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IncludeDialect {
+    Ares,
+    Phobos,
+}
+
+impl IncludeDialect {
+    fn section(self) -> &'static str {
+        match self {
+            Self::Ares => ARES,
+            Self::Phobos => PHOBOS,
+        }
+    }
+
+    fn reference(self) -> Reference {
+        match self {
+            Self::Ares => Reference::AresInclude,
+            Self::Phobos => Reference::PhobosInclude,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct DirectiveOptions {
     /// Reference edges below the root on the active path, not a visited set.
     pub max_depth: usize,
     pub strict: bool,
+    /// Execute Ares `[#include]`. Ares reads the list after the document loads.
+    pub ares: bool,
+    /// Execute Phobos `[$Include]`. Phobos `-Include` replaces the Ares hooks,
+    /// so a document that uses `$Include` leaves its `[#include]` inert.
+    pub phobos: bool,
 }
 
 impl Default for DirectiveOptions {
@@ -23,7 +92,28 @@ impl Default for DirectiveOptions {
         Self {
             max_depth: 64,
             strict: false,
+            ares: true,
+            phobos: true,
         }
+    }
+}
+
+impl DirectiveOptions {
+    /// Dialects this binary can execute. Natively one launch runs one dialect:
+    /// Phobos `-Include` swaps `$Include` in for the Ares hooks. VERA has no
+    /// such switch, so a combined build keeps both, and a document that uses
+    /// `$Include` takes over from its `[#include]`.
+    pub fn production() -> Self {
+        Self {
+            ares: crate::rules::ARES_ENABLED,
+            phobos: crate::rules::PHOBOS_ENABLED,
+            ..Self::default()
+        }
+    }
+
+    /// Whether these options expand any include list `ini` carries.
+    pub(crate) fn expands_includes(self, ini: &IniFile) -> bool {
+        select_include_dialect(ini, self).is_some()
     }
 }
 
@@ -69,11 +159,44 @@ pub struct ExpandedIni {
     pub diagnostics: Vec<DirectiveDiagnostic>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reference {
+    AresInclude,
+    PhobosInclude,
+    Inheritance,
+}
+
+impl Reference {
+    fn identity(self, name: &str) -> String {
+        match self {
+            Self::AresInclude | Self::PhobosInclude => include_identity(name),
+            Self::Inheritance => name.to_owned(),
+        }
+    }
+
+    fn cycle_kind(self) -> DiagnosticKind {
+        match self {
+            Self::AresInclude | Self::PhobosInclude => DiagnosticKind::IncludeCycle,
+            Self::Inheritance => DiagnosticKind::InheritanceCycle,
+        }
+    }
+
+    fn depth_kind(self) -> DiagnosticKind {
+        match self {
+            Self::AresInclude | Self::PhobosInclude => DiagnosticKind::IncludeDepthLimit,
+            Self::Inheritance => DiagnosticKind::InheritanceDepthLimit,
+        }
+    }
+}
+
 struct Traversal<'a> {
     source: &'a str,
     options: DirectiveOptions,
     path: Vec<String>,
     identities: Vec<String>,
+    /// Every include name read during this root load: Ares
+    /// `CCINIClass_ReadCCFile1`'s record, Phobos `SavedIncludes`.
+    included: HashSet<String>,
     diagnostics: Vec<DirectiveDiagnostic>,
     include_references: usize,
 }
@@ -100,19 +223,20 @@ impl Traversal<'_> {
         Ok(())
     }
 
-    fn enter(&mut self, name: &str, includes: bool) -> Result<bool, DirectiveDiagnostic> {
-        let identity = if includes {
-            include_identity(name)
-        } else {
-            name.to_owned()
-        };
-        if self.identities.contains(&identity) {
+    /// Whether the surrounding load reports a missing listed file as fatal.
+    /// Phobos `CCINIClass_Load_Inheritance` calls `Debug::FatalErrorAndExit`;
+    /// Ares skips a missing include.
+    fn missing_is_fatal(&self, reference: Reference) -> bool {
+        reference == Reference::PhobosInclude
+    }
+
+    fn enter(&mut self, name: &str, reference: Reference) -> Result<bool, DirectiveDiagnostic> {
+        let identity = reference.identity(name);
+        // Includes skip every file this root load already read (see
+        // `expand_includes`), so only inheritance can meet its own chain here.
+        if reference == Reference::Inheritance && self.identities.contains(&identity) {
             self.report(
-                if includes {
-                    DiagnosticKind::IncludeCycle
-                } else {
-                    DiagnosticKind::InheritanceCycle
-                },
+                reference.cycle_kind(),
                 Some(name),
                 "Circular reference skipped".into(),
             )?;
@@ -120,11 +244,7 @@ impl Traversal<'_> {
         }
         if self.path.len() > self.options.max_depth {
             self.report(
-                if includes {
-                    DiagnosticKind::IncludeDepthLimit
-                } else {
-                    DiagnosticKind::InheritanceDepthLimit
-                },
+                reference.depth_kind(),
                 Some(name),
                 format!(
                     "Maximum active reference depth {} exceeded",
@@ -161,26 +281,27 @@ pub(crate) fn include_identity(name: &str) -> String {
     parts.join("/").to_ascii_lowercase()
 }
 
+fn select_include_dialect(ini: &IniFile, options: DirectiveOptions) -> Option<IncludeDialect> {
+    // Phobos takes priority and disables the Ares hooks, so `[#include]` runs
+    // only when the caller has not selected the Phobos dialect.
+    if options.phobos && ini.section(PHOBOS).is_some() {
+        Some(IncludeDialect::Phobos)
+    } else if options.ares && ini.section(ARES).is_some() {
+        Some(IncludeDialect::Ares)
+    } else {
+        None
+    }
+}
+
 /// The caller supplies physical snapshots through its existing resource owner.
-/// Later includes override earlier ones. Ares `#include` loads this document
-/// first, so included values win; `$Include` retains the mono current-file-wins
-/// policy, without claiming that policy is executable Phobos equivalence.
-/// Expand all includes before resolving missing-key inheritance. Strict failure
-/// discards the owned candidate rather than exposing partially expanded state.
+/// A strict failure discards the owned candidate rather than exposing partially
+/// expanded state. Expand all includes before resolving missing-key inheritance.
 pub fn process_directives(
     ini: IniFile,
     source_name: &str,
     mut load: impl FnMut(&str) -> Result<Option<IniFile>, String>,
     options: DirectiveOptions,
 ) -> Result<ExpandedIni, DirectiveDiagnostic> {
-    let mut traversal = Traversal {
-        source: source_name,
-        options,
-        path: Vec::new(),
-        identities: Vec::new(),
-        diagnostics: Vec::new(),
-        include_references: 0,
-    };
     if options.max_depth == 0 {
         return Err(DirectiveDiagnostic {
             kind: DiagnosticKind::InvalidDepth,
@@ -189,17 +310,36 @@ pub fn process_directives(
             message: "max_depth must be positive".into(),
         });
     }
-    if !ini.sections.iter().any(|section| {
-        matches!(section.name.as_str(), ARES | PHOBOS) || section.is_present(INHERITS)
-    }) {
+    let dialect = select_include_dialect(&ini, options);
+    let inheritance = ini
+        .sections
+        .iter()
+        .any(|section| section.is_present(INHERITS));
+    if dialect.is_none() && !inheritance {
         return Ok(ExpandedIni {
             ini,
             diagnostics: Vec::new(),
         });
     }
-    traversal.enter(source_name, true)?;
-    let mut ini = expand_includes(ini, &mut load, &mut traversal)?;
-    traversal.exit();
+    let mut traversal = Traversal {
+        source: source_name,
+        options,
+        path: Vec::new(),
+        identities: Vec::new(),
+        included: HashSet::new(),
+        diagnostics: Vec::new(),
+        include_references: 0,
+    };
+    let mut ini = ini;
+    if let Some(dialect) = dialect {
+        // Ares `CCINIClass_ReadCCFile1` records the root file as well.
+        if dialect == IncludeDialect::Ares {
+            traversal.included.insert(include_identity(source_name));
+        }
+        traversal.enter(source_name, dialect.reference())?;
+        ini = expand_includes(ini, dialect, &mut load, &mut traversal)?;
+        traversal.exit();
+    }
     let mut completed = HashSet::new();
     // Preserve the host's physical section occurrences, first-section lookup
     // and native parsing. A document without directives is byte-parser exact.
@@ -215,28 +355,34 @@ pub fn process_directives(
 
 fn expand_includes(
     ini: IniFile,
+    dialect: IncludeDialect,
     load: &mut impl FnMut(&str) -> Result<Option<IniFile>, String>,
     traversal: &mut Traversal<'_>,
 ) -> Result<IniFile, DirectiveDiagnostic> {
-    // Retain mono's single-section priority, not a concatenation of dialects.
-    let Some(section) = ini.section(PHOBOS).or_else(|| ini.section(ARES)) else {
+    let Some(section) = ini.section(dialect.section()) else {
         return Ok(ini);
     };
-    let current_file_wins = section.name == PHOBOS;
     let remaining = MAX_INCLUDE_REFERENCES - traversal.include_references;
-    let mut includes: Vec<_> = section
-        .keys()
-        .filter_map(|key| {
-            section.read_name(key, usize::MAX).map(|name| {
-                (
-                    key.parse::<i32>().unwrap_or(i32::MAX),
-                    key.to_owned(),
-                    name.to_owned(),
-                )
+    let includes: Vec<(String, String)> = match dialect {
+        // Ares `GetKeyName` walks stored entries in file order, then
+        // `ReadString` looks each key up through the native CRC index.
+        IncludeDialect::Ares => section
+            .physical_entries()
+            .filter_map(|(key, _)| {
+                section
+                    .read_name(key, ARES_INCLUDE_NAME_CAPACITY)
+                    .map(|name| (key.to_owned(), name.to_owned()))
             })
-        })
-        .take(remaining + 1)
-        .collect();
+            .take(remaining + 1)
+            .collect(),
+        // Phobos iterates the entry list and uses each stored value directly.
+        IncludeDialect::Phobos => section
+            .physical_entries()
+            .filter(|(_, value)| !value.is_empty())
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .take(remaining + 1)
+            .collect(),
+    };
     if includes.len() > remaining {
         return Err(DirectiveDiagnostic {
             kind: DiagnosticKind::IncludeWorkLimit,
@@ -248,28 +394,55 @@ fn expand_includes(
     // Reserve the complete list before loading children, including repeated
     // references. Exhaustion always fails rather than publishing a partial INI.
     traversal.include_references += includes.len();
-    includes.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    // Both dialects apply the current document first: a later read, meaning an
+    // included file or a later sibling, overwrites its values.
     let mut merged = IniFile::empty();
-    if !current_file_wins {
-        // Ares documents root Strength=200 + included Strength=300 as 300.
-        // Read this document before its depth-first descendants, not after.
-        // https://ares-developers.github.io/Ares-docs/new/misc/include.html
-        merged.merge(&ini);
-    }
-    for (_, _, name) in includes {
-        if !traversal.enter(&name, true)? {
+    merged.merge(&ini);
+    let reference = dialect.reference();
+    for (_, name) in includes {
+        // Each file is read once per root load: Phobos `SavedIncludes` records
+        // a listed name before its existence check, and Ares records each file
+        // it reads (below).
+        let identity = include_identity(&name);
+        let repeated = match dialect {
+            IncludeDialect::Phobos => !traversal.included.insert(identity.clone()),
+            IncludeDialect::Ares => traversal.included.contains(&identity),
+        };
+        if repeated {
+            // VERA reports an Ares cycle; Phobos skips saved names silently.
+            if dialect == IncludeDialect::Ares && traversal.identities.contains(&identity) {
+                traversal.report(
+                    reference.cycle_kind(),
+                    Some(&name),
+                    "Circular reference skipped".into(),
+                )?;
+            }
             continue;
         }
-        // Exiting happens on every non-strict path, including failed loads.
+        if !traversal.enter(&name, reference)? {
+            continue;
+        }
         match load(&name) {
             Ok(Some(child)) => {
-                let child = expand_includes(child, load, traversal)?;
+                traversal.included.insert(identity);
+                let child = expand_includes(child, dialect, load, traversal)?;
                 merged.merge(&child);
+            }
+            Ok(None) if traversal.missing_is_fatal(reference) => {
+                // `enter` already placed the target at the end of the chain.
+                let reference_chain = traversal.path.clone();
+                let message = format!("Included file '{name}' is missing");
+                return Err(DirectiveDiagnostic {
+                    kind: DiagnosticKind::IncludeMissing,
+                    source_name: traversal.source.to_owned(),
+                    reference_chain,
+                    message,
+                });
             }
             Ok(None) => traversal.report(
                 DiagnosticKind::IncludeMissing,
                 None,
-                format!("Included file '{name}' is missing or empty"),
+                format!("Included file '{name}' is missing"),
             )?,
             Err(reason) => traversal.report(
                 DiagnosticKind::IncludeLoadFailed,
@@ -278,9 +451,6 @@ fn expand_includes(
             )?,
         }
         traversal.exit();
-    }
-    if current_file_wins {
-        merged.merge(&ini);
     }
     Ok(merged)
 }
@@ -294,7 +464,7 @@ fn inherit(
     if completed.contains(name) {
         return Ok(true);
     }
-    if !traversal.enter(name, false)? {
+    if !traversal.enter(name, Reference::Inheritance)? {
         return Ok(false);
     }
     let parents = ini

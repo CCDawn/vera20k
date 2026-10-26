@@ -317,8 +317,10 @@ mod tests {
         use crate::app::match_runtime::session::NetworkLoadingRequest;
 
         let (mut service, mut session, _, _, _, _) = super::super::loading_test_pair();
-        let mut rows =
-            LoadingProgressRowSnapshot::from_launch_session(session.network_setup().unwrap());
+        let mut rows = LoadingProgressRowSnapshot::from_launch_session(
+            session.network_setup().unwrap(),
+            crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
+        );
         assert!(LoadingNetworkService::borrow(&mut session, None, false).is_err());
         {
             let mut controlled = LoadingNetworkService::borrow(&mut session, None, true)
@@ -503,8 +505,10 @@ mod tests {
             .unwrap()
             .global_mut()
             .observe_loading();
-        let mut guest_rows =
-            LoadingProgressRowSnapshot::from_launch_session(guest_session.network_setup().unwrap());
+        let mut guest_rows = LoadingProgressRowSnapshot::from_launch_session(
+            guest_session.network_setup().unwrap(),
+            crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
+        );
         let host_address = host.transport.as_ref().unwrap().primary_addr().unwrap();
         let proof = host.control_proof().unwrap();
         guest.commit_peer_admission(host_address, "Host", &proof);
@@ -734,8 +738,10 @@ mod tests {
                 )),
             "actual delayed98 was observed after the same row owner retained terminal100"
         );
-        let mut fresh =
-            LoadingProgressRowSnapshot::from_launch_session(guest_session.network_setup().unwrap());
+        let mut fresh = LoadingProgressRowSnapshot::from_launch_session(
+            guest_session.network_setup().unwrap(),
+            crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
+        );
         assert!(
             fresh.update_remote_progress(0, 98),
             "new attempt resets terminal state"

@@ -283,12 +283,14 @@ fn a_failed_exit_abandons_the_object_and_refunds_it() {
     );
 }
 
-const AI_LIMIT_RULES_TAIL: &str = "[InfantryTypes]\n[AircraftTypes]\n[VehicleTypes]\n0=TANK\n\
+const AI_LIMIT_RULES_TAIL: &str = "[InfantryTypes]\n[AircraftTypes]\n[VehicleTypes]\n0=TANK\n1=TANK2\n\
     [BuildingTypes]\n0=YARD\n1=PLAIN\n2=WEAP\n\
     [YARD]\nStrength=1000\nConstructionYard=yes\nFactory=BuildingType\n\
     [PLAIN]\nStrength=1000\nCost=100\n\
     [WEAP]\nStrength=1000\nFactory=UnitType\nCost=200\n\
     [TANK]\nStrength=300\nSpeed=5\nCost=100\n{TAIL}\n\
+    Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n\
+    [TANK2]\nStrength=300\nSpeed=5\nCost=100\n\
     Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n\
     [Clear]\nBuildable=yes\n";
 
@@ -550,6 +552,107 @@ fn disable_parallel_ai_queues_serializes_war_factory_production() {
     assert!(
         ai_limit_holds(&f, weap_2),
         "the release lets the idle factory start"
+    );
+}
+
+/// Phobos `ForbidParallelAIQueues`: inert under `AllowParallelAIQueues=no`;
+/// under the default gate the category forbid blocks a second war factory,
+/// and abandoning the first releases the slot.
+#[cfg(feature = "phobos")]
+#[test]
+fn parallel_ai_queues_gate_and_category_forbid_control_a_second_factory() {
+    let (mut f, weap_1, weap_2) = ai_limit_fixture(
+        "\n[GlobalControls]\nAllowParallelAIQueues=no\nForbidParallelAIQueues.Vehicle=yes",
+        "",
+    );
+    ai_limit_visit(&mut f, weap_1);
+    ai_limit_visit(&mut f, weap_2);
+    assert!(
+        ai_limit_holds(&f, weap_1) && ai_limit_holds(&f, weap_2),
+        "the gate is off, so the forbid tags do nothing"
+    );
+
+    let (mut f, weap_1, weap_2) =
+        ai_limit_fixture("\n[GlobalControls]\nAllowParallelAIQueues=yes", "");
+    ai_limit_visit(&mut f, weap_1);
+    ai_limit_visit(&mut f, weap_2);
+    assert!(
+        ai_limit_holds(&f, weap_1) && ai_limit_holds(&f, weap_2),
+        "no forbid keeps the stock clone"
+    );
+
+    // Phobos RulesExt constructs AllowParallelAIQueues { true }, so the
+    // forbid applies without the gate key.
+    let (mut f, weap_1, weap_2) =
+        ai_limit_fixture("\n[GlobalControls]\nForbidParallelAIQueues.Vehicle=yes", "");
+    ai_limit_visit(&mut f, weap_1);
+    ai_limit_visit(&mut f, weap_2);
+    assert!(ai_limit_holds(&f, weap_1));
+    assert!(!ai_limit_holds(&f, weap_2), "the category forbids cloning");
+
+    abandon_production(
+        &mut f.sim,
+        &f.rules,
+        FactoryHolder::Building(weap_1),
+        f.owner,
+        crate::sim::world::FrameEffects::default(),
+    );
+    f.sim
+        .houses
+        .get_mut(&f.owner)
+        .unwrap()
+        .ai_unit_choices_mut()
+        .set(crate::sim::ai_unit_choice::UnitChoiceKind::Unit, 0);
+    ai_limit_visit(&mut f, weap_2);
+    assert!(
+        ai_limit_holds(&f, weap_2),
+        "the abandon released the forbidden category's slot"
+    );
+}
+
+/// Phobos `[SOMETECHNO] ForbidParallelAIQueues=yes` blocks cloning that
+/// product while the rest of the category stays allowed.
+#[cfg(feature = "phobos")]
+#[test]
+fn parallel_ai_queues_type_forbid_blocks_the_current_product() {
+    let (mut f, weap_1, weap_2) = ai_limit_fixture(
+        "\n[GlobalControls]\nAllowParallelAIQueues=yes",
+        "ForbidParallelAIQueues=yes",
+    );
+    assert!(f.rules.object("TANK").unwrap().forbid_parallel_ai_queues);
+    ai_limit_visit(&mut f, weap_1);
+    ai_limit_visit(&mut f, weap_2);
+    assert!(ai_limit_holds(&f, weap_1));
+    assert!(
+        !ai_limit_holds(&f, weap_2),
+        "the current product forbids cloning"
+    );
+}
+
+/// The type check reads the native `ProducingUnitTypeIndex` choice
+/// (`House+0x5650`), not the incumbent factory's held object.
+#[cfg(feature = "phobos")]
+#[test]
+fn parallel_ai_queues_type_forbid_follows_the_house_choice() {
+    use crate::sim::ai_unit_choice::UnitChoiceKind;
+
+    let (mut f, weap_1, weap_2) = ai_limit_fixture(
+        "\n[GlobalControls]\nAllowParallelAIQueues=yes",
+        "ForbidParallelAIQueues=yes",
+    );
+    ai_limit_visit(&mut f, weap_1);
+    // TANK is forbidden but TANK2 is not, and the house's choice moved to
+    // TANK2 (as a just-finished exit's clear and the chooser allow).
+    f.sim
+        .houses
+        .get_mut(&f.owner)
+        .unwrap()
+        .ai_unit_choices_mut()
+        .set(UnitChoiceKind::Unit, 1);
+    ai_limit_visit(&mut f, weap_2);
+    assert!(
+        ai_limit_holds(&f, weap_2),
+        "the native Producing index now names the allowed TANK2"
     );
 }
 

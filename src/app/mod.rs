@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::Instant;
+use crate::util::time::Instant;
 
 use anyhow::Result;
 use winit::application::ApplicationHandler;
@@ -11,7 +11,12 @@ use winit::dpi::PhysicalSize;
 use winit::event::{MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+#[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+#[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+mod web_keyboard;
+#[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+use web_keyboard::KeyEventExtModifierSupplement;
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::app::match_runtime::sim_tick;
@@ -125,6 +130,7 @@ pub(crate) use state::{AppState, PlatformState, reset_scenario_exit_runtime};
 /// Top-level application. Implements winit's ApplicationHandler.
 pub struct App {
     state: Option<AppState>,
+    pending_initialization: Option<initialize::InitializationJob>,
     shell_capture: Option<crate::app::diagnostics::shell_capture::ShellCaptureSession>,
     tactical_capture:
         Option<crate::app::diagnostics::tactical_capture::session::TacticalCaptureSession>,
@@ -184,6 +190,7 @@ impl App {
     ) -> Self {
         Self {
             state: None,
+            pending_initialization: None,
             shell_capture: None,
             tactical_capture: None,
             capture_render_not_before: None,
@@ -201,6 +208,7 @@ impl App {
     ) -> Self {
         Self {
             state: None,
+            pending_initialization: None,
             shell_capture: Some(
                 crate::app::diagnostics::shell_capture::ShellCaptureSession::new(request),
             ),
@@ -220,6 +228,7 @@ impl App {
     ) -> Self {
         Self {
             state: None,
+            pending_initialization: None,
             shell_capture: None,
             tactical_capture: Some(
                 crate::app::diagnostics::tactical_capture::session::TacticalCaptureSession::new(

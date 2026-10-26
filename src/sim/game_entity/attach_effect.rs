@@ -2,6 +2,7 @@
 //! Installed10058520/10058E00/100588E0/10042C30; see docs/ares-attach-effect.md.
 use super::GameEntity;
 use crate::sim::intern::InternedId;
+use crate::util::native_x87::NativeF64Bits;
 use std::hash::{Hash, Hasher};
 
 /// Native instance+0 holds the shared descriptor pointer, belonging either
@@ -68,6 +69,10 @@ mod self_cloak_tests;
 #[path = "attach_armor_tests.rs"]
 mod armor_tests;
 
+#[cfg(test)]
+#[path = "attach_rof_tests.rs"]
+mod rof_tests;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 struct AttachedEffect {
     origin: EffectOrigin,
@@ -76,11 +81,33 @@ struct AttachedEffect {
     source_house: Option<InternedId>,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(super) struct AttachEffects {
     entries: Vec<AttachedEffect>,
     animations_hidden: bool,
     self_effect: SelfEffectState,
+    rof_multiplier: NativeF64Bits,
+}
+
+impl Default for AttachEffects {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            animations_hidden: false,
+            self_effect: SelfEffectState::default(),
+            // Installed Ares TechnoExt constructor10042D98..10042DAC:
+            // FLD1; FST qword[Ext+78], independent of crate baselines.
+            rof_multiplier: NativeF64Bits::ONE,
+        }
+    }
+}
+
+struct AttachedStats {
+    firepower: NativeF64Bits,
+    speed: NativeF64Bits,
+    armor: NativeF64Bits,
+    cloak: bool,
+    rof: NativeF64Bits,
 }
 
 impl GameEntity {
@@ -88,15 +115,7 @@ impl GameEntity {
         &self,
         rules: &crate::rules::ruleset::RuleSet,
         interner: &crate::sim::intern::StringInterner,
-    ) -> Result<
-        (
-            crate::util::native_x87::NativeF64Bits,
-            crate::util::native_x87::NativeF64Bits,
-            crate::util::native_x87::NativeF64Bits,
-            bool,
-        ),
-        &'static str,
-    > {
+    ) -> Result<AttachedStats, &'static str> {
         use crate::util::native_x87::MaskedX87Chop53 as X;
         //100460A0: Ext+80/+90 are permanent crate baselines. Firepower
         //10046176..180 spills binary64 after EACH ordered entry; Foot speed
@@ -106,6 +125,7 @@ impl GameEntity {
         let mut speed = X::load_f64(self.foot_speed.crate_multiplier());
         let mut armor = self.crate_multipliers.crate_armor();
         let mut cloak = false;
+        let mut rof = NativeF64Bits::ONE;
         for entry in &self.attach_effects.entries {
             let settings = entry
                 .origin
@@ -123,12 +143,24 @@ impl GameEntity {
                 X::load_f64(settings.armor_multiplier()),
                 X::load_f64(armor),
             ));
+            // Installed Ares RecalculateStats10046184..1004618B:
+            // descriptor+28, with a binary64 spill after each ordered factor.
+            rof = X::store_f64_masked_chop(X::mul(
+                X::load_f64(settings.rof_multiplier()),
+                X::load_f64(rof),
+            ));
             if self.category().is_foot() {
                 speed = X::mul(speed, X::load_f64(settings.speed_multiplier()));
             }
             cloak |= settings.cloakable();
         }
-        Ok((firepower, X::store_f64_masked_chop(speed), armor, cloak))
+        Ok(AttachedStats {
+            firepower,
+            speed: X::store_f64_masked_chop(speed),
+            armor,
+            cloak,
+            rof,
+        })
     }
 
     /// One100460A0 projection from the canonical attachment vector. Each
@@ -138,15 +170,23 @@ impl GameEntity {
         rules: &crate::rules::ruleset::RuleSet,
         interner: &crate::sim::intern::StringInterner,
     ) {
-        let (firepower, speed, armor, cloak) = self
+        let stats = self
             .attached_stats_from_entries(rules, interner)
             .expect("live attachment belongs to the scenario rules");
-        self.crate_multipliers.set_attached_firepower(firepower);
-        self.crate_multipliers.set_attached_armor(armor);
-        self.stealth_ability.set_attached(cloak);
+        self.crate_multipliers
+            .set_attached_firepower(stats.firepower);
+        self.crate_multipliers.set_attached_armor(stats.armor);
+        self.stealth_ability.set_attached(stats.cloak);
+        // RecalculateStats10046130..10046134 commits Ext+78. The reload
+        // consumer samples it on a later GetROF; existing timers stay intact.
+        self.attach_effects.rof_multiplier = stats.rof;
         if self.category().is_foot() {
-            self.foot_speed.set_attached_speed(speed);
+            self.foot_speed.set_attached_speed(stats.speed);
         }
+    }
+
+    pub(crate) fn attached_rof_multiplier(&self) -> NativeF64Bits {
+        self.attach_effects.rof_multiplier
     }
 
     pub(crate) fn attached_effect_anims(&self) -> impl Iterator<Item = u64> + '_ {
@@ -167,6 +207,7 @@ impl GameEntity {
         if !self.attach_effects.entries.is_empty()
             || self.attach_effects.animations_hidden
             || self.attach_effects.self_effect != SelfEffectState::default()
+            || self.attach_effects.rof_multiplier != NativeF64Bits::ONE
         {
             b"ares-attach-effects-v1".hash(hasher);
             self.attach_effects.hash(hasher);
@@ -903,26 +944,29 @@ mod receiver {
                 let expected = victim
                     .attached_stats_from_entries(rules, &self.interner)
                     .map_err(|reason| (id, reason))?;
-                if victim.crate_multipliers.firepower() != expected.0 {
+                if victim.crate_multipliers.firepower() != expected.firepower {
                     return Err((
                         id,
                         "saved attached firepower differs from its baseline and effects",
                     ));
                 }
-                if victim.foot_speed.effective_multiplier() != expected.1 {
+                if victim.foot_speed.effective_multiplier() != expected.speed {
                     return Err((
                         id,
                         "saved attached speed differs from its baseline and effects",
                     ));
                 }
-                if victim.crate_multipliers.armor() != expected.2 {
+                if victim.crate_multipliers.armor() != expected.armor {
                     return Err((
                         id,
                         "saved attached armor differs from its baseline and effects",
                     ));
                 }
-                if victim.stealth_ability.attached() != expected.3 {
+                if victim.stealth_ability.attached() != expected.cloak {
                     return Err((id, "saved attached cloak ability differs from its effects"));
+                }
+                if victim.attached_rof_multiplier() != expected.rof {
+                    return Err((id, "saved attached ROF differs from its effects"));
                 }
             }
             Ok(())

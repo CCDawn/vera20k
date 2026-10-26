@@ -760,6 +760,96 @@ fn all_to_hunt_override_is_persistent_and_follows_designated_enemy() {
     assert!(house.strategy_emergency().all_to_hunt_bias());
 }
 
+#[cfg(feature = "phobos")]
+fn last_legs_fixture(general: &str) -> (Simulation, RuleSet, InternedId, u64) {
+    let mut rules = RuleSet::from_ini(&IniFile::from_str(&format!(
+        "[General]\n{general}\n[InfantryTypes]\n0=FOOT\n[VehicleTypes]\n0=WHEELS\n\
+         [AircraftTypes]\n0=WINGS\n[BuildingTypes]\n0=PLAIN\n\
+         [PLAIN]\n[FOOT]\n[WHEELS]\n[WINGS]\n"
+    )))
+    .unwrap();
+    rules.set_buildup_control_for_test("PLAIN", [0, 17, 3]);
+    let (mut sim, names) = houses(true, 1);
+    let owner = names[0];
+    let plain = spawn_building(&mut sim, owner, "PLAIN", 1000, false);
+    let house = sim.houses.get_mut(&owner).unwrap();
+    house.tracking_mut().set_buildings_for_test(1);
+    // A destination and a gatherer make Check_Build_Need answer 0, so only
+    // the no-factory block acts.
+    house.tracking_mut().set_economy_for_test(1, 1, 0);
+    house.economy_mut().set_credits_for_test(1000);
+    sim.session.set_binary_frame_for_test(1000);
+    (sim, rules, owner, plain)
+}
+
+#[cfg(feature = "phobos")]
+fn last_legs_pass(sim: &mut Simulation, rules: &RuleSet, owner: InternedId) {
+    building_strategy(
+        sim,
+        rules,
+        owner,
+        None,
+        crate::sim::world::FrameEffects::default(),
+    );
+}
+
+/// Phobos `[General] AIFireSale=` and `AIAllToHunt=` gate the no-factory
+/// block's two calls independently, and a delayed sale still hunts.
+#[cfg(feature = "phobos")]
+#[test]
+fn ai_last_legs_switches_gate_the_sale_and_the_hunt() {
+    let (mut sim, rules, owner, plain) = last_legs_fixture("AIFireSale=no");
+    last_legs_pass(&mut sim, &rules, owner);
+    assert!(!selling(&sim, plain), "AIFireSale=no");
+    assert!(sim.houses[&owner].strategy_emergency().all_to_hunt_bias());
+    assert_eq!(
+        sim.houses[&owner]
+            .strategy_emergency()
+            .ai_fire_sale_delay_timer(),
+        None,
+        "the switched-off sale never arms its delay"
+    );
+
+    let (mut sim, rules, owner, plain) = last_legs_fixture("AIAllToHunt=no");
+    last_legs_pass(&mut sim, &rules, owner);
+    assert!(selling(&sim, plain), "AIAllToHunt=no keeps the sale");
+    assert!(!sim.houses[&owner].strategy_emergency().all_to_hunt_bias());
+}
+
+/// Phobos `[General] AIFireSaleDelay=` arms a per-house timer on the first
+/// trigger and sells only once it completes; All_To_Hunt runs meanwhile.
+#[cfg(feature = "phobos")]
+#[test]
+fn ai_fire_sale_delay_defers_only_the_sale() {
+    let (mut sim, rules, owner, plain) = last_legs_fixture("AIFireSaleDelay=100");
+    last_legs_pass(&mut sim, &rules, owner);
+    assert!(!selling(&sim, plain), "armed at frame 1000");
+    assert!(sim.houses[&owner].strategy_emergency().all_to_hunt_bias());
+    assert_eq!(
+        sim.houses[&owner]
+            .strategy_emergency()
+            .ai_fire_sale_delay_timer(),
+        Some(CdTimer::started(1000, 100))
+    );
+    let restored: HouseState = serde_json::from_value(
+        serde_json::to_value(&sim.houses[&owner]).expect("house serializes"),
+    )
+    .expect("house restores");
+    assert_eq!(
+        restored.strategy_emergency().ai_fire_sale_delay_timer(),
+        Some(CdTimer::started(1000, 100)),
+        "the armed timer persists"
+    );
+
+    sim.session.set_binary_frame_for_test(1099);
+    last_legs_pass(&mut sim, &rules, owner);
+    assert!(!selling(&sim, plain), "one frame early");
+
+    sim.session.set_binary_frame_for_test(1100);
+    last_legs_pass(&mut sim, &rules, owner);
+    assert!(selling(&sim, plain), "timer completed");
+}
+
 #[test]
 fn non_bincode_missing_house_field_uses_native_constructor_defaults() {
     let owner = InternedId::from_index(1);

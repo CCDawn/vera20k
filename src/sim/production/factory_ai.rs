@@ -163,6 +163,23 @@ fn exit_finished_object(
     }
     match exit {
         BuildingExit::Placed => {
+            // Phobos `BuildingClass_KickOutUnit_BuildingType_Phobos 0x44531F`
+            // clears the building slot after the placed structure exits.
+            // Unit, Infantry and Aircraft clear in Exit_Object's prelude.
+            #[cfg(feature = "phobos")]
+            if product_type.category == ObjectCategory::Building
+                && rules.parallel_ai_queues().allows_parallel()
+            {
+                let slot = crate::sim::ai_base_building::AiFactorySlot::for_product(
+                    product_type.category,
+                    product_type.naval,
+                );
+                if let Some(house) = sim.houses.get_mut(&owner) {
+                    house
+                        .ai_production_mut()
+                        .clear_parallel_factory(slot, building);
+                }
+            }
             //4501A4 reads after exit. A consumed wall is still retained at
             //its constructor Location until the frame's shared725C70 drain.
             let object = BuiltObject::capture(sim, product);
@@ -248,9 +265,6 @@ fn start_factory(
     factory_rtti: i32,
     effects: FrameEffects<'_>,
 ) {
-    if crate::sim::credit_income::available_money(&sim.houses, owner) <= 10 {
-        return;
-    }
     // The producing building's `Naval=` decides which vehicle choice
     // `Suggest_New_Object` reads (NPSE `0xC2F130`), so resolve it first.
     let factory_naval = sim
@@ -259,6 +273,15 @@ fn start_factory(
         .get(building)
         .and_then(|entity| sim.entity_object_type(entity, rules))
         .is_some_and(|ty| ty.naval);
+    // Phobos `BuildingClass_Update_Factory_Phobos 0x4502F4` runs before the
+    // money gate, so its claimed slot survives a start that stops here.
+    #[cfg(feature = "phobos")]
+    if !parallel_start_allowed(sim, rules, building, owner, factory_rtti, factory_naval) {
+        return;
+    }
+    if crate::sim::credit_income::available_money(&sim.houses, owner) <= 10 {
+        return;
+    }
     let Some(object) =
         ai_base_building::suggest_new_object(sim, rules, owner, factory_rtti, factory_naval)
     else {
@@ -322,6 +345,83 @@ fn start_factory(
             .factories_mut()
             .remove_building_factory(building);
     }
+}
+
+/// Phobos `BuildingClass_Update_Factory_Phobos @ 0x4502F4`: with Ares'
+/// `AllowParallelAIQueues=` on, the first factory building of a category
+/// claims the house's slot; a second one is refused while the category or the
+/// type in current production forbids parallel queues. The type check reads
+/// the same native `Producing*TypeIndex` choice fields that
+/// [`ai_base_building::suggest_new_object`] consumes.
+#[cfg(feature = "phobos")]
+fn parallel_start_allowed(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    building: u64,
+    owner: InternedId,
+    factory_rtti: i32,
+    naval: bool,
+) -> bool {
+    use crate::sim::ai_base_building::AiFactorySlot;
+    use crate::sim::ai_unit_choice::UnitChoiceKind;
+    let switches = rules.parallel_ai_queues();
+    if !switches.allows_parallel() {
+        return true;
+    }
+    let Some(slot) = AiFactorySlot::for_producer(factory_rtti, naval) else {
+        return true;
+    };
+    let current = sim
+        .houses
+        .get(&owner)
+        .and_then(|house| house.ai_production().parallel_factory(slot));
+    let Some(current) = current else {
+        if let Some(house) = sim.houses.get_mut(&owner) {
+            house
+                .ai_production_mut()
+                .set_parallel_factory(slot, Some(building));
+        }
+        return true;
+    };
+    if current == building {
+        return true;
+    }
+    let category = match slot {
+        AiFactorySlot::Building => ObjectCategory::Building,
+        AiFactorySlot::Infantry => ObjectCategory::Infantry,
+        AiFactorySlot::Vehicle | AiFactorySlot::Navy => ObjectCategory::Vehicle,
+        AiFactorySlot::Aircraft => ObjectCategory::Aircraft,
+    };
+    if switches.forbids_category(category, naval) {
+        return false;
+    }
+    let choice = match slot {
+        AiFactorySlot::Building => rules.building_type_at(
+            sim.houses
+                .get(&owner)
+                .map_or(-1, |house| house.ai_production().building_choice()),
+        ),
+        AiFactorySlot::Infantry => choice_product(sim, rules, owner, UnitChoiceKind::Infantry),
+        AiFactorySlot::Aircraft => choice_product(sim, rules, owner, UnitChoiceKind::Aircraft),
+        AiFactorySlot::Vehicle | AiFactorySlot::Navy => {
+            let Some(kind) = UnitChoiceKind::of(ObjectCategory::Vehicle, naval) else {
+                return true;
+            };
+            choice_product(sim, rules, owner, kind)
+        }
+    };
+    !choice.is_some_and(|object| object.forbid_parallel_ai_queues)
+}
+
+#[cfg(feature = "phobos")]
+fn choice_product<'r>(
+    sim: &Simulation,
+    rules: &'r RuleSet,
+    owner: InternedId,
+    kind: crate::sim::ai_unit_choice::UnitChoiceKind,
+) -> Option<&'r ObjectType> {
+    let index = sim.houses.get(&owner)?.ai_unit_choices().get(kind);
+    rules.type_array_at(kind.category(), index)
 }
 
 /// `CDTimerClass` at `+0x550` has run out (`0x00450115..0x00450136`).
