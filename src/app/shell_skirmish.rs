@@ -197,11 +197,20 @@ impl App {
             return false;
         };
 
+        #[cfg(feature = "ares")]
+        let extra_flags = state
+            .process_assets
+            .native_rules()
+            .map(|rules| rules.country_flag_files())
+            .unwrap_or_default();
+        #[cfg(not(feature = "ares"))]
+        let extra_flags = Vec::new();
         state.frontend.skirmish_shell_chrome =
             crate::render::skirmish_shell_chrome::build_skirmish_shell_chrome_atlas(
                 &state.renderer.gpu,
                 &state.renderer.batch_renderer,
                 assets,
+                &extra_flags,
             );
         let ready = state.frontend.skirmish_shell_chrome.is_some();
         if !ready {
@@ -990,7 +999,12 @@ impl App {
             x,
             y,
         )
-        .and_then(crate::ui::skirmish_shell::status_help_key_for_hover)
+        .and_then(|target| {
+            crate::ui::skirmish_shell::status_help_key_for_hover_with_catalog(
+                target,
+                Some(&state.frontend.skirmish_shell_state.country_catalog),
+            )
+        })
         .map(|key| Self::localized_status_help_text(state, key))
         .unwrap_or_default();
 

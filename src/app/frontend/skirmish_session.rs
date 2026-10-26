@@ -235,10 +235,29 @@ impl MultiplayerShellRuntime {
         &mut self,
         process_assets: &crate::app::process_assets::ProcessAssets,
     ) {
-        self.cooperative_country_roster = process_assets
-            .multiplayer_countries()
-            .map(|(id, name)| CooperativeCountryRosterEntry::new(id, name))
-            .collect();
+        #[cfg(feature = "ares")]
+        {
+            self.cooperative_country_roster = process_assets
+                .country_random_rows()
+                .into_iter()
+                .map(|(id, name, multiplay, random_weight, ai_random_weight)| {
+                    CooperativeCountryRosterEntry::new_with_random(
+                        id,
+                        name,
+                        multiplay,
+                        random_weight,
+                        ai_random_weight,
+                    )
+                })
+                .collect();
+        }
+        #[cfg(not(feature = "ares"))]
+        {
+            self.cooperative_country_roster = process_assets
+                .multiplayer_countries()
+                .map(|(id, name)| CooperativeCountryRosterEntry::new(id, name))
+                .collect();
+        }
     }
 
     /// CreateHouses687FBD directly dereferences HouseTypeArray[index]. Reject
@@ -1586,9 +1605,47 @@ fn draw_shell_country(
         draw_country_for_progress(registry, progress, cooperative_role, roster, rng)
             .map(|index| LaunchCountry::from_country_index(index as u32))
     } else {
-        Ok(LaunchCountry::from_country_index(
-            rng.next_range_u32_inclusive(0, 9),
-        ))
+        #[cfg(feature = "ares")]
+        {
+            let ai = matches!(role, RandomCountryRole::Ai { .. });
+            let weight = |entry: &CooperativeCountryRosterEntry| {
+                if ai {
+                    entry.ai_random_weight
+                } else {
+                    entry.random_weight
+                }
+            };
+            let total: u64 = roster
+                .iter()
+                .filter(|entry| entry.multiplay && weight(entry) > 0)
+                .map(|entry| u64::try_from(weight(entry)).unwrap_or(0))
+                .sum();
+            if total == 0 {
+                return Err(CooperativeError::NoEligibleRandomCountries);
+            }
+            let draw = u64::from(
+                rng.next_range_u32_inclusive(0, u32::try_from(total - 1).unwrap_or(u32::MAX)),
+            );
+            let mut cumulative = 0u64;
+            for (index, entry) in roster.iter().enumerate() {
+                if !entry.multiplay || weight(entry) <= 0 {
+                    continue;
+                }
+                cumulative += u64::try_from(weight(entry)).unwrap_or(0);
+                if draw < cumulative {
+                    return Ok(LaunchCountry::from_country_index(index as u32));
+                }
+            }
+            return Err(CooperativeError::NoEligibleRandomCountries);
+        }
+        #[cfg(not(feature = "ares"))]
+        {
+            let _ = roster;
+            let _ = role;
+            Ok(LaunchCountry::from_country_index(
+                rng.next_range_u32_inclusive(0, 9),
+            ))
+        }
     }
 }
 
@@ -1738,7 +1795,15 @@ fn cooperative_country_roster_from_rules(
 ) -> Vec<CooperativeCountryRosterEntry> {
     rules
         .cooperative_country_candidates()
-        .map(|(id, name)| CooperativeCountryRosterEntry::new(id, name))
+        .map(|(id, name)| {
+            CooperativeCountryRosterEntry::new_with_random(
+                id,
+                name,
+                rules.country_multiplay(id),
+                rules.country_random_weight(id),
+                rules.country_ai_random_weight(id),
+            )
+        })
         .collect()
 }
 
@@ -1759,7 +1824,7 @@ fn controlled_ten_country_roster() -> Vec<CooperativeCountryRosterEntry> {
         "YuriCountry",
     ]
     .into_iter()
-    .map(|id| CooperativeCountryRosterEntry::new(id, None))
+    .map(|id| CooperativeCountryRosterEntry::new_with_random(id, None, true, 1, 1))
     .collect()
 }
 
@@ -3321,5 +3386,46 @@ WOLTaunts=junk
             !shell.zoom_enabled,
             "a field outside the record is untouched"
         );
+    }
+
+    #[cfg(feature = "ares")]
+    #[test]
+    fn ares_random_country_uses_multiplay_weights_and_ai_weights() {
+        use crate::skirmish_launch::RandomCountryRole;
+        let roster = vec![
+            CooperativeCountryRosterEntry::new_with_random("Zero", None, true, 0, 0),
+            CooperativeCountryRosterEntry::new_with_random("Human", None, true, 1, 0),
+            CooperativeCountryRosterEntry::new_with_random("Ai", None, true, 0, 1),
+            CooperativeCountryRosterEntry::new_with_random("NonMultiplay", None, false, 10, 10),
+        ];
+        let registry = CooperativeRegistry::default();
+        let mut rng = SimRng::new(1);
+        assert_eq!(
+            draw_shell_country(&registry, None, &roster, RandomCountryRole::Human, &mut rng)
+                .unwrap()
+                .raw_index(),
+            1
+        );
+        let mut rng = SimRng::new(1);
+        assert_eq!(
+            draw_shell_country(
+                &registry,
+                None,
+                &roster,
+                RandomCountryRole::Ai { index: 0 },
+                &mut rng
+            )
+            .unwrap()
+            .raw_index(),
+            2
+        );
+        let none = vec![CooperativeCountryRosterEntry::new_with_random(
+            "Zero", None, true, 0, 0,
+        )];
+        let mut rng = SimRng::new(1);
+        assert!(matches!(
+            draw_shell_country(&registry, None, &none, RandomCountryRole::Human, &mut rng),
+            Err(CooperativeError::NoEligibleRandomCountries)
+        ));
     }
 }

@@ -483,6 +483,16 @@ impl IniSection {
         })
     }
 
+    /// Ares Nullable<int>::Read 10008CC0 (SideExt SurvivorDivisor at 1002E59F,
+    /// TechnoTypeExt TurretROT at 1003F267) sets presence only after its
+    /// Valueable<int> read succeeds. Absent, empty and invalid input keep the
+    /// previous value and presence.
+    pub fn read_ares_nullable_int(&self, key: &str, current: Option<i32>) -> Option<i32> {
+        self.read_string_with(key, 2048, current, |previous, value| {
+            parse_ares_int(value).or(previous)
+        })
+    }
+
     /// Ares/Phobos `PartialVector2D<int>` (`Utilities/TemplateDef.h`'s
     /// `read<PartialVector2D<int>>` over `MultiParser<int>::Parse(value, out, 2)`):
     /// ReadString(2048), then at most two comma-separated [`parse_ares_int`]

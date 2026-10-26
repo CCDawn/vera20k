@@ -207,7 +207,10 @@ pub(crate) fn render_coop_score(
         if !can_continue {
             continue;
         }
-        if let Some(flag) = slot.flag.and_then(|name| atlas.lan_player_side(name))
+        if let Some(flag) = slot
+            .flag
+            .as_deref()
+            .and_then(|name| atlas.lan_player_side(name))
             && let Some(rect) = layout.control_rect(FLAGS[row])
         {
             push_flag_entry_clipped_centered(&mut controls, flag, rect, scale, SHELL_CONTROL_DEPTH);
