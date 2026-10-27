@@ -343,6 +343,13 @@ struct Opening {
     /// the 200-credit dog (speed 8, sight 9) for both army sides, Yuri's
     /// initiate (also sight 9, half the speed) where no dog exists.
     scout: &'static str,
+    /// The side's OpenTopped transport (retail `OpenTopped=yes` with
+    /// passengers who fire from inside): only the Allied Battle Fortress
+    /// qualifies — a five-seat late-game piece behind the battle lab the
+    /// loading pair boards with the roster's anti-armor infantry (the
+    /// Guardian GI's deployed launcher is the classic loadout). The
+    /// other sides keep `None` and the boarding branch sleeps.
+    fortress: Option<&'static str>,
     /// Combat vehicles the army mixes in past its core tank, each with
     /// its role; the core keeps the remaining slots. Country-locked
     /// entries stay in the table — CanBuild's `RequiredHouses=` gate
@@ -449,6 +456,7 @@ const OPENINGS: [Opening; 3] = [
         defense_heavy: "ATESLA",
         aircraft: &["BEAG", "ORCA"],
         scout: "ADOG",
+        fortress: Some("BFRT"),
     },
     Opening {
         construction_yard: "NACNST",
@@ -541,6 +549,7 @@ const OPENINGS: [Opening; 3] = [
         defense_heavy: "TESLA",
         aircraft: &[],
         scout: "DOG",
+        fortress: None,
     },
     Opening {
         construction_yard: "YACNST",
@@ -620,6 +629,7 @@ const OPENINGS: [Opening; 3] = [
         defense_heavy: "YAPSYT",
         aircraft: &[],
         scout: "INIT",
+        fortress: None,
     },
 ];
 
@@ -668,6 +678,15 @@ pub struct SuperAi {
     /// reservation hands the hero the first specialist slot past the lab.
     /// Pinned state, never read from the runtime.
     hero_issued: bool,
+    /// Whether the fortress's one-off commission has issued: the loading
+    /// pair boards cargo into a standing fortress, so the vehicle rotation
+    /// owes the base exactly one. Pinned state, never read from the runtime.
+    fortress_issued: bool,
+    /// Whether the anti-air insurance vehicle's commission has issued: the
+    /// rotation owes the base exactly one of the roster's AntiAir entries,
+    /// so the side's mobile AA answer stands before hostile air arrives.
+    /// Pinned state, never read from the runtime.
+    aa_issued: bool,
     /// The tick a war factory's rally correction may be re-attempted.
     /// Pinned state, never read from the runtime.
     rally_gate: std::collections::HashMap<u64, u32>,
@@ -702,6 +721,8 @@ impl SuperAi {
             next_sw_fire_tick: 0,
             sw_ever_stood: false,
             hero_issued: false,
+            fortress_issued: false,
+            aa_issued: false,
             place_stuck: std::collections::HashMap::new(),
             place_pause_until: std::collections::HashMap::new(),
             rally_gate: std::collections::HashMap::new(),
@@ -726,11 +747,12 @@ impl SuperAi {
     /// place a ready building, defend the base (attack the nearest intruder;
     /// else launch a gathered wave on the enemy's structures, one unit per
     /// tick; else post idle units on an Area Guard), fly the air wing's
-    /// sortie, walk an idle scout toward the map's nearest dark cell, keep
-    /// the building queue walking the ladder, hold the war factories'
-    /// rallies around the yard, keep the vehicle queue on
-    /// miners-then-tanks, keep the barracks queue on the side's basic
-    /// soldier. See the module docs for the determinism contract.
+    /// sortie, board the fortress's anti-armor cargo, walk an idle scout
+    /// toward the map's nearest dark cell, keep the building queue walking
+    /// the ladder, hold the war factories' rallies around the yard, keep
+    /// the vehicle queue on miners-then-tanks, keep the barracks queue on
+    /// the side's basic soldier. See the module docs for the determinism
+    /// contract.
     pub fn orders(&mut self, runtime: &SimRuntime, tick: u32) -> Vec<CommandEnvelope> {
         let sim = &runtime.simulation;
         let rules = &runtime.resources.rules;
@@ -1015,6 +1037,77 @@ impl SuperAi {
                         )
                     })
                     .collect();
+            }
+        }
+
+        // The fortress's boarding call. The Battle Fortress is the one
+        // roster entry the wave system never claims: neither it nor the
+        // infantry it wants sit in the core-type sets, so both idle at
+        // home. The pairing boards the roster's anti-armor infantry (the
+        // Guardian GI's deployed launcher is the classic loadout) into the
+        // first fortress with a free seat — the same Enter click a player
+        // makes, one boarding call per tick, the passenger's order gate
+        // pacing the walk.
+        if let (Some(fortress_name), Some(cargo_name)) = (
+            opening.fortress,
+            opening
+                .infantry
+                .iter()
+                .find(|entry| entry.role == Role::AntiArmor)
+                .map(|entry| entry.name),
+        ) && let Some((fortress_id, fortress_entity)) =
+            sim.substrate.entities.iter_sorted().find(|(_, entity)| {
+                entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Unit
+                    && sim.interner.resolve(entity.type_ref()) == fortress_name
+                    && entity
+                        .passenger_role
+                        .cargo()
+                        .is_some_and(|cargo| cargo.count() < cargo.capacity())
+            })
+        {
+            let fort_cell = (
+                fortress_entity.position.rx() as i16,
+                fortress_entity.position.ry() as i16,
+            );
+            // The nearest due idle cargo, ties by the substrate's stable
+            // order; a passenger already carried rides in limbo and never
+            // re-boards.
+            let mut boarding: Option<(u32, u64)> = None;
+            for (id, entity) in sim.substrate.entities.iter_sorted() {
+                let dx = entity.position.rx() as i16 - fort_cell.0;
+                let dy = entity.position.ry() as i16 - fort_cell.1;
+                if self.order_gate.get(&id).is_none_or(|&due| tick >= due)
+                    && entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Infantry
+                    && sim.interner.resolve(entity.type_ref()) == cargo_name
+                    && !entity.lifecycle.in_limbo()
+                    && matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    )
+                {
+                    let distance =
+                        (i32::from(dx) * i32::from(dx) + i32::from(dy) * i32::from(dy)) as u32;
+                    if boarding.is_none_or(|(kept, _)| distance < kept) {
+                        boarding = Some((distance, id));
+                    }
+                }
+            }
+            if let Some((_, boarder)) = boarding {
+                self.gate_idle_order(boarder, tick);
+                return vec![CommandEnvelope::new(
+                    self.house,
+                    at,
+                    Command::clicked_mission(
+                        boarder,
+                        crate::sim::mission::MissionType::Enter,
+                        crate::sim::combat::TargetKind::Entity(fortress_id),
+                    ),
+                )];
             }
         }
 
@@ -1492,8 +1585,51 @@ impl SuperAi {
         } else {
             opening.main_tank
         };
+        // The roster's anti-air entry, derived like the fortress's cargo —
+        // the side's mobile AA answer, whatever its name.
+        let aa_name = opening
+            .vehicles
+            .iter()
+            .find(|entry| entry.role == Role::AntiAir)
+            .map(|entry| entry.name);
         let vehicle_want = if economy_first {
             opening.harvester
+        } else if self.vehicle_slots >= CORE_BEFORE_SPECIALISTS as u32
+            && !self.aa_issued
+            && aa_name.is_some_and(|name| {
+                rules.object(name).is_some_and(|ty| {
+                    crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                        == crate::sim::production::CanBuild::Yes
+                })
+            })
+        {
+            // The AA insurance: exactly one of the roster's AntiAir entries
+            // once the tank core stands, so the side's AA answer exists
+            // before hostile air arrives.
+            aa_name
+        } else if opening.fortress.is_some()
+            && !self.fortress_issued
+            && self.count_structures_of_type(sim, opening.battle_lab) >= 1
+            && opening
+                .fortress
+                .and_then(|name| rules.object(name))
+                .is_some_and(|ty| {
+                    crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                        == crate::sim::production::CanBuild::Yes
+                })
+        {
+            // The fortress's one-off commission: the loading pair boards
+            // cargo into a standing Battle Fortress, and a base that never
+            // builds one boards nothing. This and the AA insurance are
+            // dedicated existence commissions rather than specialist-slot
+            // reservations — a hot war keeps the wheel from reaching its
+            // next specialist slot while the barracks rotation drains the
+            // bank faster than a 2000-credit item can gather, so a
+            // reservation starves and commissions nothing. Once the
+            // QueueProduction order is out the factory charges
+            // progressively, so no banked-cost wait belongs here.
+            // `can_build`, not the cameo — the country-lock lesson again.
+            opening.fortress
         } else if self.vehicle_slots < CORE_BEFORE_SPECIALISTS as u32 {
             Some(core_tank)
         } else if self.vehicle_slots % SPECIALIST_EVERY_VEHICLE == SPECIALIST_EVERY_VEHICLE - 1 {
@@ -1527,6 +1663,12 @@ impl SuperAi {
         {
             if !economy_first {
                 self.vehicle_slots += 1;
+                if Some(name) == aa_name {
+                    self.aa_issued = true;
+                }
+                if opening.fortress == Some(name) {
+                    self.fortress_issued = true;
+                }
             }
             return vec![CommandEnvelope::new(
                 self.house,
@@ -2960,6 +3102,11 @@ mod tests {
             /// window ever opened; `Some` with zero jets means the orders
             /// chain never reached the commission branch.
             commission_ready: Option<u32>,
+            /// The fortress pair's proof: the Battle Fortress count and
+            /// the busiest cargo load seen on one (max, not end — the
+            /// pairing's claim is that boarding ever happened).
+            fortress: usize,
+            fortress_seats: usize,
         }
         let seen = std::cell::RefCell::new(Seen::default());
         let mut command_tally = std::collections::BTreeMap::new();
@@ -3026,6 +3173,17 @@ mod tests {
                 seen.jets = seen
                     .jets
                     .max(aircraft(scenario, "ORCA") + aircraft(scenario, "BEAG"));
+                for (_, entity) in scenario.sim().substrate.entities.iter_sorted() {
+                    if entity.owner() == human
+                        && entity.category() == crate::map::entities::EntityCategory::Unit
+                        && scenario.sim().interner.resolve(entity.type_ref()) == "BFRT"
+                    {
+                        seen.fortress = seen.fortress.max(1);
+                        if let Some(cargo) = entity.passenger_role.cargo() {
+                            seen.fortress_seats = seen.fortress_seats.max(cargo.count() as usize);
+                        }
+                    }
+                }
                 if seen.commission_ready.is_none() {
                     let rules = &scenario.runtime.resources.rules;
                     let jet_ok = ["ORCA", "BEAG"].iter().any(|&name| {
@@ -3144,13 +3302,16 @@ mod tests {
                 && seen.guardian >= 1
                 && seen.tanya >= 1
                 && seen.jets >= 1
-                && revealed_pct >= 25,
+                && revealed_pct >= 25
+                && seen.fortress >= 1
+                && seen.fortress_seats >= 1,
             "growth slice incomplete at tick {tick}: GAWEAT={} GAWEAP={} refineries={} \
              power={} defenses={} FV={} GGI={} TANY={} jets={} credits={} miners={} MTNK={} \
              SREF={} E1={} queue=[{}] AMRADR={} GAAIRC={} commission_ready={:?} \
              ready=[{}] yard={} yard_last_tick={} mcv={} \
              barracks_end={} factories_end={} amradr_end={} docks_max={} docks_end={} \
-             probe_orca={} trace_len={} amradr_opened={} revealed_pct={} tally={:?}",
+             probe_orca={} trace_len={} amradr_opened={} revealed_pct={} \
+             fortress={} fortress_seats={} tally={:?}",
             seen.superweapon,
             seen.factories,
             seen.refineries,
@@ -3185,6 +3346,8 @@ mod tests {
             opening_trace.len(),
             amradr_opened,
             revealed_pct,
+            seen.fortress,
+            seen.fortress_seats,
             command_tally,
         );
     }

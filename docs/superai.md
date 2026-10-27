@@ -484,6 +484,33 @@ combat branches — production owns the busy ticks, the dogs take the
 spare ones — and the fair-growth census carries the proof: a
 revealed-fraction floor on the end state.
 
+## The fortress loading pair
+
+The Battle Fortress is the Allied late-game OpenTopped transport — five
+seats, its passengers firing from inside — and the one roster entry the
+wave system never claims: neither it nor the infantry it wants sit in
+the core-type sets, so both idle at home where the pairing finds them.
+The vehicle rotation owes the base exactly one fortress, and the
+commission is a dedicated existence branch, not a specialist-slot
+reservation: a reservation starves exactly when it matters — a hot war
+keeps the wheel from reaching its next specialist slot while the
+barracks rotation drains the bank faster than a 2000-credit item can
+gather — so the fortress takes the first free vehicle turn once the
+battle lab stands (`can_build`-gated, the country-lock lesson again),
+and once the QueueProduction order is out the factory charges
+progressively; no banked-cost wait belongs in the branch. The same
+treatment fields the AA insurance: one of the roster's AntiAir entries
+once the tank core stands, so the side's mobile AA answer exists before
+hostile air arrives. The boarding branch —
+below the combat branches, above the scouts — sends the roster's
+anti-armor infantry (the Guardian GI's deployed launcher, the classic
+loadout; derived from the roster, not hardcoded) into the first
+fortress with a free seat, as the same Enter click a player makes
+(`Command::clicked_mission` with `MissionType::Enter`), one boarding
+call per tick with the passenger's order gate pacing the walk. The
+fair-growth census carries the proof: a fortress stood and a seat was
+filled.
+
 ## Command-driven production publication
 
 Upstream `44f14000a` routed automatic mobile delivery through the local
