@@ -467,6 +467,23 @@ layer built on the way — per-type command tally, banked docks, a live
 post-drive enqueue probe and the grand-opening trace — for the next
 regression that needs them.
 
+## Scouting
+
+Retail never lifts its own shroud: the aimd corpus posts dogs as base
+and refinery guards and its roaming "patrols" circle the base's own
+buildings, so the scouting chain is fork-original. The opening table
+carries each side's scout — the 200-credit dog (speed 8, sight 9) for
+both army sides, Yuri's initiate (also sight 9) where no dog exists —
+kept two alive through a reservation on the barracks rotation's
+specialist slots (`can_build`-gated, the same country-lock lesson as
+`army_pick`). An idle, ungated scout marches to the fog grid's nearest
+never-revealed cell (ties broken by row-major scan order); the march
+reveals as it goes, arrival posts it there, and the next due window
+re-points it into what is still dark. The dispatch sits below the
+combat branches — production owns the busy ticks, the dogs take the
+spare ones — and the fair-growth census carries the proof: a
+revealed-fraction floor on the end state.
+
 ## Command-driven production publication
 
 Upstream `44f14000a` routed automatic mobile delivery through the local

@@ -157,6 +157,12 @@ const PLACE_PAUSE_TICKS: u32 = 900;
 /// command chain (observed).
 const RALLY_RETRY_TICKS: u32 = 900;
 
+/// Live scouts the opening keeps on the map. Retail never scouts (its
+/// dogs sit as base guards), so the fork's chain is its own: two cheap
+/// fast eyes (a 200-credit dog at sight 9) cover the map's dark half
+/// without taxing the barracks rotation more than a pair of soldiers.
+const SCOUT_TARGET: usize = 2;
+
 /// Combat-slot wheels: past the core, every Nth issued combat slot goes
 /// to the roster mix and the rest back to the core type. A live-count
 /// gate measures the war, not the build program — under attrition the
@@ -330,6 +336,13 @@ struct Opening {
     /// power (Kirov, Siege Chopper, Floating Disk) rides `VehicleTypes`
     /// and their war factory, so their tables stay empty here.
     aircraft: &'static [&'static str],
+    /// The side's scout: a barracks-cheap fast eye the fork keeps
+    /// [`SCOUT_TARGET`] of alive and walks into unrevealed territory.
+    /// Retail's own dogs are counter-infiltration base guards — the
+    /// scouting chain is fork-original — so the pick is purely economics:
+    /// the 200-credit dog (speed 8, sight 9) for both army sides, Yuri's
+    /// initiate (also sight 9, half the speed) where no dog exists.
+    scout: &'static str,
     /// Combat vehicles the army mixes in past its core tank, each with
     /// its role; the core keeps the remaining slots. Country-locked
     /// entries stay in the table — CanBuild's `RequiredHouses=` gate
@@ -435,6 +448,7 @@ const OPENINGS: [Opening; 3] = [
         defense_aa: "NASAM",
         defense_heavy: "ATESLA",
         aircraft: &["BEAG", "ORCA"],
+        scout: "ADOG",
     },
     Opening {
         construction_yard: "NACNST",
@@ -526,6 +540,7 @@ const OPENINGS: [Opening; 3] = [
         defense_aa: "NAFLAK",
         defense_heavy: "TESLA",
         aircraft: &[],
+        scout: "DOG",
     },
     Opening {
         construction_yard: "YACNST",
@@ -604,6 +619,7 @@ const OPENINGS: [Opening; 3] = [
         defense_aa: "YAGGUN",
         defense_heavy: "YAPSYT",
         aircraft: &[],
+        scout: "INIT",
     },
 ];
 
@@ -709,11 +725,12 @@ impl SuperAi {
     /// One command per tick, in a fixed priority: deploy the opening MCV,
     /// place a ready building, defend the base (attack the nearest intruder;
     /// else launch a gathered wave on the enemy's structures, one unit per
-    /// tick; else post idle units on an Area Guard), keep the building queue
-    /// walking the ladder, hold the war factories' rallies around the yard,
-    /// keep the vehicle queue on miners-then-tanks, keep the barracks queue
-    /// on the side's basic soldier. See the module docs for the determinism
-    /// contract.
+    /// tick; else post idle units on an Area Guard), fly the air wing's
+    /// sortie, walk an idle scout toward the map's nearest dark cell, keep
+    /// the building queue walking the ladder, hold the war factories'
+    /// rallies around the yard, keep the vehicle queue on
+    /// miners-then-tanks, keep the barracks queue on the side's basic
+    /// soldier. See the module docs for the determinism contract.
     pub fn orders(&mut self, runtime: &SimRuntime, tick: u32) -> Vec<CommandEnvelope> {
         let sim = &runtime.simulation;
         let rules = &runtime.resources.rules;
@@ -999,6 +1016,45 @@ impl SuperAi {
                     })
                     .collect();
             }
+        }
+
+        // The scouting chain's dispatch. Retail never lifts its own shroud
+        // (its dogs sit posted as base guards), so the fork walks its own:
+        // an idle, ungated scout marches to the nearest cell the house has
+        // never revealed. The march reveals on the way (sight joins the
+        // house as it moves) and arrival posts it there until the next due
+        // window re-points it into what is still dark. The dispatch sits
+        // below the combat branches: production and defense own the busy
+        // ticks, the dogs take the spare ones.
+        let mut idle_scouts = sim.substrate.entities.iter_sorted().filter(|(id, entity)| {
+            self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                && entity.owner() == self.house
+                && entity.category() == crate::map::entities::EntityCategory::Infantry
+                && sim.interner.resolve(entity.type_ref()) == opening.scout
+                && matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                )
+        });
+        if let Some((scout, entity)) = idle_scouts.next()
+            && let Some(cell) = self.nearest_unrevealed_cell(
+                sim,
+                (entity.position.rx() as i16, entity.position.ry() as i16),
+            )
+        {
+            self.gate_idle_order(scout, tick);
+            return vec![CommandEnvelope::new(
+                self.house,
+                at,
+                Command::Move {
+                    entity_id: scout,
+                    target_rx: cell.0,
+                    target_ry: cell.1,
+                },
+            )];
         }
 
         // Walk the build ladder while the building queue idles: the opening's
@@ -1491,6 +1547,16 @@ impl SuperAi {
         let infantry_want = if self.infantry_slots < CORE_BEFORE_SPECIALISTS as u32 {
             Some(opening.basic_infantry)
         } else if self.infantry_slots % SPECIALIST_EVERY_INFANTRY == SPECIALIST_EVERY_INFANTRY - 1 {
+            // The scout reservation claims the first specialist slots the
+            // rotation opens: the map's dark half is the whole chain's
+            // future (wave targets, defense readings) and costs a pair of
+            // soldiers' worth of barracks time. `can_build`, not the
+            // cameo — the same country-lock lesson as `army_pick`.
+            let scout_want = self.count_combat_of_type(sim, opening.scout) < SCOUT_TARGET
+                && rules.object(opening.scout).is_some_and(|ty| {
+                    crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                        == crate::sim::production::CanBuild::Yes
+                });
             // The hero's commission: once the battle lab stands the hero
             // takes the next specialist slot outright instead of waiting
             // for a whole-role deficit window (observed: Tanya never once
@@ -1500,7 +1566,9 @@ impl SuperAi {
             // the reservation yields to the ordinary rotation; a fallen
             // hero re-lights the cameo and the reservation re-arms the
             // replacement.
-            if !self.hero_issued
+            if scout_want {
+                Some(opening.scout)
+            } else if !self.hero_issued
                 && self.count_structures_of_type(sim, opening.battle_lab) >= 1
                 && rules.object(opening.hero).is_some_and(|ty| {
                     crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
@@ -1704,6 +1772,34 @@ impl SuperAi {
                     && sim.interner.resolve(entity.type_ref()) == type_name
             })
             .count()
+    }
+
+    /// The fog grid's nearest cell this house has never revealed, ties
+    /// broken by row-major scan order (the substrate order's determinism
+    /// discipline). The scouting dispatch walks a dog to this cell; a map
+    /// with no dark cell left answers `None` and the chain rests.
+    fn nearest_unrevealed_cell(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        from: (i16, i16),
+    ) -> Option<(u16, u16)> {
+        let fog = &sim.fog;
+        let (width, height) = (fog.width(), fog.height());
+        let mut best: Option<(u32, (u16, u16))> = None;
+        for ry in 0..height {
+            for rx in 0..width {
+                if fog.is_cell_revealed(self.house, rx, ry) {
+                    continue;
+                }
+                let dx = i32::from(rx) - i32::from(from.0);
+                let dy = i32::from(ry) - i32::from(from.1);
+                let distance = (dx * dx + dy * dy) as u32;
+                if best.is_none_or(|(kept, _)| distance < kept) {
+                    best = Some((distance, (rx, ry)));
+                }
+            }
+        }
+        best.map(|(_, cell)| cell)
     }
 
     /// How many combat units of exactly this retail type name stand under
@@ -2984,6 +3080,25 @@ mod tests {
         let amradr_opened = opening_trace
             .iter()
             .any(|&(id, _)| seen.amradr_id == Some(id));
+        // The scouting chain's end read: what fraction of the house's fog
+        // grid stands revealed. The dogs' commission and dispatch are the
+        // fork's own (retail posts its dogs as base guards), so the census
+        // owns their proof; the floor stays low on purpose — the figure to
+        // watch is the printed one.
+        let revealed_pct = {
+            let sim = scenario.sim();
+            let fog = &sim.fog;
+            let (w, h) = (u32::from(fog.width()), u32::from(fog.height()));
+            let mut lit = 0u32;
+            for ry in 0..h {
+                for rx in 0..w {
+                    if fog.is_cell_revealed(human, rx as u16, ry as u16) {
+                        lit += 1;
+                    }
+                }
+            }
+            if w * h == 0 { 0 } else { lit * 100 / (w * h) }
+        };
         // The census names the vehicle line's every member and the queue's
         // current items: which gate held the mix back is a question about
         // counts (miners, core tanks, army size) and the queue's contents,
@@ -3028,13 +3143,14 @@ mod tests {
                 && seen.ifv >= 1
                 && seen.guardian >= 1
                 && seen.tanya >= 1
-                && seen.jets >= 1,
+                && seen.jets >= 1
+                && revealed_pct >= 25,
             "growth slice incomplete at tick {tick}: GAWEAT={} GAWEAP={} refineries={} \
              power={} defenses={} FV={} GGI={} TANY={} jets={} credits={} miners={} MTNK={} \
              SREF={} E1={} queue=[{}] AMRADR={} GAAIRC={} commission_ready={:?} \
              ready=[{}] yard={} yard_last_tick={} mcv={} \
              barracks_end={} factories_end={} amradr_end={} docks_max={} docks_end={} \
-             probe_orca={} trace_len={} amradr_opened={} tally={:?}",
+             probe_orca={} trace_len={} amradr_opened={} revealed_pct={} tally={:?}",
             seen.superweapon,
             seen.factories,
             seen.refineries,
@@ -3068,6 +3184,7 @@ mod tests {
             probe_orca,
             opening_trace.len(),
             amradr_opened,
+            revealed_pct,
             command_tally,
         );
     }
