@@ -225,6 +225,38 @@ loss postponed 21073→26932). Both sides now routinely hold to the
 30000-tick backstop; breaking that stalemate is scouting/count and
 micro territory, not more wave shaping.
 
+Three live-play wedges the first MAX matches exposed, all strategy-side.
+The order chains' combat universe was the core three types only: every
+specialist the roster mix built — heroes included — was invisible to
+the guard-post and wave chains, orderless for life where it rolled out,
+jamming the factory door (which in turn backed production up behind
+it); the chains now carry the whole roster (`combat_roster`). The air
+wing's top-up lived behind a both-ground-queues-busy window it lost
+every tick to cheaper re-arming ground items, so past the first
+commissioned jet the wing never grew; top-ups now ride the same
+commission branch on the wing's own aircraft queue — but the base
+outranks the wing: while the second yard is still owed, the top-ups
+wait (a full wing once ate every wallet peak the remote refinery and
+the MCV needed, and stood over a second base that never came). And the expansion's
+ore-field scan kept only the richest cell, distance-blind — on a big
+community map every house marched its MCV at the same central
+mega-field across hostile ground ("the AI charges with its base"); the
+scan now scores value per distance walked, and the winner must host the
+following structure's foundation — the same placement predicate the
+deploy chain uses — so a field with no room beside it never wins and the
+walk aim never falls back to the ore cell itself, whose ground refuses
+the unfolding (that fallback cost a whole match's second yard). The
+foundation must also keep the expansion distance from home on its own:
+a field at the survey's minimum can hand back a foundation the ring
+scan pulled toward home, and the refinery then lands inside the very
+distance the second-base latch demands (that off-by-radius cost another
+match's second yard). Known
+gap, deliberate for
+now: the wave and superweapon targeting read the raw entity set — no
+shroud filter — so the AI aim is map-transparent; a vision-aware
+targeting pass needs the scouting chain strengthened first, or the AI
+goes passive the moment nothing stands revealed.
+
 The tech-climb slice adds the tier the strategy never had. Right behind
 the second war factory the build ladder climbs — the radar class, then
 the battle lab — before the expansion finishes with its third factory,
