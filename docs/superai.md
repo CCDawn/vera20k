@@ -284,12 +284,13 @@ on a live main-tank count of zero, so once the army switched to tier-2
 tanks the base stopped growing forever): a growth tail queues whichever
 limb runs furthest behind — power only on an actual deficit (the
 margin rule claimed every growth slot under war damage: five plants
-while refineries sat at two), war factories (the fourth queues as
-part of the standard build-out with no wallet bar — the ladder's
+while refineries sat at two), war factories (the fourth is owed by
+the ladder's last rung — as a growth entry it never once won a slot
+from the power-deficit rule (observed), and the rung carries no wallet
+bar for the same reason the build-out always had none: the ladder's
 superweapon drains the bank and the army queues absorb the income
-after, so a wallet gate never coincides with a free slot; observed a
-whole game stuck at three under bars of 3000 and 1500 alike, the item
-drawing its cost as it builds the native way — while the fifth and
+after; the item draws its cost as it builds the native way —
+while the fifth and
 sixth wait for a wallet over 1500 credits, capped at six by retail's
 `MultipleFactory=0.8` shrinking returns), refineries while the miner
 fleet can feed another dock (two miners each, capped at four) — and the expansion gate now counts the tier-2 tank
@@ -327,7 +328,15 @@ outright: a broke base that queues a 1500-credit tower parks it in the
 one building slot at zero progress forever (observed: factories stuck at
 three while the Prism Tower held the queue for the rest of the game),
 starving the growth tail behind it. Poor bases expand; rich bases arm.
-The fair_growth regression now requires two perimeter guns
+But the full-cost gate alone can wait forever in a war-poor game: each
+unit item banks only its own cost, and the hundred-credit soldier
+ladder keeps the wallet pinned under the gun's price between ore dumps
+(observed: whole games, zero gun orders). While fewer than two guns
+stand, the unit queues hold for the next gun the limb itself would
+claim — a savings hold that pools the flow past the gun's full cost on
+the idle ticks between building items. The economy's miners and the
+one-shot commissions are exempt: income first, existence second, the
+floor third. The fair_growth regression now requires two perimeter guns
 standing in its end census.
 
 The income-recovery rule fixes a total freeze observed in live play:
@@ -510,6 +519,60 @@ fortress with a free seat, as the same Enter click a player makes
 call per tick with the passenger's order gate pacing the walk. The
 fair-growth census carries the proof: a fortress stood and a seat was
 filled.
+
+## Base expansion
+
+Retail never expanded: its MCV teams regroup and deploy in place, and
+its refineries ring one base-plan anchor. The fork grows outward in two
+phases, both riding native machinery. When the home economy reaches its
+design steady state, a one-shot survey walks the overlay grid (row-major,
+strict `<`, richest cell wins) and latches an ore-field site past the
+home ring-scan's reach; the growth tail's first limb then queues a
+refinery there, and the ready-placement branch routes that one refinery
+around the latched site instead of the yard. Everything after placement
+is native — the refinery spawns its own FreeUnit miner beside it, miners
+scan ore from their own cell and dock at the nearest free bay, and miner
+production scales with the refinery count automatically. Placement
+legality is cell-local (no base-radius rule anywhere in the build-site
+predicates), so the far site needs only a clear foundation.
+
+The second phase walks a base out: once the survey latches a far ore
+field — the home economy at its design steady state — the vehicle
+rotation owes the house one expansion
+MCV — an existence commission like the fortress's, with the type
+derived from the yard's own `UndeploysInto` (AMCV/SMCV/PCV); the
+remote refinery and the MCV then advance in parallel on the building
+and vehicle queues (observed the serial order starve: the MCV was
+still charging its 3000 credits at the census budget's end in a
+war-poor late game). Retail
+gates every side's MCV behind its service depot (`Prerequisite=`:
+AMCV on GADEPT, SMCV on NADEPT, PCV on the Grinder — YADEPT sits at
+TechLevel 15, past any lobby), so the depot is a ladder rung of its
+own, built with the late base; `can_build` refuses the MCV until it
+stands. The routed remote refinery also carries a home fallback: a
+far ore field whose rings hold no legal foundation must never wedge
+the one building slot. The
+opening deploy branch stands down once any yard stands, so the escort
+branch owns the later MCV alone. Its walk aims at a legal yard
+foundation beside the second survey's field (the first field excluded),
+never the surveyed ore cell itself — tiberium-covered ground refuses
+the unfolding, and an MCV loitering near the field spent its whole
+attempt budget on misses (observed). `find_site_around` supplies the
+foundation's origin and the walk targets its center cell — the deploy
+tests the origin one cell up-left of the MCV — with exact arrival
+required before a paced `DeployMcv` draws on a per-MCV attempt budget;
+the opening's game-lifetime budget never sees a later MCV and must not
+swallow its deploys. A foundation whose deploys the attempts cannot
+buy abandons the plan; the aim latches on its first scan — a re-scanned
+target drifts as the ore spreads and is never reached (observed: the
+whole walk spent re-pointing between shifting foundations) — and the
+deploy draws once the MCV stands on the latched cell or beside it, a
+one-cell miss handing the finish to `try_to_deploy`'s own fallback
+drive. The second yard keeps the home anchor for
+placement (the substrate's stable order prefers the older yard), while
+the native base centroid follows all owned buildings. The fair-growth
+census carries the proof: a refinery stood at the expansion distance,
+and two yards stood at once.
 
 ## Command-driven production publication
 
