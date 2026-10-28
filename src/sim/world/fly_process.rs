@@ -356,6 +356,7 @@ impl Simulation {
                 &self.interner,
                 &mut self.substrate,
                 &self.resolved_terrain,
+                self.playfield_bounds,
                 id,
                 rules,
             );
@@ -439,13 +440,46 @@ impl Simulation {
             span,
         };
         let may_leave = aircraft && self.aircraft_may_leave_map(id);
+        let fly_by = aircraft && object.is_some_and(|object| object.fly_by);
         let (coord, placed) = fly_map_edge(
             candidate,
             &edge,
             may_leave,
-            aircraft && object.is_some_and(|object| object.fly_by),
+            fly_by,
             &mut self.scenario_rng,
         );
+        // Native's admission places an out-of-diamond candidate as it is
+        // for an owner that may not leave the map or a FlyBy Aircraft
+        // (`0x004CDB4C`), leaning on the engine's wrapping fixed point to
+        // keep the off-map walk representable; VERA's `SimFixed` panics
+        // once the walk leaves its domain (observed: a jet walked 128
+        // cells past the north-west corner before the position overflowed).
+        // An owner that may not operate outside the playfield is held at
+        // the edge instead: the step is refused, never placed. FlyBy
+        // Aircraft keep native behavior — they exit the map by design and
+        // `leave_map` removes them.
+        if placed
+            && !may_leave
+            && !fly_by
+            && !crate::map::playfield::size_diamond_contains(width, height, coord_cell(coord))
+        {
+            return None;
+        }
+        // The position's fixed-point domain is the last cliff.
+        // `put_world_xy` aliases a coordinate from `-32768` to
+        // `65535 * 256 + 32767` through its clamped cell word, and panics
+        // past that (native wraps its own words silently there). A flyer
+        // whose drive went rogue — observed: a spy plane whose mission
+        // stopped dispatching flew straight past the map and on toward the
+        // north-west corner — is refused the step at the cliff instead of
+        // overflowing the position, whatever class admitted it.
+        if coord.x < i32::from(i16::MIN) + 1
+            || coord.y < i32::from(i16::MIN) + 1
+            || coord.x > i32::from(u16::MAX) * 256 + 32767
+            || coord.y > i32::from(u16::MAX) * 256 + 32767
+        {
+            return None;
+        }
         placed.then_some(coord)
     }
 
@@ -458,6 +492,7 @@ impl Simulation {
         interner: &StringInterner,
         substrate: &mut ObjectSubstrate,
         resolved_terrain: &Option<ResolvedTerrainGrid>,
+        playfield_bounds: Option<crate::sim::cell_rect::PlayfieldBounds>,
         id: u64,
         rules: &RuleSet,
     ) {
@@ -489,6 +524,25 @@ impl Simulation {
         }
         let location = ground_pose::object_location(entity, resolved_terrain.as_ref());
         let (cell_x, cell_y) = coord_cell(destination);
+        // The drift's SetLocation carries no map-edge admission (the paid
+        // step's placement runs through `fly_map_edge`), so a destination
+        // whose packed cell lies outside the playfield — a wrapped
+        // NavTargetRef cell, say — would walk the flyer off the map in
+        // landing-drift steps until the sub-cell offset left the
+        // fixed-point position's domain (observed: a jet walked to -32794
+        // leptons, 128 cells off the north-west corner, and panicked in
+        // `put_world_xy`). Without MapClass authority (headless fixtures)
+        // there is no map edge to leave: the drift keeps its prior
+        // behavior, like `fly_map_edge_admission`'s no-authority arm.
+        if let Some(bounds) = playfield_bounds
+            && !crate::sim::cell_rect::cell_is_in_playfield_height_aware(
+                (i32::from(cell_x), i32::from(cell_y)),
+                Some(bounds),
+                resolved_terrain.as_ref(),
+            )
+        {
+            return;
+        }
         let centre = [
             i32::from(cell_x).wrapping_mul(256).wrapping_add(0x80),
             i32::from(cell_y).wrapping_mul(256).wrapping_add(0x80),

@@ -5,7 +5,7 @@ This branch group (`superai/*`) is a fork-only feature line: a command-layer
 **超级AI / Super AI**; the in-game rows stay English (`Super AI`,
 `Super AI MAX`) because the retail font carries no CJK glyphs. It tracks
 upstream `YuriPlanet/vera20k` `main` and keeps its footprint outside
-`src/sim/` (two documented exceptions, below). Licensed GPL like the rest of
+`src/sim/` (three documented exceptions, below). Licensed GPL like the rest of
 the tree.
 
 ## Positioning
@@ -52,6 +52,23 @@ folded into the country multiplier of `production/factory.rs`
 `HouseState::command_driven` (below): a per-house fork flag that stands the
 native AI's decision loops down for a house the command layer drives.
 Nothing else in `src/sim/` may depend on super-AI code.
+
+The third exception carries no super-AI knowledge at all — it is a crash
+guard the AI-vs-AI matches exposed. Native's Fly admission
+(`world/fly_process.rs`) places an out-of-diamond step as it is for an
+owner that may not leave the map, leaning on the engine's wrapping fixed
+point to keep the off-map walk representable; VERA's `SimFixed` panics once
+the walk leaves its domain. Three guards now hold the line: the landing
+drift ends when its destination's cell is off-playfield, the paid step
+refuses out-of-diamond candidates for owners that may not operate outside
+the playfield, and every class is refused a step past the position's
+fixed-point aliasing range (`put_world_xy`'s own documented domain).
+FlyBy Aircraft and owners that may leave the map keep native behavior
+inside that range. The observed walker was a spy plane whose mission
+dispatch stopped mid-flight — it then overflew its destination, left the
+map, and (mission still Approach with a live target, so the off-map
+removal predicate answers no) walked on toward the corner; the stalled
+mission dispatch is an open engine thread the guards make harmless.
 
 ## In-game selection and the command-driven house
 
