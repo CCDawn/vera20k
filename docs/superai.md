@@ -110,7 +110,15 @@ the retail opening (power, refinery, barracks, war factory, then a second
 refinery and harvesters) as pure decisions — one command per tick, gated by
 the production cameo state. A retail regression test drives a real Battle
 from the launch MCV to a standing construction yard, power plant and
-refinery (the idle-MCV baseline terminated at 12904 ticks).
+refinery (the idle-MCV baseline terminated at 12904 ticks). The opening
+deploy clears its own ground first: `is_clear_to_build` counts standing
+infantry and vehicles as occupants (only the deploying MCV is lifted), and
+a community map's packed start never clears while every unit stands idle
+waiting for the yard (observed: six houses, five attempts each, no yard,
+the whole match silent) — so idle own units inside the foundation are
+walked out one Move at a time, a start the ground itself refuses walks the
+MCV to the nearest legal foundation, and only a foundation that would land
+spends one of the paced attempts.
 
 The mass-production slice arms the opening: the vehicle queue builds miners
 to a target of five and then the side's main battle tank (Grizzly, Rhino,

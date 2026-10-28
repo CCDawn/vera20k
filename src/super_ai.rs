@@ -664,6 +664,10 @@ pub struct SuperAi {
     next_deploy_tick: u32,
     /// Deploy orders issued so far this game.
     deploy_attempts: u8,
+    /// The MCV's cell the deploy attempts were spent at: a walked MCV
+    /// re-arms [`Self::deploy_attempts`] (the budget is per foundation,
+    /// not per game).
+    deploy_origin: Option<(u16, u16)>,
     /// Whether a gathered wave is currently launching: one standing unit
     /// leaves per tick until only the guard reserve remains home, so the
     /// group departs together and arrives as a mass instead of trickling
@@ -764,6 +768,7 @@ impl SuperAi {
             difficulty,
             next_deploy_tick: 0,
             deploy_attempts: 0,
+            deploy_origin: None,
             wave_launching: false,
             launched: Vec::new(),
             next_wave_tick: 0,
@@ -820,8 +825,123 @@ impl SuperAi {
         let owner = sim.interner.resolve(self.house).to_string();
 
         // Deploy: the launch MCV deploys into the side's construction yard.
-        if let Some(mcv) = self.deployable_mcv(sim, rules) {
-            if tick >= self.next_deploy_tick && self.deploy_attempts < DEPLOY_ATTEMPTS {
+        // try_to_deploy tests the origin one cell up-left of the MCV with
+        // the MCV itself lifted, and `is_clear_to_build` counts every
+        // other standing infantry and vehicle as an occupant — a community
+        // map's packed 9x9 start never clears on its own while every unit
+        // stands idle waiting for the yard (observed: six houses, five
+        // attempts each, no yard ever, the whole match silent). So the
+        // opening spends its ticks on clearing instead of attempts: own
+        // idle units inside the foundation are walked out one Move at a
+        // time, a start the ground itself refuses walks the MCV to the
+        // nearest legal foundation (the escort's pattern in miniature),
+        // and only a foundation that would land draws the paced DeployMcv.
+        // The yard type comes from the MCV's own `DeploysInto` — the same
+        // rule `deployable_mcv` matched — because `opening()` resolves
+        // through a *standing* yard: gating this branch on it would be the
+        // chicken-and-egg that froze a house whose native deploy never
+        // landed (observed: 42000 ticks of empty orders, the MCV standing
+        // until the enemy found it).
+        if let Some(mcv) = self.deployable_mcv(sim, rules)
+            && let Some(entity) = sim.substrate.entities.get(mcv)
+            && let Some(yard_name) = rules
+                .object(sim.interner.resolve(entity.type_ref()))
+                .and_then(|ty| ty.deploys_into.as_deref())
+            && let Some(yard_ty) = rules.object(yard_name)
+            && matches!(
+                entity.passive_acquire_mission(),
+                crate::sim::mission::MissionType::None
+                    | crate::sim::mission::MissionType::Sleep
+                    | crate::sim::mission::MissionType::Guard
+                    | crate::sim::mission::MissionType::AreaGuard
+            )
+        {
+            let (mx, my) = (entity.position.rx() as i16, entity.position.ry() as i16);
+            let lifted = crate::sim::build_site::LiftedUnit::read(sim, mcv);
+            let clear = crate::sim::build_site::can_place_building_at(
+                sim,
+                rules,
+                Some(&runtime.resources.overlay_registry),
+                yard_ty,
+                (mx - 1, my - 1),
+                None,
+                None,
+                Some(&lifted),
+            );
+            let blocker = (!clear)
+                .then(|| {
+                    yard_ty.foundation.cell_offsets().iter().find_map(|&(dx, dy)| {
+                        sim.cell_objects(
+                            ((mx - 1 + dx) as u16, (my - 1 + dy) as u16),
+                            crate::sim::movement::locomotor::MovementLayer::Ground,
+                        )
+                        .find_map(|member| match member {
+                            crate::sim::occupancy::CellObjectMember::Entity(id) => sim
+                                .substrate
+                                .entities
+                                .get(id)
+                                .filter(|e| {
+                                    e.owner() == self.house
+                                        && e.category()
+                                            == crate::map::entities::EntityCategory::Unit
+                                        && matches!(
+                                            e.passive_acquire_mission(),
+                                            crate::sim::mission::MissionType::None
+                                                | crate::sim::mission::MissionType::Sleep
+                                                | crate::sim::mission::MissionType::Guard
+                                                | crate::sim::mission::MissionType::AreaGuard
+                                        )
+                                })
+                                .map(|_| id),
+                            _ => None,
+                        })
+                    })
+                })
+                .flatten();
+            if !clear
+                && let Some(unit) = blocker
+                && self.order_gate.get(&unit).is_none_or(|&due| tick >= due)
+            {
+                self.gate_idle_order(unit, tick);
+                return vec![CommandEnvelope::new(
+                    self.house,
+                    at,
+                    Command::Move {
+                        entity_id: unit,
+                        target_rx: (mx + 6).max(1) as u16,
+                        target_ry: my.max(1) as u16,
+                    },
+                )];
+            }
+            if !clear && blocker.is_none() {
+                // The ground itself refuses this start: walk the MCV to
+                // the nearest foundation the placement test admits (its
+                // rings skip every origin the standing MCV itself would
+                // block) and deploy from its center on arrival. A walking
+                // MCV is not idle and draws no order until it stops.
+                if let Some((ox, oy)) = find_site_around(
+                    sim,
+                    rules,
+                    &runtime.resources.overlay_registry,
+                    yard_ty,
+                    (mx, my),
+                    self.house,
+                ) {
+                    return vec![CommandEnvelope::new(
+                        self.house,
+                        at,
+                        Command::Move {
+                            entity_id: mcv,
+                            target_rx: ox + 1,
+                            target_ry: oy + 1,
+                        },
+                    )];
+                }
+            }
+            if clear
+                && tick >= self.next_deploy_tick
+                && self.deploy_attempts < DEPLOY_ATTEMPTS
+            {
                 self.next_deploy_tick = tick + DEPLOY_RETRY_TICKS;
                 self.deploy_attempts += 1;
                 return vec![CommandEnvelope::new(
@@ -839,6 +959,19 @@ impl SuperAi {
             // opening this fall-through is inert — no yard, no factories,
             // nothing ready: every branch below has nothing to issue.
         }
+        // A walked MCV re-arms the deploy budget: the attempts are spent
+        // per foundation, and transient refusals while the clearing Moves
+        // were still walking must not spend the whole game's five.
+        if let Some(mcv) = self.deployable_mcv(sim, rules)
+            && let Some(entity) = sim.substrate.entities.get(mcv)
+            && self.deploy_origin != Some((entity.position.rx(), entity.position.ry()))
+        {
+            self.deploy_origin = Some((entity.position.rx(), entity.position.ry()));
+            self.deploy_attempts = 0;
+        }
+        // Everything below the deploy speaks through the side's opening,
+        // which resolves through the standing yard — the branch above is
+        // what stands it.
         let Some(opening) = self.opening(sim) else {
             return Vec::new();
         };
@@ -3558,7 +3691,7 @@ mod tests {
                 // The remote refinery: any own refinery standing at the
                 // expansion distance from the first standing yard (the
                 // home anchor, mirroring `structure_center`'s pick).
-                if let Some((hx, hy)) = scenario
+                if let Some((_hx, hy)) = scenario
                     .sim()
                     .substrate
                     .entities
@@ -3750,6 +3883,26 @@ mod tests {
         // One combined assertion with the full census: a slow retail test
         // must explain its whole end state in one panic, not one fact per
         // rerun.
+        let mcv_probe = scenario
+            .sim()
+            .substrate
+            .entities
+            .iter_sorted()
+            .find(|(_, entity)| {
+                entity.owner() == human
+                    && entity.category() == crate::map::entities::EntityCategory::Unit
+                    && scenario.sim().interner.resolve(entity.type_ref()) == "AMCV"
+            })
+            .map(|(_, entity)| {
+                format!(
+                    "mission={:?} cell=({},{}) pos=({},{})",
+                    entity.passive_acquire_mission(),
+                    entity.position.rx(),
+                    entity.position.ry(),
+                    entity.position.sub_x(),
+                    entity.position.sub_y(),
+                )
+            });
         assert!(
             seen.superweapon >= 1
                 && seen.factories >= 4
@@ -3770,7 +3923,7 @@ mod tests {
              barracks_end={} factories_end={} amradr_end={} docks_max={} docks_end={} \
              probe_orca={} trace_len={} amradr_opened={} revealed_pct={} \
              fortress={} fortress_seats={} remote_refinery={} yards={} probe_amcv={:?} \
-             ai_state={:?} tally={:?}",
+             ai_state={:?} mcv_probe={:?} tally={:?}",
             seen.superweapon,
             seen.factories,
             seen.refineries,
@@ -3818,8 +3971,11 @@ mod tests {
                 ai.expansion2_site,
                 ai.expansion_deploy_target,
                 ai.expansion_deploy_attempts,
-                ai.next_expansion_deploy_tick
+                ai.next_expansion_deploy_tick,
+                ai.deploy_attempts,
+                ai.next_deploy_tick
             ),
+            mcv_probe,
             command_tally,
         );
     }
