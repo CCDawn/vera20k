@@ -2339,8 +2339,15 @@ impl HouseState {
 
     /// `Execute_DoList 0x0064C4FB..0x0064C50D` admits a registered House
     /// when either IsHuman or PlayerControl is set, in every session mode.
+    /// Fork (docs/superai.md): a command-driven house rides the same DoList
+    /// with the fork's AI driver as its only command source — native never
+    /// queues player events for a computer house, so admitting them changes
+    /// no native-reachable state, and refusing them left every Super-AI
+    /// order admitted but never dispatched (observed: six MAX houses, 6
+    /// DeployMcv each recorded in the replay, zero executed, the whole match
+    /// frozen).
     pub const fn event_dispatch_eligible(&self) -> bool {
-        self.is_human || self.player_control
+        self.is_human || self.player_control || self.command_driven
     }
 
     /// Native mode-aware House-control predicate shared by successful Building

@@ -2906,7 +2906,7 @@ fn find_site_around(
 
 #[cfg(test)]
 mod tests {
-    use super::{EXPANSION_MIN_DISTANCE, SuperAi, SuperAiDifficulty};
+    use super::{EXPANSION_MIN_DISTANCE, OPENINGS, SuperAi, SuperAiDifficulty};
     use crate::sim::intern::InternedId;
     use crate::sim::runtime::SimRuntime;
 
@@ -3521,6 +3521,211 @@ mod tests {
 
             assert_eq!(plain_house.economy().available_money(), starting_credits);
         }
+    }
+
+    /// The user's lobby shape end to end: several MAX (Unlimited) houses on
+    /// one team, no starting units, drivers attached exactly as the app does
+    /// (`MatchState::rebuild_super_players`: one per command-driven house,
+    /// tiers read back from the houses, no second marking pass). A frozen
+    /// opening here is the in-game "no action at all" report.
+    #[test]
+    #[ignore = "slow; retail; loads a match from the retail install"]
+    fn unlimited_team_houses_open_without_starting_units() {
+        use crate::map::entities::EntityCategory;
+        use crate::skirmish_launch::{AiDifficulty, LaunchCountry, LaunchTeam};
+
+        let ra2 = std::path::PathBuf::from(
+            std::env::var("RA2_DIR").expect("set RA2_DIR to the retail RA2/YR install directory"),
+        );
+        let map = "XTerritor.MAP";
+        let mut session = crate::headless_scenario::battle_session(
+            map,
+            &[
+                (LaunchCountry::Russia, AiDifficulty::Hard),
+                (LaunchCountry::Russia, AiDifficulty::Hard),
+                (LaunchCountry::Russia, AiDifficulty::Hard),
+                (LaunchCountry::Russia, AiDifficulty::Hard),
+                (LaunchCountry::Russia, AiDifficulty::Hard),
+                (LaunchCountry::Russia, AiDifficulty::Hard),
+            ],
+        );
+        for opponent in &mut session.opponents {
+            opponent.super_tier = Some(SuperAiDifficulty::Unlimited);
+            opponent.team = LaunchTeam::Team(1);
+        }
+        session.options.unit_count = 0;
+        let mut scenario =
+            crate::headless_scenario::load_session(&ra2, map, 0x014B_BC60, session).unwrap();
+
+        let mut drivers: Vec<SuperAi> = scenario
+            .sim()
+            .houses()
+            .iter()
+            .filter(|(_, state)| {
+                state.command_driven() && !state.multiplay_passive() && !state.is_human()
+            })
+            .map(|(&house, state)| {
+                SuperAi::new(house, state.super_tier().unwrap_or(SuperAiDifficulty::Brutal))
+            })
+            .collect();
+        assert!(
+            drivers.len() >= 2,
+            "the launch command-drove {} houses",
+            drivers.len()
+        );
+
+        let mut tally = std::collections::BTreeMap::<String, u32>::new();
+        for tick in 0..1500u32 {
+            let mut orders = Vec::new();
+            for ai in drivers.iter_mut() {
+                orders.extend(ai.orders(&scenario.runtime, tick));
+            }
+            let label = orders.first().map_or_else(
+                || "empty".to_string(),
+                |env| {
+                    format!("{:?}", env.payload)
+                        .split(['{', '('])
+                        .next()
+                        .unwrap_or("payload")
+                        .trim()
+                        .to_string()
+                },
+            );
+            *tally.entry(label).or_insert(0) += 1;
+            scenario
+                .runtime
+                .advance_frame(
+                    &orders,
+                    crate::headless_scenario::SIM_TICK_MS,
+                    crate::sim::world::TickLane::Ordinary,
+                    crate::sim::world::FrameEffects::default(),
+                )
+                .expect("advance");
+        }
+
+        let yard_names: Vec<&str> = OPENINGS.iter().map(|o| o.construction_yard).collect();
+        let mut census = String::new();
+        let mut yards_total = 0usize;
+        for ai in &drivers {
+            let sim = scenario.sim();
+            let rules = &scenario.runtime.resources.rules;
+            // Which deploy gate refuses here: the Event9 slope gate, the
+            // CanDeploySlashUnload tunnel-mouth exclusion, the WeaponsFactory
+            // cell, the engine's own admission, the queued mission, and the
+            // lifted foundation test the conversion runs. One census line
+            // names the refusing gate outright.
+            let gate_probe = ai
+                .deployable_mcv(sim, rules)
+                .and_then(|mcv| {
+                    let entity = sim.substrate.entities.get(mcv)?;
+                    let mcv_cell = (entity.position.rx(), entity.position.ry());
+                    let mut gates = format!(
+                        "mission={:?} navcom={} ",
+                        entity.passive_acquire_mission(),
+                        entity.navigation.nav_com().is_some()
+                    );
+                    gates.push_str(&format!(
+                        "engine_admission={} ",
+                        sim.can_deploy_slash_unload(mcv, rules)
+                    ));
+                    if let Some(terrain) = sim.resolved_terrain.as_ref() {
+                        if !entity.on_bridge() {
+                            let cells =
+                                crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+                            let [x, y] =
+                                crate::sim::movement::ground_pose::position_world_xy(
+                                    &entity.position,
+                                );
+                            let slope_blocked = cells.ground_fields(cells.lookup_world(x, y)).1
+                                == 0
+                                && crate::sim::movement::ground_pose::terrain_projection_differs(
+                                    &cells, [x, y],
+                                );
+                            gates.push_str(&format!("slope_blocked={slope_blocked} "));
+                        } else {
+                            gates.push_str("on_bridge ");
+                        }
+                        gates.push_str(&format!(
+                            "tube={:?} ",
+                            terrain.is_tube_deploy_neighborhood((mcv_cell.0 as i16, mcv_cell.1 as i16))
+                        ));
+                    }
+                    let weapons_factory = sim
+                        .substrate
+                        .occupancy
+                        .first_building_on_layer(
+                            mcv_cell.0,
+                            mcv_cell.1,
+                            crate::sim::movement::locomotor::MovementLayer::Ground,
+                        )
+                        .and_then(|building| sim.substrate.entities.get(building))
+                        .and_then(|building| sim.object_type(building.type_ref(), rules))
+                        .is_some_and(|kind| kind.weapons_factory);
+                    gates.push_str(&format!("weapons_factory={weapons_factory} "));
+                    // The lifted foundation test the conversion itself runs
+                    // (`Deploy @ 0x00739422`): the same call the strategy's
+                    // clear-check makes.
+                    let yard_ty = rules
+                        .object(sim.interner.resolve(entity.type_ref()))
+                        .and_then(|ty| ty.deploys_into.as_deref())
+                        .and_then(|name| rules.object(name));
+                    let clear = yard_ty.is_some_and(|yard_ty| {
+                        let lifted = crate::sim::build_site::LiftedUnit::read(sim, mcv);
+                        crate::sim::build_site::can_place_building_at(
+                            sim,
+                            rules,
+                            Some(&scenario.runtime.resources.overlay_registry),
+                            yard_ty,
+                            (mcv_cell.0 as i16 - 1, mcv_cell.1 as i16 - 1),
+                            None,
+                            None,
+                            Some(&lifted),
+                        )
+                    });
+                    gates.push_str(&format!("clear={clear}"));
+                    Some(gates)
+                })
+                .unwrap_or_else(|| "no-mcv ".to_string());
+            let yards = scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == ai.house
+                        && entity.category() == EntityCategory::Structure
+                        && yard_names.contains(&scenario.sim().interner.resolve(entity.type_ref()))
+                })
+                .count();
+            let structures = scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == ai.house && entity.category() == EntityCategory::Structure
+                })
+                .count();
+            let units = scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == ai.house && entity.category() == EntityCategory::Unit
+                })
+                .count();
+            yards_total += yards;
+            census.push_str(&format!(
+                "{}: yards={yards} structures={structures} units={units} mcv={:?} [{gate_probe}]\n",
+                scenario.sim().interner.resolve(ai.house),
+                ai.deployable_mcv(scenario.sim(), &scenario.runtime.resources.rules),
+            ));
+        }
+        assert!(
+            yards_total >= drivers.len(),
+            "every MAX house stood its yard\ncensus:\n{census}tally={tally:?}"
+        );
     }
 
     /// The growth slice: past the fixed ladder the base keeps expanding and

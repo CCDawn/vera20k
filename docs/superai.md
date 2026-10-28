@@ -5,7 +5,7 @@ This branch group (`superai/*`) is a fork-only feature line: a command-layer
 **超级AI / Super AI**; the in-game rows stay English (`Super AI`,
 `Super AI MAX`) because the retail font carries no CJK glyphs. It tracks
 upstream `YuriPlanet/vera20k` `main` and keeps its footprint outside
-`src/sim/` (three documented exceptions, below). Licensed GPL like the rest of
+`src/sim/` (four documented exceptions, below). Licensed GPL like the rest of
 the tree.
 
 ## Positioning
@@ -69,6 +69,20 @@ dispatch stopped mid-flight — it then overflew its destination, left the
 map, and (mission still Approach with a live target, so the off-map
 removal predicate answers no) walked on toward the corner; the stalled
 mission dispatch is an open engine thread the guards make harmless.
+
+The fourth exception is the DoList admission the second one rides: a
+command-driven house issues player-style events, but `Execute_DoList`
+(`0x0064C4FB..0x0064C50D`, `HouseState::event_dispatch_eligible`) admits a
+house only when it is human or player-controlled. Native never queues
+player events for a computer house, so the refusal changed no
+native-reachable state — but on this fork it left every Super-AI order
+admitted and recorded yet never dispatched: whole matches where six MAX
+houses each logged six `DeployMcv` and nothing else, the MCVs never
+twitching (the frozen-opening replay and the headless XTerritor regression
+test `unlimited_team_houses_open_without_starting_units` reproduce it down
+to the entity ids). The fix admits `command_driven` houses alongside human
+ones; the launch-flag, the DoList widening and this test are one exception
+surface.
 
 ## In-game selection and the command-driven house
 
