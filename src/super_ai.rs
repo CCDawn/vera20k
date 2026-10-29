@@ -1797,8 +1797,14 @@ impl SuperAi {
             } else {
                 None
             };
+            // A fresh alarm (a building hit inside the window) holds the
+            // next wave home; the stance's mop-up hold alone must not — on
+            // a crowded big map the focus stays latched nearly forever and
+            // the offense never sailed again (observed live: a besieged
+            // Yuri base that stopped attacking for good). The defenders
+            // already committed keep fighting either way.
             if !self.wave_launching
-                && self.defense_focus.is_none()
+                && !alarm_armed
                 && tick >= self.next_wave_tick
                 && standing.len() >= ATTACK_WAVE_SIZE
                 && (!enemy_targets.is_empty() || enemy_center.is_some())
@@ -3127,7 +3133,16 @@ impl SuperAi {
                         expansion,
                         BASE_CLUSTER_RADIUS,
                     );
+                    // The house-wide bound is the loop breaker: a cluster
+                    // item whose expansion ring refuses every site falls
+                    // back home at placement, the cluster count near the
+                    // expansion stays at zero, and without a cap the rule
+                    // re-queues the same building forever (observed live:
+                    // a Yuri base that did nothing but chain barracks).
+                    // Two stands: the ladder's home barracks plus one more
+                    // wherever this rule's item landed; a razed one rebuilds.
                     if cluster_barracks < 1
+                        && self.count_structures_of_type(sim, opening.barracks) < 2
                         && let Some(ty) = rules.object(opening.barracks)
                         && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
                             .enabled
