@@ -233,8 +233,10 @@ const ROLE_SHARE_BOOST: usize = 3;
 
 /// Retail's air-capable combat types the mix reacts to — the engine
 /// files them under infantry or vehicle categories, not aircraft:
-/// Rocketeer, Kirov, Harrier, Black Hawk, Hind, Floating Disk.
-const AIR_THREAT_TYPES: [&str; 6] = ["JUMPJET", "ZEP", "ORCA", "SHAD", "HIND", "DISK"];
+/// Rocketeer, Kirov, Harrier, Black Hawk, Hind, Floating Disk — plus the
+/// Black Eagle (Layer 3: the jet is the one air threat the list lacked, so
+/// a Korean wing never lifted the anti-air answer).
+const AIR_THREAT_TYPES: [&str; 7] = ["JUMPJET", "ZEP", "ORCA", "SHAD", "HIND", "DISK", "BEAG"];
 
 /// Ticks a superweapon launch attempt waits before trying again. The
 /// engine refuses a second storm while one runs and the dominator
@@ -372,6 +374,123 @@ const SPREAD_OFFSETS: [(i8, i8); 16] = [
     (-8, -4),
     (8, -4),
 ];
+
+// ---- Layer 3: combat & unit management ----
+//
+// The combat layer's own knobs: the futility backoff the repeated-order
+// sites share, the hero's and raiders' pacing, the boarding retry budget,
+// the siege standoff range, and the retail type tables the specialist
+// branches read.
+
+/// Futility strikes before an order kind goes into backoff for an entity:
+/// three paced re-orders of the same kind with the entity (or its aim) still
+/// on the same cell mean the order class is stuck — the post is blocked, the
+/// dark cell unreachable, the boarding refused — and repeating it is waste.
+const FUTILITY_STRIKES: u32 = 3;
+
+/// Ticks an order kind stays suppressed for an entity after
+/// [`FUTILITY_STRIKES`]: long enough to outlast the churn windows it bounds
+/// (the 150-tick guard repost, the 300-tick wave episode), short enough that
+/// a cleared wedge retries within a minute of game time.
+const FUTILITY_BACKOFF_TICKS: u32 = 1200;
+
+/// Boarding: Enter attempts a (unit, fortress) pair gets while the Enter
+/// stays refused (the unit never lands) before the unit returns to the wave
+/// pool instead of walking into the refusal forever.
+const BOARD_MAX_ATTEMPTS: u32 = 2;
+
+/// Ticks between raider windows (the Terror Drone's harvester hunt, Crazy
+/// Ivan's bomb run, the Floating Disk's power raid). One raid order per
+/// window; the reservation list keeps the raider out of the generic wave
+/// while the raid is live.
+const RAIDER_RETRY_TICKS: u32 = 300;
+
+/// Ticks between deploy-mechanic windows: the scan for a holding deployable
+/// is cheap but pointless per tick, and the toggle is once-per-unit anyway.
+const DEPLOY_MECH_TICKS: u32 = 150;
+
+/// How many dark cells nearest the scout get the zone-connection check: the
+/// scan effort stays capped even on a map whose every near candidate is
+/// across a breach.
+const SCOUT_ZONE_CANDIDATES: usize = 16;
+
+/// How many scouts may be on the march at once when the side's scout is its
+/// core soldier (Yuri's Initiate): every scout walking is one fewer home
+/// defender, so the cap holds the defense line (the dedicated two-dog scout
+/// of the other sides needs no cap — it is the whole quota).
+const SCOUT_MAX_ACTIVE: usize = 2;
+
+/// Siege standoff: the cells short of the target a siege-role wave unit
+/// holds at, spread across the range by the dispatch, instead of walking
+/// into the target's defenses.
+const SIEGE_STANDOFF_MIN: i32 = 10;
+const SIEGE_STANDOFF_MAX: i32 = 12;
+
+/// How many top enemy priority targets the air flight fans across: a flight
+/// of four drops its bombs over four structures instead of stacking on the
+/// substrate's first.
+const AIR_FAN_TARGETS: usize = 4;
+
+/// The enemy economy units the Terror Drone hunts, by retail section name.
+const ENEMY_MINER_TYPES: [&str; 3] = ["HARV", "CMIN", "SMIN"];
+
+/// Enemy power plants the Floating Disk raids first (the blinding cut).
+const ENEMY_POWER_TYPES: [&str; 3] = ["GAPOWR", "NAPOWR", "YAPOWR"];
+
+/// Enemy refineries the Floating Disk raids when no plant stands.
+const ENEMY_REFINERY_TYPES: [&str; 3] = ["GAREFN", "NAREFN", "YAREFN"];
+
+/// Neutral tech buildings the spy runs at (the stock YR
+/// `NeutralTechBuildings` list: airfield, hospital, oil derrick, outpost,
+/// machine shop, service pad).
+const TECH_BUILDING_TYPES: [&str; 6] =
+    ["CAAIRP", "CATHOSP", "CAOILD", "CAOUTP", "CAMACH", "CAPOWR"];
+
+/// The Allied infiltrator: commissioned once, behind the battle lab, and
+/// walked at the nearest revealed neutral tech building. Countries whose
+/// cameo refuses the type simply never commission one (`can_build` gate).
+const SPY_TYPE: &str = "SPY";
+
+/// The retail MCVs — the vehicles the Iron Curtain must never center on
+/// (the substrate's first vehicle was all too often the expansion MCV).
+const MCV_TYPES: [&str; 3] = ["AMCV", "SMCV", "PCV"];
+
+/// The raider specialists by retail name: the Terror Drone, Crazy Ivan and
+/// the Floating Disk.
+const RAIDER_DRONE: &str = "DRON";
+const RAIDER_IVAN: &str = "IVAN";
+const RAIDER_DISK: &str = "DISK";
+
+/// The order kinds the futility backoff tracks. One kind per entity at a
+/// time: a different kind (or a moved aim) restarts the streak.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FutilityKind {
+    /// The home guard-post re-issue (the 150-tick churn).
+    GuardPost,
+    /// The wave episode's attack-move dispatch.
+    Wave,
+    /// The scout's march at one dark cell (the aim is the tracked cell).
+    Scout,
+    /// The fortress boarding Enter.
+    Board,
+    /// The raiders' hunt orders.
+    Raid,
+    /// The hero's sabotage run.
+    HeroC4,
+    /// The spy's infiltration run.
+    Spy,
+}
+
+/// One entity's futility-backoff state: the last order kind and aim cell it
+/// was recorded against, the strike streak, and the tick the current
+/// suppression lifts (`0` — never suppressed).
+#[derive(Clone, Copy, Debug)]
+struct FutilityState {
+    kind: FutilityKind,
+    cell: (u16, u16),
+    strikes: u32,
+    suppress_until: u32,
+}
 
 /// The ladder the Super AI plays at.
 ///
@@ -949,6 +1068,42 @@ pub struct SuperAi {
     /// Earliest tick the repair limb's next survey may run; see
     /// [`REPAIR_SURVEY_TICKS`]. Pinned state, never read from the runtime.
     repair_due: u32,
+    // ---- Layer 3: combat & unit management state ----
+    /// The futility backoff, per entity: see [`FutilityState`]. The shared
+    /// helper behind the repeated-order sites this layer owns (guard
+    /// re-posts, wave dispatch, scout dispatch, boarding, raids, the hero's
+    /// sabotage run, the spy's run). Pinned state, never read from the
+    /// runtime.
+    futility: std::collections::HashMap<u64, FutilityState>,
+    /// Infantry reserved for the fortress's cargo: excluded from the wave
+    /// pool while their boarding is pending, released after
+    /// [`BOARD_MAX_ATTEMPTS`] refused Enters or once they ride in limbo.
+    /// Pinned state, never read from the runtime.
+    boarders: Vec<u64>,
+    /// Enter attempts per (unit, fortress) pair: see [`BOARD_MAX_ATTEMPTS`].
+    /// Pinned state, never read from the runtime.
+    board_attempts: std::collections::HashMap<(u64, u64), u32>,
+    /// Raiders with a live raid (Terror Drone, Crazy Ivan, Floating Disk):
+    /// excluded from the generic wave pool until their order completes.
+    /// Pinned state, never read from the runtime.
+    raiders: Vec<u64>,
+    /// The tick the next raider window may issue at; see
+    /// [`RAIDER_RETRY_TICKS`]. Pinned state, never read from the runtime.
+    raid_due: u32,
+    /// Units the deploy mechanic already toggled: the sim deploy is a
+    /// toggle, so a re-issue would undeploy. Pinned state, never read from
+    /// the runtime.
+    deploy_issued: std::collections::HashSet<u64>,
+    /// The tick the next deploy-mechanic window may scan at; see
+    /// [`DEPLOY_MECH_TICKS`]. Pinned state, never read from the runtime.
+    deploy_due: u32,
+    /// Dark cells the scouting chain has struck out: cells some scout was
+    /// paced at repeatedly without them ever revealing. Pinned state, never
+    /// read from the runtime.
+    scout_blacklist: std::collections::HashSet<(u16, u16)>,
+    /// Whether the spy's single commission has issued; the quota is one per
+    /// game. Pinned state, never read from the runtime.
+    spy_issued: bool,
 }
 
 impl SuperAi {
@@ -995,6 +1150,15 @@ impl SuperAi {
             placement_intent: None,
             repairing_structure: None,
             repair_due: 0,
+            futility: std::collections::HashMap::new(),
+            boarders: Vec::new(),
+            board_attempts: std::collections::HashMap::new(),
+            raiders: Vec::new(),
+            raid_due: 0,
+            deploy_issued: std::collections::HashSet::new(),
+            deploy_due: 0,
+            scout_blacklist: std::collections::HashSet::new(),
+            spy_issued: false,
         }
     }
 
@@ -1604,21 +1768,46 @@ impl SuperAi {
                 // instead of marching to the water's edge.
                 let mut dispatch: Option<(u64, (u16, u16))> = None;
                 if standing.len() > GUARD_RESERVE {
+                    // The candidates collect first: the `launched` filter's
+                    // borrow must end before the loop body's futility
+                    // records (pinned state mutation inside the loop).
                     for unit in standing
                         .iter()
                         .copied()
                         .filter(|unit| !self.launched.contains(unit))
+                        .collect::<Vec<_>>()
                     {
                         let Some(entity) = sim.substrate.entities.get(unit) else {
                             continue;
                         };
+                        // Layer 3: the hero never rides the generic wave (his
+                        // own branch owns him), reserved boarders and raiders
+                        // are off the pool while their orders run, and the
+                        // fortress stays home while its seats are open and
+                        // boarding is in progress.
+                        let type_name = sim.interner.resolve(entity.type_ref());
+                        if type_name == opening.hero
+                            || self.boarders.contains(&unit)
+                            || self.raiders.contains(&unit)
+                        {
+                            continue;
+                        }
+                        if Some(type_name) == opening.fortress
+                            && !self.boarders.is_empty()
+                            && entity
+                                .passenger_role
+                                .cargo()
+                                .is_some_and(|cargo| cargo.count() < cargo.capacity())
+                        {
+                            continue;
+                        }
                         let from = (entity.position.rx(), entity.position.ry());
                         let movement_zone = rules
-                            .object(sim.interner.resolve(entity.type_ref()))
+                            .object(type_name)
                             .map(|ty| ty.movement_zone)
                             .unwrap_or_default();
-                        let destination = if enemy_targets.is_empty() {
-                            enemy_center.and_then(|center| {
+                        let raw = if enemy_targets.is_empty() {
+                            enemy_center.and_then(|aim| {
                                 (0..SPREAD_OFFSETS.len())
                                     .map(|index| {
                                         (unit as usize + index) % SPREAD_OFFSETS.len()
@@ -1628,10 +1817,10 @@ impl SuperAi {
                                         let cell = on_map_cell(
                                             sim,
                                             (
-                                                center.0 + i16::from(spread.0),
-                                                center.1 + i16::from(spread.1),
+                                                aim.0 + i16::from(spread.0),
+                                                aim.1 + i16::from(spread.1),
                                             ),
-                                            center,
+                                            aim,
                                         );
                                         zones_connected(sim, movement_zone, from, cell)
                                             .then_some(cell)
@@ -1647,10 +1836,33 @@ impl SuperAi {
                                     zones_connected(sim, movement_zone, from, cell).then_some(cell)
                                 })
                         };
-                        if let Some(cell) = destination {
-                            dispatch = Some((unit, cell));
-                            break;
+                        // Layer 3: siege-role units bombard from standoff —
+                        // the destination pulls back to a cell short of the
+                        // aim along the home line instead of the aim cell
+                        // itself (the old walk-in died one V3 at a time in
+                        // the target's defense ring).
+                        let siege = opening
+                            .vehicles
+                            .iter()
+                            .any(|entry| entry.role == Role::Siege && entry.name == type_name);
+                        let destination = match raw {
+                            Some(cell) if siege => {
+                                siege_standoff_cell(sim, center, cell, from, movement_zone)
+                            }
+                            other => other,
+                        };
+                        let Some(cell) = destination else {
+                            continue;
+                        };
+                        // Layer 3: the futility backoff — a unit whose wave
+                        // dispatch keeps landing on the same standing cell
+                        // (a dropped order, an aim the ground refuses) stops
+                        // spending the episode's order on it for a while.
+                        if self.futile(unit, FutilityKind::Wave, from, tick) {
+                            continue;
                         }
+                        dispatch = Some((unit, cell));
+                        break;
                     }
                 }
                 if let Some((unit, (rx, ry))) = dispatch {
@@ -1673,7 +1885,250 @@ impl SuperAi {
                 self.wave_launching = false;
                 self.next_wave_tick = tick + WAVE_RETRY_TICKS;
             }
-            if let Some(unit) = self.due_idle_unit(&idle, tick) {
+            // Layer 3: the hero's own small branch — the wave dispatch no
+            // longer takes him (filtered above), so what remains is his own
+            // pacing. A `C4=` carrier (Tanya) sabotage-runs the first
+            // reachable enemy structure in the wave's priority order (its
+            // factories lead); the rifle heroes (Boris, Yuri Prime — their
+            // weapons auto-fire) simply hold a home-defense post like any
+            // defender. The engine's MiG flare support for Boris rides its
+            // own thread and stays out of scope.
+            let hero_pick = sim.substrate.entities.iter_sorted().find(|(id, entity)| {
+                self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                    && entity.owner() == self.house
+                    && !entity.lifecycle.in_limbo()
+                    && sim.interner.resolve(entity.type_ref()) == opening.hero
+                    && matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    )
+            });
+            if let Some((hero, hero_entity)) = hero_pick {
+                let from = (hero_entity.position.rx(), hero_entity.position.ry());
+                let c4_carrier = rules.object(opening.hero).is_some_and(|ty| ty.c4);
+                let c4_target = if c4_carrier {
+                    enemy_targets.iter().copied().find(|&(_, cell)| {
+                        zones_connected(
+                            sim,
+                            crate::rules::locomotor_type::MovementZone::Normal,
+                            from,
+                            (cell.0.max(0) as u16, cell.1.max(0) as u16),
+                        )
+                    })
+                } else {
+                    None
+                };
+                if let Some((target, _)) = c4_target {
+                    if !self.futile(hero, FutilityKind::HeroC4, from, tick) {
+                        self.gate_idle_order(hero, tick);
+                        return vec![CommandEnvelope::new(
+                            self.house,
+                            at,
+                            Command::PlantC4 {
+                                attacker_id: hero,
+                                target_building_id: target,
+                            },
+                        )];
+                    }
+                } else if matches!(
+                    hero_entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None | crate::sim::mission::MissionType::Sleep
+                ) && !self.futile(hero, FutilityKind::GuardPost, from, tick)
+                    && let Some((px, py)) =
+                        connected_ring_cell(sim, rules, center, from, hero, opening.hero)
+                {
+                    self.gate_idle_order(hero, tick);
+                    return vec![CommandEnvelope::new(
+                        self.house,
+                        at,
+                        Command::Guard {
+                            entity_id: hero,
+                            target: Some(crate::sim::combat::TargetKind::Cell(px, py)),
+                        },
+                    )];
+                }
+            }
+
+            // Layer 3: the raiders. Three paced specialists leave the
+            // generic wave pool while their raid is live (the reservation
+            // list above the wave filter) and run their own orders: the
+            // Terror Drone hunts the enemy's economy (the nearest harvester's
+            // cell), Crazy Ivan bombs a reachable enemy structure (his
+            // Attack IS the bomb-attach), and the Floating Disk raids power
+            // plants and refineries instead of marching with the tanks it
+            // outflies.
+            if tick >= self.raid_due {
+                let mut raid: Option<(u64, Command)> = None;
+                for (id, entity) in sim.substrate.entities.iter_sorted() {
+                    if entity.owner() != self.house
+                        || entity.lifecycle.in_limbo()
+                        || !matches!(
+                            entity.category(),
+                            crate::map::entities::EntityCategory::Unit
+                                | crate::map::entities::EntityCategory::Infantry
+                        )
+                        || !matches!(
+                            entity.passive_acquire_mission(),
+                            crate::sim::mission::MissionType::None
+                                | crate::sim::mission::MissionType::Sleep
+                                | crate::sim::mission::MissionType::Guard
+                                | crate::sim::mission::MissionType::AreaGuard
+                        )
+                        || self.order_gate.get(&id).is_some_and(|&due| tick < due)
+                        || self.raiders.contains(&id)
+                    {
+                        continue;
+                    }
+                    let type_name = sim.interner.resolve(entity.type_ref());
+                    let from = (entity.position.rx(), entity.position.ry());
+                    if type_name == RAIDER_DRONE
+                        && let Some((cell, _)) = self.nearest_enemy_harvester(sim, from)
+                        && zones_connected(
+                            sim,
+                            crate::rules::locomotor_type::MovementZone::Normal,
+                            from,
+                            cell,
+                        )
+                        && !self.futile(id, FutilityKind::Raid, from, tick)
+                    {
+                        raid = Some((id, Command::AttackMove {
+                            entity_id: id,
+                            target: None,
+                            destination: Some(crate::sim::combat::TargetKind::Cell(
+                                cell.0, cell.1,
+                            )),
+                        }));
+                        break;
+                    }
+                    if type_name == RAIDER_IVAN
+                        && let Some((target, _)) = enemy_targets.iter().copied().find(
+                            |&(_, cell)| {
+                                zones_connected(
+                                    sim,
+                                    crate::rules::locomotor_type::MovementZone::Normal,
+                                    from,
+                                    (cell.0.max(0) as u16, cell.1.max(0) as u16),
+                                )
+                            },
+                        )
+                        && !self.futile(id, FutilityKind::Raid, from, tick)
+                    {
+                        raid = Some((id, Command::Attack {
+                            attacker_id: id,
+                            target_id: target,
+                        }));
+                        break;
+                    }
+                    if type_name == RAIDER_DISK
+                        && let Some((_, cell)) = self.disc_raid_target(sim)
+                        && !self.futile(id, FutilityKind::Raid, from, tick)
+                    {
+                        raid = Some((id, Command::AttackMove {
+                            entity_id: id,
+                            target: None,
+                            destination: Some(crate::sim::combat::TargetKind::Cell(
+                                cell.0.max(0) as u16,
+                                cell.1.max(0) as u16,
+                            )),
+                        }));
+                        break;
+                    }
+                }
+                if let Some((id, command)) = raid {
+                    self.raiders.push(id);
+                    self.gate_idle_order(id, tick);
+                    self.raid_due = tick + RAIDER_RETRY_TICKS;
+                    return vec![CommandEnvelope::new(self.house, at, command)];
+                }
+            }
+
+            // Layer 3: the deploy mechanic. Deploy-fire infantry (Guardian
+            // GI, Desolator) and the Siege Chopper hold their Deploy toggle
+            // all game otherwise — the order exists, the AI never sent it.
+            // A unit holding an idle-class post gets its toggle once per
+            // game (the sim deploy is a toggle: a re-issue would undeploy),
+            // the infantry near home, the simple-deployer chopper out in
+            // the field where its siege mode matters.
+            if tick >= self.deploy_due {
+                self.deploy_due = tick + DEPLOY_MECH_TICKS;
+                self.deploy_issued.retain(|&id| {
+                    sim.substrate.entities.get(id).is_some_and(|entity| {
+                        entity.owner() == self.house && entity.lifecycle.object_alive()
+                    })
+                });
+                let pick = sim.substrate.entities.iter_sorted().find(|(id, entity)| {
+                    entity.owner() == self.house
+                        && entity.lifecycle.object_alive()
+                        && !entity.lifecycle.in_limbo()
+                        && matches!(
+                            entity.category(),
+                            crate::map::entities::EntityCategory::Unit
+                                | crate::map::entities::EntityCategory::Infantry
+                        )
+                        && !self.deploy_issued.contains(id)
+                        && !self.boarders.contains(id)
+                        && !self.raiders.contains(id)
+                        && sim.interner.resolve(entity.type_ref()) != opening.hero
+                        && matches!(
+                            entity.passive_acquire_mission(),
+                            crate::sim::mission::MissionType::None
+                                | crate::sim::mission::MissionType::Sleep
+                                | crate::sim::mission::MissionType::Guard
+                                | crate::sim::mission::MissionType::AreaGuard
+                        )
+                        && !entity.is_deployed()
+                        && {
+                            let type_name = sim.interner.resolve(entity.type_ref());
+                            let distance = (i32::from(entity.position.rx() as i16)
+                                - i32::from(center.0))
+                                .abs()
+                                .max(
+                                    (i32::from(entity.position.ry() as i16)
+                                        - i32::from(center.1))
+                                    .abs(),
+                                );
+                            match entity.category() {
+                                crate::map::entities::EntityCategory::Infantry => {
+                                    distance <= i32::from(BASE_DEFENSE_RADIUS)
+                                        && rules.object(type_name).is_some_and(|ty| {
+                                            ty.deployer && ty.undeploy_delay <= 0
+                                        })
+                                }
+                                _ => {
+                                    distance > i32::from(BASE_DEFENSE_RADIUS)
+                                        && rules
+                                            .object(type_name)
+                                            .is_some_and(|ty| ty.is_simple_deployer)
+                                }
+                            }
+                        }
+                });
+                if let Some((id, entity)) = pick {
+                    let infantry =
+                        entity.category() == crate::map::entities::EntityCategory::Infantry;
+                    self.deploy_issued.insert(id);
+                    return vec![CommandEnvelope::new(
+                        self.house,
+                        at,
+                        if infantry {
+                            Command::ToggleInfantryDeploy { entity_id: id }
+                        } else {
+                            Command::DeployMcv { entity_id: id }
+                        },
+                    )];
+                }
+            }
+
+            // Layer-3 futility gate folded into the Layer-2 post split: a
+            // unit whose identical post order keeps landing unmoved stops
+            // spending its reorder windows on it for a while.
+            let poster = self
+                .due_idle_unit(&idle, tick)
+                .filter(|&unit| !self.futility_suppressed(unit, FutilityKind::GuardPost, tick));
+            if let Some(unit) = poster {
                 // Spread the guard posts on a ring around the yard by unit
                 // id: defenders hold neighboring cells instead of stacking
                 // on the yard itself. Clamped onto the map for the same
@@ -1705,8 +2160,18 @@ impl SuperAi {
                 } else {
                     home_post
                 };
+                // The retry paces whatever the outcome: a dropped post order
+                // must wait its window, not re-pick per tick (the futility
+                // strikes count windows, not ticks).
                 self.gate_idle_order(unit, tick);
-                if let Some((px, py)) = post {
+                if let (Some((px, py)), Some(entity)) = (post, sim.substrate.entities.get(unit))
+                    && !self.futile(
+                        unit,
+                        FutilityKind::GuardPost,
+                        (entity.position.rx(), entity.position.ry()),
+                        tick,
+                    )
+                {
                     return vec![CommandEnvelope::new(
                         self.house,
                         at,
@@ -1719,116 +2184,195 @@ impl SuperAi {
             }
         }
 
-        // The air wing's sortie. Idle jets sit parked on their pads — a
-        // jet's bombs matter only aimed at the enemy — so when the cooldown
-        // clears, every idle aircraft attacks the top enemy priority target
-        // as one flight; the cooldown then holds while they fly, return,
-        // land and rearm the native way. The wing rides its own aircraft
-        // queue (the Airforce Command), never the ground wave's slots.
-        if tick >= self.next_airstrike_tick
-            && let Some(&(target, _)) = self.enemy_priority_targets(sim).first()
-        {
-            let flight: Vec<u64> = sim
-                .substrate
-                .entities
-                .iter_sorted()
-                .filter(|(_, entity)| {
-                    entity.owner() == self.house
-                        && entity.category() == crate::map::entities::EntityCategory::Aircraft
-                        && matches!(
-                            entity.passive_acquire_mission(),
-                            crate::sim::mission::MissionType::None
-                                | crate::sim::mission::MissionType::Sleep
-                        )
-                })
-                .map(|(id, _)| id)
+        // The air wing's sortie — Layer 3. The old flight filter read only
+        // None|Sleep missions, but the airfield reload releases a rearmed
+        // jet with Assign_Mission(Guard) and a computer house's armed jets
+        // idle-pick AreaGuard — so each jet sortied about once and then sat
+        // full-ammo forever (ORCA/BEAG are CanPassiveAquire=no: nothing
+        // self-fires them). The flight now reads the same idle classes the
+        // ground pools accept, orders only jets that actually hold ordnance
+        // (a dry count of exactly zero waits at its pad for the reload),
+        // and fans the flight across the first few enemy priority targets
+        // by jet id instead of stacking every bomb on the substrate's
+        // first. The wing commission's dock gate (the radar class standing)
+        // already keeps replacements out of an AirportBound crash loop.
+        if tick >= self.next_airstrike_tick {
+            let targets: Vec<u64> = self
+                .enemy_priority_targets(sim)
+                .iter()
+                .take(AIR_FAN_TARGETS)
+                .map(|&(id, _)| id)
                 .collect();
-            if !flight.is_empty() {
-                self.next_airstrike_tick = tick + AIRSTRIKE_RETRY_TICKS;
-                return flight
-                    .into_iter()
-                    .map(|jet| {
-                        CommandEnvelope::new(
-                            self.house,
-                            at,
-                            Command::Attack {
-                                attacker_id: jet,
-                                target_id: target,
-                            },
-                        )
+            if !targets.is_empty() {
+                let flight: Vec<u64> = sim
+                    .substrate
+                    .entities
+                    .iter_sorted()
+                    .filter(|(_, entity)| {
+                        entity.owner() == self.house
+                            && entity.category() == crate::map::entities::EntityCategory::Aircraft
+                            && matches!(
+                                entity.passive_acquire_mission(),
+                                crate::sim::mission::MissionType::None
+                                    | crate::sim::mission::MissionType::Sleep
+                                    | crate::sim::mission::MissionType::Guard
+                                    | crate::sim::mission::MissionType::AreaGuard
+                            )
+                            && entity.ammo().is_none_or(|ammo| ammo.current() != 0)
                     })
+                    .map(|(id, _)| id)
                     .collect();
+                if !flight.is_empty() {
+                    self.next_airstrike_tick = tick + AIRSTRIKE_RETRY_TICKS;
+                    return flight
+                        .into_iter()
+                        .map(|jet| {
+                            CommandEnvelope::new(
+                                self.house,
+                                at,
+                                Command::Attack {
+                                    attacker_id: jet,
+                                    target_id: targets[(jet as usize) % targets.len()],
+                                },
+                            )
+                        })
+                        .collect();
+                }
             }
         }
 
-        // The fortress's boarding call. The Battle Fortress is the one
-        // roster entry the wave system never claims: neither it nor the
-        // infantry it wants sit in the core-type sets, so both idle at
-        // home. The pairing boards the roster's anti-armor infantry (the
-        // Guardian GI's deployed launcher is the classic loadout) into the
-        // first fortress with a free seat — the same Enter click a player
-        // makes, one boarding call per tick, the passenger's order gate
-        // pacing the walk.
-        if let (Some(fortress_name), Some(cargo_name)) = (
-            opening.fortress,
-            opening
-                .infantry
-                .iter()
-                .find(|entry| entry.role == Role::AntiArmor)
-                .map(|entry| entry.name),
-        ) && let Some((fortress_id, fortress_entity)) =
-            sim.substrate.entities.iter_sorted().find(|(_, entity)| {
-                entity.owner() == self.house
-                    && entity.category() == crate::map::entities::EntityCategory::Unit
-                    && sim.interner.resolve(entity.type_ref()) == fortress_name
-                    && entity
-                        .passenger_role
-                        .cargo()
-                        .is_some_and(|cargo| cargo.count() < cargo.capacity())
-            })
+        // The fortress's boarding call — Layer 3. The cargo is reserved (a
+        // boarding candidate is off the wave pool through the `boarders`
+        // list), the load mixes (anti-armor first, then anti-infantry, up
+        // to the seats free), and a refused Enter gets at most
+        // [`BOARD_MAX_ATTEMPTS`] tries per (unit, fortress) pair before the
+        // unit returns to the wave pool — the old loop re-picked the same
+        // first anti-armor type every 150 ticks forever, both against the
+        // wave dispatch that kept eating its candidates and against the
+        // fortress's own refusal.
         {
-            let fort_cell = (
-                fortress_entity.position.rx() as i16,
-                fortress_entity.position.ry() as i16,
-            );
-            // The nearest due idle cargo, ties by the substrate's stable
-            // order; a passenger already carried rides in limbo and never
-            // re-boards.
-            let mut boarding: Option<(u32, u64)> = None;
-            for (id, entity) in sim.substrate.entities.iter_sorted() {
-                let dx = entity.position.rx() as i16 - fort_cell.0;
-                let dy = entity.position.ry() as i16 - fort_cell.1;
-                if self.order_gate.get(&id).is_none_or(|&due| tick >= due)
-                    && entity.owner() == self.house
-                    && entity.category() == crate::map::entities::EntityCategory::Infantry
-                    && sim.interner.resolve(entity.type_ref()) == cargo_name
-                    && !entity.lifecycle.in_limbo()
-                    && matches!(
-                        entity.passive_acquire_mission(),
-                        crate::sim::mission::MissionType::None
-                            | crate::sim::mission::MissionType::Sleep
-                            | crate::sim::mission::MissionType::Guard
-                            | crate::sim::mission::MissionType::AreaGuard
-                    )
+            // Reservation hygiene: dead or boarded boarders (passengers
+            // ride in limbo) leave the set.
+            self.boarders.retain(|&id| {
+                sim.substrate.entities.get(id).is_some_and(|entity| {
+                    entity.owner() == self.house
+                        && entity.lifecycle.object_alive()
+                        && !entity.lifecycle.in_limbo()
+                })
+            });
+            self.board_attempts
+                .retain(|&(unit, _), _| self.boarders.contains(&unit));
+            // A boarder whose Enters were refused twice and who stands idle
+            // again (unlanded) returns to the pool.
+            let mut pool_back: Vec<u64> = Vec::new();
+            for (&(unit, _), &attempts) in self.board_attempts.iter() {
+                if attempts >= BOARD_MAX_ATTEMPTS
+                    && self.boarders.contains(&unit)
+                    && sim.substrate.entities.get(unit).is_some_and(|entity| {
+                        matches!(
+                            entity.passive_acquire_mission(),
+                            crate::sim::mission::MissionType::None
+                                | crate::sim::mission::MissionType::Sleep
+                                | crate::sim::mission::MissionType::Guard
+                                | crate::sim::mission::MissionType::AreaGuard
+                        )
+                    })
                 {
-                    let distance =
-                        (i32::from(dx) * i32::from(dx) + i32::from(dy) * i32::from(dy)) as u32;
-                    if boarding.is_none_or(|(kept, _)| distance < kept) {
-                        boarding = Some((distance, id));
-                    }
+                    pool_back.push(unit);
                 }
             }
-            if let Some((_, boarder)) = boarding {
-                self.gate_idle_order(boarder, tick);
-                return vec![CommandEnvelope::new(
-                    self.house,
-                    at,
-                    Command::clicked_mission(
-                        boarder,
-                        crate::sim::mission::MissionType::Enter,
-                        crate::sim::combat::TargetKind::Entity(fortress_id),
-                    ),
-                )];
+            for unit in pool_back {
+                self.boarders.retain(|&kept| kept != unit);
+                self.board_attempts
+                    .retain(|&(kept, _), _| kept != unit);
+            }
+            let cargo_names = Self::boarding_cargo(opening);
+            if let Some(fortress_name) = opening.fortress
+                && !cargo_names.is_empty()
+                && let Some((fortress_id, fortress_entity)) =
+                    sim.substrate.entities.iter_sorted().find(|(_, entity)| {
+                        entity.owner() == self.house
+                            && entity.category() == crate::map::entities::EntityCategory::Unit
+                            && sim.interner.resolve(entity.type_ref()) == fortress_name
+                            && entity
+                                .passenger_role
+                                .cargo()
+                                .is_some_and(|cargo| cargo.count() < cargo.capacity())
+                    })
+            {
+                let fort_cell = (
+                    fortress_entity.position.rx() as i16,
+                    fortress_entity.position.ry() as i16,
+                );
+                // The next boarder: the cargo mix's best candidate — anti-
+                // armor outranks anti-infantry, then nearest wins — among
+                // the idle, ungated infantry on foot. The hero never boards,
+                // and a pair past its attempt budget waits for the pool-back
+                // pass above.
+                let mut boarding: Option<(usize, u32, u64)> = None;
+                for (id, entity) in sim.substrate.entities.iter_sorted() {
+                    let type_name = sim.interner.resolve(entity.type_ref());
+                    let Some(rank) = cargo_names.iter().position(|name| *name == type_name)
+                    else {
+                        continue;
+                    };
+                    if entity.owner() != self.house
+                        || entity.category() != crate::map::entities::EntityCategory::Infantry
+                        || entity.lifecycle.in_limbo()
+                        || type_name == opening.hero
+                        || self.order_gate.get(&id).is_some_and(|&due| tick < due)
+                        || self
+                            .board_attempts
+                            .get(&(id, fortress_id))
+                            .copied()
+                            .unwrap_or(0)
+                            >= BOARD_MAX_ATTEMPTS
+                        || !matches!(
+                            entity.passive_acquire_mission(),
+                            crate::sim::mission::MissionType::None
+                                | crate::sim::mission::MissionType::Sleep
+                                | crate::sim::mission::MissionType::Guard
+                                | crate::sim::mission::MissionType::AreaGuard
+                        )
+                    {
+                        continue;
+                    }
+                    let dx = entity.position.rx() as i16 - fort_cell.0;
+                    let dy = entity.position.ry() as i16 - fort_cell.1;
+                    let distance =
+                        (i32::from(dx) * i32::from(dx) + i32::from(dy) * i32::from(dy)) as u32;
+                    if boarding.is_none_or(|(kept_rank, kept_distance, _)| {
+                        (rank, distance) < (kept_rank, kept_distance)
+                    }) {
+                        boarding = Some((rank, distance, id));
+                    }
+                }
+                if let Some((_, _, boarder)) = boarding {
+                    let boarder_from = sim
+                        .substrate
+                        .entities
+                        .get(boarder)
+                        .map(|entity| (entity.position.rx(), entity.position.ry()));
+                    if let Some(from) = boarder_from
+                        && !self.futile(boarder, FutilityKind::Board, from, tick)
+                    {
+                        self.boarders.push(boarder);
+                        *self
+                            .board_attempts
+                            .entry((boarder, fortress_id))
+                            .or_insert(0) += 1;
+                        self.gate_idle_order(boarder, tick);
+                        return vec![CommandEnvelope::new(
+                            self.house,
+                            at,
+                            Command::clicked_mission(
+                                boarder,
+                                crate::sim::mission::MissionType::Enter,
+                                crate::sim::combat::TargetKind::Entity(fortress_id),
+                            ),
+                        )];
+                    }
+                }
             }
         }
 
@@ -1975,19 +2519,89 @@ impl SuperAi {
             }
         }
 
-        // The scouting chain's dispatch. Retail never lifts its own shroud
-        // (its dogs sit posted as base guards), so the fork walks its own:
-        // an idle, ungated scout marches to the nearest cell the house has
-        // never revealed. The march reveals on the way (sight joins the
-        // house as it moves) and arrival posts it there until the next due
-        // window re-points it into what is still dark. The dispatch sits
-        // below the combat branches: production and defense own the busy
-        // ticks, the dogs take the spare ones.
-        let mut idle_scouts = sim.substrate.entities.iter_sorted().filter(|(id, entity)| {
+        // The scouting chain's dispatch — Layer 3. The march at the
+        // Euclidean-nearest dark cell used to stall forever: a cell the
+        // ground rows cannot connect to (a cliff pocket, the far shore of a
+        // breach) re-ordered the same dead Move every idle window. The pick
+        // now zone-gates the nearest handful of candidates in the scout's
+        // rotation, the futility backoff strikes out a cell that was paced
+        // at repeatedly without ever revealing (it joins the blacklist and
+        // the next-nearest takes the walk), and a side whose scout is its
+        // core soldier (Yuri's Initiate) keeps at most two scouts on the
+        // march so the home defense keeps its line.
+        let scout_is_core = opening.scout == opening.basic_infantry;
+        let scouts_out = if scout_is_core {
+            sim.substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == self.house
+                        && entity.category() == crate::map::entities::EntityCategory::Infantry
+                        && sim.interner.resolve(entity.type_ref()) == opening.scout
+                        && !entity.lifecycle.in_limbo()
+                        && entity.passive_acquire_mission()
+                            == crate::sim::mission::MissionType::Move
+                })
+                .count()
+        } else {
+            0
+        };
+        if scouts_out < SCOUT_MAX_ACTIVE {
+            let mut idle_scouts = sim.substrate.entities.iter_sorted().filter(|(id, entity)| {
+                self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                    && entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Infantry
+                    && sim.interner.resolve(entity.type_ref()) == opening.scout
+                    && !entity.lifecycle.in_limbo()
+                    && matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    )
+            });
+            if let Some((scout, entity)) = idle_scouts.next() {
+                let from = (entity.position.rx() as i16, entity.position.ry() as i16);
+                if let Some(cell) =
+                    self.nearest_unrevealed_cell(sim, from, &self.scout_blacklist)
+                {
+                    // The futility aim is the dark cell itself: one scout
+                    // paced at the same unreachable cell three windows
+                    // retires the cell from the rotation, and the next
+                    // idle window walks the next-nearest candidate.
+                    if self.futile(scout, FutilityKind::Scout, cell, tick) {
+                        self.scout_blacklist.insert(cell);
+                    } else {
+                        self.gate_idle_order(scout, tick);
+                        return vec![CommandEnvelope::new(
+                            self.house,
+                            at,
+                            Command::Move {
+                                entity_id: scout,
+                                target_rx: cell.0,
+                                target_ry: cell.1,
+                            },
+                        )];
+                    }
+                }
+            }
+        }
+
+        // The spy's infiltration run — Layer 3. The one commissioned
+        // infiltrator walks at the nearest revealed neutral tech building
+        // with the engine's own capture click (the arrival sorts out what a
+        // spy does there); with nothing revealed to run at, it stays home
+        // like any other garrison piece. The futility backoff bounds the
+        // re-issue loop the same way the scout's march is bounded.
+        if let Some((spy, spy_entity)) = sim.substrate.entities.iter_sorted().find(|(id, entity)| {
             self.order_gate.get(id).is_none_or(|&due| tick >= due)
                 && entity.owner() == self.house
                 && entity.category() == crate::map::entities::EntityCategory::Infantry
-                && sim.interner.resolve(entity.type_ref()) == opening.scout
+                && sim.interner.resolve(entity.type_ref()) == SPY_TYPE
+                && !entity.lifecycle.in_limbo()
+                && !self.boarders.contains(id)
+                && !self.raiders.contains(id)
                 && matches!(
                     entity.passive_acquire_mission(),
                     crate::sim::mission::MissionType::None
@@ -1995,23 +2609,26 @@ impl SuperAi {
                         | crate::sim::mission::MissionType::Guard
                         | crate::sim::mission::MissionType::AreaGuard
                 )
-        });
-        if let Some((scout, entity)) = idle_scouts.next()
-            && let Some(cell) = self.nearest_unrevealed_cell(
-                sim,
-                (entity.position.rx() as i16, entity.position.ry() as i16),
-            )
-        {
-            self.gate_idle_order(scout, tick);
-            return vec![CommandEnvelope::new(
-                self.house,
-                at,
-                Command::Move {
-                    entity_id: scout,
-                    target_rx: cell.0,
-                    target_ry: cell.1,
-                },
-            )];
+        }) {
+            let from = (spy_entity.position.rx() as i16, spy_entity.position.ry() as i16);
+            if let Some(target) = self.nearest_revealed_tech(sim, from)
+                && !self.futile(
+                    spy,
+                    FutilityKind::Spy,
+                    (from.0.max(0) as u16, from.1.max(0) as u16),
+                    tick,
+                )
+            {
+                self.gate_idle_order(spy, tick);
+                return vec![CommandEnvelope::new(
+                    self.house,
+                    at,
+                    Command::CaptureBuilding {
+                        engineer_id: spy,
+                        target_building_id: target,
+                    },
+                )];
+            }
         }
 
         // Walk the build ladder while the building queue idles: the opening's
@@ -2828,6 +3445,18 @@ impl SuperAi {
                 })
             {
                 Some(opening.hero)
+            } else if !self.spy_issued
+                && self.count_structures_of_type(sim, opening.battle_lab) >= 1
+                && rules.object(SPY_TYPE).is_some_and(|ty| {
+                    crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                        == crate::sim::production::CanBuild::Yes
+                })
+            {
+                // Layer 3: the spy — a quota of one, behind the battle lab,
+                // `can_build`-gated so a country that refuses the infiltrator
+                // simply never spends the slot (the same country-lock lesson
+                // as the jet table).
+                Some(SPY_TYPE)
             } else {
                 // The same mix over the infantry roster, the core soldier
                 // keeping the line rolling once every share is met.
@@ -2854,6 +3483,9 @@ impl SuperAi {
         {
             if name == opening.hero {
                 self.hero_issued = true;
+            }
+            if name == SPY_TYPE {
+                self.spy_issued = true;
             }
             self.infantry_slots += 1;
             return vec![CommandEnvelope::new(
@@ -3307,35 +3939,52 @@ impl SuperAi {
 
     /// The fog grid's nearest cell this house has never revealed, ties
     /// broken by row-major scan order (the substrate order's determinism
-    /// discipline). The scouting dispatch walks a dog to this cell; a map
-    /// with no dark cell left answers `None` and the chain rests.
+    /// discipline). Cells in `skip` (the scouting chain's blacklist) stand
+    /// out of the rotation, and only the nearest
+    /// [`SCOUT_ZONE_CANDIDATES`] candidates get the zone-connection check —
+    /// the first the ground rows connect wins; a map whose every near
+    /// candidate is across a breach answers `None` and the chain rests
+    /// instead of marching into the water.
     fn nearest_unrevealed_cell(
         &self,
         sim: &crate::sim::world::Simulation,
         from: (i16, i16),
+        skip: &std::collections::HashSet<(u16, u16)>,
     ) -> Option<(u16, u16)> {
         let fog = &sim.fog;
         let (width, height) = (fog.width(), fog.height());
-        let mut best: Option<(u32, (u16, u16))> = None;
+        let mut candidates: Vec<(u32, (u16, u16))> = Vec::new();
         for ry in 0..height {
             for rx in 0..width {
-                if fog.is_cell_revealed(self.house, rx, ry) {
+                if fog.is_cell_revealed(self.house, rx, ry) || skip.contains(&(rx, ry)) {
                     continue;
                 }
                 let dx = i32::from(rx) - i32::from(from.0);
                 let dy = i32::from(ry) - i32::from(from.1);
                 let distance = (dx * dx + dy * dy) as u32;
-                if best.is_none_or(|(kept, _)| distance < kept) {
-                    best = Some((distance, (rx, ry)));
-                }
+                candidates.push((distance, (rx, ry)));
             }
         }
-        best.map(|(_, cell)| cell)
+        candidates.sort_by_key(|&(distance, _)| distance);
+        candidates
+            .into_iter()
+            .take(SCOUT_ZONE_CANDIDATES)
+            .find(|&(_, cell)| {
+                zones_connected(
+                    sim,
+                    crate::rules::locomotor_type::MovementZone::Normal,
+                    (from.0.max(0) as u16, from.1.max(0) as u16),
+                    cell,
+                )
+            })
+            .map(|(_, cell)| cell)
     }
 
     /// How many combat units of exactly this retail type name stand under
     /// hostile flags — the mix's air-pressure reading counts the enemy's
-    /// aircraft one type at a time.
+    /// aircraft one type at a time. Layer 3 adds the `Aircraft` category to
+    /// the sweep: the old Unit|Infantry pair read zero for a standing jet
+    /// wing, so the anti-air answer never lifted against one.
     fn count_enemy_units_of_type(
         &self,
         sim: &crate::sim::world::Simulation,
@@ -3350,6 +3999,7 @@ impl SuperAi {
                         entity.category(),
                         crate::map::entities::EntityCategory::Unit
                             | crate::map::entities::EntityCategory::Infantry
+                            | crate::map::entities::EntityCategory::Aircraft
                     )
                     && sim.interner.resolve(entity.type_ref()) == type_name
             })
@@ -3480,20 +4130,55 @@ impl SuperAi {
     /// Where a charged superweapon lands. The Iron Curtain is the one
     /// friendly special — its invulnerability goes on this house's own
     /// armor (organic infantry under the curtain take damage instead), so
-    /// it centers the first standing vehicle. The storm and the dominator
-    /// strike the enemy where it hurts most: their war factories if any
-    /// stand, else any structure, else the hostile mass center.
+    /// Layer 3 centers the front-most own combat vehicle: the ground mobile
+    /// nearest the enemy mass center, skipping the MCVs, the miner fleet
+    /// (and, pointless on infantry, the engineer) — the old substrate-first
+    /// pick all too often curtained the expansion MCV standing at home.
+    /// The storm and the dominator strike the enemy where it hurts most:
+    /// their war factories if any stand, else any structure, else the
+    /// hostile ground-mass center (ground-only — a jet's flight path is
+    /// not an aim point).
     fn superweapon_target(
         &self,
         sim: &crate::sim::world::Simulation,
         opening: &Opening,
     ) -> Option<(u16, u16)> {
         if opening.super_weapon_targets_self {
-            let vehicle = sim.substrate.entities.iter_sorted().find(|(_, entity)| {
-                entity.owner() == self.house
-                    && entity.category() == crate::map::entities::EntityCategory::Unit
-            })?;
-            return Some((vehicle.1.position.rx(), vehicle.1.position.ry()));
+            let anchor = self
+                .enemy_center(sim)
+                .map(|center| (center.0.max(0) as u16, center.1.max(0) as u16))
+                .or_else(|| {
+                    self.structure_center(sim, opening.construction_yard)
+                        .map(|center| (center.0.max(0) as u16, center.1.max(0) as u16))
+                });
+            let mut best: Option<(i64, (u16, u16))> = None;
+            for (_, entity) in sim.substrate.entities.iter_sorted() {
+                if entity.owner() != self.house
+                    || entity.category() != crate::map::entities::EntityCategory::Unit
+                    || entity.lifecycle.in_limbo()
+                {
+                    continue;
+                }
+                let name = sim.interner.resolve(entity.type_ref());
+                if MCV_TYPES.contains(&name) || ENEMY_MINER_TYPES.contains(&name) {
+                    continue;
+                }
+                let cell = (entity.position.rx(), entity.position.ry());
+                let distance = match anchor {
+                    Some((ax, ay)) => {
+                        let dx = i32::from(cell.0) - i32::from(ax);
+                        let dy = i32::from(cell.1) - i32::from(ay);
+                        i64::from(dx * dx + dy * dy)
+                    }
+                    // No enemy ground mobiles to front against: the
+                    // substrate's stable first pick still beats nothing.
+                    None => 0,
+                };
+                if best.is_none_or(|(kept, _)| distance < kept) {
+                    best = Some((distance, cell));
+                }
+            }
+            return best.map(|(_, cell)| cell);
         }
         let cell = self
             .enemy_priority_targets(sim)
@@ -3574,10 +4259,187 @@ impl SuperAi {
         self.order_gate.retain(|_, &mut at| at > tick);
     }
 
+    // ---- Layer 3: combat & unit management helpers ----
+
+    /// The futility backoff's read side: whether this order kind is
+    /// currently suppressed for the entity. Picking loops use it to step
+    /// past a backed-off unit instead of letting it eat the branch's whole
+    /// window.
+    fn futility_suppressed(&self, unit: u64, kind: FutilityKind, tick: u32) -> bool {
+        self.futility
+            .get(&unit)
+            .is_some_and(|state| state.kind == kind && tick < state.suppress_until)
+    }
+
+    /// The futility backoff's record side. `cell` is the entity's own cell
+    /// for post/wave/raid/hero orders, the aim cell for the scout's march.
+    /// A repeat of the same kind with the same cell on a paced re-order
+    /// window builds a strike streak; at [`FUTILITY_STRIKES`] the kind goes
+    /// into backoff for [`FUTILITY_BACKOFF_TICKS`] (and the caller skips the
+    /// order). A different kind or a moved aim restarts the streak; an
+    /// expired backoff re-arms with a fresh one. Returns whether the caller
+    /// must skip the order this tick.
+    fn futile(&mut self, unit: u64, kind: FutilityKind, cell: (u16, u16), tick: u32) -> bool {
+        let fresh = FutilityState {
+            kind,
+            cell,
+            strikes: 1,
+            suppress_until: 0,
+        };
+        let Some(state) = self.futility.get_mut(&unit) else {
+            self.futility.insert(unit, fresh);
+            return false;
+        };
+        if state.kind != kind || state.cell != cell {
+            *state = fresh;
+            return false;
+        }
+        if tick < state.suppress_until {
+            return true;
+        }
+        if state.suppress_until != 0 {
+            // The backoff expired: re-arm with a fresh streak.
+            *state = fresh;
+            return false;
+        }
+        state.strikes += 1;
+        if state.strikes >= FUTILITY_STRIKES {
+            state.suppress_until = tick + FUTILITY_BACKOFF_TICKS;
+            return true;
+        }
+        false
+    }
+
+    /// The fortress's cargo mix in boarding preference order: the roster's
+    /// anti-armor infantry first (the Guardian GI's deployed launcher is
+    /// the classic loadout), then the anti-infantry entries. The hero never
+    /// boards — the pick filters him out by name.
+    fn boarding_cargo(opening: &Opening) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        for role in [Role::AntiArmor, Role::AntiInfantry] {
+            names.extend(
+                opening
+                    .infantry
+                    .iter()
+                    .filter(|entry| entry.role == role)
+                    .map(|entry| entry.name),
+            );
+        }
+        names
+    }
+
+    /// The nearest enemy economy unit (a harvester on the move between the
+    /// enemy's refineries and its fields), with its cell — the Terror
+    /// Drone's hunt target.
+    fn nearest_enemy_harvester(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        from: (u16, u16),
+    ) -> Option<((u16, u16), u64)> {
+        let mut best: Option<(u32, u64, (u16, u16))> = None;
+        for (id, entity) in sim.substrate.entities.iter_sorted() {
+            if entity.lifecycle.in_limbo()
+                || entity.category() != crate::map::entities::EntityCategory::Unit
+                || !self.is_enemy(sim, entity.owner())
+                || !ENEMY_MINER_TYPES.contains(&sim.interner.resolve(entity.type_ref()))
+            {
+                continue;
+            }
+            let cell = (entity.position.rx(), entity.position.ry());
+            let dx = i32::from(cell.0) - i32::from(from.0);
+            let dy = i32::from(cell.1) - i32::from(from.1);
+            let distance = (dx * dx + dy * dy) as u32;
+            if best.is_none_or(|(kept, _, _)| distance < kept) {
+                best = Some((distance, id, cell));
+            }
+        }
+        best.map(|(_, id, cell)| (cell, id))
+    }
+
+    /// The Floating Disk's raid target: the enemy's first standing power
+    /// plant (the blinding cut), else its first refinery. A live
+    /// structure's own cell, limbo construction excluded.
+    fn disc_raid_target(
+        &self,
+        sim: &crate::sim::world::Simulation,
+    ) -> Option<(u64, (i16, i16))> {
+        sim.substrate
+            .entities
+            .iter_sorted()
+            .find(|(_, entity)| {
+                entity.category() == crate::map::entities::EntityCategory::Structure
+                    && !entity.lifecycle.in_limbo()
+                    && self.is_enemy(sim, entity.owner())
+                    && (ENEMY_POWER_TYPES.contains(&sim.interner.resolve(entity.type_ref()))
+                        || ENEMY_REFINERY_TYPES.contains(&sim.interner.resolve(entity.type_ref())))
+            })
+            .map(|(id, entity)| {
+                (
+                    id,
+                    (entity.position.rx() as i16, entity.position.ry() as i16),
+                )
+            })
+    }
+
+    /// The nearest revealed neutral tech building the spy can run at, with
+    /// the ground rows still connecting it to `from`: a revealed one across
+    /// a breach is a walk the sim nulls, not an infiltration. Neutral means
+    /// a passive house (the scenario's Neutral owner) — allied or hostile
+    /// tech is not the spy's errand.
+    fn nearest_revealed_tech(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        from: (i16, i16),
+    ) -> Option<u64> {
+        let from_cell = (from.0.max(0) as u16, from.1.max(0) as u16);
+        let mut best: Option<(u32, u64)> = None;
+        for (id, entity) in sim.substrate.entities.iter_sorted() {
+            if entity.category() != crate::map::entities::EntityCategory::Structure
+                || entity.lifecycle.in_limbo()
+                || !TECH_BUILDING_TYPES.contains(&sim.interner.resolve(entity.type_ref()))
+            {
+                continue;
+            }
+            let owner = entity.owner();
+            if owner == self.house || self.is_enemy(sim, owner) {
+                continue;
+            }
+            if sim
+                .houses
+                .get(&owner)
+                .is_none_or(|house| !house.multiplay_passive())
+            {
+                continue;
+            }
+            let (rx, ry) = (entity.position.rx(), entity.position.ry());
+            if !sim.fog.is_cell_revealed(self.house, rx, ry)
+                || !zones_connected(
+                    sim,
+                    crate::rules::locomotor_type::MovementZone::Normal,
+                    from_cell,
+                    (rx, ry),
+                )
+            {
+                continue;
+            }
+            let dx = i32::from(rx) - i32::from(from.0);
+            let dy = i32::from(ry) - i32::from(from.1);
+            let distance = (dx * dx + dy * dy) as u32;
+            if best.is_none_or(|(kept, _)| distance < kept) {
+                best = Some((distance, id));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
     /// The house's combat units free to take a march order, in the
     /// substrate's stable order: idle units plus the ones holding their
     /// guard post — an attack-move simply replaces that post. Units already
-    /// marching or engaging a target are not re-pointed.
+    /// marching or engaging a target are not re-pointed. Layer 3 keeps the
+    /// hero out (his own branch owns him), the reserved boarders and
+    /// raiders out (their orders run separately), and the fortress out
+    /// while its seats are open and boarding is in progress — the loading
+    /// infantry have to reach it first.
     fn standing_combat_units(
         &self,
         sim: &crate::sim::world::Simulation,
@@ -3587,7 +4449,7 @@ impl SuperAi {
         sim.substrate
             .entities
             .iter_sorted()
-            .filter(|(_, entity)| {
+            .filter(|(id, entity)| {
                 entity.owner() == self.house
                     && matches!(
                         entity.category(),
@@ -3595,6 +4457,15 @@ impl SuperAi {
                             | crate::map::entities::EntityCategory::Infantry
                     )
                     && roster.contains(&sim.interner.resolve(entity.type_ref()))
+                    && sim.interner.resolve(entity.type_ref()) != opening.hero
+                    && !self.boarders.contains(id)
+                    && !self.raiders.contains(id)
+                    && !(Some(sim.interner.resolve(entity.type_ref())) == opening.fortress
+                        && !self.boarders.is_empty()
+                        && entity
+                            .passenger_role
+                            .cargo()
+                            .is_some_and(|cargo| cargo.count() < cargo.capacity()))
                     && matches!(
                         entity.passive_acquire_mission(),
                         crate::sim::mission::MissionType::None
@@ -3695,31 +4566,32 @@ impl SuperAi {
     }
 
     /// The hostile mass center for the endgame fallback, when no hostile
-    /// building stands: the centroid of their mobile forces. Sums over the
+    /// building stands: the centroid of their ground mobiles. Sums over the
     /// entity set, so the result does not depend on iteration order. Limbo
     /// entities sit at (0,0) by native semantics and would drag the centroid
-    /// off-map, so constructor-held units stay out.
+    /// off-map, so constructor-held units stay out — and Layer 3 keeps the
+    /// aircraft out too: a flight path is not an aim point, and the old
+    /// whole-mobiles centroid pulled the superweapon aim and the endgame
+    /// wave toward wherever the jets happened to circle.
     fn enemy_center(&self, sim: &crate::sim::world::Simulation) -> Option<(i16, i16)> {
-        let centroid = |want_structure: bool| -> Option<(i16, i16)> {
-            let mut sum_x = 0i64;
-            let mut sum_y = 0i64;
-            let mut count = 0u64;
-            for (_, entity) in sim.substrate.entities.iter_sorted() {
-                let is_structure =
-                    entity.category() == crate::map::entities::EntityCategory::Structure;
-                if is_structure != want_structure
-                    || entity.lifecycle.in_limbo()
-                    || !self.is_enemy(sim, entity.owner())
-                {
-                    continue;
-                }
-                sum_x += i64::from(entity.position.rx());
-                sum_y += i64::from(entity.position.ry());
-                count += 1;
+        let mut sum_x = 0i64;
+        let mut sum_y = 0i64;
+        let mut count = 0u64;
+        for (_, entity) in sim.substrate.entities.iter_sorted() {
+            if !matches!(
+                entity.category(),
+                crate::map::entities::EntityCategory::Unit
+                    | crate::map::entities::EntityCategory::Infantry
+            ) || entity.lifecycle.in_limbo()
+                || !self.is_enemy(sim, entity.owner())
+            {
+                continue;
             }
-            (count > 0).then(|| ((sum_x / count as i64) as i16, (sum_y / count as i64) as i16))
-        };
-        centroid(false)
+            sum_x += i64::from(entity.position.rx());
+            sum_y += i64::from(entity.position.ry());
+            count += 1;
+        }
+        (count > 0).then(|| ((sum_x / count as i64) as i16, (sum_y / count as i64) as i16))
     }
 
     /// The anchor cell the site search scans around: the construction yard's,
@@ -3931,6 +4803,75 @@ fn zones_connected(
         (Some(from_zone), Some(to_zone)) => from_zone == to_zone,
         _ => true,
     }
+}
+
+/// The first zone-connected spread cell on the ring around `center` for
+/// `unit`'s rotation — the guard-post pick the defense posts and the hero's
+/// home post share. An offset that lands off-map is clamped; an offset the
+/// ground rows do not connect to the unit's own cell is passed over (a post
+/// across a breach is not a post).
+fn connected_ring_cell(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    center: (i16, i16),
+    from: (u16, u16),
+    unit: u64,
+    type_name: &str,
+) -> Option<(u16, u16)> {
+    let movement_zone = rules
+        .object(type_name)
+        .map(|ty| ty.movement_zone)
+        .unwrap_or_default();
+    (0..SPREAD_OFFSETS.len())
+        .map(|index| (unit as usize + index) % SPREAD_OFFSETS.len())
+        .find_map(|index| {
+            let spread = SPREAD_OFFSETS[index];
+            let cell = on_map_cell(
+                sim,
+                (
+                    center.0 + i16::from(spread.0),
+                    center.1 + i16::from(spread.1),
+                ),
+                center,
+            );
+            zones_connected(sim, movement_zone, from, cell).then_some(cell)
+        })
+}
+
+/// The siege-role wave unit's standoff destination: a cell 10–12 cells short
+/// of `target` along the home line (spread across the range by the unit's
+/// rotation, so several siege units do not stack on one post), clamped onto
+/// the map and zone-gated from the unit's own cell — a bombardment post the
+/// walker cannot reach is not a post. A target already within pull-back
+/// range of home answers `None` (no room to stand off: the caller keeps the
+/// plain aim path's verdict — here, skipping the unit).
+fn siege_standoff_cell(
+    sim: &crate::sim::world::Simulation,
+    home: (i16, i16),
+    target: (u16, u16),
+    from: (u16, u16),
+    movement_zone: crate::rules::locomotor_type::MovementZone,
+) -> Option<(u16, u16)> {
+    let (tx, ty) = (i32::from(target.0), i32::from(target.1));
+    let (dx, dy) = (tx - i32::from(home.0), ty - i32::from(home.1));
+    let distance = dx.abs().max(dy.abs());
+    if distance <= SIEGE_STANDOFF_MIN + 2 {
+        return None;
+    }
+    let mut step = SIEGE_STANDOFF_MAX;
+    while step >= SIEGE_STANDOFF_MIN {
+        let sx = tx - (dx * step) / distance;
+        let sy = ty - (dy * step) / distance;
+        let cell = on_map_cell(sim, (sx as i16, sy as i16), home);
+        // A pull-back clamped all the way onto the home cell is not a post.
+        if (cell.0 as i16, cell.1 as i16) != home
+            && zones_connected(sim, movement_zone, from, cell)
+        {
+            return Some(cell);
+        }
+        step -= 1;
+    }
+    None
 }
 
 /// The first legal placement origin for `ty`, scanning outward from `center`
@@ -6806,5 +7747,451 @@ mod tests {
             distance(first, neighbor_cell) < super::ORE_FIELD_EXCLUSION_RADIUS as u32,
             "setup: the neighbor refinery must contest the first pick (at {neighbor_cell:?})"
         );
+    }
+
+    // ---- Layer 3: combat & unit management ----
+
+    /// The combat layer's fixtures and reads live in a nested module so the
+    /// bridge fixtures above stay shared without re-declaring them.
+    mod combat_layer_tests {
+        use super::*;
+        use super::super::{ATTACK_WAVE_SIZE, BOARD_MAX_ATTEMPTS, FutilityKind, IDLE_REORDER_TICKS, WAVE_RETRY_TICKS};
+
+        use std::collections::BTreeMap;
+
+        /// The futility backoff's own contract, on a bare AI: three same-
+        /// kind orders at the same cell put the kind into backoff, the
+        /// backoff holds, a moved aim restarts the streak, a different kind
+        /// is independent, and an expired backoff re-arms.
+        #[test]
+        fn futility_helper_strikes_suppresses_and_expires() {
+            let (_runtime, house) = runtime();
+            let mut ai = SuperAi::new(house, SuperAiDifficulty::Fair);
+
+            assert!(
+                !ai.futile(1, FutilityKind::GuardPost, (5, 5), 0),
+                "the first order of a streak goes out"
+            );
+            assert!(
+                !ai.futile(1, FutilityKind::GuardPost, (5, 5), IDLE_REORDER_TICKS),
+                "the second repeat goes out"
+            );
+            assert!(
+                ai.futile(1, FutilityKind::GuardPost, (5, 5), 2 * IDLE_REORDER_TICKS),
+                "the third repeat is suppressed"
+            );
+            assert!(
+                ai.futility_suppressed(1, FutilityKind::GuardPost, 1000),
+                "the backoff holds inside its window"
+            );
+            assert!(
+                !ai.futility_suppressed(1, FutilityKind::Wave, 1000),
+                "a different order kind is not suppressed by it"
+            );
+            assert!(
+                !ai.futile(1, FutilityKind::GuardPost, (5, 6), 1499),
+                "a moved aim restarts the streak"
+            );
+            assert!(!ai.futile(1, FutilityKind::GuardPost, (5, 6), 1600));
+            assert!(
+                ai.futile(1, FutilityKind::GuardPost, (5, 6), 1700),
+                "the restarted streak suppresses again at three"
+            );
+            assert!(
+                !ai.futile(1, FutilityKind::GuardPost, (5, 6), 3000),
+                "an expired backoff re-arms the kind"
+            );
+        }
+
+        /// The air wing's rearm cycle: a jet sorties, comes home, the dock
+        /// cycle parks it on a Guard post with fresh ordnance — and the
+        /// next strike window sends it out again (the old None|Sleep-only
+        /// flight filter read a parked Guard jet as busy and the wing sat
+        /// full-ammo forever). Every strike envelope carries a jet that
+        /// actually holds ordnance at issue time.
+        #[test]
+        #[ignore = "slow; retail; loads a match and drives tens of thousands of frames"]
+        fn air_wing_restrikes_after_rearm() {
+            use crate::map::entities::EntityCategory;
+
+            let (mut scenario, human) = retail_battle();
+            let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
+
+            let mut strikes: Vec<(u32, u64)> = Vec::new();
+            // Per jet: the tick it was first seen parked (Guard/AreaGuard,
+            // full ammo) after having flown once.
+            let mut parked_since: BTreeMap<u64, Option<u32>> = BTreeMap::new();
+            let mut restrike = false;
+            let mut tick = 0u32;
+            while tick < 46000 && !restrike {
+                let orders = ai.orders(&scenario.runtime, tick);
+                for envelope in &orders {
+                    if let crate::sim::command::Command::Attack { attacker_id, .. } =
+                        envelope.payload
+                    {
+                        let sim = scenario.sim();
+                        if let Some(entity) = sim.substrate.entities.get(attacker_id)
+                            && entity.owner() == human
+                            && entity.category() == EntityCategory::Aircraft
+                        {
+                            let dry = entity.ammo().is_some_and(|ammo| ammo.current() == 0);
+                            assert!(
+                                !dry,
+                                "only armed jets fly (tick {tick}, jet {attacker_id})"
+                            );
+                            if parked_since
+                                .get(&attacker_id)
+                                .is_some_and(|parked| parked.is_some())
+                            {
+                                restrike = true;
+                            }
+                            strikes.push((tick, attacker_id));
+                        }
+                    }
+                }
+                scenario
+                    .runtime
+                    .advance_frame(
+                        &orders,
+                        crate::headless_scenario::SIM_TICK_MS,
+                        crate::sim::world::TickLane::Ordinary,
+                        crate::sim::world::FrameEffects::default(),
+                    )
+                    .expect("simulation frame failed");
+                // Parked read: a jet that flew before, holding Guard/AreaGuard
+                // with ordnance back.
+                for (id, entity) in scenario.sim().substrate.entities.iter_sorted() {
+                    if entity.owner() != human
+                        || entity.category() != EntityCategory::Aircraft
+                        || !strikes.iter().any(|&(_, jet)| jet == id)
+                    {
+                        continue;
+                    }
+                    let parked = matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    ) && entity.ammo().is_none_or(|ammo| ammo.current() != 0);
+                    let entry = parked_since.entry(id).or_insert(None);
+                    if parked && entry.is_none() {
+                        *entry = Some(tick);
+                    }
+                }
+                tick += 1;
+            }
+            assert!(
+                restrike,
+                "a rearmed jet must fly again: strikes={strikes:?} parked={parked_since:?}"
+            );
+            assert!(
+                strikes.len() >= 2,
+                "the wing flew at least two sorties (saw {})",
+                strikes.len()
+            );
+            assert!(
+                strikes.iter().any(|&(_, jet)| {
+                    parked_since
+                        .get(&jet)
+                        .is_some_and(|parked| parked.is_some())
+                }),
+                "the restriked jet was observed parked between its sorties"
+            );
+        }
+
+        /// The hero stands apart: the gathered wave never takes Tanya (no
+        /// AttackMove envelope may name her), and her own branch sends her
+        /// sabotage run at the reachable enemy structure instead — the
+        /// PlantC4 envelope the engine's C4 path accepts.
+        #[test]
+        #[ignore = "slow; retail; loads a retail map with real terrain zones"]
+        fn wave_spares_hero_and_tanya_plants_c4() {
+            let (mut scenario, ai_house, enemy_house) = pacific_bridge_battle();
+            let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+            scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+            spawn_near(&mut scenario, "GACNST", ai_house, (64, 92));
+            let far = far_shore(&scenario);
+            spawn_near(&mut scenario, "GAPOWR", enemy_house, far);
+            let tany = spawn_near(&mut scenario, "TANY", ai_house, (66, 90));
+            for _ in 0..ATTACK_WAVE_SIZE {
+                spawn_near(&mut scenario, "MTNK", ai_house, (64, 94));
+            }
+            let enemy_structure = scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .find(|(_, entity)| {
+                    entity.owner() == enemy_house
+                        && entity.category() == crate::map::entities::EntityCategory::Structure
+                        && scenario.sim().interner.resolve(entity.type_ref()) == "GAPOWR"
+                })
+                .map(|(id, _)| id)
+                .expect("the hostile structure");
+
+            let mut hero_wave_moves = 0usize;
+            let mut wave_moves = 0usize;
+            let mut plant: Option<(u64, u64)> = None;
+            for tick in 0..3 * WAVE_RETRY_TICKS + 600 {
+                for order in ai.orders(&scenario.runtime, tick) {
+                    match order.payload {
+                        crate::sim::command::Command::AttackMove { entity_id, .. } => {
+                            if entity_id == tany {
+                                hero_wave_moves += 1;
+                            } else {
+                                wave_moves += 1;
+                            }
+                        }
+                        crate::sim::command::Command::PlantC4 {
+                            attacker_id,
+                            target_building_id,
+                        } => {
+                            if attacker_id == tany {
+                                plant = Some((attacker_id, target_building_id));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            assert!(
+                wave_moves > 0,
+                "positive control: the gathered wave marched"
+            );
+            assert_eq!(
+                hero_wave_moves, 0,
+                "the hero never rides the generic wave"
+            );
+            assert_eq!(
+                plant,
+                Some((tany, enemy_structure)),
+                "Tanya's own branch sent her sabotage run"
+            );
+        }
+
+        /// The fortress boards a mix — anti-armor first, then anti-infantry
+        /// — with every boarder reserved out of the wave pool and the
+        /// fortress itself held home while boarding runs; a refused pair
+        /// stops at two Enters instead of retrying forever.
+        #[test]
+        #[ignore = "slow; retail; loads a retail map with real terrain zones"]
+        fn fortress_boards_a_mix_and_stops_retrying() {
+            use crate::sim::mission::MissionType;
+
+            let (mut scenario, ai_house, _enemy) = pacific_bridge_battle();
+            let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+            scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+            spawn_near(&mut scenario, "GACNST", ai_house, (64, 92));
+            let fortress = spawn_near(&mut scenario, "BFRT", ai_house, (66, 92));
+            let ggi = spawn_near(&mut scenario, "GGI", ai_house, (67, 93));
+            let snipe = spawn_near(&mut scenario, "SNIPE", ai_house, (67, 94));
+
+            let opening = ai
+                .opening(scenario.sim())
+                .expect("the Allied opening resolves through the standing yard");
+            let mut enters: BTreeMap<u64, u32> = BTreeMap::new();
+            let mut boarded_reserve_checked = false;
+            for tick in 0..1000u32 {
+                for order in ai.orders(&scenario.runtime, tick) {
+                    if let crate::sim::command::Command::MegaMission {
+                        entity_id,
+                        mission: MissionType::Enter,
+                        ..
+                    } = order.payload
+                    {
+                        *enters.entry(entity_id).or_insert(0) += 1;
+                    }
+                }
+                // While boarding is pending the reserved cargo and the open
+                // fortress stand out of the wave pool.
+                if !ai.boarders.is_empty() && !boarded_reserve_checked {
+                    let standing = ai.standing_combat_units(scenario.sim(), opening);
+                    assert!(
+                        !standing.contains(&fortress),
+                        "the fortress with open seats stays home while boarding runs"
+                    );
+                    assert!(
+                        standing.iter().all(|unit| !ai.boarders.contains(unit)),
+                        "reserved boarders are not wave members"
+                    );
+                    boarded_reserve_checked = true;
+                }
+            }
+            assert!(
+                enters.contains_key(&ggi) && enters.contains_key(&snipe),
+                "both cargo classes got their boarding call: {enters:?}"
+            );
+            assert!(
+                enters.values().all(|&count| count <= BOARD_MAX_ATTEMPTS),
+                "no pair retries past the budget: {enters:?}"
+            );
+            assert_eq!(
+                enters.get(&ggi),
+                Some(&BOARD_MAX_ATTEMPTS),
+                "the anti-armor cargo boarded first and stopped at its budget"
+            );
+        }
+
+        /// Siege-role units bombard from standoff: the wave's destination
+        /// for a V3 is a cell short of the target along the home line, not
+        /// the target cell the rest of the wave walks into.
+        #[test]
+        #[ignore = "slow; retail; loads a retail map with real terrain zones"]
+        fn siege_units_hold_standoff() {
+            use crate::sim::combat::TargetKind;
+
+            let (mut scenario, ai_house, enemy_house) = pacific_bridge_battle();
+            let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+            scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+            spawn_near(&mut scenario, "NACNST", ai_house, (64, 92));
+            let far = far_shore(&scenario);
+            spawn_near(&mut scenario, "GAPOWR", enemy_house, far);
+            let v3 = spawn_near(&mut scenario, "V3", ai_house, (66, 92));
+            for _ in 0..ATTACK_WAVE_SIZE {
+                spawn_near(&mut scenario, "HTNK", ai_house, (64, 94));
+            }
+            let target_cell = far_target_cell(&scenario);
+
+            let mut v3_destinations: Vec<(u16, u16)> = Vec::new();
+            let mut tank_destinations: Vec<(u16, u16)> = Vec::new();
+            for tick in 0..3 * WAVE_RETRY_TICKS {
+                for order in ai.orders(&scenario.runtime, tick) {
+                    if let crate::sim::command::Command::AttackMove {
+                        entity_id,
+                        destination: Some(TargetKind::Cell(rx, ry)),
+                        ..
+                    } = order.payload
+                    {
+                        if entity_id == v3 {
+                            v3_destinations.push((rx, ry));
+                        } else {
+                            tank_destinations.push((rx, ry));
+                        }
+                    }
+                }
+            }
+            assert!(
+                !tank_destinations.is_empty(),
+                "positive control: the wave marched on the target"
+            );
+            assert!(
+                tank_destinations
+                    .iter()
+                    .any(|&cell| cell == target_cell),
+                "the line units walk all the way in: {tank_destinations:?}"
+            );
+            assert!(
+                !v3_destinations.is_empty(),
+                "the siege unit joined the wave"
+            );
+            for &cell in &v3_destinations {
+                let distance = chebyshev(cell, target_cell);
+                assert_ne!(cell, target_cell, "the V3 never aims the target cell");
+                assert!(
+                    (9..=12).contains(&distance),
+                    "the V3 holds 10-12 cells short of the target (saw {distance} at {cell:?})"
+                );
+            }
+        }
+
+        /// The Terror Drone hunts the enemy's economy: with a harvester on
+        /// the map the drone's own order is the march at its cell, and the
+        /// drone stands reserved out of the generic wave while the raid is
+        /// live.
+        #[test]
+        #[ignore = "slow; retail; loads a retail map with real terrain zones"]
+        fn drones_hunt_harvesters() {
+            use crate::sim::combat::TargetKind;
+
+            let (mut scenario, ai_house, enemy_house) = pacific_bridge_battle();
+            let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+            scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+            spawn_near(&mut scenario, "NACNST", ai_house, (64, 92));
+            let drone = spawn_near(&mut scenario, "DRON", ai_house, (64, 94));
+            let harv_cell = {
+                let id = spawn_near(&mut scenario, "HARV", enemy_house, (60, 90));
+                let entity = scenario
+                    .sim()
+                    .substrate
+                    .entities
+                    .get(id)
+                    .expect("the enemy harvester");
+                (entity.position.rx(), entity.position.ry())
+            };
+
+            let mut drone_moves: Vec<(u16, u16)> = Vec::new();
+            for tick in 0..2 * WAVE_RETRY_TICKS {
+                for order in ai.orders(&scenario.runtime, tick) {
+                    if let crate::sim::command::Command::AttackMove {
+                        entity_id,
+                        destination: Some(TargetKind::Cell(rx, ry)),
+                        ..
+                    } = order.payload
+                        && entity_id == drone
+                    {
+                        drone_moves.push((rx, ry));
+                    }
+                }
+            }
+            assert!(
+                !drone_moves.is_empty(),
+                "the drone took its hunt order"
+            );
+            assert!(
+                drone_moves.iter().any(|&cell| cell == harv_cell),
+                "the drone marches at the harvester's cell: {drone_moves:?} vs {harv_cell:?}"
+            );
+            assert!(
+                ai.raiders.contains(&drone),
+                "the hunting drone is reserved out of the wave pool"
+            );
+            let opening = ai
+                .opening(scenario.sim())
+                .expect("the Soviet opening resolves through the standing yard");
+            assert!(
+                !ai.standing_combat_units(scenario.sim(), opening).contains(&drone),
+                "a live raid keeps the drone out of the wave pool"
+            );
+        }
+
+        /// The guard posts stop churning: with no intruder and no frames,
+        /// the same idle unit is re-picked every reorder window — and the
+        /// futility backoff stops the third identical Guard for a unit that
+        /// has not moved.
+        #[test]
+        #[ignore = "slow; retail; loads a retail map with real terrain zones"]
+        fn guard_posts_stop_churning() {
+            let (mut scenario, ai_house, _enemy) = pacific_bridge_battle();
+            let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+            scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+            spawn_near(&mut scenario, "GACNST", ai_house, (64, 92));
+            for _ in 0..4 {
+                spawn_near(&mut scenario, "MTNK", ai_house, (64, 94));
+            }
+
+            let mut guards: BTreeMap<u64, u32> = BTreeMap::new();
+            // Nine reorder windows: the third identical post would land near
+            // the third window and its backoff runs 1200 ticks — the whole
+            // drive stays inside the suppressed span.
+            for tick in 0..9 * IDLE_REORDER_TICKS {
+                for order in ai.orders(&scenario.runtime, tick) {
+                    if let crate::sim::command::Command::Guard { entity_id, .. } = order.payload {
+                        *guards.entry(entity_id).or_insert(0) += 1;
+                    }
+                }
+            }
+            assert!(
+                guards.values().any(|&count| count > 0),
+                "positive control: the units took their posts: {guards:?}"
+            );
+            assert!(
+                guards.values().all(|&count| count <= 2),
+                "a standing unit stops at two identical Guard posts (futility): {guards:?}"
+            );
+        }
     }
 }
