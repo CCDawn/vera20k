@@ -33,6 +33,8 @@ fn detonation(world: &mut Simulation, warhead: &str, projectile_id: u64) -> Proj
         impact: ProjectileCoord::new(2688, 2688, 0),
         payload,
         reason: ProjectileDetonationReason::DeathWeapon,
+
+        firing_occupant: None,
     }
 }
 

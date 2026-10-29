@@ -2246,6 +2246,8 @@ fn gsi_04_07_damage_fatal_transport_lifecycle_brackets_nested_death_weapon() {
                 false,
             ),
             reason: crate::sim::projectile::ProjectileDetonationReason::ReachedTarget,
+
+            firing_occupant: None,
         };
         let result = sim.tick_combat_with_fatal_lifecycle(
             &rules,
@@ -2451,6 +2453,8 @@ fn gsi_04_11_bullet_ore_reduction_precedes_outer_crater_anim_start() {
             false,
         ),
         reason: crate::sim::projectile::ProjectileDetonationReason::ReachedTarget,
+
+        firing_occupant: None,
     };
 
     let result = sim.tick_combat_with_fatal_lifecycle(

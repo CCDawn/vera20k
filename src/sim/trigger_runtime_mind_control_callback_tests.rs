@@ -51,6 +51,8 @@ fn projectile_to(
             tracks_target: false,
             target_expiry: TargetExpiryPolicy::Expire,
             collision: ProjectileCollisionPolicy::NONE,
+
+            firing_occupant: None,
         },
     );
     ProjectileDetonation {
@@ -60,6 +62,8 @@ fn projectile_to(
         impact,
         payload,
         reason: ProjectileDetonationReason::ReachedTarget,
+
+        firing_occupant: None,
     }
 }
 

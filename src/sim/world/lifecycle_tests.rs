@@ -5487,6 +5487,8 @@ pub(super) fn gsi_05_02_projectile(source_id: u64, fuse_frames: Option<u16>) -> 
         tracks_target: false,
         target_expiry: TargetExpiryPolicy::Expire,
         collision: ProjectileCollisionPolicy::NONE,
+
+        firing_occupant: None,
     }
 }
 
@@ -6592,6 +6594,8 @@ fn gsi_05_04_combat_fatal_expiry_keeps_authoritative_cell_target() {
         impact: ProjectileCoord::new(5 * 256 + 128, 6 * 256 + 128, 0),
         payload: ProjectilePayload::new(10, sim.interner.intern("KILLWH"), None, false),
         reason: crate::sim::projectile::ProjectileDetonationReason::ReachedTarget,
+
+        firing_occupant: None,
     };
     let logic_order = sim.live_object_order_snapshot();
 
@@ -6725,6 +6729,8 @@ fn gsi_05_04_combat_fatal_garrison_recursion_keeps_cell_target() {
         impact: ProjectileCoord::new(8 * 256 + 128, 8 * 256 + 128, 0),
         payload: ProjectilePayload::new(10, sim.interner.intern("KILLWH"), None, false),
         reason: crate::sim::projectile::ProjectileDetonationReason::ReachedTarget,
+
+        firing_occupant: None,
     };
     let logic_order = sim.live_object_order_snapshot();
 

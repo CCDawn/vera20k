@@ -662,6 +662,8 @@ fn compare_native_smashing_tail(retired: bool, typed: bool) {
                 tracks_target: false,
                 target_expiry: TargetExpiryPolicy::DetonateAtLastKnown,
                 collision: ProjectileCollisionPolicy::NONE,
+
+                firing_occupant: None,
             },
         );
         // The corpus starts with a supplied already-admitted Inviso Bullet
@@ -694,6 +696,8 @@ fn compare_native_smashing_tail(retired: bool, typed: bool) {
                     } else {
                         ProjectileDetonationReason::ReachedTarget
                     },
+
+                    firing_occupant: None,
                 }],
                 &rules,
                 None,

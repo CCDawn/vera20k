@@ -582,6 +582,8 @@ impl Simulation {
                     impact: crate::sim::projectile::ProjectileCoord::new(coords.x, coords.y, z),
                     payload: bullet.payload(),
                     reason: crate::sim::projectile::ProjectileDetonationReason::DeathWeapon,
+
+                    firing_occupant: None,
                 };
                 bridge_state_changed |= self.commit_logic_projectile_detonations(
                     rules,

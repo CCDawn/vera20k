@@ -1330,6 +1330,8 @@ mod receiver {
                     impact: coordinate(&f["impact"]),
                     payload: bullet.payload(),
                     reason: crate::sim::projectile::ProjectileDetonationReason::ReachedTarget,
+
+                    firing_occupant: None,
                 };
                 let distance = match target {
                     crate::sim::projectile::ProjectileTarget::Entity(id) => {

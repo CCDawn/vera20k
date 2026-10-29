@@ -1956,6 +1956,8 @@ fn gsi_04_10_projectile_inert_suppresses_bridge_ore_and_collector_rng() {
         impact: ProjectileCoord::new(8 * 256 + 128, 5 * 256 + 128, 0),
         payload: payload_from_weapon(100, warhead, weapon, &rules, &mut interner),
         reason: ProjectileDetonationReason::ReachedTarget,
+
+        firing_occupant: None,
     };
     let mut entities = EntityStore::new();
     let mut scenario_rng = SimRng::new(77);
@@ -2569,6 +2571,8 @@ fn gsi_04_07_damage_prior_projectile_fatal_death_weapon_is_inline() {
                 &mut interner,
             ),
             reason: ProjectileDetonationReason::ReachedTarget,
+
+            firing_occupant: None,
         };
         let mut scenario_rng = SimRng::new(1);
         let mut main_rng = SimRng::new(41);
@@ -2892,6 +2896,8 @@ fn retaliates(case: RetaliationCase) -> bool {
         impact: ProjectileCoord::new(i32::from(victim_rx) * 256 + 128, 5 * 256 + 128, 0),
         payload: payload_from_weapon(10, incoming_wh, incoming_weapon, &rules, &mut interner),
         reason: ProjectileDetonationReason::ReachedTarget,
+
+        firing_occupant: None,
     };
     let mut houses = crate::sim::houses::Houses::default();
     houses.register(HouseState::new(victim_owner, 0, None, case.human, 0, 10));
@@ -3357,6 +3363,8 @@ fn gsi_04_07_damage_retaliation_is_receiver_synchronous_and_uses_mission_overrid
             impact: ProjectileCoord::new(8 * 256 + 128, 5 * 256 + 128, 0),
             payload: payload_from_weapon(10, incoming_wh, incoming_weapon, &rules, &mut interner),
             reason: ProjectileDetonationReason::ReachedTarget,
+
+            firing_occupant: None,
         };
         let mut alliances = HouseAllianceMap::new();
         if allied {
@@ -4266,6 +4274,8 @@ fn gsi_04_07_damage_repair_bullet_cellspread_zero_keeps_signed_area_record() {
             &mut interner,
         ),
         reason: ProjectileDetonationReason::ReachedTarget,
+
+        firing_occupant: None,
     };
     let emitted = emit_detonations(
         &[detonation],
@@ -7249,6 +7259,8 @@ fn a_death_weapon_over_water_picks_its_anim_at_the_zero_location() {
             &mut interner,
         ),
         reason: crate::sim::projectile::ProjectileDetonationReason::ReachedTarget,
+
+        firing_occupant: None,
     };
     let handles =
         crate::sim::type_handle_table::ResolvedRuleHandles::resolve(&rules, &mut interner);
@@ -9293,6 +9305,8 @@ fn campaign_reverse_only_alliance_keeps_shrapnel_hostile_head_before_random_cell
             &mut interner,
         ),
         reason: crate::sim::projectile::ProjectileDetonationReason::ReachedTarget,
+
+        firing_occupant: None,
     };
     let mut scenario_rng = SimRng::new(0x46_a310);
     let mut expected_rng = scenario_rng.clone();
@@ -9375,6 +9389,8 @@ fn projectile_shrapnel_count_measures_to_the_firers_get_coords() {
             &mut interner,
         ),
         reason: crate::sim::projectile::ProjectileDetonationReason::ReachedTarget,
+
+        firing_occupant: None,
     };
     align_attackers_to_targets(&mut entities);
     let result = tick_detonations(
@@ -9434,6 +9450,8 @@ fn projectile_shrapnel_aims_at_a_building_foundation_center() {
             &mut interner,
         ),
         reason: crate::sim::projectile::ProjectileDetonationReason::ReachedTarget,
+
+        firing_occupant: None,
     };
     align_attackers_to_targets(&mut entities);
     let result = tick_detonations(
@@ -9543,6 +9561,8 @@ fn commit_shrapnel(
             impact,
             payload,
             reason: crate::sim::projectile::ProjectileDetonationReason::ReachedTarget,
+
+            firing_occupant: None,
         }],
         rules,
         None,
@@ -9600,6 +9620,8 @@ fn shrapnel_at_cell_5_5(
             &mut interner,
         ),
         reason: crate::sim::projectile::ProjectileDetonationReason::ReachedTarget,
+
+        firing_occupant: None,
     };
     let mut scenario_rng = SimRng::new(0x46_a3d6);
     let result = tick_detonations(
@@ -9730,6 +9752,8 @@ fn projectile_shrapnel_reads_the_bullets_location_not_its_impact() {
             tracks_target: false,
             target_expiry: TargetExpiryPolicy::DetonateAtLastKnown,
             collision: ProjectileCollisionPolicy::NONE,
+
+            firing_occupant: None,
         },
     );
     assert_eq!(sim.projectiles.get(id).unwrap().position(), location);
@@ -9916,6 +9940,8 @@ fn gsi_04_01_projectile_shrapnel_captures_each_shared_dummy_lookup() {
             &mut interner,
         ),
         reason: crate::sim::projectile::ProjectileDetonationReason::ReachedTarget,
+
+        firing_occupant: None,
     };
 
     let scenario_rng = SimRng::new(0x46_a310);
@@ -10513,14 +10539,18 @@ fn gsi_08_12_a_dont_score_victim_pays_no_experience() {
     assert_eq!(killer.veterancy.raw().bits(), 0);
 }
 
-/// A garrison's kill promotes an occupant, never the building. A BuildingType
-/// is untrainable by default (constructor `0x0045E42E`), so `Record_The_Kill`
-/// takes its occupied-building arm (`0x00702F98..0x00702FEA`) and pays the
-/// occupant at the building's fire index. FireAt has already moved that
-/// index past the shooter (`0x006FF031..0x006FF085`) when the shot kills, so
-/// with two GIs inside the one next in line is paid for the shooter's kill.
+/// A garrison's kill promotes the shooter, never the building nor the next
+/// occupant in line. A BuildingType is untrainable by default (constructor
+/// `0x0045E42E`), so `Record_The_Kill` takes its occupied-building arm
+/// (`0x00702F98..0x00702FEA`). Stock pays `Occupants[+0x69C]` there — but
+/// FireAt has already advanced that index past the shooter
+/// (`0x006FF031..0x006FF085`) when the shot kills, so stock pays the NEXT
+/// occupant in line. NPExt ext66 changes the paid party to the ACTUAL
+/// shooter: VERA captures the pre-advance occupant onto the bullet and the
+/// award pays that id, so with two GIs inside the one who fired is paid for
+/// the shooter's own kill.
 #[test]
-fn gsi_08_12_a_garrison_kill_pays_the_occupant_next_in_line() {
+fn gsi_08_12_a_garrison_kill_pays_the_actual_shooter() {
     let rules = RuleSet::from_ini(&IniFile::from_str(
         "\
 [InfantryTypes]\n0=E1\n1=E2\n\n\
@@ -10556,19 +10586,190 @@ fn gsi_08_12_a_garrison_kill_pays_the_occupant_next_in_line() {
     store.insert(victim);
     let mut interner = test_interner();
     install_entity_attack_target_for_test(&mut store, 10, 2);
-    // The occupant at fire index 0 shoots; the one after it is next in line.
-    let (shooter, next) = {
+    // The occupant at fire index 0 shoots; the capture rides that id. The
+    // bullet-level capture assertion lives in
+    // `garrison_oracle_tests::the_admitted_bullet_carries_the_pre_advance_firing_occupant`
+    // (this M60 round detonates inside the tick, so the fixture hands back no
+    // spawn record for it).
+    let shooter = {
         let occupants = store.get(10).unwrap().passenger_role.occupants();
         assert_eq!(occupants.fire_index(), 0);
-        (occupants.ids()[0], occupants.ids()[1])
+        occupants.ids()[0]
     };
     tick(&mut store, &rules, &mut interner, 0, &mut SimRng::new(1));
 
     assert_eq!(store.get(2).map_or(0, |victim| victim.health.current()), 0);
     let raw = |id: u64| store.get(id).unwrap().veterancy.raw().bits();
     assert_eq!(raw(10), 0, "the building never ranks");
-    assert_eq!(raw(shooter), 0, "the shooter is not the one paid");
-    assert_ne!(raw(next), 0, "the occupant next in line is");
+    assert_eq!(raw(1), 0, "the occupant next in line is not paid");
+    assert_ne!(raw(shooter), 0, "the actual shooter is");
+}
+
+/// A lone occupant's garrison kill wraps back onto the shooter. Native's
+/// advance is `(index + 1) % count` (`0x006FF031..0x006FF085`), so with one
+/// occupant `(0 + 1) % 1 = 0` and stock's slot read already paid the shooter
+/// (the ext66 changelog thread confirms this path was already correct); the
+/// ext66 capture pays the same occupant whatever the cursor does.
+#[test]
+fn ext66_a_lone_occupants_garrison_kill_wraps_back_onto_the_shooter() {
+    let rules = RuleSet::from_ini(&IniFile::from_str(
+        "\
+[InfantryTypes]\n0=E1\n1=E2\n\n\
+[VehicleTypes]\n\n\
+[AircraftTypes]\n\n\
+[BuildingTypes]\n0=CAGAS\n\n\
+[General]\nVeteranRatio=3.0\nVeteranCap=2\n\n\
+[CAGAS]\nStrength=800\nArmor=wood\nCost=500\nCanBeOccupied=yes\nCanOccupyFire=yes\nMaxNumberOccupants=5\n\n\
+[E1]\nStrength=125\nArmor=flak\nSpeed=4\nCost=200\nPrimary=M60\nOccupyWeapon=M60\n\n\
+[E2]\nStrength=1\nArmor=flak\nSpeed=4\nCost=300\n\n\
+[M60]\nDamage=25\nROF=20\nRange=5\nWarhead=SA\n\n\
+[SA]\nVerses=100%,100%,100%,90%,70%,25%,100%,25%,25%,0%,0%\n",
+    ))
+    .expect("lone garrison fixture parses");
+    let mut store = EntityStore::new();
+    let mut building = make_entity_owned(10, "CAGAS", 5, 5, 800, "Soviet");
+    building.set_category_for_test(EntityCategory::Structure);
+    building
+        .passenger_role
+        .occupants_mut()
+        .set_ids_for_test(vec![7]);
+    store.insert(building);
+    let mut occupant = make_infantry_entity(7, "E1", 5, 5, 125);
+    occupant.set_owner_for_test(test_intern("Soviet"));
+    occupant.passenger_role = crate::sim::passenger::PassengerRole::inside_for_test(10, false);
+    store.insert(occupant);
+    let mut victim = make_infantry_entity(2, "E2", 8, 5, 1);
+    victim.set_owner_for_test(test_intern("Americans"));
+    store.insert(victim);
+    let mut interner = test_interner();
+    install_entity_attack_target_for_test(&mut store, 10, 2);
+    tick(&mut store, &rules, &mut interner, 0, &mut SimRng::new(1));
+
+    assert_eq!(store.get(2).map_or(0, |victim| victim.health.current()), 0);
+    assert_eq!(
+        store
+            .get(10)
+            .unwrap()
+            .passenger_role
+            .occupants()
+            .fire_index(),
+        0,
+        "the native advance wraps the lone occupant back onto itself"
+    );
+    let raw = |id: u64| store.get(id).unwrap().veterancy.raw().bits();
+    assert_eq!(raw(10), 0, "the building never ranks");
+    assert_ne!(raw(7), 0, "the shooter is paid through the wrap");
+}
+
+/// A shooter that stops being a valid occupant while its bullet is in flight
+/// pays NOBODY. NPExt ext66 keeps the award on the actual shooter, so the
+/// capture no longer re-aims at whoever the shifted occupants list names;
+/// the stale-slot read the branch would otherwise take pays nobody (unpinned
+/// NPExt question: whether ext66 still pays a shooter who left mid-flight is
+/// not stated; VERA keeps the conservative existing fork).
+#[test]
+fn ext66_a_shooter_gone_mid_flight_pays_nobody() {
+    let rules = RuleSet::from_ini_with_fixed_art_for_test(
+        &IniFile::from_str(
+            "\
+[InfantryTypes]\n0=E1\n1=E2\n\n\
+[VehicleTypes]\n\n\
+[AircraftTypes]\n\n\
+[BuildingTypes]\n0=CAGAS\n\n\
+[CAGAS]\nStrength=800\nArmor=wood\nCanBeOccupied=yes\nCanOccupyFire=yes\nMaxNumberOccupants=5\n\n\
+[E1]\nStrength=125\nArmor=flak\nSpeed=4\nCost=200\nPrimary=GUN\nOccupyWeapon=GUN\n\n\
+[E2]\nStrength=1\nArmor=flak\nSpeed=4\nCost=300\n\n\
+[GUN]\nDamage=25\nROF=20\nRange=5\nSpeed=128\nProjectile=TESTPROJ\nWarhead=SA\n\n\
+[TESTPROJ]\nImage=SHOT\nROT=0\nArcing=yes\n\n\
+[SA]\nVerses=100%,100%,100%,90%,70%,25%,100%,25%,25%,0%,0%\n",
+        ),
+        &IniFile::from_str("[SHOT]\nFlat=no\n"),
+    )
+    .expect("mid-flight fixture parses");
+    let mut store = EntityStore::new();
+    let mut building = make_entity_owned(10, "CAGAS", 5, 5, 800, "Soviet");
+    building.set_category_for_test(EntityCategory::Structure);
+    building
+        .passenger_role
+        .occupants_mut()
+        .set_ids_for_test(vec![3, 1]);
+    store.insert(building);
+    for id in [1, 3] {
+        let mut occupant = make_infantry_entity(id, "E1", 5, 5, 125);
+        occupant.set_owner_for_test(test_intern("Soviet"));
+        occupant.passenger_role = crate::sim::passenger::PassengerRole::inside_for_test(10, false);
+        store.insert(occupant);
+    }
+    let mut victim = make_infantry_entity(2, "E2", 8, 5, 1);
+    victim.set_owner_for_test(test_intern("Americans"));
+    store.insert(victim);
+    let mut interner = test_interner();
+    install_entity_attack_target_for_test(&mut store, 10, 2);
+    let mut scenario_rng = SimRng::new(1);
+    let fire = tick(&mut store, &rules, &mut interner, 0, &mut scenario_rng);
+    assert_eq!(
+        fire.projectile_spawns[0].firing_occupant,
+        Some(3),
+        "occupant 3 fired from the pre-advance index 0"
+    );
+    // The shooter leaves during the flight: BuildingPointerExpired44EAC0
+    // removes the vector entry by shifting, the cursor stays put.
+    if let Some(building) = store.get_mut(10) {
+        building
+            .passenger_role
+            .occupants_mut()
+            .set_ids_for_test(vec![1]);
+    }
+    store.remove(3);
+
+    // Resume the flight outside the fixture and land the detonation through
+    // the real receiver commit, with the capture intact on the spawn.
+    let mut sim = crate::sim::world::Simulation::new();
+    let projectile_id = sim.substrate.allocate_stable_id();
+    sim.admit_projectile(projectile_id, fire.projectile_spawns[0]);
+    let target_positions =
+        BTreeMap::from([(2, ProjectileCoord::new(8 * 256 + 128, 5 * 256 + 128, 0))]);
+    let shared_cell_dummy = sim.effective_shared_cell_dummy();
+    let mut detonations = Vec::new();
+    for _ in 0..8 {
+        detonations = sim
+            .projectiles
+            .advance(0, &target_positions, None, &shared_cell_dummy, |_, _| {
+                Some(
+                    crate::sim::projectile::ProjectileCollisionResponse::TargetZClamp(
+                        target_positions[&2],
+                    ),
+                )
+            })
+            .detonations;
+        if !detonations.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        detonations.len(),
+        1,
+        "the resumed shot must reach its target"
+    );
+    tick_detonations(
+        &mut store,
+        &mut OccupancyGrid::new(),
+        &rules,
+        &mut interner,
+        &mut crate::sim::houses::Houses::default(),
+        &HouseAllianceMap::new(),
+        1,
+        &[],
+        &detonations,
+        &mut scenario_rng,
+        &mut SimRng::new(1),
+    );
+
+    assert_eq!(store.get(2).map_or(0, |victim| victim.health.current()), 0);
+    let raw = |id: u64| store.get(id).unwrap().veterancy.raw().bits();
+    assert_eq!(raw(1), 0, "the remaining occupant is not paid");
+    assert_eq!(raw(10), 0, "the building never ranks");
+    assert!(store.get(3).is_none(), "the shooter is gone");
 }
 
 /// A garrison's rearm is the NEXT occupant's: FireAt advances the firing
@@ -10638,7 +10839,9 @@ fn gsi_08_05_a_mixed_garrison_rearms_with_the_next_occupants_weapon() {
 
 /// A base defence never ranks: a BuildingType is untrainable unless its
 /// section says `Trainable=yes` (constructor `0x0045E42E`), so its kills pay
-/// nobody (`Record_The_Kill`, `0x00702EF5..0x00702FF5`).
+/// nobody (`Record_The_Kill`, `0x00702EF5..0x00702FF5`). NPExt ext66 leaves
+/// this untouched: a non-garrison shot carries no captured shooter
+/// (`firing_occupant` None), so the award keeps its prior behavior.
 #[test]
 fn gsi_08_12_a_base_defence_kill_pays_nobody() {
     let rules = RuleSet::from_ini(&IniFile::from_str(
@@ -11420,6 +11623,8 @@ fn gsi_08_08_special_arm_suppresses_damage_but_keeps_the_detonation_tail() {
                 &mut interner,
             ),
             reason: ProjectileDetonationReason::ReachedTarget,
+
+            firing_occupant: None,
         };
         let mut trace = FixtureTrace::default();
         let emitted = emit_detonations(
@@ -11507,6 +11712,8 @@ fn clusters_scatter_around_the_impact() {
             &mut interner,
         ),
         reason: ProjectileDetonationReason::ReachedTarget,
+
+        firing_occupant: None,
     };
     let mut trace = FixtureTrace::default();
     emit_detonations(
@@ -11582,6 +11789,8 @@ fn gsi_08_33_direct_rocker_only_claims_a_vehicle_target() {
                 &mut interner,
             ),
             reason: ProjectileDetonationReason::ReachedTarget,
+
+            firing_occupant: None,
         };
         let mut trace = FixtureTrace::default();
         let emitted = emit_detonations(

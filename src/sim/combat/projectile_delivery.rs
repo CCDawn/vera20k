@@ -209,6 +209,10 @@ pub(crate) struct FiredBullet {
     /// `[ESP+0x84]`), which AreaFire's own-cell retarget does not replace.
     /// Other launchers take their target's.
     pub(super) target_on_bridge: bool,
+    /// The garrison occupant FireAt fired through, captured at the
+    /// pre-advance fire index (NPExt ext66 kill credit). `None` for every
+    /// launcher but an occupied building's FireAt.
+    pub(super) firing_occupant: Option<u64>,
 }
 
 /// An Object target's OnBridge (`+0x8C`); `false` for anything else.
@@ -290,6 +294,7 @@ impl FiredBullet {
             speed: crate::sim::projectile::projectile_velocity_magnitude(velocity)
                 .clamp(0.0, f64::from(u16::MAX)) as u16,
             target_on_bridge: target_on_bridge(world, target),
+            firing_occupant: None,
         })
     }
 }
@@ -350,6 +355,7 @@ impl ProjectileDelivery {
             tracks_target: self.tracks_target,
             target_expiry: TargetExpiryPolicy::DetonateAtLastKnown,
             collision: self.collision,
+            firing_occupant: bullet.firing_occupant,
         }
     }
 }

@@ -814,6 +814,8 @@ fn projectile_level_uses_loaded_theater_interval_through_runtime() {
                     level: true,
                     ..ProjectileCollisionPolicy::NONE
                 },
+
+                firing_occupant: None,
             },
         );
         let mut runtime = SimRuntime::from_simulation(sim);

@@ -251,6 +251,8 @@ fn native_ifv_bridge_impact_orders_live_selection_debris_ids_and_rng() {
                 tracks_target: false,
                 target_expiry: TargetExpiryPolicy::DetonateAtLastKnown,
                 collision: ProjectileCollisionPolicy::NONE,
+
+                firing_occupant: None,
             },
         );
         let main_before = world.main_rng.logical_state();
@@ -264,6 +266,8 @@ fn native_ifv_bridge_impact_orders_live_selection_debris_ids_and_rng() {
                 impact,
                 payload,
                 reason: ProjectileDetonationReason::ReachedTarget,
+
+                firing_occupant: None,
             }],
             &rules,
             Some(&overlays),

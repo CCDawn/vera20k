@@ -251,6 +251,9 @@ pub(crate) struct AoEDamageOrigin {
     pub source_id: u64,
     pub source_house: Option<crate::sim::intern::InternedId>,
     pub warhead_ref: crate::sim::intern::InternedId,
+    /// The killing bullet's captured garrison shooter (NPExt ext66); `None`
+    /// for every origin that is not an occupied building's own bullet.
+    pub firing_occupant: Option<u64>,
 }
 
 impl From<(u64, crate::sim::intern::InternedId)> for AoEDamageOrigin {
@@ -259,6 +262,7 @@ impl From<(u64, crate::sim::intern::InternedId)> for AoEDamageOrigin {
             source_id,
             source_house: None,
             warhead_ref,
+            firing_occupant: None,
         }
     }
 }
@@ -281,6 +285,7 @@ impl
             source_id,
             source_house,
             warhead_ref,
+            firing_occupant: None,
         }
     }
 }
@@ -292,6 +297,7 @@ impl From<&str> for AoEDamageOrigin {
             source_id: super::RAD_NO_ATTACKER,
             source_house: None,
             warhead_ref: crate::sim::intern::InternedId::default(),
+            firing_occupant: None,
         }
     }
 }
@@ -628,6 +634,7 @@ impl AoECollector {
                         origin.source_id,
                         origin.source_house,
                         origin.warhead_ref,
+                        origin.firing_occupant,
                         rules,
                         interner,
                     );
@@ -782,6 +789,7 @@ impl AoECollector {
                     self.origin.source_house,
                     self.ground_source_admitted,
                     self.origin.warhead_ref,
+                    self.origin.firing_occupant,
                 );
             }
         }
@@ -847,6 +855,7 @@ impl AoECollector {
                 self.origin.source_house,
                 self.ground_source_admitted,
                 self.origin.warhead_ref,
+                self.origin.firing_occupant,
             );
         }
 
@@ -993,6 +1002,7 @@ fn push_airborne_aoe_damage(
     source_id: u64,
     source_house: Option<crate::sim::intern::InternedId>,
     warhead_ref: crate::sim::intern::InternedId,
+    firing_occupant: Option<u64>,
     rules: &RuleSet,
     interner: &StringInterner,
 ) {
@@ -1047,14 +1057,16 @@ fn push_airborne_aoe_damage(
         return;
     }
 
-    result.push_entity(EntityDamageEvent::area(
+    let mut event = EntityDamageEvent::area(
         entity.stable_id(),
         base_damage,
         distance_leptons,
         source_id,
         source_house,
         warhead_ref,
-    ));
+    );
+    event.firing_occupant = firing_occupant;
+    result.push_entity(event);
 }
 
 /// Collects one ground/deck-list receiver record for `Apply_area_damage`
@@ -1076,6 +1088,7 @@ fn push_entity_aoe_damage(
     source_house: Option<crate::sim::intern::InternedId>,
     source_self_admitted: bool,
     warhead_ref: crate::sim::intern::InternedId,
+    firing_occupant: Option<u64>,
 ) {
     // Apply_area_damage's selected ground/deck list excludes the source object
     // unless its type opts into DamageSelf or this is Rules.CrushWarhead.
@@ -1143,6 +1156,7 @@ fn push_entity_aoe_damage(
     // 489932 tests the spread-loop index, independently of the later
     // transaction-wide filter. The unique zero offset is its first cell.
     event.adjacent_ground_cell_record = !center_cell;
+    event.firing_occupant = firing_occupant;
     result.push_entity(event);
 }
 

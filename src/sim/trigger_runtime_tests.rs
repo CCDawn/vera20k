@@ -1927,6 +1927,8 @@ fn mind_control_tag_projectile(
             tracks_target: false,
             target_expiry: TargetExpiryPolicy::Expire,
             collision: ProjectileCollisionPolicy::NONE,
+
+            firing_occupant: None,
         },
     );
     crate::sim::projectile::ProjectileDetonation {
@@ -1936,6 +1938,8 @@ fn mind_control_tag_projectile(
         impact,
         payload,
         reason: crate::sim::projectile::ProjectileDetonationReason::ReachedTarget,
+
+        firing_occupant: None,
     }
 }
 
@@ -3296,6 +3300,8 @@ fn master_frame_save_load_continues_trigger_projectile_and_delete_state() {
             tracks_target: false,
             target_expiry: TargetExpiryPolicy::Expire,
             collision: ProjectileCollisionPolicy::NONE,
+
+            firing_occupant: None,
         },
     );
     let deleted_id = spawn_type(&mut original, "GAPOWR");

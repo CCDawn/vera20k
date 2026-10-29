@@ -114,6 +114,8 @@ fn fixture(row: &Value, kind: &crate::rules::projectile_type::ProjectileType) ->
             tracks_target: false,
             target_expiry: TargetExpiryPolicy::Expire,
             collision: ProjectileCollisionPolicy::NONE,
+
+            firing_occupant: None,
         },
     );
     sim.projectiles_mut_for_test()

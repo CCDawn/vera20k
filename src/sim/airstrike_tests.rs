@@ -54,6 +54,8 @@ impl Fixture {
                 impact: ProjectileCoord::new(c.x, c.y, c.z),
                 payload,
                 reason: ProjectileDetonationReason::ReachedTarget,
+
+                firing_occupant: None,
             }],
             &self.rules,
             None,

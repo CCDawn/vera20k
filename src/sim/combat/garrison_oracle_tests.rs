@@ -144,6 +144,102 @@ fn a_shot_before_an_unarmed_occupant_rearms_without_an_rng_draw() {
     }
 }
 
+/// NPExt ext66: the kill credit pays the ACTUAL shooter, so the admitted
+/// bullet carries the occupant the pre-advance fire index names
+/// (`Occupants[+0x69C]` read at `0x00702FD1` made while it still names the
+/// shooter; the advance `0x006FF031..0x006FF085` follows in the same FireAt
+/// call). Production-emission regression with the same supplied state as the
+/// rearm oracle above.
+#[test]
+fn the_admitted_bullet_carries_the_pre_advance_firing_occupant() {
+    let rules = RuleSet::from_ini(&IniFile::from_str(
+        "[BuildingTypes]\n0=HOUSE\n[InfantryTypes]\n0=ARMED\n1=UNARMED\n\
+         [HOUSE]\nStrength=800\nCanBeOccupied=yes\nCanOccupyFire=yes\n\
+         [ARMED]\nStrength=125\nPrimary=Gun\nOccupyWeapon=Gun\n\
+         [UNARMED]\nStrength=125\n\
+         [Gun]\nDamage=5\nROF=120\nRange=6\nProjectile=InvisibleHigh\nWarhead=SA\n\
+         [InvisibleHigh]\nInviso=yes\n\
+         [SA]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
+    ))
+    .unwrap();
+    let mut world = crate::sim::world::Simulation::new();
+    let mut building =
+        GameEntity::test_default_of_category(1, "HOUSE", "Test", 10, 10, EntityCategory::Structure);
+    // Occupants in admission order: armed (2, at the firing index), then
+    // unarmed (3, next in line).
+    for (id, kind) in [(2, "ARMED"), (3, "UNARMED")] {
+        let mut occupant = GameEntity::test_default_of_category(
+            id,
+            kind,
+            "Test",
+            10,
+            10,
+            EntityCategory::Infantry,
+        );
+        occupant.passenger_role = PassengerRole::inside_for_test(1, false);
+        building.passenger_role.occupants_mut().add(id);
+        world.substrate.entities.insert(occupant);
+    }
+    world.substrate.entities.insert(building);
+    world.interner = test_interner();
+    crate::sim::arena_fixture::flat_arena(&mut world, &rules);
+
+    let building = world.substrate.entities.get(1).unwrap();
+    let obj = rules.object("HOUSE").unwrap();
+    let selected = super::combat_weapon::resolve_weapon_index(
+        &rules,
+        building,
+        obj,
+        0,
+        &world.substrate.entities,
+        &world.interner,
+    )
+    .expect("the armed occupant's gun");
+    let shot = super::world_fire::AdmittedFire {
+        snap: super::build_attacker_snapshot(
+            building,
+            super::TargetKind::Cell(14, 10),
+            Some(super::GarrisonSnapshot {
+                fire_index: 0,
+                occupant_count: 2,
+            }),
+        ),
+        obj,
+        selected,
+        target_coords: (
+            14,
+            10,
+            crate::util::fixed_math::SimFixed::from_num(128),
+            crate::util::fixed_math::SimFixed::from_num(128),
+        ),
+        target_type_ref: building.type_ref(),
+        is_garrison: true,
+    };
+    let mut emitted = super::CombatEmit::default();
+    let bullet_id = super::world_fire::emit_admitted_fire(
+        &mut world,
+        &rules,
+        shot,
+        17,
+        &mut emitted,
+        None,
+        crate::sim::world::FrameEffects::default(),
+    )
+    .expect("the garrison shot launches");
+    assert_eq!(emitted.fire_events.len(), 1);
+    // The bullet names the occupant at the index BEFORE the advance, and the
+    // advance itself still turned the cursor.
+    let bullet = world.projectiles.get(bullet_id).expect("admitted bullet");
+    assert_eq!(bullet.firing_occupant(), Some(2));
+    assert_ne!(
+        bullet.firing_occupant(),
+        Some(3),
+        "the capture is not the occupant next in line"
+    );
+    let building = world.substrate.entities.get(1).unwrap();
+    assert_eq!(building.passenger_role.occupants().fire_index(), 1);
+}
+
 /// Supply the native corpus's type links and live state through existing
 /// fixture owners. Expected outputs remain in the executed native corpus.
 pub(super) fn for_each_native_case(

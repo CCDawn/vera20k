@@ -59,6 +59,8 @@ fn scene(z: i32) -> (Simulation, RuleSet, u64, ProjectileDetonation) {
         impact: ProjectileCoord::new(2699, 5259, z + 10),
         payload,
         reason: ProjectileDetonationReason::ReachedTarget,
+
+        firing_occupant: None,
     };
     (world, rules, source, request)
 }

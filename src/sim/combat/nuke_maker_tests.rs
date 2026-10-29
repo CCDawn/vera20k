@@ -112,6 +112,8 @@ fn nuke_maker_matches_native() {
                 &mut sim.interner,
             ),
             reason: ProjectileDetonationReason::ReachedTarget,
+
+            firing_occupant: None,
         };
         nuke_maker(&mut sim, &rules, &detonation);
         let events = row["events"].as_array().unwrap();

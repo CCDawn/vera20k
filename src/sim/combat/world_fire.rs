@@ -1719,6 +1719,20 @@ pub(super) fn emit_admitted_fire(
             .with_installed_weapon(Some(world.interner.intern(selected.weapon_id)))
             .with_damage_multiplier(damage_multiplier);
             // `BulletClass::Fire` (`0x006FF014`) at the launch source.
+            // NPExt ext66: the kill credit pays the shooter, so the occupant
+            // the pre-advance fire index names is captured onto the bullet.
+            // Nothing between here and the advance below can change the
+            // occupants, so this is the native `Occupants[+0x69C]` read at
+            // `0x00702FD1` made while it still names the shooter.
+            let firing_occupant = is_garrison
+                .then(|| {
+                    world
+                        .substrate
+                        .entities
+                        .get(snap.stable_id)
+                        .and_then(|building| combat_weapon::firing_occupant_id(building, obj))
+                })
+                .flatten();
             super::admit_fired_bullet(
                 world,
                 rules,
@@ -1746,6 +1760,7 @@ pub(super) fn emit_admitted_fire(
                         world,
                         entry_target.projectile_target(world),
                     ),
+                    firing_occupant,
                 },
             );
         }
@@ -1809,9 +1824,11 @@ pub(super) fn emit_admitted_fire(
     // `(+0x69C + 1) % occupants`. Everything after reads the new index: the
     // rearm below (`GetROF` at `0x006FF289` takes the building's weapon
     // through `BuildingClass::GetWeapon @ 0x004526F0`, i.e. the NEXT
-    // occupant's ROF and Burst) and the shot's own kill credit, since its
-    // Inviso bullet detonates later in its own AI (possibly this frame's
-    // Logic tail, once its impact/fuse admits it).
+    // occupant's ROF and Burst). The kill credit no longer does: NPExt ext66
+    // pays the shooter captured onto the bullet above, not the occupant the
+    // advanced index names when the shot's own kill lands later (the Inviso
+    // bullet detonates in its own AI, possibly this frame's Logic tail, once
+    // its impact/fuse admits it).
     if is_garrison && let Some(building) = world.substrate.entities.get_mut(snap.stable_id) {
         building.passenger_role.occupants_mut().advance_fire_index();
     }

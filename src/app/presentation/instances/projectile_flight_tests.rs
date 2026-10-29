@@ -184,6 +184,8 @@ fn original_cannon_launch_motion_and_live_bridge_draw_form_one_production_chain(
                 arcing: kind.arcing,
                 ..ProjectileCollisionPolicy::NONE
             },
+
+            firing_occupant: None,
         },
     );
     assert!(sim.register_projectile(id, kind.flat));
@@ -393,6 +395,8 @@ fn original_ifv_dragon_frame_getter_matches_retained_flights_and_all_directions(
             tracks_target: false,
             target_expiry: TargetExpiryPolicy::Expire,
             collision: ProjectileCollisionPolicy::NONE,
+
+            firing_occupant: None,
         },
     );
     let mut directions = BTreeSet::new();

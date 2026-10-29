@@ -136,6 +136,8 @@ fn original_area_receipt_selects_nullify_after_em_effect_rng_and_before_return()
                 tracks_target: false,
                 target_expiry: TargetExpiryPolicy::DetonateAtLastKnown,
                 collision: ProjectileCollisionPolicy::NONE,
+
+                firing_occupant: None,
             },
         );
         let main_before = world.main_rng.logical_state();
@@ -150,6 +152,8 @@ fn original_area_receipt_selects_nullify_after_em_effect_rng_and_before_return()
                 impact: coordinate,
                 payload,
                 reason: ProjectileDetonationReason::DeathWeapon,
+
+                firing_occupant: None,
             }],
             &rules,
             None,
@@ -401,6 +405,8 @@ fn native_area_receipt_tracks_dispatch_and_strict_iron_curtain_boundary() {
                     impact: ProjectileCoord::new(2688, 5248, 624),
                     payload,
                     reason: crate::sim::projectile::ProjectileDetonationReason::ReachedTarget,
+
+                    firing_occupant: None,
                 }],
                 &rules,
                 None,
@@ -553,6 +559,8 @@ fn area_ic_primary_cell_controls_cross_cell_health() {
                 impact,
                 payload,
                 reason: crate::sim::projectile::ProjectileDetonationReason::DeathWeapon,
+
+                firing_occupant: None,
             }],
             &rules,
             None,

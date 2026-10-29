@@ -462,7 +462,7 @@ pub(crate) fn collect_area(
     cell: (u16, u16),
     damage: i32,
     warhead: &WarheadType,
-    origin: (u64, Option<InternedId>, InternedId),
+    origin: impl Into<combat_aoe::AoEDamageOrigin>,
     air_impact: Option<combat_aoe::AoEAirImpact>,
     impact_z: i32,
     effects: FrameEffects<'_>,
@@ -706,9 +706,10 @@ fn collect_area_at<'r>(
     impact: ProjectileCoord,
     damage: i32,
     warhead: &'r WarheadType,
-    origin: (u64, Option<InternedId>, InternedId),
+    origin: impl Into<combat_aoe::AoEDamageOrigin>,
     effects: FrameEffects<'_>,
 ) -> AreaAtImpact<'r> {
+    let origin = origin.into();
     // Observe the shared entry, including Bullet and nested receiver calls;
     // an external-only wrapper misses those paths and must not double-count.
     #[cfg(test)]
@@ -737,10 +738,10 @@ fn collect_area_at<'r>(
             cell: (rx, ry),
             impact,
             damage,
-            source_id: origin.0,
-            source_house: origin.1,
+            source_id: origin.source_id,
+            source_house: origin.source_house,
             warhead,
-            warhead_ref: origin.2,
+            warhead_ref: origin.warhead_ref,
             object_list_layer: aoe.object_list_layer,
             routed_wall,
             entered,
@@ -3184,6 +3185,15 @@ fn emit_detonation_receivers<'r>(
                 .entities
                 .get(detonation.source_id)
                 .map(|source| source.owner());
+            // NPExt ext66: the bullet carries its shooting garrison occupant;
+            // every receiver record of this area pays the kill to the shooter
+            // instead of the building's advanced fire index.
+            let origin = combat_aoe::AoEDamageOrigin {
+                source_id: detonation.source_id,
+                source_house,
+                warhead_ref: detonation.payload.warhead,
+                firing_occupant: detonation.firing_occupant,
+            };
             let area = collect_area_at(
                 world,
                 rules,
@@ -3191,11 +3201,7 @@ fn emit_detonation_receivers<'r>(
                 detonation.impact,
                 detonation.payload.area_damage(),
                 warhead,
-                (
-                    detonation.source_id,
-                    source_house,
-                    detonation.payload.warhead,
-                ),
+                origin,
                 effects,
             );
             #[cfg(test)]

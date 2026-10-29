@@ -7119,6 +7119,8 @@ mod tests {
             tracks_target: false,
             target_expiry: TargetExpiryPolicy::Expire,
             collision: ProjectileCollisionPolicy::NONE,
+
+            firing_occupant: None,
         }
     }
 

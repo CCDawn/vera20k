@@ -20,18 +20,25 @@ use super::*;
 ///    (spawn owner) non-null AND its type `Trainable=` → the spawn OWNER
 ///    (`0x00702F31..0x00702F96`); stock `V3ROCKET`/`DMISL`/`CMISL` are
 ///    `Trainable=no, MissileSpawn=yes`, which is how a V3 promotes.
-/// 4. else an occupied Building (`vtable+0x400`, RTTI 6) → the occupant at
-///    the building's fire index (`+0x688[+0x69C]`, `0x00702F98..0x00702FEA`),
-///    with no `Trainable=` test on it. A BuildingType is untrainable by
-///    default (constructor `0x0045E42E`) and no retail occupiable type sets
-///    the key, so every garrison kill lands here: its occupants promote, the
-///    building never does. FireAt has already advanced the index past the
-///    shooter (`0x006FF031..0x006FF085`) when its bullet kills, so with
-///    several occupants the NEXT one in line is paid.
-///    RESIDUAL: native reads that slot unchecked; VERA pays nobody when the
-///    index is past the occupant count ([`combat_weapon::firing_occupant_id`]).
-///    Trigger: occupants leaving, but not all of them, between the shot and
-///    the kill. Effect: native reads a stale slot. Frequency: rare.
+/// 4. else an occupied Building (`vtable+0x400`, RTTI 6) → the shooting
+///    occupant (`0x00702F98..0x00702FEA`), with no `Trainable=` test on it. A
+///    BuildingType is untrainable by default (constructor `0x0045E42E`) and no
+///    retail occupiable type sets the key, so every garrison kill lands here:
+///    its occupants promote, the building never does. NATIVE reads
+///    `Occupants[+0x69C]` (`0x00702FC5..0x00702FD1`) at the kill — but FireAt
+///    has already advanced that index past the shooter
+///    (`0x006FF031..0x006FF085`) when its bullet kills, so stock pays the
+///    NEXT occupant in line, and `(count-1+1) % 1 = 0` wraps a lone
+///    occupant's kill back onto itself. NPExt ext66 changes the paid party to
+///    the ACTUAL shooter: VERA captures that occupant onto the bullet at
+///    launch (the pre-advance index read in
+///    [`crate::sim::combat::world_fire`]) and pays it here. A shooter that is
+///    no longer a valid occupant of the building pays NOBODY.
+///    RESIDUAL: native reads `Occupants[+0x69C]` unchecked and a stale slot
+///    can hold a removed occupant or read past the count; VERA pays nobody
+///    rather than read one ([`combat_weapon::firing_occupant_id`]). Trigger:
+///    occupants leaving, but not all of them, between the shot and the kill.
+///    Effect: native reads a stale slot. Frequency: rare.
 /// 5. else nobody.
 ///
 /// Every cost on both sides is the type's Cost_Of for the VICTIM's house
@@ -44,6 +51,7 @@ fn award_kill_experience(
     victim_id: u64,
     points: i32,
     victim_house: Option<&HouseCostFactors>,
+    firing_occupant: Option<u64>,
 ) {
     if killer_id == RAD_NO_ATTACKER || killer_id == victim_id {
         return;
@@ -71,8 +79,9 @@ fn award_kill_experience(
         // Branch 3: a spawned missile pays its launcher.
         killer.spawn_owner_id.owner().and_then(trainable_cost)
     } else {
-        // Branch 4: an occupied building pays the occupant at its fire index.
-        combat_weapon::firing_occupant_id(killer, killer_type).and_then(|occupant| {
+        // Branch 4: an occupied building pays its shooting occupant
+        // ([`garrison_shooter_recipient`]).
+        garrison_shooter_recipient(killer, killer_type, firing_occupant).and_then(|occupant| {
             let occupant_type = interner.object_type(entities.get(occupant)?.type_ref(), rules)?;
             Some((occupant, cost_of(occupant_type)))
         })
@@ -88,6 +97,32 @@ fn award_kill_experience(
             rules.general.veteran_ratio,
             rules.general.veteran_cap,
         );
+    }
+}
+
+/// The occupant a garrison kill (Record_The_Kill branch 4) pays.
+///
+/// NPExt ext66 pays the ACTUAL shooter, which the bullet carried from launch:
+/// still a valid occupant of the killer building → the shooter, whatever the
+/// fire index the advance (`0x006FF031..0x006FF085`) has since rotated to.
+/// The shooter left, died or was replaced during the flight → nobody, the
+/// same safety fork the unchecked native slot read takes when its index is
+/// past the count (unpinned NPExt question; VERA keeps the conservative
+/// existing branch rather than read a stale slot). No capture (older saves
+/// and replays, and every record outside the bullet receiver) → the branch's
+/// prior live read, [`combat_weapon::firing_occupant_id`].
+fn garrison_shooter_recipient(
+    killer: &GameEntity,
+    killer_type: &ObjectType,
+    firing_occupant: Option<u64>,
+) -> Option<u64> {
+    match firing_occupant {
+        Some(shooter) => {
+            let still_occupies = combat_weapon::is_occupied(killer, killer_type)
+                && killer.passenger_role.occupants().ids().contains(&shooter);
+            still_occupies.then_some(shooter)
+        }
+        None => combat_weapon::firing_occupant_id(killer, killer_type),
     }
 }
 
@@ -157,6 +192,7 @@ fn record_the_kill(
     victim_cost: i32,
     callback: KillCallback,
     rules: &RuleSet,
+    firing_occupant: Option<u64>,
 ) {
     let Some(victim) = entities.get(victim_id) else {
         return;
@@ -228,6 +264,7 @@ fn record_the_kill(
             victim_id,
             points,
             victim_house.as_ref(),
+            firing_occupant,
         );
     }
     // 702FF0 awards experience before 703003..7031DC book the House fields.
@@ -256,6 +293,23 @@ impl crate::sim::world::Simulation {
         &mut self,
         victim_id: u64,
         source: KillSource,
+        callback: KillCallback,
+        context: crate::sim::world::UninitContext<'_>,
+    ) {
+        self.record_the_kill_with_firing_occupant(victim_id, source, None, callback, context)
+    }
+
+    /// [`Self::record_the_kill`] with the garrison shooter the killing bullet
+    /// carried at launch ([`crate::sim::projectile::ProjectileDetonation::
+    /// firing_occupant`]): the experience award pays that shooter instead of
+    /// the occupant at the building's fire index advanced since the shot
+    /// (NPExt ext66). Only the bullet receiver path passes a capture; every
+    /// other caller keeps the prior live read.
+    pub(crate) fn record_the_kill_with_firing_occupant(
+        &mut self,
+        victim_id: u64,
+        source: KillSource,
+        firing_occupant: Option<u64>,
         callback: KillCallback,
         context: crate::sim::world::UninitContext<'_>,
     ) {
@@ -319,6 +373,7 @@ impl crate::sim::world::Simulation {
             victim_cost,
             callback,
             rules,
+            firing_occupant,
         );
         #[cfg(any(test, feature = "test-support"))]
         self.trace_lifecycle_for_test(

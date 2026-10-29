@@ -142,6 +142,7 @@ pub(crate) fn death_weapon_detonation(
         )
         .with_installed_weapon(Some(weapon)),
         reason: crate::sim::projectile::ProjectileDetonationReason::DeathWeapon,
+        firing_occupant: None,
     })
 }
 

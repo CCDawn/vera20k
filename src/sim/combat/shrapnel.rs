@@ -228,6 +228,8 @@ pub(super) fn emit_projectile_shrapnel(
                 elasticity_bits: child_projectile.elasticity.to_bits(),
                 arcing: child_projectile.arcing,
             },
+
+            firing_occupant: None,
         };
         world.admit_projectile_spawns([spawn], rules);
         // SpawnShrapnel46A887/46AD3E: each child Fire precedes its independent

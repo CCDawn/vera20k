@@ -1068,6 +1068,16 @@ pub struct ProjectileSpawn {
     pub tracks_target: bool,
     pub target_expiry: TargetExpiryPolicy,
     pub collision: ProjectileCollisionPolicy,
+    /// The garrison occupant FireAt fired this shot through, captured before
+    /// the occupant advance (`0x006FF031..0x006FF085`): the pre-advance fire
+    /// index names the shooter. NPExt ext66 has the kill credit pay this
+    /// shooter instead of whoever the advanced index names; VERA carries the
+    /// id on the bullet so the kill award is not a second live read of a
+    /// rotated index. `None` when the shooter is not a garrison occupant.
+    /// Independent of the Owner pointer: a `PointerExpired` source clear does
+    /// not drop it (unpinned NPExt question; the capture outlives the owner).
+    #[serde(default)]
+    pub firing_occupant: Option<u64>,
 }
 
 /// Persistent state corresponding to one native `BulletClass` instance.
@@ -1123,6 +1133,12 @@ pub struct Projectile {
     /// [`Simulation::construct_bullet_scheme`]: crate::sim::world::Simulation::construct_bullet_scheme
     #[serde(default)]
     firer_house: Option<InternedId>,
+    /// The garrison shooter captured at launch ([`ProjectileSpawn::
+    /// firing_occupant`]), read before the occupant advance. VERA-only carry
+    /// (native re-reads the building at the kill); persisted so a save during
+    /// the flight keeps the ext66 award honest.
+    #[serde(default)]
+    firing_occupant: Option<u64>,
     /// Bullet `+0x158`: set at a `NUKE` impact (`0x00467F3C`), cleared when
     /// the wait ends (`0x0046676A`).
     #[serde(default)]
@@ -1229,6 +1245,11 @@ impl Projectile {
 
     pub const fn source_id(&self) -> u64 {
         self.source_id
+    }
+
+    /// The garrison shooter captured at launch, `None` for every other shot.
+    pub const fn firing_occupant(&self) -> Option<u64> {
+        self.firing_occupant
     }
 
     pub const fn position(&self) -> ProjectileCoord {
@@ -1423,6 +1444,12 @@ pub struct ProjectileDetonation {
     pub impact: ProjectileCoord,
     pub payload: ProjectilePayload,
     pub reason: ProjectileDetonationReason,
+    /// The shooting garrison occupant carried from launch
+    /// ([`Projectile::firing_occupant`]); the kill award pays this shooter,
+    /// not the advanced fire index (NPExt ext66). `None` for every
+    /// non-garrison shot and for the death weapon's never-placed bullet.
+    #[serde(default)]
+    pub firing_occupant: Option<u64>,
 }
 
 /// A `NUKE` warhead's impact (`BulletClass::AI 0x00467E53`), the bullet on
@@ -1844,6 +1871,7 @@ impl ProjectileStore {
                 collision: ProjectileCollisionPolicy::NONE,
                 on_bridge: false,
                 firer_house: None,
+                firing_occupant: None,
                 awaiting_anim: false,
                 awaited_anim: None,
             },
@@ -1890,6 +1918,7 @@ impl ProjectileStore {
         projectile.tracks_target = spawn.tracks_target;
         projectile.target_expiry = spawn.target_expiry;
         projectile.collision = spawn.collision;
+        projectile.firing_occupant = spawn.firing_occupant;
         id
     }
 
@@ -2950,6 +2979,7 @@ fn detonation(
         impact,
         payload: projectile.payload,
         reason,
+        firing_occupant: projectile.firing_occupant,
     }
 }
 
@@ -3157,6 +3187,7 @@ mod tests {
             tracks_target: true,
             target_expiry: TargetExpiryPolicy::DetonateAtLastKnown,
             collision: ProjectileCollisionPolicy::NONE,
+            firing_occupant: None,
         }
     }
 

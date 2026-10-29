@@ -38,7 +38,7 @@ pub(crate) fn observe_area_visit(
     impact: ProjectileCoord,
     damage: i32,
     warhead: &WarheadType,
-    origin: (u64, Option<InternedId>, InternedId),
+    origin: combat_aoe::AoEDamageOrigin,
 ) {
     AREA_VISIT_TRACE.with_borrow_mut(|trace| {
         if let Some(observations) = trace {
@@ -47,9 +47,9 @@ pub(crate) fn observe_area_visit(
                 "coord": [impact.x, impact.y, impact.z],
                 "damage": damage,
                 "warhead": warhead.id,
-                "source_id": origin.0,
-                "no_source": origin.0 == RAD_NO_ATTACKER,
-                "no_source_house": origin.1.is_none(),
+                "source_id": origin.source_id,
+                "no_source": origin.source_id == RAD_NO_ATTACKER,
+                "no_source_house": origin.source_house.is_none(),
                 "rng_streams": {
                     "main": world.main_rng.native_state_hex(),
                     "scenario": world.scenario_rng.native_state_hex(),

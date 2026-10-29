@@ -110,6 +110,12 @@ pub(crate) struct EntityDamageEvent {
     /// Such records are filtered by an armed transaction but cannot arm it.
     /// Airborne and primary-cell records leave this false.
     pub(crate) adjacent_ground_cell_record: bool,
+    /// The garrison shooter the killing bullet carried at launch
+    /// ([`crate::sim::projectile::ProjectileDetonation::firing_occupant`]).
+    /// The Record_The_Kill award pays this shooter, not the occupant at the
+    /// building's advanced fire index (NPExt ext66). `None` for every record
+    /// that is not an occupied building's own bullet's area damage.
+    pub(crate) firing_occupant: Option<u64>,
     pub(crate) damage_writeback: Option<DamageWriteback>,
 }
 
@@ -140,6 +146,7 @@ impl EntityDamageEvent {
             },
             near_center_ic_isolation_eligible: false,
             adjacent_ground_cell_record: false,
+            firing_occupant: None,
             damage_writeback: None,
         }
     }
@@ -163,6 +170,7 @@ impl EntityDamageEvent {
             receiver_flags,
             near_center_ic_isolation_eligible: false,
             adjacent_ground_cell_record: false,
+            firing_occupant: None,
             damage_writeback: None,
         }
     }

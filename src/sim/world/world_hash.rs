@@ -951,6 +951,13 @@ impl Simulation {
                 b"bullet-firer-scheme-v1".hash(hasher);
                 house.index().hash(hasher);
             }
+            // The ext66 garrison shooter the bullet carries from launch: two
+            // states that differ only in the capture must not share a hash,
+            // as with every other carried field folded above.
+            if let Some(occupant) = projectile.firing_occupant() {
+                b"bullet-firing-occupant-v1".hash(hasher);
+                occupant.hash(hasher);
+            }
             if projectile.awaiting_anim() {
                 b"bullet-awaited-anim-v1".hash(hasher);
                 projectile.awaited_anim().hash(hasher);

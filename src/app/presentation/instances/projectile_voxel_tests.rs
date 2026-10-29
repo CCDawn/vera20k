@@ -513,6 +513,8 @@ pub(crate) fn admitted_kirov_bomb(
             tracks_target: false,
             target_expiry: TargetExpiryPolicy::Expire,
             collision: ProjectileCollisionPolicy::NONE,
+
+            firing_occupant: None,
         },
     );
     (sim, id)

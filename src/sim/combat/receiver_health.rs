@@ -126,8 +126,17 @@ impl super::object_health::ObjectHealthHost for ReceiverHealthHost<'_, '_, '_> {
                 } else {
                     super::KillSource::Techno((attacker != RAD_NO_ATTACKER).then_some(attacker))
                 };
-                self.world
-                    .record_the_kill(id, source, super::KillCallback::Terminal, context);
+                // NPExt ext66: the killing bullet's captured garrison shooter
+                // rides the record, so the award pays the shooter rather than
+                // the occupant at the building's fire index advanced at fire
+                // time (`0x006FF031..0x006FF085`).
+                self.world.record_the_kill_with_firing_occupant(
+                    id,
+                    source,
+                    self.event.firing_occupant,
+                    super::KillCallback::Terminal,
+                    context,
+                );
             }
             HealthCallback::Destroy => {
                 if self.execute_world_callbacks {

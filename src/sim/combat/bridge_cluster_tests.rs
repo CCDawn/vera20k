@@ -97,6 +97,8 @@ fn detonation(sim: &mut Simulation, input: &Value) -> ProjectileDetonation {
         )
         .with_installed_weapon(Some(sim.interner.intern("SHOT"))),
         reason: ProjectileDetonationReason::ReachedTarget,
+
+        firing_occupant: None,
     }
 }
 

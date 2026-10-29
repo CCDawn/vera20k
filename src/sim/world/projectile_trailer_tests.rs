@@ -183,6 +183,8 @@ fn scene(row: &Value, terminal: bool, rules: &RuleSet) -> (Simulation, u64) {
         tracks_target: false,
         target_expiry: TargetExpiryPolicy::Expire,
         collision: ProjectileCollisionPolicy::NONE,
+
+        firing_occupant: None,
     };
     let id = sim.substrate.allocate_stable_id();
     sim.admit_projectile(id, spawn);

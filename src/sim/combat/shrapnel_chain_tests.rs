@@ -186,6 +186,8 @@ impl PrismScene {
             impact: bullet.position(),
             payload: bullet.payload(),
             reason: ProjectileDetonationReason::ReachedTarget,
+
+            firing_occupant: None,
         };
         let mut run = world_receiver::ReceiverRun::default();
         world_receiver::commit_projectiles(&mut self.world, &mut run, &[impact], &self.rules, None);
@@ -1057,6 +1059,8 @@ fn shrapnel_children_and_lasers_match_original_spawn_shrapnel() {
                 &mut world.interner,
             ),
             reason: ProjectileDetonationReason::ReachedTarget,
+
+            firing_occupant: None,
         };
         super::emit_projectile_shrapnel(
             &mut world,

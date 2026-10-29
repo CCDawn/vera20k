@@ -661,6 +661,8 @@ fn magnetron_temporary_bullet_tails_match_original_rng_lights_and_ids() {
                 impact,
                 payload,
                 reason: ProjectileDetonationReason::DeathWeapon,
+
+                firing_occupant: None,
             }],
             FrameEffects::default(),
         );
@@ -1369,6 +1371,8 @@ fn a_death_weapon_detonates_once_without_cluster_draws() {
         },
         payload,
         reason,
+
+        firing_occupant: None,
     };
     let before = sim.scenario_rng.state();
     sim.commit_logic_projectile_detonations(
