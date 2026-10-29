@@ -292,6 +292,9 @@ fn round_options(
             start_position: choices.start_position,
             team: choices.team,
             difficulty: options::decoded_difficulty(words.difficulty)?,
+            // The cooperative round record carries no Super AI tier; only
+            // this fork's own launch paths commission one.
+            super_tier: None,
         });
     }
     Ok(CooperativeRoundOptions {
