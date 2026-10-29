@@ -17,7 +17,7 @@
 //! - Reads from sim/ via EntityStore iteration (GameEntity fields).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::time::Instant;
+use crate::util::time::Instant;
 
 #[path = "unit_shadow_cache.rs"]
 mod shadow_cache;
@@ -84,6 +84,7 @@ pub enum PoseTilt {
     /// radians above the horizon, never zero here.
     Rocket(f32),
     /// Shared Drive4AFF60/Ship69F670 dynamic matrix, retained per Unit part.
+    /// Hover513F40's rocking arm draws it at slope 0.
     Ground(vxl_raster::GroundPose),
 }
 
@@ -218,7 +219,8 @@ pub struct UnitAtlasPage {
 
 /// Observation of resident palette-index textures, including unused page space.
 /// This excludes CPU caches, pose/slope caches, other atlases and driver overhead.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// The default is the receipt of an atlas never built: no sprites and no pages.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct UnitAtlasStatistics {
     pub resident_sprite_count: usize,
     /// Last non-no-op build's rasterized sprites, including shadow sprites;
@@ -574,11 +576,12 @@ fn render_unit_key(
     pose: &mut Option<PoseParts>,
 ) -> Option<RenderedKey> {
     let (sprite, native_draw_bounds) = model.render(key, vpl, None, pose)?;
+    // One companion per facing and slope, beside the flight template that
+    // the ground draw's key falls back to.
     let legacy_shadow = (key.layer == VxlLayer::Shadow
+        && key.frame == 0
         && native_draw_bounds.is_some()
-        && !model
-            .shadow
-            .is_some_and(|shadow| shadow.aircraft || shadow.jumpjet))
+        && model.shadow.is_some_and(|shadow| shadow.ground))
     .then(|| {
         let mut fallback_key = key.clone();
         fallback_key.frame = LEGACY_SHADOW_FRAME;
@@ -737,9 +740,7 @@ fn seed_unit_variant_keys(
     let barrel_pitches = rules
         .and_then(|rules| rules.object(variant))
         .map_or_else(|| vec![0], |object| unit_barrel_pitches(object.fire_angle));
-    let shadow = rules
-        .and_then(|rules| rules.object(variant))
-        .and_then(ShadowModel::for_object);
+    let shadow = rules.and_then(|rules| ShadowModel::for_type(rules, variant));
     let mut shadow_frames = 1;
     for (layer, turret_index) in layers {
         let frame_key = (variant.to_string(), layer, turret_index);
@@ -766,14 +767,16 @@ fn seed_unit_variant_keys(
         );
     }
     // Aircraft414728 includes the body frame remainder in its shadow cache
-    // key, but707280 still samples ShadowIndex's HVA frame zero.
+    // key, but707280 still samples ShadowIndex's HVA frame zero. Unit's key
+    // (73B619, 73C21E..73C287) carries no body frame.
     if is_ground_vehicle || shadow.is_some_and(|shadow| shadow.aircraft || shadow.jumpjet) {
+        let mut shadows = HashSet::new();
         insert_unit_layer_keys(
-            needed,
+            &mut shadows,
             variant,
             VxlLayer::Shadow,
             0,
-            if shadow.is_some_and(|s| s.aircraft || s.jumpjet) {
+            if shadow.is_some_and(|s| s.aircraft) {
                 shadow_frames
             } else {
                 1
@@ -781,22 +784,22 @@ fn seed_unit_variant_keys(
             true,
             &[0],
         );
-        if shadow.is_some_and(|shadow| shadow.jumpjet) {
-            let grounded: Vec<_> = needed
-                .iter()
-                .filter(|key| {
-                    key.type_id == variant
-                        && key.layer == VxlLayer::Shadow
-                        && key.frame & GROUNDED_SHADOW_FRAME_FLAG == 0
+        // Unit73C468's grounded mask has its own entry: on every slope under
+        // the Jumpjet suffix, and on level ground for Drive.
+        let grounded: Vec<_> = shadows
+            .iter()
+            .filter(|key| {
+                shadow.is_some_and(|shadow| {
+                    !shadow.aircraft && (shadow.jumpjet || key.slope_type == 0)
                 })
-                .cloned()
-                .map(|mut key| {
-                    key.frame |= GROUNDED_SHADOW_FRAME_FLAG;
-                    key
-                })
-                .collect();
-            needed.extend(grounded);
-        }
+            })
+            .map(|key| UnitSpriteKey {
+                frame: GROUNDED_SHADOW_FRAME_FLAG,
+                ..key.clone()
+            })
+            .collect();
+        needed.extend(shadows);
+        needed.extend(grounded);
     }
 }
 
@@ -845,6 +848,25 @@ fn needed_unit_keys(
     (needed, frame_counts)
 }
 
+/// Caller-owned upload state. Resident GPU pages never enter a raster worker.
+pub(crate) struct UnitAtlasUpload {
+    started: Instant,
+    frame_counts: UnitFrameCounts,
+    missing: UnitAtlasDemand,
+    existing: Option<UnitAtlas>,
+}
+
+/// Owned display inputs derived from the scene; no scene state is copied.
+pub(crate) struct UnitRasterWork {
+    models: Vec<(UnitModel, Vec<UnitSpriteKey>)>,
+    vpl: Option<VplFile>,
+    failed: BTreeMap<String, usize>,
+}
+
+pub(crate) struct UnitRasterOutput {
+    rendered: Vec<CachedUnitSprite>,
+}
+
 /// Build or refresh the unit sprite atlas for every voxel model in the world.
 ///
 /// Without an `existing` atlas every model's sprites are rendered and
@@ -866,6 +888,19 @@ pub fn build_unit_atlas(
     existing: Option<UnitAtlas>,
     interner: Option<&crate::sim::intern::StringInterner>,
 ) -> Option<UnitAtlas> {
+    let (work, upload) = prepare_unit_atlas(entities, asset_manager, rules, existing, interner);
+    upload.finish(device, queue, batch, work.render())
+}
+
+/// Freeze the physical source choices in their established model/key order.
+/// CPU raster scheduling may change; asset resolution and simulation do not.
+pub(crate) fn prepare_unit_atlas(
+    entities: &crate::sim::entity_store::EntityStore,
+    asset_manager: &AssetManager,
+    rules: Option<&RuleSet>,
+    existing: Option<UnitAtlas>,
+    interner: Option<&crate::sim::intern::StringInterner>,
+) -> (UnitRasterWork, UnitAtlasUpload) {
     let started = Instant::now();
     // Step 1: the voxel models the atlas has not collected yet — every one at
     // map load — and the keys they draw with. For turret units, separate
@@ -878,7 +913,19 @@ pub fn build_unit_atlas(
     };
     if missing.is_empty() {
         log::info!("No new voxel models — keeping the current unit atlas");
-        return existing;
+        return (
+            UnitRasterWork {
+                models: Vec::new(),
+                vpl: None,
+                failed: BTreeMap::new(),
+            },
+            UnitAtlasUpload {
+                started,
+                frame_counts: BTreeMap::new(),
+                missing,
+                existing,
+            },
+        );
     }
     let (needed, frame_counts) = needed_unit_keys(&missing, asset_manager, rules);
     // A type seeded as an aircraft after its ground variant (or the reverse)
@@ -919,12 +966,12 @@ pub fn build_unit_atlas(
         missing.len(),
     );
 
-    // Step 2: Render the new sprites.
-    let mut rendered: Vec<CachedUnitSprite> = Vec::with_capacity(new_keys.len());
-    let mut failed: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut models = Vec::new();
+    let mut failed = BTreeMap::new();
+    let mut vpl = None;
     if !new_keys.is_empty() {
         // Load VPL file for Blinn-Phong lighting lookup (optional).
-        let vpl: Option<VplFile> =
+        vpl =
             asset_manager
                 .get_ref("VOXELS.VPL")
                 .and_then(|data| match VplFile::from_bytes(data) {
@@ -941,22 +988,65 @@ pub fn build_unit_atlas(
                     }
                 });
 
-        // One model at a time, its poses spread over the cores. Each worker
-        // takes whole poses, so a pose's parts still share one render, and
-        // results are merged back in key order.
-        let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
         for type_keys in new_keys.chunk_by(|a, b| a.type_id == b.type_id) {
             let type_id = type_keys[0].type_id.as_str();
-            let Some(model) = UnitModel::load(asset_manager, type_id, rules) else {
-                *failed.entry(type_id).or_default() += type_keys.len();
-                continue;
-            };
+            if let Some(model) = UnitModel::load(asset_manager, type_id, rules) {
+                models.push((model, type_keys.to_vec()));
+            } else {
+                *failed.entry(type_id.to_string()).or_default() += type_keys.len();
+            }
+        }
+    }
+    (
+        UnitRasterWork {
+            models,
+            vpl,
+            failed,
+        },
+        UnitAtlasUpload {
+            started,
+            frame_counts,
+            missing,
+            existing,
+        },
+    )
+}
+impl UnitRasterWork {
+    /// Pure CPU work: all physical files and type metadata were resolved by
+    /// prepare_unit_atlas. It owns no simulation, asset manager or GPU handles.
+    pub(crate) fn render(self) -> UnitRasterOutput {
+        self.render_cancellable(&std::sync::atomic::AtomicBool::new(false))
+    }
+
+    pub(crate) fn render_cancellable(
+        self,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> UnitRasterOutput {
+        let mut rendered = Vec::new();
+        let mut failed = self.failed;
+        #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+        let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+        for (model, type_keys) in self.models {
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
             let poses: Vec<&[UnitSpriteKey]> = type_keys
                 .chunk_by(|a, b| {
                     (a.frame, a.facing, a.slope_type) == (b.frame, b.facing, b.slope_type)
                 })
                 .collect();
-            let (model, vpl) = (&model, vpl.as_ref());
+            let (model, vpl) = (&model, self.vpl.as_ref());
+            #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+            let results: Vec<Option<RenderedKey>> = {
+                let mut pose = None;
+                poses
+                    .iter()
+                    .flat_map(|keys| keys.iter())
+                    .take_while(|_| !cancelled.load(std::sync::atomic::Ordering::Relaxed))
+                    .map(|key| render_unit_key(model, key, vpl, &mut pose))
+                    .collect()
+            };
+            #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
             let results: Vec<Option<RenderedKey>> = std::thread::scope(|scope| {
                 let jobs: Vec<_> = poses
                     .chunks(poses.len().div_ceil(workers))
@@ -966,6 +1056,9 @@ pub fn build_unit_atlas(
                             chunk
                                 .iter()
                                 .flat_map(|keys| keys.iter())
+                                .take_while(|_| {
+                                    !cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                                })
                                 .map(|key| render_unit_key(model, key, vpl, &mut pose))
                                 .collect::<Vec<_>>()
                         })
@@ -984,7 +1077,7 @@ pub fn build_unit_atlas(
                         rendered.extend(legacy_shadow);
                         rendered.push(sprite);
                     }
-                    None => *failed.entry(key.type_id.as_str()).or_default() += 1,
+                    None => *failed.entry(key.type_id.clone()).or_default() += 1,
                 }
             }
         }
@@ -992,49 +1085,71 @@ pub fn build_unit_atlas(
         for (type_id, count) in failed {
             log::warn!("Failed to render {count} VXL sprites for {type_id}");
         }
+        UnitRasterOutput { rendered }
     }
-
-    // Step 3: shelf-pack into new pages at map load; afterwards append to a
-    // growth page so resident sprites are never repacked or re-uploaded.
-    let added = rendered.len();
-    let mut atlas = match existing {
-        Some(mut atlas) => {
-            atlas.append_sprites(device, queue, batch, rendered);
-            atlas
+}
+impl UnitAtlasUpload {
+    /// Main-thread completion of the same atlas owner used by map loading and
+    /// live growth. CPU workers never expose partially uploaded resources.
+    pub(crate) fn finish(
+        self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batch: &BatchRenderer,
+        output: UnitRasterOutput,
+    ) -> Option<UnitAtlas> {
+        let Self {
+            started,
+            frame_counts,
+            missing,
+            existing,
+        } = self;
+        if missing.is_empty() {
+            return existing;
         }
-        None if rendered.is_empty() => {
-            log::warn!("No unit sprites rendered");
-            return None;
-        }
-        None => match pack_sprites_on_device(device, queue, batch, &rendered) {
-            Ok(mut atlas) => {
-                atlas.rendered_cache = rendered;
+        let rendered = output.rendered;
+        // Step 3: shelf-pack into new pages at map load; afterwards append to a
+        // growth page so resident sprites are never repacked or re-uploaded.
+        let added = rendered.len();
+        let mut atlas = match existing {
+            Some(mut atlas) => {
+                atlas.append_sprites(device, queue, batch, rendered);
                 atlas
             }
-            Err(err) => {
-                log::error!("Unit atlas packing failed: {err}");
+            None if rendered.is_empty() => {
+                log::warn!("No unit sprites rendered");
                 return None;
             }
-        },
-    };
-    atlas.frame_counts.extend(frame_counts);
-    atlas.covered.extend(missing);
-    atlas.rendered = u32::try_from(added).unwrap_or(u32::MAX);
-    let page_dimensions = atlas
-        .pages
-        .iter()
-        .map(|page| format!("{}x{}", page.texture.width, page.texture.height))
-        .collect::<Vec<_>>()
-        .join(", ");
-    log::info!(
-        "Unit atlas: {} sprites added in {:.1} ms; {} sprites across {} page(s): {}",
-        added,
-        started.elapsed().as_secs_f64() * 1000.0,
-        atlas.sprite_count(),
-        atlas.page_count(),
-        page_dimensions,
-    );
-    Some(atlas)
+            None => match pack_sprites_on_device(device, queue, batch, &rendered) {
+                Ok(mut atlas) => {
+                    atlas.rendered_cache = rendered;
+                    atlas
+                }
+                Err(err) => {
+                    log::error!("Unit atlas packing failed: {err}");
+                    return None;
+                }
+            },
+        };
+        atlas.frame_counts.extend(frame_counts);
+        atlas.covered.extend(missing);
+        atlas.rendered = u32::try_from(added).unwrap_or(u32::MAX);
+        let page_dimensions = atlas
+            .pages
+            .iter()
+            .map(|page| format!("{}x{}", page.texture.width, page.texture.height))
+            .collect::<Vec<_>>()
+            .join(", ");
+        log::info!(
+            "Unit atlas: {} sprites added in {:.1} ms; {} sprites across {} page(s): {}",
+            added,
+            started.elapsed().as_secs_f64() * 1000.0,
+            atlas.sprite_count(),
+            atlas.page_count(),
+            page_dimensions,
+        );
+        Some(atlas)
+    }
 }
 
 // Physical admission has one GPU-independent owner shared with native
@@ -1080,24 +1195,44 @@ struct ShadowModel {
     index: i32,
     considered_aircraft: bool,
     aircraft: bool,
+    /// Draws through Unit73C1D2's Jumpjet suffix: on every slope, with its
+    /// grounded mask in a separate entry.
     jumpjet: bool,
+    /// Also draws its ground shadow outside that suffix, so its legacy
+    /// stencil stays resident beside a native one.
+    ground: bool,
 }
 
 impl ShadowModel {
-    fn for_object(object: &crate::rules::object_type::ObjectType) -> Option<Self> {
+    fn for_type(rules: &RuleSet, type_id: &str) -> Option<Self> {
         use crate::rules::locomotor_type::LocomotorKind;
-        let aircraft = object.category == crate::rules::object_type::ObjectCategory::Aircraft
+        use crate::rules::object_type::ObjectCategory;
+        let object = rules.object(type_id)?;
+        let aircraft = object.category == ObjectCategory::Aircraft
             && matches!(object.locomotor, LocomotorKind::Fly | LocomotorKind::Rocket);
-        let jumpjet = object.category == crate::rules::object_type::ObjectCategory::Vehicle
-            && object.locomotor == LocomotorKind::Jumpjet;
+        let vehicle = object.category == ObjectCategory::Vehicle;
+        let own_jumpjet = vehicle && object.locomotor == LocomotorKind::Jumpjet;
+        // An `IsLocomotor=` hit (BulletClass::DetonateAtCoord 0x004694CB,
+        // `sim::locomotor_lift`) installs its warhead's `Locomotor=` on a
+        // vehicle whose Size its shot exceeds (stock MagneticBeam's 5000
+        // exceeds every one's); a Jumpjet there (stock LocomotorBeam) draws
+        // the victim through that suffix, whose Shadow_Matrix is the base
+        // 0x0055A7D0 at its cell's slope.
+        let lifted = vehicle
+            && !own_jumpjet
+            && rules
+                .warheads_iter()
+                .any(|warhead| warhead.is_locomotor && warhead.locomotor == LocomotorKind::Jumpjet);
         (aircraft
-            || jumpjet
+            || own_jumpjet
+            || lifted
             || (object.locomotor == LocomotorKind::Drive && !object.considered_aircraft))
             .then_some(Self {
                 index: object.voxel_shadow_index(),
                 considered_aircraft: object.considered_aircraft,
                 aircraft,
-                jumpjet,
+                jumpjet: own_jumpjet || lifted,
+                ground: vehicle && !own_jumpjet,
             })
     }
 }
@@ -1162,9 +1297,7 @@ impl UnitModel {
             type_id: type_id.to_string(),
             body: Some(body),
             guns,
-            shadow: rules
-                .and_then(|r| r.object(type_id))
-                .and_then(ShadowModel::for_object),
+            shadow: rules.and_then(|rules| ShadowModel::for_type(rules, type_id)),
             use_buffer,
         })
     }
@@ -1213,11 +1346,15 @@ impl UnitModel {
         //706BD0->707280 caller supplies NULL for its body-mask surface.
         // Unit Jumpjet has a distinct grounded first-fill mask and fresh
         // positive low-flight masks; its high-flight template stays unmasked.
-        // Ground Drive retains its existing first-fill composed-body mask.
+        // Ground Drive retains its first-fill composed-body mask in the
+        // grounded entry a Track/Wheel type keys at 73C468, so a lifted
+        // vehicle's flight template stays unmasked.
         if key.layer == VxlLayer::Shadow
             && key.frame != LEGACY_SHADOW_FRAME
             && let Some(shadow) = self.shadow
-            && (shadow.aircraft || shadow.jumpjet || (params.slope_type == 0 && key.frame == 0))
+            && (shadow.aircraft
+                || shadow.jumpjet
+                || (params.slope_type == 0 && key.frame == GROUNDED_SHADOW_FRAME_FLAG))
             && let Some(body) = &self.body
         {
             let sprite = vxl_raster::shadow::render(
@@ -1227,7 +1364,7 @@ impl UnitModel {
                 shadow.index,
                 shadow.considered_aircraft,
             );
-            if (shadow.aircraft || shadow.jumpjet) && sprite.is_none() {
+            if (shadow.aircraft || (shadow.jumpjet && !shadow.ground)) && sprite.is_none() {
                 return None;
             }
             if let Some(sprite) = sprite {
@@ -1779,100 +1916,32 @@ fn plan_sprite_pages(
         }
     }
 
-    let mut indices: Vec<usize> = (0..dimensions.len()).collect();
-    indices.sort_by(|&a, &b| dimensions[b].1.cmp(&dimensions[a].1));
-
-    let total_area: u64 = dimensions
+    let sizes: Vec<[u32; 2]> = dimensions
         .iter()
-        .map(|&(width, height)| {
-            (width as u64 + SPRITE_PADDING as u64) * (height as u64 + SPRITE_PADDING as u64)
-        })
-        .sum();
-    let estimated_side = (total_area as f64).sqrt().ceil() as u32;
-    let widest_sprite = dimensions
-        .iter()
-        .map(|&(width, _)| width)
-        .max()
-        .unwrap_or(0);
-    let minimum_width = 64.min(max_texture_dim);
-    let mut page_width = estimated_side
-        .max(minimum_width)
-        .max(widest_sprite)
-        .min(max_texture_dim);
-
-    while simulate_shelf_height(&indices, dimensions, page_width) > max_texture_dim as u64
-        && page_width < max_texture_dim
-    {
-        page_width = page_width.saturating_mul(2).min(max_texture_dim);
-    }
-
-    let mut placements = Vec::with_capacity(dimensions.len());
-    let mut page_heights: Vec<u32> = Vec::new();
-    let mut page = 0usize;
-    let mut cursor_x = 0u32;
-    let mut cursor_y = 0u32;
-    let mut shelf_height = 0u32;
-
-    for &sprite_index in &indices {
-        let (width, height) = dimensions[sprite_index];
-        if cursor_x + width > page_width {
-            let next_y = cursor_y + shelf_height + SPRITE_PADDING;
-            if next_y + height > max_texture_dim {
-                page += 1;
-                cursor_x = 0;
-                cursor_y = 0;
-                shelf_height = 0;
-            } else {
-                cursor_x = 0;
-                cursor_y = next_y;
-                shelf_height = 0;
-            }
-        }
-        if cursor_y + height > max_texture_dim {
-            page += 1;
-            cursor_x = 0;
-            cursor_y = 0;
-            shelf_height = 0;
-        }
-
-        placements.push(UnitAtlasPlacement {
-            sprite_index,
-            page,
-            x: cursor_x,
-            y: cursor_y,
-        });
-        if page_heights.len() <= page {
-            page_heights.resize(page + 1, 0);
-        }
-        page_heights[page] = page_heights[page].max(cursor_y + height);
-        cursor_x += width + SPRITE_PADDING;
-        shelf_height = shelf_height.max(height);
-    }
-
+        .map(|&(width, height)| [width, height])
+        .collect();
+    let plan = atlas_growth::plan_initial_shelves(
+        &sizes,
+        atlas_growth::InitialShelfPolicy {
+            padding: SPRITE_PADDING,
+            max_dim: max_texture_dim,
+            split_pages: true,
+        },
+    );
     Ok(UnitAtlasPackPlan {
-        page_width,
-        page_heights,
-        placements,
+        page_width: plan.width,
+        page_heights: plan.page_heights,
+        placements: plan
+            .placements
+            .into_iter()
+            .map(|placed| UnitAtlasPlacement {
+                sprite_index: placed.index,
+                page: placed.page,
+                x: placed.origin[0],
+                y: placed.origin[1],
+            })
+            .collect(),
     })
-}
-
-fn simulate_shelf_height(indices: &[usize], dimensions: &[(u32, u32)], page_width: u32) -> u64 {
-    let mut cursor_x = 0u64;
-    let mut cursor_y = 0u64;
-    let mut shelf_height = 0u64;
-    for &sprite_index in indices {
-        let (width, height) = dimensions[sprite_index];
-        let width = width as u64;
-        let height = height as u64;
-        if cursor_x + width > page_width as u64 {
-            cursor_y += shelf_height + SPRITE_PADDING as u64;
-            cursor_x = 0;
-            shelf_height = 0;
-        }
-        cursor_x += width + SPRITE_PADDING as u64;
-        shelf_height = shelf_height.max(height);
-    }
-    cursor_y + shelf_height
 }
 
 /// Shelf-pack cached sprites into lossless GPU texture pages.

@@ -64,10 +64,11 @@ impl NetworkFailureModal {
 
 pub(crate) fn pending(state: &AppState) -> bool {
     state.frontend.screen == crate::app::GameScreen::InGame
-        && state.match_state.sim_runtime.as_ref().is_some_and(|rt| {
-            rt.simulation.pending_network_failure().is_some()
-                || rt.simulation.pending_network_interruption().is_some()
-        })
+        && (state.match_state.frame_stopped
+            || state.match_state.sim_runtime.as_ref().is_some_and(|rt| {
+                rt.simulation.pending_network_failure().is_some()
+                    || rt.simulation.pending_network_interruption().is_some()
+            }))
 }
 
 /// Also used for a restored suspended frame: no second mismatch record or

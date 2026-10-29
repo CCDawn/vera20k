@@ -97,6 +97,7 @@ fn counted_action94_uses_ground_then_real_frame_damage_and_cleanup() {
         &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
         None,
         None,
+        None,
     );
     sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
     sim.session.publish_started();

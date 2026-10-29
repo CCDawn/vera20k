@@ -84,6 +84,7 @@ pub struct TacticalPointViewport {
     pub z_bottom_term: i16,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub struct TacticalCompatFrame<'a> {
     pub a_plane: WordPlane<'a>,
@@ -135,6 +136,7 @@ pub enum PointRejectReason {
     InvalidColorIndex,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackedPointWrite {
     pub screen: IVec2,
@@ -143,6 +145,7 @@ pub struct PackedPointWrite {
     pub draw_ordinal: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointResolution {
     Rejected(PointRejectReason),

@@ -28,7 +28,7 @@ pub struct LanOptionsFields<'a> {
 
 impl LanMessage {
     /// 5DEAC7..5DEB49 and5E8DC0 append every row and a trailing wide comma.
-    pub fn roster(sender: &str, slots: &[&str; 8]) -> Result<Self, LanMessageError> {
+    pub fn roster(sender: &str, slots: &[&str]) -> Result<Self, LanMessageError> {
         let mut units = Vec::new();
         for name in slots {
             units.extend(name.encode_utf16().take_while(|unit| *unit != 0));
@@ -172,7 +172,7 @@ pub struct LanOptionsAi {
 /// outputs; the app/session remains their authority. No map or rules defaults
 /// are invented by the wire encoder.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LanGameOptions {
+pub struct LanGameOptions<const N: usize = 8> {
     pub seed: u32,
     pub current_speed: i32,
     pub game_speed: i32,
@@ -193,10 +193,10 @@ pub struct LanGameOptions {
     pub scenario_filename: String,
     pub map_digest: String,
     pub humans: Vec<LanOptionsHuman>,
-    pub ai: [LanOptionsAi; 8],
+    pub ai: [LanOptionsAi; N],
 }
 
-impl LanGameOptions {
+impl<const N: usize> LanGameOptions<N> {
     /// 5DBB60 uses signed `%d`, three literal zero `%x` fields per human,
     /// then the `@:` sentinel and all eight AI rows including their last comma.
     pub fn encode(&self) -> Vec<u8> {
@@ -246,7 +246,11 @@ impl LanGameOptions {
             *out.last_mut().expect("a human record ends in a comma") = b':';
         }
         out.extend(b"@:");
-        for ai in self.ai {
+        for ai in self
+            .ai
+            .iter()
+            .take(if self.map_player_capacity > 8 { N } else { 8 })
+        {
             out.extend(
                 format!(
                     "{},{},{},{},{},",

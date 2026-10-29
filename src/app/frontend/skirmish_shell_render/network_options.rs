@@ -19,7 +19,7 @@ use crate::render::shell_text::{self, ShellAlign, ShellTextDraw};
 use crate::render::shell_text_reveal::PathAReveal;
 use crate::ui::network_options::{OK, PAGE};
 use crate::ui::shell::geom::{RectPx, ShellScale};
-use std::time::Instant;
+use crate::util::time::Instant;
 
 pub(crate) fn render_network_options(
     state: &mut AppState,
@@ -131,10 +131,11 @@ pub(crate) fn render_network_options(
             let top = (font.cell_height() * scale.factor()).round() as i32 / 2;
             push_group_or_plain_frame(
                 &mut controls,
-                atlas,
+                atlas.white_pixel,
                 RectPx::new(rect.x, rect.y + top, rect.w, rect.h - top),
                 Some((font.text_width(&caption) as f32 * scale.factor()).round() as i32),
                 false,
+                ShellScale::RETAIL,
             );
             texts.push(text(
                 &caption,
@@ -187,7 +188,7 @@ pub(crate) fn render_network_options(
             ControlPaint::Combo {
                 rect: layout.card,
                 swatch: None,
-                open: dialog.combo_open,
+                open: dialog.popup.control.is_some(),
                 disabled: false,
             },
             scale,
@@ -268,11 +269,12 @@ pub(crate) fn render_network_options(
                 &mut overlay.controls,
                 atlas,
                 popup.rect,
-                dialog.card_hot_row.and_then(|index| popup.row_rect(index)),
+                dialog.popup.hot_row.and_then(|index| popup.row_rect(index)),
                 [],
                 popup.scrollbar().zip(popup.thumb()),
                 dialog
-                    .card_scroll
+                    .popup
+                    .scroll
                     .pressed_part()
                     .map(super::controls::dropdown_scroll_part),
                 scale,

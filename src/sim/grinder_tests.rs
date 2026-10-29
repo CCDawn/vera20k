@@ -499,7 +499,7 @@ fn sov03_authored_trigger80_teams_walk_and_recycle_all_four_civilian_types() {
             u16::try_from(source_x).unwrap(),
             u16::try_from(source_y).unwrap(),
         );
-        sim.initialize_trigger_definitions(&cropped, &teams, None, None);
+        sim.initialize_trigger_definitions(&cropped, &teams, None, None, None);
         sim.classify_map_triggers(&rules);
         let frame = |sim: &mut Simulation| {
             sim.advance_app_frame(
@@ -796,7 +796,7 @@ fn arrival_callbacks_precede_refund_and_playback_precedes_the_next_main_draw() {
     )
     .unwrap();
     let teams = TeamAiIniRegistry::from_sources(&IniFile::from_str(""), &map.ini, false);
-    sim.initialize_trigger_definitions(&map, &teams, None, None);
+    sim.initialize_trigger_definitions(&map, &teams, None, None, None);
     sim.classify_map_triggers(&rules);
     sim.attach_object_trigger_tag(grinder, Some("OWNER_TAG"));
     sim.attach_object_trigger_tag(civ, Some("DONE_TAG"));

@@ -8,8 +8,9 @@
 //! - ui/ does NOT depend on: assets/, render/, audio/, net/
 
 pub mod campaign_score_shell;
-pub mod campaign_shell;
 pub(crate) mod coop_score_shell;
+pub mod campaign_shell;
+pub(crate) mod chat_translation;
 pub mod gadget;
 pub mod game_screen;
 pub(crate) mod lan_shell;
@@ -25,6 +26,8 @@ pub mod shell;
 pub mod sidebar;
 pub mod single_player_shell;
 pub mod skirmish_shell;
+#[cfg(feature = "phobos")]
+pub mod sw_sidebar;
 pub mod tooltips;
 pub(crate) mod wol_buddy;
 pub(crate) mod wol_chat;

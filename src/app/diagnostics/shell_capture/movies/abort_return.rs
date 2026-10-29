@@ -37,6 +37,7 @@ use winit::event::{ElementState, MouseButton};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AbortInputPhase {
+    AwaitMenu,
     Menu,
     AbortPressed,
     Modal,
@@ -105,6 +106,31 @@ impl AbortReturnInput {
         frame: u32,
         choice: Option<AbortButton>,
     ) -> Result<Self> {
+        Self::begin_mode(state, route, frame, choice, true)
+    }
+
+    /// Live peers must advance only through their normal frame boundary. Queue
+    /// Options through the keyboard and wait for the actual menu to appear.
+    pub(super) fn begin_network_observe(
+        state: &mut AppState,
+        route: &mut Vec<Value>,
+        frame: u32,
+    ) -> Result<Self> {
+        Self::begin_mode(state, route, frame, Some(AbortButton::Secondary), false)
+    }
+
+    fn begin_mode(
+        state: &mut AppState,
+        route: &mut Vec<Value>,
+        frame: u32,
+        choice: Option<AbortButton>,
+        advance: bool,
+    ) -> Result<Self> {
+        // Queue_Options647040 publishes an event; EventClass4C7929..4C7939
+        // opens the menu only when that event executes. Network diagnostics
+        // await the ordinary frame owner, as live Observe already does; their
+        // frozen MatchSession start is not an offline exact-step L0 receipt.
+        let advance = advance && !state.match_state.session_mode().is_network();
         // Ordinary world Escape resolves the actual binding before
         // Options enters B5, exactly as the window handler does.
         ensure!(
@@ -127,19 +153,25 @@ impl AbortReturnInput {
         );
         // Queue_Options647040 publishes an OPTIONS event. Its ordinary
         // EventClass tail, rather than the key edge, requests the modal.
-        if state.match_state.match_presentation.in_game_menu
-            != crate::ui::pause_menu::InGameMenuState::Menu
+        if advance
+            && state.match_state.match_presentation.in_game_menu
+                != crate::ui::pause_menu::InGameMenuState::Menu
         {
             crate::app::match_runtime::sim_tick::advance_in_game_runtime_exact_step(state)?;
         }
         ensure!(
-            state.match_state.match_presentation.in_game_menu
-                == crate::ui::pause_menu::InGameMenuState::Menu,
+            !advance
+                || state.match_state.match_presentation.in_game_menu
+                    == crate::ui::pause_menu::InGameMenuState::Menu,
             "ordinary Escape did not open B5"
         );
         route.push(json!({"frame": frame, "action": "Escape press", "dialog": menu_dialog(state)}));
         Ok(Self {
-            phase: AbortInputPhase::Menu,
+            phase: if advance {
+                AbortInputPhase::Menu
+            } else {
+                AbortInputPhase::AwaitMenu
+            },
             choice,
             stop_at_menu: false,
             menu_press: PauseMenuButton::Abort,
@@ -152,7 +184,14 @@ impl AbortReturnInput {
         route: &mut Vec<Value>,
         frame: u32,
     ) -> Result<bool> {
+        if self.phase == AbortInputPhase::AwaitMenu {
+            if state.match_state.match_presentation.in_game_menu != InGameMenuState::Menu {
+                return Ok(false);
+            }
+            self.phase = AbortInputPhase::Menu;
+        }
         match self.phase {
+            AbortInputPhase::AwaitMenu => unreachable!("menu wait returned above"),
             AbortInputPhase::Menu => {
                 ensure!(
                     state.match_state.match_presentation.in_game_menu == InGameMenuState::Menu

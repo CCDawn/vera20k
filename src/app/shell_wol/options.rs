@@ -27,10 +27,20 @@ pub(crate) struct WolOptionsPage {
 
 pub(crate) fn layout(state: &AppState) -> WolOptionsLayout {
     let (width, height) = shell_layout::shell_screen_size(state);
-    if shell_layout::fills_window(state) {
+    let layout = if shell_layout::fills_window(state) {
         WolOptionsLayout::responsive(width as i32, height as i32)
     } else {
         WolOptionsLayout::new(width as i32, height as i32)
+    };
+    if state
+        .frontend
+        .wol
+        .as_ref()
+        .is_some_and(|visit| visit.modern_ui())
+    {
+        layout.modern()
+    } else {
+        layout
     }
 }
 
@@ -151,13 +161,16 @@ pub(crate) fn commit_close(state: &mut AppState, staged: Option<WolPreferences>)
 /// `0xD6` because the handler cleared `g_GameActive` (`0x0078EEAD`).
 pub(crate) fn commit_open_sound(state: &mut AppState) {
     let positions = crate::app::input::sound::volume_positions(state);
+    let sliders_enabled = state.audio.launcher_audio_available;
     let Some(page) = page_mut(state) else {
         return;
     };
     page.ui.buttons = Default::default();
     page.ui.hovered = None;
     // GameActive 0 skips the track list init (0x006B6485).
-    page.sound = Some(SoundState::new(positions, Vec::new(), -1));
+    let mut sound = SoundState::new(positions, Vec::new(), -1);
+    sound.sliders_enabled = sliders_enabled;
+    page.sound = Some(sound);
     open_sound_art(state);
     state
         .frontend

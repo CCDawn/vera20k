@@ -267,8 +267,8 @@ pub(crate) struct WolOptionsLayout {
     pub(crate) page: MenuPageLayout,
     /// Status line `0x695`: the template is 316 DLU wide here.
     pub(crate) status_help: RectPx,
-    /// Template order, as [`CHECKBOXES`].
-    pub(crate) checkboxes: [RectPx; 9],
+    /// Template order, as [`CHECKBOXES`]; `None` for a box the page hides.
+    pub(crate) checkboxes: [Option<RectPx>; 9],
 }
 
 impl WolOptionsLayout {
@@ -311,9 +311,28 @@ impl WolOptionsLayout {
             status_help,
             checkboxes: CHECKBOXES.map(|checkbox| {
                 let (x, y, w, h) = checkbox.dlu;
-                scale.scale_rect(child_window(x, y, w, h))
+                Some(scale.scale_rect(child_window(x, y, w, h)))
             }),
         }
+    }
+
+    /// The modern page keeps Play Music alone, in the first row; the other
+    /// boxes neither draw nor hit. Paging, finding and the bad-language
+    /// filter have no online service, nothing reads Show All, the language
+    /// filters count any text beyond Latin-1 as Asian (`0x007B7D90`), and
+    /// with no buddy list or clans Filter Buddies hides every sender and
+    /// Filter Clan none. Native diagnostics keep the retail page through the
+    /// same layout and state owners.
+    pub(crate) fn modern(mut self) -> Self {
+        let first_row = self.checkboxes[0];
+        for (checkbox, rect) in CHECKBOXES.iter().zip(&mut self.checkboxes) {
+            *rect = if checkbox.id == MUSIC {
+                first_row
+            } else {
+                None
+            };
+        }
+        self
     }
 
     /// The control under `(x, y)`, buttons first, then the checkboxes.
@@ -324,14 +343,15 @@ impl WolOptionsLayout {
         CHECKBOXES
             .iter()
             .zip(self.checkboxes)
-            .find_map(|(checkbox, rect)| rect.contains(x, y).then_some(checkbox.id))
+            .find_map(|(checkbox, rect)| rect?.contains(x, y).then_some(checkbox.id))
     }
 
     pub(crate) fn checkbox_rect(&self, id: u16) -> Option<RectPx> {
         CHECKBOXES
             .iter()
             .zip(self.checkboxes)
-            .find_map(|(checkbox, rect)| (checkbox.id == id).then_some(rect))
+            .find(|(checkbox, _)| checkbox.id == id)
+            .and_then(|(_, rect)| rect)
     }
 }
 
@@ -377,6 +397,25 @@ mod tests {
             let id = u16::from_str_radix(&key[2..], 16).unwrap();
             assert_eq!(tooltip_key(id), help.as_str(), "{key}");
         }
+    }
+
+    #[test]
+    fn modern_page_keeps_only_play_music() {
+        let retail = WolOptionsLayout::responsive(1600, 1200);
+        let modern = WolOptionsLayout::responsive(1600, 1200).modern();
+        assert_eq!(modern.checkbox_rect(MUSIC), retail.checkbox_rect(PAGES));
+        for checkbox in CHECKBOXES.iter().filter(|checkbox| checkbox.id != MUSIC) {
+            assert_eq!(modern.checkbox_rect(checkbox.id), None);
+        }
+        let center = |id| {
+            let rect = retail.checkbox_rect(id).unwrap();
+            (rect.x + rect.w / 2, rect.y + rect.h / 2)
+        };
+        let (x, y) = center(PAGES);
+        assert_eq!(modern.control_at(x, y), Some(MUSIC));
+        let (x, y) = center(LANGUAGE);
+        assert_eq!(modern.control_at(x, y), None);
+        assert_eq!(retail.control_at(x, y), Some(LANGUAGE));
     }
 
     #[test]

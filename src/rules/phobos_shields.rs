@@ -55,7 +55,7 @@ impl AffectedHouse {
     /// `Read<AffectedHouse>`: every token must match a known spelling, or the
     /// whole read fails and the caller retains its current value.
     #[cfg(feature = "phobos")]
-    fn parse(raw: &str) -> Option<Self> {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         let mut parsed = Self::NONE;
         for part in raw.split(',') {
             let token = part.trim_matches(|c| matches!(c, ' ' | '\t' | '\r'));

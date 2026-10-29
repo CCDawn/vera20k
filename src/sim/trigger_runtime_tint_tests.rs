@@ -17,7 +17,7 @@ fn action(kind: i32, operand: &str) -> RuntimeAction {
         .unwrap()
         .entries()[0]
         .clone();
-    RuntimeDefinitions::default().resolve_action(entry, None, None)
+    RuntimeDefinitions::default().resolve_action(entry, None, None, None)
 }
 
 fn run(sim: &mut Simulation, action: &RuntimeAction) -> bool {
@@ -120,6 +120,7 @@ fn ordered_tag_rgb_actions_then_the_production_fade_keep_distinct_palette_operat
     sim.initialize_trigger_definitions(
         &map,
         &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
+        None,
         None,
         None,
     );

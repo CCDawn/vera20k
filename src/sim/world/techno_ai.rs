@@ -199,8 +199,8 @@ impl Simulation {
     /// either side of the object's own locomotion, and both checkpoints are the
     /// same pair of virtuals — the readiness predicate at self-vtable `+0x200`
     /// followed by `Commence` at `+0x1ec` when it returns true. Our object-AI
-    /// stage is the first checkpoint (it runs immediately before Phase-1 ground
-    /// movement); this is the second.
+    /// stage is the first checkpoint (it runs immediately before the object's
+    /// own ground movement); this is the second.
     ///
     /// Without it a unit that came to rest during its own movement step could
     /// not commence until the next tick, so every mission commencement that
@@ -1065,6 +1065,20 @@ fn veterancy_promotion_step(
             rules.general.upgrade_veteran_sound.as_deref()
         }
     };
+    // Installed Ares promotion10046AF0: veteran10046BBA..10046BD6,
+    // elite10046C12..10046C2D choose the TypeExt NullableIdx<Voc> before
+    // the same ordered sound/EVA dispatch10046D2F..10046D56. Unset uses
+    // Rules+228/+22C; an explicit -1 suppresses sound, not the EVA.
+    #[cfg(feature = "ares")]
+    let sound = interner
+        .object_type_in_category(entity.type_ref(), entity.category().into(), rules)
+        .and_then(|object| {
+            object.promotion_sound_override(matches!(
+                promotion,
+                crate::sim::combat::veterancy::Promotion::Elite
+            ))
+        })
+        .unwrap_or(sound);
     let sound_id = sound.map(|name| interner.intern(name));
     sound_events.emit(super::SimSoundEvent::UnitPromoted {
         owner,
@@ -1456,13 +1470,25 @@ fn techno_common_steps(
     effects: FrameEffects<'_>,
     turret_rotate_sample: Option<bool>,
 ) -> bool {
+    // Ares TechnoClass_Update1004B348..1004B397 converts for the current
+    // surface before the same visit updates self-attached effects1004B434.
+    #[cfg(feature = "ares")]
+    sim.update_ares_surface_conversion(id, rules, effects);
     // Ares1004B434 updates attachments before1004B528 EMP recovery.
     #[cfg(feature = "ares")]
     sim.update_ares_attach_effects(id, rules);
+    #[cfg(feature = "ares")]
+    sim.update_ares_operator_operability(id, rules, effects);
     // Installed6F9E50 ->1004B320 owns delayed Building reactivation before
     //the stock head. EMP expiry itself must not invent a future-power sweep.
     #[cfg(feature = "ares")]
     sim.update_ares_emp_operability(id, rules, effects);
+    #[cfg(feature = "ares")]
+    sim.update_ares_driver_killed_mission(id, rules, overlay_registry, effects);
+    // Ares1004B64B..1004B658 follows the extension updates and precedes
+    // the original common head, consuming a ready displayed bounty sum.
+    #[cfg(feature = "ares")]
+    sim.flush_bounty_display(id, rules, effects, false);
     // Techno6F9E70..6F9EA8 re-drives +4A4 at Location before mission
     // Stop/Release. A zero gain must stop a live loop before Guard can
     // release it to decay at the previous gain.
@@ -2180,6 +2206,10 @@ fn techno_common_post(sim: &mut Simulation, id: u64, rules: &RuleSet, _effects: 
     flash_step(&mut sim.substrate, id, sim.session.binary_frame());
 
     sim.update_damage_spark_after_ai(id, rules);
+    // Techno6FAF01..6FAF07 invokes virtual+4A0(0), after damage sparks and
+    // before EMP. Its simulation discovery prelude is independent of radar
+    // presentation, viewport admission and rendering cadence.
+    sim.update_techno_discovery_from_shroud(id);
     // Installed Ares6FAF0D ->10053DF0, after the ordinary Techno tail.
     // No global frame sweep: limbo/skipped/dead visits never reach this slot.
     #[cfg(feature = "ares")]
@@ -5764,3 +5794,11 @@ mod mirage_disguise_tests;
 
 #[cfg(any(test, feature = "test-support"))]
 use super::bridge_test_evidence;
+
+#[cfg(test)]
+#[path = "techno_ai/promotion_sound_tests.rs"]
+mod promotion_sound_tests;
+
+#[cfg(test)]
+#[path = "techno_ai/surface_conversion_tests.rs"]
+mod surface_conversion_tests;

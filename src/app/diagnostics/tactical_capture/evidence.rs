@@ -184,7 +184,6 @@ impl GraphicsEvidence {
         window_scale_factor: f64,
         surface_format: impl Into<String>,
         render_extent: [u32; 2],
-        app_ui_scale: f32,
         bitmap_font: BitmapFontEvidence,
     ) -> Result<Self> {
         ensure!(
@@ -194,10 +193,6 @@ impl GraphicsEvidence {
         ensure!(
             window_scale_factor.is_finite() && window_scale_factor > 0.0,
             "tactical window scale factor must be finite and positive"
-        );
-        ensure!(
-            app_ui_scale.is_finite() && app_ui_scale > 0.0,
-            "tactical app UI scale must be finite and positive"
         );
         let surface_format = surface_format.into();
         ensure!(
@@ -211,7 +206,9 @@ impl GraphicsEvidence {
             width: render_extent[0],
             height: render_extent[1],
             window_scale_factor,
-            app_ui_scale: f64::from(app_ui_scale),
+            // Sidebar artwork draws one render pixel per asset pixel; sealed
+            // profiles pin this at 1.0 (profile.rs validate_capture).
+            app_ui_scale: 1.0,
             bitmap_font,
         })
     }

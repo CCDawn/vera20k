@@ -107,6 +107,12 @@ english.GameCheckOptionalHeading=Optional content - installation can continue:
 english.GameCheckFailed=Setup could not check this folder. Choose another folder or try again.%n%1
 english.GameCheckNoFolder=No game folder was selected.
 english.ConfigNotWritten=Setup could not write %1.
+english.ReadyFiles=Files to install / replace:
+english.ReadyChanges=Other changes:
+english.ReadyConfigNew=Create config.toml with the selected game folder.
+english.ReadyConfigExisting=Keep config.toml settings; update the game-folder path.
+english.ReadyExtras=Add an Inno Setup uninstaller and a Start menu shortcut.
+english.ReadyPreserved=Existing saves, replays and personal settings are kept.
 chinesesimplified.GameDirCaption=《尤里的复仇》文件夹
 chinesesimplified.GameDirDescription=《尤里的复仇》安装在哪里？
 chinesesimplified.GameDirSubCaption=请选择一个安装，或浏览其他文件夹。
@@ -148,12 +154,19 @@ chinesesimplified.GameCheckOptionalHeading=可选内容 - 可以继续安装：
 chinesesimplified.GameCheckFailed=安装程序无法检查此文件夹。请选择其他文件夹或重试。%n%1
 chinesesimplified.GameCheckNoFolder=尚未选择游戏文件夹。
 chinesesimplified.ConfigNotWritten=安装程序无法写入 %1。
+chinesesimplified.ReadyFiles=将安装或替换的文件：
+chinesesimplified.ReadyChanges=其他更改：
+chinesesimplified.ReadyConfigNew=创建 config.toml，记录所选游戏文件夹。
+chinesesimplified.ReadyConfigExisting=保留 config.toml 中的设置，仅更新游戏文件夹路径。
+chinesesimplified.ReadyExtras=添加 Inno Setup 卸载程序和开始菜单快捷方式。
+chinesesimplified.ReadyPreserved=保留已有的存档、录像和个人设置。
 
 [Files]
 Source: "vera20k.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "config.toml.example"; DestDir: "{app}"; Flags: ignoreversion
 Source: "README.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "LICENSE-GPL"; DestDir: "{app}"; Flags: ignoreversion
+Source: "LGPL-2.1-or-later.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "THIRD_PARTY_LICENSES.html"; DestDir: "{app}"; Flags: ignoreversion
 
 [Tasks]
@@ -732,6 +745,42 @@ end;
 procedure RegisterPreviousData(PreviousDataKey: Integer);
 begin
   SetPreviousData(PreviousDataKey, 'GameDir', GameDir());
+end;
+
+procedure AppendReadySection(var Memo: String; Section, NewLine: String);
+begin
+  if Section = '' then
+    Exit;
+  if Memo <> '' then
+    Memo := Memo + NewLine + NewLine;
+  Memo := Memo + Section;
+end;
+
+function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo,
+  MemoTypeInfo, MemoComponentsInfo, MemoGroupInfo, MemoTasksInfo: String): String;
+var
+  ConfigInfo: String;
+begin
+  { Use the standard Ready memo and retain Inno Setup's normal sections.
+    Keep the filenames below aligned with the six packaged [Files] entries. }
+  Result := '';
+  AppendReadySection(Result, MemoUserInfoInfo, NewLine);
+  AppendReadySection(Result, MemoDirInfo, NewLine);
+  AppendReadySection(Result, MemoTypeInfo, NewLine);
+  AppendReadySection(Result, MemoComponentsInfo, NewLine);
+  AppendReadySection(Result, MemoGroupInfo, NewLine);
+  AppendReadySection(Result, CustomMessage('ReadyFiles') + NewLine +
+    Space + 'vera20k.exe, config.toml.example, README.txt' + NewLine +
+    Space + 'LICENSE-GPL, LGPL-2.1-or-later.txt, THIRD_PARTY_LICENSES.html', NewLine);
+  if FileExists(AddBackslash(WizardDirValue()) + 'config.toml') then
+    ConfigInfo := CustomMessage('ReadyConfigExisting')
+  else
+    ConfigInfo := CustomMessage('ReadyConfigNew');
+  AppendReadySection(Result, CustomMessage('ReadyChanges') + NewLine +
+    Space + ConfigInfo + NewLine + Space + CustomMessage('ReadyExtras'), NewLine);
+  AppendReadySection(Result, MemoTasksInfo, NewLine);
+  AppendReadySection(Result, CustomMessage('ReadyPreserved') + NewLine +
+    CustomMessage('GameInstallUntouched'), NewLine);
 end;
 
 { Whether Line assigns Key: `key = ...`, or with Commented `# key = ...`. }

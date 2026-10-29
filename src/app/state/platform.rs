@@ -63,6 +63,8 @@ pub(crate) struct PlatformState {
     /// The physical modifier keys held, the source both modifier views are
     /// derived from (see `HeldModifierKeys`).
     pub(crate) held_modifier_keys: crate::app::input::hotkeys::HeldModifierKeys,
+    /// The input method's state for the chat edits (`app::input::ime`).
+    pub(crate) ime: crate::app::input::ime::ImeState,
     /// Whether this application currently owns the foreground.
     ///
     /// gamemd tracks the same edge-triggered byte from `WM_ACTIVATEAPP` and
@@ -119,6 +121,7 @@ impl PlatformState {
             os_cursor_visible: None,
             live_modifiers: winit::keyboard::ModifiersState::empty(),
             held_modifier_keys: Default::default(),
+            ime: Default::default(),
             window_active: true,
             pause_on_focus_loss,
             window_hidden: false,
@@ -129,14 +132,13 @@ impl PlatformState {
         }
     }
 
-    /// Is the match frozen because the window is not the foreground?
-    ///
-    /// True only while the window is deactivated and `pause_on_focus_loss` is
-    /// configured; the single gate for the simulation and the message clock.
+    /// True while the window is deactivated and `pause_on_focus_loss` is
+    /// configured; [`super::AppState::focus_freeze_active`] adds the session
+    /// gate and is the single gate for the simulation and the message clock.
     /// The audio stop is deliberately not part of it: gamemd gates its primary
     /// output on the activation edge itself, so that gate follows
     /// [`Self::window_active`] alone.
-    pub(crate) fn focus_freeze_active(&self) -> bool {
+    pub(crate) fn focus_freeze_configured(&self) -> bool {
         self.pause_on_focus_loss && !self.window_active
     }
 }

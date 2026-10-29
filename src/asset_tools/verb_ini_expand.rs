@@ -21,8 +21,16 @@ pub fn run(
         .resolve_ref(name)
         .ok_or_else(|| fail(format!("INI {name} is unavailable")))?;
     let raw = IniFile::from_bytes(raw.bytes).map_err(|e| fail(e.to_string()))?;
-    let selected = select_ini_with_options(assets, name, DirectiveOptions { strict, max_depth })
-        .map_err(fail)?;
+    let selected = select_ini_with_options(
+        assets,
+        name,
+        DirectiveOptions {
+            strict,
+            max_depth,
+            ..DirectiveOptions::default()
+        },
+    )
+    .map_err(fail)?;
     let raw_names: BTreeSet<_> = raw.section_names().into_iter().collect();
     let names: BTreeSet<_> = selected.ini.section_names().into_iter().collect();
     let added: Vec<_> = names.difference(&raw_names).copied().collect();

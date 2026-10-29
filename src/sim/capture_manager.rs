@@ -152,6 +152,11 @@ impl CaptureManagerState {
         i32::try_from(self.nodes.len()).unwrap_or(i32::MAX)
     }
 
+    /// `+0x3C MaxControlNodes`, the native display maximum.
+    pub fn max_control(&self) -> i32 {
+        self.max_control
+    }
+
     /// `IsOverloading @ 0x004726C0`: no extra pip unless an infinite
     /// manager exceeds its retained capacity. The returned bool is the
     /// native out-parameter (`+0x44 > 0`), which selects the active frame.
@@ -381,6 +386,13 @@ impl MindControlLink {
         self.house_controller
     }
 
+    /// Installed Ares KillDriver10045892 clears Techno+2CC explicitly;
+    /// ordinary ChangeOwner deliberately preserves this separate controller.
+    #[cfg(feature = "ares")]
+    pub(crate) fn clear_house_controller(&mut self) {
+        self.house_controller = None;
+    }
+
     pub(crate) fn house_original_owner(&self) -> Option<InternedId> {
         self.house_original_owner
     }
@@ -445,8 +457,16 @@ impl CaptureVictimFacts {
                 target.invulnerability.as_ref(),
                 frame,
             )
-            // CanCapture's gate 9 (`0x00471D1E..0x00471D2C`).
-            || target.constructing_or_selling();
+            // CanCapture471D1E..471D2C reads raw current +AC for every
+            // Techno. A queued Construction is still capturable until it
+            // commences; GetFireError repeats this gate at discharge.
+            || matches!(
+                target.mission.current().known(),
+                Some(MissionType::Construction | MissionType::Selling)
+            );
+        // Ares CanCapture10048FB8 refuses a killed driver for every consumer.
+        #[cfg(feature = "ares")]
+        let refused = refused || target.driver_killed();
         Self {
             owner: target.owner(),
             capturable: !refused,
@@ -645,6 +665,11 @@ impl Simulation {
         let Some(object) = self.substrate.entities.get(id) else {
             return false;
         };
+        // Ares CanBePermaMindControlled10049E54 shares the driverless refusal.
+        #[cfg(feature = "ares")]
+        if object.driver_killed() {
+            return false;
+        }
         if object.category() == EntityCategory::Structure {
             return false;
         }
@@ -691,6 +716,19 @@ impl Simulation {
         }
         if let Some(ring) = rules.mind_control.perma_controlled_anim.as_deref() {
             self.attach_control_ring(id, ring, rules);
+        }
+    }
+
+    /// Installed Ares capture10045C03..10045C1C clears permanent control
+    /// and UnInit's the ring after any controller's FreeUnit has finished.
+    #[cfg(feature = "ares")]
+    pub(crate) fn clear_permanent_control_and_ring(&mut self, id: u64, rules: &RuleSet) {
+        let ring = self.substrate.entities.get_mut(id).and_then(|object| {
+            object.mind_control.permanent = false;
+            object.mind_control.ring_anim.take()
+        });
+        if let Some(ring) = ring {
+            self.destroy_anim(ring, rules);
         }
     }
 

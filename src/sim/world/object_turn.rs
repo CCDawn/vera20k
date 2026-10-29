@@ -990,6 +990,20 @@ impl Simulation {
             body_frame_before_process,
             rules,
         );
+        // Foot AI 4DAB3C..4DABB1: a DropAsBomb object starting to fall plays
+        // its type's VoiceFalling at its Location, before the sinking/crash
+        // edges and looping-sound position update (PlayAt7509E0, ungated).
+        if let Some(entity) = sim.substrate.entities.get_mut(stable_id)
+            && entity.observe_falling_edge()
+            && let Some(voice) = sim
+                .interner
+                .object_type(entity.type_ref(), rules)
+                .and_then(|object| object.voice_falling.clone())
+        {
+            let event =
+                super::SimSoundEvent::voc_at_location(voice, entity, sim.resolved_terrain.as_ref());
+            sim.sound_events.emit(event);
+        }
         Self::sinking_edge_sounds(
             &sim.interner,
             &mut sim.substrate,
@@ -1001,6 +1015,7 @@ impl Simulation {
             &sim.interner,
             &mut sim.substrate,
             &mut sim.sound_events,
+            &sim.session,
             &sim.houses,
             stable_id,
             rules,
@@ -1083,6 +1098,18 @@ impl Simulation {
             .get(stable_id)
             .is_some_and(|entity| entity.category() == EntityCategory::Infantry);
         if infantry {
+            // Installed Ares InfantryClass_Update_Reload10047980 replaces
+            // gamemd51BCB2: out of limbo, Reload(+424) before idle Scatter.
+            // The shared Techno owner supplies count/clock semantics; the
+            // Unit-only MobileFire pause is deliberately not used here.
+            #[cfg(feature = "ares")]
+            if let Some(entity) = sim.substrate.entities.get_mut(stable_id)
+                && entity.is_object_alive()
+                && !entity.lifecycle.in_limbo()
+                && let Some(obj) = sim.interner.object_type(entity.type_ref(), rules)
+            {
+                entity.reload_techno_ammo(obj, sim.session.binary_frame() as i32);
+            }
             //51BCA4..51BDCF follows the entire FootAI, including Process and
             // its tails. A successful Scatter invokes Process a second time
             // synchronously, before the Infantry Ready/Commence/fire suffix.

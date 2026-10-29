@@ -3,7 +3,59 @@
 
 use super::geom::{RectPx, ShellScale};
 use super::list::{ListMetrics, ListScrollInteraction, ListScrollPart, ShellListGeometry};
-use crate::ui::skirmish_shell::{DropdownMetrics, ScrollModel, combo_dropdown_row_rect};
+use crate::ui::skirmish_shell::{
+    DropdownMetrics, ScrollModel, combo_arrow_hit_rect, combo_dropdown_row_rect,
+};
+use crate::util::time::Instant;
+
+/// What one mouse press does to an owner-draw combo or its open list.
+///
+/// `OwnerDraw_ComboBox @ 0x00617250` plays the open cue on any press of an
+/// enabled face (`0x006184A2..0x006184BA`) and opens the list only from its
+/// arrow zone ([`combo_arrow_hit_rect`], `0x006184BF..0x006184D7`). The open
+/// list's drop window (`ComboDropWin @ 0x0060D540`) captures the mouse: its
+/// scrollbar takes a press silently, and a pick or a press anywhere else
+/// closes it with the close cue (`0x0060E4E9..0x0060E500`) and goes no further.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ComboPress {
+    /// The open list's scrollbar part under the press.
+    Scroll(ListScrollPart),
+    /// A row of the open list; the list closes.
+    Pick(usize),
+    /// Anywhere else while the list is open; the list closes.
+    Dismiss,
+    /// The face outside the arrow zone; only the open cue plays.
+    Face,
+    /// The arrow zone; the list opens.
+    Open,
+}
+
+/// The two combo cues, `GUIComboOpenSound` and `GUIComboCloseSound`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ComboCue {
+    Open,
+    Close,
+}
+
+impl ComboPress {
+    /// A press on the collapsed face of an enabled combo whose control rect is
+    /// `rect`.
+    pub(crate) fn on_face(rect: RectPx, scale: ShellScale, x: i32, y: i32) -> Self {
+        if combo_arrow_hit_rect(rect, scale).contains(x, y) {
+            Self::Open
+        } else {
+            Self::Face
+        }
+    }
+
+    pub(crate) fn cue(self) -> Option<ComboCue> {
+        match self {
+            Self::Scroll(_) => None,
+            Self::Pick(_) | Self::Dismiss => Some(ComboCue::Close),
+            Self::Face | Self::Open => Some(ComboCue::Open),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ComboPopup {
@@ -102,6 +154,15 @@ impl ComboPopup {
             .contains(x, y)
             .then(|| self.first + ((y - self.rect.y) / self.row_height) as usize)
     }
+    /// A press while this list is open: [`ComboPress::Scroll`],
+    /// [`ComboPress::Pick`] or [`ComboPress::Dismiss`].
+    pub(crate) fn press(&self, x: i32, y: i32) -> ComboPress {
+        if let Some(part) = self.scroll_part_at(x, y) {
+            return ComboPress::Scroll(part);
+        }
+        self.row_at(x, y)
+            .map_or(ComboPress::Dismiss, ComboPress::Pick)
+    }
     pub(crate) fn track_hot_row(&self, hot_row: &mut Option<usize>, x: i32, y: i32) {
         // 60E262 retains the previous hot row after leaving the row content.
         if let Some(row) = self.row_at(x, y) {
@@ -143,9 +204,79 @@ impl<Id: Copy> ComboPopupInteraction<Id> {
     pub(crate) fn cancel_pointer(&mut self) {
         self.scroll.cancel();
     }
+    /// A press while this interaction's list `popup` is open. The scrollbar
+    /// takes it; a pick or a dismiss closes the list.
+    pub(crate) fn press_list(
+        &mut self,
+        popup: ComboPopup,
+        x: i32,
+        y: i32,
+        now: Instant,
+    ) -> ComboPress {
+        let press = popup.press(x, y);
+        match press {
+            ComboPress::Scroll(part) => {
+                self.scroll
+                    .press(part, popup.scroll_geometry(), &mut self.top_index, y, now)
+            }
+            _ => self.close(),
+        }
+        press
+    }
+    /// A press on the face of enabled combo `id`, whose control rect is
+    /// `rect`; the arrow zone opens its list at `selected`.
+    pub(crate) fn press_face(
+        &mut self,
+        id: Id,
+        rect: RectPx,
+        scale: ShellScale,
+        selected: Option<usize>,
+        x: i32,
+        y: i32,
+    ) -> ComboPress {
+        let press = ComboPress::on_face(rect, scale, x, y);
+        if press == ComboPress::Open {
+            self.open(id, selected);
+        }
+        press
+    }
     pub(crate) fn pointer_moved(&mut self, popup: ComboPopup, x: i32, y: i32) {
         popup.track_hot_row(&mut self.hot_row, x, y);
         self.scroll
             .pointer_moved(popup.scroll_geometry(), &mut self.top_index, x, y);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn face_press_opens_only_right_of_client_right_minus_0x14() {
+        // 0x006184CD..0x006184D7: `x > right - 0x14`, `right` exclusive.
+        let rect = RectPx::new(10, 20, 120, 21);
+        let right = rect.x + rect.w;
+        let press = |x| ComboPress::on_face(rect, ShellScale::RETAIL, x, 25);
+        assert_eq!(press(right - 0x14), ComboPress::Face);
+        assert_eq!(press(right - 0x13), ComboPress::Open);
+        assert_eq!(press(right - 1), ComboPress::Open);
+        assert_eq!(press(right - 0x13).cue(), Some(ComboCue::Open));
+        assert_eq!(press(rect.x).cue(), Some(ComboCue::Open));
+    }
+
+    #[test]
+    fn open_list_press_picks_or_dismisses_and_closes_with_the_close_cue() {
+        let popup = ComboPopup::new(RectPx::new(0, 0, 100, 21), ShellScale::RETAIL, 3, 0, 0);
+        let row = popup.row_rect(1).unwrap();
+        let mut combo = ComboPopupInteraction::default();
+        combo.open(7u16, Some(0));
+        let pick = combo.press_list(popup, row.x + 1, row.y + 1, Instant::now());
+        assert_eq!((pick, combo.control), (ComboPress::Pick(1), None));
+        combo.open(7, Some(0));
+        let below = popup.rect.y + popup.rect.h + 5;
+        let dismiss = combo.press_list(popup, row.x + 1, below, Instant::now());
+        assert_eq!((dismiss, combo.control), (ComboPress::Dismiss, None));
+        assert_eq!(pick.cue(), Some(ComboCue::Close));
+        assert_eq!(dismiss.cue(), Some(ComboCue::Close));
     }
 }

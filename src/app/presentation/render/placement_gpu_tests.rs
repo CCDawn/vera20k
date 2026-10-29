@@ -233,7 +233,7 @@ fn retail_placement_matches_original_cell_and_foundation_raster() {
                 // Independent original caller camera, actual loaded map/paid
                 // preview, and production X-outer traversal, with no fitted
                 // cell positions or native-admission input in this scene.
-                let instances = shape.build_building_preview(&preview);
+                let instances = shape.build_building_preview(&preview, 1.0);
                 assert_eq!(instances.len(), 4);
                 assert_eq!(
                     row["native_order"],
@@ -279,7 +279,7 @@ fn retail_placement_matches_original_cell_and_foundation_raster() {
                         vec![instance]
                     }
                     2 => vec![
-                        shape.building_placement_instance(cell).unwrap();
+                        shape.building_placement_instance(cell, 1.0).unwrap();
                         input["repeat"].as_u64().unwrap() as usize
                     ],
                     other => panic!("uncovered marker input {other}"),

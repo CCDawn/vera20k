@@ -595,9 +595,15 @@ fn drain_sound_events_inner(state: &mut AppState, redrive_owners: bool) {
             }
             continue;
         }
+        // Building43FC34 already updated +6B4 on its unchanged operational
+        // branch, before later C4/destructor callbacks. Changed edges only
+        // Detach/Play; neither branch admits a final-position update here.
+        if crate::sim::world::working_sound_building(owner).is_some() {
+            continue;
+        }
         // Techno6F9EA8 and Foot4DADF0 re-drive their handles at the actual
         // AI visit. A tail poll could overwrite that position or restart a
-        // loop after a later callback. Turret/working and Anim stay separate.
+        // loop after a later callback. Turret and Anim stay separate.
         if crate::sim::combat::gattling::gattling_sound_techno(owner).is_some()
             || sim.entities().get(owner).is_some_and(|entity| {
                 use crate::map::entities::EntityCategory::{Aircraft, Infantry, Unit};

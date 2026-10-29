@@ -30,6 +30,7 @@ use crate::asset_tools::identify;
 use crate::asset_tools::names::NameDict;
 use crate::asset_tools::palette;
 use crate::asset_tools::report::{CompareReport, CompareVariant, ErrorReport, RenderOutputs};
+use crate::asset_tools::sanitise_name;
 use crate::assets::asset_manager::AssetManager;
 use crate::assets::aud_file;
 use crate::assets::csf_file::CsfFile;
@@ -232,7 +233,7 @@ pub fn run(
         ));
     }
 
-    let sanitised = sanitise_name(name);
+    let sanitised = sanitise_name(name, FALLBACK_DIR_NAME);
     let dir = compare_dir(&opts.out, &sanitised);
 
     let mut outputs = RenderOutputs {
@@ -824,31 +825,6 @@ fn name_list(names: &[String]) -> String {
     )
 }
 
-/// Replace every character outside `[A-Za-z0-9._-]` so the name is safe as a
-/// directory and filename component on any platform.
-///
-/// Mirrors `verb_render::sanitise_name` character for character — copied rather
-/// than called because that one is module-private, and pinned to the same
-/// fixtures by the test below. Flattening the path separators is also what keeps
-/// a name like `../../x` from escaping the output root.
-fn sanitise_name(name: &str) -> String {
-    let sanitised: String = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitised.is_empty() {
-        FALLBACK_DIR_NAME.to_string()
-    } else {
-        sanitised
-    }
-}
-
 /// `<out>/compare/<sanitised>/`, a sibling of `<out>/render/<sanitised>/` and
 /// absolutised the same way, so the reported paths do not depend on the
 /// reader's working directory.
@@ -865,7 +841,7 @@ fn compare_dir(out: &Path, sanitised: &str) -> PathBuf {
 fn variant_png_name(sanitised: &str, index: usize, archive: &str) -> String {
     format!(
         "{sanitised}.v{index:02}.{}.png",
-        sanitise_name(archive_leaf(archive))
+        sanitise_name(archive_leaf(archive), FALLBACK_DIR_NAME)
     )
 }
 
@@ -1152,7 +1128,10 @@ mod tests {
 
     #[test]
     fn a_traversing_name_flattens_to_one_component() {
-        let dir = compare_dir(Path::new(DEFAULT_OUT_ROOT), &sanitise_name("../../etc/x"));
+        let dir = compare_dir(
+            Path::new(DEFAULT_OUT_ROOT),
+            &sanitise_name("../../etc/x", FALLBACK_DIR_NAME),
+        );
         assert!(dir.ends_with(".._.._etc_x"), "{}", dir.display());
         assert_eq!(
             dir.parent().and_then(Path::file_name),

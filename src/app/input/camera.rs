@@ -438,7 +438,7 @@ const OCTANT_DELTA: [(f32, f32); 8] = [
 pub(crate) struct EdgeScrollState {
     /// Wall-clock origin for the radar timer. Edge scroll is driven by the real
     /// cursor, so it is presentation state and never enters the sim.
-    epoch: std::time::Instant,
+    epoch: crate::util::time::Instant,
     /// gamemd's CoastLevel: 0 is the slowest creep, higher is faster.
     coast_level: i32,
     /// Last direction octant. Retained so the map keeps coasting in the same
@@ -452,7 +452,7 @@ pub(crate) struct EdgeScrollState {
 impl Default for EdgeScrollState {
     fn default() -> Self {
         Self {
-            epoch: std::time::Instant::now(),
+            epoch: crate::util::time::Instant::now(),
             coast_level: 0,
             octant: 0,
             last_coast_change: None,
@@ -590,6 +590,7 @@ pub(crate) fn camera_input_idle(state: &AppState) -> bool {
         && !input.tactical_mouse.right_held
         && !input.tactical_mouse.right_pan_engaged
         && input.edge_scroll.coasting_direction().is_none()
+        && !touch_owns_pointer(input)
         && edge_scroll_intent(
             (input.cursor_x, input.cursor_y),
             state.render_width() as i32,
@@ -1223,11 +1224,12 @@ fn keyboard_scroll_distance(state: &AppState) -> f32 {
 /// Main_Tick's keyboard requests run after logic (0x55DD42..0x55DD96), and
 /// remain pending until the next Tactical__AI commit with that frame's mouse.
 pub(crate) fn queue_keyboard_scroll(state: &mut AppState) {
-    if state
-        .match_state
-        .sim_runtime
-        .as_ref()
-        .is_some_and(|runtime| runtime.simulation.session().input_locked())
+    if !state.match_state.match_diagnostics.is_replay_playback()
+        && state
+            .match_state
+            .sim_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.simulation.session().input_locked())
     {
         return;
     }
@@ -1277,11 +1279,12 @@ pub(crate) fn queue_keyboard_scroll(state: &mut AppState) {
 /// committing the view. Main_Tick calls input before logic (0x55D8AB); captured
 /// right drag and uncaptured edge/coast are mutually exclusive in 0x692F30.
 pub(crate) fn poll_mouse_scroll(state: &mut AppState) -> (f32, f32) {
-    if state
-        .match_state
-        .sim_runtime
-        .as_ref()
-        .is_some_and(|runtime| runtime.simulation.session().input_locked())
+    if !state.match_state.match_diagnostics.is_replay_playback()
+        && state
+            .match_state
+            .sim_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.simulation.session().input_locked())
     {
         return (0.0, 0.0);
     }
@@ -1293,7 +1296,9 @@ pub(crate) fn poll_mouse_scroll(state: &mut AppState) -> (f32, f32) {
     // the capture, so the map is frozen for the whole of a band-box or
     // right-drag gesture. The minimap-drag inhibit is VERA-internal: gamemd's
     // minimap re-centres only on press, while this flag owns the gesture here.
-    if !state.match_state.input.tactical_mouse.captured && !state.match_state.input.minimap_dragging
+    if !state.match_state.input.tactical_mouse.captured
+        && !state.match_state.input.minimap_dragging
+        && !touch_owns_pointer(&state.match_state.input)
     {
         let now = state.match_state.input.edge_scroll.radar_timer();
         let scroll_rate = state
@@ -1453,12 +1458,10 @@ const ZOOM_SNAP: f32 = 0.002;
 /// Records the world point under the cursor so `animate_zoom` can keep it
 /// pinned at that screen position during the smooth ease.
 ///
-/// **Currently unbound.** Stock YR has no world zoom at all, and the wheel — the
-/// only input that used to reach this — is the sidebar strip scroll in gamemd.
-/// The zoom machinery is kept intact (`animate_zoom` still runs, and every
-/// camera path still divides by `zoom_level`) so a future non-wheel binding or a
-/// spectator/debug view can drive it, but nothing calls this today.
-#[allow(dead_code)]
+/// Only replay playback binds this: its presentation-only input routes the
+/// mouse wheel here (`handler.rs`). Stock YR has no world zoom, and in a live
+/// match the wheel is the sidebar strip scroll, as in gamemd. `animate_zoom`
+/// runs every frame and every camera path divides by `zoom_level`.
 pub(crate) fn apply_zoom(state: &mut AppState, delta_lines: f32) {
     let old_target = state.match_state.input.zoom_target;
     let factor = ZOOM_STEP.powf(delta_lines);
@@ -2224,9 +2227,25 @@ fn blocked_mask_to_scroll_dir(mask: u8) -> Option<ScrollDir> {
     })
 }
 
+/// Whether a touch, not the OS pointer, owns the cursor this frame.
+///
+/// gamemd's edge scroll assumes a mouse that leaves the band when the hand
+/// does. A touch device has none: the mapper parks a synthetic cursor at the
+/// last contact, so the band would stay engaged with nothing to carry it away,
+/// and a touch pan holds no button, so it cannot hold the tactical capture that
+/// freezes the band for native's right-drag pan.
+pub(crate) fn touch_owns_pointer(input: &crate::app::input::state::MatchInputState) -> bool {
+    input.cursor_from_touch || input.touch_mapper.pan_active()
+}
+
 /// Active edge intent plus whether the tactical clamp removes all requested
 /// components. Cursor feedback and motion both use this exact probe.
 pub(crate) fn edge_scroll_cursor_state(state: &AppState) -> Option<(ScrollDir, bool)> {
+    // The band is inhibited for motion (`poll_mouse_scroll`), so it must not
+    // light its arrow either.
+    if touch_owns_pointer(&state.match_state.input) {
+        return None;
+    }
     let sw = state.render_width() as f32;
     let sh = state.render_height() as f32;
     let direction = edge_scroll_intent(

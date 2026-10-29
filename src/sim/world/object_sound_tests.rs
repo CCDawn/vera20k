@@ -43,6 +43,7 @@ fn sim_with_trigger(action: &str) -> (Simulation, crate::map::map_file::MapFile)
         &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
         None,
         Some(&sounds()),
+        None,
     );
     sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
     (sim, map)

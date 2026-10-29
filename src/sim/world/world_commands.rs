@@ -17,10 +17,11 @@ use crate::sim::cell_rect::canonical_cell_coord;
 use crate::sim::combat;
 use crate::sim::command::{
     ArchiveRecord, BUILDING_OFF_LINE_OPCODE, BUILDING_ON_LINE_OPCODE, BuildingOnLineRecord,
-    COMMAND_RECORD_LEN, Command, CommandEnvelope, CommandRecord, DeployRecord, ExitRecord,
-    GameSpeedRecord, MegaMissionOrder, MegaMissionRecord, MegaMissionTarget, PlaceRecord,
+    COMMAND_RECORD_LEN, Command, CommandEnvelope, CommandRecord, CycleProducerRecord, DeployRecord,
+    ExitRecord, GameSpeedRecord, MegaMissionOrder, MegaMissionRecord, MegaMissionTarget,
+    ObjectAction, ObjectActionRecord, PaidSuperAction, PaidSuperRecord, PlaceRecord,
     ProductionEvent, ProductionRecord, RepairRecord, ScatterRecord, SellWallAtCellRecord,
-    StopRecord,
+    SpecialPlaceRecord, StopRecord,
 };
 use crate::sim::house_diplomacy::HouseAlliances;
 use crate::sim::intern::{InternedId, StringInterner};
@@ -270,6 +271,174 @@ impl Simulation {
         Some(record)
     }
 
+    /// TargetEvent4C65E0 is used by SELL16 (Execute4C6F12) and
+    /// PRIMARY11 (Execute4C718C). Eject is the existing VERA bunker action,
+    /// carried explicitly rather than claiming a native self-Unload mapping.
+    pub fn encode_object_action_record(
+        &self,
+        owner: InternedId,
+        command: &Command,
+    ) -> Option<CommandRecord> {
+        let (entity, action) = match *command {
+            Command::SellBuilding { entity_id } => (entity_id, ObjectAction::Sell),
+            Command::TogglePrimaryFactory { entity_id } => (entity_id, ObjectAction::Primary),
+            Command::EjectBunker { bunker_id } => (bunker_id, ObjectAction::EjectBunker),
+            _ => return None,
+        };
+        let mut record = self.encode_header_event(owner, action.opcode())?;
+        ObjectActionRecord {
+            house_id: record.house_id(),
+            frame: record.frame_stamp(),
+            entity_id: i32::try_from(entity).ok()?,
+            action,
+        }
+        .write_into(&mut record);
+        Some(record)
+    }
+
+    /// Event0D4C794B retains its dword GameSpeed payload for the shared receiver.
+    pub fn encode_game_speed_record(&self, owner: InternedId, speed: u8) -> Option<CommandRecord> {
+        let header = self.encode_header_event(owner, crate::sim::command::GAME_SPEED_OPCODE)?;
+        GameSpeedRecord {
+            house_id: header.house_id(),
+            frame: header.frame_stamp(),
+            speed: i32::from(speed),
+        }
+        .encode()
+        .ok()
+    }
+
+    /// VERA sidebar cycles are ordered commands, because the selected primary
+    /// affects delivery. Keep the next-candidate decision in production's
+    /// existing cycle_active_producer_for_owner_category execution owner.
+    pub fn encode_cycle_producer_record(
+        &self,
+        owner: InternedId,
+        category: production::ProductionCategory,
+    ) -> Option<CommandRecord> {
+        let header =
+            self.encode_header_event(owner, crate::sim::command::VERA_CYCLE_PRODUCER_OPCODE)?;
+        CycleProducerRecord {
+            house_id: header.house_id(),
+            frame: header.frame_stamp(),
+            category,
+        }
+        .encode()
+        .ok()
+    }
+
+    /// SPECIAL_PLACE4C6B60 carries the rules-owned registry index, not an
+    /// InternedId. Paid selections use one VERA record so their existing
+    /// saved sequence guard and cancellation execute identically on all peers.
+    pub fn encode_superweapon_record(
+        &self,
+        owner: InternedId,
+        command: &Command,
+        rules: &RuleSet,
+    ) -> Option<CommandRecord> {
+        let header = self.encode_header_event(owner, SpecialPlaceRecord::OPCODE)?;
+        let index = |id| i32::try_from(rules.super_weapon_index(self.interner.resolve(id))?).ok();
+        let (selection, action, cell) = match *command {
+            Command::LaunchSuperWeapon {
+                sw_type_id,
+                target_rx,
+                target_ry,
+            } => {
+                if target_rx >= 512 || target_ry >= 512 {
+                    return None;
+                }
+                return SpecialPlaceRecord {
+                    house_id: header.house_id(),
+                    frame: header.frame_stamp(),
+                    type_index: index(sw_type_id)?,
+                    cell: (
+                        i16::try_from(target_rx).ok()?,
+                        i16::try_from(target_ry).ok()?,
+                    ),
+                }
+                .encode()
+                .ok();
+            }
+            Command::BeginPaidSuperWeapon {
+                selection,
+                target_rx,
+                target_ry,
+            } => (selection, PaidSuperAction::Begin, (target_rx, target_ry)),
+            Command::CompletePaidSuperWeapon {
+                selection,
+                target_rx,
+                target_ry,
+            } => (selection, PaidSuperAction::Complete, (target_rx, target_ry)),
+            Command::CancelPaidSuperWeapon { selection } => {
+                (selection, PaidSuperAction::Cancel, (0, 0))
+            }
+            _ => return None,
+        };
+        PaidSuperRecord {
+            house_id: header.house_id(),
+            frame: header.frame_stamp(),
+            action,
+            source: index(selection.source)?,
+            destination: index(selection.destination)?,
+            sequence: selection.sequence,
+            cell: (i16::try_from(cell.0).ok()?, i16::try_from(cell.1).ok()?),
+        }
+        .encode()
+    }
+
+    pub(super) fn superweapon_command_from_record(
+        &self,
+        record: &CommandRecord,
+        rules: &RuleSet,
+    ) -> Option<(InternedId, Command)> {
+        let owner = *self
+            .houses
+            .order()
+            .get(usize::try_from(record.house_id()).ok()?)?;
+        if !self.houses.contains_key(&owner) {
+            return None;
+        }
+        let type_id = |index| {
+            self.interner
+                .get(rules.super_weapon_order.get(usize::try_from(index).ok()?)?)
+        };
+        if let Some(event) = SpecialPlaceRecord::decode(record) {
+            if !(0..512).contains(&event.cell.0) || !(0..512).contains(&event.cell.1) {
+                return None;
+            }
+            return Some((
+                owner,
+                Command::LaunchSuperWeapon {
+                    sw_type_id: type_id(event.type_index)?,
+                    target_rx: u16::try_from(event.cell.0).ok()?,
+                    target_ry: u16::try_from(event.cell.1).ok()?,
+                },
+            ));
+        }
+        let event = PaidSuperRecord::decode(record)?;
+        let selection = crate::sim::superweapon::PaidSuperWeaponSelection {
+            source: type_id(event.source)?,
+            destination: type_id(event.destination)?,
+            sequence: event.sequence,
+        };
+        Some((
+            owner,
+            match event.action {
+                PaidSuperAction::Begin => Command::BeginPaidSuperWeapon {
+                    selection,
+                    target_rx: event.cell.0 as u16,
+                    target_ry: event.cell.1 as u16,
+                },
+                PaidSuperAction::Complete => Command::CompletePaidSuperWeapon {
+                    selection,
+                    target_rx: event.cell.0 as u16,
+                    target_ry: event.cell.1 as u16,
+                },
+                PaidSuperAction::Cancel => Command::CancelPaidSuperWeapon { selection },
+            },
+        ))
+    }
+
     /// SetRallyPoint4439C5 and object-click44367B ask the actor's vt+38
     /// (Techno6F9DB0), not PlayerPtr. Preserve that House and both tokens
     /// at issue; send-time retiming remains the packet codec's responsibility.
@@ -303,6 +472,17 @@ impl Simulation {
     ) -> Option<CommandRecord> {
         let selection =
             production::ProductionSelection::for_type(rules, self.object_type(type_id, rules)?)?;
+        self.encode_selected_production_record(command_owner, event, selection)
+    }
+
+    /// Typed callers retain Select6AAD00's existing RTTI/index/Naval fields.
+    /// The name-only encoder above deliberately keeps broad-name semantics.
+    pub fn encode_selected_production_record(
+        &self,
+        command_owner: InternedId,
+        event: ProductionEvent,
+        selection: production::ProductionSelection,
+    ) -> Option<CommandRecord> {
         let mut record = self.encode_header_event(command_owner, event.opcode())?;
         ProductionRecord {
             house_id: record.house_id(),
@@ -354,7 +534,11 @@ impl Simulation {
             .factories()
             .view(command_owner, category)?
             .complete_object()?;
-        let object = self.object_type(held.type_id, rules)?;
+        let object = self.interner.object_type_in_category(
+            held.type_id,
+            category.object_category(),
+            rules,
+        )?;
         if object.category == crate::rules::object_type::ObjectCategory::Building {
             return None;
         }
@@ -573,6 +757,7 @@ impl Simulation {
             .position(|&owner| owner == command_owner)
             .and_then(|index| i8::try_from(index).ok())?;
         let typed = MegaMissionRecord {
+            auxiliary: MegaMissionTarget::Null,
             house_id,
             frame: self.session.binary_frame() as i32,
             source_id: i32::try_from(source_id).ok()?,
@@ -749,7 +934,44 @@ impl Simulation {
             };
             return Some(CommandEnvelope::new(owner, execute_tick, payload));
         }
-        if ProductionRecord::decode(record).is_some() || PlaceRecord::decode(record).is_some() {
+        if let Some(event) = ObjectActionRecord::decode(record) {
+            let owner = *self
+                .houses
+                .order()
+                .get(usize::try_from(event.house_id).ok()?)?;
+            let entity_id = u64::try_from(event.entity_id).ok()?;
+            let command = match event.action {
+                ObjectAction::Sell => Command::SellBuilding { entity_id },
+                ObjectAction::Primary => Command::TogglePrimaryFactory { entity_id },
+                ObjectAction::EjectBunker => Command::EjectBunker {
+                    bunker_id: entity_id,
+                },
+            };
+            return self
+                .houses
+                .contains_key(&owner)
+                .then(|| CommandEnvelope::new(owner, execute_tick, command));
+        }
+        if let Some(event) = CycleProducerRecord::decode(record) {
+            let owner = *self
+                .houses
+                .order()
+                .get(usize::try_from(event.house_id).ok()?)?;
+            return self.houses.contains_key(&owner).then(|| {
+                CommandEnvelope::new(
+                    owner,
+                    execute_tick,
+                    Command::CycleProducerFocus {
+                        category: event.category,
+                    },
+                )
+            });
+        }
+        if ProductionRecord::decode(record).is_some()
+            || PlaceRecord::decode(record).is_some()
+            || SpecialPlaceRecord::decode(record).is_some()
+            || PaidSuperRecord::decode(record).is_some()
+        {
             let owner = *self
                 .houses
                 .order()
@@ -849,6 +1071,17 @@ impl Simulation {
             }
             let entity_id = u64::try_from(typed.source_id).ok()?;
             self.substrate.entities.get(entity_id)?;
+            // Keep NavComAux in the native carrier until execution, where
+            // the shared MegaMission receiver applies it after the setters.
+            if typed.auxiliary != MegaMissionTarget::Null {
+                return Some(CommandEnvelope::new(
+                    owner,
+                    execute_tick,
+                    Command::SynchronizedRecord {
+                        record: record.clone(),
+                    },
+                ));
+            }
             let target = |token: MegaMissionTarget| -> Option<Option<combat::TargetKind>> {
                 Some(match token {
                     MegaMissionTarget::Null => None,
@@ -1077,6 +1310,26 @@ impl Simulation {
         );
     }
 
+    /// The canonical cell and overlay a wall sale's signed CellStruct names.
+    fn wall_sale_cell(
+        &self,
+        x: i16,
+        y: i16,
+    ) -> Option<(u16, u16, crate::sim::overlay_grid::OverlayCell)> {
+        // EventClass rejects only the exact packed null CellStruct. Every
+        // other signed pair is resolved by MapClass' fixed 512-wide linear
+        // cell array, so out-of-range components may alias a canonical slot.
+        if (x, y) == (0, 0) {
+            return None;
+        }
+        let (rx, ry) = canonical_cell_coord(i32::from(x), i32::from(y))?;
+        let grid = self.overlay_grid.as_ref()?;
+        if rx >= grid.width() || ry >= grid.height() {
+            return None;
+        }
+        Some((rx, ry, *grid.cell(rx, ry)))
+    }
+
     /// `HouseClass::Sell_Building_At_Cell @ 0x004FCE80` for house
     /// `command_owner` at cell `(x, y)`: the player's wall sale and the
     /// computer's in `AI_Manage_Build_Queue` (`sim::ai_build_need`). It sells
@@ -1094,22 +1347,9 @@ impl Simulation {
         overlays: &crate::rules::overlay_types::OverlayTypeRegistry,
         effects: FrameEffects<'_>,
     ) -> bool {
-        // EventClass rejects only the exact packed null CellStruct. Every
-        // other signed pair is resolved by MapClass' fixed 512-wide linear
-        // cell array, so out-of-range components may alias a canonical slot.
-        if (x, y) == (0, 0) {
-            return false;
-        }
-        let Some((rx, ry)) = canonical_cell_coord(i32::from(x), i32::from(y)) else {
+        let Some((rx, ry, cell)) = self.wall_sale_cell(x, y) else {
             return false;
         };
-        let Some(grid) = self.overlay_grid.as_ref() else {
-            return false;
-        };
-        if rx >= grid.width() || ry >= grid.height() {
-            return false;
-        }
-        let cell = *grid.cell(rx, ry);
         let (Some(overlay_id), Some(wall_owner)) = (cell.overlay_id, cell.wall_owner) else {
             return false;
         };
@@ -1379,35 +1619,52 @@ impl Simulation {
         // Event command receivers clear Plan tokens before applying ordinary
         // orders. Flag2 acknowledges its path without detaching it; use the
         // same payload dispatcher while keeping state installed for callbacks.
-        let decoded_planned;
+        let decoded_native;
+        let mut auxiliary = MegaMissionTarget::Null;
         let planned = matches!(cmd, Command::PlanningRecord { record }
             if record.opcode() == 4 && record.payload()[22] == 2);
-        let cmd = if planned {
-            let Command::PlanningRecord { record } = cmd else {
-                unreachable!()
-            };
+        let native_mission = match cmd {
+            Command::PlanningRecord { record } if planned => Some(record),
+            Command::SynchronizedRecord { record }
+                if record.opcode() == 4 && record.payload()[22] == 0 =>
+            {
+                Some(record)
+            }
+            _ => None,
+        };
+        let cmd = if let Some(record) = native_mission {
             let mut ordinary = record.clone();
             ordinary.payload_mut()[22] = 0;
             let Some(typed) = MegaMissionRecord::decode(&ordinary) else {
                 return false;
             };
+            auxiliary = typed.auxiliary;
+            // Only the temporary semantic projection omits NavComAux. The
+            // queue, plan graph and saved/replayed bytes keep the full token.
+            ordinary.payload_mut()[21] = 0;
             let Some(envelope) = self.decode_native_command_record(&ordinary, self.session.tick())
             else {
                 return false;
             };
-            if let Ok(actor) = u64::try_from(typed.source_id) {
+            if planned && let Ok(actor) = u64::try_from(typed.source_id) {
                 self.planning_acknowledge(actor);
             }
-            decoded_planned = envelope.payload;
-            &decoded_planned
+            decoded_native = envelope.payload;
+            &decoded_native
         } else {
             cmd
         };
+        if self.network_command_actor_foreign(command_owner, cmd) {
+            return false;
+        }
         let ordinary_actor = match cmd {
             Command::Stop { entity_id }
             | Command::Scatter { entity_id }
             | Command::DeployMcv { entity_id }
-            | Command::ToggleRepair { entity_id } => Some(*entity_id),
+            | Command::ToggleRepair { entity_id }
+            // EventClass::Execute @ 0x004C6CB0, SELL arm 0x004C6F20:
+            // PlanningDetach precedes the target's alive/owner refusal.
+            | Command::SellBuilding { entity_id } => Some(*entity_id),
             _ => cmd.megamission_actor(),
         };
         if !planned && let Some(actor) = ordinary_actor {
@@ -1421,7 +1678,6 @@ impl Simulation {
                 if self.interner.get(command_owner) != self.session.current_house() {
                     return false;
                 }
-                #[cfg(any(test, feature = "test-support"))]
                 if self.replaying_recorded_commands {
                     return false;
                 }
@@ -1453,6 +1709,7 @@ impl Simulation {
                     *mission,
                     *target,
                     *destination,
+                    auxiliary,
                     rules,
                     overlay_registry,
                     frame_effects,
@@ -1462,6 +1719,17 @@ impl Simulation {
                 self.apply_planning_record(command_owner, record, rules)
             }
             Command::SynchronizedRecord { record } => {
+                if let Some((owner, command)) = self.superweapon_command_from_record(record, rules)
+                {
+                    let owner = self.interner.resolve(owner).to_owned();
+                    return self.apply_command_with_overlays(
+                        &owner,
+                        &command,
+                        rules,
+                        overlay_registry,
+                        frame_effects,
+                    );
+                }
                 if let Some(event) = ArchiveRecord::decode(record) {
                     let Ok(entity_id) = u64::try_from(event.entity_id) else {
                         return false;
@@ -1528,6 +1796,7 @@ impl Simulation {
                     MissionType::Move,
                     None,
                     Some(combat::TargetKind::Cell(*target_rx, *target_ry)),
+                    auxiliary,
                     rules,
                     overlay_registry,
                     frame_effects,
@@ -1542,6 +1811,7 @@ impl Simulation {
                     MissionType::Move,
                     None,
                     Some(combat::TargetKind::Entity(*target_id)),
+                    auxiliary,
                     rules,
                     overlay_registry,
                     frame_effects,
@@ -1700,6 +1970,7 @@ impl Simulation {
                     MissionType::Attack,
                     Some(combat::TargetKind::Entity(*target_id)),
                     None,
+                    auxiliary,
                     rules,
                     overlay_registry,
                     frame_effects,
@@ -1715,6 +1986,7 @@ impl Simulation {
                     MissionType::Attack,
                     Some(combat::TargetKind::Cell(*target_rx, *target_ry)),
                     None,
+                    auxiliary,
                     rules,
                     overlay_registry,
                     frame_effects,
@@ -1730,6 +2002,7 @@ impl Simulation {
                     MissionType::AttackMove,
                     *target,
                     *destination,
+                    auxiliary,
                     rules,
                     overlay_registry,
                     frame_effects,
@@ -1741,6 +2014,7 @@ impl Simulation {
                     MissionType::AreaGuard,
                     *target,
                     None,
+                    auxiliary,
                     rules,
                     overlay_registry,
                     frame_effects,
@@ -1792,6 +2066,7 @@ impl Simulation {
                     MissionType::Unload,
                     None,
                     None,
+                    auxiliary,
                     rules,
                     overlay_registry,
                     frame_effects,
@@ -1894,11 +2169,20 @@ impl Simulation {
                     frame_effects,
                 )
             }
-            // The SELL event (`EventClass::Execute 0x004C6F20`): the target's
-            // owner must be the event's house (`0x004C6F45`); a building
-            // takes `Sell_Back(-1)` (`0x004C6FA2`).
+            // EventClass::Execute @ 0x004C6CB0, SELL arm 0x004C6F12:
+            // the prefix above detaches Planning (4C6F20), then +90/alive
+            // and current Owner+30 must match the signed event House
+            // (4C6F2D..4C6F48). A building takes SellBack(-1) at4C6FA2;
+            // CanSell belongs to input admission, not this receiver.
+            // Depot Unit/Aircraft sales at4C6F5A..4C6F96 remain a separate
+            // unimplemented service lifecycle; this order handles buildings.
             Command::SellBuilding { entity_id } => {
-                if !self.entity_owned_by_id(command_owner, *entity_id) {
+                let Some(entity) = self.substrate.entities.get(*entity_id) else {
+                    return false;
+                };
+                if !entity.lifecycle.object_alive()
+                    || !self.entity_owned_by_id(command_owner, *entity_id)
+                {
                     return false;
                 }
                 production::sell_back(
@@ -1922,7 +2206,7 @@ impl Simulation {
             // GoOffline 0x00452360. go_building_online/offline carry the native
             // semantics (idempotent latch, house power + tech-tree invalidation,
             // Stuff flag, factory queue refresh, EVA line for a human house). The
-            // dispatch has no owner check, and none is added here.
+            // dispatch has no owner check; only the VERA network gate above adds one.
             Command::SetBuildingOnLine { entity_id, on } => {
                 let Some(owner) = self.interner.get(command_owner) else {
                     return false;
@@ -2001,6 +2285,14 @@ impl Simulation {
                 // every sender: House+0x248, then Flag_To_Die when no other
                 // human House is undefeated (0x005E2BA0).
                 house.mark_left_game();
+                // Execute_DoList64C9B1 destroys this source on every peer.
+                // Retire its existing NodeNameTag timing row at the same shared
+                // event, before later records may choose another publisher.
+                if let Some(index) = self.houses.index_of(owner)
+                    && let Ok(house_id) = i8::try_from(index)
+                {
+                    self.session.retire_network_command_source(house_id);
+                }
                 if self.other_undefeated_humans(owner) == 0 {
                     self.flag_house_to_die(owner);
                 }
@@ -2072,6 +2364,11 @@ impl Simulation {
                     return false;
                 }
                 self.flag_house_to_die(owner);
+                // REMOVEPLAYER is synchronized source loss, distinct from
+                // DESTRUCT/defeat: a connected WOL observer remains a publisher.
+                if let Ok(house_id) = i8::try_from(*house_index) {
+                    self.session.retire_network_command_source(house_id);
+                }
                 true
             }
             // Event4C6ED2 resolves Techno and detaches planning6386E0 above,
@@ -2213,6 +2510,7 @@ impl Simulation {
                             MissionType::Unload,
                             None,
                             None,
+                            auxiliary,
                             rules,
                             overlay_registry,
                             frame_effects,
@@ -2297,6 +2595,7 @@ impl Simulation {
                     MissionType::Sabotage,
                     None,
                     Some(combat::TargetKind::Entity(*target_building_id)),
+                    auxiliary,
                     rules,
                     overlay_registry,
                     frame_effects,
@@ -2345,6 +2644,7 @@ impl Simulation {
                     MissionType::Capture,
                     None,
                     Some(combat::TargetKind::Entity(*target_building_id)),
+                    auxiliary,
                     rules,
                     overlay_registry,
                     frame_effects,
@@ -2358,14 +2658,13 @@ impl Simulation {
             } => {
                 // The SPECIAL_PLACE event (`EventClass::Execute 0x004C78D6`).
                 let owner = self.interner.intern(command_owner);
-                self.fire_super_weapon(
+                self.place_super_weapon(
                     rules,
                     owner,
                     *sw_type_id,
                     (*target_rx, *target_ry),
                     overlay_registry,
                     frame_effects,
-                    false,
                 )
             }
             Command::CompletePaidSuperWeapon {
@@ -2381,7 +2680,7 @@ impl Simulation {
                     (*target_rx, *target_ry),
                     overlay_registry,
                     frame_effects,
-                    false,
+                    crate::sim::superweapon::SuperWeaponTargetSource::Manual,
                     Some(*selection),
                 )
             }
@@ -2409,7 +2708,7 @@ impl Simulation {
                     (*target_rx, *target_ry),
                     overlay_registry,
                     frame_effects,
-                    false,
+                    crate::sim::superweapon::SuperWeaponTargetSource::Manual,
                     Some(*selection),
                 )
             }
@@ -2766,14 +3065,69 @@ impl Simulation {
 
     /// Check ownership using stable_id via EntityStore.
     ///
-    /// Used only by receivers whose contract includes an owner gate. The
-    /// MEGAMISSION receiver4C71CA..4C74CA resolves its actor independently of
-    /// the event house; its admission checks lifetime and tokens instead.
+    /// Used by receivers whose contract includes an owner gate and by the
+    /// VERA network actor gate. The native MEGAMISSION receiver4C71CA..4C74CA
+    /// resolves its actor independently of the event house; its admission
+    /// checks lifetime and tokens instead.
     pub(crate) fn entity_owned_by_id(&self, command_owner: &str, stable_id: u64) -> bool {
         self.substrate
             .entities
             .get(stable_id)
             .is_some_and(|e| command_owner.eq_ignore_ascii_case(self.interner.resolve(e.owner())))
+    }
+
+    /// VERA-only network admission, not a native receiver test: refuse an
+    /// event whose acting object exists and belongs to another House.
+    ///
+    /// `EventClass::Execute @ 0x004C6CB0` trusts the sender for most object
+    /// orders (MEGAMISSION, IDLE, Deploy, Repair, Primary, On/Off-line,
+    /// Archive, wall sale @ 0x004FCE80, PlanMgr connect @ 0x00639800 and
+    /// append @ 0x00638120), so a modified client could retask, deploy, sell
+    /// or power down an opponent's objects. Ordinary input orders
+    /// `IsHumanPlayer @ 0x0050B6F0` actors, the sending House in every
+    /// network mode. Offline modes keep the native receivers unchanged
+    /// (campaign PlayerControl houses).
+    ///
+    /// Intended retail differences, all refused alike on every client:
+    /// * retail input quirks that order a selected enemy object — the Guard
+    ///   key's miner arm (`0x00730D60`) and Stop on an enemy building with a
+    ///   rally line — do nothing online;
+    /// * an order whose actor is captured or mind-controlled between issue
+    ///   and execution is dropped, including its planning detach, where
+    ///   retail runs it on the new owner's object. The flag-2 planning
+    ///   acknowledge stays ahead of this gate, so that actor's latch clears.
+    fn network_command_actor_foreign(&self, command_owner: &str, cmd: &Command) -> bool {
+        if !self.session.game_mode().is_network() {
+            return false;
+        }
+        let foreign = |id: u64| {
+            self.substrate.entities.get(id).is_some() && !self.entity_owned_by_id(command_owner, id)
+        };
+        match cmd {
+            Command::Stop { entity_id }
+            | Command::Scatter { entity_id }
+            | Command::DeployMcv { entity_id }
+            | Command::UndeployBuilding { entity_id }
+            | Command::ToggleRepair { entity_id }
+            | Command::SellBuilding { entity_id }
+            | Command::TogglePrimaryFactory { entity_id }
+            | Command::SetBuildingOnLine { entity_id, .. }
+            | Command::ArchiveObject { entity_id, .. } => foreign(*entity_id),
+            Command::SetRally { producer_ids, .. } => producer_ids.iter().any(|&id| foreign(id)),
+            Command::SynchronizedRecord { record } => ArchiveRecord::decode(record)
+                .and_then(|event| u64::try_from(event.entity_id).ok())
+                .is_some_and(foreign),
+            Command::PlanningRecord { record } => {
+                super::planning::planning_record_actor(record).is_some_and(foreign)
+            }
+            Command::SellWallAtCell { x, y } => self
+                .wall_sale_cell(*x, *y)
+                .and_then(|(_, _, cell)| cell.wall_owner)
+                .is_some_and(|owner| {
+                    !command_owner.eq_ignore_ascii_case(self.interner.resolve(owner))
+                }),
+            _ => cmd.megamission_actor().is_some_and(foreign),
+        }
     }
 
     /// The acting object's half of the native order-admission gate.
@@ -3000,9 +3354,7 @@ impl Simulation {
     ///    back to Guard (`techno_ai::building_missions`).
     ///
     /// The tail (`0x004C749D..0x004C74BA`) hands a non-NULL third token to
-    /// the NavComAux setter (vt+0x47C). No represented order carries one:
-    /// [`crate::sim::command::MegaMissionRecord::decode`] refuses a non-NULL
-    /// auxiliary kind.
+    /// the NavComAux setter (vt+0x47C), after Set_Destination clears it.
     ///
     /// The arm tests neither the actor's owner (`0x004C71CA` resolves it
     /// independently of the event house) nor friendship nor the actor's
@@ -3018,6 +3370,7 @@ impl Simulation {
         mission: MissionType,
         target: Option<combat::TargetKind>,
         destination: Option<combat::TargetKind>,
+        auxiliary: MegaMissionTarget,
         rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
@@ -3129,6 +3482,24 @@ impl Simulation {
                 frame_effects,
             );
         }
+        if foot && auxiliary != MegaMissionTarget::Null {
+            let auxiliary = match auxiliary {
+                MegaMissionTarget::Null => None,
+                MegaMissionTarget::Cell { x, y } => {
+                    Some(combat::TargetKind::Cell(x as u16, y as u16))
+                }
+                MegaMissionTarget::Object { id } => {
+                    u64::try_from(id).ok().map(combat::TargetKind::Entity)
+                }
+            };
+            let auxiliary = self.resolve_event_token(auxiliary);
+            self.substrate
+                .entities
+                .get_mut(entity_id)
+                .unwrap()
+                .navigation
+                .set_nav_com_aux(auxiliary.map(Into::into));
+        }
         MegaMissionExecution::Executed
     }
 }
@@ -3209,6 +3580,76 @@ mod tests {
     }
 
     #[test]
+    fn network_match_refuses_orders_for_another_houses_object() {
+        use crate::sim::house_state::HouseState;
+        use crate::sim::scenario_session::ScenarioGameMode;
+        let rules = amcv_move_rules();
+        let world = |mode| {
+            let mut sim = Simulation::new();
+            for (index, name) in [(0, "Americans"), (1, "British")] {
+                let owner = sim.intern(name);
+                sim.houses
+                    .register(HouseState::new(owner, index, None, true, 0, 10));
+            }
+            sim.session.set_game_mode(mode);
+            spawn_rule_backed_unit(&mut sim, 42, "AMCV", &rules);
+            sim
+        };
+        let move_order = Command::Move {
+            entity_id: 42,
+            target_rx: 25,
+            target_ry: 20,
+        };
+        let stop = Command::Stop { entity_id: 42 };
+
+        let mut sim = world(ScenarioGameMode::Wol);
+        assert!(!sim.apply_command("British", &move_order, Some(&rules)));
+        assert!(!sim.apply_command("British", &stop, Some(&rules)));
+        let actor = sim.substrate.entities.get(42).unwrap();
+        assert_eq!(actor.mission.queued(), MissionId::NONE);
+        assert!(actor.navigation.nav_com().is_none());
+        assert!(sim.apply_command("Americans", &move_order, Some(&rules)));
+        assert!(sim.apply_command("Americans", &stop, Some(&rules)));
+
+        // Offline receivers stay native: MEGAMISSION has no sender gate.
+        let mut sim = world(ScenarioGameMode::Skirmish);
+        assert!(sim.apply_command("British", &move_order, Some(&rules)));
+    }
+
+    #[test]
+    fn network_match_refuses_selling_another_houses_wall() {
+        use crate::sim::house_state::HouseState;
+        let (rules, overlays) = crate::sim::world::tests::gsi_04_07_wall_sell_rules(false, false);
+        let mut sim = Simulation::new();
+        let owner = sim.intern("Americans");
+        for (index, house) in [(0, owner), (1, sim.intern("British"))] {
+            sim.houses
+                .register(HouseState::new(house, index, None, true, 0, 10));
+        }
+        sim.session
+            .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Wol);
+        let mut grid = crate::sim::overlay_grid::OverlayGrid::new(3, 3);
+        grid.place_owned_wall(1, 1, 2, 0, owner);
+        sim.overlay_grid = Some(grid);
+        let sale = Command::SellWallAtCell { x: 1, y: 1 };
+        let sell = |sim: &mut Simulation, house: &str| {
+            sim.apply_command_with_overlays(
+                house,
+                &sale,
+                &rules,
+                Some(&overlays),
+                FrameEffects::default(),
+            )
+        };
+        let wall = |sim: &Simulation| sim.overlay_grid.as_ref().unwrap().cell(1, 1).overlay_id;
+
+        assert!(!sell(&mut sim, "British"));
+        assert!(wall(&sim).is_some());
+        assert!(sell(&mut sim, "Americans"));
+        assert_eq!(wall(&sim), None);
+    }
+
+    #[test]
     fn accepted_archive_keeps_its_tokens_after_capture_and_resolves_missing_target_to_null() {
         use crate::sim::house_state::HouseState;
         let rules = amcv_move_rules();
@@ -3265,6 +3706,98 @@ mod tests {
             sim.substrate.entities.get(42).unwrap().archive_target(),
             None
         );
+    }
+
+    #[test]
+    fn queued_sale_retains_issuer_across_capture_and_does_not_readmit_can_sell() {
+        let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+            return;
+        };
+        let Some((_, mut assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        let mut rules = retail.rules;
+        crate::map::theater::load_theater(&mut assets, "URBAN");
+        rules.bind_building_buildup_assets(&assets, "URBAN");
+        assert!(rules.has_buildup("GAPILE"));
+        let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x4C6F12);
+        let old_owner = sim.interner.get("Americans").unwrap();
+        let new_owner = sim.interner.get("Russians").unwrap();
+        sim.houses
+            .get_mut(&new_owner)
+            .unwrap()
+            .set_is_human_for_test(true);
+        let building = sim
+            .spawn_object("GAPILE", "Americans", 8, 8, 0, &rules)
+            .unwrap();
+        let record = sim
+            .encode_object_action_record(
+                old_owner,
+                &Command::SellBuilding {
+                    entity_id: building,
+                },
+            )
+            .unwrap();
+        assert!(sim.admit_native_command_record(record.clone()));
+        sim.change_owner_with_rules(building, new_owner, &rules, None, FrameEffects::default());
+        let bytes = crate::sim::snapshot::GameSnapshot::save(&sim, 0, 0, "sale", 0);
+        let mut sim = crate::sim::snapshot::GameSnapshot::load(&bytes)
+            .unwrap()
+            .sim;
+        sim.restore_after_snapshot_load().unwrap();
+        let admitted = sim.take_frame_commands_for_test();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].owner, old_owner);
+        assert!(!sim.apply_command("Americans", &admitted[0].payload, Some(&rules)));
+        assert!(
+            !sim.substrate
+                .entities
+                .get(building)
+                .unwrap()
+                .building_down()
+        );
+
+        // A double click can admit two events before the first starts Selling.
+        // The second still reaches SellBack(-1), even though CanSell now refuses.
+        let current = sim
+            .encode_object_action_record(
+                new_owner,
+                &Command::SellBuilding {
+                    entity_id: building,
+                },
+            )
+            .unwrap();
+        let envelope = sim.decode_native_command_record(&current, 0).unwrap();
+        let credits = sim.houses[&new_owner].economy().credits();
+        let (accepted, draws) = crate::sim::rng::trace_draws(|| {
+            sim.apply_command("Russians", &envelope.payload, Some(&rules))
+        });
+        assert!(accepted);
+        assert!(draws.is_empty(), "crew RNG belongs to later Selling visits");
+        let actor = sim.substrate.entities.get(building).unwrap();
+        assert!(actor.building_down());
+        let progress = (actor.mission.handler_state(), *actor.native_stage());
+        assert!(!production::can_sell_building(&sim, &rules, building));
+        assert!(sim.apply_command("Russians", &envelope.payload, Some(&rules)));
+        let actor = sim.substrate.entities.get(building).unwrap();
+        assert_eq!(
+            (actor.mission.handler_state(), *actor.native_stage()),
+            progress
+        );
+        assert_eq!(sim.houses[&new_owner].economy().credits(), credits);
+        // Event4C6F2D..4C6F35 refuses a retained but no-longer-alive target.
+        sim.substrate
+            .entities
+            .get_mut(building)
+            .unwrap()
+            .lifecycle
+            .set_object_alive_for_test(false);
+        sim.sound_events.clear_for_test();
+        assert!(!sim.apply_command("Russians", &envelope.payload, Some(&rules)));
+        assert!(sim.sound_events.iter().next().is_none());
+        sim.substrate.entities.remove(building);
+        let stale = sim.decode_native_command_record(&record, 0).unwrap();
+        assert!(!sim.apply_command("Americans", &stale.payload, Some(&rules)));
     }
 
     #[test]

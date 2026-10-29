@@ -40,11 +40,7 @@ impl RulesTypeReferences {
         let Some(resolved) = resolved else {
             return;
         };
-        if !POINTERS
-            .iter()
-            .chain(&DEFAULT_PARTICLE_SYSTEMS)
-            .any(|&(kept, _)| kept == key)
-        {
+        if !kept_pointer(key) {
             return;
         }
         match resolved {
@@ -72,7 +68,11 @@ impl RulesTypeReferences {
 
     /// Publish each kept pointer and list; a null pointer is the empty name.
     pub(crate) fn apply_to(&self, rules: &mut RuleSet) {
-        for &(key, publish) in POINTERS.iter().chain(&DEFAULT_PARTICLE_SYSTEMS) {
+        for &(key, publish) in POINTERS
+            .iter()
+            .chain(&DEFAULT_PARTICLE_SYSTEMS)
+            .chain(npatch_pointers())
+        {
             publish(rules, self.pointers.get(key).map_or("", String::as_str));
         }
         for &(key, publish) in LISTS {
@@ -90,6 +90,25 @@ fn named(id: &str) -> Option<String> {
     (!id.is_empty()).then(|| id.to_owned())
 }
 
+/// The extension pointers this build's rules processor keeps: none without
+/// the capability, which never reads their keys.
+fn npatch_pointers() -> &'static [(&'static str, PublishPointer)] {
+    if crate::rules::NPATCH_ENABLED {
+        NPATCH_POINTERS
+    } else {
+        &[]
+    }
+}
+
+/// Whether the processor keeps `key` as a pointer.
+fn kept_pointer(key: &str) -> bool {
+    POINTERS
+        .iter()
+        .chain(&DEFAULT_PARTICLE_SYSTEMS)
+        .chain(npatch_pointers())
+        .any(|&(kept, _)| kept == key)
+}
+
 /// The kept pointers, by reader. Each Rules offset is the constructor's null
 /// store and the read's store.
 const POINTERS: &[(&str, PublishPointer)] = &[
@@ -97,13 +116,17 @@ const POINTERS: &[(&str, PublishPointer)] = &[
     ("EMPulseSparkles", |rules, id| {
         rules.bind_emp_sparkles(named(id))
     }),
-    // ReadCombatDamage (`0x0066BBB0`): FlameDamage2 +F88 (constructor
+    // ReadCombatDamage (`0x0066BBB0`): FlameDamage +F84 (constructor
+    // 666B1C, read66C2A1..66C2CF); FlameDamage2 +F88 (constructor
     //666B22, read66C2D4..66C2FE); C4Warhead +FA8 (constructor
     // `0x00666B52`, read `0x0066C31F`), CrushWarhead +FAC (`0x00666B58`,
     // `0x0066C35D`), IvanWarhead +FC8 (`0x00666B82`, `0x0066C50C`), WarheadTypes;
     // DrainAnimationType +31C, ControlledAnimationType +320 and
     // PermaControlledAnimationType +324 (`0x00665AD8..0x00665AE4`,
     // `0x0066C94F..0x0066CA4F`), AnimTypes.
+    ("FlameDamage", |rules, id| {
+        rules.combat_damage.bind_flame_damage(named(id));
+    }),
     ("FlameDamage2", |rules, id| {
         rules.combat_damage.bind_flame_damage2(named(id));
     }),
@@ -256,6 +279,21 @@ const POINTERS: &[(&str, PublishPointer)] = &[
     }),
 ];
 
+/// The pointers an installed extension keeps, by reader. They are part of the
+/// same retained set as [`POINTERS`] when the capability is compiled in: the
+/// extension's reader runs inside the rules load, so its FindOrAllocate
+/// identity must survive later passes exactly like a vanilla pointer's.
+/// Without the capability nothing reads the key, the type is never allocated,
+/// and the name is not admitted here.
+const NPATCH_POINTERS: &[(&str, PublishPointer)] = &[
+    // NPSE's `[General] VehicleParachute=`: the canopy an airdropped
+    // non-infantry object takes instead of `Parachute=` (`0xC30FF8..0xC3101F`
+    // reads it; `sim::movement::parachute_descent` casts it).
+    ("VehicleParachute", |rules, id| {
+        rules.general.vehicle_parachute = named(id).map(|id| id.to_ascii_uppercase());
+    }),
+];
+
 /// ReadCombatDamage's nine `Default*System=` ParticleSystemTypes
 /// (+1018..+1038, constructor from `0x00666C09`, read
 /// `0x0066CACD..0x0066CCE0`), in read order.
@@ -365,6 +403,14 @@ const LISTS: &[(&str, PublishList)] = &[
     }),
     ("ConcreteWalls", |rules, ids| {
         rules.concrete_wall_types = rules.ids_with_objects(ids, ObjectCategory::Building);
+    }),
+    // Original ReadAI672AE0: NSGates673830..673870 (+A6C), then
+    // EWGates673875..6738A7 (+A88), through the retained list reader67B550.
+    ("NSGates", |rules, ids| {
+        rules.ns_gate_types = rules.ids_with_objects(ids, ObjectCategory::Building);
+    }),
+    ("EWGates", |rules, ids| {
+        rules.ew_gate_types = rules.ids_with_objects(ids, ObjectCategory::Building);
     }),
     // NeutralTechBuildings +ADC through the list reader `0x0067B550`
     // (`0x006664A7`, `0x00673926`): the random map generator reads it from

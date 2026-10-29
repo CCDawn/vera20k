@@ -286,8 +286,7 @@ fn hover(state: &AppState) -> Option<Hover> {
         return None;
     }
     let sim = &state.match_state.sim_runtime.as_ref()?.simulation;
-    let owner = crate::app::input::commands::preferred_local_owner_name(state)
-        .unwrap_or_else(|| "Americans".to_string());
+    let owner = crate::app::input::commands::preferred_local_owner_name(state)?;
     let object = target
         .tracker_hit
         .and_then(|id| crate::app::input::entity_pick::hover_object_by_id(sim, id, &owner));

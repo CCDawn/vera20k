@@ -20,9 +20,6 @@
 //!   house's masks (`+0x2C4..+0x2D0`, `0x004F7A07..0x004F7A51`), but only the
 //!   House constructor writes them (zero; operand census of each offset,
 //!   2026-10-12), so it admits the house's own country only, as VERA does.
-//! - An infantry type with `VehicleThief=` also counts the house's units
-//!   that hold one of it (`UnitClass+0x338`); VERA has no hijacking, so the
-//!   count adds none.
 
 use crate::map::entities::EntityCategory;
 use crate::rules::object_type::{FactoryType, ObjectCategory, ObjectType};
@@ -33,6 +30,10 @@ use crate::sim::house_tracking::HouseTracking;
 use crate::sim::intern::InternedId;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::world::{SimSoundEvent, Simulation};
+
+#[cfg(test)]
+#[path = "thief_capture_tests.rs"]
+mod thief_capture_tests;
 
 /// `HouseClass::CanBuild`'s answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,13 +181,7 @@ pub(crate) fn can_build(
     if !crate::rules::ARES_ENABLED && !controlled_by_human {
         return CanBuild::Yes;
     }
-    if !bypass_prerequisites
-        && controlled_by_human
-        && !obj
-            .prerequisite
-            .iter()
-            .all(|&entry| prerequisite_on_map(sim, rules, house, entry))
-    {
+    if !bypass_prerequisites && controlled_by_human && !owns_prerequisites(sim, rules, house, obj) {
         return CanBuild::No;
     }
     #[cfg(feature = "ares")]
@@ -196,6 +191,26 @@ pub(crate) fn can_build(
         FactorySearch::Online(_) | FactorySearch::Primary(_) => {}
     }
     build_limit(sim, rules, owner, obj, count_in_production)
+}
+
+/// Whether `house` has every `Prerequisite=` entry of `obj` on the map
+/// ([`prerequisite_on_map`]; an empty list is met): CanBuild's human arm, and
+/// with `ares` the power plant filter `0x10021CA0` of `sim::ai_base_building`.
+/// That filter asks HouseOwnsAll `0x10008110` of each of the type's
+/// prerequisite lists (TechnoTypeExt `+0x40`) and is met by any one. Ares
+/// reads list 0 from `Prerequisite=` (`0x1003E0B7`); VERA reads no
+/// `Prerequisite.Lists=`/`Prerequisite.List#=` (`0x1003E093`, `0x1003E0F1`),
+/// so a type that adds lists is judged by list 0 alone. No retail INI sets
+/// either key.
+pub(crate) fn owns_prerequisites(
+    sim: &Simulation,
+    rules: &RuleSet,
+    house: &HouseState,
+    obj: &ObjectType,
+) -> bool {
+    obj.prerequisite
+        .iter()
+        .all(|&entry| prerequisite_on_map(sim, rules, house, entry))
 }
 
 /// One `Prerequisite=` entry of CanBuild's human arm
@@ -390,7 +405,10 @@ fn ares_owned_build_limit_count(
         return matching_installed_upgrades(sim, house, host, upgrade)
             .fold(0_i32, |count, _| count.wrapping_add(1));
     }
-    let own = tracked(EntityCategory::from(obj.category), &obj.id);
+    // Ares CountOwned10020C23..10020C81 keeps the original Infantry
+    // VehicleThief census. The existing Unit+338 owner supplies this count.
+    let own = tracked(EntityCategory::from(obj.category), &obj.id)
+        .wrapping_add(captured_vehicle_thief_count(sim, rules, house.name(), obj));
     let converted = match obj.category {
         ObjectCategory::Building => obj
             .undeploys_into
@@ -438,7 +456,8 @@ fn build_limit(
             house
                 .tracking()
                 .owned_count(EntityCategory::from(obj.category), type_id)
-        });
+        })
+        .wrapping_add(captured_vehicle_thief_count(sim, rules, owner, obj));
     let produced = || {
         rules
             .type_array_index(obj.category, &obj.id)
@@ -528,7 +547,7 @@ fn build_limit(
 /// magnitude is reached by what the house produced and what the factory
 /// holds; with a positive one, once the
 /// tracked count (`owned_count`) and the factory's reach it. An infantry
-/// `VehicleThief=` would add the units that hold one (module residual).
+/// `VehicleThief=` adds the units that hold one (`0x0050B4C4..0x0050B506`).
 pub(crate) fn check_build_limit(
     sim: &Simulation,
     rules: &RuleSet,
@@ -580,7 +599,38 @@ pub(crate) fn check_build_limit(
     let owned = type_id.zip(tracking).map_or(0, |(type_id, tracking)| {
         tracking.owned_count(EntityCategory::from(obj.category), type_id)
     });
-    owned.wrapping_add(queued) >= limit
+    owned
+        .wrapping_add(captured_vehicle_thief_count(sim, rules, owner, obj))
+        .wrapping_add(queued)
+        >= limit
+}
+
+/// The shared Unit census in House::CanBuild4F80E6..4F8128 and
+/// CheckBuildLimit50B4C4..50B506 (retail gamemd.exe). Both include limbo
+/// and pending destruction; only owner and retained InfantryType index are
+/// tested. The entity store owns membership; no second counter is needed.
+fn captured_vehicle_thief_count(
+    sim: &Simulation,
+    rules: &RuleSet,
+    owner: InternedId,
+    obj: &ObjectType,
+) -> i32 {
+    if obj.category == ObjectCategory::Infantry && obj.vehicle_thief {
+        rules
+            .type_array_index(ObjectCategory::Infantry, &obj.id)
+            .map_or(0, |index| {
+                sim.entities()
+                    .values()
+                    .filter(|entity| {
+                        entity.category() == EntityCategory::Unit
+                            && entity.owner() == owner
+                            && entity.capture_infantry_type_index.get() == index
+                    })
+                    .fold(0i32, |count, _| count.wrapping_add(1))
+            })
+    } else {
+        0
+    }
 }
 
 /// ObjectClass::FindFactory5F5C20 resolves this object's actual type and owner,
@@ -596,7 +646,7 @@ pub fn object_find_factory(
     require_online: bool,
 ) -> Option<u64> {
     let object = sim.entities().get(object_id)?;
-    let object_type = sim.object_type(object.type_ref(), rules)?;
+    let object_type = sim.entity_object_type(object, rules)?;
     find_factory(
         sim,
         rules,
@@ -690,7 +740,7 @@ fn query_factory(
         let Some(building) = sim.substrate.entities.get(id) else {
             continue;
         };
-        let Some(building_type) = sim.object_type(building.type_ref(), rules) else {
+        let Some(building_type) = sim.entity_object_type(building, rules) else {
             continue;
         };
         if !building.lifecycle.in_limbo()
@@ -786,7 +836,7 @@ pub(crate) fn initialize_factory_primary(sim: &mut Simulation, rules: &RuleSet, 
     if building.category() != EntityCategory::Structure || building.lifecycle.in_limbo() {
         return;
     }
-    let Some(ty) = sim.object_type(building.type_ref(), rules) else {
+    let Some(ty) = sim.entity_object_type(building, rules) else {
         return;
     };
     let Some(factory) = ty.factory_type() else {
@@ -810,7 +860,7 @@ pub(crate) fn initialize_factory_primary(sim: &mut Simulation, rules: &RuleSet, 
                     .is_some_and(|candidate| {
                         !candidate.lifecycle.in_limbo()
                             && sim.production.is_primary_factory(candidate_id)
-                            && sim.object_type(candidate.type_ref(), rules).is_some_and(
+                            && sim.entity_object_type(candidate, rules).is_some_and(
                                 |candidate_type| {
                                     candidate_type.factory_type() == Some(factory)
                                         && candidate_type.naval == ty.naval
@@ -836,7 +886,7 @@ pub fn can_select_factory_primary(sim: &Simulation, rules: &RuleSet, id: u64) ->
         building.category() == EntityCategory::Structure
             && !sim.production.is_primary_factory(id)
             && sim
-                .object_type(building.type_ref(), rules)
+                .entity_object_type(building, rules)
                 .is_some_and(|ty| !ty.invisible_in_game && ty.factory_type().is_some())
     })
 }
@@ -855,7 +905,7 @@ pub(crate) fn toggle_factory_primary(sim: &mut Simulation, rules: &RuleSet, id: 
             if building.category() != EntityCategory::Structure {
                 return None;
             }
-            let ty = sim.object_type(building.type_ref(), rules)?;
+            let ty = sim.entity_object_type(building, rules)?;
             Some((
                 building.owner(),
                 ty.factory_type()?,
@@ -880,11 +930,9 @@ pub(crate) fn toggle_factory_primary(sim: &mut Simulation, rules: &RuleSet, id: 
             .filter(|&peer| {
                 sim.substrate.entities.get(peer).is_some_and(|candidate| {
                     !candidate.lifecycle.in_limbo()
-                        && sim
-                            .object_type(candidate.type_ref(), rules)
-                            .is_some_and(|ty| {
-                                ty.factory_type() == Some(factory) && ty.naval == naval
-                            })
+                        && sim.entity_object_type(candidate, rules).is_some_and(|ty| {
+                            ty.factory_type() == Some(factory) && ty.naval == naval
+                        })
                 })
             })
             .collect();

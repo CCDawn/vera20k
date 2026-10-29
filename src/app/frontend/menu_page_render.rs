@@ -1,7 +1,7 @@
 //! Render glue for the RA2TS-bearing right-panel menu pages: Single Player
 //! `0x100` and Movies & Credits `0x101` (`ui::shell::menu_page`).
 
-use std::time::Instant;
+use crate::util::time::Instant;
 
 use anyhow::Result;
 
@@ -247,7 +247,8 @@ pub(crate) fn active_page_title_text(
         ShellSlideKind::MainMenu
         | ShellSlideKind::Skirmish
         | ShellSlideKind::Score
-        | ShellSlideKind::CampaignScore => {
+        | ShellSlideKind::CampaignScore
+        | ShellSlideKind::CampaignEnd => {
             return String::new();
         }
     };
@@ -594,7 +595,7 @@ mod tests {
         // Steady dispatch presents the page directly to the swapchain.
         let app_source = include_str!("../frame.rs");
         let dispatch = &app_source[app_source
-            .find("ActiveMenuPage::from_state(state)")
+            .find("ScreenPage::SinglePlayer | ScreenPage::MoviesAndCredits =>")
             .expect("menu page steady dispatch")..];
         let shell_call = dispatch
             .find("render_active_menu_page")

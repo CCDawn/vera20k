@@ -232,6 +232,15 @@ pub(crate) struct MatchInputState {
     pub(crate) retail_screenshot_requested: bool,
     /// True while left-dragging on minimap (camera pan mode).
     pub(crate) minimap_dragging: bool,
+    /// Touch gestures translated into mouse input (Windows touchscreens). Its
+    /// sticky gesture lives here, beside the other pointer bytes, so the match
+    /// teardown ladder resets it with them.
+    pub(crate) touch_mapper: crate::app::input::touch::TouchMouseMapper,
+    /// The cursor position came from a touch, not a hardware pointer. VERA
+    /// internal: edge auto-scroll needs a pointer that can leave the band, and
+    /// a lifted finger leaves the synthetic cursor parked. The next real
+    /// `CursorMoved` clears it.
+    pub(crate) cursor_from_touch: bool,
     /// Selection drag state — tracks mouse drag for box-select.
     pub(crate) selection_state: crate::sim::selection::SelectionState,
     /// Player-side `g_CurrentObjects` order. Selection commands update this
@@ -248,7 +257,7 @@ pub(crate) struct MatchInputState {
     /// the 800 ms double-tap that centres the camera. Wall clock, never sim
     /// state: the original stamps `timeGetTime()` here and only a recall writes
     /// it — assigning with Ctrl+digit never does.
-    pub(crate) last_control_group_press: Option<(usize, std::time::Instant)>,
+    pub(crate) last_control_group_press: Option<(usize, crate::util::time::Instant)>,
     /// The object the camera is following, i.e. `DisplayClass +0x11A0` behind
     /// its valid byte `+0x119C`. `None` is the cleared pair.
     pub(crate) follow_target: Option<u64>,
@@ -387,6 +396,8 @@ impl MatchInputState {
         Self {
             cursor_visibility: Default::default(),
             minimap_dragging: false,
+            touch_mapper: crate::app::input::touch::TouchMouseMapper::new(),
+            cursor_from_touch: false,
             selection_state: crate::sim::selection::SelectionState::new(),
             selection_order: Vec::new(),
             selection_order_pending: false,
@@ -650,6 +661,10 @@ impl MatchInputState {
         self.minimap_dragging = false;
         self.selection_state.cancel_drag();
         self.tactical_mouse.cancel_mouse_drag();
+        // The touch gesture is the mapper's; without this a finger still down
+        // when the drag is torn down would deliver its release into the screen
+        // that replaced it.
+        self.touch_mapper.reset();
     }
 
     /// TAction46 clears the active display modes before Lock684240 cancels

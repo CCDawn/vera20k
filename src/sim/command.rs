@@ -53,8 +53,12 @@ pub const MEGAMISSION_STAGE_CAPACITY: usize = 0x100;
 /// (`0x0064CBF4..0x0064CC3D`). This admission owner serves both the production
 /// semantic dispatcher and the synchronized byte queue. Local OutList admission
 /// is a separate boundary. Source: original gamemd.exe instructions.
-pub(crate) fn stage_megamission<T: Clone>(stage: &mut Vec<T>, command: &T) -> bool {
-    if stage.len() >= MEGAMISSION_STAGE_CAPACITY {
+pub(crate) fn stage_megamission<T: Clone>(
+    stage: &mut Vec<T>,
+    command: &T,
+    capacity: usize,
+) -> bool {
+    if stage.len() >= capacity {
         return false;
     }
     stage.push(command.clone());
@@ -83,6 +87,74 @@ pub const ABANDON_ALL_OPCODE: u8 = 0x2e;
 pub const GAME_SPEED_OPCODE: u8 = 0x0d;
 pub const OPTIONS_OPCODE: u8 = 0x0c;
 pub const LATENCY_FUDGE_OPCODE: u8 = 0x24;
+/// ProcessNetwork647E7B / EventClass4C800C: synchronized network timing.
+pub const TIMING_OPCODE: u8 = 0x20;
+/// ProcessNetwork647767 / EventClass4C80B1: a source's mean frame cost.
+pub const PROCESS_TIME_OPCODE: u8 = 0x21;
+
+/// The five-byte EVENT_TIMING payload. A zero send rate cannot be produced by
+/// ProcessNetwork and would divide by zero in native; reject it on decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimingRecord {
+    pub house_id: i8,
+    pub frame: i32,
+    pub frames_per_second: u16,
+    pub max_ahead: u16,
+    pub frame_send_rate: std::num::NonZeroU8,
+}
+
+impl TimingRecord {
+    pub fn encode(self) -> Result<CommandRecord, CommandRecordError> {
+        let mut payload = [0; 5];
+        payload[..2].copy_from_slice(&self.frames_per_second.to_le_bytes());
+        payload[2..4].copy_from_slice(&self.max_ahead.to_le_bytes());
+        payload[4] = self.frame_send_rate.get();
+        CommandRecord::encode(
+            TIMING_OPCODE,
+            i32::from(self.house_id),
+            self.frame,
+            &payload,
+        )
+    }
+
+    pub fn decode(record: &CommandRecord) -> Option<Self> {
+        (record.opcode() == TIMING_OPCODE).then_some(())?;
+        Some(Self {
+            house_id: record.house_id(),
+            frame: record.frame_stamp(),
+            frames_per_second: u16::from_le_bytes(record.payload()[..2].try_into().ok()?),
+            max_ahead: u16::from_le_bytes(record.payload()[2..4].try_into().ok()?),
+            frame_send_rate: std::num::NonZeroU8::new(record.payload()[4])?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessTimeRecord {
+    pub house_id: i8,
+    pub frame: i32,
+    pub milliseconds: u16,
+}
+
+impl ProcessTimeRecord {
+    pub fn encode(self) -> Result<CommandRecord, CommandRecordError> {
+        CommandRecord::encode(
+            PROCESS_TIME_OPCODE,
+            i32::from(self.house_id),
+            self.frame,
+            &self.milliseconds.to_le_bytes(),
+        )
+    }
+
+    pub fn decode(record: &CommandRecord) -> Option<Self> {
+        (record.opcode() == PROCESS_TIME_OPCODE).then_some(())?;
+        Some(Self {
+            house_id: record.house_id(),
+            frame: record.frame_stamp(),
+            milliseconds: u16::from_le_bytes(record.payload()[..2].try_into().ok()?),
+        })
+    }
+}
 
 /// Payload of the native GAMESPEED event (opcode `0x0D`, type 13 at
 /// `0x004C794B`): the setting dword at Event+7; the sender rides the header.
@@ -432,6 +504,224 @@ impl CommandRecord {
             MegaMissionTarget::Object { id } => Some(id),
             _ => None,
         }
+    }
+}
+
+/// TargetClass events share constructor4C65E0's five-byte object token.
+/// SELL is Event16 (4C6F12), Primary is Event11 (4C718C). Bunker eject is
+/// an explicit VERA event for the existing release owner, not a native opcode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectAction {
+    Sell,
+    Primary,
+    EjectBunker,
+}
+
+pub const VERA_EJECT_BUNKER_OPCODE: u8 = 0x31;
+pub const VERA_PAID_SUPER_OPCODE: u8 = 0x30;
+pub const VERA_CYCLE_PRODUCER_OPCODE: u8 = 0x32;
+pub const VERA_PAID_SUPER_PAYLOAD_LEN: u8 = 21;
+
+impl ObjectAction {
+    pub const fn opcode(self) -> u8 {
+        match self {
+            Self::Sell => 0x16,
+            Self::Primary => 0x11,
+            Self::EjectBunker => VERA_EJECT_BUNKER_OPCODE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectActionRecord {
+    pub house_id: i8,
+    pub frame: i32,
+    pub entity_id: i32,
+    pub action: ObjectAction,
+}
+
+impl ObjectActionRecord {
+    pub fn write_into(self, record: &mut CommandRecord) {
+        record.write_object_target(
+            self.action.opcode(),
+            self.house_id,
+            self.frame,
+            self.entity_id,
+        );
+    }
+
+    pub fn decode(record: &CommandRecord) -> Option<Self> {
+        let action = match record.opcode() {
+            0x16 => ObjectAction::Sell,
+            0x11 => ObjectAction::Primary,
+            VERA_EJECT_BUNKER_OPCODE => ObjectAction::EjectBunker,
+            _ => return None,
+        };
+        Some(Self {
+            house_id: record.house_id(),
+            frame: record.frame_stamp(),
+            entity_id: record.object_target_id()?,
+            action,
+        })
+    }
+}
+
+/// SPECIAL_PLACE constructor4C6B60 stores the SuperWeaponTypes index at+7,
+/// then CellStruct at+B/+D. Execute4C78D6 passes both to House::Fire_SW4FAE50.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpecialPlaceRecord {
+    pub house_id: i8,
+    pub frame: i32,
+    pub type_index: i32,
+    pub cell: (i16, i16),
+}
+impl SpecialPlaceRecord {
+    pub const OPCODE: u8 = 0x12;
+    pub fn encode(self) -> Result<CommandRecord, CommandRecordError> {
+        let mut payload = [0; 8];
+        payload[..4].copy_from_slice(&self.type_index.to_le_bytes());
+        payload[4..6].copy_from_slice(&self.cell.0.to_le_bytes());
+        payload[6..8].copy_from_slice(&self.cell.1.to_le_bytes());
+        CommandRecord::encode(Self::OPCODE, i32::from(self.house_id), self.frame, &payload)
+    }
+    pub fn decode(record: &CommandRecord) -> Option<Self> {
+        (record.opcode() == Self::OPCODE).then(|| Self {
+            house_id: record.house_id(),
+            frame: record.frame_stamp(),
+            type_index: i32::from_le_bytes(record.payload()[..4].try_into().unwrap()),
+            cell: (
+                i16::from_le_bytes(record.payload()[4..6].try_into().unwrap()),
+                i16::from_le_bytes(record.payload()[6..8].try_into().unwrap()),
+            ),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaidSuperAction {
+    Begin,
+    Complete,
+    Cancel,
+}
+
+/// VERA paid-power ticket transport. Rule-array indices are portable across
+/// clients whose interners differ; the one-use sequence remains a full u64.
+/// Layout: action:u8, source:i32, destination:i32, sequence:u64, cell:i16x2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaidSuperRecord {
+    pub house_id: i8,
+    pub frame: i32,
+    pub action: PaidSuperAction,
+    pub source: i32,
+    pub destination: i32,
+    pub sequence: u64,
+    pub cell: (i16, i16),
+}
+impl PaidSuperRecord {
+    fn canonical(self) -> bool {
+        self.house_id >= 0
+            && self.source >= 0
+            && self.destination >= 0
+            && self.source != self.destination
+            && self.sequence != 0
+            && if self.action == PaidSuperAction::Cancel {
+                self.cell == (0, 0)
+            } else {
+                (0..512).contains(&self.cell.0) && (0..512).contains(&self.cell.1)
+            }
+    }
+    pub fn encode(self) -> Option<CommandRecord> {
+        if !self.canonical() {
+            return None;
+        }
+        let mut payload = [0; VERA_PAID_SUPER_PAYLOAD_LEN as usize];
+        payload[0] = match self.action {
+            PaidSuperAction::Begin => 0,
+            PaidSuperAction::Complete => 1,
+            PaidSuperAction::Cancel => 2,
+        };
+        payload[1..5].copy_from_slice(&self.source.to_le_bytes());
+        payload[5..9].copy_from_slice(&self.destination.to_le_bytes());
+        payload[9..17].copy_from_slice(&self.sequence.to_le_bytes());
+        payload[17..19].copy_from_slice(&self.cell.0.to_le_bytes());
+        payload[19..21].copy_from_slice(&self.cell.1.to_le_bytes());
+        CommandRecord::encode(
+            VERA_PAID_SUPER_OPCODE,
+            i32::from(self.house_id),
+            self.frame,
+            &payload,
+        )
+        .ok()
+    }
+    pub fn decode(record: &CommandRecord) -> Option<Self> {
+        if record.opcode() != VERA_PAID_SUPER_OPCODE {
+            return None;
+        }
+        let payload = record.payload();
+        let value = Self {
+            house_id: record.house_id(),
+            frame: record.frame_stamp(),
+            action: match payload[0] {
+                0 => PaidSuperAction::Begin,
+                1 => PaidSuperAction::Complete,
+                2 => PaidSuperAction::Cancel,
+                _ => return None,
+            },
+            source: i32::from_le_bytes(payload[1..5].try_into().ok()?),
+            destination: i32::from_le_bytes(payload[5..9].try_into().ok()?),
+            sequence: u64::from_le_bytes(payload[9..17].try_into().ok()?),
+            cell: (
+                i16::from_le_bytes(payload[17..19].try_into().ok()?),
+                i16::from_le_bytes(payload[19..21].try_into().ok()?),
+            ),
+        };
+        value.canonical().then_some(value)
+    }
+}
+
+/// VERA sidebar cycling resolves the next primary at execution, preserving
+/// the order of multiple queued cycles through the existing production owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CycleProducerRecord {
+    pub house_id: i8,
+    pub frame: i32,
+    pub category: ProductionCategory,
+}
+impl CycleProducerRecord {
+    pub fn encode(self) -> Result<CommandRecord, CommandRecordError> {
+        let category = match self.category {
+            ProductionCategory::Building => 0,
+            ProductionCategory::Defense => 1,
+            ProductionCategory::Infantry => 2,
+            ProductionCategory::Vehicle => 3,
+            ProductionCategory::Aircraft => 4,
+            ProductionCategory::Ship => 5,
+        };
+        CommandRecord::encode(
+            VERA_CYCLE_PRODUCER_OPCODE,
+            i32::from(self.house_id),
+            self.frame,
+            &[category],
+        )
+    }
+    pub fn decode(record: &CommandRecord) -> Option<Self> {
+        if record.opcode() != VERA_CYCLE_PRODUCER_OPCODE {
+            return None;
+        }
+        let category = match record.payload()[0] {
+            0 => ProductionCategory::Building,
+            1 => ProductionCategory::Defense,
+            2 => ProductionCategory::Infantry,
+            3 => ProductionCategory::Vehicle,
+            4 => ProductionCategory::Aircraft,
+            5 => ProductionCategory::Ship,
+            _ => return None,
+        };
+        Some(Self {
+            house_id: record.house_id(),
+            frame: record.frame_stamp(),
+            category,
+        })
     }
 }
 
@@ -840,6 +1130,7 @@ pub struct MegaMissionRecord {
     pub frame: i32,
     pub source_id: i32,
     pub order: MegaMissionOrder,
+    pub auxiliary: MegaMissionTarget,
 }
 
 impl MegaMissionRecord {
@@ -885,6 +1176,10 @@ impl MegaMissionRecord {
         };
         let (target_value, target_kind) = target.token()?;
         let (destination_value, destination_kind) = destination.token()?;
+        let (auxiliary_value, auxiliary_kind) = match self.auxiliary {
+            MegaMissionTarget::Null => (self.source_id, NULL_TARGET_KIND),
+            auxiliary => auxiliary.token()?,
+        };
         let payload = &mut record.payload_mut()[..MEGAMISSION_OWNED_PAYLOAD_LEN];
         payload[MEGAMISSION_SOURCE_VALUE_OFFSET..MEGAMISSION_SOURCE_KIND_OFFSET]
             .copy_from_slice(&self.source_id.to_le_bytes());
@@ -897,8 +1192,8 @@ impl MegaMissionRecord {
             .copy_from_slice(&destination_value.to_le_bytes());
         payload[MEGAMISSION_DESTINATION_KIND_OFFSET] = destination_kind;
         payload[MEGAMISSION_AUXILIARY_VALUE_OFFSET..MEGAMISSION_AUXILIARY_KIND_OFFSET]
-            .copy_from_slice(&self.source_id.to_le_bytes());
-        payload[MEGAMISSION_AUXILIARY_KIND_OFFSET] = NULL_TARGET_KIND;
+            .copy_from_slice(&auxiliary_value.to_le_bytes());
+        payload[MEGAMISSION_AUXILIARY_KIND_OFFSET] = auxiliary_kind;
         payload[MEGAMISSION_PLANNING_OFFSET] = 0;
         Ok(())
     }
@@ -927,7 +1222,6 @@ impl MegaMissionRecord {
                 .ok()?,
         );
         if payload[MEGAMISSION_SOURCE_KIND_OFFSET] != ABSTRACT_OBJECT_TARGET_KIND
-            || payload[MEGAMISSION_AUXILIARY_KIND_OFFSET] != NULL_TARGET_KIND
             || payload[MEGAMISSION_PLANNING_OFFSET] != 0
         {
             return None;
@@ -938,6 +1232,17 @@ impl MegaMissionRecord {
             destination,
             payload[MEGAMISSION_DESTINATION_KIND_OFFSET],
         )?;
+        // EventClass::Execute 0x004C74A2..0x004C74BA resolves this token
+        // separately, after the class destination setter. A NULL kind ignores
+        // its DWORD (Connect63684F retains the template source there).
+        let auxiliary = if payload[MEGAMISSION_AUXILIARY_KIND_OFFSET] == NULL_TARGET_KIND {
+            MegaMissionTarget::Null
+        } else {
+            MegaMissionTarget::from_token(
+                i32::from_le_bytes(payload[17..21].try_into().ok()?),
+                payload[MEGAMISSION_AUXILIARY_KIND_OFFSET],
+            )?
+        };
         let order = match (action, target, destination) {
             (1, target, MegaMissionTarget::Null) => MegaMissionOrder::Attack { target },
             (29, target, destination) => MegaMissionOrder::AttackMove {
@@ -972,6 +1277,7 @@ impl MegaMissionRecord {
             frame: record.frame_stamp(),
             source_id,
             order,
+            auxiliary,
         })
     }
 }
@@ -1265,16 +1571,16 @@ impl Command {
     }
 
     /// Classify local issue, not already-admitted replay/network input. The
-    /// paid source/destination commands each fire SPECIAL_PLACE and consume
-    /// a slot; only cancellation is local ticket bookkeeping.
+    /// semantic paid source/destination commands consume a slot. The normal
+    /// UI serializes all three paid actions, including cancellation, before
+    /// this boundary; each serialized carrier consumes an event slot.
     pub(crate) fn consumes_native_outlist_slot(&self) -> bool {
         match self {
             Self::Select { .. }
             | Self::AssignControlGroup { .. }
             | Self::SetGameSpeed { .. }
             | Self::MoveFlash { .. }
-            | Self::CancelPaidSuperWeapon { .. }
-            | Self::CycleProducerFocus { .. } => false,
+            | Self::CancelPaidSuperWeapon { .. } => false,
             Self::PlanningRecord { .. }
             | Self::Move { .. }
             | Self::MoveToObject { .. }
@@ -1303,6 +1609,7 @@ impl Command {
             | Self::PlaceProducedMobile { .. }
             | Self::Scatter { .. }
             | Self::TogglePrimaryFactory { .. }
+            | Self::CycleProducerFocus { .. }
             | Self::Cheer
             | Self::MegaMission { .. }
             | Self::Destruct
@@ -1538,6 +1845,90 @@ mod tests {
     }
 
     #[test]
+    fn vera_action_records_reject_noncanonical_fields_before_execution() {
+        use super::{ObjectAction, ObjectActionRecord, PaidSuperAction, PaidSuperRecord};
+        let paid = PaidSuperRecord {
+            house_id: 29,
+            frame: 77,
+            action: PaidSuperAction::Begin,
+            source: 3,
+            destination: 4,
+            sequence: u64::MAX,
+            cell: (511, 0),
+        };
+        let record = paid.encode().unwrap();
+        assert_eq!(PaidSuperRecord::decode(&record), Some(paid));
+        assert!(
+            PaidSuperRecord {
+                sequence: 0,
+                ..paid
+            }
+            .encode()
+            .is_none()
+        );
+        assert!(
+            PaidSuperRecord {
+                destination: 3,
+                ..paid
+            }
+            .encode()
+            .is_none()
+        );
+        assert!(PaidSuperRecord { source: -1, ..paid }.encode().is_none());
+        assert!(
+            PaidSuperRecord {
+                cell: (512, 0),
+                ..paid
+            }
+            .encode()
+            .is_none()
+        );
+        assert!(
+            PaidSuperRecord {
+                action: PaidSuperAction::Cancel,
+                ..paid
+            }
+            .encode()
+            .is_none()
+        );
+        let mut malformed = record.clone();
+        malformed.payload_mut()[0] = 3;
+        assert!(PaidSuperRecord::decode(&malformed).is_none());
+        let cancel = PaidSuperRecord {
+            action: PaidSuperAction::Cancel,
+            cell: (0, 0),
+            ..paid
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(PaidSuperRecord::decode(&cancel).unwrap().sequence, u64::MAX);
+        let action = ObjectActionRecord {
+            house_id: 29,
+            frame: 77,
+            entity_id: 42,
+            action: ObjectAction::EjectBunker,
+        };
+        let mut record = CommandRecord::encode(0, 0, 0, &[]).unwrap();
+        action.write_into(&mut record);
+        assert_eq!(ObjectActionRecord::decode(&record), Some(action));
+        record.payload_mut()[4] = 0x0b;
+        assert!(ObjectActionRecord::decode(&record).is_none());
+        let mut cycle = super::CycleProducerRecord {
+            house_id: 29,
+            frame: 77,
+            category: super::ProductionCategory::Ship,
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            super::CycleProducerRecord::decode(&cycle).unwrap().category,
+            super::ProductionCategory::Ship
+        );
+        cycle.payload_mut()[0] = 6;
+        assert!(super::CycleProducerRecord::decode(&cycle).is_none());
+    }
+
+    #[test]
     fn synchronized_carrier_roundtrip_preserves_opaque_native_bytes() {
         use super::{Command, CommandEnvelope};
         let record = CommandRecord::decode_exact(&[0xa5; COMMAND_RECORD_LEN]).unwrap();
@@ -1692,6 +2083,7 @@ mod tests {
                 _ => panic!("uncovered native constructor row {name}"),
             };
             let typed = MegaMissionRecord {
+                auxiliary: MegaMissionTarget::Null,
                 house_id: i8::try_from(i32::from_le_bytes(args[0].to_le_bytes())).unwrap(),
                 frame: i32::try_from(row["frame"].as_i64().unwrap()).unwrap(),
                 source_id: i32::from_le_bytes(args[1].to_le_bytes()),
@@ -1721,6 +2113,7 @@ mod tests {
         for (x, y) in [(999, i16::MAX), (-999, i16::MIN), (-999, 0), (0, 0)] {
             let mut record = CommandRecord::decode_exact(&[0; COMMAND_RECORD_LEN]).unwrap();
             let typed = MegaMissionRecord {
+                auxiliary: MegaMissionTarget::Null,
                 house_id: 0,
                 frame: 1,
                 source_id: 7,
@@ -1736,6 +2129,7 @@ mod tests {
         let mut record = CommandRecord::decode_exact(&[0; COMMAND_RECORD_LEN]).unwrap();
         assert_eq!(
             MegaMissionRecord {
+                auxiliary: MegaMissionTarget::Null,
                 house_id: 0,
                 frame: 1,
                 source_id: 7,
@@ -1753,6 +2147,7 @@ mod tests {
     fn gsi_16_01_megamission_move_rejects_wrong_tokens_action_and_planning() {
         let mut valid = CommandRecord::decode_exact(&[0; COMMAND_RECORD_LEN]).unwrap();
         MegaMissionRecord {
+            auxiliary: MegaMissionTarget::Null,
             house_id: 0,
             frame: 1,
             source_id: 7,
@@ -1782,6 +2177,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn megamission_preserves_the_clicked_cell_separately_from_the_destination() {
+        let mut record = CommandRecord::decode_exact(&[0; COMMAND_RECORD_LEN]).unwrap();
+        let typed = MegaMissionRecord {
+            house_id: 0,
+            frame: 1,
+            source_id: 7,
+            order: MegaMissionOrder::Move {
+                target_x: 11,
+                target_y: 20,
+            },
+            auxiliary: MegaMissionTarget::Cell { x: 10, y: 20 },
+        };
+        typed.write_into(&mut record).unwrap();
+        // EventClass constructor 0x004C68A3/0x004C68B4 stores the two
+        // independent Cell tokens; only the destination is spread later.
+        assert_ne!(&record.payload()[12..17], &record.payload()[17..22]);
+        assert_eq!(MegaMissionRecord::decode(&record), Some(typed));
+    }
+
     /// The object receiver `0x004D74E0` sends Move with the object as its
     /// destination token (`0x004D7C76`), which the constructor writes in the
     /// slot a Move cell takes. A Move with no destination stays outside the
@@ -1790,6 +2205,7 @@ mod tests {
     fn megamission_move_to_object_carries_an_abstract_destination_token() {
         let mut record = CommandRecord::decode_exact(&[0xcc; COMMAND_RECORD_LEN]).unwrap();
         let typed = MegaMissionRecord {
+            auxiliary: MegaMissionTarget::Null,
             house_id: 1,
             frame: 9,
             source_id: 7,
@@ -1813,6 +2229,7 @@ mod tests {
     fn megamission_repair_preserves_its_destination() {
         let mut record = CommandRecord::decode_exact(&[0xcc; COMMAND_RECORD_LEN]).unwrap();
         let typed = MegaMissionRecord {
+            auxiliary: MegaMissionTarget::Null,
             house_id: 1,
             frame: 9,
             source_id: 7,

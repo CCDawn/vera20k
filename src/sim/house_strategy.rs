@@ -34,7 +34,9 @@
 //!    building whose type has `Factory=` sells everything and sends everyone
 //!    hunting as well (`0x004FD879..0x004FD904`); then a house that must
 //!    rebuild its economy (Check_Build_Need, asked first) runs
-//!    Manage_Build_Queue (`sim::ai_build_need`).
+//!    Manage_Build_Queue (`sim::ai_build_need`). Phobos
+//!    `[General] AIFireSale=`/`AIAllToHunt=` gate only these two last-legs
+//!    calls; `AIFireSaleDelay=` arms a per-house timer on the first reach.
 //!
 //! Evidence: `tools/ai_strategy_oracle.py` runs the Update block, whole
 //! Strategy with the original UpdateAngerNodes, Fire_Sale and All_To_Hunt;
@@ -88,11 +90,19 @@ pub(crate) fn update_strategy(
     let Some(house) = sim.houses.get(&owner) else {
         return;
     };
-    if !house.strategy_timer().expired(frame)
-        || house.is_controlled_by_human(sim.session.game_mode_nonzero())
-        || house.multiplay_passive()
-        || house.command_driven()
-    {
+    if !house.strategy_timer().expired(frame) {
+        return;
+    }
+    if house.is_controlled_by_human(sim.session.game_mode_nonzero()) {
+        // Ares4F9004 hook10034CD0 calls AI_TryFireSW for humans, after
+        // the existing strategy timer gate, without restarting that timer.
+        #[cfg(feature = "ares")]
+        crate::sim::superweapon::ai_fire::try_fire(sim, rules, owner, registry, frame_effects);
+        return;
+    }
+    // Fork: command-driven houses (the Super AI) run their own economy;
+    // the native building strategy must not fight it.
+    if house.multiplay_passive() || house.command_driven() {
         return;
     }
     let delay = building_strategy(sim, rules, owner, registry, frame_effects);
@@ -152,7 +162,7 @@ fn building_strategy(
         let no_factory = !suppressed && !has_live_factory(sim, rules, owner);
         let build_need = crate::sim::ai_build_need::check_build_need(sim, rules, owner);
         if no_factory {
-            sell_off_and_hunt(sim, rules, owner, "no factory", registry, frame_effects);
+            last_legs_actions(sim, rules, owner, registry, frame_effects);
         }
         if build_need {
             crate::sim::ai_build_need::manage_build_queue(
@@ -185,6 +195,64 @@ fn sell_off_and_hunt(
     );
     fire_sale(sim, rules, owner, registry, frame_effects);
     all_to_hunt(sim, rules, owner, registry, frame_effects);
+}
+
+/// `0x004FD8F7..0x004FD907`, the no-factory block's calls, as Phobos
+/// `[General] AIFireSale=`, `AIFireSaleDelay=` and `AIAllToHunt=` gate them
+/// (`src/Ext/House/Hooks.cpp`). All_To_Hunt still runs while the delayed sale
+/// waits, and the timer is armed once and then only read.
+fn last_legs_actions(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    owner: InternedId,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    frame_effects: FrameEffects<'_>,
+) {
+    #[cfg(feature = "phobos")]
+    phobos_last_legs_actions(sim, rules, owner, registry, frame_effects);
+    #[cfg(not(feature = "phobos"))]
+    sell_off_and_hunt(sim, rules, owner, "no factory", registry, frame_effects);
+}
+
+#[cfg(feature = "phobos")]
+fn phobos_last_legs_actions(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    owner: InternedId,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    frame_effects: FrameEffects<'_>,
+) {
+    if rules.general.ai_fire_sale {
+        let frame = sim.session.binary_frame() as i32;
+        let delay = rules.general.ai_fire_sale_delay;
+        let sale_due = if delay <= 0 {
+            true
+        } else {
+            match sim
+                .houses
+                .get(&owner)
+                .map(|house| house.strategy_emergency().ai_fire_sale_delay_timer())
+            {
+                Some(Some(timer)) => timer.expired(frame),
+                Some(None) => {
+                    if let Some(house) = sim.houses.get_mut(&owner) {
+                        house
+                            .strategy_emergency_mut()
+                            .start_ai_fire_sale_delay(frame, delay);
+                    }
+                    false
+                }
+                None => false,
+            }
+        };
+        if sale_due {
+            log::debug!("{} sells off on its last legs", sim.interner.resolve(owner));
+            fire_sale(sim, rules, owner, registry, frame_effects);
+        }
+    }
+    if rules.general.ai_all_to_hunt {
+        all_to_hunt(sim, rules, owner, registry, frame_effects);
+    }
 }
 
 /// `0x004FD538..0x004FD71E`: see the module doc.

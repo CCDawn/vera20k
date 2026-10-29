@@ -48,7 +48,7 @@ impl App {
             entries,
             current,
             empty.into(),
-            saved_seeds::new_slot_file_time(std::time::SystemTime::now()),
+            saved_seeds::new_slot_file_time(crate::util::time::SystemTime::now()),
             rows,
         ));
         state.frontend.skirmish_shell_state.player_name_edit.focused = false;
@@ -71,33 +71,41 @@ impl App {
         }
     }
 
-    fn show_saved_seed_prompt(
-        state: &mut AppState,
-        purpose: SavedSeedPromptPurpose,
+    /// The saved-file browsers' message box: Yes/No to confirm, else OK.
+    pub(super) fn saved_browser_prompt<I>(
+        state: &AppState,
+        purpose: SavedSeedPromptPurpose<I>,
         body: String,
         confirm: bool,
-    ) {
+    ) -> SavedSeedPrompt<I> {
         let affirmative = if confirm {
             Self::csf_label(state, "TXT_YES", "Yes")
         } else {
             Self::csf_label(state, "TXT_OK", "OK")
         };
         let negative = confirm.then(|| Self::csf_label(state, "TXT_NO", "No"));
+        SavedSeedPrompt {
+            purpose,
+            body,
+            affirmative,
+            negative,
+        }
+    }
+
+    fn show_saved_seed_prompt(
+        state: &mut AppState,
+        purpose: SavedSeedPromptPurpose,
+        body: String,
+        confirm: bool,
+    ) {
+        let prompt = Self::saved_browser_prompt(state, purpose, body, confirm);
         if let Some(browser) = state
             .frontend
             .skirmish_shell_state
             .saved_seed_browser
             .as_mut()
         {
-            browser.description_edit.focused = false;
-            browser.pressed_control = None;
-            browser.scroll_repeat_at = None;
-            browser.prompt = Some(SavedSeedPrompt {
-                purpose,
-                body,
-                affirmative,
-                negative,
-            });
+            browser.show_prompt(prompt);
         }
     }
 
@@ -375,7 +383,7 @@ impl App {
             &layout,
             y,
             pointer_moved,
-            std::time::Instant::now(),
+            crate::util::time::Instant::now(),
         ) {
             Self::sync_saved_seed_edit_scroll(state);
         }
@@ -404,7 +412,7 @@ impl App {
             &layout,
             extent,
             pointer,
-            std::time::Instant::now(),
+            crate::util::time::Instant::now(),
             saved_file_input::host_double_click_limits(),
         );
         Self::apply_saved_seed_input(state, result);

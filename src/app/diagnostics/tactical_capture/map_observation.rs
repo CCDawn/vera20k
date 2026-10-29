@@ -1538,9 +1538,10 @@ impl MapSidebarObservation {
                 rect: rect(view.scroll_down_button.rect),
                 disabled: view.scroll_down_button.disabled,
             },
+            // Native never disables Repair/Sell; the receipt keeps the field.
             mode_buttons: [&view.repair_button, &view.sell_button].map(|button| MapSidebarToggle {
                 rect: rect(button.rect),
-                disabled: button.disabled,
+                disabled: false,
                 active: button.active,
             }),
         })
@@ -4479,13 +4480,8 @@ impl TacticalCaptureSession {
         output: &GameRenderOutput,
     ) -> Result<(bool, Value)> {
         validate_loaded_resources(state)?;
-        let unit_atlas = state
-            .match_state
-            .match_presentation
-            .unit_atlas
-            .as_ref()
-            .context("unit atlas absent at final map render")?
-            .statistics()?;
+        let unit_atlas =
+            unit_atlas_statistics(state.match_state.match_presentation.unit_atlas.as_ref())?;
         let ready = output.sidebar_view.is_some()
             && !state.match_state.paused()
             && !state.main_menu_dialog_open()
@@ -4529,7 +4525,6 @@ impl TacticalCaptureSession {
             "instance_counts": super::super::evidence::RenderInstanceCountEvidence::from_counts(output.instance_counts)?,
             "internal_extent": [state.render_width(), state.render_height()],
             "surface_extent": [state.renderer.gpu.config.width, state.renderer.gpu.config.height],
-            "ui_scale": state.match_state.match_presentation.ui_scale,
             "gpu": super::super::evidence::GpuAdapterEvidence::from_observation(state.renderer.gpu.capture_adapter_observation()),
             "unit_atlas": unit_atlas,
             "frame_wall_mean_ms": frame_wall_mean_ms,
@@ -4644,9 +4639,26 @@ impl TacticalCaptureSession {
     }
 }
 
+/// A scene with no voxel demand never builds the unit atlas (the builder keeps
+/// its absent `existing` atlas), so its receipt is an atlas with no pages.
+fn unit_atlas_statistics(
+    atlas: Option<&crate::render::unit_atlas::UnitAtlas>,
+) -> Result<crate::render::unit_atlas::UnitAtlasStatistics> {
+    atlas.map_or_else(|| Ok(Default::default()), |atlas| atlas.statistics())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scene_without_voxels_reports_an_empty_unit_atlas() {
+        assert_eq!(
+            serde_json::to_value(unit_atlas_statistics(None).unwrap()).unwrap(),
+            json!({"resident_sprite_count": 0, "last_build_rasterized_sprite_count": 0,
+                "pages": [], "total_texel_payload_bytes": 0})
+        );
+    }
 
     fn initialized_map() -> MapObservation {
         MapObservation {
@@ -5018,7 +5030,7 @@ mod tests {
         // Actual presentation composites advance this owner without any Logic
         // tick. Numeric/native goldens belong to the renderer's own tests.
         for _ in 0..14 {
-            beams.composite(60, viewport);
+            beams.composite(60, viewport, |_| true);
         }
         let draws = beams.draws().to_vec();
         assert!(!draws.is_empty());
@@ -5044,7 +5056,7 @@ mod tests {
         );
         assert_eq!(serde_json::to_value(beams.observation()).unwrap(), retained);
         assert_eq!(beams.draws(), draws.as_slice());
-        beams.composite(60, viewport);
+        beams.composite(60, viewport, |_| true);
         let expired =
             serde_json::to_value(MapRadiationBeamObservation::capture(&beams).unwrap()).unwrap();
         assert!(expired["live"].as_array().unwrap().is_empty());
@@ -5609,7 +5621,7 @@ mod tests {
     #[test]
     fn gestures_require_sealed_neutral_cursor_and_strict_tactical_pixel_arguments() {
         let mut profile = example();
-        profile.schema_version = PROFILE_V2.to_owned();
+        profile.cursor_position = None;
         profile.gestures = Some(Vec::new());
         assert!(profile.validate().is_err());
         profile.cursor_position = Some([720, 556]);

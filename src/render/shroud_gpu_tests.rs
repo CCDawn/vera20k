@@ -62,6 +62,118 @@ fn load_pass<'a>(
 }
 
 #[test]
+#[ignore = "requires GPU; wheel zoom native-world camera, clipped resolve and frame-size UI"]
+fn production_world_zoom_resolves_before_screen_fixed_ui() {
+    let gpu = Gpu::new();
+    let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+    let size = [12, 8];
+    let mut zoom =
+        super::upscale_pass::WorldZoomPass::new(&gpu.device, &gpu.queue, format, [10, 8], 1.25);
+    zoom.set_view(&gpu.device, &gpu.queue, size, 0.8);
+    let source_size = zoom.source_size();
+    assert_eq!(source_size, [15, 10]);
+    let batch = BatchRenderer::new_with_device(&gpu.device, &gpu.queue, format);
+    batch.write_camera(
+        &gpu.queue,
+        super::batch::CameraUniform {
+            zoom: 0.8,
+            ..camera(size)
+        },
+    );
+    batch.set_native_world_resolution(&gpu.queue, source_size);
+    assert_eq!(batch.camera_uniform().screen_size, [15.0, 10.0]);
+    assert_eq!(batch.camera_uniform().zoom, 1.0);
+    assert_eq!(batch.ui_camera_uniform().screen_size, [12.0, 8.0]);
+    let mut composition =
+        super::combat_light::CombatLightRenderer::new_with_device(&gpu.device, &gpu.queue, format);
+    composition.prepare_with_device(
+        &gpu.device,
+        &gpu.queue,
+        &[],
+        source_size.map(|v| v as f32),
+        [0.0; 2],
+        1.0,
+    );
+    let red =
+        batch.create_texture_on_device(&gpu.device, &gpu.queue, &[255, 0, 0, 255], 1, 1, None);
+    let green =
+        batch.create_texture_on_device(&gpu.device, &gpu.queue, &[0, 255, 0, 255], 1, 1, None);
+    let native = buffer(
+        &gpu,
+        &[SpriteInstance {
+            size: source_size.map(|v| v as f32),
+            uv_size: [1.0; 2],
+            tint: [1.0; 3],
+            alpha: 1.0,
+            ..Default::default()
+        }],
+    );
+    let ui = buffer(
+        &gpu,
+        &[SpriteInstance {
+            position: [9.0, 0.0],
+            size: [3.0, 8.0],
+            uv_size: [1.0; 2],
+            tint: [1.0; 3],
+            alpha: 1.0,
+            ..Default::default()
+        }],
+    );
+    let tactical = [0, 1, 9, 7];
+    let clip = zoom.world_clip(tactical);
+    assert_eq!(clip, [0, 1, 12, 9]);
+    let cv = composition.composition_view();
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    clear(
+        &mut encoder,
+        &cv,
+        zoom.depth_view(),
+        65535,
+        wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+    );
+    {
+        let mut pass = load_pass(&mut encoder, &cv, zoom.depth_view());
+        pass.set_scissor_rect(clip[0], clip[1], clip[2], clip[3]);
+        batch.draw_passthrough_range(&mut pass, &red, &native, 0, 1);
+    }
+    zoom.composite(
+        &gpu.device,
+        &mut encoder,
+        composition.composition_texture(),
+        tactical,
+        wgpu::Color::BLACK,
+    );
+    {
+        let mut pass = load_pass(&mut encoder, zoom.color_view(), zoom.frame_depth_view());
+        batch.draw_with_buffer_ui_passthrough(&mut pass, &green, &ui, 1);
+    }
+    let reads = [gpu.read(&mut encoder, zoom.color_texture())];
+    let output = gpu.finish(encoder, &reads, size);
+    for y in 0..size[1] {
+        for x in 0..size[0] {
+            let expected = if x >= 9 {
+                [0, 255, 0, 255]
+            } else if y >= 1 {
+                [0, 0, 255, 255]
+            } else {
+                [0, 0, 0, 255]
+            };
+            let offset = ((y * size[0] + x) * 4) as usize;
+            assert_eq!(
+                &output[0][offset..offset + 4],
+                &expected,
+                "frame pixel {x},{y}"
+            );
+        }
+    }
+    batch.write_camera(&gpu.queue, camera(size));
+    assert_eq!(
+        batch.camera_uniform().screen_size,
+        batch.ui_camera_uniform().screen_size
+    );
+}
+
+#[test]
 #[ignore = "requires GPU; native A body/shadow colors, raw stores, source holes and depth rejects"]
 fn production_a_blitters_preserve_raw_surface_pixels_through_holes_and_depth_rejects() {
     let native = fixture();
@@ -340,7 +452,23 @@ fn production_world_a_sampling_matches_cpu_source_at_fractional_scroll_and_zoom(
                         % alphas.len()]
                 })
                 .collect::<Vec<_>>();
-            let source = ShroudBuffer::fixture(&gpu.device, &gpu.queue, virtual_size, scroll, &a);
+            let mut source =
+                ShroudBuffer::fixture(&gpu.device, &gpu.queue, virtual_size, scroll, &a);
+            assert_eq!(
+                source.sample_world(scroll[0], scroll[1], scroll[0], scroll[1]),
+                Some(a[0]),
+                "the production source defaults to native A"
+            );
+            // One fractional view exercises the opt-in style; the remaining
+            // views retain the production default and native color goldens.
+            let translucent = zoom == 0.75 && scroll == [13.25, -7.25];
+            source.set_translucent_fog(&gpu.queue, translucent);
+            if translucent {
+                assert_ne!(
+                    source.sample_world(scroll[0], scroll[1], scroll[0], scroll[1]),
+                    Some(a[0])
+                );
+            }
             // Every iteration replaces the source view, even at identical size.
             batch.bind_shroud(&gpu.device, Some(&source));
             let instance = SpriteInstance {
@@ -402,9 +530,22 @@ fn production_world_a_sampling_matches_cpu_source_at_fractional_scroll_and_zoom(
                                     .unwrap_or(127)
                             };
                             let offset = ((y * size[0] + x) * 4) as usize;
+                            // The elective style has no native color golden.
+                            // Compare its real GPU output with the CPU palette
+                            // owner using the same sampled A; opaque views
+                            // continue to assert executed native colors.
+                            let expected = if translucent {
+                                PaletteLight::color_scheme([1000; 3], 1000).rgb565(
+                                    [200, 100, 50],
+                                    1,
+                                    a,
+                                )
+                            } else {
+                                expected_colors[a as usize]
+                            };
                             assert_eq!(
                                 &output[0][offset..offset + 4],
-                                &encoded(expected_colors[a as usize], format),
+                                &encoded(expected, format),
                                 "{route} zoom{zoom} scroll{scroll:?} disabled{disabled} pixel{x},{y} A{a}"
                             );
                         }
@@ -434,7 +575,8 @@ fn production_a_blitter_workload_timing() {
     let pixels = (0..size[0] * size[1])
         .map(|i| [0, 63, 127][(i as usize / 16) % 3])
         .collect::<Vec<_>>();
-    let source = ShroudBuffer::fixture(&gpu.device, &gpu.queue, size, [0.0; 2], &pixels);
+    let mut source = ShroudBuffer::fixture(&gpu.device, &gpu.queue, size, [0.0; 2], &pixels);
+    source.set_translucent_fog(&gpu.queue, true);
     let color = gpu.target(size, format);
     let cv = color.create_view(&Default::default());
     let depth = gpu.target(size, wgpu::TextureFormat::Depth32Float);
@@ -503,6 +645,7 @@ fn production_a_blitter_workload_timing() {
                             end_of_pass_write_index: Some(1),
                         }),
                         occlusion_query_set: None,
+                        multiview_mask: None,
                     });
                     batch.draw_passthrough_range(&mut pass, &texture, &instances, 0, count);
                 }

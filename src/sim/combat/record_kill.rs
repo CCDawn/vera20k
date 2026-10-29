@@ -170,6 +170,21 @@ fn record_the_kill(
     if matches!(source, KillSource::Techno(_)) && victim.tracking_facts.dont_score() {
         return;
     }
+    #[cfg(feature = "ares")]
+    if let KillSource::Techno(Some(attacker)) = source {
+        // Ares RegisterDestruction_Bounty702E64 ->1004B100 precedes the
+        // original alliance/XP work, after Tags and DontScore. No E4 payout.
+        crate::sim::bounty::award(
+            entities, houses, interner, alliances, rules, victim_id, attacker,
+        );
+    }
+    // Bounty changes the existing wallet and may queue a presentation sum on
+    // an actor. Reborrow the victim after that visit rather than retaining a
+    // mutable-store alias across the native hook.
+    #[cfg(feature = "ares")]
+    let Some(victim) = entities.get(victim_id) else {
+        return;
+    };
     let killer_id = match source {
         KillSource::Techno(source) => source,
         KillSource::House(_) => None,
@@ -257,12 +272,26 @@ impl crate::sim::world::Simulation {
             // even for NULL. Each call re-reads Object+34, without Alive/HP
             // gates. This precedes the base CostOf and its6/4 callbacks.
             // Source: original bodies/vtable via tools.native_inspect.
-            // RESIDUAL: hijacked Units (+338 !=-1) with a transferable Tag
-            // skip this prefix; hijacking state/crew transfer is not ported.
+            //74472F..74473F: a retained captor and transferable Tag skip
+            //this prefix;738374 later copies that Tag to the escaped captor.
             // No own RNG/timer/detach; synchronous Tag actions own those.
-            for kind in [7, 48, 29] {
-                if kind != 7 || source.is_present() {
-                    self.dispatch_object_tag_event(victim_id, kind, Some(victim_id), None, context);
+            let captor_has_tag = self
+                .substrate
+                .entities
+                .get(victim_id)
+                .is_some_and(|victim| victim.capture_infantry_type_index.get() != -1)
+                && self.trigger_runtime.object_tag_is_transferable(victim_id);
+            if !captor_has_tag {
+                for kind in [7, 48, 29] {
+                    if kind != 7 || source.is_present() {
+                        self.dispatch_object_tag_event(
+                            victim_id,
+                            kind,
+                            Some(victim_id),
+                            None,
+                            context,
+                        );
+                    }
                 }
             }
         }

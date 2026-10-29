@@ -88,7 +88,7 @@ fn run(
         .unwrap()
         .entries()[0]
         .clone();
-    let action = RuntimeDefinitions::default().resolve_action(entry, None, None);
+    let action = RuntimeDefinitions::default().resolve_action(entry, None, None, None);
     let live_index = live.then(|| sim.trigger_runtime.trigger_order[0]);
     sim.apply_live_trigger_action(
         &action,

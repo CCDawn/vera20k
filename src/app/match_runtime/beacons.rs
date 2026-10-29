@@ -29,8 +29,6 @@ use crate::app::match_runtime::session::SessionMode;
 use crate::net::lan_messages::ingame::BeaconRecord;
 use crate::sim::radar::{RadarEventRequest, RadarEventType};
 
-/// `BeaconManagerClass` rows: the eight Houses its loops visit.
-pub(crate) const BEACON_HOUSES: usize = 8;
 /// Beacons per House (`CanPlaceBeacon 0x00430F30`).
 pub(crate) const BEACONS_PER_HOUSE: usize = 3;
 
@@ -79,18 +77,20 @@ pub(crate) enum Deletion {
 pub(crate) struct BeaconManager {
     /// Native keeps a count beside the slots (`+0x60`); every writer moves it
     /// with a slot, so emptiness is read from the slots.
-    slots: [[Option<Beacon>; BEACONS_PER_HOUSE]; BEACON_HOUSES],
+    // VERA extends the native eight rows to actual House registry indices.
+    // BTreeMap preserves the native House-major visit order without a cap.
+    slots: std::collections::BTreeMap<usize, [Option<Beacon>; BEACONS_PER_HOUSE]>,
 }
 
 impl BeaconManager {
     fn row(&self, house: usize) -> Option<&[Option<Beacon>; BEACONS_PER_HOUSE]> {
-        self.slots.get(house)
+        self.slots.get(&house)
     }
 
     /// `CanPlaceBeacon 0x00430F30`: the House has an empty slot.
     pub(crate) fn can_place(&self, house: usize) -> bool {
         self.row(house)
-            .is_some_and(|row| row.iter().any(Option::is_none))
+            .is_none_or(|row| row.iter().any(Option::is_none))
     }
 
     /// The slot half of `PlaceBeacon 0x00430BA0` (`0x00430BA0..0x00430CD1`):
@@ -102,7 +102,7 @@ impl BeaconManager {
         coord: [i32; 3],
         slot: Option<usize>,
     ) -> Option<usize> {
-        let row = self.slots.get_mut(house)?;
+        let row = self.slots.entry(house).or_default();
         let slot = match slot {
             None => row.iter().position(Option::is_none)?,
             Some(slot) if slot < BEACONS_PER_HOUSE => slot,
@@ -126,7 +126,7 @@ impl BeaconManager {
             },
             BeaconTarget::Slot { house, slot } => (house, slot, false),
         };
-        let Some(record) = self.slots.get_mut(house).and_then(|row| row.get_mut(slot)) else {
+        let Some(record) = self.slots.get_mut(&house).and_then(|row| row.get_mut(slot)) else {
             return Deletion::None;
         };
         let Some(beacon) = record.as_mut() else {
@@ -170,14 +170,14 @@ impl BeaconManager {
     /// `SelectBeacon 0x00430F70`'s flag write (`0x0043104E`), after its
     /// Unselect_All (`0x00431045`).
     pub(crate) fn set_selected(&mut self, house: usize, slot: usize) {
-        if let Some(Some(beacon)) = self.slots.get_mut(house).and_then(|row| row.get_mut(slot)) {
+        if let Some(Some(beacon)) = self.slots.get_mut(&house).and_then(|row| row.get_mut(slot)) {
             beacon.selected = true;
         }
     }
 
     /// `0x00431060`, the tail of `Unselect_All_With_Mode_Reset 0x0048DC90`.
     pub(crate) fn clear_selection(&mut self) {
-        for beacon in self.slots.iter_mut().flatten().flatten() {
+        for beacon in self.slots.values_mut().flatten().flatten() {
             beacon.selected = false;
         }
     }
@@ -193,7 +193,7 @@ impl BeaconManager {
 
     /// Every record, House-major as the native loops visit them.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, usize, &Beacon)> {
-        self.slots.iter().enumerate().flat_map(|(house, row)| {
+        self.slots.iter().flat_map(|(&house, row)| {
             row.iter().enumerate().filter_map(move |(slot, beacon)| {
                 beacon.as_ref().map(|beacon| (house, slot, beacon))
             })
@@ -313,6 +313,16 @@ pub(crate) fn place_beacon(
     coord: [i32; 3],
     slot: Option<usize>,
 ) {
+    // The registry, rather than the native eight-row array, bounds VERA's
+    // admitted House indices. Invalid received indices still create no row.
+    if !state
+        .match_state
+        .sim_runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.simulation.houses().order().get(house).is_some())
+    {
+        return;
+    }
     let Some(slot) = state
         .match_state
         .match_presentation
@@ -440,8 +450,8 @@ pub(crate) fn local_player_defeated(state: &mut AppState) {
 }
 
 /// The receive arms `0x0048D798..0x0048D7EF`. The record's House and slot
-/// index the manager directly natively; a record outside its rows is
-/// dropped here.
+/// index the manager directly natively; a record outside the actual House
+/// registry is dropped by the shared placement owner.
 pub(crate) fn receive(state: &mut AppState, record: BeaconRecord) {
     match record {
         BeaconRecord::Placed { house, slot, coord } => {
@@ -502,7 +512,7 @@ mod tests {
             }
         );
         assert_eq!(beacons.store(1, [5, 0, 0], None), Some(0));
-        assert!(beacons.can_place(0) && !beacons.can_place(BEACON_HOUSES));
+        assert!(beacons.can_place(0) && beacons.can_place(31));
     }
 
     #[test]

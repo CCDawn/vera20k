@@ -419,6 +419,12 @@ impl InstanceBufferPool {
     }
 }
 
+/// Exact world and UI uniforms uploaded this frame, owned together.
+struct UploadedCameras {
+    world: CameraUniform,
+    ui: CameraUniform,
+}
+
 /// Instanced sprite batch renderer.
 ///
 /// Draws many textured quads in a single draw call using GPU instancing.
@@ -487,7 +493,7 @@ pub struct BatchRenderer {
     /// Camera uniform buffer (group 0) — world camera with zoom.
     // Exact bytes last written by the camera owner; scissor consumers read
     // this record instead of independently reconstructing scroll/zoom/origin.
-    uploaded_camera: std::sync::RwLock<CameraUniform>,
+    uploaded_camera: std::sync::RwLock<UploadedCameras>,
     camera_buffer: wgpu::Buffer,
     /// World blitters use the shared A texture for source palette selection.
     camera_bind_group: wgpu::BindGroup,
@@ -649,8 +655,11 @@ impl BatchRenderer {
         let pipeline_layout: wgpu::PipelineLayout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Batch Pipeline Layout"),
-                bind_group_layouts: &[&camera_bind_group_layout, &texture_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[
+                    Some(&camera_bind_group_layout),
+                    Some(&texture_bind_group_layout),
+                ],
+                immediate_size: 0,
             });
 
         // Overlay pipeline: depth write ON, LessEqual compare.
@@ -685,13 +694,13 @@ impl BatchRenderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
 
@@ -729,13 +738,13 @@ impl BatchRenderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::Always,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
 
@@ -776,13 +785,13 @@ impl BatchRenderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::Less,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
 
@@ -820,13 +829,13 @@ impl BatchRenderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::Less,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
 
@@ -875,8 +884,11 @@ impl BatchRenderer {
         let zdepth_pipeline_layout: wgpu::PipelineLayout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("ZDepth Pipeline Layout"),
-                bind_group_layouts: &[&camera_bind_group_layout, &zdepth_texture_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[
+                    Some(&camera_bind_group_layout),
+                    Some(&zdepth_texture_bind_group_layout),
+                ],
+                immediate_size: 0,
             });
         let zdepth_pipeline: wgpu::RenderPipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -908,14 +920,14 @@ impl BatchRenderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: true,
+                    depth_write_enabled: Some(true),
                     // `TMP_TileBlitter @ 0x00547CF0`: `base + zdata <= zbuf`.
-                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
 
@@ -964,11 +976,11 @@ impl BatchRenderer {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("ZSprite Pipeline Layout"),
                 bind_group_layouts: &[
-                    &camera_bind_group_layout,
-                    &texture_bind_group_layout,
-                    &zshape_bind_group_layout,
+                    Some(&camera_bind_group_layout),
+                    Some(&texture_bind_group_layout),
+                    Some(&zshape_bind_group_layout),
                 ],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
         let make_zsprite_pipeline = |label: &str, depth_write_enabled: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1000,14 +1012,14 @@ impl BatchRenderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled,
+                    depth_write_enabled: Some(depth_write_enabled),
                     // Sprite leaves test `z < zbuf` (strict).
-                    depth_compare: wgpu::CompareFunction::Less,
+                    depth_compare: Some(wgpu::CompareFunction::Less),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             })
         };
@@ -1087,11 +1099,11 @@ impl BatchRenderer {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Voxel Sprite Pipeline Layout"),
                 bind_group_layouts: &[
-                    &camera_bind_group_layout,
-                    &unit_atlas_bind_group_layout,
-                    &voxel_palette_bind_group_layout,
+                    Some(&camera_bind_group_layout),
+                    Some(&unit_atlas_bind_group_layout),
+                    Some(&voxel_palette_bind_group_layout),
                 ],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
         let voxel_pipeline = |label, depth_compare| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1123,13 +1135,13 @@ impl BatchRenderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(depth_compare),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             })
         };
@@ -1159,7 +1171,10 @@ impl BatchRenderer {
             voxel_passthrough_pipeline,
             camera_bind_group_layout,
             camera_buffer,
-            uploaded_camera: std::sync::RwLock::new(camera_uniform),
+            uploaded_camera: std::sync::RwLock::new(UploadedCameras {
+                world: camera_uniform,
+                ui: ui_camera(camera_uniform),
+            }),
             camera_bind_group,
             surface_camera_bind_group,
             bound_shroud_view: None,
@@ -1496,7 +1511,8 @@ impl BatchRenderer {
     /// scrolling. The argument uses unscaled native rows, not target pixels.
     pub(crate) fn update_native_z_origin(&self, queue: &wgpu::Queue, origin_y: f32) {
         let mut uploaded = self.uploaded_camera.write().expect("camera owner lock");
-        uploaded.native_z_origin_y = origin_y;
+        uploaded.world.native_z_origin_y = origin_y;
+        uploaded.ui.native_z_origin_y = origin_y;
         let offset = std::mem::offset_of!(CameraUniform, native_z_origin_y) as u64;
         queue.write_buffer(&self.camera_buffer, offset, bytemuck::bytes_of(&origin_y));
         queue.write_buffer(
@@ -1507,12 +1523,25 @@ impl BatchRenderer {
     }
 
     pub(crate) fn camera_uniform(&self) -> CameraUniform {
-        *self.uploaded_camera.read().expect("camera owner lock")
+        self.uploaded_camera
+            .read()
+            .expect("camera owner lock")
+            .world
     }
 
-    /// The UI camera's uniform as last written: the world camera at zoom 1.
+    /// The UI camera's exact uploaded viewport, independent of world resolution.
     pub(crate) fn ui_camera_uniform(&self) -> CameraUniform {
-        ui_camera(self.camera_uniform())
+        self.uploaded_camera.read().expect("camera owner lock").ui
+    }
+
+    /// Render the world at native texel resolution while UI keeps frame pixels.
+    /// These are distinct GPU buffers; no camera is rewritten between encoded
+    /// passes, since queue writes would otherwise affect every draw this frame.
+    pub(crate) fn set_native_world_resolution(&self, queue: &wgpu::Queue, size: [u32; 2]) {
+        let mut uploaded = self.uploaded_camera.write().expect("camera owner lock");
+        uploaded.world.screen_size = size.map(|v| v as f32);
+        uploaded.world.zoom = 1.0;
+        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uploaded.world));
     }
 
     /// A UI camera of its own, for drawing the UI into a surface of its own
@@ -1537,15 +1566,53 @@ impl BatchRenderer {
         (buffer, group)
     }
 
+    /// A frame-sized world projection for fixed-pixel status sprites after
+    /// wheel resampling. Separate bindings keep E00's live A lookup and 600's
+    /// neutral A; queue writes must not change the native-world camera used
+    /// by already encoded passes. Bind groups retain their uniform buffer.
+    pub(crate) fn create_frame_world_cameras(
+        &self,
+        device: &wgpu::Device,
+        zoom: f32,
+        shroud: Option<&crate::render::shroud_buffer::ShroudBuffer>,
+    ) -> [wgpu::BindGroup; 2] {
+        let uniform = CameraUniform {
+            zoom,
+            ..self.ui_camera_uniform()
+        };
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Frame world projection"),
+            contents: bytemuck::bytes_of(&uniform),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let neutral = camera_group(
+            device,
+            &self.camera_bind_group_layout,
+            &buffer,
+            &self.neutral_a.0,
+            &self.neutral_a.1,
+        );
+        let world = if let Some(shroud) = shroud {
+            let (view, source) = shroud.gpu_source();
+            camera_group(
+                device,
+                &self.camera_bind_group_layout,
+                &buffer,
+                view,
+                source,
+            )
+        } else {
+            neutral.clone()
+        };
+        [world, neutral]
+    }
+
     pub(crate) fn write_camera(&self, queue: &wgpu::Queue, uniform: CameraUniform) {
         let mut uploaded = self.uploaded_camera.write().expect("camera owner lock");
-        *uploaded = uniform;
+        uploaded.world = uniform;
+        uploaded.ui = ui_camera(uniform);
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
-        queue.write_buffer(
-            &self.ui_camera_buffer,
-            0,
-            bytemuck::bytes_of(&ui_camera(uniform)),
-        );
+        queue.write_buffer(&self.ui_camera_buffer, 0, bytemuck::bytes_of(&uploaded.ui));
     }
 
     /// Create a standalone instance buffer (not stored in the renderer).
@@ -1603,6 +1670,10 @@ impl BatchRenderer {
     /// Access the camera bind group for use by external pipelines (e.g., fog shader).
     pub fn camera_bind_group(&self) -> &wgpu::BindGroup {
         &self.camera_bind_group
+    }
+
+    pub(crate) fn surface_camera_bind_group(&self) -> &wgpu::BindGroup {
+        &self.surface_camera_bind_group
     }
 
     /// Share the production RGBA/source-index binding layout.

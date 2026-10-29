@@ -51,6 +51,7 @@ pub(crate) struct FrameClientBoundary<'a> {
     planning: Option<RefCell<(&'a mut PlanningInputState, &'a mut SelectionState)>>,
     network: Option<RefCell<&'a mut super::session::MatchSession>>,
     live_network: Option<RefCell<&'a mut crate::net::live_commands::LiveCommandSession>>,
+    logic_frame_rate: u32,
     outcome_wait: Option<RefCell<&'a mut Option<super::scenario_exit::ScenarioOutcomeVoiceWait>>>,
     scenario_pause: Option<RefCell<ScenarioPauseOwners<'a>>>,
 }
@@ -72,6 +73,7 @@ impl<'a> FrameClientBoundary<'a> {
             planning: None,
             network: None,
             live_network: None,
+            logic_frame_rate: 0,
             outcome_wait: None,
             scenario_pause: None,
         }
@@ -111,6 +113,11 @@ impl<'a> FrameClientBoundary<'a> {
         live: Option<&'a mut crate::net::live_commands::LiveCommandSession>,
     ) -> Self {
         self.live_network = live.map(RefCell::new);
+        self
+    }
+
+    pub(crate) fn with_logic_frame_rate(mut self, frame_rate: u32) -> Self {
+        self.logic_frame_rate = frame_rate;
         self
     }
 
@@ -182,6 +189,9 @@ impl<'a> FrameClientBoundary<'a> {
                 &mut elapsed,
                 sfx,
                 *other_local_pause,
+                // The admitted frame completes before a relay pause takes
+                // effect, so its native/audio pause reasons still coincide.
+                *other_local_pause,
                 wall_ms,
             ),
             _ => unreachable!(),
@@ -244,23 +254,47 @@ impl NetworkCommandBoundary for FrameClientBoundary<'_> {
         })?;
         let now_ms = super::frame_pacer::wall_clock_ms();
         let now = super::frame_pacer::frame_bucket(now_ms);
-        live.borrow_mut()
-            .poll(queues, context, max_ahead, now, now_ms as u32)
-            .map(Some)
-            .map_err(|error| {
-                log::error!("live network command exchange: {error}");
-                match error {
-                    LiveCommandError::Exchange(CommandExchangeError::InitialChecksum {
-                        ..
-                    }) => NetworkInterruption::ScenariosDiffer.into(),
-                    LiveCommandError::Exchange(CommandExchangeError::Decode(error))
-                        if error.kind == DecodeFailureKind::AdmissionFull =>
-                    {
-                        NetworkInterruption::QueueFull.into()
-                    }
-                    error => NetworkCommandError::Unavailable(error.to_string()),
+        let latency_fudge = self
+            .network
+            .as_ref()
+            .map_or(0, |session| session.borrow().latency_fudge());
+        let mut live = live.borrow_mut();
+        live.finish_processing(now_ms as u32);
+        live.poll(
+            queues,
+            context,
+            max_ahead,
+            now,
+            now_ms as u32,
+            latency_fudge,
+            self.logic_frame_rate,
+        )
+        .map(Some)
+        .map_err(|error| {
+            log::error!("live network command exchange: {error}");
+            match error {
+                LiveCommandError::Sequenced(
+                    crate::net::live_commands::SequencedError::Desync { .. },
+                ) => NetworkInterruption::ScenariosDiffer.into(),
+                LiveCommandError::Sequenced(
+                    crate::net::live_commands::SequencedError::QueueFull,
+                ) => NetworkInterruption::QueueFull.into(),
+                LiveCommandError::Sequenced(_) => NetworkInterruption::ConnectionFailed.into(),
+                LiveCommandError::Startup(crate::net::live_commands::StartupError::Aborted) => {
+                    NetworkInterruption::ConnectionFailed.into()
                 }
-            })
+                LiveCommandError::Startup(_)
+                | LiveCommandError::Exchange(CommandExchangeError::InitialChecksum { .. }) => {
+                    NetworkInterruption::ScenariosDiffer.into()
+                }
+                LiveCommandError::Exchange(CommandExchangeError::Decode(error))
+                    if error.kind == DecodeFailureKind::AdmissionFull =>
+                {
+                    NetworkInterruption::QueueFull.into()
+                }
+                error => NetworkCommandError::Unavailable(error.to_string()),
+            }
+        })
     }
 
     fn record_frame_checksum(&self, frame: u32, checksum: u32) {
@@ -406,7 +440,7 @@ mod tactical_radar_tests {
         )
         .unwrap();
         sim.install_waypoints(&map.waypoints);
-        sim.initialize_trigger_definitions(&map, &Default::default(), None, None);
+        sim.initialize_trigger_definitions(&map, &Default::default(), None, None, None);
         sim.classify_map_triggers(&rules);
         sim.advance_triggers(&rules, None, FrameEffects::empty());
         assert!(matches!(
@@ -516,6 +550,8 @@ mod network_command_tests {
             .register(HouseState::new(owner, 0, None, true, 0, 10));
         sim.session_mut_for_test()
             .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Wol);
+        // WOL admission includes MaxAhead before the frame-256 House gate.
+        sim.install_network_timing(10);
         sim.session_mut_for_test().set_tick_for_test(256);
         sim.session_mut_for_test().set_binary_frame_for_test(256);
         SimRuntime::from_simulation(sim)

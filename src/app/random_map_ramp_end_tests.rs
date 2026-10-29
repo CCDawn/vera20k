@@ -262,7 +262,9 @@ fn generated_connector_uses_native_slope_piece_tileset() {
     seed_dir.write(seed_name, &seed_bytes);
     struct SilentProgress;
     impl crate::app::loading::pump::LoadingProgressSink for SilentProgress {
-        fn milestone(&mut self, _percent: u32) {}
+        fn milestone(&mut self, _percent: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
     let loaded = crate::app::loading::init::load_map_initial_with_assets(
         seed_dir.path().to_path_buf(),

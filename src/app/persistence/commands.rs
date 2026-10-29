@@ -168,8 +168,8 @@ fn prepare_save<'a>(
         .loaded_map_hash
         .ok_or(SaveCommandError::MissingMapHash)?;
     let sim = &runtime.simulation;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let now = crate::util::time::SystemTime::now()
+        .duration_since(crate::util::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let mut sinking_waterlines = state
@@ -184,6 +184,13 @@ fn prepare_save<'a>(
         .match_presentation
         .sidebar_projection
         .saved_order();
+    // Phobos keeps `SWSidebar_Enable` in the scenario extension, so it rides
+    // the local presentation envelope rather than the simulation hash.
+    #[cfg(feature = "phobos")]
+    let sidebar_order = sidebar_order.map(|mut order| {
+        order.set_sw_sidebar_expanded(state.match_state.match_presentation.sw_sidebar.expanded);
+        order
+    });
     let tactical_view = crate::app::input::camera::saved_tactical_view(state);
     let rules_owner = rules_owner.ok_or(SaveCommandError::MissingResources("process rules"))?;
     let processed =
@@ -289,7 +296,8 @@ impl PreparedSave<'_> {
         let clock_save = clock.begin_save(crate::app::match_runtime::frame_pacer::wall_clock_ms());
         self.resources
             .set_elapsed_buckets(clock_save.accumulated_buckets());
-        let anim_intensities = self.lighting.saved_anim_intensities(sim);
+        let (cell_lighting, anim_intensities) = self.lighting.saved_at(sim);
+        self.local_view.set_lighting(cell_lighting);
         let bytes = crate::sim::snapshot::GameSnapshot::save_validated_with_presentation(
             sim,
             self.map_hash,
@@ -432,6 +440,7 @@ pub(crate) fn try_load_save_file(
                 frontend_main: &state.frontend.frontend_main_rng,
                 rules_owner,
                 tile_cache: &state.process_assets.tile_variant_selector_cache,
+                lighting: &state.match_state.match_presentation.lighting,
                 load_clock: &load_clock,
             },
             &mut assets,

@@ -165,6 +165,7 @@ pub enum ReceiveOutcome {
 pub struct ReceivedMessage {
     pub peer_id: i32,
     pub payload: Vec<u8>,
+    pub delivery: Delivery,
 }
 
 /// Private queues, sequence counters and delivery cursor have one owner.
@@ -268,6 +269,10 @@ impl<D: Copy> SendQueue<D> {
         self.entries.len() < self.capacity && frame_bytes <= self.max_frame_bytes
     }
 
+    pub(super) fn available_slots(&self) -> usize {
+        self.capacity.saturating_sub(self.entries.len())
+    }
+
     /// `0x0048B410`: total-send advances on successful admission, not emission.
     pub(super) fn enqueue(&mut self, frame: Vec<u8>, destination: D) -> bool {
         if !self.can_enqueue(frame.len()) {
@@ -300,14 +305,22 @@ impl<D: Copy> SendQueue<D> {
 
     /// Both `0x0048C040` and `0x0053FCB0` mark the first reliable sequence
     /// match. Their caller alone decides whether source identity is required.
-    pub(super) fn acknowledge(&mut self, incoming_sequence: u32) {
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.frame[2] == 0 && sequence(&entry.frame) == incoming_sequence)
-        {
+    pub(super) fn acknowledge(
+        &mut self,
+        incoming_sequence: u32,
+        require_sent: bool,
+        mut source_matches: impl FnMut(D) -> bool,
+    ) -> bool {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| {
+            entry.frame[2] == 0
+                && sequence(&entry.frame) == incoming_sequence
+                && (!require_sent || entry.attempts > 0)
+                && source_matches(entry.destination)
+        }) {
             entry.completed = true;
+            return true;
         }
+        false
     }
 
     /// Sole `0x0048C3E0` body. Global and private retirement policies run only
@@ -317,11 +330,13 @@ impl<D: Copy> SendQueue<D> {
         now_ticks: u32,
         timing: RetryTiming,
         send: &mut impl FnMut(D, &[u8]),
+        response: &mut impl FnMut(D, u32, u32),
     ) -> bool {
         self.entries.retain(|entry| {
             if entry.completed && entry.frame[2] == 0 {
-                self.response_time
-                    .record(now_ticks.wrapping_sub(entry.first_sent));
+                let elapsed = now_ticks.wrapping_sub(entry.first_sent);
+                self.response_time.record(elapsed);
+                response(entry.destination, sequence(&entry.frame), elapsed);
             }
             !entry.completed
         });
@@ -545,7 +560,7 @@ impl LanConnections {
         }
         let incoming_sequence = sequence(frame);
         if frame[2] == 2 {
-            peer.send.acknowledge(incoming_sequence);
+            peer.send.acknowledge(incoming_sequence, false, |()| true);
             return Ok(ReceiveOutcome::Acknowledgment);
         }
         if frame[2] > 1 {
@@ -621,11 +636,8 @@ impl LanConnections {
             let index = self.next_receive_peer;
             self.next_receive_peer = (index + 1) % self.peers.len();
             let peer = &mut self.peers[index];
-            if let Some(payload) = peer.pop_received() {
-                return Some(ReceivedMessage {
-                    peer_id: peer.id,
-                    payload,
-                });
+            if let Some(message) = peer.pop_received() {
+                return Some(message);
             }
         }
         None
@@ -654,12 +666,17 @@ impl Peer {
         timing: RetryTiming,
         send: &mut impl FnMut(SocketAddrV4, &[u8]),
     ) -> bool {
-        self.send.service(now_ticks, timing, &mut |(), frame| {
-            send(self.endpoint, frame);
-        })
+        self.send.service(
+            now_ticks,
+            timing,
+            &mut |(), frame| {
+                send(self.endpoint, frame);
+            },
+            &mut |(), _, _| {},
+        )
     }
 
-    fn pop_received(&mut self) -> Option<Vec<u8>> {
+    fn pop_received(&mut self) -> Option<ReceivedMessage> {
         let entry = self.receive.iter_mut().find(|entry| {
             !entry.consumed
                 && (entry.frame[2] == 1
@@ -669,7 +686,15 @@ impl Peer {
             self.delivered_reliable = sequence(&entry.frame);
         }
         entry.consumed = true;
-        Some(entry.frame[CONNECTION_HEADER_LEN..].to_vec())
+        Some(ReceivedMessage {
+            peer_id: self.id,
+            payload: entry.frame[CONNECTION_HEADER_LEN..].to_vec(),
+            delivery: if entry.frame[2] == 0 {
+                Delivery::Reliable
+            } else {
+                Delivery::Unreliable
+            },
+        })
     }
 
     fn retire_received(&mut self) {

@@ -8,6 +8,7 @@ use crate::map::rmg::options::RmgOptions;
 use crate::map::rmg::preview::PreviewImage;
 use crate::map::rmg::randomize::{RandomRanged, derive_from_map_type, randomize};
 use crate::map::rmg::settings::RmgSettings;
+use crate::ui::shell::combobox::ComboPress;
 use crate::ui::shell::geom::{RectPx, ShellScale};
 use crate::ui::shell::static_reveal::DialogStatics;
 use crate::ui::shell::trackbar::{TrackbarHold, TrackbarPress, TrackbarRange};
@@ -337,40 +338,41 @@ impl RandomMapSetupModalState {
     }
 
     /// A mouse press on the combos, and the cue it plays; `None` when the
-    /// press is not theirs. `OwnerDraw_ComboBox @ 0x00617250` plays the open
-    /// cue on any press of an enabled face (`0x006184A2..0x006184BA`) and
-    /// opens the list only from its arrow zone, `x > right - 0x14`
-    /// (`0x006184BF..0x006184D7`; the shared hit rect is 1 px wider). The open list's drop window (`0x0060D540`) captures the
-    /// mouse: a pick, or a press anywhere else, closes it with the close cue
-    /// (`0x0060E4E9..0x0060E500`) and goes no further.
+    /// press is not theirs. [`ComboPress`] holds the native face and drop
+    /// window rules; this dialog keeps its own list rows.
     pub fn press_combos(
         &mut self,
         layout: &super::super::layout::RandomMapSetupLayout,
         x: i32,
         y: i32,
     ) -> Option<super::SkirmishShellUiSound> {
-        if let Some(combo) = self.open_combo {
+        let press = if let Some(combo) = self.open_combo {
             let items = setup_combo_items(combo);
-            if let Some(index) = super::super::layout::random_map_setup_dropdown_row_at(
+            let press = super::super::layout::random_map_setup_dropdown_row_at(
                 layout,
                 combo.row(),
                 items.len(),
                 x,
                 y,
-            ) {
+            )
+            .map_or(ComboPress::Dismiss, ComboPress::Pick);
+            if let ComboPress::Pick(index) = press {
                 self.set_combo_value(combo, items[index].value);
             }
             self.open_combo = None;
-            return Some(super::SkirmishShellUiSound::GuiComboCloseSound);
-        }
-        let combo = super::super::layout::random_map_setup_control_at(layout, x, y)
-            .and_then(SetupCombo::from_control)
-            .filter(|combo| self.is_enabled(combo.control()))?;
-        let face = layout.control_rects[combo.row()];
-        if super::super::layout::combo_arrow_hit_rect(face, layout.scale).contains(x, y) {
-            self.open_combo = Some(combo);
-        }
-        Some(super::SkirmishShellUiSound::GuiComboOpenSound)
+            press
+        } else {
+            let combo = super::super::layout::random_map_setup_control_at(layout, x, y)
+                .and_then(SetupCombo::from_control)
+                .filter(|combo| self.is_enabled(combo.control()))?;
+            let face = layout.control_rects[combo.row()];
+            let press = ComboPress::on_face(face, layout.scale, x, y);
+            if press == ComboPress::Open {
+                self.open_combo = Some(combo);
+            }
+            press
+        };
+        press.cue().map(super::SkirmishShellUiSound::combo)
     }
 
     fn on_option_changed(&mut self) {

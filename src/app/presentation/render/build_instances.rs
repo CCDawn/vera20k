@@ -70,12 +70,15 @@ pub(super) struct UiInstances {
     pub software_cursor: Vec<SpriteInstance>,
     pub drag: Vec<SpriteInstance>,
     pub placement: Vec<SpriteInstance>,
+    /// Phobos placement preview artwork, drawn after the PLACE cells.
+    #[cfg(feature = "phobos")]
+    pub placement_ghost: Vec<SpriteInstance>,
     pub target_line: Vec<SpriteInstance>,
     pub tactical_line_calls: Vec<crate::app::presentation::airstrike_lines::TacticalLineCall>,
     pub factory_rally_first: Vec<SpriteInstance>,
     pub factory_rally_second: Vec<SpriteInstance>,
     /// One stream per beacon row: each row has its own House Convert strip.
-    pub beacons: [Vec<SpriteInstance>; crate::app::match_runtime::beacons::BEACON_HOUSES],
+    pub beacons: Vec<Vec<SpriteInstance>>,
 }
 
 /// Sidebar chrome, cameos, text, minimap, and radar animation.
@@ -92,6 +95,18 @@ pub(super) struct SidebarInstances {
     pub queue_overlay: Vec<SpriteInstance>,
     pub queue_text: Vec<SpriteInstance>,
     pub text: Vec<SpriteInstance>,
+    #[cfg(feature = "phobos")]
+    pub sw_sidebar_chrome: Vec<SpriteInstance>,
+    #[cfg(feature = "phobos")]
+    pub sw_sidebar_cameo: Vec<SpriteInstance>,
+    #[cfg(feature = "phobos")]
+    pub sw_sidebar_gclock: Vec<SpriteInstance>,
+    #[cfg(feature = "phobos")]
+    pub sw_sidebar_hover: Vec<SpriteInstance>,
+    #[cfg(feature = "phobos")]
+    pub sw_sidebar_overlay: Vec<SpriteInstance>,
+    #[cfg(feature = "phobos")]
+    pub sw_sidebar_text: Vec<SpriteInstance>,
     pub minimap: Vec<SpriteInstance>,
     pub viewport_rect: Vec<SpriteInstance>,
     pub content_boundary: Vec<SpriteInstance>,
@@ -345,10 +360,41 @@ pub(super) fn build_world_instances(
                             state.match_state.input.camera_y,
                         ],
                         size: [sw, sh],
+                        zoom: state.match_state.input.zoom_level,
                         ignore_visibility: state.match_state.sandbox_full_visibility,
                     },
                 );
                 status.group = group_labels.remove(&parent.parent.id).unwrap_or_default();
+                // Phobos DigitalDisplay: built here because the GAME.FNT atlas
+                // lives on the renderer; the value/position owner is
+                // presentation::digital_display.
+                #[cfg(feature = "phobos")]
+                if state.match_state.match_presentation.digital_display_enabled
+                    && let Some(rules) = state.rules()
+                {
+                    let digital =
+                        crate::app::presentation::digital_display::digital_display_instances(
+                            sim,
+                            entity,
+                            rules,
+                            overlay,
+                            &state.renderer.bit_font,
+                            hovered,
+                            local_owner.as_deref(),
+                            crate::app::presentation::ui_overlays::StatusViewport {
+                                camera: [
+                                    state.match_state.input.camera_x,
+                                    state.match_state.input.camera_y,
+                                ],
+                                size: [sw, sh],
+                                zoom: state.match_state.input.zoom_level,
+                                ignore_visibility: state.match_state.sandbox_full_visibility,
+                            },
+                            true,
+                        );
+                    status.digital_text = digital.texts;
+                    status.digital_shapes = digital.shapes;
+                }
                 if !entity.sinking.is_active() && !entity.passenger_role.is_inside_transport() {
                     if let (Some(frame), Some(shape)) = (
                         state
@@ -404,6 +450,74 @@ pub(super) fn build_world_instances(
     }
     if let Some(rt) = state.match_state.sim_runtime.as_ref() {
         instances::assign_tether_redraws(&rt.simulation, &mut planned_objects);
+    }
+    // VERA's translucent fog lifts the A buffer's near-black concealment, so
+    // live enemy objects the local viewer cannot see leave the draw plan fully
+    // (body, shadow, attached anim parts and extras) instead of showing through
+    // the fog. Terrain, overlays and revealed map art stay visible.
+    if let Some(rt) = state.match_state.sim_runtime.as_ref() {
+        let sim = &rt.simulation;
+        if let Some(viewer) = instances::translucent_fog_viewer(state, sim) {
+            let rules = &rt.resources.rules;
+            let fog_of_war = sim.session().game_options().fog_of_war;
+            let concealed = |entity: &crate::sim::game_entity::GameEntity| {
+                instances::translucent_fog_conceals(sim, viewer, entity)
+            };
+            // Particles owned by an object follow it out of the fog.
+            let particle_owners: std::collections::BTreeMap<u64, Option<u64>> = sim
+                .particle_systems()
+                .display_particles()
+                .map(|(system, particle)| {
+                    (
+                        particle.stable_id(),
+                        system.and_then(|system| system.owner_entity()),
+                    )
+                })
+                .collect();
+            planned_objects.retain(|parent| {
+                let id = parent.parent.id;
+                if let Some(entity) = sim.entities().get(id) {
+                    return !concealed(entity);
+                }
+                if let Some(owner) = particle_owners.get(&id) {
+                    return owner.is_none_or(|owner_id| {
+                        sim.entities().get(owner_id).is_none_or(|e| !concealed(e))
+                    });
+                }
+                let Some(anim) = sim.anim(id) else {
+                    return true;
+                };
+                // Building-attached AnimClass parts (idle components, damage
+                // fire) follow their owner object out of the fog, whether the
+                // attachment is the Anim object pointer or a Building slot.
+                if let Some(owner_id) = anim
+                    .owner_entity()
+                    .or_else(|| anim.building_slot().map(|(owner, _)| owner))
+                {
+                    return sim
+                        .entities()
+                        .get(owner_id)
+                        .is_none_or(|entity| !concealed(entity));
+                }
+                // Standalone effect (explosion, fire, smoke): hidden over an
+                // unseen cell unless rules declare it as a superweapon effect.
+                let name = sim.interner().resolve(anim.type_id());
+                if instances::is_superweapon_effect_anim(name, &rules.general) {
+                    return true;
+                }
+                let Some(coord) = sim.anim_absolute_coord(id) else {
+                    return true;
+                };
+                let cell = instances::lepton_cell(coord.x, coord.y);
+                !instances::translucent_fog_conceals_cell(
+                    Some(viewer),
+                    Some(sim.fog()),
+                    cell.0,
+                    cell.1,
+                    fog_of_war,
+                )
+            });
+        }
     }
     // Native +99 is set before a Building's body opportunity, independently
     // of successful pixels. Empty body frames still have a retained parent.
@@ -736,23 +850,20 @@ pub(super) fn build_ui_instances(state: &AppState, wall_ms: u32) -> UiInstances 
         None => Vec::new(),
     };
 
-    let placement = build_placement_preview(state);
+    let placement_preview = build_placement_preview(state);
 
     let input = &state.match_state.input;
-    let camera = [input.camera_x.round() as i32, input.camera_y.round() as i32];
     let (x, y, width, height) = crate::app::input::camera::tactical_viewport_px(state);
-    let view = crate::app::presentation::target_lines::TacticalViewport {
-        camera,
-        clip: [
-            x as i32,
-            y as i32,
-            (width as f32 / input.zoom_level).ceil() as i32,
-            (height as f32 / input.zoom_level).ceil() as i32,
-        ],
-        zoom: input.zoom_level,
-    };
-    // Shared native logical viewport; both overlays scale the raster before
-    // the UI passthrough draw, so fractional zoom cannot pad individual pixels.
+    let view = tactical_line_viewport(
+        [input.camera_x, input.camera_y],
+        [x, y, width, height],
+        state.renderer.world_zoom_pass.as_ref(),
+    );
+    let camera = view.camera;
+    // All path, planning and rally pixels go onto the native world surface.
+    // Its camera/clip and the final WorldZoomPass own the scale. Pre-scaling
+    // individual spans here would quantize them again on that smaller/larger
+    // attachment, distorting dash spacing and node borders at fractional zoom.
     let mut designations = std::collections::HashMap::new();
     if !state.match_state.input.planning.active()
         && let Some(runtime) = state.match_state.sim_runtime.as_ref()
@@ -783,11 +894,6 @@ pub(super) fn build_ui_instances(state: &AppState, wall_ms: u32) -> UiInstances 
         }
     }
     let interleave_enabled = !designations.is_empty();
-    // Surface commands keep logical pixels; the shared GPU owner applies zoom.
-    let line_view = crate::app::presentation::target_lines::TacticalViewport {
-        zoom: if interleave_enabled { 1. } else { view.zoom },
-        ..view
-    };
     // The shroud A-buffer sample DSurface4C0750's dashed lines read.
     let mut shroud_alpha = |point: [i32; 2]| -> u8 {
         if state.match_state.sandbox_full_visibility {
@@ -833,7 +939,7 @@ pub(super) fn build_ui_instances(state: &AppState, wall_ms: u32) -> UiInstances 
                 .and_then(|assets| assets.get_ref("palette.pal")),
             &state.match_state.match_presentation.house_color_map,
             wall_ms,
-            line_view,
+            view,
             if interleave_enabled {
                 Some(&mut after_entity)
             } else {
@@ -873,7 +979,9 @@ pub(super) fn build_ui_instances(state: &AppState, wall_ms: u32) -> UiInstances 
     UiInstances {
         software_cursor,
         drag,
-        placement,
+        placement: placement_preview.cells,
+        #[cfg(feature = "phobos")]
+        placement_ghost: placement_preview.ghost,
         target_line,
         tactical_line_calls,
         factory_rally_first,
@@ -882,19 +990,32 @@ pub(super) fn build_ui_instances(state: &AppState, wall_ms: u32) -> UiInstances 
     }
 }
 
+/// The one world-surface viewport for planning, action and rally producers.
+/// Wheel zoom changes its clip, while the native raster keeps one-pixel spans.
+fn tactical_line_viewport(
+    camera: [f32; 2],
+    tactical: [u32; 4],
+    zoom: Option<&crate::render::upscale_pass::WorldZoomPass>,
+) -> crate::app::presentation::target_lines::TacticalViewport {
+    crate::app::presentation::target_lines::TacticalViewport {
+        camera: camera.map(|v| v.round() as i32),
+        clip: zoom
+            .map_or(tactical, |zoom| zoom.world_clip(tactical))
+            .map(|v| v as i32),
+        zoom: 1.,
+    }
+}
+
 /// `BeaconManagerClass` Draw `0x00430AC0`, called by TacticalClass::Draw at
 /// `0x006D46B6` just before BandBox.
-fn build_beacon_instances(
-    state: &AppState,
-) -> [Vec<SpriteInstance>; crate::app::match_runtime::beacons::BEACON_HOUSES] {
-    let mut rows: [Vec<SpriteInstance>; crate::app::match_runtime::beacons::BEACON_HOUSES] =
-        Default::default();
+fn build_beacon_instances(state: &AppState) -> Vec<Vec<SpriteInstance>> {
     let (Some(art), Some(runtime)) = (
         state.match_state.match_presentation.beacon_art.as_ref(),
         state.match_state.sim_runtime.as_ref(),
     ) else {
-        return rows;
+        return Vec::new();
     };
+    let mut rows = vec![Vec::new(); art.house_count()];
     let frame = runtime.simulation.session().binary_frame();
     for beacon in crate::app::match_runtime::beacons::draws(state) {
         if let (Some(row), Some(instance)) = (
@@ -907,25 +1028,122 @@ fn build_beacon_instances(
     rows
 }
 
+/// The PLACE cells and, in Phobos builds, the preview artwork drawn after them.
+struct PlacementPreviewInstances {
+    cells: Vec<SpriteInstance>,
+    #[cfg(feature = "phobos")]
+    ghost: Vec<SpriteInstance>,
+}
+
 /// Active PLACE cells. Tactical6D5030 suppresses the building ghost outside
 /// the map editor; Cell47EC90 supplies frame0 or slope+2. Keep one ordered
 /// stream rather than regrouping overlapping cells by admitted color.
-fn build_placement_preview(state: &AppState) -> Vec<SpriteInstance> {
-    let (Some(shape), Some(preview)) = (
-        state
-            .match_state
-            .match_presentation
-            .selection_overlay
-            .as_ref()
-            .and_then(|overlay| overlay.placement_shape()),
-        &state.match_state.input.building_placement_preview,
-    ) else {
-        return Vec::new();
+fn build_placement_preview(state: &AppState) -> PlacementPreviewInstances {
+    let mut out = PlacementPreviewInstances {
+        cells: Vec::new(),
+        #[cfg(feature = "phobos")]
+        ghost: Vec::new(),
     };
+    let Some(preview) = &state.match_state.input.building_placement_preview else {
+        return out;
+    };
+    let shape = state
+        .match_state
+        .match_presentation
+        .selection_overlay
+        .as_ref()
+        .and_then(|overlay| overlay.placement_shape());
     // Residual: native6D53CB suppresses auto-fill when the wall is blocked;
     // the production list still includes those cells. The ordinary2x2 path
     // has no filler cells and shares one current-cell presentation transport.
-    shape.build_building_preview(preview)
+    // Phobos `0x47EFAE` selects the grid translucency from the rules global
+    // plus the client switch, independently of the per-type preview gate.
+    #[cfg(feature = "phobos")]
+    let alpha = state.rules().map_or(1.0, |rules| {
+        rules
+            .placement_preview_globals()
+            .effective_grid_translucency(
+                state.match_state.match_presentation.show_placement_preview,
+            )
+            .opacity()
+    });
+    #[cfg(not(feature = "phobos"))]
+    let alpha = 1.0;
+    if let Some(shape) = shape {
+        out.cells = shape.build_building_preview(preview, alpha);
+    }
+    #[cfg(feature = "phobos")]
+    {
+        out.ghost = build_placement_ghost(state, preview);
+    }
+    out
+}
+
+/// Phobos `TacticalClass_DrawPlacement_PlacementPreview 0x6D528A`: the
+/// per-type preview image at the current placement cell. The rules global,
+/// the client switch and the type's own `PlacementPreview=` must all admit it.
+#[cfg(feature = "phobos")]
+fn build_placement_ghost(
+    state: &AppState,
+    preview: &crate::sim::production::BuildingPlacementPreview,
+) -> Vec<SpriteInstance> {
+    let Some(rules) = state.rules() else {
+        return Vec::new();
+    };
+    let globals = rules.placement_preview_globals();
+    if !globals.enabled || !state.match_state.match_presentation.show_placement_preview {
+        return Vec::new();
+    }
+    let Some(type_id) = state.armed_building_type() else {
+        return Vec::new();
+    };
+    let Some(object) = rules.object(type_id) else {
+        return Vec::new();
+    };
+    if !object.placement_preview() {
+        return Vec::new();
+    }
+    let Some(point) = crate::app::presentation::placement_preview::preview_screen_point(
+        preview,
+        object.placement_preview_offset(),
+    ) else {
+        return Vec::new();
+    };
+    let Some(assets) = state.process_assets.manager() else {
+        return Vec::new();
+    };
+    let local_owner = crate::app::input::commands::preferred_local_owner_name(state);
+    let remap_house = local_owner
+        .as_deref()
+        .and_then(|owner| {
+            state
+                .match_state
+                .match_presentation
+                .house_color_map
+                .get(owner)
+        })
+        .copied();
+    let translucency = object
+        .placement_preview_translucency()
+        .unwrap_or(globals.translucency);
+    let presentation = &state.match_state.match_presentation;
+    let mut art = presentation.placement_preview_art.borrow_mut();
+    art.build_instance(
+        &state.renderer.gpu.device,
+        &state.renderer.gpu.queue,
+        &state.renderer.batch_renderer,
+        assets,
+        rules,
+        type_id,
+        object,
+        &presentation.theater_name,
+        &presentation.theater_ext,
+        remap_house,
+        point,
+        translucency.opacity(),
+    )
+    .into_iter()
+    .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,6 +1278,13 @@ pub(super) fn build_sidebar_instances(state: &mut AppState) -> SidebarInstances 
         .as_ref()
         .map(|v| build_sidebar_cameo_instances(state, v, status_labels))
         .unwrap_or_default();
+    #[cfg(feature = "phobos")]
+    let sw_sidebar = view
+        .as_ref()
+        .map(|_| {
+            crate::app::presentation::sw_sidebar_build::build(state, status_labels, ready_tint)
+        })
+        .unwrap_or_default();
     let mut text_layers = view
         .as_ref()
         .map(|v| build_sidebar_text_instances(state, v, status_labels, ready_tint))
@@ -1073,7 +1298,6 @@ pub(super) fn build_sidebar_instances(state: &mut AppState) -> SidebarInstances 
             crate::app::presentation::sidebar_text::build_sidebar_credits_instances(
                 &state.renderer.bit_font,
                 v,
-                state.match_state.match_presentation.ui_scale,
                 crate::app::presentation::sidebar_text::credits_tint(theme),
                 [
                     state.match_state.input.camera_x,
@@ -1116,6 +1340,18 @@ pub(super) fn build_sidebar_instances(state: &mut AppState) -> SidebarInstances 
         queue_overlay: cameo_layers.queue_overlay,
         queue_text: text_layers.queue,
         text: text_layers.status,
+        #[cfg(feature = "phobos")]
+        sw_sidebar_chrome: sw_sidebar.chrome,
+        #[cfg(feature = "phobos")]
+        sw_sidebar_cameo: sw_sidebar.cameo,
+        #[cfg(feature = "phobos")]
+        sw_sidebar_gclock: sw_sidebar.gclock,
+        #[cfg(feature = "phobos")]
+        sw_sidebar_hover: sw_sidebar.hover,
+        #[cfg(feature = "phobos")]
+        sw_sidebar_overlay: sw_sidebar.overlay,
+        #[cfg(feature = "phobos")]
+        sw_sidebar_text: sw_sidebar.text,
         minimap,
         viewport_rect,
         content_boundary,
@@ -1141,13 +1377,12 @@ fn build_radar_anim_instance(state: &AppState) -> Vec<SpriteInstance> {
     let spec = state.match_state.match_presentation.sidebar_layout_spec;
     let layout = crate::ui::sidebar::compute_layout_with_spec(spec, sw, sh, 0);
 
-    let s = state.match_state.match_presentation.ui_scale;
     vec![SpriteInstance {
         position: [
             state.match_state.input.camera_x + layout.sidebar_x,
             state.match_state.input.camera_y + layout.radar_y,
         ],
-        size: [ra.width as f32 * s, ra.height as f32 * s],
+        size: [ra.width as f32, ra.height as f32],
         uv_origin: [0.0, 0.0],
         uv_size: [1.0, 1.0],
         depth: 0.00048,

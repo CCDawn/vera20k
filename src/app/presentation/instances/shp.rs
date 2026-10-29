@@ -807,9 +807,12 @@ pub(crate) fn build_shp_instances_from_inputs(
                     draw_decision,
                 );
             }
+        }
+        if entity.category() == EntityCategory::Structure {
             // Building voxel guns remain inside their SHP hull's draw call.
             if let Some(rules_obj) = rules.and_then(|r| r.object(type_str))
                 && rules_obj.turret_anim_is_voxel
+                && building_voxel_turret_visible(entity, rules_obj.artillary)
                 && let Some(unit_atlas) = input.unit_atlas
             {
                 let turret_offset = art_reg
@@ -1034,6 +1037,27 @@ fn infantry_air_shadow_piece(
     })
 }
 
+/// BuildingClass::DrawIt/DrawBody @ 0x0043DA80, original instructions
+/// 0x0043DF6E..0x0043DFBB: Construction in either current (+AC) or queued
+/// (+B4) mission hides the gun before the last Buildup stage (+F8, type
+/// +F04/+F08). Selling checks only current and hides it after stage zero.
+/// Artillary (type+16CA) bypasses both gates; BState does not gate the gun.
+fn building_voxel_turret_visible(
+    entity: &crate::sim::game_entity::GameEntity,
+    artillary: bool,
+) -> bool {
+    use crate::sim::mission::MissionType;
+    let current = entity.mission.current().known();
+    let queued = entity.mission.queued().known();
+    let stage = entity.construction_stage_value();
+    let [start, count, _] = entity.building_construction_control();
+    let constructing =
+        current == Some(MissionType::Construction) || queued == Some(MissionType::Construction);
+    artillary
+        || !(constructing && stage < start.wrapping_add(count).wrapping_sub(1)
+            || current == Some(MissionType::Selling) && stage > 0)
+}
+
 /// Emit a building's native B8 turret and C0 barrel at its TurretAnim anchor.
 ///
 /// Building draw43DA80 uses the current primary facing and retained +148 HVA
@@ -1176,6 +1200,9 @@ fn emit_building_turret_vxl(
     }
 }
 
+#[cfg(test)]
+#[path = "building_turret_visibility_tests.rs"]
+mod building_turret_visibility_tests;
 #[cfg(test)]
 #[path = "building_voxel_tests.rs"]
 mod building_voxel_tests;
@@ -1497,6 +1524,7 @@ pub(crate) fn build_building_anim_instances(
             grid,
             cell,
             sim,
+            local_owner_id,
             building,
             &|id| anim_colour_word(state, sim, cells.as_ref(), &shrouded, id),
             axis.origin_y,
@@ -1547,6 +1575,7 @@ fn emit_building_anims(
     light_grid: &crate::map::lighting::CellLightGrid,
     cell: (u16, u16),
     sim: &crate::sim::world::Simulation,
+    local_owner_id: Option<crate::sim::intern::InternedId>,
     building: &crate::sim::game_entity::GameEntity,
     anim_word: &dyn Fn(u64) -> u16,
     origin_y: f32,
@@ -1576,7 +1605,7 @@ fn emit_building_anims(
         };
         // Building's retained slot reaches DrawIt422CA0..4238AF until physical
         // release. That body gates on hidden19D, not19B or Logic membership.
-        if instance.draw_runtime().hidden {
+        if instance.hidden_for(local_owner_id) {
             continue;
         }
         let anim_name = sim.interner().resolve(instance.type_id());

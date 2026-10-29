@@ -581,8 +581,7 @@ fn synthetic_theater_with_wood_bridge_set() -> TheaterData {
         bridge_set: None,
         wood_bridge_set: Some(1),
         slope_set_pieces: None,
-        bridge_middle_1: None,
-        bridge_middle_2: None,
+        high_bridge_rim_tiles: crate::map::bridge_rim_tiles::HighBridgeRimTiles::ABSENT,
         tunnels: None,
         track_tunnels: None,
         dirt_tunnels: None,
@@ -607,8 +606,7 @@ fn synthetic_theater_from_ini(ini: &[u8]) -> TheaterData {
         bridge_set: None,
         wood_bridge_set: None,
         slope_set_pieces: None,
-        bridge_middle_1: None,
-        bridge_middle_2: None,
+        high_bridge_rim_tiles: crate::map::bridge_rim_tiles::HighBridgeRimTiles::ABSENT,
         tunnels: None,
         track_tunnels: None,
         dirt_tunnels: None,
@@ -1461,8 +1459,11 @@ fn authored_fill_defers_all_executable_projection() {
           [Tunnel FX]\nTile01Anim=TUNNELFX\nTile01AttachesTo=0\n",
     );
     theater.bridge_set = Some(0);
-    theater.bridge_middle_1 = Some(1);
-    theater.bridge_middle_2 = Some(5);
+    theater.high_bridge_rim_tiles = crate::map::bridge_rim_tiles::HighBridgeRimTiles {
+        base: 0,
+        middle: [1, 5],
+        ..crate::map::bridge_rim_tiles::HighBridgeRimTiles::ABSENT
+    };
     theater.tunnels = Some(0);
     let tmp_name = theater
         .lookup
@@ -4621,8 +4622,7 @@ Tile03ZAdjust=-10
         bridge_set: None,
         wood_bridge_set: None,
         slope_set_pieces: None,
-        bridge_middle_1: None,
-        bridge_middle_2: None,
+        high_bridge_rim_tiles: crate::map::bridge_rim_tiles::HighBridgeRimTiles::ABSENT,
         tunnels: None,
         track_tunnels: None,
         dirt_tunnels: None,

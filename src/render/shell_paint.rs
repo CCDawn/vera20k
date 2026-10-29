@@ -22,7 +22,7 @@
 //! composition the quit-confirm and validation modals both delegate to.
 
 use std::borrow::Cow;
-use std::time::Instant;
+use crate::util::time::Instant;
 
 use crate::render::batch::SpriteInstance;
 use crate::render::bit_font::BitFont;
@@ -736,9 +736,8 @@ pub struct ModalButton {
 /// Emit the mode-2 modal sprites: selected PUDLGBG background at the dialog
 /// top-left, clipped by the dialog client (621E90 -> 4AED70), then each MNBTTN
 /// button centered on its control rect at the state-selected frame. Both grow
-/// with `scale`, which is [`ShellScale::RETAIL`] for the message-box family's
-/// own fixed-size box and a stretched page's scale where the dialog itself
-/// stretches. A missing background is the caller's concern — only present
+/// with the layout's `scale`, including message boxes over a fitted shell.
+/// A missing background is the caller's concern — only present
 /// entries are emitted here, so the solid-panel fallback stays with the host
 /// caller.
 pub fn paint_modal_sprites(
@@ -787,7 +786,7 @@ pub fn paint_modal_sprites(
 }
 
 /// Compose the full mode-2 SHP modal: [`paint_modal_sprites`] plus the body/button
-/// labels (via [`paint_labels_at_depth`] at the modal's front-most text depth).
+/// labels at the modal's front-most text depth, all using the layout's scale.
 pub fn paint_modal_shp(
     font: &BitFont,
     background: Option<SkirmishShellChromeEntry>,
@@ -799,7 +798,7 @@ pub fn paint_modal_shp(
     depths: ModalDepths,
 ) -> ModalDraw {
     let sprites = paint_modal_sprites(background, button_frames, dialog, buttons, scale, depths);
-    let text = paint_labels_at_depth(font, labels, depths.text);
+    let text = paint_labels_at_depth_scaled(font, labels, depths.text, scale.factor());
     ModalDraw { sprites, text }
 }
 
@@ -1055,6 +1054,38 @@ mod tests {
         button: 0.4,
         text: 0.3,
     };
+
+    #[test]
+    fn modal_labels_grow_with_the_panel_and_button_art() {
+        let font = crate::render::bit_font::tests::make_test_font(&[(b'A' as u16, 6)], 4);
+        let draw = |scale: ShellScale| {
+            let rect = scale.scale_rect(RectPx::new(175, 137, 451, 326));
+            paint_modal_shp(
+                &font,
+                Some(fake_skirmish_entry([0.0; 2], [1.0; 2], [451.0, 326.0])),
+                ModalButtonFrames::default(),
+                rect,
+                &[],
+                &[PaintLabel {
+                    text: "A".into(),
+                    rect,
+                    align: ShellAlign::NONE,
+                    rgb: SHELL_TEXT_RGB_ENABLED,
+                    path_a_reveal: None,
+                }],
+                scale,
+                MODAL_DEPTHS,
+            )
+        };
+        let retail = draw(ShellScale::RETAIL);
+        let fitted = draw(ShellScale::from_screen(1600, 1200));
+        assert_eq!(fitted.sprites[0].size, [902.0, 652.0]);
+        let glyph = &retail.text[0].instances[0];
+        let grown = &fitted.text[0].instances[0];
+        assert_eq!(grown.size, glyph.size.map(|v| v * 2.0));
+        assert_eq!(grown.position, glyph.position.map(|v| v * 2.0));
+        assert_eq!(fitted.text[0].scissor.w, retail.text[0].scissor.w * 2);
+    }
 
     #[test]
     fn progress_background_is_clipped_to_original_dialog_client() {

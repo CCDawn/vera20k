@@ -575,6 +575,165 @@ fn ready_building(sim: &mut Simulation, rules: &RuleSet, owner: &str, type_id: &
     super::complete_held_building_for_test(sim, rules, owner_id, type_id);
 }
 
+/// CanCapture471D1E reads current +AC, not Get_Mission's queued fallback.
+/// EvaluateCandidate6F7CE8 can therefore admit a just-placed Pillbox before
+/// Construction commences; Fire_At_Target5209DE rechecks after FireUp=6.
+#[test]
+fn a_prime_acquires_a_placed_pillbox_before_construction_commences() {
+    use crate::sim::mission::MissionId;
+
+    let Some((mut sim, mut rules, registry, yuri)) = stock_yuri_cloning_world() else {
+        return;
+    };
+    let (_, mut assets) = crate::rules::retail_ini_fixture::retail_assets().unwrap();
+    crate::map::theater::load_theater(&mut assets, "TEMPERATE").unwrap();
+    rules.bind_building_buildup_assets(&assets, "TEMPERATE");
+    assert_eq!(rules.buildup_control("GAPILL"), [0, 8, 6]);
+    assert!(!rules.object("GAPILL").unwrap().immune_to_psionics);
+    assert_eq!(rules.object("YURIPR").unwrap().fire_up_frame, 6);
+    sim.install_resolved_terrain_for_new_map(crate::map::resolved_terrain::test_retail_clear_grid(
+        64, 64,
+    ));
+    assert!(sim.rebuild_dynamic_navigation(&rules));
+    let american = sim.interner.intern("Americans");
+    let mut house =
+        crate::sim::house_state::HouseState::new(american, 1, Some(american), true, 10_000, 10);
+    house.project_country_mults(&rules, &sim.interner);
+    sim.houses.register(house);
+    for (kind, owner, x, y) in [
+        ("GACNST", "Americans", 14, 14),
+        ("GAPILE", "Americans", 14, 20),
+        ("GAPOWR", "Americans", 14, 24),
+        ("YACNST", "YuriCountry", 35, 35),
+    ] {
+        sim.spawn_object_at_height_with_overlay_registry(
+            kind, owner, x, y, 0, 0, &rules, &registry,
+        )
+        .unwrap();
+    }
+    let prime = sim
+        .spawn_object_at_height_with_overlay_registry(
+            "YURIPR",
+            "YuriCountry",
+            24,
+            14,
+            0xC0,
+            0,
+            &rules,
+            &registry,
+        )
+        .unwrap();
+    // Supply a completed, unpublished factory object; its constructor and
+    // subsequent PLACE/Unlimbo/mission/action work use production owners.
+    ready_building(&mut sim, &rules, "Americans", "GAPILL");
+    let pillbox = super::lifecycle_tests::held_id(&sim, american, ProductionCategory::Defense);
+    let aligned = (0..120).any(|_| {
+        let now = sim.session.binary_frame();
+        let timer = sim.entities().get(prime).unwrap().passive_scan.timer();
+        // Observe a natural scan leaving room for FireUp6 before the
+        // sixteenth-frame illegal-target clear (Techno6FA472..6FA4CB).
+        if !timer.due(now) && timer.due(now.wrapping_add(1)) && (now + 1) % 16 <= 9 {
+            return true;
+        }
+        sim.advance_tick(&[], Some(&rules), None, Some(&registry), 67);
+        false
+    });
+    assert!(aligned, "observe the normal scan timer without changing it");
+    assert!(
+        sim.entities()
+            .get(prime)
+            .unwrap()
+            .attack_target
+            .target()
+            .is_none()
+    );
+    let gapill = sim.interner.get("GAPILL").unwrap();
+    let place = place_event(american, gapill, (18, 14), sim.session.tick() + 1);
+    assert_eq!(
+        sim.advance_tick(&[place], Some(&rules), None, Some(&registry), 67)
+            .executed_commands,
+        1
+    );
+    let placed = sim.entities().get(pillbox).unwrap();
+    assert_eq!(placed.mission.current(), MissionId::NONE);
+    assert_eq!(
+        placed.mission.queued().known(),
+        Some(MissionType::Construction)
+    );
+    sim.advance_tick(&[], Some(&rules), None, Some(&registry), 67);
+    let actor = sim.entities().get(prime).unwrap();
+    assert_eq!(
+        actor.attack_target.target(),
+        Some(TargetKind::Entity(pillbox))
+    );
+    assert_eq!(
+        actor.infantry_sprite_pose().unwrap().0,
+        4,
+        "native FireUp action"
+    );
+    assert!(actor.passive_scan.acquired());
+    assert_eq!(actor.mission_leaf.foot_firing_sequence_latch(), 1);
+
+    let mut reset = false;
+    let mut cleaned = false;
+    for _ in 0..16 {
+        sim.advance_tick(&[], Some(&rules), None, Some(&registry), 67);
+        let target = sim.entities().get(pillbox).unwrap();
+        assert_eq!(
+            target.owner(),
+            american,
+            "FireUp must not capture Construction"
+        );
+        let actor = sim.entities().get(prime).unwrap();
+        if !reset && actor.mission_leaf.foot_firing_sequence_latch() == 0 {
+            assert_eq!(
+                target.mission.current().known(),
+                Some(MissionType::Construction)
+            );
+            assert_eq!(actor.infantry_sprite_pose().unwrap().0, 0);
+            assert_eq!(
+                actor.attack_target.target(),
+                Some(TargetKind::Entity(pillbox))
+            );
+            reset = true;
+        }
+        if reset && actor.attack_target.target().is_none() {
+            assert_eq!((sim.session.binary_frame() - 1) % 16, 0);
+            assert!(!actor.passive_scan.timer().due(sim.session.binary_frame()));
+            cleaned = true;
+            break;
+        }
+    }
+    assert!(reset, "the delayed fire query resets the firing action");
+    assert!(cleaned, "the periodic check drops the now-illegal target");
+    assert!(
+        (0..120).any(|_| {
+            sim.advance_tick(&[], Some(&rules), None, Some(&registry), 67);
+            sim.entities().get(pillbox).unwrap().owner() == yuri
+        }),
+        "normal scanning and firing can capture after construction finishes"
+    );
+    assert_eq!(
+        sim.entities()
+            .get(pillbox)
+            .unwrap()
+            .mind_control
+            .controller(),
+        Some(prime)
+    );
+    assert_eq!(
+        sim.entities()
+            .get(prime)
+            .unwrap()
+            .capture_manager
+            .as_ref()
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(sim.entities().get(prime).unwrap().owner(), yuri);
+}
+
 /// Place `owner`'s ready `type_id` at `cell` through Place_Production.
 fn place_building(
     sim: &mut Simulation,
@@ -1130,6 +1289,8 @@ fn a_human_placement_draws_its_buildup_until_it_opens() {
 #[test]
 fn stock_gapowr_placement_restores_power_and_radar_during_buildup() {
     let mut sim = placement_sim();
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Skirmish);
     let rules = stock_power_contract_rules();
     let grid = PathGrid::new(64, 64);
 

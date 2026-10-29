@@ -16,7 +16,8 @@ use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 
-use crate::app::{App, AppState, BUILD_STAMP, GameScreen};
+use crate::app::input::precedence::{InputLayer, ModalPage, ScreenPage};
+use crate::app::{App, AppState, BUILD_STAMP};
 use crate::render::batch::{BatchRenderer, BatchTexture, DepthAxis, SpriteInstance};
 use crate::render::gpu::GpuContext;
 use crate::render::status_font::StrokeFace;
@@ -70,27 +71,21 @@ impl Buttons {
     pub(crate) const MISSING_MENU: Self = Self([Some(Action::Resume), Some(Action::Abort)]);
     pub(crate) const ABORT_CONFIRM: Self = Self([Some(Action::Leave), Some(Action::Resume)]);
 
+    /// The card that takes input now: render draws the same card from the
+    /// same decision (`input::precedence`).
     fn for_state(state: &AppState) -> Option<Self> {
-        match state.frontend.screen {
-            GameScreen::MainMenu if state.frontend.main_menu_shell_error.is_some() => Some(Self::QUIT),
-            GameScreen::MissionResult { .. }
-                if !App::score_shell_active(state)
-                    && !App::campaign_score_shell_active(state)
-                    && !crate::app::input::coop_score::active(state) =>
-            {
-                Some(Self::BACK_TO_MENU)
-            }
-            GameScreen::InGame
-                if state.match_state.match_presentation.in_game_menu.is_open()
-                    && !state.match_state.match_presentation.in_game_menu.draws_over_battlefield()
-                    && !crate::app::frontend::skirmish_shell_render::native_in_game_shell_active(state) =>
-            {
-                Some(if state.match_state.match_presentation.in_game_menu == InGameMenuState::AbortConfirm {
+        match crate::app::input::precedence::input_layer(state) {
+            InputLayer::Page(ModalPage::ShellError) => Some(Self::QUIT),
+            InputLayer::Screen(ScreenPage::ResultCard) => Some(Self::BACK_TO_MENU),
+            InputLayer::Screen(ScreenPage::InGameCard) => Some(
+                if state.match_state.match_presentation.in_game_menu
+                    == InGameMenuState::AbortConfirm
+                {
                     Self::ABORT_CONFIRM
                 } else {
                     Self::MISSING_MENU
-                })
-            }
+                },
+            ),
             _ => None,
         }
     }
@@ -630,6 +625,7 @@ pub(crate) fn render(
         }),
         timestamp_writes: None,
         occlusion_query_set: None,
+        multiview_mask: None,
     });
     if let Some((buffer, count)) = &glow_buffer {
         batch.draw_with_buffer_passthrough(&mut pass, glow, buffer, *count);

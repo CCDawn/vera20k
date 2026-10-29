@@ -8,7 +8,9 @@
 //! - Part of the app layer — may depend on everything.
 
 use crate::app::AppState;
-use crate::app::presentation::sidebar_render::{current_sidebar_theme, current_sidebar_view};
+use crate::app::presentation::sidebar_render::{
+    current_sidebar_side, current_sidebar_theme, current_sidebar_view,
+};
 use crate::assets::csf_file::{CsfArg, format_csf};
 use crate::map::entities::EntityCategory;
 use crate::render::batch::SpriteInstance;
@@ -18,6 +20,11 @@ use crate::ui::tooltips::{TipRect, TipRegion};
 /// In-game tip ids mirror the gamemd id space: button ids as-is, cameo slots
 /// at 1000+.
 pub(crate) const CAMEO_TIP_ID_BASE: u32 = 1000;
+
+/// Phobos left superweapon sidebar cameo tips, one id per visible slot. Kept
+/// clear of the right sidebar's cameo range.
+#[cfg(feature = "phobos")]
+pub(crate) const SW_SIDEBAR_TIP_ID_BASE: u32 = 2000;
 
 /// CSF label carrying the cameo tooltip money format. Retail English value is
 /// `"%s $%d"` — name, space, currency sign, cost.
@@ -63,12 +70,12 @@ pub(crate) const TIP_CURSOR_OFFSET: [i32; 2] = [12, 16];
 /// sides of an 86x38 box).
 pub(crate) const TIP_BORDER_PX: f32 = 1.0;
 /// Popup box size = measured text plus this much in **total** (not per side):
-/// gamemd adds 4 to the measured width and 3 to the measured height.
+/// positioning pass `0x00478C46..0x00478C49` adds 4 width and 3 height.
 pub(crate) const TIP_BOX_PAD: [f32; 2] = [4.0, 3.0];
-/// Text draw origin inside the popup box: `+2` horizontal, `+4` vertical.
-/// With the FNT cell height carrying a 1 px gap under the glyph rows, a
-/// one-line tip lands exactly flush with the box bottom.
-pub(crate) const TIP_TEXT_INSET: [f32; 2] = [2.0, 4.0];
+/// Draw pass `0x00478F2D..0x00478F30` pads the frame separately from positioning.
+const TIP_DRAW_PAD: [f32; 2] = [8.0, 4.0];
+/// `0x00479024..0x00479029`: text starts at x+4/y+2, not x+2/y+4.
+pub(crate) const TIP_TEXT_INSET: [f32; 2] = [4.0, 2.0];
 
 pub(crate) fn now_ms(state: &AppState) -> u64 {
     state.diagnostic_presentation_ms().unwrap_or_else(|| {
@@ -188,7 +195,7 @@ fn tactical_world_tip_text(
     world: (f32, f32),
     cursor_coordinates: bool,
 ) -> String {
-    tactical_world_tip_text_sampled(view, rules, csf, world, cursor_coordinates, None)
+    tactical_world_tip_text_sampled(view, rules, csf, world, cursor_coordinates, None, None)
 }
 
 fn tactical_world_tip_text_sampled(
@@ -198,6 +205,7 @@ fn tactical_world_tip_text_sampled(
     world: (f32, f32),
     cursor_coordinates: bool,
     interpolation: Option<&crate::app::presentation::interpolation::RenderInterpolation>,
+    translucent_viewer: Option<crate::sim::intern::InternedId>,
 ) -> String {
     let Some((terrain, viewer)) = view.resolved_terrain().zip(view.session().current_house())
     else {
@@ -226,6 +234,7 @@ fn tactical_world_tip_text_sampled(
         crate::app::input::entity_pick::PresentedWorld {
             sim,
             interpolation: interpolation.unwrap_or(&native),
+            translucent_viewer,
         },
         &order,
         Some(view.fog()),
@@ -330,6 +339,15 @@ fn unit_turret_tip_text(
     object: &crate::rules::object_type::ObjectType,
     csf: Option<&crate::assets::csf_file::CsfFile>,
 ) -> String {
+    // Ares UnitGetUIName746B89 ->1004BF20 returns the configured full
+    // weapon-mode name before the original passenger/turret formatter.
+    #[cfg(feature = "ares")]
+    if let Some(label) = object
+        .gunner_turrets
+        .weapon_ui_name(entity.current_weapon_number())
+    {
+        return crate::assets::csf_file::type_ui_name(Some(label), csf);
+    }
     let tip = |key: &str| csf.map_or_else(|| key.to_owned(), |csf| csf.text(key).into_owned());
     let passenger = entity
         .passenger_role
@@ -350,10 +368,18 @@ fn unit_turret_tip_text(
         },
         None => tip("Tip:Rocket"),
     };
-    format!(
-        "{word} {}",
-        crate::assets::csf_file::type_ui_name(object.ui_name.as_deref(), csf)
-    )
+    let own = crate::assets::csf_file::type_ui_name(object.ui_name.as_deref(), csf);
+    #[cfg(feature = "ares")]
+    {
+        // Ares spacing hook746C55 ->1004BF90 separates nonempty pieces only.
+        if word.is_empty() {
+            return own;
+        }
+        if own.is_empty() {
+            return word;
+        }
+    }
+    format!("{word} {own}")
 }
 
 fn tactical_tip_text(state: &AppState) -> String {
@@ -376,6 +402,8 @@ fn tactical_tip_text(state: &AppState) -> String {
         input.cursor_x,
         input.cursor_y,
     );
+    let translucent_viewer =
+        crate::app::presentation::instances::translucent_fog_viewer(state, view.simulation());
     tactical_world_tip_text_sampled(
         view,
         rules,
@@ -383,6 +411,7 @@ fn tactical_tip_text(state: &AppState) -> String {
         world,
         input.cursor_coordinates,
         Some(&state.match_state.match_presentation.interpolation),
+        translucent_viewer,
     )
 }
 
@@ -578,6 +607,41 @@ fn sync_in_game_regions(state: &mut AppState) {
             text,
         });
     }
+    // Phobos left superweapon sidebar: `SWButtonClass` shows the same super
+    // weapon name/cost tip as the right cameo.
+    #[cfg(feature = "phobos")]
+    {
+        let sw = &state.match_state.match_presentation.sw_sidebar;
+        if sw.ui.enabled && sw.expanded {
+            for (index, entry) in sw.entries.iter().enumerate() {
+                let text = dynamic_tip_text(cursor, || {
+                    let amount = state
+                        .rules()
+                        .and_then(|rules| {
+                            let super_type = rules.super_weapon(&entry.type_id)?;
+                            Some(crate::sim::superweapon::financial_type(rules, super_type))
+                        })
+                        .map_or(0, |super_type| super_type.money_amount);
+                    let money_format = state
+                        .process_assets
+                        .csf
+                        .as_ref()
+                        .map(|csf| csf.text(CAMEO_TIP_MONEY_FORMAT));
+                    superweapon_money_tip(money_format.as_deref(), &entry.view.display_name, amount)
+                });
+                regions.push(TipRegion {
+                    id: SW_SIDEBAR_TIP_ID_BASE + index as u32,
+                    rect: TipRect::new(
+                        entry.rect.x.round() as i32,
+                        entry.rect.y.round() as i32,
+                        entry.rect.w.round() as i32,
+                        entry.rect.h.round() as i32,
+                    ),
+                    text,
+                });
+            }
+        }
+    }
     state
         .match_state
         .match_presentation
@@ -601,8 +665,23 @@ pub(crate) fn build_tooltip_instances(
         return (Vec::new(), Vec::new(), Vec::new());
     }
     // gamemd draws the tip in the current sidebar text colour, so the same
-    // side-dependent colour the cameo labels use — not a fixed yellow.
-    let tint = crate::render::sidebar_text::side_highlight_color(current_sidebar_theme(state));
+    // side-dependent colour the cameo labels use — not a fixed yellow. Ares
+    // `[Side] ToolTipColor=` (`SideExt+80`, applied by
+    // `Game_InitializeToolTipColor @ 0x1002F360`) replaces it.
+    let tint = state
+        .match_state
+        .sim_runtime
+        .as_ref()
+        .and_then(|runtime| {
+            runtime
+                .resources
+                .rules
+                .side_tooltip_color(current_sidebar_side(state))
+        })
+        .map(|rgb| rgb.map(|channel| f32::from(channel) / 255.0))
+        .unwrap_or_else(|| {
+            crate::render::sidebar_text::side_highlight_color(current_sidebar_theme(state))
+        });
     tooltip_quads(
         &state.renderer.bit_font,
         &tip.text,
@@ -660,18 +739,22 @@ pub(crate) fn tooltip_quads(
     // Region the popup is sized and placed against. gamemd measures with the
     // selected region's width; which region record it picks is UNCHECKED, so
     // the render surface width is used here.
-    let (layout, [box_w, box_h]) = size_tip_box(font, text, region[2] as u32);
+    let (layout, [placement_w, placement_h]) = size_tip_box(font, text, region[2] as u32);
+    let box_w = layout.width as f32 + TIP_DRAW_PAD[0];
+    let box_h = layout.height as f32 + TIP_DRAW_PAD[1];
     let bx = place_tip(
         tip_xy[0] as f32,
         TIP_CURSOR_OFFSET[0] as f32,
-        box_w,
+        placement_w,
         region[0],
         region[2],
     );
+    // Draw clamps the wider frame to the surface at `0x00478F40..0x00478F56`.
+    let bx = bx.min(region[0] + (region[2] - box_w).max(0.0));
     let by = place_tip(
         tip_xy[1] as f32,
         TIP_CURSOR_OFFSET[1] as f32,
-        box_h,
+        placement_h,
         region[1],
         region[3],
     );
@@ -1541,7 +1624,7 @@ mod tests {
         }
 
         // And with no pan the box sits at cursor + the native cursor offset,
-        // with the text at the +2/+4 inset inside it.
+        // with the text at the native +4/+2 inset inside it.
         assert_eq!(
             at_origin.0[0].position,
             [
@@ -1552,8 +1635,8 @@ mod tests {
         assert_eq!(
             at_origin.2[0].position,
             [
-                100.0 + TIP_CURSOR_OFFSET[0] as f32 + 2.0,
-                100.0 + TIP_CURSOR_OFFSET[1] as f32 + 4.0
+                100.0 + TIP_CURSOR_OFFSET[0] as f32 + 4.0,
+                100.0 + TIP_CURSOR_OFFSET[1] as f32 + 2.0
             ]
         );
     }
@@ -1566,7 +1649,7 @@ mod tests {
     fn sidebar_tip_only_flips_when_the_screen_would_clip_it() {
         let font = make_test_font(&[(b'x' as u16, 6)], 4);
         let screen = [0.0, 0.0, 1024.0, 768.0];
-        // "xxx" measures 21 px, so the box is 25 wide.
+        // "xxx" measures 21 px: positioning uses 25, drawing uses 29.
         let (fill, _, text) = tooltip_quads(
             &font,
             "xxx",
@@ -1581,7 +1664,7 @@ mod tests {
             [912.0, 316.0],
             "a cameo tip must not flip while the screen still has room"
         );
-        assert_eq!(text[0].position, [914.0, 320.0]);
+        assert_eq!(text[0].position, [916.0, 318.0]);
 
         // One cursor pixel further right leaves no room for the box, so it
         // lands back-up of the cursor instead: 1010 - 12 - 25.
@@ -1595,7 +1678,65 @@ mod tests {
             true,
         );
         assert_eq!(flipped[0].position, [973.0, 316.0]);
-        assert_eq!(flipped[0].size, [25.0, font.cell_height() + 3.0]);
+        assert_eq!(flipped[0].size, [29.0, font.cell_height() + 4.0]);
+    }
+
+    #[test]
+    fn tooltip_draw_uses_native_insets_for_cjk_latin_digits_and_multiple_lines() {
+        let font = make_test_font(
+            &[('汉' as u16, 16), (b'A' as u16, 6), (b'1' as u16, 6)],
+            4,
+        );
+        for region in [[0.0, 0.0, 800.0, 600.0], [0.0, 0.0, 1280.0, 720.0]] {
+            for text in ["汉", "A1", "汉\nA1"] {
+                let layout = font.wrap_layout(text, region[2] as u32);
+                let (fill, _, glyphs) = tooltip_quads(
+                    &font,
+                    text,
+                    [100, 100],
+                    region,
+                    [1.0; 3],
+                    [0.0; 2],
+                    true,
+                );
+                assert_eq!(
+                    fill[0].size,
+                    [layout.width as f32 + 8.0, layout.height as f32 + 4.0]
+                );
+                assert_eq!(
+                    glyphs[0].position,
+                    [fill[0].position[0] + 4.0, fill[0].position[1] + 2.0]
+                );
+                if text.contains('\n') {
+                    assert_eq!(glyphs[1].position[0], glyphs[0].position[0]);
+                    assert_eq!(
+                        glyphs[1].position[1] - glyphs[0].position[1],
+                        font.cell_height()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tooltip_draw_clamps_the_wider_frame_without_changing_position_measurement() {
+        let font = make_test_font(&[(b'x' as u16, 6)], 4);
+        assert_eq!(
+            size_tip_box(&font, "xxx", 1024).1,
+            [25.0, font.cell_height() + 3.0]
+        );
+        let (fill, _, text) = tooltip_quads(
+            &font,
+            "xxx",
+            [985, 300],
+            [0.0, 0.0, 1024.0, 768.0],
+            [1.0; 3],
+            [0.0; 2],
+            true,
+        );
+        assert_eq!(fill[0].position, [995.0, 316.0]);
+        assert_eq!(fill[0].size, [29.0, font.cell_height() + 4.0]);
+        assert_eq!(text[0].position, [999.0, 318.0]);
     }
 
     /// The retail tip's interior is solid black — captured over bright cameo art

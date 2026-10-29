@@ -299,7 +299,6 @@ impl BridgeRecalcCatalog {
                 )
             })
             .collect();
-        let ini = crate::rules::ini_parser::IniFile::from_bytes(&theater.ini_data);
         let mut heads = HashMap::new();
         let mut files = HashMap::new();
         for id in ids {
@@ -320,26 +319,11 @@ impl BridgeRecalcCatalog {
                 .and_then(|filename| read_resident_tmp(assets, rules, tile, filename, set))
                 .map(Arc::new);
             let result = (|| {
-                let ini = ini
-                    .as_ref()
-                    .map_err(|error| BridgeRecalcCatalogError::Unavailable {
-                        tile,
-                        reason: format!("theater INI: {error}"),
-                    })?;
-                let set = theater.lookup.tileset_index(tile);
-                let set_name = set.and_then(|set| theater.lookup.set_name(set));
-                let set_section = set.map(|set| format!("TileSet{set:04}"));
-                // This narrow adapter supports the independently proved
-                // absence of shadow policy. It does not interpret TS shadow
-                // options or silently suppress a declared native callback.
-                if [set_section.as_deref(), set_name]
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|name| ini.section(name))
-                    .any(|section| {
-                        section.is_present("ShadowCaster") || section.is_present("ShadowTiles")
-                    })
-                {
+                // RecalcAttributes `0x0047DAA2` applies GetShadowCellOffsets
+                // (`0x00547C80`) only for a +0x2E1 tile type. This adapter
+                // does not port that walk, so it rejects such tiles instead
+                // of silently dropping the native callback.
+                if theater.lookup.casts_tile_shadow(tile) {
                     return Err(BridgeRecalcCatalogError::Unsupported {
                         tile,
                         effect: "declared shadow policy",

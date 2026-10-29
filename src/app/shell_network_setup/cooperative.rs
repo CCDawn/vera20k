@@ -9,7 +9,7 @@
 use super::NetworkSetupRequest;
 use crate::app::AppState;
 use crate::app::frontend::skirmish_session::cooperative::{
-    CooperativeCampaignText, CooperativeSlotContext,
+    CooperativeCampaignText, CooperativeSlotContext, SavedCampaignJoin, SavedCampaignLeave,
 };
 use crate::skirmish_modes::MpModeClass;
 
@@ -162,6 +162,7 @@ pub(super) fn host_opened(state: &mut AppState) -> anyhow::Result<()> {
     }
     refresh_rows(state, false)?;
     let inputs = SlotInputs::read(state);
+    let save = state.frontend.multiplayer_shell_runtime.cooperative_save();
     let refresh = {
         let parts = state.frontend.multiplayer_shell_runtime.cooperative_parts();
         parts.progress.request_refresh();
@@ -174,6 +175,7 @@ pub(super) fn host_opened(state: &mut AppState) -> anyhow::Result<()> {
                     ..context
                 },
                 0,
+                save.as_ref(),
             )
         })
     };
@@ -248,7 +250,9 @@ fn select_scenario(state: &mut AppState, index: usize, bc_open: bool) -> anyhow:
 
 /// Choose Map's list in Cooperative (`+0x4C`): one `"%d. %s"` row per
 /// campaign whose reserve's map is among `records` (the mode's valid
-/// scenarios), with that record as the row's data. A game-type click
+/// scenarios), with that record as the row's data, then the saved
+/// campaign's `TXT_COOP_USE_SAVE` row when coopsave.ini holds the pair's
+/// section and its next map is among them. A game-type click
 /// (`0x005E6C14..0x005E6C9B`) first rebuilds the reserves (`+0x0C` true,
 /// `+0x10`). None when `mode_id` is not Cooperative or no setup is open.
 pub(crate) fn chooser_rows(
@@ -272,6 +276,7 @@ pub(crate) fn chooser_rows(
         .iter()
         .map(|(index, file)| (*index, file.as_str()))
         .collect();
+    let save = state.frontend.multiplayer_shell_runtime.cooperative_save();
     let rows = {
         let parts = state.frontend.multiplayer_shell_runtime.cooperative_parts();
         if clicked {
@@ -280,23 +285,42 @@ pub(crate) fn chooser_rows(
         inputs.with(|_, nodes| {
             parts
                 .progress
-                .chooser_rows(parts.registry, parts.rng, nodes, &files)
+                .chooser_rows(parts.registry, parts.rng, nodes, &files, save.as_ref())
         })
     };
     Some(
         rows.into_iter()
             .map(|row| {
+                let Some(campaign) = row.campaign else {
+                    return (row.record, saved_row_label(state));
+                };
                 let key = state
                     .frontend
                     .multiplayer_shell_runtime
-                    .cooperative_campaign_name(row.campaign)
+                    .cooperative_campaign_name(campaign)
                     .unwrap_or_default()
                     .to_owned();
                 let name = crate::app::App::csf_label(state, &key, &key);
-                (row.record, format!("{}. {}", row.campaign + 1, name))
+                (row.record, format!("{}. {}", campaign + 1, name))
             })
             .collect(),
     )
+}
+
+fn saved_row_label(state: &AppState) -> String {
+    crate::app::App::csf_label(state, "TXT_COOP_USE_SAVE", "TXT_COOP_USE_SAVE")
+}
+
+/// Every scenario record's file name, as `[0xA8B8CC]` holds them.
+fn scenario_files(state: &AppState) -> Vec<(usize, String)> {
+    state
+        .frontend
+        .scenario_catalog
+        .records()
+        .iter()
+        .enumerate()
+        .map(|(index, record)| (index, record.file_name.clone()))
+        .collect()
 }
 
 /// Use Map (`0x005E7160`) in Cooperative, after the setup took the map: a
@@ -311,6 +335,7 @@ pub(super) fn map_used(state: &mut AppState, mode_changed: bool, row: usize) -> 
     let current = inputs.current;
     let host_setup = host_setup_open(state);
     let setup = setup_open(state);
+    let save = state.frontend.multiplayer_shell_runtime.cooperative_save();
     let refresh = {
         let parts = state.frontend.multiplayer_shell_runtime.cooperative_parts();
         inputs.with(|context, _| {
@@ -320,9 +345,13 @@ pub(super) fn map_used(state: &mut AppState, mode_changed: bool, row: usize) -> 
                     .enter_mode(parts.registry, parts.rng, context, current, host_setup);
             }
             parts.progress.request_refresh();
-            parts
-                .progress
-                .accept_chooser_row(parts.registry, parts.rng, context, row)
+            parts.progress.accept_chooser_row(
+                parts.registry,
+                parts.rng,
+                context,
+                row,
+                save.as_ref(),
+            )
         })
     };
     if mode_changed || refresh {
@@ -339,8 +368,67 @@ pub(super) fn map_used(state: &mut AppState, mode_changed: bool, row: usize) -> 
 /// `0x005E2FA0`: the chooser's
 /// selected mode when Choose Map is on top, else the current one, gets
 /// `+0x94`, which makes the record if needed, binds the two names and
-/// publishes it. Ordinary modes' `+0x94` does nothing.
+/// publishes it; with the pair's save it then adds Choose Map's saved row
+/// or prints `TXT_SAVE_CAMP_AVAILABLE`. Ordinary modes' `+0x94` does
+/// nothing.
 pub(super) fn guest_joined(state: &mut AppState) -> anyhow::Result<()> {
+    if !peer_mode_cooperative(state) {
+        return Ok(());
+    }
+    let inputs = SlotInputs::read(state);
+    let setup = setup_open(state);
+    let published = {
+        let parts = state.frontend.multiplayer_shell_runtime.cooperative_parts();
+        inputs.with(|_, nodes| parts.progress.join(parts.registry, parts.rng, nodes, setup))
+    };
+    publish(state, published)?;
+    let save = state.frontend.multiplayer_shell_runtime.cooperative_save();
+    let files = scenario_files(state);
+    let files: Vec<(usize, &str)> = files
+        .iter()
+        .map(|(index, file)| (*index, file.as_str()))
+        .collect();
+    let tail = state
+        .frontend
+        .multiplayer_shell_runtime
+        .cooperative_parts()
+        .progress
+        .saved_join(save.as_ref(), inputs.chooser_on_top, &files);
+    match tail {
+        SavedCampaignJoin::Nothing => {}
+        SavedCampaignJoin::Notice => {
+            let text = crate::app::App::csf_label(
+                state,
+                "TXT_SAVE_CAMP_AVAILABLE",
+                "TXT_SAVE_CAMP_AVAILABLE",
+            );
+            crate::app::shell_lan::append_chat(
+                state,
+                crate::ui::lan_shell::LanChatLine {
+                    text: text.encode_utf16().collect(),
+                    color: u32::MAX,
+                },
+            );
+        }
+        SavedCampaignJoin::Row(record) => {
+            let label = saved_row_label(state);
+            if let Some(modal) = state
+                .frontend
+                .skirmish_shell_state
+                .choose_map_modal
+                .as_mut()
+            {
+                modal.push_row(record, label);
+            }
+            state.platform.window.request_redraw();
+        }
+    }
+    Ok(())
+}
+
+/// The mode a join or departure calls (`0x005E2FA0`, `0x005E11DC`): Choose
+/// Map's selected game type while it is on top, else the current mode.
+fn peer_mode_cooperative(state: &AppState) -> bool {
     let mode_id = match state
         .frontend
         .skirmish_shell_state
@@ -350,19 +438,61 @@ pub(super) fn guest_joined(state: &mut AppState) -> anyhow::Result<()> {
         Some(modal) => modal.selected_mode_id,
         None => match state.match_state.session.network_setup() {
             Some(launch) => launch.mode.id,
-            None => return Ok(()),
+            None => return false,
         },
     };
-    if !is_cooperative(state, mode_id) {
+    is_cooperative(state, mode_id)
+}
+
+/// The host's accepted departure (LAN `0x005E11DC..0x005E1235`) runs that
+/// mode's `+0x90`; only Cooperative's acts. Under Choose Map it drops a
+/// listed saved row; elsewhere a save in use gives way to the reserve's
+/// campaign, whose first map the setup takes and publishes.
+/// RESIDUAL: outside Choose Map native refreshes the type and map statics
+/// and runs the throttled publish `0x005E32D0` on every departure, and a
+/// first map missing from the catalog selects index `count`; here only a
+/// found map is selected and published.
+pub(super) fn guest_left(state: &mut AppState) -> anyhow::Result<()> {
+    if !peer_mode_cooperative(state) {
         return Ok(());
     }
-    let inputs = SlotInputs::read(state);
-    let setup = setup_open(state);
-    let published = {
+    let chooser_on_top = state
+        .frontend
+        .skirmish_shell_state
+        .choose_map_modal
+        .is_some();
+    let leave = {
         let parts = state.frontend.multiplayer_shell_runtime.cooperative_parts();
-        inputs.with(|_, nodes| parts.progress.join(parts.registry, parts.rng, nodes, setup))
+        parts
+            .progress
+            .guest_left(parts.registry, parts.rng, chooser_on_top)
     };
-    publish(state, published)
+    match leave {
+        SavedCampaignLeave::Nothing => {}
+        SavedCampaignLeave::RemoveRow => {
+            if let Some(modal) = state
+                .frontend
+                .skirmish_shell_state
+                .choose_map_modal
+                .as_mut()
+            {
+                modal.pop_row();
+            }
+            state.platform.window.request_redraw();
+        }
+        SavedCampaignLeave::Scenario(token) => {
+            let index = scenario_files(state).into_iter().find_map(|(index, file)| {
+                crate::util::native_string::crt_strcmpi(&file, &format!("{token}.MAP"))
+                    .is_eq()
+                    .then_some(index)
+            });
+            if let Some(index) = index {
+                select_scenario(state, index, false)?;
+                super::actions::queue(state, NetworkSetupRequest::PublishOptions);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The join's country (`0x005E1945..0x005E1973`): the requested country if

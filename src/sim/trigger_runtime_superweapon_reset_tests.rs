@@ -92,7 +92,7 @@ fn execute(
     entry: ActionEntry,
     owner_present: bool,
 ) -> bool {
-    let resolved = RuntimeDefinitions::default().resolve_action(entry, None, None);
+    let resolved = RuntimeDefinitions::default().resolve_action(entry, None, None, None);
     let context = TriggerActionContext {
         live_index: None,
         incoming_house: owner_present.then_some(owner),

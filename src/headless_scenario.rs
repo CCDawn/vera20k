@@ -42,22 +42,12 @@ pub fn battle_session(
     opponents: &[(LaunchCountry, AiDifficulty)],
 ) -> SkirmishLaunchSession {
     use crate::skirmish_launch::{
-        LaunchStartPosition, LaunchTeam, PreFillHouseRoster, SkirmishAiSlot, SkirmishLaunchMode,
-        SkirmishLaunchOptions, SkirmishLocalSlot,
+        BATTLE_MODE_ID, LaunchStartPosition, LaunchTeam, PreFillHouseRoster, SkirmishAiSlot,
+        SkirmishLaunchMode, SkirmishLaunchOptions, SkirmishLocalSlot,
     };
 
     SkirmishLaunchSession {
-        mode: SkirmishLaunchMode {
-            class: crate::skirmish_modes::MpModeClass::Battle,
-            id: 1,
-            ui_name_key: "GUI:Battle".to_string(),
-            tooltip_key: "STT:ModeBattle".to_string(),
-            override_file: "MPBattleMD.ini".to_string(),
-            map_filter: "standard".to_string(),
-            random_maps_allowed: true,
-            allies_allowed: true,
-            must_ally: false,
-        },
+        mode: SkirmishLaunchMode::stock(BATTLE_MODE_ID).expect("stock Battle row"),
         selected_map_file: Some(selected_map_file.to_string()),
         humans: vec![crate::skirmish_launch::SkirmishHumanSlot {
             raw_slot_index: Some(0),
@@ -100,6 +90,8 @@ pub struct HeadlessScenario {
     /// resources - no independently swappable execution inputs remain.
     pub runtime: crate::sim::runtime::SimRuntime,
     pub map: MapFile,
+    /// Identity of the exact map payload consumed by this construction.
+    pub source: crate::map::source::LoadedMapSource,
 }
 
 impl HeadlessScenario {
@@ -220,17 +212,30 @@ pub fn load_with_launch(
     seed: u32,
     launch: crate::sim::scenario_bootstrap::MatchLaunchDescriptor,
 ) -> Result<HeadlessScenario, String> {
-    load_with_launch_and_ini(retail_dir, map_file_name, seed, launch, &Default::default())
+    load_with_launch_and_ini(
+        retail_dir,
+        map_file_name,
+        seed,
+        launch,
+        &Default::default(),
+        crate::sim::scenario_session::ScenarioGameMode::Skirmish,
+        None,
+        None,
+    )
 }
 
-/// Explicit host policy for non-YR callers; no hidden cwd/config reread.
-/// Rules, fixed Art and AI all consume the one resolved provider choice.
+/// Explicit asset policy and launch GameMode; no hidden cwd/config reread.
+/// Rules, fixed Art and AI consume the one resolved provider choice. Replays
+/// retain the recorded mode before any mode-dependent House construction.
 pub fn load_with_launch_and_ini(
     retail_dir: &Path,
     map_file_name: &str,
     seed: u32,
     launch: crate::sim::scenario_bootstrap::MatchLaunchDescriptor,
     ini: &crate::util::ini_roots::IniRootConfig,
+    game_mode: crate::sim::scenario_session::ScenarioGameMode,
+    accepted_native_id_prefix: Option<u32>,
+    process_rules: Option<&mut crate::rules::process_owner::NativeRulesProcessOwner>,
 ) -> Result<HeadlessScenario, String> {
     let mut assets = AssetManager::new(retail_dir, MediaArchiveMode::STOCK_DIGITAL)
         .and_then(|assets| assets.with_ini_roots(ini))
@@ -240,24 +245,78 @@ pub fn load_with_launch_and_ini(
                 retail_dir.display()
             )
         })?;
-    let mut map = crate::map::source::load_map_by_name_or_path_with_assets(
+    load_with_assets(
         retail_dir,
         map_file_name,
-        &assets,
+        seed,
+        launch,
+        &mut assets,
+        game_mode,
+        accepted_native_id_prefix,
+        process_rules,
     )
-    .map_err(|error| format!("load map {map_file_name}: {error}"))?
-    .map;
+}
+
+/// Reuse the production headless scenario load after retail scenario discovery
+/// has already registered loose YRO archives in the caller's AssetManager.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn load_with_registered_scenario_assets(
+    retail_dir: &Path,
+    map_file_name: &str,
+    seed: u32,
+    launch: crate::sim::scenario_bootstrap::MatchLaunchDescriptor,
+    assets: &mut AssetManager,
+) -> Result<HeadlessScenario, String> {
+    load_with_assets(
+        retail_dir,
+        map_file_name,
+        seed,
+        launch,
+        assets,
+        crate::sim::scenario_session::ScenarioGameMode::Skirmish,
+        None,
+        None,
+    )
+}
+
+fn load_with_assets(
+    retail_dir: &Path,
+    map_file_name: &str,
+    seed: u32,
+    launch: crate::sim::scenario_bootstrap::MatchLaunchDescriptor,
+    assets: &mut AssetManager,
+    game_mode: crate::sim::scenario_session::ScenarioGameMode,
+    accepted_native_id_prefix: Option<u32>,
+    process_rules: Option<&mut crate::rules::process_owner::NativeRulesProcessOwner>,
+) -> Result<HeadlessScenario, String> {
+    let loaded_map =
+        crate::map::source::load_map_by_name_or_path_with_assets(retail_dir, map_file_name, assets)
+            .map_err(|error| format!("load map {map_file_name}: {error}"))?;
+    let source = loaded_map.source;
+    let mut map = loaded_map.map;
     // Preserve the process-owned cold Rules registry before theater archive
     // priority changes. The same owner then performs the active noncampaign
     // reset/rebuild and transfers its move-only native-ID receipt.
     let audio_definitions = crate::rules::audio_sources::AudioDefinitions::select(&assets);
-    let (_, _, mut native_rules_owner) = crate::rules::retail_sources::load_startup_rules(
-        &assets,
-        std::sync::Arc::clone(audio_definitions.sounds()),
-        std::sync::Arc::clone(audio_definitions.eva()),
-    )
-    .ok_or_else(|| "load native startup rules".to_string())?
-    .into_parts();
+    let mut cold_rules_owner;
+    let native_rules_owner = if let Some(owner) = process_rules {
+        owner
+    } else {
+        let (_, _, owner) = crate::rules::retail_sources::load_startup_rules(
+            &assets,
+            std::sync::Arc::clone(audio_definitions.sounds()),
+            std::sync::Arc::clone(audio_definitions.eva()),
+        )
+        .ok_or_else(|| "load native startup rules".to_string())?
+        .into_parts();
+        cold_rules_owner = owner;
+        &mut cold_rules_owner
+    };
+    // ThemeClass::ReadINI720590 is process data even without an output device.
+    // Keep the existing headless archive stack: THEMEMD.MIX and the preserved
+    // RA2 THEME.MIX extension were mounted at startup; this route has no shell
+    // neutral-archive activation. Resolve before scenario Rules/theater changes.
+    let themes = crate::rules::theme_ini::ThemeCatalog::select(&assets);
     let scenario_prefix_plan =
         crate::sim::scenario_bootstrap::prepare_stock_offline_scenario_prefix_plan(
             &launch,
@@ -270,6 +329,9 @@ pub fn load_with_launch_and_ini(
         &assets,
         Some(&launch.session().mode.override_file),
     )?;
+    // This headless entry has no MainMenuTypedCodes owner or THETEAM input.
+    // It shares the process Rules owner (including LANGRULE Digest reads), but
+    // cannot admit Full_Init's mode-5 TMCJ4F route.
     let (mut rules, _, art_ini, native_rules_receipt) = native_rules_owner
         .load_scenario(
             crate::rules::process_owner::NativeScenarioRulesPrefix::NonCampaign(
@@ -284,7 +346,7 @@ pub fn load_with_launch_and_ini(
         .map_err(|error| format!("admit rebuilt launch Countries: {error}"))?;
     let team_ai_registry =
         crate::rules::team_ai_ini::TeamAiIniRegistry::load_retail(&assets, &map.ini, true)?;
-    let theater = theater::load_theater(&mut assets, &map.header.theater)
+    let theater = theater::load_theater(assets, &map.header.theater)
         .ok_or_else(|| format!("load theater {}", map.header.theater))?;
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art_ini));
     let infantry_sequences =
@@ -343,6 +405,14 @@ pub fn load_with_launch_and_ini(
     let (mut sim, scenario_prefix_projection) = bootstrap_rng
         .into_stock_offline_staged_simulation(&descriptor, bound_scenario_prefix)
         .map_err(|error| format!("stage stock-offline Simulation: {error}"))?;
+    // CreateHouses687FCE..688092 gives WOL humans their node name; other
+    // modes use "<human player>". The House owner hashes that native identity,
+    // so restoring GameMode after construction cannot reconstruct a WOL start.
+    sim.install_session_mode(game_mode);
+    if let Some(checkpoint) = accepted_native_id_prefix {
+        sim.install_accepted_native_id_prefix(checkpoint)
+            .map_err(|error| format!("replay native-ID prefix: {error}"))?;
+    }
     let shared_cell_dummy = crate::map::resolved_terrain::SharedCellDummy::fresh();
     shared_cell_dummy.reconstruct_for_map_resize();
     sim.bind_shared_cell_dummy(shared_cell_dummy.clone());
@@ -352,6 +422,7 @@ pub fn load_with_launch_and_ini(
         &team_ai_registry,
         Some(audio_definitions.eva()),
         Some(audio_definitions.sounds().as_ref()),
+        Some(&themes),
     );
     let (mut scenario_fill_rng, variant_main_rng) = sim.terrain_load_draws();
     let mut scenario_fill_ranged =
@@ -439,7 +510,7 @@ pub fn load_with_launch_and_ini(
         &theater,
         &assets,
         &mut rules,
-        &mut native_rules_owner,
+        native_rules_owner,
         &overlay_registry,
         &overlay_shp_ids,
         signed_new_ini_format,
@@ -504,6 +575,7 @@ pub fn load_with_launch_and_ini(
             },
         },
         map,
+        source,
     })
 }
 
@@ -1595,13 +1667,19 @@ mod retail_construction_tests {
             .collect()
     }
 
-    /// Two retail Yuri TeamTypes whose members are spawned beside the Yuri
-    /// house's base once the bases stand: "Yuri Infantry - M1" (`05FFB46C-G`,
-    /// script `0,4 / 49 / 0,1`) and "Yuri Engineers" (`08B95EFC-G`,
-    /// `54 / 0,6 / 49 / 0,9 / 0,2`). Action 0's scan finds the first team
-    /// another house's infantry, which its members attack. For the second it
-    /// prints whether an engineer aimed at another house's building: in the
-    /// first run that team disbanded before frame 1000, not yet explained.
+    /// Two retail Yuri TeamTypes whose members are spawned on the free cells
+    /// nearest the Yuri house's base centre once the bases stand: "Yuri
+    /// Infantry - M1" (`05FFB46C-G`, five Initiates and an engineer, script
+    /// `0,4 / 49 / 0,1`) and "Yuri Engineers" (`08B95EFC-G`,
+    /// `54 / 0,6 / 49 / 0,9 / 0,2`). The first team may recruit the house's
+    /// own Initiates; its leader's action 0 scan finds another house's
+    /// infantry, which an Initiate of the team attacks. For the second it
+    /// prints whether an engineer aimed at another house's building.
+    ///
+    /// The cells 15 north of that base lie in no zone (0xFFFF), and
+    /// `Evaluate_Candidate`'s zone test (`0x006F7E7E..0x006F7E9C`) rejects
+    /// every quarry of a leader standing there: action 0 finds nothing, the
+    /// script runs out and the team is gone.
     #[test]
     #[ignore = "requires RA2_DIR with installed retail RA2/YR assets"]
     fn retail_yuri_teams_attack() {
@@ -1613,10 +1691,15 @@ mod retail_construction_tests {
         }
         let runtime = &mut scenario.runtime;
         let (sim, resources) = (&mut runtime.simulation, &runtime.resources);
-        let (yuri, spawned) = spawn_beside_base(
+        let yuri = house_of(sim, "YuriCountry");
+        let (bx, by) = sim.houses[&yuri]
+            .base_center()
+            .expect("the base has a centre");
+        let spawned = spawn_on_free_cells(
             sim,
             &resources.rules,
-            "YuriCountry",
+            yuri,
+            cells_nearest((i32::from(bx), i32::from(by))),
             &[
                 "INIT",
                 "INIT",
@@ -1674,9 +1757,11 @@ mod retail_construction_tests {
         for frame in 1..=3_000u32 {
             scenario.tick();
             let sim = scenario.sim();
-            infantry_attacked |= spawned.iter().any(|&id| {
-                sim.entities().get(id).is_some_and(|entity| {
-                    entity.type_ref() == initiate && aims_at_another_house(sim, entity)
+            infantry_attacked |= sim.team_script_vm.team(teams[0]).is_some_and(|team| {
+                team.members().any(|id| {
+                    sim.entities().get(id).is_some_and(|entity| {
+                        entity.type_ref() == initiate && aims_at_another_house(sim, entity)
+                    })
                 })
             });
             engineer_attacked |= spawned.iter().any(|&id| {
@@ -1746,8 +1831,11 @@ mod retail_construction_tests {
     /// 14 and 43); it carries them to the yard (47) and unloads them, and
     /// they rejoin the team (8). Five riders fill the Night Hawk, so action
     /// 14 finishes on its no-transport arm without archiving a cell (only a
-    /// transport with a seat left reaches `Set_ArchiveTarget @ 0x0070C610`),
-    /// and the unload sends it out of the team with no destination.
+    /// transport with a seat left reaches `Set_ArchiveTarget @ 0x0070C610`).
+    /// It keeps the post its Area Guard archived before the team stepped
+    /// (`TeamClass::AI @ 0x006E9140` spares a `TransportsReturnOnUnload=`
+    /// transport's archive), and the unload sends it out of the team to that
+    /// post.
     #[test]
     #[ignore = "requires RA2_DIR with installed retail RA2/YR assets"]
     fn retail_transport_teams_load_and_unload() {
@@ -1842,10 +1930,21 @@ mod retail_construction_tests {
                 })
                 .expect("a team of the TeamType");
             let (transport, infantry) = (spawned[0], &spawned[1..]);
+            // The transport's cell, which a computer's Foot on Area Guard
+            // archives as its post (`FootClass::Mission_AreaGuard`,
+            // `0x004D6D78..0x004D6DB9`) before the team steps.
+            let post = sim
+                .entities()
+                .get(transport)
+                .map(|entity| (entity.position.rx(), entity.position.ry()))
+                .expect("the transport stands");
             // The first frame all the infantry were aboard the transport and
             // its archive then, the first frame after that they were all
-            // members again, and the first frame the transport was not, with
-            // its NavCom then.
+            // members again, and the first frame the team stood without the
+            // transport, with its NavCom then. A team whose engineers took the
+            // only building ends instead: action 46 (`0x006EE310`) finds no
+            // target and completes, and `TeamClass::AI` destroys a team run
+            // past its script's end (`0x006E9140`, to `0x006E9713`).
             let (mut loaded, mut archive, mut unloaded) = (None, None, None);
             let mut transport_left = None;
             let mut present = (true, vec![true; spawned.len()]);
@@ -1923,8 +2022,7 @@ mod retail_construction_tests {
                 }
                 if let Some(done) = unloaded {
                     if transport_left.is_none()
-                        && !team
-                            .is_some_and(|team| team.members().any(|member| member == transport))
+                        && team.is_some_and(|team| team.members().all(|member| member != transport))
                     {
                         transport_left = Some((
                             frame,
@@ -1949,11 +2047,19 @@ mod retail_construction_tests {
                 "{team_type}: the infantry never rejoined"
             );
             if team_type == "0AD4D7BC-G" {
-                assert_eq!(archive, None, "the full Night Hawk archived a cell");
+                let (x, y) = post;
+                assert_eq!(
+                    archive,
+                    Some(crate::sim::combat::TargetKind::Cell(x, y)),
+                    "the full Night Hawk archived a cell over its post"
+                );
                 assert_eq!(
                     transport_left.map(|(_, nav_com)| nav_com),
-                    Some(None),
-                    "the Night Hawk left its team with no destination"
+                    Some(Some(crate::sim::components::NavTargetRef::Cell {
+                        rx: x,
+                        ry: y
+                    })),
+                    "the Night Hawk left its team for its post"
                 );
             } else {
                 assert_eq!(transport_left, None, "the HTK left its team");
@@ -3021,9 +3127,13 @@ mod retail_construction_tests {
     /// "Allied Spy vs Soviet Power" (`09B5091C-G`: one SPY, the script
     /// `0,4 / 47,131081 / 46,9 / 47,131083 / 46,11`) for a Normal American
     /// house against the idle local Soviet house, which is given a Tesla
-    /// Reactor beside its MCV, guarded by a Sentry Gun and a Conscript. The
+    /// Reactor beside its MCV, guarded by a Sentry Gun and a Conscript, once
+    /// the American house has deployed its MCV: that yard's deploy sends
+    /// every ground Techno of the house, a team's included, to the new base
+    /// (`HouseClass::MoveGroundForcesToBase @ 0x0050C920`, from
+    /// `UnitClass::Deploy` at `0x00739926`), and would call the spy home. The
     /// team's spy is spawned twelve cells from the reactor, towards its own
-    /// house's MCV. Action 0 (attack infantry) takes the flat walk over every
+    /// house's yard. Action 0 (attack infantry) takes the flat walk over every
     /// object (`0x006F8FE0`) and finds the Conscript, which the `MakeupKit`
     /// (`Range=-2`) reaches from anywhere: its `MakesDisguise=` shot dresses
     /// the spy as a Soviet Conscript, and the `FireOnce=` shot ends the
@@ -3047,10 +3157,20 @@ mod retail_construction_tests {
             },
             &[(LaunchCountry::America, AiDifficulty::Normal)],
         );
+        let america = house_of(scenario.sim(), "Americans");
+        let is_american_yard = |entity: &crate::sim::game_entity::GameEntity| {
+            entity.owner() == america
+                && entity.category() == crate::map::entities::EntityCategory::Structure
+        };
+        for _ in 0..300 {
+            scenario.tick();
+            if scenario.sim().entities().values().any(is_american_yard) {
+                break;
+            }
+        }
         let runtime = &mut scenario.runtime;
         let (sim, rules) = (&mut runtime.simulation, &runtime.resources.rules);
         let soviet = house_of(sim, "Russians");
-        let america = house_of(sim, "Americans");
         let at = |sim: &Simulation, id| {
             let entity = sim.entities().get(id).expect("spawned");
             (
@@ -3081,18 +3201,18 @@ mod retail_construction_tests {
             cells_nearest((rx, ry)),
             &["NALASR", "E2"],
         );
-        // Twelve cells out towards the American MCV. The nearest cells the
+        // Twelve cells out towards the American yard. The nearest cells the
         // other way lie in no zone (0xFFFF), and Evaluate_Candidate's zone
         // test, which only DWORD -1 skips (`0x006F7E36`), then rejects every
         // quarry of a spy standing there.
-        let american_mcv = sim
+        let american_yard = sim
             .substrate
             .entities
             .iter_sorted()
-            .find(|(_, entity)| entity.owner() == america)
+            .find(|(_, entity)| is_american_yard(entity))
             .map(|(id, _)| id)
-            .expect("the American MCV");
-        let (ax, ay) = at(sim, american_mcv);
+            .expect("the American Construction Yard");
+        let (ax, ay) = at(sim, american_yard);
         let reach = (ax - rx).abs().max((ay - ry).abs()).max(1);
         let toward = (rx + (ax - rx) * 12 / reach, ry + (ay - ry) * 12 / reach);
         let cells = cells_nearest(toward)

@@ -207,9 +207,10 @@ impl From<&AttackerSnapshot> for FireSource {
 /// facing/truncation implementation. A source without a locomotor starts
 /// from the identity, so its offset is along world X. The result adds to the
 /// same virtual +AC base as GetFLH. Executed source/ART controls:
-/// tools/procedural_drawing_oracle/action_lines. Drive/Ship use the same
-/// physical-model and locomotor matrix inputs as GetFLH, including the
-/// translation of a rocking hull.
+/// tools/procedural_drawing_oracle/action_lines. Drive/Ship/Hover use the
+/// same physical-model and locomotor matrix inputs as GetFLH (the
+/// locomotor's vt+0x24 at `0x006F3DB7`), including the translation of a
+/// rocking hull.
 ///
 /// BuildingClass's override (`0x00453A70`) has no port: neither caller
 /// reaches a building.
@@ -338,33 +339,30 @@ pub(crate) fn fire_coordinate(
     let aim_facing16 = base.fire_facing;
     let art = base.art;
 
-    let flh_delta = art
-        .and_then(|art| {
-            // GetFLH6F3B28 calls GetWeapon70E140. Its elite FLH belongs to
-            // the elite weapon record, which is used only when nonnull.
-            let use_elite = usize::try_from(weapon_index).is_ok_and(|index| {
-                super::combat_weapon::uses_elite_weapon(obj, snap.veterancy, index)
-            });
-            // GetFLH6F3AF5..6F3B21 selects AlternateFLH before GetWeapon.
-            let flh = if weapon_index < 0 {
-                art.alternate_fire_flh(
-                    (-i64::from(weapon_index) - 1) as usize,
-                    obj.turret_count,
-                    obj.weapon_count,
-                )
-            } else {
-                art.weapon_flh(obj.turret_count, obj.weapon_count, weapon_index, use_elite)
-            };
-            let flh = Flh {
-                forward: flh.forward.wrapping_add(base_coords.forward),
-                lateral: flh.lateral.wrapping_add(base_coords.lateral),
-                height: flh.height.wrapping_add(base_coords.height),
-            };
-            flh_world_delta(art, flh, base.facings, burst_index, base.locomotor_basis)
-        })
-        .unwrap_or((0, 0, 0));
+    // GetFLH6F3B28 selects the stored WeaponStruct, not a fresh ART read.
+    // GetWeapon70E140 qualifies its elite record only when nonnull.
+    let use_elite = usize::try_from(weapon_index)
+        .is_ok_and(|index| super::combat_weapon::uses_elite_weapon(obj, snap.veterancy, index));
+    let flh = if weapon_index < 0 {
+        obj.alternate_fire_flh((-i64::from(weapon_index) - 1) as usize)
+    } else {
+        obj.weapon_flh(weapon_index, use_elite)
+    };
+    let flh = Flh {
+        forward: flh.forward.wrapping_add(base_coords.forward),
+        lateral: flh.lateral.wrapping_add(base_coords.lateral),
+        height: flh.height.wrapping_add(base_coords.height),
+    };
+    let flh_delta = flh_world_delta(
+        art.map_or(0, |art| art.turret_offset),
+        flh,
+        base.facings,
+        burst_index,
+        base.locomotor_basis,
+    )
+    .unwrap_or((0, 0, 0));
     if snap.category == EntityCategory::Structure
-        && let Some((px, py)) = art.and_then(|art| building_pixel_offset(art, snap))
+        && let Some((px, py)) = building_pixel_offset(art, snap)
     {
         let (dx, dy) = PixelConversionBounds::isometric_pixel_to_leptons(px, py);
         // Building4538ED..45395A: PrimaryFireDualOffset+1764 adds the
@@ -432,6 +430,70 @@ struct FireBase<'r> {
     art: Option<&'r ArtEntry>,
 }
 
+/// Installed Fly Draw_Matrix4CF610 at the GetFLH6F3B9B call frame. Height
+/// comes from the live canonical Cell query, independent of display bands,
+/// voxel assets and camera projection. A null native cache key omits no tilt.
+fn fly_locomotor_basis(
+    world: &Simulation,
+    entity: &GameEntity,
+    obj: &ObjectType,
+    secondary: &crate::sim::movement::FacingClass,
+    frame: u32,
+) -> glam::Mat4 {
+    use crate::map::voxel_pose::{
+        crash_fly_locomotor_matrix, normal_fly_locomotor_matrix, voxel_body_facing,
+    };
+    use crate::sim::movement::facing_class::RotationDirection;
+    let step = step32_from_facing16(secondary.current(frame));
+    if crate::sim::movement::air_movement::current_fly_height(
+        entity,
+        world.resolved_terrain.as_ref(),
+    ) <= 0
+    {
+        return voxel_body_facing(step);
+    }
+    let pitching = entity
+        .locomotor
+        .as_ref()
+        .and_then(|loco| loco.current_fly_speed())
+        .is_some_and(|speed| f64::from_bits(speed.bits()) > obj.fly_pitch_speed());
+    if entity.crash.is_crashing() {
+        let mut angles = entity
+            .rocking
+            .as_ref()
+            .map_or([0.; 2], |r| r.angles_native());
+        if pitching {
+            use crate::util::native_x87::{NativeF32Bits, X87Chop53 as X};
+            let single =
+                |value: f32| X::load_f32(NativeF32Bits::from_bits(value.to_bits())).unwrap();
+            angles[1] = f32::from_bits(
+                X::store_f32(X::add(
+                    single(angles[1]),
+                    single(obj.fly_pitch_angle_radians()),
+                ))
+                .expect("finite Fly crash pitch")
+                .bits(),
+            );
+        }
+        return crash_fly_locomotor_matrix(step, angles);
+    }
+    let pitch = if pitching {
+        obj.fly_pitch_angle_radians()
+    } else {
+        0.0
+    };
+    let roll = if pitching {
+        match secondary.rotation_direction_at(frame) {
+            Some(RotationDirection::Positive) => obj.fly_roll_angle_f32(),
+            Some(RotationDirection::Negative) => -obj.fly_roll_angle_f32(),
+            None => 0.0,
+        }
+    } else {
+        0.0
+    };
+    normal_fly_locomotor_matrix(step, pitch, roll)
+}
+
 fn fire_coordinate_base<'r>(
     world: &Simulation,
     rules: &'r RuleSet,
@@ -492,25 +554,53 @@ fn fire_coordinate_base<'r>(
     let art = firer_art(rules, obj);
     // GetFLH6F3B6C..6F3BA3 consumes the actual locomotor Draw_Matrix.
     // The physical half sizes come from the immutable rules binding, never
-    // the renderer's model cache. Ground pose math has one shared owner.
+    // the renderer's model cache. Fly's raw pose has no half-size requirement.
+    // Ground pose math has one shared owner;
+    // Hover's Draw_Matrix (`0x00513F40`) is that owner at the slope
+    // [`hover_draw_slope`](crate::sim::movement::hover::hover_draw_slope)
+    // picks. Its cell reads go through an isolated query because the turret
+    // pivot also serves the presentation's target lines: a miss, which needs a
+    // Location outside every allocated cell, stamps that query's Dummy, not
+    // the simulation's as GetFLH's lookups would natively.
     let locomotor_basis = world
         .substrate
         .entities
         .get(snap.stable_id)
-        .filter(|entity| {
-            entity.locomotor.as_ref().is_some_and(|loco| {
-                matches!(
-                    loco.active_kind(),
-                    crate::rules::locomotor_type::LocomotorKind::Drive
-                        | crate::rules::locomotor_type::LocomotorKind::Ship
-                )
-            })
-        })
         .and_then(|entity| {
+            use crate::rules::locomotor_type::LocomotorKind;
+            let kind = entity.locomotor.as_ref()?.active_kind();
+            if kind == LocomotorKind::Fly {
+                return Some(fly_locomotor_basis(
+                    world,
+                    entity,
+                    obj,
+                    snap.barrel_facing.as_ref().unwrap_or(&snap.hull_facing),
+                    binary_frame,
+                ));
+            }
             use crate::map::voxel_pose::{VxlSlopeBlend, ground_locomotor_matrix};
             use crate::sim::movement::slope_transition::{SlopeRenderPhase, state_for_entity};
+            if !matches!(
+                kind,
+                LocomotorKind::Drive | LocomotorKind::Ship | LocomotorKind::Hover
+            ) {
+                return None;
+            }
             let half_sizes = rules.object_voxel_half_sizes(&obj.id)?;
-            let (slope, blend) =
+            let angles = entity
+                .rocking
+                .as_ref()
+                .map_or([0.; 2], |state| state.angles_native());
+            let (slope, blend) = if kind == LocomotorKind::Hover {
+                let cells = world
+                    .resolved_terrain
+                    .as_ref()
+                    .map(crate::map::resolved_terrain::NativeCellQuery::isolated);
+                (
+                    crate::sim::movement::hover::hover_draw_slope(entity, cells.as_ref(), angles),
+                    None,
+                )
+            } else {
                 match state_for_entity(entity).map(|state| state.render_phase(binary_frame)) {
                     Some(SlopeRenderPhase::Stable(slope)) => (slope, None),
                     Some(SlopeRenderPhase::Transition {
@@ -528,15 +618,13 @@ fn fire_coordinate_base<'r>(
                         }),
                     ),
                     None => (0, None),
-                };
+                }
+            };
             Some(ground_locomotor_matrix(
                 slope,
                 blend,
                 crate::util::direction_tables::step32_from_facing16(body_facing16),
-                entity
-                    .rocking
-                    .as_ref()
-                    .map_or([0.; 2], |state| state.angles_native()),
+                angles,
                 half_sizes,
             ))
         });
@@ -679,7 +767,7 @@ fn coords_xy(
 /// `TechnoClass::GetFLH @ 0x006F3AD0`'s transform of one FLH triple about
 /// the object's turret offset.
 fn flh_world_delta(
-    art: &ArtEntry,
+    turret_offset: i32,
     flh: crate::rules::flh::Flh,
     facings: crate::util::flh_transform::FlhFacings,
     burst_index: u8,
@@ -689,7 +777,7 @@ fn flh_world_delta(
         flh.forward,
         flh.lateral,
         flh.height,
-        art.turret_offset,
+        turret_offset,
         facings,
         burst_index,
         locomotor_basis,
@@ -724,14 +812,16 @@ fn open_topped_port_coordinate(
     let transport_obj = world.interner.object_type(transport.type_ref(), rules)?;
     let source = FireSource::of_entity(transport);
     let base = fire_coordinate_base(world, rules, &source, transport_obj);
-    let flh = base.art.map_or_else(Default::default, |art| {
-        art.alternate_fire_flh(port, transport_obj.turret_count, transport_obj.weapon_count)
-    });
+    let flh = transport_obj.alternate_fire_flh(port);
     let burst_index = (transport.weapon_burst.index() & 1) as u8;
-    let delta = base
-        .art
-        .and_then(|art| flh_world_delta(art, flh, base.facings, burst_index, base.locomotor_basis))
-        .unwrap_or((0, 0, 0));
+    let delta = flh_world_delta(
+        base.art.map_or(0, |art| art.turret_offset),
+        flh,
+        base.facings,
+        burst_index,
+        base.locomotor_basis,
+    )
+    .unwrap_or((0, 0, 0));
     let rider_aim = fire_coordinate_base(
         world,
         rules,
@@ -749,18 +839,21 @@ fn open_topped_port_coordinate(
 }
 
 /// The art pixel offset a building's shot leaves from, if it has one.
-fn building_pixel_offset(art: &ArtEntry, snap: &FireSource) -> Option<(i32, i32)> {
+fn building_pixel_offset(art: Option<&ArtEntry>, snap: &FireSource) -> Option<(i32, i32)> {
     if let Some(fire_index) = snap.garrison_fire_index {
+        // BuildingClass::GetFLH453849..4538C2 returns the stored muzzle
+        // port before TechnoClass's weapon coordinate. Missing metadata
+        // supplies the existing zero-port fallback, never a weapon FLH.
         return Some(
-            art.muzzle_flash_positions
-                .get(usize::try_from(fire_index).ok()?)
-                .copied()
+            usize::try_from(fire_index)
+                .ok()
+                .and_then(|index| art?.muzzle_flash_positions.get(index).copied())
                 .unwrap_or((0, 0)),
         );
     }
     // Original4538D1 tests only +E44 even for weapon1; the prior secondary
     // offset and pixel-X mirror here had no native counterpart.
-    primary_fire_pixel_offset(Some(art))
+    primary_fire_pixel_offset(art)
 }
 
 /// The muzzle animation type a shot constructs.
@@ -826,8 +919,9 @@ mod tests {
     use crate::util::fixed_math::SimFixed;
 
     fn rules() -> RuleSet {
-        let mut rules = RuleSet::from_ini(&IniFile::from_str(
-            "[InfantryTypes]\n0=E1\n1=INIT\n[VehicleTypes]\n[AircraftTypes]\n\
+        let mut rules = RuleSet::from_ini_with_fixed_art_for_test(
+            &IniFile::from_str(
+                "[InfantryTypes]\n0=E1\n1=INIT\n[VehicleTypes]\n[AircraftTypes]\n\
              [BuildingTypes]\n0=BUNK\n1=TOWER\n\
              [E1]\nStrength=125\nImage=GI\nPrimary=M60\nSecondary=ONE\n\
              [INIT]\nStrength=125\nPrimary=JAB\n\
@@ -839,8 +933,14 @@ mod tests {
              [BARE]\nDamage=25\nROF=20\nRange=5\nWarhead=SA\n\
              [JAB]\nDamage=25\nROF=20\nRange=5\nWarhead=SA\nOpenToppedAnim=GUNFIRE\n\
              [SA]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
-        ))
-        .expect("rules");
+            ),
+            &IniFile::from_str(
+                "[GI]\nPrimaryFireFLH=0,0,105\nSecondaryFireFLH=0,0,90\n\
+             [BUNK]\nMuzzleFlash0=30,15\nMuzzleFlash1=-30,15\n\
+             [TOWER]\nPrimaryFirePixelOffset=30,15\nPrimaryFireDualOffset=yes\n",
+            ),
+        )
+        .unwrap();
         rules.replace_art_registry_for_test(ArtRegistry::from_ini(&IniFile::from_str(
             "[GI]\nPrimaryFireFLH=0,0,105\nSecondaryFireFLH=0,0,90\n\
              [BUNK]\nMuzzleFlash0=30,15\nMuzzleFlash1=-30,15\n\
@@ -871,6 +971,88 @@ mod tests {
     const Y: i32 = 11 * 256 + 128;
     const Z: i32 = 2 * 104;
 
+    /// GetFLH6F3AD0 -> Fly4CF610 replayed at the first stock Boris/BPLN
+    /// Burst2 release on Death. These are the original outputs at the
+    /// captured Logic146 prior; the test supplies that numeric prior, while
+    /// the ordinary command/creation/release observation remains separate.
+    #[test]
+    fn retail_boris_plane_burst_uses_its_banked_locomotor_matrix() {
+        use crate::sim::movement::FacingClass;
+        use crate::util::native_x87::NativeF64Bits;
+        let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
+        else {
+            return;
+        };
+        // Flat ground supplies the same positive-height gate; this compact
+        // numeric seam does not recreate Death's captured floor416 cell.
+        let mut world = crate::sim::arena_fixture::rival_arena_with_size(&rules, 17, 128);
+        let id = world
+            .spawn_object("BPLN", "Russians", 90, 71, 0, &rules)
+            .unwrap();
+        world.session.set_binary_frame_for_test(146);
+        let facing: FacingClass = serde_json::from_value(serde_json::json!({
+            "current": 11242, "prev": 23140, "start_frame": 146,
+            "duration_frames": 23, "rot_per_frame": 512
+        }))
+        .unwrap();
+        let actor = world.substrate.entities.get_mut(id).unwrap();
+        actor.position.set_sub_x_for_test(SimFixed::from_num(158));
+        actor.position.set_sub_y_for_test(SimFixed::from_num(18));
+        actor.position.set_exact_z_leptons_for_test(Some(1916));
+        actor.body_facing = facing;
+        actor.barrel_facing = Some(facing);
+        actor
+            .locomotor
+            .as_mut()
+            .unwrap()
+            .fly_runtime_mut()
+            .unwrap()
+            .set_current_speed_bits_for_test(NativeF64Bits::ONE);
+        assert_eq!(facing.current(146), 23133);
+        let obj = rules.object("BPLN").unwrap();
+        for (speed, z, expected) in [
+            (
+                NativeF64Bits::ONE,
+                1916,
+                [[23266, 18136, 1867], [23171, 18279, 1965]],
+            ),
+            // Equality at PitchSpeed closes BOTH normal tilt arms. The
+            // original zero-roll control supplies these flat coordinates.
+            (
+                NativeF64Bits::from_bits(0x3fd0_0000_0000_0000),
+                1916,
+                [[23274, 18125, 1916], [23164, 18291, 1916]],
+            ),
+            // This arena's floor is0: the same active turn at zero height
+            // must use yaw alone, irrespective of the retained Air layer.
+            (
+                NativeF64Bits::ONE,
+                0,
+                [[23274, 18125, 0], [23164, 18291, 0]],
+            ),
+        ] {
+            let actor = world.substrate.entities.get_mut(id).unwrap();
+            actor.position.set_exact_z_leptons_for_test(Some(z));
+            actor
+                .locomotor
+                .as_mut()
+                .unwrap()
+                .fly_runtime_mut()
+                .unwrap()
+                .set_current_speed_bits_for_test(speed);
+            let source = FireSource::of_entity(world.substrate.entities.get(id).unwrap());
+            for (burst, [x, y, z]) in expected.into_iter().enumerate() {
+                let fire =
+                    fire_coordinate(&world, &rules, &source, obj, 0, burst as u8, Flh::default());
+                assert_eq!(
+                    fire.coord,
+                    ProjectileCoord::new(x, y, z),
+                    "{speed:?} burst{burst}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn numbered_flh_readers_and_slot_bounds_match_original() {
         let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
@@ -884,15 +1066,18 @@ mod tests {
             for (key, value) in row["art"].as_object().unwrap() {
                 text.push_str(&format!("{key}={}\n", value.as_str().unwrap()));
             }
-            let art = ArtRegistry::from_ini(&IniFile::from_str(&text));
-            let entry = art.get("FV").unwrap();
+            let ini = IniFile::from_str(&format!(
+                "[VehicleTypes]\n0=FV\n[FV]\nTurretCount={}\nWeaponCount={}\n",
+                row["turret_count"].as_i64().unwrap(),
+                row["weapon_count"].as_i64().unwrap(),
+            ));
+            let processed = crate::rules::native_processing::RulesLayerStack::new(ini)
+                .process_with_fixed_art(&IniFile::from_str(&text))
+                .unwrap();
+            let rules = RuleSet::from_processed_rules(&processed).unwrap();
+            let object = rules.object("FV").unwrap();
             for (elite, expected) in [(false, "normal"), (true, "elite")] {
-                let flh = entry.weapon_flh(
-                    row["turret_count"].as_i64().unwrap() as i32,
-                    row["weapon_count"].as_i64().unwrap() as i32,
-                    row["index"].as_i64().unwrap() as i32,
-                    elite,
-                );
+                let flh = object.weapon_flh(row["index"].as_i64().unwrap() as i32, elite);
                 let xyz = [flh.forward, flh.lateral, flh.height];
                 let original =
                     std::array::from_fn::<_, 3, _>(|i| row[expected][i].as_i64().unwrap() as i32);
@@ -1053,7 +1238,7 @@ mod tests {
             let obj = rules.object("DISK").unwrap();
             assert_eq!(obj.has_turret, input["has_turret"].as_bool().unwrap());
             assert_eq!(
-                rules.art().get("DISK").unwrap().primary_fire_flh,
+                rules.object("DISK").unwrap().weapon_flh(0, false),
                 Flh::from(triple(&input["primary_flh"]))
             );
             let before = world.state_hash();
@@ -1105,10 +1290,16 @@ mod tests {
 
     #[test]
     fn numbered_weapon_index_and_elite_weapon_binding_reach_fire_coordinate() {
-        let mut rules = RuleSet::from_ini(&IniFile::from_str(
-            "[VehicleTypes]\n0=FV\n[FV]\nTurretCount=4\nWeaponCount=3\n\
+        let mut rules = RuleSet::from_ini_with_fixed_art_for_test(
+            &IniFile::from_str(
+                "[VehicleTypes]\n0=FV\n[FV]\nTurretCount=4\nWeaponCount=3\n\
              Weapon1=W\nWeapon3=W\nEliteWeapon3=WE\n[W]\nDamage=1\n[WE]\nDamage=2\n",
-        ))
+            ),
+            &IniFile::from_str(
+                "[FV]\nWeapon1FLH=0,0,3\nWeapon3FLH=0,0,6\n\
+             EliteWeapon1FLH=0,0,99\nEliteWeapon3FLH=0,0,9\n",
+            ),
+        )
         .unwrap();
         rules.install_art_data(ArtRegistry::from_ini(&IniFile::from_str(
             "[FV]\nWeapon1FLH=0,0,3\nWeapon3FLH=0,0,6\n\
@@ -1138,6 +1329,65 @@ mod tests {
                 .z,
             Z + 3
         );
+    }
+
+    fn layered_firing_offset_rules(map: &str) -> RuleSet {
+        use crate::rules::native_processing::{RulesLayerKind, RulesLayerStack};
+        let mut layers = RulesLayerStack::new(IniFile::from_str(
+            "[VehicleTypes]\n0=TEST\n[TEST]\nImage=OLD\nTurretCount=2\nWeaponCount=1\nWeapon1=W\n[W]\nDamage=1\n",
+        ));
+        layers.push(RulesLayerKind::Scenario, IniFile::from_str(map));
+        let art = IniFile::from_str("[OLD]\nVoxel=yes\nWeapon1FLH=0,0,73\n[NEW]\nVoxel=yes\n");
+        let mut rules =
+            RuleSet::from_processed_rules(&layers.process_with_fixed_art(&art).unwrap()).unwrap();
+        rules.install_art_data(ArtRegistry::from_ini(&art));
+        rules
+    }
+
+    #[test]
+    fn image_change_keeps_the_previously_read_weapon_firing_offset() {
+        // TechnoType::ReadINI712170:715B76 supplies the stored coordinate as
+        // ReadCoord3's default after ObjectType5F92F8 changes Image.
+        let retained = layered_firing_offset_rules("[TEST]\nImage=NEW\n");
+        let unchanged = layered_firing_offset_rules("[TEST]\n");
+        let world = Simulation::new();
+        let source = source(EntityCategory::Unit);
+        let shot = |rules: &RuleSet| {
+            fire_coordinate(
+                &world,
+                rules,
+                &source,
+                rules.object("TEST").unwrap(),
+                0,
+                0,
+                Flh::default(),
+            )
+        };
+        assert_eq!(shot(&retained), shot(&unchanged));
+        assert_eq!(shot(&retained).coord.z, Z + 73);
+    }
+
+    #[test]
+    fn reducing_weapon_count_keeps_the_skipped_firing_offset() {
+        //715B27 jumps over numbered coordinate writes at count0; GetFLH
+        //6F3B28 still reads the retained WeaponStruct at the supplied index.
+        let retained = layered_firing_offset_rules("[TEST]\nWeaponCount=0\n");
+        let unchanged = layered_firing_offset_rules("[TEST]\n");
+        let world = Simulation::new();
+        let source = source(EntityCategory::Unit);
+        let shot = |rules: &RuleSet| {
+            fire_coordinate(
+                &world,
+                rules,
+                &source,
+                rules.object("TEST").unwrap(),
+                0,
+                0,
+                Flh::default(),
+            )
+        };
+        assert_eq!(shot(&retained), shot(&unchanged));
+        assert_eq!(shot(&retained).coord.z, Z + 73);
     }
 
     /// The source Z is the stored firer's actual height, not its level byte.
@@ -1236,6 +1486,10 @@ mod tests {
 #[cfg(test)]
 #[path = "fire_coord_building_tests.rs"]
 mod building_tests;
+
+#[cfg(test)]
+#[path = "fire_coord_hover_tests.rs"]
+mod hover_tests;
 
 #[cfg(test)]
 mod control_link_port_tests {

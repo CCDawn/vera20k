@@ -8,8 +8,12 @@ pub(crate) mod building_anim;
 pub(crate) mod combat_lights;
 pub(crate) mod control_links;
 pub(crate) mod detail;
+#[cfg(feature = "phobos")]
+pub(crate) mod digital_display;
 pub(crate) mod electric_bolts;
 pub(crate) mod fire_effects;
+#[cfg(feature = "ares")]
+pub(crate) mod flying_credits;
 pub(crate) mod house_ui;
 pub(crate) mod instances;
 pub(crate) mod interpolation;
@@ -18,6 +22,8 @@ pub(crate) mod lasers;
 pub(crate) mod line_trails;
 pub(crate) mod outcome_banner;
 pub(crate) mod overlay_index;
+#[cfg(feature = "phobos")]
+pub(crate) mod placement_preview;
 pub(crate) mod radial_indicators;
 pub(crate) mod radiation_beams;
 pub(crate) mod render;
@@ -29,6 +35,10 @@ pub(crate) mod sidebar_render;
 pub(crate) mod sidebar_surface;
 pub(crate) mod sidebar_text;
 pub(crate) mod state;
+#[cfg(feature = "phobos")]
+pub(crate) mod sw_sidebar;
+#[cfg(feature = "phobos")]
+pub(crate) mod sw_sidebar_build;
 pub(crate) mod super_timers;
 pub(crate) mod talk_bubble;
 pub(crate) mod target_lines;

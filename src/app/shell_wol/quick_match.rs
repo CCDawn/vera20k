@@ -22,7 +22,7 @@
 //! ([`crate::app::shell_network_setup`]). Quick Co-op (mode 2) is a later
 //! chain: the welcome keeps refusing it.
 
-use std::time::{Duration, Instant};
+use crate::util::time::{Duration, Instant};
 
 use super::WolPage;
 use super::lobby;
@@ -121,8 +121,8 @@ pub(crate) struct QuickMatchDialog {
 
 /// `time()`.
 fn now_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    crate::util::time::SystemTime::now()
+        .duration_since(crate::util::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
@@ -141,6 +141,24 @@ impl QuickMatchGlobals {
             && self
                 .timeout
                 .is_some_and(|timeout| now.wrapping_sub(self.stamp) > timeout)
+    }
+
+    /// `0x117`'s Cancel (event 0) during the guest's search: the list wait
+    /// `0x0077F120` takes it and returns 0, so the search ends with stage 3
+    /// (20 s, `0x007A1F5A..0x007A1FA6`) and the host's name for
+    /// `WOL:MatchGameChannelNotFound`. Between tries the next try's
+    /// `ResetEvent` sweep over the 18 events drops it. `None` outside a
+    /// search; the runner then ends as usual.
+    fn cancel_search(&mut self) -> Option<Option<String>> {
+        let search = self.search.as_ref()?;
+        if search.next_at.is_some() {
+            return Some(None);
+        }
+        let host = search.name.trim_end_matches("'s_game").to_owned();
+        self.search = None;
+        self.failure = 0;
+        self.set(stage::IN_LOBBY, Some(20));
+        Some(Some(host))
     }
 
     /// When [`Self::expired`] turns true.
@@ -644,7 +662,7 @@ fn matchbot_text(
 }
 
 /// `0x007A1BB0`'s names: `strtok(":")` ends the options, then
-/// `strtok(",")` ten times; the first token is the host, the tenth the
+/// `strtok(",")` nine times; the first token is the host, the ninth the
 /// guest (empty fields merge).
 fn start_names(payload: &str) -> (Option<&str>, Option<&str>) {
     let rest = payload.trim_start_matches(':');
@@ -654,7 +672,7 @@ fn start_names(payload: &str) -> (Option<&str>, Option<&str>) {
     let players = rest.find(':').map_or("", |index| &rest[index + 1..]);
     let mut tokens = players.split(',').filter(|token| !token.is_empty());
     let host = tokens.next();
-    let guest = tokens.nth(8);
+    let guest = tokens.nth(7);
     (host, guest)
 }
 
@@ -931,13 +949,22 @@ pub(super) fn exit(state: &mut AppState) {
 }
 
 /// `0x117`'s Cancel `0x5C0`: after Start Game Now it only closes the page;
+/// a guest's search takes it ([`QuickMatchGlobals::cancel_search`]);
 /// otherwise event 0 ends the runner without a box.
 fn cancel(state: &mut AppState) {
     if stage(state) == stage::STARTED {
         close_dialog(state);
         return;
     }
-    exit(state);
+    match globals_mut(state).and_then(QuickMatchGlobals::cancel_search) {
+        Some(Some(host)) => {
+            csf_name_line(state, "WOL:MatchGameChannelNotFound", &host, ERROR_COLOR);
+            // 0x007A1BB0 returned: the runner's stage-3 test asks again.
+            runner_request(state);
+        }
+        Some(None) => {}
+        None => exit(state),
+    }
 }
 
 /// The pump `0x0077F900`'s Quick Match half: stage 5 re-arms its 180 s;
@@ -1181,12 +1208,33 @@ mod tests {
     }
 
     #[test]
-    fn start_names_take_the_first_and_tenth_player_tokens() {
-        let payload = "0,1,2:Alpha,1,2,,3,4,5,6,7,8,Beta,9";
+    fn start_names_take_the_first_and_ninth_player_tokens() {
+        let payload = "0,1,2:Alpha,1,2,,3,4,5,6,7,Beta,9";
         assert_eq!(start_names(payload), (Some("Alpha"), Some("Beta")));
         assert_eq!(start_names("::x:A,1,2"), (Some("A"), None));
         assert_eq!(start_names("no players"), (None, None));
         assert_eq!(start_names(""), (None, None));
+    }
+
+    #[test]
+    fn cancel_ends_only_a_search_whose_list_request_is_out() {
+        let mut globals = QuickMatchGlobals::default();
+        assert_eq!(globals.cancel_search(), None);
+        globals.set(stage::SEARCHING, Some(30));
+        globals.search = Some(GameSearch {
+            name: "Alpha's_game".into(),
+            tries: 2,
+            next_at: Some(Instant::now()),
+        });
+        assert_eq!(globals.cancel_search(), Some(None));
+        assert_eq!(globals.stage, stage::SEARCHING);
+        globals.search.as_mut().unwrap().next_at = None;
+        assert_eq!(globals.cancel_search(), Some(Some("Alpha".into())));
+        assert!(globals.search.is_none());
+        assert_eq!(
+            (globals.stage, globals.timeout),
+            (stage::IN_LOBBY, Some(20))
+        );
     }
 
     #[test]

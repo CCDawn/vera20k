@@ -91,7 +91,7 @@ fn click(
     let orders = engineer_capture_orders(sim, rules, &mut selected, hover).unwrap();
     assert_eq!(orders.len(), 1);
     let record = if planning {
-        sim.encode_planning_order_record(owner, &orders[0])
+        sim.encode_planning_order_record(owner, &orders[0], None)
     } else {
         sim.encode_megamission_record(owner, &orders[0])
     }

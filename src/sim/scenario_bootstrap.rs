@@ -164,6 +164,7 @@ pub fn native_gather_start_positions(
     gather_start_positions_with_search(
         waypoints,
         participant_count,
+        8,
         bounds,
         rng,
         |seed_rx, seed_ry| {
@@ -186,27 +187,35 @@ pub fn native_gather_start_positions(
 pub(crate) fn native_gather_pre_fill_start_positions(
     waypoints: &HashMap<u32, Waypoint>,
     required_start_count: usize,
-    header: &MapHeader,
+    map: &MapFile,
     rng: &mut SimRng,
 ) -> Option<Vec<Waypoint>> {
-    let bounds = NativeStartBounds::from_map_header(header)?;
+    let bounds = NativeStartBounds::from_map_header(&map.header)?;
+    // VERA's explicitly declared 9–30-start maps use the same map-capacity
+    // reader as setup and retained loading metadata. Participant count alone
+    // must not discard a high authored start chosen by a small roster.
+    let authored_slot_limit = crate::map::waypoints::multiplayer_start_slot_limit(
+        crate::map::waypoints::skirmish_player_capacity(&map.ini),
+    );
     Some(gather_start_positions_with_search(
         waypoints,
         required_start_count,
+        authored_slot_limit,
         bounds,
         rng,
-        |seed_rx, seed_ry| find_nearby_pre_fill_start_rect(header, seed_rx, seed_ry),
+        |seed_rx, seed_ry| find_nearby_pre_fill_start_rect(&map.header, seed_rx, seed_ry),
     ))
 }
 
 fn gather_start_positions_with_search(
     waypoints: &HashMap<u32, Waypoint>,
     participant_count: usize,
+    authored_slot_limit: u32,
     bounds: NativeStartBounds,
     rng: &mut SimRng,
     mut find_nearby: impl FnMut(u16, u16) -> Option<(u16, u16)>,
 ) -> Vec<Waypoint> {
-    let authored_prefix = (0..8u32)
+    let authored_prefix = (0..authored_slot_limit)
         .take_while(|index| waypoints.contains_key(index))
         .count();
     let target_count = authored_prefix.max(participant_count);
@@ -639,7 +648,7 @@ pub fn prepare_stock_offline_scenario_prefix_plan(
     let first_gathered_starts = native_gather_pre_fill_start_positions(
         start_waypoints,
         roster_start_count,
-        &map_data.header,
+        map_data,
         &mut scenario_rng,
     )
     .ok_or(PreFillScenarioPrefixPlanError::InvalidMapCellExtent)?;
@@ -650,7 +659,7 @@ pub fn prepare_stock_offline_scenario_prefix_plan(
     let final_gathered_starts = native_gather_pre_fill_start_positions(
         start_waypoints,
         roster_start_count,
-        &map_data.header,
+        map_data,
         &mut scenario_rng,
     )
     .ok_or(PreFillScenarioPrefixPlanError::InvalidMapCellExtent)?;
@@ -754,115 +763,16 @@ pub fn stock_offline_start_callback_family(
     session: &SkirmishLaunchSession,
 ) -> Result<StockOfflineStartCallbackFamily, PreFillScenarioPrefixPlanError> {
     let mode = &session.mode;
-    let expected = match mode.id {
-        1 => (
-            "GUI:Battle",
-            "STT:ModeBattle",
-            "MPBattleMD.ini",
-            "standard",
-            true,
-            true,
-            false,
-            StockOfflineStartCallbackFamily::Battle,
-        ),
-        2 => (
-            "GUI:FreeForAll",
-            "STT:ModeFreeForAll",
-            "MPFreeForAllMD.ini",
-            "standard",
-            true,
-            false,
-            false,
-            StockOfflineStartCallbackFamily::Battle,
-        ),
-        3 => (
-            "GUI:Cooperative",
-            "STT:ModeCooperative",
-            "MPCoopMD.ini",
-            "cooperative",
-            false,
-            false,
-            false,
-            StockOfflineStartCallbackFamily::Cooperative,
-        ),
-        4 => (
-            "GUI:UnholyAlliance",
-            "STT:ModeUnholyAlliance",
-            "MPUnholyMD.ini",
-            "standard",
-            false,
-            true,
-            false,
-            StockOfflineStartCallbackFamily::Battle,
-        ),
-        5 => (
-            "GUI:Megawealth",
-            "STT:ModeMegawealth",
-            "MPMWMD.ini",
-            "megawealth",
-            false,
-            true,
-            false,
-            StockOfflineStartCallbackFamily::Battle,
-        ),
-        6 => (
-            "GUI:Duel",
-            "STT:ModeDuel",
-            "MPDuelMD.ini",
-            "duel",
-            false,
-            true,
-            false,
-            StockOfflineStartCallbackFamily::Battle,
-        ),
-        7 => (
-            "GUI:MeatGrind",
-            "STT:ModeMeatGrind",
-            "MPMeatMD.ini",
-            "meatgrind",
-            false,
-            true,
-            false,
-            StockOfflineStartCallbackFamily::Battle,
-        ),
-        8 => (
-            "GUI:NavalWar",
-            "STT:ModeNavalWar",
-            "MPNavalMD.ini",
-            "navalwar",
-            false,
-            true,
-            false,
-            StockOfflineStartCallbackFamily::Battle,
-        ),
-        9 => (
-            "GUI:TeamGame",
-            "STT:ModeTeamGame",
-            "MPTeamMD.ini",
-            "teamgame",
-            false,
-            true,
-            true,
-            StockOfflineStartCallbackFamily::Battle,
-        ),
-        _ => {
-            return Err(PreFillScenarioPrefixPlanError::UnsupportedStockMode { id: mode.id });
-        }
-    };
-    let (ui_name, tooltip, override_file, map_filter, random_maps, allies, must_ally, family) =
-        expected;
-    if mode.ui_name_key.eq_ignore_ascii_case(ui_name)
-        && mode.tooltip_key.eq_ignore_ascii_case(tooltip)
-        && mode.override_file.eq_ignore_ascii_case(override_file)
-        && mode.map_filter.eq_ignore_ascii_case(map_filter)
-        && mode.random_maps_allowed == random_maps
-        && mode.allies_allowed == allies
-        && mode.must_ally == must_ally
-    {
-        Ok(family)
-    } else {
-        Err(PreFillScenarioPrefixPlanError::UnsupportedStockMode { id: mode.id })
-    }
+    let stock = mode
+        .matching_stock()
+        .ok_or(PreFillScenarioPrefixPlanError::UnsupportedStockMode { id: mode.id })?;
+    Ok(
+        if stock.class == crate::skirmish_modes::MpModeClass::Cooperative {
+            StockOfflineStartCallbackFamily::Cooperative
+        } else {
+            StockOfflineStartCallbackFamily::Battle
+        },
+    )
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1784,7 +1694,8 @@ fn assign_launch_base_centers(
 
 pub fn normalized_launch_slots(session: &SkirmishLaunchSession) -> Vec<NormalizedSkirmishSlot> {
     // CreateHouses687F66..84 compares signed DWORD node+53; equal colors
-    // retain source order. 688137 writes the House index back to each node.
+    // retain source order, normalized by the launch owner for local-first LAN
+    // nodes. 688137 writes the House index back to each node.
     // Internal owner keys must stay distinct even for duplicate handles or
     // handles colliding with generated AI/fixed Houses (688092..6880A4).
     let mut used_names: Vec<String> = ["Neutral", "Special"]
@@ -1796,7 +1707,7 @@ pub fn normalized_launch_slots(session: &SkirmishLaunchSession) -> Vec<Normalize
             .map(|index| normalize_house_name(&format!("Computer{index}"))),
     );
     let mut humans: Vec<_> = session.humans.iter().enumerate().collect();
-    humans.sort_by_key(|(index, human)| (human.slot.color_index, *index));
+    humans.sort_by_key(|(index, human)| (human.slot.color_index, human.house_source_order(*index)));
     let mut slots = Vec::with_capacity(humans.len() + session.opponents.len());
     for (index, human) in humans {
         let mut owner_name = human.name.clone();
@@ -2941,6 +2852,11 @@ impl Simulation {
         crate::sim::world::GeneratedTechnoInitTable,
         crate::sim::world::GeneratedTechnoInitError,
     > {
+        if let Some(lighting) = trace.lighting {
+            self.session
+                .lighting_mut()
+                .install_generated_lighting(lighting);
+        }
         replay_generated_construction_trace_with_rng(
             &mut self.scenario_rng,
             &mut self.native_unique_ids,
@@ -3644,6 +3560,774 @@ mod tests {
                 case["name"]
             );
         }
+    }
+
+    fn network_hash_perspective(
+        local_player: usize,
+    ) -> (crate::sim::runtime::SimRuntime, [u64; 2]) {
+        network_hash_perspective_with_survivor(local_player, false)
+    }
+
+    fn network_hash_perspective_with_survivor(
+        local_player: usize,
+        third_human: bool,
+    ) -> (crate::sim::runtime::SimRuntime, [u64; 2]) {
+        network_vision_perspective(local_player, 2 + usize::from(third_human), None, "")
+    }
+
+    fn network_vision_perspective(
+        local_player: usize,
+        human_count: usize,
+        observer: Option<usize>,
+        extra_rules: &str,
+    ) -> (crate::sim::runtime::SimRuntime, [u64; 2]) {
+        use crate::sim::runtime::{SimResources, SimRuntime};
+        use crate::sim::scenario_session::ScenarioGameMode;
+        let mut ini = launch_fixture_ini(
+            "[Clear]\nBuildable=yes\n[CombatDamage]\nC4Warhead=Super\n[Warheads]\n0=Super\n[Super]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n[VehicleTypes]\n0=MTNK\n[MTNK]\nStrength=300\nSpeed=6\nSight=4\nOwner=Americans\nMovementZone=Normal\nSpeedType=Track\nLocomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n",
+        );
+        ini.merge(&IniFile::from_str(extra_rules));
+        let rules = RuleSet::from_ini(&ini).unwrap();
+        let mut session = one_player_battle_launch("shared-world.map")
+            .session()
+            .clone();
+        let template = session.humans[0].clone();
+        session.humans = (0..human_count)
+            .map(|index| {
+                let mut human = template.clone();
+                human.name = match index {
+                    0 => "Host".into(),
+                    1 => "Guest".into(),
+                    2 => "Third".into(),
+                    _ => format!("Player{index:02}"),
+                };
+                human.raw_slot_index = Some(index as u8);
+                human.set_observer(observer == Some(index));
+                human.slot.color_index = if human.is_observer() {
+                    8
+                } else {
+                    (index * 8 / human_count.max(8)) as u8
+                };
+                human
+            })
+            .collect();
+        session.local_player_index = local_player;
+        session.options.short_game = false;
+        session.options.bases = false;
+        session.options.unit_count = 0;
+        session.rebuild_house_roster();
+        let launch = MatchLaunchDescriptor::from_resolved(session).unwrap();
+        let mut sim = Simulation::with_seed(73);
+        sim.session.set_game_mode(ScenarioGameMode::Wol);
+        sim.session.install_network_timing(10);
+        initialize_skirmish_launch_houses(&mut sim, &HouseRoster::default(), &rules, &launch);
+        crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
+        sim.fog = crate::sim::vision::FogState::new(32, 32);
+        let actors = [
+            sim.spawn_object("MTNK", "Host", 8, 8, 0, &rules).unwrap(),
+            sim.spawn_object("MTNK", "Guest", 24, 24, 0, &rules)
+                .unwrap(),
+        ];
+        for (index, human) in launch.session().humans.iter().enumerate().skip(2) {
+            if !human.is_observer() {
+                sim.spawn_object(
+                    "MTNK",
+                    &human.name,
+                    8 + ((index - 2) % 8) as u16 * 2,
+                    24 - ((index - 2) / 8) as u16 * 2,
+                    0,
+                    &rules,
+                )
+                .unwrap();
+            }
+        }
+        let overlays = crate::rules::overlay_types::OverlayTypeRegistry::empty();
+        sim.finalize_scenario_post_map(crate::sim::scenario_post_map::ScenarioPostMapInput {
+            map_width: 32,
+            map_height: 32,
+            fill_silos: false,
+            rules: &rules,
+            overlay_registry: &overlays,
+            house_roster: &HouseRoster::default(),
+            skirmish_session: Some(&launch),
+            campaign_map: None,
+        });
+        sim.hash_state_every(std::num::NonZeroU64::MIN);
+        (
+            SimRuntime {
+                simulation: sim,
+                resources: SimResources {
+                    rules,
+                    overlay_registry: overlays,
+                    terrain_template: None,
+                },
+            },
+            actors,
+        )
+    }
+
+    #[test]
+    fn scripted_result_network_views_keep_both_humans_and_local_exit_consistent() {
+        use crate::rules::team_ai_ini::TeamAiIniRegistry;
+        use crate::sim::house_state::HouseOutcomeKind;
+        let mut finals = Vec::new();
+        for local in [0, 1] {
+            let (mut runtime, actors) = network_hash_perspective(local);
+            let sim = &mut runtime.simulation;
+            let rules = &runtime.resources.rules;
+            let owner = sim.entities().get(actors[0]).unwrap().owner();
+            let ini = IniFile::from_str(
+                "[TeamTypes]\n0=RESULT-TEAM\n[RESULT-TEAM]\n\
+                House=Americans\nScript=RESULT-SCRIPT\nTaskForce=RESULT-FORCE\nGroup=-1\nRecruiter=yes\nMax=1\n\
+                [ScriptTypes]\n0=RESULT-SCRIPT\n[RESULT-SCRIPT]\n0=23,77\n\
+                [TaskForces]\n0=RESULT-FORCE\n[RESULT-FORCE]\nGroup=-1\n0=1,MTNK\n",
+            );
+            let registry = TeamAiIniRegistry::from_sources(&IniFile::empty(), &ini, true);
+            sim.install_team_ai_registry(&registry, rules).unwrap();
+            let ty = sim.interner.get("RESULT-TEAM").unwrap();
+            let team = sim.create_team(ty, Some(owner), rules).unwrap();
+            let player = sim.session.current_house().unwrap();
+            let mut executed = false;
+            for _ in 0..120 {
+                runtime.advance_frame_for_tooling(&[], 22).unwrap();
+                let sim = &runtime.simulation;
+                if let Some(team) = sim.team_script_vm.team(team)
+                    && team.cursor() == 0
+                {
+                    assert!(team.refusal().is_none(), "{:?}", team.refusal());
+                    assert!(team.advance_pending());
+                    assert_eq!(team.members().collect::<Vec<_>>(), [actors[0]]);
+                    executed = true;
+                }
+                if sim.ready_outcome_for_owner(player).is_some() {
+                    break;
+                }
+            }
+            let sim = &runtime.simulation;
+            assert!(executed, "ordinary Team AI reaches the loss action");
+            assert!(sim.houses[&owner].has_lost());
+            let guest = sim.entities().get(actors[1]).unwrap().owner();
+            assert!(sim.houses[&guest].has_lost());
+            assert_eq!(
+                sim.ready_outcome_for_owner(player).unwrap().kind,
+                HouseOutcomeKind::Defeat
+            );
+            assert!(
+                sim.ready_outcome_for_owner(if player == owner { guest } else { owner })
+                    .is_none()
+            );
+            assert!(sim.team_script_vm.team(team).is_none());
+            finals.push(sim.state_hash());
+        }
+        assert_eq!(
+            finals[0], finals[1],
+            "local identity does not select shared House flags"
+        );
+    }
+
+    #[test]
+    fn network_local_perspectives_share_startup_fog_and_ordinary_frame_hashes() {
+        use crate::sim::command::{Command, CommandEnvelope};
+        use crate::sim::world::{FrameEffects, TickLane};
+        let (mut left, actors) = network_hash_perspective(0);
+        let (mut right, other_actors) = network_hash_perspective(1);
+        assert_eq!(actors, other_actors);
+        assert_ne!(
+            left.simulation.session.current_house(),
+            right.simulation.session.current_house()
+        );
+        assert_eq!(
+            left.simulation.fog.plane_digests(),
+            right.simulation.fog.plane_digests()
+        );
+        assert_eq!(
+            left.simulation.state_hash(),
+            right.simulation.state_hash(),
+            "fresh accepted world"
+        );
+        let start = left.simulation.entities().get(actors[0]).unwrap().position;
+        let start = (start.rx(), start.ry());
+        for frame in 0..48 {
+            // These are ordinary local frame-ingress inputs, intentionally
+            // different on the two clients, not synchronized player orders.
+            if frame == 2 {
+                for (runtime, actor) in [(&mut left, actors[0]), (&mut right, actors[1])] {
+                    let owner = runtime.simulation.session.current_house().unwrap();
+                    assert!(runtime.simulation.issue_local_command(CommandEnvelope::new(
+                        owner,
+                        runtime.simulation.session.tick(),
+                        Command::Select {
+                            entity_ids: vec![actor],
+                            additive: false
+                        },
+                    )));
+                }
+            }
+            if frame == 3 {
+                let owner = left.simulation.interner.get("Host").unwrap();
+                let record = left
+                    .simulation
+                    .encode_megamission_record(
+                        owner,
+                        &Command::Move {
+                            entity_id: actors[0],
+                            target_rx: 12,
+                            target_ry: 8,
+                        },
+                    )
+                    .unwrap();
+                assert!(left.simulation.admit_native_command_record(record.clone()));
+                assert!(right.simulation.admit_native_command_record(record));
+            }
+            assert!(left.simulation.prepare_fog_view_for("Host"));
+            assert!(right.simulation.prepare_fog_view_for("Guest"));
+            assert!(right.simulation.prepare_fog_view_for("Guest"));
+            let a = left
+                .advance_frame(&[], 33, TickLane::Ordinary, FrameEffects::empty())
+                .unwrap();
+            let b = right
+                .advance_frame(&[], 33, TickLane::Ordinary, FrameEffects::empty())
+                .unwrap();
+            assert!(a.tick.frame_committed && b.tick.frame_committed);
+            assert_eq!(
+                a.tick.state_hash, b.tick.state_hash,
+                "ordinary frame {frame}"
+            );
+            assert_eq!(
+                left.simulation.fog.plane_digests(),
+                right.simulation.fog.plane_digests(),
+                "all human views at frame {frame}"
+            );
+        }
+        let final_position = left.simulation.entities().get(actors[0]).unwrap().position;
+        assert_ne!(
+            (final_position.rx(), final_position.ry()),
+            start,
+            "real admitted Move must execute"
+        );
+    }
+
+    #[test]
+    fn network_zero_sight_discovery_uses_each_human_admission_and_retains_shared_hash() {
+        use crate::sim::world::UninitContext;
+        let extra = "[InfantryTypes]\n0=E1\n[E1]\nStrength=100\nSight=0\nOwner=Americans\nSpeed=4\nMovementZone=Normal\nSpeedType=Foot\nLocomotor={4A582744-9839-11d1-B709-00A024DDAFD1}\n";
+        let (mut left, _) = network_vision_perspective(0, 2, None, extra);
+        let (mut right, _) = network_vision_perspective(1, 2, None, extra);
+        let host = left.simulation.interner.get("Host").unwrap();
+        let guest = left.simulation.interner.get("Guest").unwrap();
+        let mut ids = Vec::new();
+        for runtime in [&mut left, &mut right] {
+            let id = runtime
+                .simulation
+                .spawn_object("E1", "Guest", 16, 16, 0, &runtime.resources.rules)
+                .unwrap();
+            assert!(!runtime.simulation.techno_discovered_by_viewer(id, host));
+            assert!(!runtime.simulation.techno_discovered_by_viewer(id, guest));
+            ids.push(id);
+        }
+        assert_eq!(ids[0], ids[1]);
+        assert_eq!(left.simulation.state_hash(), right.simulation.state_hash());
+        let unseen = left.simulation.state_hash();
+        for viewer in [host, guest] {
+            for runtime in [&mut left, &mut right] {
+                let context = UninitContext::with_rules(&runtime.resources.rules);
+                assert!(runtime.simulation.discover_techno(ids[0], viewer, context));
+                assert!(!runtime.simulation.discover_techno(ids[0], viewer, context));
+                assert!(
+                    runtime
+                        .simulation
+                        .techno_discovered_by_viewer(ids[0], viewer)
+                );
+            }
+            assert_eq!(left.simulation.state_hash(), right.simulation.state_hash());
+        }
+        assert_ne!(
+            left.simulation.state_hash(),
+            unseen,
+            "retained shared discovery is hashed"
+        );
+        assert!(left.simulation.houses[&guest].discovered_by_current_house());
+        assert!(right.simulation.houses[&guest].discovered_by_current_house());
+    }
+
+    #[test]
+    fn network_high_discovery_bits_survive_observer_and_early_player_removal() {
+        use crate::sim::world::{FrameEffects, TickLane, UninitContext};
+        let extra = "[InfantryTypes]\n0=E1\n[E1]\nStrength=100\nSight=0\nOwner=Americans\nSpeed=4\nMovementZone=Normal\nSpeedType=Foot\nLocomotor={4A582744-9839-11d1-B709-00A024DDAFD1}\n";
+        let (mut left, actors) = network_vision_perspective(0, 30, Some(28), extra);
+        let (mut right, other_actors) = network_vision_perspective(29, 30, Some(28), extra);
+        assert_eq!(actors, other_actors);
+        let last = right.simulation.session.current_house().unwrap();
+        let observer = left.simulation.interner.get("Player28").unwrap();
+        let early = left.simulation.interner.get("Guest").unwrap();
+        let host = left.simulation.session.current_house().unwrap();
+        let viewers: Vec<_> = left
+            .simulation
+            .houses
+            .in_order()
+            .filter(|house| house.is_human())
+            .map(|house| house.name())
+            .collect();
+        // Test precondition: native color sorting puts the observer last.
+        // These distinct logical viewers exercise both compact high bits.
+        assert_eq!(
+            (viewers.len(), viewers[28], viewers[29]),
+            (30, last, observer)
+        );
+        assert_eq!(left.simulation.session.observer_house(), Some(observer));
+        let ids = [&mut left, &mut right].map(|runtime| {
+            runtime
+                .simulation
+                .spawn_object("E1", "Host", 16, 8, 0, &runtime.resources.rules)
+                .unwrap()
+        });
+        assert_eq!(ids[0], ids[1]);
+        assert_eq!(left.simulation.state_hash(), right.simulation.state_hash());
+        for viewer in [last, observer] {
+            let before = left.simulation.state_hash();
+            for runtime in [&mut left, &mut right] {
+                let context = UninitContext::with_rules(&runtime.resources.rules);
+                let sim = &mut runtime.simulation;
+                assert!(!sim.techno_discovered_by_viewer(ids[0], viewer));
+                assert!(sim.discover_techno(ids[0], viewer, context));
+                assert!(sim.techno_discovered_by_viewer(ids[0], viewer));
+                if viewer == last {
+                    assert!(!sim.techno_discovered_by_viewer(ids[0], observer));
+                }
+                let retained = (sim.state_hash(), sim.rng_state());
+                assert!(!sim.discover_techno(ids[0], viewer, context));
+                assert_eq!((sim.state_hash(), sim.rng_state()), retained);
+            }
+            assert_ne!(left.simulation.state_hash(), before);
+            assert_eq!(left.simulation.state_hash(), right.simulation.state_hash());
+        }
+        // Real EventClass REMOVEPLAYER4C7B73/Flag_To_Die4C7BE1, not a
+        // direct defeated flag or mutation of the immutable House registry.
+        let early_index = left
+            .simulation
+            .houses
+            .order()
+            .iter()
+            .position(|&owner| owner == early)
+            .unwrap() as i32;
+        let record = left
+            .simulation
+            .encode_remove_player_record(host, early_index)
+            .unwrap();
+        assert!(left.simulation.admit_native_command_record(record.clone()));
+        assert!(right.simulation.admit_native_command_record(record));
+        for _ in 0..6 {
+            let a = left
+                .advance_frame(&[], 33, TickLane::Ordinary, FrameEffects::empty())
+                .unwrap();
+            let b = right
+                .advance_frame(&[], 33, TickLane::Ordinary, FrameEffects::empty())
+                .unwrap();
+            assert!(a.tick.frame_committed && b.tick.frame_committed);
+            assert_eq!(a.tick.state_hash, b.tick.state_hash);
+        }
+        for runtime in [&mut left, &mut right] {
+            let sim = &mut runtime.simulation;
+            assert!(sim.houses[&early].is_defeated());
+            assert!(
+                !sim.entities()
+                    .get(actors[1])
+                    .is_some_and(|entity| entity.lifecycle.object_alive())
+            );
+            for viewer in [last, observer] {
+                assert!(sim.techno_discovered_by_viewer(ids[0], viewer));
+                let retained = (sim.state_hash(), sim.rng_state());
+                assert!(!sim.discover_techno(
+                    ids[0],
+                    viewer,
+                    UninitContext::with_rules(&runtime.resources.rules)
+                ));
+                assert_eq!((sim.state_hash(), sim.rng_state()), retained);
+            }
+        }
+        assert_eq!(left.simulation.state_hash(), right.simulation.state_hash());
+        // Simulation deserialization intentionally restarts Scenario RNG.
+        // Compare this retained owner separately from the live-world hashes
+        // above, which include every shared state/RNG change during cleanup.
+        let saved = crate::util::save_codec::serialize(&left.simulation).unwrap();
+        let restored: Simulation = crate::util::save_codec::deserialize(&saved).unwrap();
+        assert_eq!(
+            restored.entities().get(ids[0]).unwrap().discovery,
+            left.simulation.entities().get(ids[0]).unwrap().discovery,
+        );
+        for viewer in [last, observer] {
+            assert!(restored.techno_discovered_by_viewer(ids[0], viewer));
+        }
+    }
+
+    #[test]
+    fn network_trigger_and_reveal_to_all_lifecycle_update_both_logical_maps() {
+        use crate::sim::world::{FrameEffects, TickLane, UninitContext};
+        let extra = "[General]\nRevealTriggerRadius=3\n[BuildingTypes]\n0=CAMERA\n[CAMERA]\nStrength=100\nSight=3\nRevealToAll=yes\nOwner=Americans\nFoundation=1x1\n";
+        let (mut left, _) = network_vision_perspective(0, 2, None, extra);
+        let (mut right, _) = network_vision_perspective(1, 2, None, extra);
+        let host = left.simulation.interner.get("Host").unwrap();
+        let guest = left.simulation.interner.get("Guest").unwrap();
+        let mut ids = Vec::new();
+        for runtime in [&mut left, &mut right] {
+            let sim = &mut runtime.simulation;
+            sim.install_playfield_from_map_header(&crate::map::map_file::MapHeader {
+                theater: "TEMPERATE".into(),
+                fill: "Clear".into(),
+                level: 0,
+                width: 16,
+                height: 16,
+                local_left: 0,
+                local_top: 0,
+                local_width: 16,
+                local_height: 16,
+            });
+            sim.session.install_waypoints(
+                &[(
+                    7,
+                    crate::map::waypoints::Waypoint {
+                        index: 7,
+                        rx: 16,
+                        ry: 16,
+                    },
+                )]
+                .into(),
+            );
+            let rules = &runtime.resources.rules;
+            assert!(!sim.fog.is_cell_revealed(host, 16, 16));
+            assert!(!sim.fog.is_cell_revealed(guest, 16, 16));
+            assert!(sim.trigger_reveal_at_waypoint(7, UninitContext::with_rules(rules)));
+            assert!(sim.fog.is_cell_revealed(host, 16, 16));
+            assert!(sim.fog.is_cell_revealed(guest, 16, 16));
+            assert!(sim.trigger_conceal_at_waypoint(7, UninitContext::with_rules(rules)));
+            let id = sim
+                .spawn_object("CAMERA", "Host", 16, 16, 0, rules)
+                .unwrap();
+            let camera = sim.entities().get(id).unwrap();
+            assert!(rules.object("CAMERA").unwrap().reveal_to_all);
+            assert_eq!(camera.sight.range(), 3);
+            assert!(camera.in_playfield());
+            assert!(camera.building_art.actually_placed());
+            assert!(sim.fog.sight_is_latched(id, host));
+            assert!(sim.techno_discovered_by_viewer(id, guest));
+            assert!(sim.houses[&guest].initial_sight_refresh_pending());
+            // CellPUT discovery can open this Human building before Unlimbo
+            // establishes3D5 (6F6CFE). Native UpdateReveal70AF58..60 rejects
+            // that early alternate call. House4F9338..935A subsequently
+            // consumes24B and visits Map4ADCD0's RTA arm in ordinary Logic.
+            assert!(!sim.fog.holds_alternate_sight(id, guest));
+            ids.push(id);
+        }
+        assert_eq!(ids[0], ids[1]);
+        for runtime in [&mut left, &mut right] {
+            let frame = runtime
+                .advance_frame(&[], 33, TickLane::Ordinary, FrameEffects::empty())
+                .unwrap();
+            assert!(frame.tick.frame_committed);
+            let sim = &mut runtime.simulation;
+            let rules = &runtime.resources.rules;
+            let id = ids[0];
+            assert!(sim.fog.holds_alternate_sight(id, guest));
+            assert_eq!(
+                sim.fog.by_owner()[&guest].shroud_knowledge_raw()[16 * 32 + 16].counter(),
+                -1,
+                "one represented RTA visitor must add one alternate sight contribution"
+            );
+            assert!(!sim.fog.holds_alternate_sight(id, host));
+            assert!(sim.fog.is_cell_visible(host, 16, 16));
+            assert!(sim.fog.is_cell_visible(guest, 16, 16));
+            // Native Limbo6F6B06 releases every represented PlayerPtr,
+            // including the owner (DestructionEffects44172F excludes it).
+            assert_eq!(
+                sim.techno_limbo_with_context(id, UninitContext::with_rules(rules)),
+                crate::sim::world::ConcealOutcome::Concealed
+            );
+            assert!(!sim.fog.holds_alternate_sight(id, guest));
+        }
+
+        assert_eq!(
+            left.simulation.fog.plane_digests(),
+            right.simulation.fog.plane_digests()
+        );
+        assert_eq!(left.simulation.state_hash(), right.simulation.state_hash());
+    }
+
+    #[test]
+    fn network_two_human_destruct_keeps_full_frame_and_terminal_score_hashes_equal() {
+        use crate::sim::house_state::HouseOutcomeKind;
+        use crate::sim::world::{FrameEffects, TickLane};
+        let (mut left, _) = network_hash_perspective(0);
+        let (mut right, _) = network_hash_perspective(1);
+        let host = left.simulation.interner.get("Host").unwrap();
+        let guest = left.simulation.interner.get("Guest").unwrap();
+        let mut finished = false;
+        for frame in 0..600 {
+            if frame == 30 {
+                let record = left.simulation.encode_destruct_record(guest).unwrap();
+                assert!(left.simulation.admit_native_command_record(record.clone()));
+                assert!(right.simulation.admit_native_command_record(record));
+            }
+            let a = left
+                .advance_frame(&[], 33, TickLane::Ordinary, FrameEffects::empty())
+                .unwrap();
+            let b = right
+                .advance_frame(&[], 33, TickLane::Ordinary, FrameEffects::empty())
+                .unwrap();
+            assert_eq!(a.tick.tick, b.tick.tick, "frame {frame}");
+            assert_eq!(
+                a.tick.frame_committed, b.tick.frame_committed,
+                "frame {frame}"
+            );
+            assert_eq!(
+                a.tick.state_hash,
+                b.tick.state_hash,
+                "frame {frame}: {:?} / {:?}",
+                left.simulation.state_hash_owners(),
+                right.simulation.state_hash_owners()
+            );
+            assert_eq!(
+                left.simulation.fog.plane_digests(),
+                right.simulation.fog.plane_digests(),
+                "frame {frame}"
+            );
+            if left.simulation.terminal_score_snapshot().is_some()
+                || right.simulation.terminal_score_snapshot().is_some()
+            {
+                assert_eq!(
+                    left.simulation.terminal_score_snapshot(),
+                    right.simulation.terminal_score_snapshot()
+                );
+                assert_eq!(left.simulation.state_hash(), right.simulation.state_hash());
+                assert_eq!(
+                    left.simulation.ready_outcome_for_owner(host).unwrap().kind,
+                    HouseOutcomeKind::Victory
+                );
+                assert_eq!(
+                    right
+                        .simulation
+                        .ready_outcome_for_owner(guest)
+                        .unwrap()
+                        .kind,
+                    HouseOutcomeKind::Defeat
+                );
+                finished = true;
+                break;
+            }
+        }
+        assert!(
+            finished,
+            "real DESTRUCT must reach the committed terminal score frame"
+        );
+    }
+
+    #[test]
+    fn network_defeated_viewer_and_storm_keep_shared_maps_and_radar() {
+        use crate::sim::power_system::has_active_radar;
+        use crate::sim::world::{FrameEffects, TickLane};
+        let (mut left, _) = network_hash_perspective_with_survivor(0, true);
+        let (mut right, _) = network_hash_perspective_with_survivor(1, true);
+        let guest = left.simulation.interner.get("Guest").unwrap();
+        let host = left.simulation.interner.get("Host").unwrap();
+        let record = left.simulation.encode_destruct_record(guest).unwrap();
+        assert!(left.simulation.admit_native_command_record(record.clone()));
+        assert!(right.simulation.admit_native_command_record(record));
+        for _ in 0..6 {
+            for runtime in [&mut left, &mut right] {
+                runtime
+                    .advance_frame(&[], 33, TickLane::Ordinary, FrameEffects::empty())
+                    .unwrap();
+            }
+            assert_eq!(
+                left.simulation.state_hash(),
+                right.simulation.state_hash(),
+                "defeat projection: {:?} versus {:?}",
+                left.simulation.hash_owner_diagnostics_for_test(),
+                right.simulation.hash_owner_diagnostics_for_test()
+            );
+        }
+        for runtime in [&mut left, &mut right] {
+            let sim = &runtime.simulation;
+            assert!(sim.houses[&guest].is_defeated());
+            assert!(!sim.houses[&host].is_defeated());
+            assert!(sim.fog.whole_map_revealed_for_owner(guest));
+            assert!(has_active_radar(sim.power_states.as_map(), guest));
+            assert!(
+                sim.session.outcome_request().is_none(),
+                "defeated viewer watches hostile survivors"
+            );
+        }
+        assert_eq!(
+            left.simulation.fog.plane_digests(),
+            right.simulation.fog.plane_digests()
+        );
+        for runtime in [&mut left, &mut right] {
+            crate::sim::superweapon::lightning_storm::start(
+                &mut runtime.simulation,
+                &runtime.resources.rules,
+                60,
+                0,
+                (16, 16),
+                None,
+            );
+            let sim = &runtime.simulation;
+            assert_eq!(
+                sim.power_states[&host]
+                    .radar_outage_for_test()
+                    .remaining(sim.session.binary_frame() as i32),
+                60
+            );
+            assert_eq!(
+                sim.power_states[&guest]
+                    .radar_outage_for_test()
+                    .remaining(sim.session.binary_frame() as i32),
+                0
+            );
+        }
+        assert_eq!(left.simulation.state_hash(), right.simulation.state_hash());
+        for _ in 0..2 {
+            for runtime in [&mut left, &mut right] {
+                runtime
+                    .advance_frame(&[], 33, TickLane::Ordinary, FrameEffects::empty())
+                    .unwrap();
+            }
+            assert_eq!(left.simulation.state_hash(), right.simulation.state_hash());
+            assert!(has_active_radar(
+                left.simulation.power_states.as_map(),
+                guest
+            ));
+            assert!(has_active_radar(
+                right.simulation.power_states.as_map(),
+                guest
+            ));
+        }
+    }
+
+    #[test]
+    fn network_hash_omits_local_control_but_preserves_sight_fog_credits_and_timer() {
+        let (mut left, _) = network_hash_perspective(0);
+        let (mut right, _) = network_hash_perspective(1);
+        let host = left.simulation.interner.get("Host").unwrap();
+        let guest = left.simulation.interner.get("Guest").unwrap();
+        // PlayerControl is this client's input/EVA selector. Initial sight
+        // invalidation drives shared fog work and must still be detectable.
+        left.simulation
+            .houses
+            .get_mut(&guest)
+            .unwrap()
+            .assign_player_control(true);
+        assert_eq!(left.simulation.state_hash(), right.simulation.state_hash());
+        assert!(
+            left.simulation
+                .houses
+                .get_mut(&host)
+                .unwrap()
+                .take_initial_sight_refresh()
+        );
+        assert_ne!(left.simulation.state_hash(), right.simulation.state_hash());
+        assert!(
+            right
+                .simulation
+                .houses
+                .get_mut(&host)
+                .unwrap()
+                .take_initial_sight_refresh()
+        );
+        assert_eq!(left.simulation.state_hash(), right.simulation.state_hash());
+        left.simulation
+            .houses
+            .get_mut(&host)
+            .unwrap()
+            .economy_mut()
+            .add_credits(1);
+        assert_ne!(left.simulation.state_hash(), right.simulation.state_hash());
+        right
+            .simulation
+            .houses
+            .get_mut(&host)
+            .unwrap()
+            .economy_mut()
+            .add_credits(1);
+        assert_eq!(left.simulation.state_hash(), right.simulation.state_hash());
+        let fog_before = left.simulation.fog.plane_digests();
+        left.simulation
+            .reveal_map_for_owner(host, &left.resources.rules);
+        assert_ne!(left.simulation.fog.plane_digests(), fog_before);
+        assert_ne!(left.simulation.state_hash(), right.simulation.state_hash());
+        right
+            .simulation
+            .reveal_map_for_owner(host, &right.resources.rules);
+        assert_eq!(left.simulation.state_hash(), right.simulation.state_hash());
+        // AllowWin Tag destruction owns the same +298 timer as ToDie. Its
+        // shared anchor remains detectable even with identical result flags.
+        left.simulation
+            .houses
+            .get_mut(&host)
+            .unwrap()
+            .removed_allow_win_tag(0);
+        right
+            .simulation
+            .houses
+            .get_mut(&host)
+            .unwrap()
+            .removed_allow_win_tag(1);
+        assert_ne!(left.simulation.state_hash(), right.simulation.state_hash());
+    }
+
+    #[test]
+    fn thirty_human_local_first_lan_nodes_share_the_same_constructed_house_order() {
+        let mut host = one_player_battle_launch("thirty-lan.map").session().clone();
+        let template = host.humans[0].clone();
+        host.humans = (0..30)
+            .map(|row| {
+                let mut human = template.clone();
+                human.raw_slot_index = Some(row);
+                human.name = format!("Player{row:02}");
+                human.slot.color_index = row % 8;
+                human
+            })
+            .collect();
+        host.rebuild_house_roster();
+        let mut guest = host.clone();
+        guest.humans.rotate_left(8);
+        guest.rebuild_house_roster();
+        assert_eq!(host.local_player().name, "Player00");
+        assert_eq!(guest.local_player().name, "Player08");
+        assert_eq!(host.pre_fill_house_roster, guest.pre_fill_house_roster);
+        let host_order: Vec<_> = normalized_launch_slots(&host)
+            .into_iter()
+            .map(|slot| slot.owner_name)
+            .collect();
+        let guest_order: Vec<_> = normalized_launch_slots(&guest)
+            .into_iter()
+            .map(|slot| slot.owner_name)
+            .collect();
+        assert_eq!(host_order, guest_order);
+        let rules = techno_constructor_start_rules();
+        let worlds: Vec<_> = [host, guest]
+            .into_iter()
+            .map(|session| {
+                let descriptor = MatchLaunchDescriptor::from_resolved(session).unwrap();
+                let mut sim = Simulation::with_seed(73);
+                sim.session
+                    .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Lan);
+                initialize_skirmish_launch_houses(
+                    &mut sim,
+                    &HouseRoster::default(),
+                    &rules,
+                    &descriptor,
+                );
+                sim
+            })
+            .collect();
+        assert_eq!(worlds[0].houses.len(), 32);
+        for name in host_order {
+            assert_eq!(worlds[0].interner.get(&name), worlds[1].interner.get(&name));
+        }
+        assert_ne!(
+            worlds[0].session.current_house(),
+            worlds[1].session.current_house()
+        );
+        assert_eq!(worlds[0].state_hash(), worlds[1].state_hash());
     }
 
     #[test]
@@ -4850,6 +5534,37 @@ mod tests {
     }
 
     #[test]
+    fn scenario_prefix_declared_thirty_starts_preserves_two_player_start29() {
+        let mut source = String::from(
+            "[Basic]\nMaxPlayers=30\n[Map]\nSize=0,0,64,64\nLocalSize=0,0,64,64\n[Waypoints]\n",
+        );
+        for index in 0..30 {
+            source.push_str(&format!("{index}={}\n", 30030 + index));
+        }
+        source.push_str("[IsoMapPack5]\n1=CAAEABUAAAAAEQAA\n");
+        let map = MapFile::from_bytes(source.as_bytes()).unwrap();
+        let mut session = one_player_battle_launch("THIRTY.MAP").session().clone();
+        session.humans[0].slot.start_position = LaunchStartPosition::Position(0);
+        let mut guest = session.humans[0].clone();
+        guest.name = "Guest".into();
+        guest.raw_slot_index = Some(1);
+        guest.slot.color_index = 1;
+        guest.slot.start_position = LaunchStartPosition::Position(29);
+        session.humans.push(guest);
+        session.rebuild_house_roster();
+        let launch = MatchLaunchDescriptor::from_resolved(session).unwrap();
+        let plan =
+            prepare_stock_offline_scenario_prefix_plan(&launch, &map, &map.waypoints, 17).unwrap();
+        assert_eq!(plan.first_gathered_starts().len(), 30);
+        assert_eq!(plan.final_gathered_starts().len(), 30);
+        assert_eq!(plan.assignment().placements[1].1, map.waypoints[&29]);
+        assert_eq!(
+            plan.rng_checkpoints().after_first_house_pass,
+            plan.rng_checkpoints().after_second_gather_and_chooser
+        );
+    }
+
+    #[test]
     fn scenario_prefix_sparse_waypoints_preserve_only_entries_below_target() {
         let map = prefix_map_with_starts(&[]);
         let starts = HashMap::from([
@@ -4872,8 +5587,7 @@ mod tests {
         ]);
         let mut target_two_rng = SimRng::new(0x5200);
         let target_two =
-            native_gather_pre_fill_start_positions(&starts, 2, &map.header, &mut target_two_rng)
-                .unwrap();
+            native_gather_pre_fill_start_positions(&starts, 2, &map, &mut target_two_rng).unwrap();
         assert_eq!(target_two.len(), 2);
         assert_eq!((target_two[0].rx, target_two[0].ry), (30, 30));
         assert!(
@@ -4884,7 +5598,7 @@ mod tests {
 
         let mut target_three_rng = SimRng::new(0x5200);
         let target_three =
-            native_gather_pre_fill_start_positions(&starts, 3, &map.header, &mut target_three_rng)
+            native_gather_pre_fill_start_positions(&starts, 3, &map, &mut target_three_rng)
                 .unwrap();
         assert_eq!(target_three.len(), 3);
         assert_eq!((target_three[0].rx, target_three[0].ry), (30, 30));

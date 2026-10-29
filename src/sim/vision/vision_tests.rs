@@ -977,11 +977,9 @@ fn a_gap_event_asks_the_generators_house_about_the_viewer() {
     assert!(!covered("Americans", "Soviet"));
 }
 
-/// Materializing a viewer's retained deposits asks from each generator's house
-/// as the event did: only the generator's alliance with the viewer projects
-/// the friendly gap fog.
+/// The gap event asks from the generator's house, as6FB3DA does.
 #[test]
-fn materialized_gap_fog_asks_the_generators_house_about_the_viewer() {
+fn gap_fog_asks_the_generators_house_about_the_viewer() {
     let viewer = intern::test_intern("Soviet");
     let gapper = intern::test_intern("Americans");
     let interner = ti();
@@ -1003,16 +1001,85 @@ fn materialized_gap_fog_asks_the_generators_house_about_the_viewer() {
             asker.to_ascii_uppercase(),
             [other.to_ascii_uppercase()].into(),
         )]);
-        materialize_gap_generator_sources(
+        publish_gap_generator_event(
             &mut fog,
             &alliances,
-            &BTreeMap::from([(viewer, vec![source])]),
+            viewer,
+            source,
+            true,
+            false,
             &interner,
+            &Default::default(),
         );
         fog.is_cell_gap_fog(viewer, 30, 35)
     };
     assert!(fogged("Americans", "Soviet"));
     assert!(!fogged("Soviet", "Americans"));
+}
+
+/// The hostile-admission gate also reads the viewer's defeat:
+/// `0x006FB2E3..0x006FB2F1` reads PlayerPtr+0x1F5 (`MPlayer_Defeated`) and
+/// jumps to `0x006FB3C1`, the friendly Cell+0x13C leaf. A defeated viewer
+/// takes the allied treatment under the same hostile source that shrouds a
+/// live viewer; a defeated allied viewer keeps the pre-gate projection.
+#[test]
+fn defeated_viewer_takes_the_allied_fog_projection_instead_of_shroud() {
+    let viewer = intern::test_intern("Soviet");
+    let gapper = intern::test_intern("Americans");
+    let interner = ti();
+    let source = GapGeneratorSource {
+        stable_id: 1,
+        owner: gapper,
+        rx: 30,
+        ry: 30,
+        radius: 10,
+    };
+    let projection = |allied: bool, defeated: bool| {
+        let mut fog = FogState {
+            width: 64,
+            height: 64,
+            ..Default::default()
+        };
+        fog.mark_visible_for_owner(viewer, 30, 35);
+        let alliances = if allied {
+            HouseAllianceMap::from([(
+                "AMERICANS".to_ascii_uppercase(),
+                ["SOVIET".to_ascii_uppercase()].into(),
+            )])
+        } else {
+            HouseAllianceMap::new()
+        };
+        let defeated_viewers = if defeated {
+            std::collections::BTreeSet::from([viewer])
+        } else {
+            Default::default()
+        };
+        apply_gap_generator_sources_with_spy_sat(
+            &mut fog,
+            &alliances,
+            &[source],
+            &interner,
+            &std::collections::BTreeSet::new(),
+            &defeated_viewers,
+        );
+        fog
+    };
+
+    // Defeated hostile viewer: the 0x006FB3C1 friendly projection; the view
+    // itself stays open.
+    let defeated = projection(false, true);
+    assert!(defeated.is_cell_gap_fog(viewer, 30, 35));
+    assert!(!defeated.is_cell_gap_covered(viewer, 30, 35));
+    assert!(defeated.is_cell_visible(viewer, 30, 35));
+    // Control: the same hostile source covers a live viewer.
+    let alive = projection(false, false);
+    assert!(!alive.is_cell_gap_fog(viewer, 30, 35));
+    assert!(alive.is_cell_gap_covered(viewer, 30, 35));
+    assert!(!alive.is_cell_visible(viewer, 30, 35));
+    // A defeated allied viewer stays exactly on today's allied projection.
+    let allied = projection(true, true);
+    assert!(allied.is_cell_gap_fog(viewer, 30, 35));
+    assert!(!allied.is_cell_gap_covered(viewer, 30, 35));
 }
 
 /// With height-LOS enabled but perfectly flat terrain, reveal must be identical to
@@ -1469,6 +1536,7 @@ fn shroud_current_sight_matches_original_native_sequences() {
                         &sources,
                         &interner,
                         &map_clear,
+                        &std::collections::BTreeSet::new(),
                     );
                 }
                 frame if frame.starts_with("frame") => {

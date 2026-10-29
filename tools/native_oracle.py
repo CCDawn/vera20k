@@ -12,6 +12,7 @@ from collections import deque
 from functools import lru_cache
 import hashlib
 import gzip
+import inspect
 import io
 import json
 import os
@@ -47,6 +48,27 @@ class OracleError(RuntimeError):
 
 class OracleMismatch(OracleError):
     """A comparison ran, and its native output or evidence differs from the reference."""
+
+
+def require(condition, message: str) -> None:
+    """A fixture or observation check that `python -O` cannot remove."""
+    if not condition:
+        raise OracleError(message)
+
+
+def edited_source(function, *edits: tuple[str, str]) -> str:
+    """`function`'s source with each (anchor, replacement) applied in order.
+
+    For harnesses that adapt a shared Python fixture in memory before exec: an
+    anchor that is missing or repeated fails instead of leaving the old setup.
+    """
+    source = inspect.getsource(function)
+    for anchor, replacement in edits:
+        count = source.count(anchor)
+        require(count == 1, f"{function.__qualname__}: fixture edit anchor occurs "
+                            f"{count} times: {anchor!r}")
+        source = source.replace(anchor, replacement)
+    return source
 
 
 class NativeCallTrace:

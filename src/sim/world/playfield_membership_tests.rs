@@ -124,7 +124,7 @@ fn reinforcement_scene(
     sim.install_team_ai_registry(&registry, &retail.rules)
         .unwrap();
     sim.session.install_waypoints(&map.waypoints);
-    sim.initialize_trigger_definitions(&map, &registry, None, None);
+    sim.initialize_trigger_definitions(&map, &registry, None, None, None);
     sim.classify_map_triggers(&retail.rules);
     sim.advance_triggers(&retail.rules, Some(&overlays), FrameEffects::default());
     let actor = sim

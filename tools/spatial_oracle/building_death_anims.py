@@ -73,6 +73,7 @@ from pathlib import Path
 from unicorn.x86_const import UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_ESI, UC_X86_REG_ESP
 
 from tools.native_oracle import finish_vectors, provenance, run_checked
+from tools.native_oracle import require
 from tools.spatial_oracle import anim_bouncer_launch as launch
 from tools.spatial_oracle import smudge_can_place
 from tools.spatial_oracle.anim_bouncer_launch import dwords
@@ -2179,7 +2180,7 @@ def constructed_cancellation_execute(inputs, mode):
         invoke('factory_vector_original_startup',0x4E6E60,0)
         factory=f.allocate(0x80)
         invoke('factory_original_constructor',0x4C98B0,factory)
-        assert invoke('original_start_production_gapowr',0x4C9C70,factory,f.types['GAPOWR'],owner,0)&255==1
+        require(invoke('original_start_production_gapowr',0x4C9C70,factory,f.types['GAPOWR'],owner,0)&255==1, 'native 0x4C9C70 returned an unexpected result')
         product=read(factory+0x58)
         assert product and read(product+0x520)==f.types['GAPOWR']
         type_kind=invoke('original_building_type_rtti',read(read(f.types['GAPOWR'])+0x2C),f.types['GAPOWR'])
@@ -2562,7 +2563,7 @@ def wall_autofill_execute(inputs, control):
             p = invoke(f'setup_wall_{index}_create', 0x45E880, typ, owner)
             coord = f.allocate(12)
             u.mem_write(coord, dwords(xy[0] * 256 + 128, xy[1] * 256 + 128, 0))
-            assert invoke(f'setup_wall_{index}_unlimbo', 0x440580, p, coord, 0) & 255 == 1
+            require(invoke(f'setup_wall_{index}_unlimbo', 0x440580, p, coord, 0) & 255 == 1, 'native 0x440580 returned an unexpected result')
             if index + 1 == len(endpoints):
                 invoke('setup_endpoint_deferred_drain', 0x725C70, 0)
                 assert read(0xB0F6A8) == 0
@@ -3112,7 +3113,7 @@ def grapple_fixture(inputs, root, *, seed=1, drone=False, start_attached=True):
         # FacingClass::Current4C93D0 returns the supplied DirStruct pointer;
         # Parasite helper629736 passes output storage, then reads that DWORD.
         current=f.allocate(4);u.mem_write(current,dwords(0))
-        assert bc.invoke(u,0x4C93D0,p+0x388,current)==current
+        require(bc.invoke(u,0x4C93D0,p+0x388,current)==current, 'native 0x4C93D0 returned an unexpected result')
         result=dict(native_id=read(p+0x10),alive=u.mem_read(p+0x90,1)[0],
             limbo=u.mem_read(p+0x81,1)[0],health=read(p+0x6C),
             location=list(struct.unpack('<3i',u.mem_read(p+0x9C,12))),
@@ -3121,7 +3122,7 @@ def grapple_fixture(inputs, root, *, seed=1, drone=False, start_attached=True):
             primary_facing_hex=bytes(u.mem_read(p+0x388,20)).hex(),
             primary_current_raw=read(current))
         if drone:
-            assert bc.invoke(u,0x4C93D0,p+0x3A0,current)==current
+            require(bc.invoke(u,0x4C93D0,p+0x3A0,current)==current, 'native 0x4C93D0 returned an unexpected result')
             result.update(secondary_current_raw=read(current),secondary_facing_hex=bytes(u.mem_read(p+0x3A0,20)).hex())
         return result
     def manager_timers(p):
@@ -3511,7 +3512,7 @@ def suicide_fire_execute(inputs, *, ordinary=False, wounded=False, seed=31):
     hooks=[u.hook_add(UC_HOOK_CODE,observe),u.hook_add(UC_HOOK_MEM_WRITE,written)]
     try:
         playfield=f.allocate(12);u.mem_write(playfield,dwords(*coords(actor+0x9C)))
-        assert bc.invoke(u,0x568350,0x87F7E8,playfield)&255==1
+        require(bc.invoke(u,0x568350,0x87F7E8,playfield)&255==1, 'native 0x568350 returned an unexpected result')
         boundary('before_preparation')
         preparation=None
         if wounded:

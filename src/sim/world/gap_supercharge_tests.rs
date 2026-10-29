@@ -11,6 +11,10 @@ use crate::sim::pathfinding::PathGrid;
 
 fn arena(rules: &RuleSet) -> (Simulation, PathGrid, InternedId) {
     let mut sim = Simulation::with_seed(0x44E2BE);
+    // This arena consumes Battle-mode rules; supply its noncampaign session
+    // instead of inheriting the synthetic campaign default.
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Skirmish);
     for (name, human) in [("Russians", false), ("Americans", true)] {
         let id = sim.interner.intern(name);
         sim.houses
@@ -20,6 +24,9 @@ fn arena(rules: &RuleSet) -> (Simulation, PathGrid, InternedId) {
     sim.intern_rule_type_ids(rules);
     sim.resolve_type_handles(rules);
     let owner = sim.interner.get("Americans").unwrap();
+    // Bind the actual human viewer and map before Unlimbo.
+    sim.session.set_current_house_for_test(Some(owner));
+    sim.fog = vision::FogState::new(32, 32);
     (sim, grid, owner)
 }
 
@@ -344,6 +351,13 @@ fn an_allied_current_house_without_the_gap_keeps_the_charge_through_the_outage()
     let deposits = viewers(&sim);
     assert!(deposits[&owner].active(), "the owner's copy is re-added");
     assert!(!deposits[&player].active(), "the new ally's copy stays 0");
+
+    // Native allied-Building branches4ADFB9/4ADE1C refresh sight only.
+    // A later map reset/reveal must not activate that client's gap copy.
+    sim.reset_shroud_for_owner(player, rules);
+    sim.reveal_map_for_owner(player, rules);
+    assert!(!viewers(&sim)[&player].active());
+    assert!(!sim.fog.is_cell_gap_fog(player, 16, 26));
 
     for x in 0..10 {
         spawn(&mut sim, "GAGAP", 2 + 2 * x, 20);

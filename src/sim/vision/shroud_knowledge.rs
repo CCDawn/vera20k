@@ -10,6 +10,9 @@ use std::hash::{Hash, Hasher};
 pub(crate) struct ShroudKnowledge {
     counter: i32,
     gap_counter: i32,
+    /// Cell+13C, initialized to zero by CellClass47BD50. Source: gamemd.exe.
+    /// Unlike +134, map reveal/reset stores preserve this signed counter.
+    friendly_gap_counter: i32,
     open: bool,
     pending: bool,
     local_sources: u32,
@@ -21,6 +24,7 @@ impl Default for ShroudKnowledge {
         Self {
             counter: 1,
             gap_counter: 0,
+            friendly_gap_counter: 0,
             open: false,
             pending: false,
             local_sources: 0,
@@ -39,6 +43,21 @@ impl ShroudKnowledge {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn gap_counter(&self) -> i32 {
         self.gap_counter
+    }
+
+    pub(crate) fn friendly_gap_counter(&self) -> i32 {
+        self.friendly_gap_counter
+    }
+
+    /// CreateGap6FB408..414 / DestroyGap6FB6E5..6F1 use wrapping INC/DEC,
+    /// including removal after a hostile activation and a later defeat.
+    /// Source: original gamemd.exe instructions; no saturation or receipt gate.
+    pub(super) fn count_friendly_gap(&mut self, active: bool) {
+        self.friendly_gap_counter = if active {
+            self.friendly_gap_counter.wrapping_add(1)
+        } else {
+            self.friendly_gap_counter.wrapping_sub(1)
+        };
     }
 
     /// Mapped.
@@ -68,7 +87,7 @@ impl ShroudKnowledge {
     /// The published flags of this cell (the projection's `FLAG_*` bits).
     pub(super) fn published_flags(&self) -> u8 {
         use super::{
-            FLAG_EFFECTIVE_GAP_SIGHT, FLAG_GAP_COVERED, FLAG_HOSTILE_GAP_PRESENT,
+            FLAG_EFFECTIVE_GAP_SIGHT, FLAG_GAP_COVERED, FLAG_GAP_FOG, FLAG_HOSTILE_GAP_PRESENT,
             FLAG_PENDING_GAP_CONCEAL, FLAG_REVEALED, FLAG_SUSTAINED_SIGHT, FLAG_VISIBLE,
         };
         let mut flags = 0;
@@ -94,6 +113,10 @@ impl ShroudKnowledge {
             if !self.open {
                 flags |= FLAG_GAP_COVERED;
             }
+        }
+        // IsFogged58652E..586536 takes JLE for Cell+13C <= 0.
+        if self.friendly_gap_counter > 0 {
+            flags |= FLAG_GAP_FOG;
         }
         flags
     }
@@ -222,12 +245,13 @@ impl ShroudKnowledge {
         self.transient_visible = value;
     }
 
-    /// This cell's state hash record: the four counters little-endian, then
-    /// the flags.
+    /// The established sight/shroud hash prefix: four counters and flags.
+    /// OwnerVisibility hashes the retained friendly gap plane separately.
     pub(super) fn hash_record(&self) -> [u8; 17] {
         let Self {
             counter,
             gap_counter,
+            friendly_gap_counter: _,
             open,
             pending,
             local_sources,

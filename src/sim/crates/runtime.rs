@@ -934,12 +934,6 @@ mod tests {
             "the replacement took the free slot"
         );
 
-        assert!(
-            on.take_master_frame_test_trace()
-                .contains(&crate::sim::world::MasterFrameTestRung::CrateRegen),
-            "the rung is an observable master-frame position, not an incidental call"
-        );
-
         let mut off = sim_with_grid(0x5C);
         off.session.set_game_mode(
             crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),

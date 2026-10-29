@@ -4,10 +4,9 @@
 
 use crate::rules::ini_parser::ini_value::{crt_atoi, scan_hex_u32, strtok};
 use crate::ui::shell::button::ShellButtonInteraction;
-use crate::ui::shell::combobox::ComboPopup;
+use crate::ui::shell::combobox::{ComboPopup, ComboPopupInteraction};
 use crate::ui::shell::descriptor::DialogId;
 use crate::ui::shell::geom::{RectPx, ShellScale, center_offset, child_window, dlu_rect};
-use crate::ui::shell::list::ListScrollInteraction;
 use crate::ui::shell::menu_page::{self, MenuPageButtonSpec, MenuPageLayout, MenuPageSpec};
 use crate::ui::skirmish_shell::{COMBO_FACE_H, SavedSeedDescriptionEdit};
 
@@ -115,11 +114,9 @@ pub(crate) struct NetworkOptionsState {
     pub(crate) send_delay: bool,
     pub(crate) buttons: ShellButtonInteraction<u16>,
     pub(crate) focused_control: u16,
-    pub(crate) combo_open: bool,
-    pub(crate) card_top_index: usize,
-    pub(crate) card_hot_row: Option<usize>,
-    pub(crate) card_scroll: ListScrollInteraction,
-    focus_started_at: std::time::Instant,
+    /// The adapter combo's open list.
+    pub(crate) popup: ComboPopupInteraction<()>,
+    focus_started_at: crate::util::time::Instant,
     original_send_delay: bool,
     original_port: i32,
     phase: Phase,
@@ -128,7 +125,7 @@ pub(crate) struct NetworkOptionsState {
 impl NetworkOptionsState {
     pub(crate) fn cancel_pointer(&mut self) {
         self.buttons = ShellButtonInteraction::default();
-        self.card_scroll.cancel();
+        self.popup.cancel_pointer();
     }
 
     pub(crate) fn new(
@@ -177,11 +174,8 @@ impl NetworkOptionsState {
             send_delay,
             buttons: ShellButtonInteraction::default(),
             focused_control: PORT,
-            combo_open: false,
-            card_top_index: 0,
-            card_hot_row: None,
-            card_scroll: ListScrollInteraction::default(),
-            focus_started_at: std::time::Instant::now(),
+            popup: ComboPopupInteraction::default(),
+            focus_started_at: crate::util::time::Instant::now(),
             original_send_delay: send_delay,
             original_port: port,
             phase: Phase::Editing,
@@ -195,7 +189,7 @@ impl NetworkOptionsState {
             return;
         }
         if self.focused_control != control {
-            self.focus_started_at = std::time::Instant::now();
+            self.focus_started_at = crate::util::time::Instant::now();
         }
         self.focused_control = control;
         self.socket.focused = control == SOCKET;
@@ -204,7 +198,7 @@ impl NetworkOptionsState {
     }
 
     /// NewEdit's focus handler clears its phase, then toggles every 1000 ms.
-    pub(crate) fn caret_visible(&self, now: std::time::Instant) -> bool {
+    pub(crate) fn caret_visible(&self, now: crate::util::time::Instant) -> bool {
         now.saturating_duration_since(self.focus_started_at)
             .as_secs()
             % 2
@@ -251,20 +245,17 @@ impl NetworkOptionsState {
         if index < self.cards.len().max(1) {
             self.selected_card = index;
         }
-        self.combo_open = false;
-        self.card_scroll.cancel();
+        self.popup.close();
     }
 
     pub(crate) fn card_popup(&self, layout: &NetworkOptionsLayout) -> Option<ComboPopup> {
-        if !self.combo_open {
-            return None;
-        }
+        self.popup.control?;
         Some(ComboPopup::new(
             layout.card,
             layout.page.scale,
             self.cards.len().max(1),
             CARD_VISIBLE_ROWS,
-            self.card_top_index,
+            self.popup.top_index,
         ))
     }
 
@@ -286,7 +277,7 @@ impl NetworkOptionsState {
         if self.phase != Phase::Editing {
             return Vec::new();
         }
-        self.combo_open = false;
+        self.popup.close();
         let socket_text = self.socket.narrow_text(16);
         let socket = if socket_text.is_empty() {
             u16::MAX
@@ -481,13 +472,13 @@ mod tests {
     #[test]
     fn tab_cycles_edits_without_dismissing_the_adapter_popup() {
         let mut state = fresh();
-        state.combo_open = true;
+        state.popup.open((), None);
         state.cycle_focus(false);
         assert_eq!(state.focused_control, SOCKET);
-        assert!(state.combo_open);
+        assert!(state.popup.control.is_some());
         state.cycle_focus(true);
         assert_eq!(state.focused_control, PORT);
-        assert!(state.combo_open);
+        assert!(state.popup.control.is_some());
     }
 
     #[test]

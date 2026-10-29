@@ -20,6 +20,7 @@ Thumbs.db
 *.txt
 !tools/requirements-test.txt
 !tools/telemetry-dashboard/vendor/THREE-LICENSE.txt
+!/LICENSES/*.txt
 !.github/release/macos/requirements.txt
 !.github/release/icon.png
 *.tmp
@@ -37,15 +38,38 @@ Thumbs.db
 
 /docs/*
 !/docs/capabilities.md
+!/docs/wasm.md
 !/docs/ares.md
+!/docs/ares-side-defaults.md
+!/docs/ares-country-presentation.md
+!/docs/ares-country-paradrop.md
+!/docs/ares-country-powerplants.md
 !/docs/phobos.md
 !/docs/phobos-custom-radiation.md
 !/docs/phobos-superweapon-technos.md
 !/docs/phobos-ore-spawners.md
 !/docs/phobos-harvester-gather-animations.md
 !/docs/phobos-hide-if-no-ore-threshold.md
+!/docs/phobos-digital-display.md
+!/docs/phobos-placement-preview.md
+!/docs/phobos-sidebar-gdi.md
+!/docs/phobos-infantry-auto-deploy.md
+!/docs/phobos-fly-no-wobbles.md
+!/docs/phobos-center-pause-menu.md
+!/docs/phobos-timer-blink-color.md
+!/docs/phobos-missing-cameo.md
+!/docs/phobos-power-plant-enhancer.md
+!/docs/phobos-building-queue.md
+!/docs/phobos-ai-dehardcode.md
+!/docs/phobos-parallel-ai-queues.md
+!/docs/phobos-skirmish-unlimited-colors.md
+!/docs/phobos-superweapon-sidebar.md
+!/docs/phobos-prone-speed.md
+!/docs/phobos-building-type-selectable.md
 !/docs/npatch.md
+!/docs/verax.md
 !/docs/ares-generic-warhead.md
+!/docs/ares-hunter-seeker.md
 !/docs/ini-roots.md
 !/docs/personal-rules.md
 !/docs/_config.yml
@@ -68,6 +92,8 @@ Thumbs.db
 !/docs/images/**
 
 .mcp.json
+# Cloudflare CLI cache: holds the account ID and email wherever `cf` runs.
+.cloudflare/
 /.claude/*
 !/.claude/skills/
 /.claude/skills/ghidra-up/
@@ -88,6 +114,7 @@ tools/vendor-eval/
 !/README.zh-CN.md
 !/README.ar.md
 !/README.es.md
+!/README.ja.md
 !/README.ru.md
 !/README.th.md
 !/README.tr.md

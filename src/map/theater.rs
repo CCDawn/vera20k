@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use crate::assets::asset_manager::AssetManager;
 use crate::assets::pal_file::Palette;
 use crate::assets::tmp_file::TmpFile;
+use crate::map::bridge_rim_tiles::HighBridgeRimTiles;
 use crate::map::map_file::MapError;
 use crate::rules::ini_parser::{IniFile, IniSection};
 
@@ -343,6 +344,9 @@ pub struct TilesetLookup {
     /// Per-tileset AllowTiberium= flag — parsed from `[TileSetNNNN] AllowTiberium=`.
     /// Default `false`. Tiberium/ore only places on opt-in in-range tile types.
     allow_tiberium_flags: Vec<bool>,
+    /// Per-tileset IsometricTileTypeClass+0x2E1 (`ShadowCaster` with a
+    /// nonzero `ShadowTiles`); see [`TilesetLookup::casts_tile_shadow`].
+    shadow_caster_flags: Vec<bool>,
     /// tile_id → terrain animation attachment, parallel to `entries`.
     /// `None` means the tile declared no `Tile%02dAnim`, matching the tile
     /// type's -1 animation index.
@@ -471,6 +475,17 @@ impl TilesetLookup {
             .unwrap_or(false)
     }
 
+    /// IsometricTileTypeClass+0x2E1, the gate of the tile-shadow draw
+    /// (CellClass::DrawTileShadow `0x004802A0`) and of the shadow-cell offsets
+    /// RecalcAttributes applies (GetShadowCellOffsets `0x00547C80`, called at
+    /// `0x0047DAA2`). Missing tilesets and out-of-range tile ids are false.
+    pub fn casts_tile_shadow(&self, tile_id: u16) -> bool {
+        self.tileset_index(tile_id)
+            .and_then(|idx| self.shadow_caster_flags.get(usize::from(idx)))
+            .copied()
+            .unwrap_or(false)
+    }
+
     /// Translate one raw IsoMap tile index through the active theater's
     /// declaration-ordered `LastTilesInSet` compatibility records.
     ///
@@ -533,6 +548,7 @@ fn parse_tileset_sections(ini: &IniFile, extension: &str) -> Result<TilesetLooku
     let mut set_names: Vec<String> = Vec::new();
     let mut morphable_flags: Vec<bool> = Vec::new();
     let mut allow_tiberium_flags: Vec<bool> = Vec::new();
+    let mut shadow_caster_flags: Vec<bool> = Vec::new();
     let mut tile_anims: Vec<Option<TileAnimAttachment>> = Vec::new();
     let mut legacy_tile_index_exceptions = Vec::new();
     let mut actual_cursor = 0i32;
@@ -586,6 +602,14 @@ fn parse_tileset_sections(ini: &IniFile, extension: &str) -> Result<TilesetLooku
         morphable_flags.push(morphable);
         let allow_tiberium: bool = section.read_bool("AllowTiberium", false);
         allow_tiberium_flags.push(allow_tiberium);
+        // ReadBool `0x00546204` (default false); only a set ShadowCaster reads
+        // ShadowTiles (ReadInt `0x00546248`, default 0). Each tile stores
+        // +0x2E1 only when both are nonzero (`0x005464A6`, `0x00546AF8`). The
+        // set's base also joins the 0xAA102C list `0x0054621C`, which only
+        // +0x2E1 tiles consult.
+        shadow_caster_flags.push(
+            section.read_bool("ShadowCaster", false) && section.read_int("ShadowTiles", 0) != 0,
+        );
 
         // Diagnostic: log ALL tileset TilesInSet values for debugging.
         log::debug!(
@@ -666,6 +690,7 @@ fn parse_tileset_sections(ini: &IniFile, extension: &str) -> Result<TilesetLooku
         set_names,
         morphable_flags,
         allow_tiberium_flags,
+        shadow_caster_flags,
         tile_anims,
         legacy_tile_index_exceptions,
     })
@@ -708,6 +733,14 @@ pub fn theater_extension(name: &str) -> Option<&'static str> {
     theater_def(name).map(|def| def.extension)
 }
 
+/// Every active-YR theater as `(name, TMP extension)`, e.g.
+/// `("TEMPERATE", "tem")`, in definition order.
+pub fn theater_names_and_extensions() -> impl Iterator<Item = (&'static str, &'static str)> {
+    THEATER_DEFS
+        .iter()
+        .map(|(name, def)| (*name, def.extension))
+}
+
 /// Look up the theater definition for a theater name (e.g., "TEMPERATE").
 fn theater_def(name: &str) -> Option<&'static TheaterDef> {
     let upper: String = name.to_ascii_uppercase();
@@ -728,7 +761,8 @@ pub struct TheaterData {
     pub tiberium_palette: Palette,
     /// File extension for TMP files (e.g., "tem").
     pub extension: &'static str,
-    /// Raw INI bytes (needed by LAT config parsing).
+    /// Raw INI bytes, retained as content identity. `load_theater` reads
+    /// every consumed key; nothing re-parses them.
     pub ini_data: Vec<u8>,
     /// Tileset index for concrete/stone bridgehead tiles (BridgeSet= in theater INI).
     pub bridge_set: Option<u16>,
@@ -736,12 +770,9 @@ pub struct TheaterData {
     pub wood_bridge_set: Option<u16>,
     /// `[General] SlopeSetPieces=N` - TileSet section whose first tile becomes DAT_00ABC1F8.
     pub slope_set_pieces: Option<u16>,
-    /// `[General] BridgeMiddle1=N` — BridgeSet-relative offset for the NS
-    /// bridgehead variant block. The 4 NS variant tile_ids occupy
-    /// `BridgeSet_start + {N-1, N, N+1, N+2}`. None if the key is absent.
-    pub bridge_middle_1: Option<u16>,
-    /// `[General] BridgeMiddle2=N` — same for EW.
-    pub bridge_middle_2: Option<u16>,
+    /// The ten signed `[General] Bridge*` piece keys with the published
+    /// BridgeSet tile base, as native keeps them.
+    pub high_bridge_rim_tiles: HighBridgeRimTiles,
     /// `[General] Tunnels=N` - theater tile set for tunnel/low-bridge tube cells.
     #[cfg(any(test, feature = "test-support"))]
     pub tunnels: Option<u16>,
@@ -764,6 +795,17 @@ pub struct TheaterData {
     pub rmg_tiles: RmgTileKeys,
 }
 
+impl TheaterData {
+    /// `BridgeMiddle1/2` as tile-index offsets: the NS (EW) bridgehead variant
+    /// block occupies `BridgeSet_start + {N-1, N, N+1, N+2}`. Negative and
+    /// oversized signed keys have no u16 tile identity and are None.
+    pub fn bridge_middles(&self) -> [Option<u16>; 2] {
+        self.high_bridge_rim_tiles
+            .middle
+            .map(|key| u16::try_from(key).ok())
+    }
+}
+
 /// Every BridgeMiddle1/2 tile a live bridge publication can write, for the
 /// tile atlas pre-load. Relative to each family's tileset base (BridgeSet,
 /// WoodBridgeSet), a middle variant `v` is `base + key - 1 + v`: damage
@@ -778,7 +820,8 @@ impl BridgeMiddleTiles {
     /// None without BridgeMiddle1/2 or without either family's tileset.
     /// Variants past the end of the tileset lookup are omitted.
     pub fn from_theater(td: &TheaterData) -> Option<Self> {
-        let keys = [td.bridge_middle_1?, td.bridge_middle_2?];
+        let [middle_1, middle_2] = td.bridge_middles();
+        let keys = [middle_1?, middle_2?];
         let max_tile = td.lookup.len() as u32;
         let mut tile_ids = Vec::new();
         for set in [td.bridge_set, td.wood_bridge_set].into_iter().flatten() {
@@ -849,14 +892,12 @@ pub fn load_theater(asset_manager: &mut AssetManager, theater_name: &str) -> Opt
     .unwrap_or_else(native_missing_theater_palette);
 
     // Original ReadTheater545150 reads these from the same General section
-    // as the signed repair/rim owner. These u16 fields are bounded tile-index
-    // projections; HighBridgeRimTiles independently retains signed values.
+    // as the signed bridge piece keys below. These u16 fields are bounded
+    // tile-index projections.
     let general = ini.section("General");
     let mut bridge_set = read_general_u16(general, "BridgeSet");
     let mut wood_bridge_set = read_general_u16(general, "WoodBridgeSet");
     let slope_set_pieces = read_general_u16(general, "SlopeSetPieces");
-    let bridge_middle_1 = read_general_u16(general, "BridgeMiddle1");
-    let bridge_middle_2 = read_general_u16(general, "BridgeMiddle2");
     let tunnels = read_general_u16(general, "Tunnels");
     let track_tunnels = read_general_u16(general, "TrackTunnels");
     let dirt_tunnels = read_general_u16(general, "DirtTunnels");
@@ -876,6 +917,36 @@ pub fn load_theater(asset_manager: &mut AssetManager, theater_name: &str) -> Opt
         &mut cliff_ranges,
         &mut rmg_tiles,
     );
+    let high_bridge_rim_tiles = HighBridgeRimTiles::read(
+        bridge_set
+            .and_then(|set| lookup.bounds().get(usize::from(set)))
+            .map_or(-1, |bounds| i32::from(bounds.start)),
+        general,
+    );
+    let theater = TheaterData {
+        lookup,
+        iso_palette,
+        unit_palette,
+        tiberium_palette,
+        extension: def.extension,
+        ini_data,
+        bridge_set,
+        wood_bridge_set,
+        slope_set_pieces,
+        high_bridge_rim_tiles,
+        #[cfg(any(test, feature = "test-support"))]
+        tunnels,
+        #[cfg(any(test, feature = "test-support"))]
+        track_tunnels,
+        #[cfg(any(test, feature = "test-support"))]
+        dirt_tunnels,
+        #[cfg(any(test, feature = "test-support"))]
+        dirt_track_tunnels,
+        automatic_tube_bases,
+        cliff_ranges,
+        rmg_tiles,
+    };
+    let [bridge_middle_1, bridge_middle_2] = theater.bridge_middles();
     if bridge_set.is_some() || wood_bridge_set.is_some() {
         log::info!(
             "Theater {}: BridgeSet={:?}, WoodBridgeSet={:?}, BridgeMiddle={:?}/{:?}, Tunnels={:?}/{:?}/{:?}/{:?}",
@@ -906,30 +977,7 @@ pub fn load_theater(asset_manager: &mut AssetManager, theater_name: &str) -> Opt
         );
     }
 
-    Some(TheaterData {
-        lookup,
-        iso_palette,
-        unit_palette,
-        tiberium_palette,
-        extension: def.extension,
-        ini_data,
-        bridge_set,
-        wood_bridge_set,
-        slope_set_pieces,
-        bridge_middle_1,
-        bridge_middle_2,
-        #[cfg(any(test, feature = "test-support"))]
-        tunnels,
-        #[cfg(any(test, feature = "test-support"))]
-        track_tunnels,
-        #[cfg(any(test, feature = "test-support"))]
-        dirt_tunnels,
-        #[cfg(any(test, feature = "test-support"))]
-        dirt_track_tunnels,
-        automatic_tube_bases,
-        cliff_ranges,
-        rmg_tiles,
-    })
+    Some(theater)
 }
 
 /// The stock corpus stops at `g`. The alphabet-wide cap is deliberately well
@@ -1090,8 +1138,8 @@ fn apply_lunar_global_zeroing(
 }
 
 /// Checked tile-index projection; absent, negative and out-of-range values
-/// have no representable u16 tile identity. Native signed repair keys remain
-/// owned by HighBridgeRimTiles and must not be reconstructed from this view.
+/// have no representable u16 tile identity. The signed bridge piece keys stay
+/// in HighBridgeRimTiles and must not be reconstructed from this view.
 fn read_general_u16(general: Option<&IniSection>, key: &str) -> Option<u16> {
     u16::try_from(general?.read_int(key, -1)).ok()
 }

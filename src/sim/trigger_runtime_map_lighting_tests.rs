@@ -13,7 +13,7 @@ fn native() -> &'static Value {
 }
 
 fn run(sim: &mut Simulation, rules: &RuleSet, entry: crate::map::actions::ActionEntry) -> bool {
-    let action = RuntimeDefinitions::default().resolve_action(entry, None, None);
+    let action = RuntimeDefinitions::default().resolve_action(entry, None, None, None);
     sim.apply_live_trigger_action(
         &action,
         TriggerActionContext {

@@ -8,7 +8,7 @@ use crate::sim::command::Command;
 use crate::sim::house_state::HouseState;
 use crate::sim::runtime::{SimResources, SimRuntime};
 use crate::sim::snapshot::GameSnapshot;
-use crate::sim::world::{CellActionQuery, MasterFrameTestRung, MoveAction, TickLane};
+use crate::sim::world::{CellActionQuery, FrameStep, MoveAction, TickLane};
 
 fn scene() -> Option<(SimRuntime, u64)> {
     let mut retail = crate::rules::retail_ini_fixture::retail_battle_rules()?;
@@ -276,15 +276,15 @@ fn authored_water_yard_refusal_refunds_keeps_constructor_and_survives_short_game
         .expect("real Track/Water Unlimbo refusal retains the constructor")
         .stable_id();
     assert_retained(&runtime.simulation, owner, held);
-    runtime.simulation.take_master_frame_test_trace();
+    runtime.simulation.take_frame_step_trace();
     runtime
         .advance_frame(&[], 33, TickLane::Ordinary, FrameEffects::default())
         .unwrap();
     assert!(
         runtime
             .simulation
-            .take_master_frame_test_trace()
-            .contains(&MasterFrameTestRung::Houses)
+            .take_frame_step_trace()
+            .contains(&FrameStep::Houses)
     );
     assert!(!runtime.simulation.houses.get(&owner).unwrap().is_defeated());
     assert_retained(&runtime.simulation, owner, held);

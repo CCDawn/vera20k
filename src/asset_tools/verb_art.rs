@@ -21,14 +21,15 @@
 //!
 //! ## Dependency rules
 //! - Depends on `assets/` (archive resolution), `rules/` (the art registry and
-//!   its filename-convention helpers), and the sibling `identify` / `locate` /
-//!   `report` modules.
+//!   its filename-convention helpers), `map::theater` (the production theater
+//!   table), and the sibling `identify` / `locate` / `report` modules.
 //! - Nothing from `sim/`, `render/`, `ui/`, `audio/`, or `net/`. The cameo
 //!   ordering is *mirrored* from the render-side resolver, not imported.
 
 use crate::asset_tools::identify;
 use crate::asset_tools::report::{AnimSlot, ArtCandidate, ArtForReport, ErrorReport};
 use crate::assets::asset_manager::AssetManager;
+use crate::map::theater::theater_names_and_extensions;
 use crate::rules::art_data::{
     ArtRegistry, effect_shp_candidates, object_shp_candidates, voxel_asset_names,
 };
@@ -36,25 +37,6 @@ use crate::rules::art_data::{
 /// Theater assumed when the caller does not pass `--theater`. Temperate is the
 /// theater every stock skirmish map uses unless it says otherwise.
 const DEFAULT_THEATER: &str = "tem";
-
-/// Accepted `--theater` values and the `(theater_ext, theater_name)` pair each
-/// maps to.
-///
-/// Both strings are what the `rules::art_data` candidate builders expect, and
-/// they are not interchangeable: `theater_ext` becomes the file extension
-/// (`GAPOWR.TEM`), while `theater_name` selects the `NewTheater` substitution
-/// letter and only matches on the long uppercase spelling. Passing `"tem"` where
-/// `"TEMPERATE"` belongs silently disables the substitution and yields candidates
-/// that never resolve. The pairs are copied from the theater table in
-/// `map::theater`, which is what the production loader uses.
-const THEATERS: &[(&str, &str, &str)] = &[
-    ("tem", "tem", "TEMPERATE"),
-    ("sno", "sno", "SNOW"),
-    ("urb", "urb", "URBAN"),
-    ("lun", "lun", "LUNAR"),
-    ("des", "des", "DESERT"),
-    ("ubn", "ubn", "NEWURBAN"),
-];
 
 /// Faction filename prefixes a cameo sometimes drops (`GAPOWR` → `POWRICON`).
 /// Mirrors the production sidebar cameo resolver.
@@ -82,8 +64,8 @@ const NO_RULES_IMAGE_WARNING: &str = "no rules Image= was supplied, so the effec
 /// Options for one `asset art-for` invocation.
 #[derive(Debug, Clone)]
 pub struct ArtForOptions {
-    /// Theater short name, e.g. `tem`. See [`THEATERS`] for the accepted set;
-    /// the long spelling (`temperate`) is accepted too, in any case.
+    /// Theater extension, e.g. `tem`, or its long name (`temperate`), in any
+    /// case; the production theater table in `map::theater` is the accepted set.
     pub theater: String,
 }
 
@@ -142,23 +124,28 @@ fn validate_type_id(type_id: &str) -> Result<&str, ErrorReport> {
     Ok(trimmed)
 }
 
-/// Map a `--theater` value to `(theater_ext, theater_name)`.
+/// Map a `--theater` value to `(theater_ext, theater_name)` through the
+/// production theater table.
 ///
-/// Matches the short name or the long name, case-insensitively, so a caller that
+/// Both strings are what the `rules::art_data` candidate builders expect, and
+/// they are not interchangeable: `theater_ext` becomes the file extension
+/// (`GAPOWR.TEM`), while `theater_name` selects the `NewTheater` substitution
+/// letter and only matches on the long uppercase spelling. Passing `"tem"` where
+/// `"TEMPERATE"` belongs silently disables the substitution and yields candidates
+/// that never resolve.
+///
+/// Matches the extension or the long name, case-insensitively, so a caller that
 /// types `TEMPERATE` is not punished for it.
 fn resolve_theater(requested: &str) -> Option<(&'static str, &'static str)> {
     let wanted = requested.trim();
-    THEATERS
-        .iter()
-        .find(|(short, _, long)| {
-            wanted.eq_ignore_ascii_case(short) || wanted.eq_ignore_ascii_case(long)
-        })
-        .map(|(_, ext, name)| (*ext, *name))
+    theater_names_and_extensions()
+        .find(|(name, ext)| wanted.eq_ignore_ascii_case(ext) || wanted.eq_ignore_ascii_case(name))
+        .map(|(name, ext)| (ext, name))
 }
 
 /// The rejection path for an unknown theater, listing every valid short name.
 fn unknown_theater_error(requested: &str) -> ErrorReport {
-    let valid: Vec<&str> = THEATERS.iter().map(|(short, _, _)| *short).collect();
+    let valid: Vec<&str> = theater_names_and_extensions().map(|(_, ext)| ext).collect();
     ErrorReport {
         error: format!("unknown theater \"{}\"", requested.trim()),
         hint: Some(format!(
@@ -455,6 +442,7 @@ fn resolve_candidate(asset_manager: &AssetManager, name: &str) -> (ArtCandidate,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::map::theater::theater_extension;
 
     /// A resolver that reports every name as missing.
     fn miss() -> impl FnMut(&str) -> (ArtCandidate, Option<String>) {
@@ -500,7 +488,18 @@ mod tests {
 
     #[test]
     fn theater_lookup_accepts_the_long_spelling_and_ignores_case() {
-        assert_eq!(resolve_theater("TEMPERATE"), Some(("tem", "TEMPERATE")));
+        for (ext, name) in [
+            ("tem", "TEMPERATE"),
+            ("sno", "SNOW"),
+            ("urb", "URBAN"),
+            ("lun", "LUNAR"),
+            ("des", "DESERT"),
+            ("ubn", "NEWURBAN"),
+        ] {
+            assert_eq!(resolve_theater(ext), Some((ext, name)));
+            assert_eq!(resolve_theater(name), Some((ext, name)));
+            assert_eq!(theater_extension(name), Some(ext));
+        }
         assert_eq!(resolve_theater("newurban"), Some(("ubn", "NEWURBAN")));
         assert_eq!(resolve_theater("  SNO  "), Some(("sno", "SNOW")));
     }
@@ -514,7 +513,7 @@ mod tests {
         let err = unknown_theater_error("mars");
         assert!(err.error.contains("mars"), "{}", err.error);
         let hint = err.hint.expect("the rejection must name the valid set");
-        for (short, _, _) in THEATERS {
+        for short in ["tem", "sno", "urb", "lun", "des", "ubn"] {
             assert!(hint.contains(short), "hint omits {short}: {hint}");
         }
     }

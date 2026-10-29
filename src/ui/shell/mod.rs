@@ -20,6 +20,7 @@ pub mod in_game_shell;
 pub mod layout;
 pub mod menu_page;
 pub mod modal;
+pub mod paging;
 pub mod pause_menu;
 pub mod restate;
 pub mod saved_file_input;

@@ -66,7 +66,7 @@ impl Scene {
         }
         if let Some(map) = map {
             let teams = TeamAiIniRegistry::load_retail(&assets, &map.ini, true).unwrap();
-            sim.initialize_trigger_definitions(map, &teams, None, None);
+            sim.initialize_trigger_definitions(map, &teams, None, None, None);
             let terrain = sim.resolved_terrain().unwrap().clone();
             assert_eq!(
                 sim.spawn_from_map_with_resolved_and_overlay_registry(

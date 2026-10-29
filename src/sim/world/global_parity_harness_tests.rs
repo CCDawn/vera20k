@@ -1292,6 +1292,7 @@ fn global_skirmish_replay_is_deterministic_and_baseline_stable() {
     for &checkpoint in STREAM_CHECKPOINT_TICKS {
         let chunk_end = (checkpoint as usize + 1).min(log.ticks.len());
         let chunk = ReplayLog {
+            startup: None,
             header: log.header.clone(),
             ticks: log.ticks[chunk_start..chunk_end].to_vec(),
             initial_scenario_services: if chunk_start == 0 {
@@ -1318,6 +1319,7 @@ fn global_skirmish_replay_is_deterministic_and_baseline_stable() {
     }
     if chunk_start < log.ticks.len() {
         let tail = ReplayLog {
+            startup: None,
             header: log.header.clone(),
             ticks: log.ticks[chunk_start..].to_vec(),
             initial_scenario_services: Vec::new(),

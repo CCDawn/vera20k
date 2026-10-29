@@ -56,11 +56,44 @@ fn credits(s: &Scene) -> i32 {
 
 /// Advance one production frame; returns the owner's credits after it.
 fn frame(s: &mut Scene) -> i32 {
+    frame_with_effects(s, &[], crate::sim::world::FrameEffects::default())
+}
+
+/// Same fixture frame as `advance_tick`, with caller-owned frame effects.
+fn frame_with_effects(
+    s: &mut Scene,
+    commands: &[crate::sim::command::CommandEnvelope],
+    effects: crate::sim::world::FrameEffects<'_>,
+) -> i32 {
     let overlay = crate::sim::tiberium::test_support::overlay_registry();
     let grid = s.sim.path_grid_snapshot();
+    s.sim.install_fixture_path_grid(grid.as_deref());
     s.sim
-        .advance_tick(&[], Some(&s.rules), grid.as_deref(), Some(overlay), 67);
+        .advance_master_frame(
+            commands,
+            &s.rules,
+            Some(overlay),
+            67,
+            crate::sim::world::TickLane::Ordinary,
+            false,
+            effects,
+        )
+        .expect("fixture frame must complete")
+        .into_tick();
     credits(s)
+}
+
+/// Run the headless fixture frame with the owner's retained sidebar visits.
+fn frame_with_production_strip(s: &mut Scene, owner: crate::sim::intern::InternedId) -> i32 {
+    let previous_house = s.sim.session.current_house();
+    s.sim.session.set_current_house_for_test(Some(owner));
+    let due = s.sim.take_due_commands();
+    let visits = s.sim.production.factories().strip_visits_for_test(owner);
+    let effects =
+        crate::sim::world::FrameEffects::default().with_production_strip(&visits, &|_| {});
+    let balance = frame_with_effects(s, &due, effects);
+    s.sim.session.set_current_house_for_test(previous_house);
+    balance
 }
 
 /// A second full War Miner in Mission_Harvest's FINDING_HOME state.
@@ -357,7 +390,7 @@ fn retail_ore_deposit_funds_the_retained_cash_stalled_build() {
         // No Resume or replacement enqueue: the same paid head leaves, then
         // the queued successor is constructed and delivered through ExitObject.
         for _ in 0..1500 {
-            frame(&mut s);
+            frame_with_production_strip(&mut s, owner);
             if s.sim
                 .production
                 .factories()

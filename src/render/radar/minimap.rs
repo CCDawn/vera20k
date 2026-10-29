@@ -42,7 +42,7 @@ use super::helpers::{
     cell_visibility_color, dim_color, set_pixel, surface_visibility_color,
 };
 pub use super::helpers::{OverlayClassification, default_minimap_rect};
-use super::helpers::{OverlayPixel, TerrainPixel};
+use super::helpers::{OverlayPixel, TerrainPixels};
 #[cfg(test)]
 use super::projection::minimap_screen_point_to_camera_top_left;
 use super::projection::{MinimapPlayfieldProjection, aperture_pixel, generated_primary_copy_frame};
@@ -109,12 +109,13 @@ pub struct MinimapRenderer {
     pub(super) world_origin_y: f32,
     pub(super) world_width: f32,
     pub(super) world_height: f32,
-    terrain_pixels: Vec<TerrainPixel>,
+    terrain_pixels: TerrainPixels,
     /// Exact generated-primary pixels, including each pixel's native inverse
     /// shroud/fog cell and packed terrain color.
     surface_pixels: Vec<RadarSurfacePixel>,
     /// Per-cell overlay metadata. Authoritative radar surfaces bake these into
-    /// raw RGB before sampling; only the mapless fallback stamps them later.
+    /// raw RGB before sampling; only the mapless fallback stamps them later and
+    /// updates them for dirty cells.
     overlay_pixels: Vec<OverlayPixel>,
     /// Legacy mapless aspect-fit sub-region within the native aperture.
     pub(super) map_offset_x: f32,
@@ -461,7 +462,7 @@ impl MinimapRenderer {
                     }
                 }
                 if self.native_radar_terrain.is_none() {
-                    for terrain_pixel in &self.terrain_pixels {
+                    for terrain_pixel in self.terrain_pixels.iter() {
                         let color = match cell_visibility_color(local_owner, fog, terrain_pixel) {
                             Some(color) => color,
                             None => continue,
@@ -773,7 +774,7 @@ impl MinimapRenderer {
     }
 
     /// Spacebar review of the eight most recent accepted event cells.
-    pub(crate) fn cycle_radar_event(&mut self, now: std::time::Instant) -> Option<(u16, u16)> {
+    pub(crate) fn cycle_radar_event(&mut self, now: crate::util::time::Instant) -> Option<(u16, u16)> {
         self.radar_events.cycle_cell(now)
     }
 

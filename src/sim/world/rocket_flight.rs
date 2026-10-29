@@ -1023,8 +1023,11 @@ pub(super) mod retail_tests {
     }
 
     /// Two enemy Flak Tracks beside a V3 Launcher on retail Hills shoot its
-    /// rocket down in flight, through an ordinary command and bound runtime
-    /// frames. The rocket is a target only once the climb has put it in the
+    /// rocket down in flight, through bound runtime frames. The launcher is
+    /// the computer's and the Flak Tracks are the player's: a human House's
+    /// idle Flak Track guards, taking only what it can fire at, where a
+    /// computer's Area Guard would go for the launcher. The rocket is a
+    /// target only once the climb has put it in the
     /// AircraftTracker. The killing hit plays its `Explosion=` anim, and
     /// Crash keeps the rocket alive with no Health and drops it from every
     /// Flak Track (`AircraftClass::ReceiveDamage @ 0x004165C0`). The next
@@ -1052,20 +1055,41 @@ pub(super) mod retail_tests {
         let mut scenario =
             crate::headless_scenario::load_session(&retail, "Hills.mmx", 0x0B21_D6E5, session)
                 .expect("load retail Hills with a computer opponent");
-        let candidates = sites(&scenario);
         let owner = scenario
             .sim()
             .session
             .current_house()
             .expect("launch house");
         let owner_name = scenario.sim().interner.resolve(owner).to_owned();
-        let enemy_name = scenario
+        let enemy = scenario
             .sim()
             .houses
             .iter()
             .find(|(name, house)| **name != owner && !house.multiplay_passive())
-            .map(|(name, _)| scenario.sim().interner.resolve(*name).to_owned())
+            .map(|(name, _)| *name)
             .expect("the computer house");
+        let enemy_name = scenario.sim().interner.resolve(enemy).to_owned();
+        // The computer deploys its MCV in the first frames, and its new
+        // Construction Yard sends every ground Techno it owns to its base
+        // (`UnitClass::Deploy` -> `HouseClass::MoveGroundForcesToBase` at
+        // `0x00739926`), so the launcher arrives after it.
+        let has_yard = |scenario: &crate::headless_scenario::HeadlessScenario| {
+            scenario.sim().substrate.entities.values().any(|entity| {
+                entity.owner() == enemy
+                    && entity.category() == crate::map::entities::EntityCategory::Structure
+            })
+        };
+        for _ in 0..300 {
+            if has_yard(&scenario) {
+                break;
+            }
+            scenario
+                .runtime
+                .advance_frame_for_tooling(&[], SIM_TICK_MS)
+                .expect("advance production frame");
+        }
+        assert!(has_yard(&scenario), "the computer deploys its MCV");
+        let candidates = sites(&scenario);
         let runtime = &mut scenario.runtime;
         let rules = &runtime.resources.rules;
         let regen_rate = rules.object("V3").expect("[V3]").spawn_regen_rate as u64;
@@ -1083,14 +1107,14 @@ pub(super) mod retail_tests {
             .into_iter()
             .find_map(|(launcher, target)| {
                 let mut placed = Vec::new();
-                let tank = sim.spawn_object("MTNK", &enemy_name, target.0, target.1, 0, rules);
+                let tank = sim.spawn_object("MTNK", &owner_name, target.0, target.1, 0, rules);
                 placed.extend(tank);
-                let v3 = sim.spawn_object("V3", &owner_name, launcher.0, launcher.1, 0, rules);
+                let v3 = sim.spawn_object("V3", &enemy_name, launcher.0, launcher.1, 0, rules);
                 placed.extend(v3);
                 let flak: Vec<_> = [launcher.1 - 2, launcher.1 + 2]
                     .into_iter()
                     .filter_map(|y| {
-                        sim.spawn_object("HTK", &enemy_name, launcher.0 + 5, y, 0, rules)
+                        sim.spawn_object("HTK", &owner_name, launcher.0 + 5, y, 0, rules)
                     })
                     .collect();
                 placed.extend(flak.iter().copied());
@@ -1106,6 +1130,23 @@ pub(super) mod retail_tests {
             })
             .expect("Hills admits a V3, its target and two Flak Tracks");
         sim.resolve_type_handles(rules);
+        // An Attack command from the computer House does not reach its V3
+        // here, so it takes its target and Attack through their owners.
+        sim.assign_target_represented(
+            v3,
+            Some(crate::sim::combat::TargetKind::Entity(target)),
+            rules,
+            None,
+            crate::sim::world::FrameEffects::default(),
+        )
+        .expect("the V3 takes the tank as its target");
+        let now = sim.session.binary_frame();
+        let attack =
+            crate::sim::mission::MissionId::from_known(crate::sim::mission::MissionType::Attack);
+        sim.substrate
+            .mission_assign_exact(v3, attack, now)
+            .expect("the V3 takes Attack");
+        let _ = sim.substrate.mission_commence_exact(v3, now);
         let strength = sim.substrate.entities.get(target).unwrap().health.current();
         let target_z =
             position_world_coord(&sim.substrate.entities.get(target).unwrap().position).z;
@@ -1127,20 +1168,8 @@ pub(super) mod retail_tests {
         let mut detonation_anims = Vec::new();
         let mut last_location = None;
         for frame in 0..1500u64 {
-            let commands = if frame == 0 {
-                vec![CommandEnvelope::new(
-                    owner,
-                    runtime.simulation.session.tick() + 1,
-                    Command::Attack {
-                        attacker_id: v3,
-                        target_id: target,
-                    },
-                )]
-            } else {
-                Vec::new()
-            };
             runtime
-                .advance_frame_for_tooling(&commands, SIM_TICK_MS)
+                .advance_frame_for_tooling(&[], SIM_TICK_MS)
                 .expect("advance production frame");
             let sim = &runtime.simulation;
             let new_anims: Vec<(String, crate::sim::anim_class::AnimWorldCoord)> = sim

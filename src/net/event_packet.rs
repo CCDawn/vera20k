@@ -19,6 +19,68 @@ const EXTENDED: u8 = 0x1f;
 const MEGA_LEN: usize = 23;
 type ActorToken = [u8; 5];
 
+/// VERA clients extend the native body with a full command frontier. The
+/// prefix is `VCM`, version1, then a little-endian u64. It stays inside the
+/// existing private reliable payload limit; native codec fixtures omit it.
+pub const LIVE_EVENT_PREFIX_LEN: usize = 12;
+const LIVE_EVENT_MAGIC: [u8; 4] = *b"VCM\x01";
+
+#[derive(Debug, Clone, Copy)]
+pub enum EventPacketHeader {
+    Native(FrameInfo),
+    Vera {
+        frame_info: FrameInfo,
+        command_frontier: u64,
+    },
+}
+
+impl From<FrameInfo> for EventPacketHeader {
+    fn from(value: FrameInfo) -> Self {
+        Self::Native(value)
+    }
+}
+
+impl EventPacketHeader {
+    fn frame_info(self) -> FrameInfo {
+        match self {
+            Self::Native(info)
+            | Self::Vera {
+                frame_info: info, ..
+            } => info,
+        }
+    }
+
+    fn bytes(self, opcode: u8) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if let Self::Vera {
+            command_frontier, ..
+        } = self
+        {
+            bytes.extend_from_slice(&LIVE_EVENT_MAGIC);
+            bytes.extend_from_slice(&command_frontier.to_le_bytes());
+        }
+        bytes.extend_from_slice(&self.frame_info().encode().as_bytes()[..HEADER_LEN]);
+        let header_start = bytes.len() - HEADER_LEN;
+        bytes[header_start] = opcode;
+        bytes
+    }
+}
+
+pub fn live_command_frontier(bytes: &[u8]) -> Option<u64> {
+    (bytes.len() >= LIVE_EVENT_PREFIX_LEN + HEADER_LEN
+        && bytes.starts_with(&LIVE_EVENT_MAGIC)
+        && matches!(bytes[LIVE_EVENT_PREFIX_LEN], FRAME_INFO | FRAME_SYNC))
+    .then(|| u64::from_le_bytes(bytes[4..LIVE_EVENT_PREFIX_LEN].try_into().unwrap()))
+}
+
+fn body_offset(bytes: &[u8]) -> usize {
+    if bytes.starts_with(&LIVE_EVENT_MAGIC) {
+        LIVE_EVENT_PREFIX_LEN
+    } else {
+        0
+    }
+}
+
 /// Original64A000's probe uses the FRAMEINFO header layout with opcode19.
 /// `checksum` carries Scenario's random seed (A8E7A8) here; `timing_word`
 /// carries the probe sequence. The shared send policy supplies event_frame
@@ -34,6 +96,22 @@ pub fn encode_frame_sync(info: FrameInfo) -> Result<[u8; HEADER_LEN], PacketEnco
     Ok(bytes)
 }
 
+/// Live probes carry the same frontier as ordinary packets. Otherwise a raw
+/// probe could grant frame credit while overtaking every command packet.
+pub fn encode_live_frame_sync(
+    info: FrameInfo,
+    command_frontier: u64,
+) -> Result<Vec<u8>, PacketEncodeError> {
+    if info.house_id < 0 {
+        return Err(PacketEncodeError::InvalidHouse);
+    }
+    Ok(EventPacketHeader::Vera {
+        frame_info: info,
+        command_frontier,
+    }
+    .bytes(FRAME_SYNC))
+}
+
 /// Inspect the leading header without admitting it to the command queue.
 pub fn decode_frame_info(bytes: &[u8]) -> Option<FrameInfo> {
     decode_header(bytes, FRAME_INFO)
@@ -46,6 +124,7 @@ pub fn decode_frame_sync(bytes: &[u8]) -> Option<FrameInfo> {
 }
 
 fn decode_header(bytes: &[u8], opcode: u8) -> Option<FrameInfo> {
+    let bytes = bytes.get(body_offset(bytes)..)?;
     if bytes.len() < HEADER_LEN || bytes[0] != opcode {
         return None;
     }
@@ -62,6 +141,19 @@ const PAYLOAD_LENGTHS: [u8; 47] = [
     0, 10, 4, 5, 2, 0, 4, 4, 104, 64, 0, 4, 5, 10, 0, 5, 4, 12,
 ];
 
+// VERA fixed records reuse this codec and its existing reliable/cache owners.
+// Native entries retain the original8208EC table unchanged.
+fn event_payload_len(opcode: u8) -> Option<u8> {
+    match opcode {
+        crate::sim::command::VERA_PAID_SUPER_OPCODE => {
+            Some(crate::sim::command::VERA_PAID_SUPER_PAYLOAD_LEN)
+        }
+        crate::sim::command::VERA_EJECT_BUNKER_OPCODE => Some(5),
+        crate::sim::command::VERA_CYCLE_PRODUCER_OPCODE => Some(1),
+        _ => PAYLOAD_LENGTHS.get(usize::from(opcode)).copied(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodeBlock {
     Capacity,
@@ -75,7 +167,7 @@ pub enum EncodeBlock {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PacketEncodeError {
-    #[error("event packet capacity {0} cannot hold its 14-byte header")]
+    #[error("event packet capacity {0} cannot hold its header")]
     HeaderCapacity(usize),
     #[error("event packet requires a nonnegative registered source House")]
     InvalidHouse,
@@ -104,6 +196,9 @@ pub enum DecodeFailureKind {
     ExtendedPayload,
     UnsupportedOpcode(u8),
     InvalidHouse,
+    /// VERA packets have one authenticated source/header. An embedded header
+    /// could otherwise change the House of later decoded commands.
+    UnexpectedHeader,
     InvalidCacheSlot(u8),
     MissingCachedRun(u8),
     InvalidRunLength(u8),
@@ -134,7 +229,7 @@ pub struct DecodedEventPacket {
 impl DecodedEventPacket {
     pub fn command_count(self, packet: &[u8]) -> usize {
         self.admitted_records
-            .saturating_sub(usize::from(packet.first() == Some(&FRAME_INFO)))
+            .saturating_sub(usize::from(decode_frame_info(packet).is_some()))
     }
 }
 
@@ -176,11 +271,14 @@ impl EventPacketCodec {
     pub fn encode_packet(
         &mut self,
         records: &[&CommandRecord],
-        header: FrameInfo,
+        header: impl Into<EventPacketHeader>,
         current_frame: i32,
         capacity: usize,
     ) -> Result<EncodedEventPacket, PacketEncodeError> {
-        if capacity < HEADER_LEN {
+        let packet_header = header.into();
+        let header = packet_header.frame_info();
+        let header_bytes = packet_header.bytes(FRAME_INFO);
+        if capacity < header_bytes.len() {
             return Err(PacketEncodeError::HeaderCapacity(capacity));
         }
         if header.house_id < 0 {
@@ -190,14 +288,14 @@ impl EventPacketCodec {
             return Err(PacketEncodeError::TooManyRecords);
         }
         let mut packet = EncodedEventPacket {
-            bytes: header.encode().as_bytes()[..HEADER_LEN].to_vec(),
+            bytes: header_bytes,
             mirrors: Vec::new(),
             blocked: None,
         };
         let mut run: Option<OpenRun> = None;
         for (index, &source) in records.iter().enumerate() {
             let opcode = source.opcode();
-            let payload_len = PAYLOAD_LENGTHS.get(usize::from(opcode)).copied();
+            let payload_len = event_payload_len(opcode);
             let unsupported = match opcode {
                 EXTENDED => Some(EncodeBlock::ExtendedPayload),
                 FRAME_INFO | FRAME_SYNC => Some(EncodeBlock::PacketHeaderOpcode(opcode)),
@@ -276,6 +374,31 @@ impl EventPacketCodec {
         Ok(packet)
     }
 
+    /// A live send commits cache state only after all reliable destinations
+    /// accept the packet. Snapshot only the eight send slots; cloning received
+    /// peer caches per packet would multiply a large match's memory traffic.
+    pub(crate) fn encode_packet_if_accepted(
+        &mut self,
+        records: &[&CommandRecord],
+        header: impl Into<EventPacketHeader>,
+        current_frame: i32,
+        capacity: usize,
+        accept: impl FnOnce(&EncodedEventPacket) -> bool,
+    ) -> Result<Option<EncodedEventPacket>, PacketEncodeError> {
+        let saved_send = self.send.clone();
+        match self.encode_packet(records, header, current_frame, capacity) {
+            Ok(packet) if accept(&packet) => Ok(Some(packet)),
+            Ok(_) => {
+                self.send = saved_send;
+                Ok(None)
+            }
+            Err(error) => {
+                self.send = saved_send;
+                Err(error)
+            }
+        }
+    }
+
     fn matching_slot(&self, actors: &[ActorToken]) -> Option<usize> {
         (actors.len() > 1)
             .then(|| self.send.iter().position(|slot| slot.actors == actors))
@@ -328,10 +451,12 @@ impl EventPacketCodec {
         mut admit: impl FnMut(CommandRecord) -> bool,
     ) -> Result<DecodedEventPacket, PacketDecodeError> {
         let mut report = DecodedEventPacket::default();
-        if bytes.len() < HEADER_LEN {
+        let header_offset = body_offset(bytes);
+        if bytes.len() < header_offset + HEADER_LEN {
             return Ok(report);
         }
-        let source_house = bytes[2] as i8;
+        report.consumed_bytes = header_offset;
+        let source_house = bytes[header_offset + 2] as i8;
         if source_house < 0 {
             return Err(decode_error(
                 bytes,
@@ -345,7 +470,15 @@ impl EventPacketCodec {
         while report.consumed_bytes < bytes.len() {
             let start = report.consumed_bytes;
             let opcode = bytes[start];
-            let Some(&len) = PAYLOAD_LENGTHS.get(usize::from(opcode)) else {
+            if start != header_offset && bytes[start..].starts_with(&LIVE_EVENT_MAGIC) {
+                return Err(decode_error(
+                    bytes,
+                    start,
+                    report,
+                    DecodeFailureKind::UnexpectedHeader,
+                ));
+            }
+            let Some(len) = event_payload_len(opcode) else {
                 return Err(decode_error(
                     bytes,
                     start,
@@ -370,6 +503,17 @@ impl EventPacketCodec {
                 //64C325..64C370 returns the accepted prefix on a short next
                 //fixed record. It does not report DoList capacity failure.
                 break;
+            }
+            // Our encoder emits exactly one leading header. Reject a second
+            // one before it can replace the authenticated source's House.
+            // This is transport hardening, not a legacy wire requirement.
+            if start != header_offset && matches!(opcode, FRAME_SYNC | FRAME_INFO) {
+                return Err(decode_error(
+                    bytes,
+                    start,
+                    report,
+                    DecodeFailureKind::UnexpectedHeader,
+                ));
             }
             if opcode == FRAME_SYNC {
                 report.consumed_bytes += HEADER_LEN;

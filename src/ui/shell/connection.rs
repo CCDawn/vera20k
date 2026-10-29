@@ -17,7 +17,7 @@ use super::geom::{self, RectPx};
 use super::in_game_shell::{self, InGameShellLayout};
 use crate::ui::lan_shell::{LanChatLine, LanListState};
 
-/// Rows the dialog has, one per connection node (local player first).
+/// Physical row slots. VERA pages the complete local-first node snapshot.
 pub const CONNECTION_ROWS: usize = 8;
 
 /// Row button ids by row (table 0x00837300). The template swaps 0x641 and
@@ -47,12 +47,16 @@ pub enum ConnectionButton {
     /// Row button `0x640..0x647`: propose removing that player
     /// (0x0064AAE0).
     Player(usize),
+    PreviousPage,
+    NextPage,
 }
 
 /// A child the pointer can rest on, for the status-line help.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionControl {
     Quit,
+    PreviousPage,
+    NextPage,
     Player(usize),
     Bar(usize),
     Countdown,
@@ -64,6 +68,7 @@ impl ConnectionControl {
     pub fn help_key(self) -> &'static str {
         match self {
             Self::Quit => "STT:ReconnectButtonLeaveGame",
+            Self::PreviousPage | Self::NextPage => "",
             Self::Player(_) => "STT:ReconnectButtonPlayer",
             Self::Bar(_) => "STT:ReconnectProgressPlayer",
             Self::Countdown => "STT:ReconnectLabelTime",
@@ -75,6 +80,8 @@ impl ConnectionControl {
     pub fn id(self) -> u16 {
         match self {
             Self::Quit => 0x2,
+            Self::PreviousPage => 0xF201,
+            Self::NextPage => 0xF202,
             Self::Player(row) => PLAYER_IDS[row],
             Self::Bar(row) => BAR_IDS[row],
             Self::Countdown => 0x650,
@@ -85,6 +92,8 @@ impl ConnectionControl {
     fn button(self) -> Option<ConnectionButton> {
         match self {
             Self::Quit => Some(ConnectionButton::Quit),
+            Self::PreviousPage => Some(ConnectionButton::PreviousPage),
+            Self::NextPage => Some(ConnectionButton::NextPage),
             Self::Player(row) => Some(ConnectionButton::Player(row)),
             Self::Bar(_) | Self::Countdown | Self::List => None,
         }
@@ -95,6 +104,7 @@ impl ConnectionControl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionLayout {
     pub quit: RectPx,
+    pub paging: [RectPx; 2],
     pub status_line: RectPx,
     pub players: [RectPx; CONNECTION_ROWS],
     pub bars: [RectPx; CONNECTION_ROWS],
@@ -117,6 +127,7 @@ pub fn connection_layout(
     };
     ConnectionLayout {
         quit: shell.lower_button_rect(width, button_size),
+        paging: super::paging::button_rects(shell.lower_button_rect(width, button_size)),
         status_line: in_game_shell::status_line_rect(height),
         players: std::array::from_fn(|row| ordinary(player_dlu(row))),
         bars: std::array::from_fn(|row| ordinary(bar_dlu(row))),
@@ -138,6 +149,8 @@ impl ConnectionLayout {
     pub fn control_rect(&self, control: ConnectionControl) -> RectPx {
         match control {
             ConnectionControl::Quit => self.quit,
+            ConnectionControl::PreviousPage => self.paging[0],
+            ConnectionControl::NextPage => self.paging[1],
             ConnectionControl::Player(row) => self.players[row],
             ConnectionControl::Bar(row) => self.bars[row],
             ConnectionControl::Countdown => self.countdown,
@@ -189,12 +202,22 @@ pub fn bar_paint(rect: RectPx, lag: u32, age_ticks: u32) -> BarPaint {
     }
 }
 
+/// A named node bound at dialog creation. VERA keeps its stable source index
+/// with the retail name snapshot so disconnects cannot retarget a row button.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConnectionRow {
+    pub(crate) source_index: usize,
+    pub(crate) name: String,
+}
+
 /// Pointer state and the list while 0xEA is open. The row names are fixed
 /// at the init arm (0x497): row `i < nodeCount` shows node `i`'s name, the
 /// rest are destroyed.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ConnectionPage {
-    pub(crate) rows: Vec<String>,
+    pub(crate) rows: Vec<ConnectionRow>,
+    /// VERA's viewport; rows remain the wait owner's complete snapshot.
+    pub(crate) page: super::paging::RowPage,
     /// Static 0x650 after its first `TXT_TIME_ALLOWED` write.
     pub(crate) countdown: Option<String>,
     /// List 0x651.
@@ -208,6 +231,25 @@ pub(crate) struct ConnectionPage {
 }
 
 impl ConnectionPage {
+    pub fn row_source(&self, row: usize) -> Option<usize> {
+        self.rows.get(row).map(|row| row.source_index)
+    }
+
+    pub fn visible_range(&self) -> std::ops::Range<usize> {
+        self.page.range(self.rows.len(), CONNECTION_ROWS)
+    }
+    pub fn page_count(&self) -> usize {
+        super::paging::RowPage::count(self.rows.len(), CONNECTION_ROWS)
+    }
+    pub fn change_page(&mut self, next: bool) -> bool {
+        let changed = self.page.change(next, self.rows.len(), CONNECTION_ROWS);
+        if changed {
+            self.buttons = Default::default();
+            self.hovered = None;
+        }
+        changed
+    }
+
     /// The visible child under a pointer, in template order (Quit, list,
     /// row buttons, bars, countdown), as `ChildWindowFromPointEx` finds it.
     pub fn control_at(
@@ -216,9 +258,15 @@ impl ConnectionPage {
         x: i32,
         y: i32,
     ) -> Option<ConnectionControl> {
-        let rows = self.rows.len().min(CONNECTION_ROWS);
+        let rows = self.visible_range().len();
         [ConnectionControl::Quit, ConnectionControl::List]
             .into_iter()
+            .chain(
+                (self.page_count() > 1)
+                    .then_some([ConnectionControl::PreviousPage, ConnectionControl::NextPage])
+                    .into_iter()
+                    .flatten(),
+            )
             .chain(TEMPLATE_PLAYER_ORDER.iter().filter_map(|id| {
                 PLAYER_IDS
                     .iter()
@@ -234,7 +282,12 @@ impl ConnectionPage {
     /// The button a control is, for capture.
     pub fn button_at(&self, layout: &ConnectionLayout, x: i32, y: i32) -> Option<ConnectionButton> {
         self.control_at(layout, x, y)
-            .and_then(ConnectionControl::button)
+            .and_then(|control| match control {
+                ConnectionControl::Player(visible) => Some(ConnectionButton::Player(
+                    self.visible_range().start + visible,
+                )),
+                other => other.button(),
+            })
     }
 
     /// The tail of 0x0064AAE0 / 0x0064AD10 after their line: keep at most
@@ -340,7 +393,16 @@ mod tests {
     fn row_buttons_follow_the_swapped_id_table_and_absent_rows_take_no_pointer() {
         let layout = connection_layout(800, 600, shell(800, 600), [125, 25]);
         let page = ConnectionPage {
-            rows: vec!["a".into(), "b".into()],
+            rows: vec![
+                ConnectionRow {
+                    source_index: 4,
+                    name: "a".into(),
+                },
+                ConnectionRow {
+                    source_index: 7,
+                    name: "b".into(),
+                },
+            ],
             ..Default::default()
         };
         let row1 = layout.players[1];
@@ -349,10 +411,30 @@ mod tests {
             Some(ConnectionControl::Player(1))
         );
         assert_eq!(ConnectionControl::Player(1).id(), 0x642);
+        assert_eq!(page.row_source(1), Some(7));
         let row2 = layout.players[2];
         assert_eq!(page.control_at(&layout, row2.x + 1, row2.y + 1), None);
         let bar2 = layout.bars[2];
         assert_eq!(page.control_at(&layout, bar2.x + 1, bar2.y + 1), None);
+        let mut page = ConnectionPage {
+            rows: (0..30)
+                .map(|row| ConnectionRow {
+                    source_index: 29 - row,
+                    name: row.to_string(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(page.change_page(true));
+        let first = layout.players[0];
+        assert_eq!(
+            page.button_at(&layout, first.x + 1, first.y + 1),
+            Some(ConnectionButton::Player(8))
+        );
+        assert_eq!(page.row_source(8), Some(21));
+        assert!(page.change_page(true));
+        assert!(page.change_page(true));
+        assert_eq!(page.visible_range(), 24..30);
     }
 
     /// Complete64A7B0 supplied both rows' original fill geometry and RGB565

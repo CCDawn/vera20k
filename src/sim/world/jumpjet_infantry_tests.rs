@@ -190,6 +190,7 @@ fn retail_rocketeer_hover_raises_its_cell_tag_on_absolute_frames_after_restore()
         &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
         None,
         None,
+        None,
     );
     sim.install_authored_cell_trigger_tags(&map);
     sim.classify_map_triggers(&scenario.runtime.resources.rules);
@@ -286,6 +287,7 @@ fn retail_rocketeer_hover_raises_its_cell_tag_on_absolute_frames_after_restore()
     sim.initialize_trigger_definitions(
         &once,
         &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
+        None,
         None,
         None,
     );

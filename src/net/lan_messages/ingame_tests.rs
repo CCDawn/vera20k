@@ -178,3 +178,37 @@ fn beacon_records_carry_coord_slot_and_house_at_native_offsets() {
         Err(InGameMessageError::WrongBeaconKind { actual: 0x22 })
     ));
 }
+
+#[test]
+fn scoped_loading_rejects_a_prior_match_and_prior_final_options() {
+    let scope = SessionScope {
+        epoch: [7; 16],
+        revision: 9,
+    };
+    let progress = LoadingProgressMessage::new("Host", 100).unwrap();
+    let bytes = progress.scoped_bytes(scope);
+    let received = LoadingProgressMessage::decode_scoped(&bytes, scope).unwrap();
+    assert_eq!(received.name(), "Host");
+    assert_eq!(received.percent(), 100);
+    assert!(
+        LoadingProgressMessage::decode_scoped(
+            &bytes,
+            SessionScope {
+                epoch: [8; 16],
+                ..scope
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        LoadingProgressMessage::decode_scoped(
+            &bytes,
+            SessionScope {
+                revision: 10,
+                ..scope
+            }
+        )
+        .is_err()
+    );
+    assert!(LoadingProgressMessage::decode_scoped(progress.as_bytes(), scope).is_err());
+}

@@ -79,7 +79,7 @@ fn append_construction_options(
     {
         return;
     }
-    let Some(factory) = sim.object_type(building.type_ref(), rules) else {
+    let Some(factory) = sim.entity_object_type(building, rules) else {
         return;
     };
     let ids = match factory.factory_type() {
@@ -324,7 +324,7 @@ pub(super) fn is_production_factory(
             && factory_category == ProductionCategory::Building)
 }
 
-/// VERA-only: the producer-focus list (the sidebar's view and `CycleProducerFocus`): the owner's
+/// VERA-only: the producer-focus list (`CycleProducerFocus`): the owner's
 /// structures that build `category`, less dying, limboed and constructing ones, from the store.
 pub fn producer_candidates_for_owner_category(
     entities: &EntityStore,

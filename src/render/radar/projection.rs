@@ -9,9 +9,9 @@ use super::current_cell::CurrentRadarCellAuthority;
 use super::geometry::NativeRadarSurfaceGeometry;
 use super::helpers::{
     COLOR_SHROUD, MINIMAP_HEIGHT, MINIMAP_WIDTH, OverlayPixel, RadarSurfacePixel, TerrainPixel,
-    compute_aspect_fit, overlay_radar_color, radar_color_for_cell, radar_colors_for_cell,
-    set_pixel, structural_bridge_radar_color, terrain_brightness_for_theater,
-    world_to_minimap_pixel,
+    TerrainPixels, compute_aspect_fit, overlay_radar_color, radar_color_for_cell,
+    radar_colors_for_cell, set_pixel, structural_bridge_radar_color,
+    terrain_brightness_for_theater, world_to_minimap_pixel,
 };
 use super::minimap::{MinimapCellRadarSource, MinimapOverlayDatum};
 use super::terrain::{NativeRadarCellColors, NativeRadarTerrainSurface};
@@ -70,7 +70,7 @@ pub(super) struct MinimapPlayfieldProjection {
     pub world_origin_y: f32,
     pub world_width: f32,
     pub world_height: f32,
-    pub terrain_pixels: Vec<TerrainPixel>,
+    pub terrain_pixels: TerrainPixels,
     pub surface_pixels: Vec<RadarSurfacePixel>,
     pub overlay_pixels: Vec<OverlayPixel>,
     pub map_offset_x: f32,
@@ -349,7 +349,7 @@ impl MinimapPlayfieldProjection {
             world_origin_y,
             world_width,
             world_height,
-            terrain_pixels,
+            terrain_pixels: TerrainPixels::new(terrain_pixels),
             surface_pixels,
             overlay_pixels,
             map_offset_x,

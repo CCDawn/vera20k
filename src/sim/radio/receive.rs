@@ -131,7 +131,7 @@ fn building_receive(
                     );
                 }
                 if let Some(entity) = sim.substrate.entities.get(building)
-                    && let Some(object) = sim.object_type(entity.type_ref(), rules)
+                    && let Some(object) = sim.entity_object_type(entity, rules)
                     && object.construction_yard
                 {
                     let damaged = crate::sim::building_art::requested_damage_state(
@@ -155,7 +155,7 @@ fn building_receive(
                 .substrate
                 .entities
                 .get(building)
-                .and_then(|entity| sim.object_type(entity.type_ref(), rules))
+                .and_then(|entity| sim.entity_object_type(entity, rules))
             else {
                 return RadioResponse::None;
             };
@@ -185,7 +185,7 @@ fn building_receive(
                 .substrate
                 .entities
                 .get(building)
-                .and_then(|entity| sim.object_type(entity.type_ref(), rules))
+                .and_then(|entity| sim.entity_object_type(entity, rules))
                 .is_some_and(|object| object.weapons_factory || object.unit_repair || object.bunker)
             {
                 RadioResponse::Queued //43CE18 returns literal0x17.
@@ -200,7 +200,7 @@ fn building_receive(
                 .substrate
                 .entities
                 .get(building)
-                .and_then(|entity| sim.object_type(entity.type_ref(), rules))
+                .and_then(|entity| sim.entity_object_type(entity, rules))
                 .is_some_and(|object| object.weapons_factory)
             {
                 RadioResponse::Roger
@@ -1060,6 +1060,12 @@ pub(crate) fn unit_can_enter_radio(
     else {
         return RadioResponse::None;
     };
+    // Ares73758A ->1004C250 returns the native no-response tail73761F.
+    // CanDrive admission is separate; ordinary cargo cannot board this hull.
+    #[cfg(feature = "ares")]
+    if transport.driver_killed() {
+        return RadioResponse::None;
+    }
     if transport_type.passengers == 0
         || !crate::sim::combat::combat_weapon::is_ally_by_object(
             Some(sim.house_alliances.as_map()),
@@ -1115,12 +1121,10 @@ fn transport_has_room(
         .passenger_role
         .cargo()
         .map_or(0, |cargo| cargo.total_size());
-    crate::sim::passenger::PassengerCargo::size_fits_capacity(
+    crate::sim::passenger::PassengerCargo::size_fits_transport(
         occupied,
         sender_type.size,
         transport_type.passengers,
-    ) && crate::sim::passenger::PassengerCargo::size_within_limit(
-        sender_type.size,
         transport_type.size_limit,
     )
 }
@@ -1282,7 +1286,7 @@ fn aircraft_receive(
         return RadioResponse::None;
     }
     let ammo = entity.ammo().map_or(-1, |ammo| ammo.current());
-    let object = sim.object_type(entity.type_ref(), rules);
+    let object = sim.entity_object_type(entity, rules);
     let type_ammo = object.map_or(-1, |object| object.ammo);
     let transport = AircraftHold {
         carryall: object.is_some_and(|object| object.carryall),

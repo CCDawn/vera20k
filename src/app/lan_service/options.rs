@@ -15,12 +15,27 @@ use crate::net::lan_messages::setup::{self, LanGameOptions, LanOptionsAi, LanOpt
 use crate::net::lan_messages::{LanMessage, game_name_hash};
 use crate::rules::ini_value::{crt_atoi, strtok};
 use crate::skirmish_launch::{
-    AiDifficulty, LaunchCountry, LaunchStartPosition, LaunchTeam, SkirmishAiSlot,
-    SkirmishLaunchMode, SkirmishLocalSlot,
+    AiDifficulty, LaunchCountry, LaunchStartPosition, LaunchTeam, NETWORK_PLAYER_SLOT_COUNT,
+    SkirmishAiSlot, SkirmishLaunchMode, SkirmishLocalSlot,
 };
 use crate::util::native_string::{narrow_utf16_c_string, narrow_widened, widen_bytes};
 
-pub(super) fn encode_options(state: &AppState) -> Result<LanMessage> {
+pub(super) fn publish_options(state: &mut AppState) -> Result<bool> {
+    // Generated dependency preparation can exceed a discovery-query interval.
+    // A backpressured retry must yield before that work, allowing the existing
+    // transport owner to drain. queue_payload retains its final ACK recheck.
+    if state
+        .match_state
+        .lan_service
+        .as_ref()
+        .ok_or_else(|| anyhow!("no LAN service"))?
+        .queued_setup_count()
+        != 0
+    {
+        return Ok(false);
+    }
+    let agreement = crate::app::shell_network_setup::agreement::local(state)?;
+    let random_map = crate::app::shell_network_setup::maps::host_generated_manifest(state)?;
     let session = &state.match_state.session;
     ensure!(session.host(), "only the host publishes full LAN options");
     let options = projected_options(
@@ -35,17 +50,157 @@ pub(super) fn encode_options(state: &AppState) -> Result<LanMessage> {
             .multiplayer_shell_runtime
             .cooperative_difficulty(),
     )?;
-    let game = super::active_game_name(state).ok_or_else(|| anyhow!("no active LAN game"))?;
-    let local = session
+    let text = options.encode();
+    let service = state.match_state.lan_service.as_ref().expect("LAN visit");
+    let admissions = session
         .network_setup()
         .expect("projected setup")
-        .local_player();
-    Ok(LanMessage::options(
-        &local.name,
-        &options.encode(),
-        super::color_value(local) as u32,
-        game_name_hash(&game),
-    )?)
+        .humans
+        .iter()
+        .enumerate()
+        .filter_map(|(source, human)| {
+            let endpoint = session.network_endpoint(source)?;
+            Some(ExtendedAdmission {
+                name: human.name.clone(),
+                endpoint,
+                identity: service.peer_admissions.get(&endpoint)?.identity,
+            })
+        })
+        .collect();
+    let text = serde_json::to_vec(&ExtendedOptions {
+        text,
+        agreement: agreement.clone(),
+        selected_map_file: session
+            .network_setup()
+            .expect("projected setup")
+            .selected_map_file
+            .clone()
+            .ok_or_else(|| anyhow!("no selected map"))?,
+        effective_digest: session
+            .network_map_metadata()
+            .expect("projected metadata")
+            .effective_digest
+            .clone(),
+        source_sha256: session
+            .network_map_metadata()
+            .expect("projected metadata")
+            .source_sha256
+            .clone(),
+        random_map: random_map.clone(),
+        admissions,
+    })?;
+    let admitted = queue_payload(
+        state,
+        crate::net::lan_messages::extended_setup::SetupKind::Options,
+        text,
+    )?;
+    if admitted {
+        crate::app::shell_network_setup::invalidate_network_agreement(state)?;
+        let service = state.match_state.lan_service.as_mut().expect("visit");
+        service.deferred_setup.retain(|request| {
+            !matches!(
+                request,
+                crate::app::shell_network_setup::NetworkSetupRequest::Ready(_)
+                    | crate::app::shell_network_setup::NetworkSetupRequest::MapStatus(_)
+            )
+        });
+        service.setup_agreement = Some(agreement);
+        let scope = service.setup_scope().expect("admitted options scope");
+        super::maps::received_options(state, scope, random_map)?;
+    }
+    Ok(admitted)
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ExtendedOptions {
+    text: Vec<u8>,
+    selected_map_file: String,
+    agreement: crate::app::shell_network_setup::agreement::MultiplayerAgreement,
+    source_sha256: String,
+    effective_digest: String,
+    random_map: Option<crate::app::shell_network_setup::maps::GeneratedMapManifest>,
+    admissions: Vec<ExtendedAdmission>,
+}
+
+/// Host-authored admission projection for native Type3 assembly, derived from
+/// Session and replaced with each complete snapshot. Only Session admits a
+/// participant/address; a stale Type3 cannot replace the host's current proof.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ExtendedAdmission {
+    name: String,
+    endpoint: SocketAddrV4,
+    identity: super::PeerAdmission,
+}
+
+/// Exact received host snapshot, replaced on every admitted revision and
+/// cleared with the visit. Session remains the editable options/roster owner.
+pub(super) struct ReceivedOptions {
+    scope: crate::net::lan_messages::SessionScope,
+    options: ExtendedOptions,
+}
+
+pub(super) fn reapply_received_options(state: &mut AppState) -> Result<()> {
+    let Some(options) = state.match_state.lan_service.as_ref().and_then(|service| {
+        let received = service.received_options.as_ref()?;
+        (service.setup_scope() == Some(received.scope)).then(|| received.options.clone())
+    }) else {
+        return Ok(());
+    };
+    receive_options_text(
+        state,
+        &options.text,
+        options.source_sha256,
+        options.effective_digest,
+        options.selected_map_file,
+    )
+}
+
+fn queue_payload(
+    state: &mut AppState,
+    kind: crate::net::lan_messages::extended_setup::SetupKind,
+    payload: Vec<u8>,
+) -> Result<bool> {
+    let endpoints = super::remote_sources(state)
+        .into_iter()
+        .filter_map(|source| state.match_state.session.network_endpoint(source))
+        .collect::<Vec<_>>();
+    let game = super::active_game_name(state).ok_or_else(|| anyhow!("no active LAN game"))?;
+    let mut scoped = game_name_hash(&game).to_le_bytes().to_vec();
+    scoped.extend_from_slice(&payload);
+    let service = state
+        .match_state
+        .lan_service
+        .as_mut()
+        .ok_or_else(|| anyhow!("no LAN service"))?;
+    // Packet7 must already be in a new guest's receive queue before any
+    // full setup can arrive. The same ACK boundary also serializes complete
+    // extended snapshots across native global backpressure and reordering.
+    if service.queued_setup_count() != 0 {
+        return Ok(false);
+    }
+    let previous_scope = service.ensure_host_scope()?;
+    service.setup_generation = service
+        .setup_generation
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("LAN setup generation exhausted"))?;
+    let scope = crate::net::lan_messages::SessionScope {
+        epoch: previous_scope.epoch,
+        revision: service.setup_generation,
+    };
+    let parts = crate::net::lan_messages::extended_setup::encode(kind, scope, &scoped)?;
+    let packets = endpoints
+        .into_iter()
+        .flat_map(|endpoint| {
+            parts
+                .iter()
+                .map(move |part| (part.clone(), super::direct(endpoint)))
+        })
+        .collect::<Vec<_>>();
+    let admitted = service.queue_setup(packets.into_iter())?;
+    if admitted && kind == crate::net::lan_messages::extended_setup::SetupKind::Options {
+        service.setup_scope = Some(scope);
+    }
+    Ok(admitted)
 }
 
 pub(super) fn receive_options(
@@ -54,19 +209,35 @@ pub(super) fn receive_options(
     message: &LanMessage,
 ) -> Result<()> {
     validate_host(state, source, message)?;
-    let fields = message
-        .options_fields()
-        .ok_or_else(|| anyhow!("not a LAN options packet"))?;
-    let game = super::active_game_name(state).ok_or_else(|| anyhow!("no active LAN game"))?;
-    ensure!(
-        fields.game_name_hash == game_name_hash(&game),
-        "different LAN game"
+    super::reject_setup_compatibility(
+        state,
+        "The LAN host did not send VERA20k build and rules agreement.",
     );
-    let (options, current_speed, ai_options) = parse_options(
+    anyhow::bail!("unscoped legacy full setup is not a VERA admission")
+}
+
+fn receive_options_text(
+    state: &mut AppState,
+    text: &[u8],
+    source_sha256: String,
+    effective_digest: String,
+    selected_map_file: String,
+) -> Result<()> {
+    ensure!(
+        source_sha256.is_empty() || crate::map::source::valid_source_sha256(&source_sha256),
+        "invalid map source identity"
+    );
+    let (mut options, current_speed, ai_options) = parse_options(
         &state.match_state.session,
         &state.frontend.skirmish_modes,
-        fields.text,
+        text,
     )?;
+    crate::map::source::validate_network_map_name(&selected_map_file)?;
+    // VERA keeps the host's logical UTF-8 identity independently of the
+    // bounded native text projection and the local SHA-named cache path.
+    options.launch.selected_map_file = Some(selected_map_file);
+    options.map_metadata.source_sha256 = source_sha256;
+    options.map_metadata.effective_digest = effective_digest;
     crate::app::shell_network_setup::service_event(state, NetworkSetupEvent::HostSetup(options))?;
     state
         .match_state
@@ -83,12 +254,192 @@ pub(super) fn receive_options(
     Ok(())
 }
 
-pub(super) fn encode_roster(state: &AppState) -> Result<LanMessage> {
+pub(super) fn publish_roster(state: &mut AppState) -> Result<bool> {
     let session = &state.match_state.session;
     ensure!(session.host(), "only the host publishes a LAN roster");
+    let rows = if session
+        .network_setup_capacity()
+        .is_some_and(|capacity| capacity > 8)
+    {
+        NETWORK_PLAYER_SLOT_COUNT
+    } else {
+        8
+    };
     let names = projected_roster(session)?;
-    let names = std::array::from_fn(|index| names[index].as_str());
-    Ok(LanMessage::roster(&super::local_name(state), &names)?)
+    let names = &names[..rows];
+    queue_payload(
+        state,
+        crate::net::lan_messages::extended_setup::SetupKind::Roster,
+        serde_json::to_vec(names)?,
+    )
+}
+
+pub(super) fn receive_extended(
+    state: &mut AppState,
+    source: SocketAddrV4,
+    bytes: &[u8],
+    now: u32,
+) -> Result<()> {
+    let host = state
+        .match_state
+        .lan_service
+        .as_ref()
+        .and_then(|service| service.admitted_host.as_ref())
+        .ok_or_else(|| anyhow!("no admitted LAN host"))?
+        .clone();
+    validate_host_endpoint(&state.match_state.session, &host, source, &host.0)?;
+    let scope = crate::net::lan_messages::extended_setup::fragment_scope(bytes)?;
+    ensure!(
+        state
+            .match_state
+            .lan_service
+            .as_ref()
+            .and_then(|service| service.setup_scope())
+            .is_some_and(|expected| expected.epoch == scope.epoch),
+        "extended setup belongs to an old LAN admission"
+    );
+    let complete = state
+        .match_state
+        .lan_service
+        .as_mut()
+        .expect("admitted LAN service")
+        .setup_reassembly
+        .receive(bytes, now)?;
+    let Some((kind, bytes)) = complete else {
+        return Ok(());
+    };
+    let game = super::active_game_name(state).ok_or_else(|| anyhow!("no active LAN game"))?;
+    ensure!(
+        bytes.len() >= 4 && bytes[..4] == game_name_hash(&game).to_le_bytes(),
+        "different LAN game"
+    );
+    let bytes = &bytes[4..];
+    match kind {
+        crate::net::lan_messages::extended_setup::SetupKind::Options => {
+            let options: ExtendedOptions = serde_json::from_slice(bytes)?;
+            if options.agreement.version != crate::app::shell_network_setup::agreement::version() {
+                super::reject_setup_compatibility(
+                    state,
+                    "VERA20k build or enabled gameplay features differ from the LAN host.",
+                );
+                anyhow::bail!("LAN gameplay build mismatch");
+            }
+            ensure!(
+                crate::map::source::valid_source_sha256(&options.agreement.rules_digest),
+                "invalid LAN rules agreement"
+            );
+            ensure!(
+                options.admissions.len() <= NETWORK_PLAYER_SLOT_COUNT,
+                "too many LAN admission proofs"
+            );
+            let mut endpoints = std::collections::BTreeSet::new();
+            let mut names = std::collections::BTreeSet::new();
+            for admission in &options.admissions {
+                ensure!(
+                    endpoints.insert(admission.endpoint)
+                        && names.insert(admission.name.to_ascii_lowercase())
+                        && !admission.name.eq_ignore_ascii_case(&host.0)
+                        && admission.identity.join_nonce != [0; 16]
+                        && admission.identity.admission_nonce != [0; 16],
+                    "invalid LAN admission proof projection"
+                );
+            }
+            {
+                let service = state.match_state.lan_service.as_mut().expect("visit");
+                if service
+                    .setup_scope
+                    .is_some_and(|current| scope.revision < current.revision)
+                {
+                    return Ok(());
+                }
+                service.setup_scope = Some(scope);
+                service.deferred_setup.retain(|request| {
+                    !matches!(
+                        request,
+                        crate::app::shell_network_setup::NetworkSetupRequest::Ready(_)
+                            | crate::app::shell_network_setup::NetworkSetupRequest::MapStatus(_)
+                    )
+                });
+                service.setup_agreement = Some(options.agreement.clone());
+                service.received_options = Some(ReceivedOptions {
+                    scope,
+                    options: options.clone(),
+                });
+                service.replace_peer_admissions(
+                    options
+                        .admissions
+                        .iter()
+                        .map(|admission| {
+                            (
+                                admission.endpoint,
+                                admission.name.clone(),
+                                admission.identity,
+                            )
+                        })
+                        .chain(std::iter::once((
+                            host.1,
+                            host.0.clone(),
+                            super::PeerAdmission {
+                                join_nonce: [0; 16],
+                                admission_nonce: [0; 16],
+                            },
+                        ))),
+                );
+            }
+            // A full host snapshot also retires an old endpoint through the
+            // same ParticipantLeft owner as Type10. Otherwise a lost departure
+            // could retain a peer while its stale Type3 is correctly refused.
+            let launch = state
+                .match_state
+                .session
+                .network_setup()
+                .ok_or_else(|| anyhow!("no setup"))?;
+            let departed = launch
+                .humans
+                .iter()
+                .enumerate()
+                .filter_map(|(source, human)| {
+                    if source == launch.local_player_index {
+                        return None;
+                    }
+                    let endpoint = state.match_state.session.network_endpoint(source)?;
+                    let retained = state
+                        .match_state
+                        .lan_service
+                        .as_ref()
+                        .expect("visit")
+                        .peer_admissions
+                        .get(&endpoint)
+                        .is_some_and(|record| record.name.eq_ignore_ascii_case(&human.name));
+                    (!retained).then_some(endpoint)
+                })
+                .collect::<Vec<_>>();
+            for endpoint in departed {
+                if let Some(index) = state.match_state.session.network_endpoint_source(endpoint) {
+                    crate::app::shell_network_setup::service_event(
+                        state,
+                        NetworkSetupEvent::ParticipantLeft { index },
+                    )?;
+                }
+            }
+            crate::app::shell_network_setup::invalidate_network_agreement(state)?;
+            receive_options_text(
+                state,
+                &options.text,
+                options.source_sha256,
+                options.effective_digest,
+                options.selected_map_file,
+            )?;
+            super::maps::received_options(state, scope, options.random_map)
+        }
+        crate::net::lan_messages::extended_setup::SetupKind::Roster => {
+            let names: Vec<String> = serde_json::from_slice(bytes)?;
+            let rows = parsed_roster(&state.match_state.session, &names)?;
+            state.match_state.session.accept_network_roster(rows)?;
+            state.platform.window.request_redraw();
+            Ok(())
+        }
+    }
 }
 
 pub(super) fn receive_roster(
@@ -97,17 +448,7 @@ pub(super) fn receive_roster(
     message: &LanMessage,
 ) -> Result<()> {
     validate_host(state, source, message)?;
-    let names = message
-        .roster_names()
-        .ok_or_else(|| anyhow!("not a LAN roster packet"))?;
-    //5E8EA3's empty input returns before clearing the old row bindings.
-    if names.is_empty() {
-        return Ok(());
-    }
-    let rows = parsed_roster(&state.match_state.session, &names)?;
-    state.match_state.session.accept_network_roster(rows)?;
-    state.platform.window.request_redraw();
-    Ok(())
+    anyhow::bail!("unscoped native roster is not a VERA admission")
 }
 
 fn validate_host(state: &AppState, source: SocketAddrV4, message: &LanMessage) -> Result<()> {
@@ -149,7 +490,7 @@ fn projected_options(
     session: &MatchSession,
     current_speed: i32,
     cooperative_difficulty: i32,
-) -> Result<LanGameOptions> {
+) -> Result<LanGameOptions<NETWORK_PLAYER_SLOT_COUNT>> {
     let launch = session
         .network_setup()
         .ok_or_else(|| anyhow!("no admitted setup"))?;
@@ -216,7 +557,11 @@ fn parse_options(
     session: &MatchSession,
     modes: &[crate::skirmish_modes::SkirmishGameMode],
     bytes: &[u8],
-) -> Result<(HostOptions, i32, [NetworkAiOptions; 8])> {
+) -> Result<(
+    HostOptions,
+    i32,
+    [NetworkAiOptions; NETWORK_PLAYER_SLOT_COUNT],
+)> {
     let text = widen_bytes(bytes);
     let (header, tail) = text
         .split_once(':')
@@ -253,6 +598,8 @@ fn parse_options(
         official: crt_atoi(next()?) != 0,
         byte_length: crt_atoi(next()?),
         digest: String::new(),
+        source_sha256: String::new(),
+        effective_digest: String::new(),
     };
     launch.selected_map_file = Some(next()?.to_owned());
     let digest = next()?.to_owned();
@@ -297,12 +644,16 @@ fn parse_options(
     let mut opponents = Vec::new();
     let mut ai_options = [NetworkAiOptions {
         difficulty: 0,
-        country: 0,
-        color: 0,
-        start: 0,
-        team: 0,
-    }; 8];
-    for row in 0..8u8 {
+        country: -1,
+        color: -1,
+        start: -2,
+        team: -2,
+    }; NETWORK_PLAYER_SLOT_COUNT];
+    for row in 0..if map_metadata.player_capacity > 8 {
+        NETWORK_PLAYER_SLOT_COUNT as u8
+    } else {
+        8
+    } {
         let mut next_int = || {
             fields
                 .next()
@@ -361,7 +712,7 @@ fn parse_options(
     ))
 }
 
-fn decoded_choices(
+pub(super) fn decoded_choices(
     old: &SkirmishLocalSlot,
     country: i32,
     color: i32,
@@ -397,8 +748,8 @@ fn decoded_choices(
     }
     slot.start_position = match start {
         -2 | -1 => LaunchStartPosition::Auto,
-        0..=7 => LaunchStartPosition::Position(start as u8),
-        _ => anyhow::bail!("start outside native waypoint domain"),
+        0..=29 => LaunchStartPosition::Position(start as u8),
+        _ => anyhow::bail!("start outside supported waypoint domain"),
     };
     slot.team = match team {
         -2 | -1 => LaunchTeam::None,
@@ -408,19 +759,19 @@ fn decoded_choices(
     Ok(slot)
 }
 
-fn start_value(start: LaunchStartPosition) -> i32 {
+pub(super) fn start_value(start: LaunchStartPosition) -> i32 {
     match start {
         LaunchStartPosition::Auto => -2,
         LaunchStartPosition::Position(index) => i32::from(index),
     }
 }
-fn team_value(team: LaunchTeam) -> i32 {
+pub(super) fn team_value(team: LaunchTeam) -> i32 {
     match team {
         LaunchTeam::None => -2,
         LaunchTeam::Team(index) => i32::from(index),
     }
 }
-fn decoded_difficulty(value: i32) -> Result<AiDifficulty> {
+pub(super) fn decoded_difficulty(value: i32) -> Result<AiDifficulty> {
     match value {
         0 => Ok(AiDifficulty::Hard),
         1 => Ok(AiDifficulty::Normal),
@@ -429,7 +780,7 @@ fn decoded_difficulty(value: i32) -> Result<AiDifficulty> {
     }
 }
 
-fn projected_roster(session: &MatchSession) -> Result<[String; 8]> {
+fn projected_roster(session: &MatchSession) -> Result<[String; NETWORK_PLAYER_SLOT_COUNT]> {
     let launch = session
         .network_setup()
         .ok_or_else(|| anyhow!("no admitted setup"))?;
@@ -462,12 +813,18 @@ fn projected_roster(session: &MatchSession) -> Result<[String; 8]> {
     }))
 }
 
-fn parsed_roster(session: &MatchSession, names: &[String]) -> Result<[NetworkRosterEntry; 8]> {
-    ensure!(names.len() <= 8, "LAN roster exceeds eight rows");
+fn parsed_roster(
+    session: &MatchSession,
+    names: &[String],
+) -> Result<[NetworkRosterEntry; NETWORK_PLAYER_SLOT_COUNT]> {
+    ensure!(
+        names.len() <= NETWORK_PLAYER_SLOT_COUNT,
+        "LAN roster exceeds thirty rows"
+    );
     let launch = session
         .network_setup()
         .ok_or_else(|| anyhow!("no admitted setup"))?;
-    let mut rows = [NetworkRosterEntry::Vacancy(NetworkVacancy::Open); 8];
+    let mut rows = [NetworkRosterEntry::Vacancy(NetworkVacancy::Open); NETWORK_PLAYER_SLOT_COUNT];
     for (row, name) in names.iter().enumerate() {
         rows[row] = match name.as_str() {
             setup::OPEN => NetworkRosterEntry::Vacancy(NetworkVacancy::Open),
@@ -536,12 +893,87 @@ mod tests {
                     official: true,
                     byte_length: 123456,
                     digest: "0123456789abcdef0123456789abcdef".into(),
+                    source_sha256: String::new(),
+                    effective_digest: String::new(),
                 },
                 None,
                 true,
             )
             .unwrap();
         session
+    }
+
+    #[test]
+    fn extended_options_and_roster_retain_thirtieth_participant() {
+        let mut host = fixture(true);
+        let mut launch = host.network_setup().unwrap().clone();
+        let template = launch.humans[0].clone();
+        launch.humans = (0..30)
+            .map(|row| {
+                let mut human = template.clone();
+                human.name = format!("Player{row}");
+                human.raw_slot_index = Some(row);
+                human.slot.start_position = LaunchStartPosition::Position(row);
+                human
+            })
+            .collect();
+        launch.rebuild_house_roster();
+        host.accept_network_setup(launch.clone(), true, None)
+            .unwrap();
+        host.select_network_map(launch.mode.clone(), "thirty.map".into(), 30)
+            .unwrap();
+        host.accept_network_map_metadata(
+            NetworkMapMetadata {
+                player_capacity: 30,
+                ..host.network_map_metadata().unwrap().clone()
+            },
+            None,
+            true,
+        )
+        .unwrap();
+        let mut guest = fixture(false);
+        launch.local_player_index = 29;
+        guest.accept_network_setup(launch, false, None).unwrap();
+        let payload = projected_options(&host, 3, 0).unwrap().encode();
+        let parts = crate::net::lan_messages::extended_setup::encode(
+            crate::net::lan_messages::extended_setup::SetupKind::Options,
+            crate::net::lan_messages::SessionScope {
+                epoch: [7; 16],
+                revision: 1,
+            },
+            &payload,
+        )
+        .unwrap();
+        assert!(parts.len() > 1);
+        let mut receive = crate::net::lan_messages::extended_setup::Reassembly::default();
+        let mut complete = None;
+        for part in parts.iter().rev() {
+            complete = receive.receive(part, 1).unwrap().or(complete);
+        }
+        let (_, bytes) = complete.unwrap();
+        let (options, _, ai) = parse_options(
+            &guest,
+            &crate::skirmish_modes::stock_skirmish_modes(),
+            &bytes,
+        )
+        .unwrap();
+        guest
+            .accept_network_host_setup(options.launch, options.vacancies, 30, None, false)
+            .unwrap();
+        guest.accept_network_inactive_ai_options(ai).unwrap();
+        let names = projected_roster(&host).unwrap();
+        guest
+            .accept_network_roster(parsed_roster(&guest, &names).unwrap())
+            .unwrap();
+        assert_eq!(
+            guest.network_setup().unwrap().local_player().name,
+            "Player29"
+        );
+        assert_eq!(
+            guest.network_setup().unwrap().local_player().raw_slot_index,
+            Some(29)
+        );
+        assert_eq!(guest.network_setup_capacity(), Some(30));
     }
 
     #[test]

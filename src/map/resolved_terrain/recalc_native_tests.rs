@@ -380,8 +380,11 @@ fn assert_resident_source_rejection_preserves_cell(catalog: Arc<BridgeRecalcCata
 #[test]
 fn resident_recalc_rejects_unadmitted_lifecycle_requirements() {
     for (declaration, raw_land, effect) in [
-        ("ShadowCaster=yes\n", 11, "declared shadow policy"),
-        ("ShadowTiles=1\n", 11, "declared shadow policy"),
+        (
+            "ShadowCaster=yes\nShadowTiles=1\n",
+            11,
+            "declared shadow policy",
+        ),
         (
             "[Plain]\nTile01Anim=FIRE\nTile01AttachesTo=0\n",
             11,
@@ -755,7 +758,7 @@ fn retail_bridge_recalc_and_presentation_match_original_execution() {
         0,
         crate::map::tile_variant_selector::TileVariantSelector::from_initialized(table),
     );
-    let keys = crate::map::bridge_rim_tiles::HighBridgeRimTiles::from_theater(&theater);
+    let keys = theater.high_bridge_rim_tiles;
     let wood = theater.lookup.bounds()[usize::from(theater.wood_bridge_set.unwrap())].start;
     drop(assets);
     for tile in (keys.base..keys.base + 16)

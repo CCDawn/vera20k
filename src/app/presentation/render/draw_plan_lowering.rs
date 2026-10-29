@@ -152,8 +152,21 @@ pub(crate) enum ObjectExtrasRun {
         self_heal: Option<u32>,
         group_rectangles: std::ops::Range<u32>,
         group_text: std::ops::Range<u32>,
+        /// Phobos digital display text: per-entry backing/glyph ranges in
+        /// list order (rectangles, then glyphs).
+        digital_text: Vec<(std::ops::Range<u32>, std::ops::Range<u32>)>,
+        /// Phobos digital display custom-SHP glyphs: catalog index and the
+        /// uploaded instance index, in emission order.
+        digital_shapes: Vec<(u32, u32)>,
         talk_bubble: Option<u32>,
     },
+}
+
+/// One parent's fixed-pixel health draw after wheel resampling.
+pub(crate) struct FrameHealthBar {
+    pub background: Option<u32>,
+    pub shield_background: Option<u32>,
+    pub fills: std::ops::Range<u32>,
 }
 
 /// One native layer output: exact integer parent order plus flat GPU instances.
@@ -175,6 +188,9 @@ pub(crate) struct ObjectLayerPass {
     pub extras_lines: Vec<crate::render::surface_line::SurfaceLine>,
     pub extras_instances: Vec<SpriteInstance>,
     pub extras_runs: Vec<ObjectExtrasRun>,
+    /// Wheel-zoom health commands removed from both world Extras visits.
+    /// Indices still refer to the single `extras_instances` upload.
+    pub frame_health: Vec<FrameHealthBar>,
     /// Aligned with `instances`; retained for executable ordering checks.
     #[cfg(test)]
     pub owners: Vec<DrawId>,
@@ -382,6 +398,24 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                 let rectangles_end = lowered.extras_instances.len() as u32;
                 lowered.extras_instances.extend(strip.group.text);
                 let text_end = lowered.extras_instances.len() as u32;
+                let mut digital_text = Vec::with_capacity(strip.digital_text.len());
+                for text in strip.digital_text {
+                    let rectangles_start = lowered.extras_instances.len() as u32;
+                    lowered.extras_instances.extend(text.rectangles);
+                    let rectangles_end = lowered.extras_instances.len() as u32;
+                    lowered.extras_instances.extend(text.text);
+                    let text_end = lowered.extras_instances.len() as u32;
+                    digital_text.push((rectangles_start..rectangles_end, rectangles_end..text_end));
+                }
+                let digital_shapes = strip
+                    .digital_shapes
+                    .into_iter()
+                    .map(|(catalog, instance)| {
+                        let index = lowered.extras_instances.len() as u32;
+                        lowered.extras_instances.push(instance);
+                        (catalog, index)
+                    })
+                    .collect();
                 let talk_bubble = strip.talk_bubble.map(|instance| {
                     let index = lowered.extras_instances.len() as u32;
                     lowered.extras_instances.push(instance);
@@ -400,6 +434,8 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                     self_heal,
                     group_rectangles: rectangles_start..rectangles_end,
                     group_text: rectangles_end..text_end,
+                    digital_text,
+                    digital_shapes,
                     talk_bubble,
                 }
             });
@@ -431,6 +467,8 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                         self_heal: None,
                         group_rectangles: fills.start..fills.start,
                         group_text: fills.start..fills.start,
+                        digital_text: Vec::new(),
+                        digital_shapes: Vec::new(),
                         talk_bubble: None,
                     });
                 }
@@ -486,6 +524,8 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                 self_heal,
                 group_rectangles,
                 group_text,
+                digital_text,
+                digital_shapes,
                 talk_bubble,
                 ..
             }) = strip
@@ -503,6 +543,8 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                     || self_heal.is_some()
                     || !group_rectangles.is_empty()
                     || !group_text.is_empty()
+                    || !digital_text.is_empty()
+                    || !digital_shapes.is_empty()
                     || talk_bubble.is_some()
                 {
                     if is_building {
@@ -524,6 +566,8 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                         self_heal,
                         group_rectangles,
                         group_text,
+                        digital_text,
+                        digital_shapes,
                         talk_bubble,
                     });
                 }
@@ -881,6 +925,7 @@ mod tests {
             group: Default::default(),
             talk_bubble: None,
             self_heal: None,
+            ..Default::default()
         });
         let pass = lower_ground_object_instances(vec![parent]);
         // Native6D9920 draws the base before rally. Display6D913C Behind,

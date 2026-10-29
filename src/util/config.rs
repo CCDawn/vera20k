@@ -94,6 +94,14 @@ impl PathsConfig {
 
 /// Shared by packaged and direct launches. No writable setting defaults to
 /// the retail installation, even when VERA's executable is installed there.
+#[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+pub fn default_settings_dir() -> Result<PathBuf> {
+    // Browser VFS: keep the profile outside imported retail assets, within the
+    // launcher's existing persisted user-data namespace.
+    Ok(PathBuf::from("/saves/profile"))
+}
+
+#[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
 pub fn default_settings_dir() -> Result<PathBuf> {
     if cfg!(target_os = "windows") {
         if let Some(path) = std::env::var_os("LOCALAPPDATA")
@@ -149,12 +157,16 @@ pub struct GraphicsConfig {
     /// trails) per gamemd's "Extra Animations" option. Default ON to match
     /// gamemd's default.
     pub extra_animations: bool,
+    /// VERA presentation option: show terrain through translucent fog while
+    /// concealing unseen enemy objects. Off by default for the retail look.
+    pub translucent_fog: bool,
 }
 
 impl Default for GraphicsConfig {
     fn default() -> Self {
         Self {
             extra_animations: true,
+            translucent_fog: false,
         }
     }
 }
@@ -192,6 +204,12 @@ pub const fn default_input_delay_ticks() -> u32 {
 }
 
 impl GameConfig {
+    #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+    pub fn load() -> Result<Self> {
+        let path = Path::new("/config.toml");
+        Self::parse_from(&crate::util::file_system::read_to_string(path)?, path)
+    }
+
     /// Load the optional host override, otherwise use the retail module directory.
     ///
     /// Retail provenance: Executable-root path discovery — `WinMain` @ `0x006BB9A0`.
@@ -200,6 +218,7 @@ impl GameConfig {
     /// `SetCurrentDirectoryA` before opening `RA2MD.INI` or any MIX archive.
     /// Rust keeps the resolved directory explicit instead of mutating the
     /// process-wide current directory.
+    #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
     pub fn load() -> Result<Self> {
         let working_dir =
             std::env::current_dir().context("Failed to locate the working directory")?;
@@ -208,12 +227,20 @@ impl GameConfig {
         Self::load_from(&working_dir, &executable)
     }
 
+    /// Explicit launch-local assets override; writable settings retain their
+    /// existing owner and must still remain outside the selected retail root.
+    pub fn with_retail_directory(mut self, directory: PathBuf) -> Result<Self> {
+        self.paths.ra2_dir = directory;
+        self.paths.separate_settings_from_assets()?;
+        Ok(self)
+    }
+
     /// [`GameConfig::load`] for a process with this working directory and executable.
     pub fn load_from(working_dir: &Path, executable: &Path) -> Result<Self> {
         let root = retail_asset_root_from_executable(executable)?;
         for directory in [working_dir, root.as_path()] {
             let path = directory.join(CONFIG_FILE_NAME);
-            match std::fs::read_to_string(&path) {
+            match crate::util::file_system::read_to_string(&path) {
                 Ok(contents) => return Self::parse_from(&contents, &path),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => {
@@ -299,6 +326,9 @@ impl GameConfig {
                 }
                 ("graphics", "extra_animations") => {
                     parse_bool(value).map(|on| graphics.extra_animations = on)
+                }
+                ("graphics", "translucent_fog") => {
+                    parse_bool(value).map(|on| graphics.translucent_fog = on)
                 }
                 ("gameplay", "input_delay_ticks") => {
                     parse_u32(value).map(|ticks| gameplay.input_delay_ticks = ticks)
@@ -746,6 +776,15 @@ extra_animations = false
 "#;
         let config = GameConfig::parse(toml_str).expect("old configs keep loading");
         assert!(!config.graphics.extra_animations);
+        assert!(!config.graphics.translucent_fog);
+    }
+
+    #[test]
+    fn translucent_fog_is_an_explicit_graphics_option() {
+        let config =
+            GameConfig::parse("[paths]\nra2_dir = 'retail'\n[graphics]\ntranslucent_fog = true\n")
+                .unwrap();
+        assert!(config.graphics.translucent_fog);
     }
 
     #[test]

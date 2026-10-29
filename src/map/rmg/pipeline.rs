@@ -49,8 +49,6 @@ pub const LAND_TYPES: usize = super::phases::zones::LAND_TYPES;
 
 /// The generator's default ground level (`MapSeed+0x30C` = 4).
 const DEFAULT_LEVEL: u8 = 4;
-/// The generated-start quota standard skirmish writes (`MapSeed` start slots).
-pub const STANDARD_START_QUOTA: i32 = 4;
 
 /// Pre-resolved inputs for one generation run.
 pub struct PipelineInputs<'a> {
@@ -304,7 +302,13 @@ pub fn run_pipeline(
         );
         let args = StartsArgs {
             map_type: inputs.map_type,
-            start_quota: STANDARD_START_QUOTA,
+            // SyncOptionsFromControls596C70 writes NumPlayers to global
+            // MapSeed+50 (ABE028) at596DE9. Generate598960 uses that same
+            // record (596644..59664C); CreateStartingPoints594B50 reads its
+            // quota at594DF0, and SelectStartCandidates594F40 divides by it
+            // at594F7D. Native's explicit4 stores (7A2494/596018) belong to
+            // separate WOL territory setup, not ordinary dialog generation.
+            start_quota: inputs.num_players,
             num_players: inputs.num_players,
             tiberium_layout: inputs.tiberium_layout,
             gen_w,
@@ -683,6 +687,7 @@ mod tests {
     fn production_trace_orders_huts_before_mixed_tech_and_binds_final_entities() {
         let expected = ConstructionSnapshot {
             trace: RmgConstructionTrace {
+                lighting: None,
                 events: vec![
                     crate::map::rmg::RmgConstructionEvent {
                         ordinal: 0,

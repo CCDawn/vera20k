@@ -1568,6 +1568,7 @@ fn scanner_mask<'r>(
                 armed: is_armed_from_facts(attacker_obj, facts),
                 infiltrate: attacker_obj.infiltrate,
                 vehicle_thief: attacker_obj.vehicle_thief,
+                thief: attacker_obj.thief,
                 c4: super::veterancy::holds_c4(
                     super::veterancy::rank_from_u16(attacker.veterancy),
                     attacker_obj,
@@ -2301,8 +2302,11 @@ fn evaluate_candidate(
         return None;
     }
 
-    // `LegalTarget=` (`+0x231`) at `0x006F8260`: every retail techno leaves
-    // it at its `yes` default; VERA does not read it for technos.
+    // TechnoClass::Evaluate_Candidate 0x006F8260..0x006F826E:
+    // ObjectType+0x231 (LegalTarget) excludes a candidate before scoring.
+    if !candidate_obj.legal_target {
+        return None;
+    }
 
     // `0x006F826E..0x006F835E`: outside the campaign, a `MultiplayPassive`
     // house's objects are off limits but for the building exception.

@@ -48,10 +48,13 @@
 //!   `Exit_Object` arms a human's placement takes, including the Infantry
 //!   arm's Cloning Vat copies. Its residual: the refinery arm's Unit exit.
 
+use crate::map::entities::EntityCategory;
 use crate::rules::object_type::ObjectCategory;
+use crate::rules::object_type::ObjectType;
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::ai_base_building::{self, BuildingExit};
+use crate::sim::ai_unit_choice::UnitChoiceKind;
 use crate::sim::intern::InternedId;
 use crate::sim::timer::CdTimer;
 use crate::sim::world::FrameEffects;
@@ -97,7 +100,7 @@ pub(crate) fn factory_ai(
         .substrate
         .entities
         .get(building)
-        .and_then(|entity| sim.object_type(entity.type_ref(), rules))
+        .and_then(|entity| sim.entity_object_type(entity, rules))
         .map(|ty| ty.factory_rtti())
         .filter(|&factory| factory != 0)
     else {
@@ -140,7 +143,12 @@ fn exit_finished_object(
     let Some(product) = object.entity_id else {
         return;
     };
-    let Some(product_type) = sim.object_type(object.type_id, rules) else {
+    let Some(product_type) = sim
+        .substrate
+        .entities
+        .get(product)
+        .and_then(|entity| sim.entity_object_type(entity, rules))
+    else {
         return;
     };
     let is_building = product_type.category == ObjectCategory::Building;
@@ -158,6 +166,23 @@ fn exit_finished_object(
     }
     match exit {
         BuildingExit::Placed => {
+            // Phobos `BuildingClass_KickOutUnit_BuildingType_Phobos 0x44531F`
+            // clears the building slot after the placed structure exits.
+            // Unit, Infantry and Aircraft clear in Exit_Object's prelude.
+            #[cfg(feature = "phobos")]
+            if product_type.category == ObjectCategory::Building
+                && rules.parallel_ai_queues().allows_parallel()
+            {
+                let slot = crate::sim::ai_base_building::AiFactorySlot::for_product(
+                    product_type.category,
+                    product_type.naval,
+                );
+                if let Some(house) = sim.houses.get_mut(&owner) {
+                    house
+                        .ai_production_mut()
+                        .clear_parallel_factory(slot, building);
+                }
+            }
             //4501A4 reads after exit. A consumed wall is still retained at
             //its constructor Location until the frame's shared725C70 drain.
             let object = BuiltObject::capture(sim, product);
@@ -186,7 +211,10 @@ fn exit_finished_object(
             // `0x004501FF..0x00450220`: the object's owner stops choosing
             // naval buildings.
             let naval_building = sim
-                .object_type(object.type_id, rules)
+                .substrate
+                .entities
+                .get(product)
+                .and_then(|entity| sim.entity_object_type(entity, rules))
                 .is_some_and(|ty| ty.category == ObjectCategory::Building && ty.naval);
             if naval_building && let Some(house) = sim.houses.get_mut(&owner) {
                 house.ai_production_mut().forbid_naval();
@@ -240,18 +268,53 @@ fn start_factory(
     factory_rtti: i32,
     effects: FrameEffects<'_>,
 ) {
-    if crate::sim::credit_income::available_money(&sim.houses, owner) <= 10 {
-        return;
-    }
-    let Some(object) = ai_base_building::suggest_new_object(sim, rules, owner, factory_rtti) else {
-        return;
-    };
+    // The producing building's `Naval=` decides which vehicle choice
+    // `Suggest_New_Object` reads (NPSE `0xC2F130`), so resolve it first.
     let factory_naval = sim
         .substrate
         .entities
         .get(building)
-        .and_then(|entity| sim.object_type(entity.type_ref(), rules))
+        .and_then(|entity| sim.entity_object_type(entity, rules))
         .is_some_and(|ty| ty.naval);
+    // Phobos `BuildingClass_Update_Factory_Phobos 0x4502F4` runs before the
+    // money gate, so its claimed slot survives a start that stops here.
+    #[cfg(feature = "phobos")]
+    if !parallel_start_allowed(sim, rules, building, owner, factory_rtti, factory_naval) {
+        return;
+    }
+    if crate::sim::credit_income::available_money(&sim.houses, owner) <= 10 {
+        return;
+    }
+    let Some(object) =
+        ai_base_building::suggest_new_object(sim, rules, owner, factory_rtti, factory_naval)
+    else {
+        return;
+    };
+    // Both NP generations gate at the fetched type before naval admission:
+    // #359 C335A0 reads AIBuildLimit; legacy ext173 C2D15A/C2CF67 uses
+    // BuildLimit when EnableAIBuildLimitation is set. Both constraints apply
+    // when a ruleset explicitly combines the compatibility keys.
+    if crate::rules::NPATCH_ENABLED
+        && (ai_build_limit_blocks(sim, rules, owner, object, object.aibuild_limit)
+            || rules.general.enable_ai_build_limitation
+                && ai_build_limit_blocks(sim, rules, owner, object, object.build_limit))
+    {
+        clear_aibuild_limit_choice(sim, owner, object);
+        return;
+    }
+    // NPSE 2.0 Factory_AI C2F07C..C2F11F reserves the fetched type's
+    // class before naval admission, allocation and construction. The House
+    // owner retains failed-start/expired reservations until a native release.
+    #[cfg(feature = "npatch")]
+    if rules.general.disable_parallel_ai_queues
+        && !sim.houses.get_mut(&owner).is_some_and(|house| {
+            house
+                .ai_production_mut()
+                .reserve_parallel(object.category, object.naval)
+        })
+    {
+        return;
+    }
     if object.category == ObjectCategory::Vehicle && object.naval != factory_naval {
         return;
     }
@@ -287,6 +350,83 @@ fn start_factory(
     }
 }
 
+/// Phobos `BuildingClass_Update_Factory_Phobos @ 0x4502F4`: with Ares'
+/// `AllowParallelAIQueues=` on, the first factory building of a category
+/// claims the house's slot; a second one is refused while the category or the
+/// type in current production forbids parallel queues. The type check reads
+/// the same native `Producing*TypeIndex` choice fields that
+/// [`ai_base_building::suggest_new_object`] consumes.
+#[cfg(feature = "phobos")]
+fn parallel_start_allowed(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    building: u64,
+    owner: InternedId,
+    factory_rtti: i32,
+    naval: bool,
+) -> bool {
+    use crate::sim::ai_base_building::AiFactorySlot;
+    use crate::sim::ai_unit_choice::UnitChoiceKind;
+    let switches = rules.parallel_ai_queues();
+    if !switches.allows_parallel() {
+        return true;
+    }
+    let Some(slot) = AiFactorySlot::for_producer(factory_rtti, naval) else {
+        return true;
+    };
+    let current = sim
+        .houses
+        .get(&owner)
+        .and_then(|house| house.ai_production().parallel_factory(slot));
+    let Some(current) = current else {
+        if let Some(house) = sim.houses.get_mut(&owner) {
+            house
+                .ai_production_mut()
+                .set_parallel_factory(slot, Some(building));
+        }
+        return true;
+    };
+    if current == building {
+        return true;
+    }
+    let category = match slot {
+        AiFactorySlot::Building => ObjectCategory::Building,
+        AiFactorySlot::Infantry => ObjectCategory::Infantry,
+        AiFactorySlot::Vehicle | AiFactorySlot::Navy => ObjectCategory::Vehicle,
+        AiFactorySlot::Aircraft => ObjectCategory::Aircraft,
+    };
+    if switches.forbids_category(category, naval) {
+        return false;
+    }
+    let choice = match slot {
+        AiFactorySlot::Building => rules.building_type_at(
+            sim.houses
+                .get(&owner)
+                .map_or(-1, |house| house.ai_production().building_choice()),
+        ),
+        AiFactorySlot::Infantry => choice_product(sim, rules, owner, UnitChoiceKind::Infantry),
+        AiFactorySlot::Aircraft => choice_product(sim, rules, owner, UnitChoiceKind::Aircraft),
+        AiFactorySlot::Vehicle | AiFactorySlot::Navy => {
+            let Some(kind) = UnitChoiceKind::of(ObjectCategory::Vehicle, naval) else {
+                return true;
+            };
+            choice_product(sim, rules, owner, kind)
+        }
+    };
+    !choice.is_some_and(|object| object.forbid_parallel_ai_queues)
+}
+
+#[cfg(feature = "phobos")]
+fn choice_product<'r>(
+    sim: &Simulation,
+    rules: &'r RuleSet,
+    owner: InternedId,
+    kind: crate::sim::ai_unit_choice::UnitChoiceKind,
+) -> Option<&'r ObjectType> {
+    let index = sim.houses.get(&owner)?.ai_unit_choices().get(kind);
+    rules.type_array_at(kind.category(), index)
+}
+
 /// `CDTimerClass` at `+0x550` has run out (`0x00450115..0x00450136`).
 fn placement_wait_over(sim: &Simulation, building: u64) -> bool {
     let frame = sim.session.binary_frame() as i32;
@@ -294,6 +434,60 @@ fn placement_wait_over(sim: &Simulation, building: u64) -> bool {
         .entities
         .get(building)
         .is_some_and(|entity| entity.ai_placement_timer.expired(frame))
+}
+
+/// NP `BuildingClass::Factory_AI` count comparison: NPSE #359
+/// C335A0..C33726 for AIBuildLimit, NPExt ext173 C2CF67..C2D129 for the
+/// global switch's BuildLimit. Positive limits compare tracking directly;
+/// Add_Tracking4FF700 already includes limbo factory objects. Non-positive
+/// limits compare both produced and tracked counts after wrapping NEG, with
+/// signed JLE; zero therefore blocks. Reuse the same history/count owners,
+/// without the stock CheckBuildLimit50B370 factory/pad adjustments.
+fn ai_build_limit_blocks(
+    sim: &Simulation,
+    rules: &RuleSet,
+    owner: InternedId,
+    object: &ObjectType,
+    limit: i32,
+) -> bool {
+    let owned = sim
+        .interner
+        .get(&object.id)
+        .zip(sim.houses.get(&owner))
+        .map_or(0, |(type_id, house)| {
+            house
+                .tracking()
+                .owned_count(EntityCategory::from(object.category), type_id)
+        });
+    if limit > 0 {
+        return owned >= limit;
+    }
+    let produced = rules
+        .type_array_index(object.category, &object.id)
+        .zip(sim.houses.get(&owner))
+        .map_or(0, |(index, house)| {
+            house.produced_count(object.category, index)
+        });
+    produced.wrapping_neg() <= limit || owned.wrapping_neg() <= limit
+}
+
+/// The at-limit arm: the native hook writes `-1` into the category's
+/// production choice slot before the start skips — `+0x564C` building
+/// (`0xC3371C`), `+0x5654` infantry (`0xC3360C`), `+0x5658` aircraft, and for
+/// a unit `+0x5650` or the naval queue's `+0x16130` by `UnitType+0xCCE`
+/// (`0xC33570..0xC33592`, NPSE 2.0; legacy ext173 C2D039 uses +160F8).
+/// A capped building is cleared too, and
+/// its plan node stays unsatisfied, so `choose_building` returns the same
+/// type: that is the manual's warning (`AI克隆生产`) that a building at its
+/// limit leaves the computer unable to build anything, not a recovery.
+fn clear_aibuild_limit_choice(sim: &mut Simulation, owner: InternedId, object: &ObjectType) {
+    let Some(house) = sim.houses.get_mut(&owner) else {
+        return;
+    };
+    match UnitChoiceKind::of(object.category, object.naval) {
+        Some(kind) => house.ai_unit_choices_mut().clear(kind),
+        None => house.ai_production_mut().clear_building_choice(),
+    }
 }
 
 /// `BuildingClass+0x550..+0x558`, the wait before the building's computer

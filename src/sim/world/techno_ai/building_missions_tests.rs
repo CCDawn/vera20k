@@ -1693,6 +1693,17 @@ fn retail_dustbowl_tesla_coil_charges_before_each_shot() {
         let entity = scenario.sim().substrate.entities.get(coil).unwrap();
         entity.pending_building_fire.pending().is_some()
     };
+    // The coil's drain reaches its House at Added_To_Game (`0x00502B48` ->
+    // `0x0044E880` -> `0x005018C0`), the plant's output only at the House's
+    // assessment (`0x004F844B`), which follows the frame's objects. The
+    // coil's first Update is unpowered; the second one's operational edge
+    // (`0x0043FB20`) restores the Active anim that Grand_Opening paused.
+    retail_frame(&mut scenario, Vec::new());
+    assert_eq!(
+        slots(&scenario),
+        (None, None),
+        "unpowered on its first Update"
+    );
     retail_frame(&mut scenario, Vec::new());
     assert_eq!(
         slots(&scenario),

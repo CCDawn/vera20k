@@ -412,7 +412,7 @@ fn movie_list_composition<'a>(
         atlas,
         &buttons,
         crate::app::frontend::menu_page_render::MENU_PAGE_BUTTON_POLICY,
-        std::time::Instant::now(),
+        crate::util::time::Instant::now(),
         None,
     );
     // The slide engine draws the button frames only; captions return with
@@ -493,7 +493,7 @@ pub(crate) fn render_movie_list(
         let title_window = state
             .frontend
             .shell_page_title
-            .paint(std::time::Instant::now());
+            .paint(crate::util::time::Instant::now());
         let status_text = movie_list_status_key(state)
             .map(|key| resolve_csf(state, key).into_owned())
             .unwrap_or_default();
@@ -573,6 +573,14 @@ pub(crate) fn render_fullscreen_movie(
         texture: movie.surface().batch_texture(),
         instances: vec![instance],
     }];
+    let subtitle: Vec<_> = movie
+        .subtitle_text(
+            &state.renderer.bit_font,
+            state.renderer.gpu.config.width as i32,
+            state.renderer.gpu.config.height as i32,
+        )
+        .into_iter()
+        .collect();
     encode_shell_pass(
         state,
         encoder,
@@ -580,6 +588,7 @@ pub(crate) fn render_fullscreen_movie(
         "Play_Movie",
         ShellComposition {
             draws: &draws,
+            text: &subtitle,
             ..ShellComposition::default()
         },
     );

@@ -6,8 +6,9 @@ use crate::app::frontend::{shell_layout, shell_transition};
 use crate::app::{App, AppState};
 use crate::ui::main_menu_dialogs::options::LauncherCue;
 use crate::ui::network_options::*;
+use crate::ui::shell::combobox::ComboPress;
 use crate::ui::shell::descriptor::DialogId;
-use std::time::Instant;
+use crate::util::time::Instant;
 use winit::event::{KeyEvent, MouseButton};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
@@ -214,15 +215,7 @@ pub(crate) fn cursor_moved(state: &mut AppState) {
         if let Some(popup) = dialog.card_popup(&layout) {
             // ComboDropWin60E262..60E2AC keeps its last hot row when
             // the pointer leaves rows, including over the scrollbar.
-            if let Some(row) = popup.row_at(x, y) {
-                dialog.card_hot_row = Some(row);
-            }
-            dialog.card_scroll.pointer_moved(
-                popup.scroll_geometry(),
-                &mut dialog.card_top_index,
-                x,
-                y,
-            );
+            dialog.popup.pointer_moved(popup, x, y);
         }
     }
     state.platform.window.request_redraw();
@@ -242,36 +235,26 @@ pub(crate) fn mouse(state: &mut AppState, button: MouseButton, pressed: bool) {
         .expect("D7 input owner");
     if pressed {
         if dialog.pending_message().is_none() {
-            if let Some(popup) = dialog.card_popup(&layout) {
-                if let Some(part) = popup.scroll_part_at(x, y) {
-                    dialog.card_scroll.press(
-                        part,
-                        popup.scroll_geometry(),
-                        &mut dialog.card_top_index,
-                        y,
-                        Instant::now(),
-                    );
-                    state.platform.window.request_redraw();
-                    return;
-                }
-                if let Some(row) = popup.row_at(x, y) {
+            let press = if let Some(popup) = dialog.card_popup(&layout) {
+                let press = dialog.popup.press_list(popup, x, y, Instant::now());
+                if let ComboPress::Pick(row) = press {
                     dialog.select_card(row);
-                } else {
-                    dialog.combo_open = false;
                 }
-                App::play_launcher_options_cue(state, LauncherCue::ComboClose);
-                state.platform.window.request_redraw();
-                return;
-            }
-            if over == Some(CARD) {
-                if crate::ui::skirmish_shell::combo_arrow_hit_rect(layout.card, layout.page.scale)
-                    .contains(x, y)
-                {
-                    dialog.combo_open = true;
-                    dialog.card_top_index = 0;
-                    dialog.card_hot_row = Some(dialog.selected_card);
+                Some(press)
+            } else if over == Some(CARD) {
+                let selected = Some(dialog.selected_card);
+                Some(
+                    dialog
+                        .popup
+                        .press_face((), layout.card, layout.page.scale, selected, x, y),
+                )
+            } else {
+                None
+            };
+            if let Some(press) = press {
+                if let Some(cue) = press.cue() {
+                    App::play_launcher_options_cue(state, cue.into());
                 }
-                App::play_launcher_options_cue(state, LauncherCue::ComboOpen);
                 state.platform.window.request_redraw();
                 return;
             }
@@ -301,7 +284,7 @@ pub(crate) fn mouse(state: &mut AppState, button: MouseButton, pressed: bool) {
             App::play_main_menu_button_sound(state);
         }
     } else {
-        dialog.card_scroll.cancel();
+        dialog.popup.cancel_pointer();
         if let Some(control) = dialog.buttons.release(over) {
             activate(state, control);
         }
@@ -314,14 +297,14 @@ pub(crate) fn poll_scroll_repeat(state: &mut AppState) -> Option<Instant> {
     let (x, y) = state.match_state.input.cursor_px();
     let dialog = state.frontend.network_options.as_mut()?;
     let popup = dialog.card_popup(&layout)?;
-    if dialog.card_scroll.poll(
+    if dialog.popup.scroll.poll(
         popup.scroll_geometry(),
-        &mut dialog.card_top_index,
+        &mut dialog.popup.top_index,
         x,
         y,
         Instant::now(),
     ) {
         state.platform.window.request_redraw();
     }
-    dialog.card_scroll.repeat_at()
+    dialog.popup.scroll.repeat_at()
 }

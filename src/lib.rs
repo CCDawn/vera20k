@@ -8,6 +8,9 @@
 //! scenario) is the `vera20k-core` crate (`src/core_lib.rs`). Its modules are
 //! re-exported here, so `crate::sim::...` and `vera20k::sim::...` keep naming
 //! them.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown", not(feature = "wasm")))]
+compile_error!("browser builds require --features wasm");
+
 pub use vera20k_core::{
     assets, headless_scenario, map, net, rules, sim, skirmish_launch, skirmish_modes, super_ai,
     util,
@@ -29,6 +32,11 @@ const _: () = assert!(
 const _: () = assert!(
     cfg!(feature = "npatch") == rules::NPATCH_ENABLED,
     "enable NPatch through the vera20k package's npatch feature"
+);
+// The same boundary for VERA20K's own VeraX extension capability.
+const _: () = assert!(
+    cfg!(feature = "verax") == rules::VERAX_ENABLED,
+    "enable VeraX through the vera20k package's verax feature"
 );
 
 // Opaque process-RNG cursor receipt shared by map generation and simulation.
@@ -58,3 +66,11 @@ mod architecture_guards;
 // Fixture files that library tests read from the checkout.
 #[cfg(test)]
 use vera20k_core::test_fixture;
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+pub mod web;
+
+// Browser protocol tests run on the host without linking JavaScript APIs.
+#[cfg(all(feature = "wasm", any(test, all(target_arch = "wasm32", target_os = "unknown"))))]
+#[path = "web/lifecycle.rs"]
+mod browser_lifecycle;

@@ -8,13 +8,11 @@
 //! paint their caption only; their owner-draw face is not traced.
 
 use super::chrome::*;
-use super::controls::{
-    ControlPaint, NewEditPaint, list_controls, paint_control, push_new_edit_instances,
-};
+use super::controls::{ControlPaint, list_controls, paint_control, push_new_edit};
 use super::text::rect_to_text_rect;
 use super::{
     OWNERDRAW_SELECTED_RGB_FROM_DAT_00AC4604_PACKED_000000FF, SHELL_CONTROL_DEPTH,
-    SHELL_CONTROL_TEXT_DEPTH, SHELL_EDIT_CARET_DEPTH, SHELL_EDIT_FRAME_DEPTH, SHELL_LABEL_TEXT_RGB,
+    SHELL_CONTROL_TEXT_DEPTH, SHELL_LABEL_TEXT_RGB,
 };
 use crate::app::AppState;
 use crate::render::batch::SpriteInstance;
@@ -24,7 +22,7 @@ use crate::render::shell_text::{self, ShellAlign, ShellTextDraw};
 use crate::ui::shell::geom::{RectPx, ShellScale};
 use crate::ui::skirmish_shell::SavedSeedDescriptionEdit;
 use crate::ui::wol_lobby::*;
-use std::time::Instant;
+use crate::util::time::Instant;
 
 /// The popups paint over the covered dialog, before their own controls.
 pub(super) const POPUP_DEPTHS: ModalDepths = ModalDepths {
@@ -78,7 +76,7 @@ pub(super) fn push_icon(
     shell_paint::push_entry_grown(out, *entry, px, py, scale, SHELL_CONTROL_DEPTH - 0.00003);
 }
 
-/// A NewEdit's frame and text, as BB and `0x10F` paint theirs.
+/// A NewEdit as `0x10F` and the WOL popups paint theirs.
 pub(super) fn push_edit(
     paint: &mut WolLobbyPaint,
     state: &AppState,
@@ -91,37 +89,18 @@ pub(super) fn push_edit(
     let Some(atlas) = state.frontend.skirmish_shell_chrome.as_ref() else {
         return;
     };
-    let font = &state.renderer.bit_font;
-    let field = scale.derive_rect(rect, |rect| {
-        RectPx::new(rect.x + 2, rect.y, rect.w - 1, rect.h + 1)
-    });
-    push_new_edit_instances(
+    push_new_edit(
         &mut paint.controls,
+        &mut paint.texts,
         atlas,
-        font,
+        &state.renderer.bit_font,
         edit,
-        NewEditPaint {
-            frame: scale.derive_rect(rect, |rect| {
-                RectPx::new(rect.x - 2, rect.y - 2, rect.w + 5, rect.h + 5)
-            }),
-            text: field,
-            background: None,
-            frame_depth: SHELL_EDIT_FRAME_DEPTH,
-            caret_depth: SHELL_EDIT_CARET_DEPTH,
-            caret_visible,
-        },
+        None,
+        rect,
+        caret_visible,
+        text_depth,
         scale,
     );
-    paint.texts.push(shell_text::draw_in_rect_scaled(
-        font,
-        &edit.painted_text(),
-        rect_to_text_rect(field),
-        SHELL_LABEL_TEXT_RGB,
-        ShellAlign::V_CENTER,
-        [0.0; 2],
-        text_depth,
-        scale.factor(),
-    ));
 }
 
 pub(crate) fn paint_wol_lobby_children(
@@ -137,6 +116,7 @@ pub(crate) fn paint_wol_lobby_children(
     };
     let font = &state.renderer.bit_font;
     let scale = layout.page.scale;
+    let modern = ui.is_modern();
     let now = Instant::now();
     let text = |value: &str, rect: RectPx, align: ShellAlign, rgb: [f32; 3]| {
         shell_text::draw_in_rect_scaled(
@@ -162,6 +142,14 @@ pub(crate) fn paint_wol_lobby_children(
             &label(state, key),
             rect,
             ShellAlign::NONE,
+            SHELL_LABEL_TEXT_RGB,
+        ));
+    }
+    if let Some(rect) = layout.observer_caption {
+        paint.texts.push(text(
+            &label(state, "GUI:Observe"),
+            rect,
+            ShellAlign::H_RIGHT,
             SHELL_LABEL_TEXT_RGB,
         ));
     }
@@ -196,8 +184,13 @@ pub(crate) fn paint_wol_lobby_children(
             }
             None => {
                 if let Some((_, key)) = SORT_BUTTONS.iter().find(|(known, _)| *known == id) {
+                    let caption = if modern && matches!(id, SORT_ALPHA | PLAYER_SORT_ALPHA) {
+                        "Name".to_owned()
+                    } else {
+                        label(state, key)
+                    };
                     paint.texts.push(text(
-                        &label(state, key),
+                        &caption,
                         rect,
                         ShellAlign::H_CENTER | ShellAlign::V_CENTER,
                         SHELL_LABEL_TEXT_RGB,
@@ -216,7 +209,7 @@ pub(crate) fn paint_wol_lobby_children(
         },
         scale,
     );
-    if let Some(entry) = atlas.lan_observer_toggle(ui.observer) {
+    if !modern && let Some(entry) = atlas.lan_observer_toggle(ui.observer) {
         push_flag_entry_clipped_centered(
             &mut paint.controls,
             entry,
@@ -225,14 +218,20 @@ pub(crate) fn paint_wol_lobby_children(
             SHELL_CONTROL_DEPTH,
         );
     }
-    push_edit(
-        &mut paint,
-        state,
+    push_new_edit(
+        &mut paint.controls,
+        &mut paint.texts,
+        atlas,
+        font,
         &ui.chat.edit,
+        state
+            .platform
+            .ime
+            .composition(crate::app::input::ime::ImeTarget::WolLobbyChat),
         layout.chat,
         ui.popup.is_none() && ui.caret_visible(now),
-        scale,
         SHELL_CONTROL_TEXT_DEPTH,
+        scale,
     );
 
     let lobbies = ui
@@ -248,14 +247,16 @@ pub(crate) fn paint_wol_lobby_children(
         .chat
         .list
         .geometry(layout.chat_log, ui.chat.lines.len(), scale);
-    list_controls(
-        &mut paint.controls,
-        atlas,
-        lobbies,
-        &ui.lobby_list,
-        true,
-        scale,
-    );
+    if !modern {
+        list_controls(
+            &mut paint.controls,
+            atlas,
+            lobbies,
+            &ui.lobby_list,
+            true,
+            scale,
+        );
+    }
     list_controls(
         &mut paint.controls,
         atlas,
@@ -309,6 +310,7 @@ pub(crate) fn paint_wol_lobby_children(
             SHELL_LABEL_TEXT_RGB,
         ));
     }
+    let ping_header = layout.control_rect(SORT_PING);
     for (visible, row) in ui
         .game_rows
         .iter()
@@ -322,25 +324,53 @@ pub(crate) fn paint_wol_lobby_children(
         } else {
             SHELL_LABEL_TEXT_RGB
         };
+        // The modern list keeps one retail icon, a password game's lock, in
+        // the first icon column; that row's name starts at the next one.
+        let name_x = if row.keyed {
+            GAME_PASSWORD_X
+        } else {
+            GAME_TYPE_X
+        };
         paint.texts.push(text(
             &row.text,
-            cell(rect, GAME_NAME_X, GAME_NAME_W),
+            if modern {
+                cell(rect, name_x, GAME_PING_X - 2 - name_x)
+            } else {
+                cell(rect, GAME_NAME_X, GAME_NAME_W)
+            },
             ShellAlign::V_CENTER,
             rgb,
         ));
-        // A -1 ping is the text "???"; any other is an integer cell.
+        // A -1 ping is the text "???"; any other is an integer cell. The
+        // modern list centres it under its Ping header instead of starting
+        // it at the retail column, left of the header's caption.
         let ping = if row.ping == -1 {
             "???".to_owned()
         } else {
             row.ping.to_string()
         };
-        paint.texts.push(text(
-            &ping,
-            cell(rect, GAME_PING_X, 0),
-            ShellAlign::V_CENTER,
-            rgb,
-        ));
-        if let Some(art) = art {
+        let (ping_rect, ping_align) = match ping_header.filter(|_| modern) {
+            Some(header) => (
+                RectPx::new(header.x, rect.y, header.w, rect.h),
+                ShellAlign::H_CENTER | ShellAlign::V_CENTER,
+            ),
+            None => (cell(rect, GAME_PING_X, 0), ShellAlign::V_CENTER),
+        };
+        paint.texts.push(text(&ping, ping_rect, ping_align, rgb));
+        if modern {
+            if row.keyed
+                && let Some(art) = art
+            {
+                push_icon(
+                    &mut paint.icons,
+                    art,
+                    "wolpriv.pcx",
+                    rect,
+                    GAME_TYPE_X,
+                    scale,
+                );
+            }
+        } else if let Some(art) = art {
             push_icon(
                 &mut paint.icons,
                 art,
@@ -374,10 +404,17 @@ pub(crate) fn paint_wol_lobby_children(
         let rect = players.row(visible);
         paint.texts.push(text(
             &row.name,
-            cell(rect, PLAYER_NAME_X, PLAYER_NAME_W),
+            if modern {
+                cell(rect, 2, 0)
+            } else {
+                cell(rect, PLAYER_NAME_X, PLAYER_NAME_W)
+            },
             ShellAlign::V_CENTER,
             SHELL_LABEL_TEXT_RGB,
         ));
+        if modern {
+            continue;
+        }
         if let Some((tag, _)) = &row.clan {
             paint.texts.push(text(
                 tag,

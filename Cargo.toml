@@ -1,6 +1,6 @@
 [package]
 name = "vera20k"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 description = "Vera20k Engine — a from-scratch Rust engine for Red Alert 2: Yuri's Revenge"
 autobins = false
@@ -13,7 +13,7 @@ publish = false
 # asset tools and the game binary). The core manifest sits in `src/`, so rustc
 # still names every source file `src/...`.
 [workspace]
-members = ["src"]
+members = ["src", "services/relay-protocol", "services/relay"]
 # Plain `cargo build`/`cargo test --lib` cover both crates.
 default-members = [".", "src"]
 
@@ -38,6 +38,12 @@ path = "src/bin/telemetry-serve.rs"
 required-features = ["telemetry-dashboard"]
 
 [features]
+# Browser host support; target selection still controls every platform implementation.
+wasm = ["vera20k-core/wasm", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:web-sys", "dep:console_log", "dep:console_error_panic_hook", "getrandom/wasm_js"]
+# Optional browser networking; desktop targets keep their native transport.
+wasm-net = ["wasm", "vera20k-core/wasm-net"]
+# Browser LAN play over WebRTC; the gateway only coordinates the handshake.
+wasm-lan = ["wasm-net", "vera20k-core/wasm-lan"]
 # Development builds carry the Ctrl+Shift dev chord. The release workflow builds
 # with `--no-default-features`, so shipped binaries do not.
 default = ["dev-overlays"]
@@ -48,12 +54,14 @@ ares = ["vera20k-core/ares"]
 phobos = ["vera20k-core/phobos"]
 # Placeholder for the NPatch capability; no chain reads it yet.
 npatch = ["vera20k-core/npatch"]
+# VERA20K's own first-party extension capability; VeraX-gated chains read it.
+verax = ["vera20k-core/verax"]
 # The Ctrl+Shift dev chord: renderer-native diagnostic overlays (grid, heightmap,
 # pathgrid, foot path, fog), the debug pause and quicksave/quickload. Captures
 # rely on it (literal Ctrl+Shift+M/N quicksave/quickload).
 dev-overlays = ["vera20k-core/dev-overlays"]
 # Optional read-only local browser dashboard, absent from default/shipping builds.
-telemetry-dashboard = ["vera20k-core/telemetry", "dep:getrandom", "dep:sha1"]
+telemetry-dashboard = ["vera20k-core/telemetry", "dep:sha1"]
 # Explicit offline trainer and per-unit event hooks. Never enabled by the
 # dashboard alone or the default/shipping feature set.
 debug-tools = ["telemetry-dashboard", "dev-overlays", "vera20k-core/debug-tools"]
@@ -62,15 +70,22 @@ debug-tools = ["telemetry-dashboard", "dev-overlays", "vera20k-core/debug-tools"
 # The GPU-free engine. Its dev features follow this package's.
 vera20k-core = { path = "src" }
 
-# OS session credentials and RFC6455 handshake; no simulation RNG or command intake.
-getrandom = { version = "=0.3.4", optional = true }
+# Background HTTPS lobby I/O; verified TLS is independent of simulation.
+base64 = "0.22"
+
+# OS multiplayer session nonces and RFC6455 handshake; no simulation RNG or command intake.
+getrandom = { version = "=0.3.4" }
 sha1 = { version = "=0.10.6", optional = true }
 
 # --- GPU rendering ---
-wgpu = "27"
+wgpu = "29.0.4"
 # winit 0.30 is the latest stable. 0.31 is still in beta.
 # Uses the ApplicationHandler trait pattern (deferred window creation).
-winit = "0.30"
+# The supported no-title CSD keeps Wayland borders/buttons and window title
+# metadata, but omits drawn title text when the compositor needs client-side
+# decorations. It avoids ab_glyph's unmaintained ttf-parser; X11/server-side
+# decorations and the macOS/Windows title bars keep their normal text.
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita-notitle"] }
 # raw-window-handle + windows-sys let us clip the OS cursor to the game window
 # with the Win32 ClipCursor API . That is reliable on frameless
 # windows. winit's CursorGrabMode::Confined instead clips a *hidden* cursor to a
@@ -105,6 +120,17 @@ image = { version = "0.25", default-features = false, features = ["png", "ico"] 
 # Playback only: the engine decodes its own audio and hands rodio PCM buffers, so
 # rodio's decoders (symphonia), dither and microphone recording stay off.
 rodio = { version = "0.22", default-features = false, features = ["playback"] }
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+ureq = { version = "3.5", default-features = false, features = ["rustls", "json"] }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", optional = true, features = ["Window", "Document", "HtmlCanvasElement", "Element", "HtmlElement", "AudioBuffer", "AudioBufferSourceNode", "AudioContext", "AudioDestinationNode", "AudioNode", "AudioScheduledSourceNode", "BaseAudioContext"] }
+console_log = { version = "1", optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # Continuing presentation uptime across saved-game process restarts. The
@@ -144,7 +170,7 @@ serde_json = "1"
 # thiserror for structured library errors (AssetError, RulesError, etc.)
 thiserror = "2"
 # anyhow for application-level error propagation (main.rs, app facade)
-anyhow = "1"
+anyhow = "1.0.104"
 log = "0.4"
 
 [lints]

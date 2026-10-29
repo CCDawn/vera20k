@@ -513,7 +513,7 @@ fn family_rim_tiles(
 fn hut_tile_keys(terrain: &ResolvedTerrainGrid, family: HutBridgeFamily) -> HighBridgeRimTiles {
     let mut keys = terrain
         .high_bridge_rim_tiles()
-        .unwrap_or_else(|| HighBridgeRimTiles::from_ini(-1, &[]));
+        .unwrap_or(HighBridgeRimTiles::ABSENT);
     if family == HutBridgeFamily::Low {
         keys.base = terrain.wood_bridge_set_base();
     }

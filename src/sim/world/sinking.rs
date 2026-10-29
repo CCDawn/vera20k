@@ -6,7 +6,7 @@
 //! still-marked hull through [`Simulation::begin_living_ship_sinking`]. Foot AI
 //! skips Process, observes the sound edge, and Unit/Aircraft AI lowers the raw
 //! coordinate until its terminal RecordKill/UnInit.
-//! Native execution: tools/spatial_oracle/naval_occupants and naval_sink_tick.
+//! Native execution: tools/spatial_oracle/naval_sink_tick.
 //! Aircraft suffix control flow: AircraftClass::AI414DB6..414ED0.
 
 use super::{SimSoundEvent, Simulation, UninitContext};
@@ -68,7 +68,7 @@ impl Simulation {
         entity.health.set(1);
         entity.lifecycle.restore_alive();
         entity.sinking.active = true;
-        self.techno_death_stun(
+        self.stun(
             id,
             UninitContext::with_rules(rules).with_effects(frame_effects),
         );
@@ -106,7 +106,7 @@ impl Simulation {
                 self.dispatch_unit_lost_events(&[event]);
             }
         }
-        self.techno_death_stun(
+        self.stun(
             id,
             UninitContext::with_rules(rules).with_effects(frame_effects),
         );

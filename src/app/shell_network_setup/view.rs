@@ -81,7 +81,10 @@ pub(crate) fn view(state: &AppState) -> Option<SetupView> {
                 .iter()
                 .position(|map| map.file_name.eq_ignore_ascii_case(file))
         });
-    let capacity = session.network_setup_capacity()?.clamp(0, 8) as usize;
+    let capacity = session
+        .network_setup_capacity()?
+        .clamp(0, crate::skirmish_launch::NETWORK_PLAYER_SLOT_COUNT as i32)
+        as usize;
     let observer_row = session.network_observer_row().map(usize::from);
     let row_limit = session.network_row_limit()?;
     let visible_limit = if observer_row == Some(0) && (capacity as i32) < row_limit {
@@ -96,9 +99,21 @@ pub(crate) fn view(state: &AppState) -> Option<SetupView> {
             .multiplayer_shell_runtime
             .cooperative_setup_view()
     });
+    let row_count = visible_limit
+        .max(observer_row.map_or(0, |row| row + 1))
+        .min(crate::skirmish_launch::NETWORK_PLAYER_SLOT_COUNT);
+    let first_row = state
+        .frontend
+        .multiplayer_setup
+        .as_ref()
+        .map_or(0, |ui| ui.first_row(row_count));
     let mut combos = Vec::with_capacity(40);
     let mut row_icons = std::array::from_fn(|_| None);
-    for row in 0..8u8 {
+    for visible_row in 0..VISIBLE_SETUP_ROWS {
+        let row = (first_row + visible_row) as u8;
+        if usize::from(row) >= crate::skirmish_launch::NETWORK_PLAYER_SLOT_COUNT {
+            break;
+        }
         let human = launch
             .humans
             .iter()
@@ -206,7 +221,8 @@ pub(crate) fn view(state: &AppState) -> Option<SetupView> {
         }
         let selected = players.iter().position(|item| item.value == slot_value);
         combos.push(SetupCombo {
-            id: SetupColumn::Player.control(usize::from(row)),
+            id: SetupColumn::Player.control(visible_row),
+            row,
             enabled: host || is_local,
             visible,
             selected,
@@ -268,6 +284,8 @@ pub(crate) fn view(state: &AppState) -> Option<SetupView> {
                     .filter(|ai| ai.raw_slot_index != row && !ai.color_random)
                     .map(|ai| usize::from(ai.color_index)),
             );
+        let color_claims =
+            color_claims.filter(|_| launch.humans.len() + launch.opponents.len() <= 8);
         let colors =
             skirmish_shell::available_color_choices(usize::try_from(color).ok(), color_claims)
                 .into_iter()
@@ -312,7 +330,8 @@ pub(crate) fn view(state: &AppState) -> Option<SetupView> {
         ] {
             let selected = choices.iter().position(|item| item.value == value);
             combos.push(SetupCombo {
-                id: column.control(usize::from(row)),
+                id: column.control(visible_row),
+                row,
                 enabled: editable && (column != SetupColumn::Team || mode.allies_allowed),
                 visible: visible
                     && (column == SetupColumn::Country || !observer)
@@ -322,8 +341,15 @@ pub(crate) fn view(state: &AppState) -> Option<SetupView> {
             });
         }
         if visible {
-            row_icons[usize::from(row)] = Some(SetupRowIcon {
-                country: flag_pcx_for_side_item_data(country).map(str::to_owned),
+            let flag = match u16::try_from(country)
+                .ok()
+                .and_then(|index| state.process_assets.country_flag_surface(index))
+            {
+                Some(flag) => Some(flag),
+                None => flag_pcx_for_side_item_data(country).map(str::to_owned),
+            };
+            row_icons[visible_row] = Some(SetupRowIcon {
+                country: flag,
                 // 0x5EA3E0: wolhost.pcx on the human row named [0xA8D610];
                 // a WOL guest learns it from the user list, otherwise the
                 // host is row 0.
@@ -375,10 +401,12 @@ pub(crate) fn view(state: &AppState) -> Option<SetupView> {
         let human = launch
             .humans
             .iter()
-            .find(|human| human.raw_slot_index == Some(row as u8))?;
+            .find(|human| human.raw_slot_index == Some((first_row + row) as u8))?;
         ping_icon(protocol.ping(&human.name)?)
     });
     Some(SetupView {
+        first_row,
+        row_count,
         dialog,
         ping_icons,
         host,
@@ -388,7 +416,8 @@ pub(crate) fn view(state: &AppState) -> Option<SetupView> {
         short_game_locked: host && profile_is_wol(state) && room.tournament_or_clan(),
         team_header: !clan_room,
         accept_enabled: protocol.accept_eligible
-            && !session.network_player_ready(launch.local_player_index),
+            && !session.network_player_ready(launch.local_player_index)
+            && crate::app::shell_wol::local_choices_agreed(state),
         start_requested: protocol.start_requested
             && !session.network_player_ready(launch.local_player_index),
         combos,

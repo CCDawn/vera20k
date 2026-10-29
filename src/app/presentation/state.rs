@@ -7,8 +7,8 @@
 //! allocated while the shell is active.
 //! Process-lifetime GPU objects live in `app::renderer_state::RendererState`.
 
+use crate::util::time::Instant;
 use std::collections::{BTreeMap, HashMap};
-use std::time::Instant;
 
 use crate::map::houses::{HouseColorMap, HouseRoster};
 use crate::map::overlay::TerrainObject;
@@ -43,6 +43,11 @@ pub(crate) struct MatchPresentationState {
     pub(crate) bridge_atlas: Option<BridgeAtlas>,
     pub(crate) sidebar_cameo_atlas: Option<SidebarCameoAtlas>,
     pub(crate) sidebar_chrome: Option<SidebarChromeSet>,
+    /// This match's Ares `GraphicalText.Image/Palette` overlay art, rebuilt
+    /// with the incoming world like the sidebar chrome. `None` keeps the
+    /// process InitGame GRFXTXT art.
+    pub(crate) outcome_banner_side_art:
+        Option<crate::app::presentation::outcome_banner::OutcomeBannerArt>,
     pub(crate) software_cursor: Option<crate::app::presentation::render::SoftwareCursor>,
     pub(crate) terrain_grid: Option<TerrainGrid>,
     /// Overlay entries from map for per-frame instance generation.
@@ -59,6 +64,8 @@ pub(crate) struct MatchPresentationState {
     pub(crate) lighting: super::lighting::MatchLighting,
     pub(crate) line_trails: super::line_trails::LineTrails,
     pub(crate) lasers: super::lasers::Lasers,
+    #[cfg(feature = "ares")]
+    pub(crate) flying_credits: std::cell::RefCell<super::flying_credits::FlyingCredits>,
     pub(crate) talk_bubble: super::talk_bubble::TalkBubble,
     pub(crate) electric_bolts: super::electric_bolts::ElectricBolts,
     /// Process registry B04A60; ordinary kind1 beams copy their endpoints.
@@ -93,12 +100,42 @@ pub(crate) struct MatchPresentationState {
         Option<crate::render::sidebar_chrome::ResolvedSidebarChromeIdentity>,
     /// Content insets [left, top, right, bottom] derived from the transparent opening
     /// in radar.shp frame 0. Used to position the minimap inside the chrome housing.
-    /// Unscaled pixels — multiply by `ui_scale` at use site.
+    /// radar.shp pixels, which draw one-to-one in render pixels.
     pub(crate) radar_content_insets: Option<[u32; 4]>,
     /// Whether the local player currently has operational radar (power-gated).
     pub(crate) has_radar: bool,
     /// Selection overlay renderer — highlights and drag rectangle.
     pub(crate) selection_overlay: Option<SelectionOverlay>,
+    /// Phobos `[Phobos] DigitalDisplay.Enable` from the imported client
+    /// profile.
+    #[cfg(feature = "phobos")]
+    pub(crate) digital_display_enabled: bool,
+    /// Phobos `[Phobos] ShowPlacementPreview` (source default true).
+    #[cfg(feature = "phobos")]
+    pub(crate) show_placement_preview: bool,
+    /// Phobos `[Phobos] ShowFlashOnSelecting` (source default false): gates
+    /// `[AudioVisual] SelectionFlashDuration` on each local selection.
+    #[cfg(feature = "phobos")]
+    pub(crate) show_flash_on_selecting: bool,
+    /// Phobos `uimd.ini [Sidebar] CenterPauseMenuBackground` (default no),
+    /// applied to the active-game shell's background rectangle.
+    #[cfg(feature = "phobos")]
+    pub(crate) center_pause_menu_background: bool,
+    /// Phobos `[Phobos] ShowPowerPlantEnhancerRange` (source default false):
+    /// the client half of the placement-time enhancer ring switch.
+    #[cfg(feature = "phobos")]
+    pub(crate) show_power_plant_enhancer_range: bool,
+    /// Phobos placement preview SHP cache for the current placing type.
+    #[cfg(feature = "phobos")]
+    pub(crate) placement_preview_art:
+        std::cell::RefCell<super::placement_preview::PlacementPreviewArt>,
+    /// Phobos left superweapon sidebar: `uimd.ini` settings, toggle state,
+    /// filtered order and computed geometry.
+    #[cfg(feature = "phobos")]
+    pub(crate) sw_sidebar: super::sw_sidebar::SwSidebarState,
+    /// Loaded `[SIDE] SuperWeaponSidebar.*PCX` atlas for the current match.
+    #[cfg(feature = "phobos")]
+    pub(crate) sw_sidebar_art: Option<crate::render::sw_sidebar_art::SwSidebarArt>,
     /// PBEACON/RDRBEACN in each beacon row's House Convert, loaded with the
     /// world (`Init_BeaconArt 0x004309D0`).
     pub(crate) beacon_art: Option<crate::render::beacon_art::BeaconArt>,
@@ -132,8 +169,6 @@ pub(crate) struct MatchPresentationState {
     pub(crate) active_sidebar_tab: SidebarTab,
     /// Native side-specific geometry in physical render pixels.
     pub(crate) sidebar_layout_spec: SidebarChromeLayoutSpec,
-    /// Ordinary retail artwork uses one render pixel per source pixel.
-    pub(crate) ui_scale: f32,
     /// Shared tooltip service (study S1) — the model is clock-injected; only
     /// `input::tooltips` reads the wall clock.
     pub(crate) tooltips: crate::ui::tooltips::TooltipService,

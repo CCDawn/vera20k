@@ -44,7 +44,7 @@ fn retail_root() -> PathBuf {
 }
 
 fn headless_device() -> (wgpu::Device, wgpu::Queue) {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         ..Default::default()
@@ -168,7 +168,7 @@ fn retail_atlas_refresh_costs() {
     }
 
     let started = Instant::now();
-    let extra = crate::app::frontend::skirmish::deployable_building_types(Some(rules));
+    let extra = sprite_atlas::deployable_building_types(Some(rules));
     let remaps = sprite_atlas::collect_anim_remap_base_keys(sim, &house_colors);
     let mut sprites = sprite_atlas::build_sprite_atlas(
         &device,
@@ -256,7 +256,7 @@ fn retail_atlas_refresh_costs() {
     let covers = |sim: &crate::sim::world::Simulation,
                   sprites: &sprite_atlas::SpriteAtlas,
                   units: &unit_atlas::UnitAtlas| {
-        let extra = crate::app::frontend::skirmish::deployable_building_types(Some(rules));
+        let extra = sprite_atlas::deployable_building_types(Some(rules));
         let remaps = sprite_atlas::collect_anim_remap_base_keys(sim, &house_colors);
         let sprites_covered = sprite_atlas::atlas_covers_world(
             Some(sprites),
@@ -294,7 +294,7 @@ fn retail_atlas_refresh_costs() {
     let refresh_sprites =
         |sim: &crate::sim::world::Simulation, atlas: sprite_atlas::SpriteAtlas, label: &str| {
             let started = Instant::now();
-            let extra = crate::app::frontend::skirmish::deployable_building_types(Some(rules));
+            let extra = sprite_atlas::deployable_building_types(Some(rules));
             let remaps = sprite_atlas::collect_anim_remap_base_keys(sim, &house_colors);
             let atlas = sprite_atlas::build_sprite_atlas(
                 &device,
@@ -453,7 +453,7 @@ fn retail_atlas_refresh_costs() {
         Some(rules),
         Some(art),
         &house_colors,
-        &crate::app::frontend::skirmish::deployable_building_types(Some(rules)),
+        &sprite_atlas::deployable_building_types(Some(rules)),
         &sprite_atlas::collect_anim_remap_base_keys(sim, &house_colors),
         &cell_drawers,
         &Default::default(),

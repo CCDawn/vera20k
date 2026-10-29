@@ -5,7 +5,7 @@
 //! Match-lifetime state lives in the match owners; process-lifetime GPU and
 //! audio objects live in `RendererState` / `AppAudioRuntime`.
 
-use std::time::Instant;
+use crate::util::time::Instant;
 
 use super::startup_splash;
 use crate::app::shell_random_map::{RandomMapGenerationJob, RandomMapGenerationRetention};
@@ -13,9 +13,19 @@ use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::ui::game_screen::GameScreen;
 
 pub(crate) struct FrontendState {
+    /// Immutable process flag from Parse_Command_Line52F94B (0xA8EDDC).
+    pub(crate) campaign_speed_control: bool,
     /// External offline launch: returning from the session closes the process for its client.
     pub(crate) external_launch: bool,
     pub(crate) external_launch_error: Option<String>,
+    /// The external launch's local result, first decided wins
+    /// (docs/spawn.md); see `App::external_match_result`.
+    pub(crate) external_match_result: Option<crate::app::cncnet::ExternalMatchResult>,
+    /// Frames, duration and opponent departure for the launch report.
+    pub(crate) external_progress: crate::app::cncnet::ExternalLaunchProgress,
+    /// Browser launch is closing its network owners before engine exit.
+    #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+    pub(crate) browser_exit_pending: bool,
     /// The Skirmish setup dialog's state.
     pub(crate) skirmish_shell_state: crate::ui::skirmish_shell::SkirmishShellState,
     /// Choose Map's last clicked game-type row `[0x008316FC]`: starts at -1,
@@ -28,6 +38,10 @@ pub(crate) struct FrontendState {
         crate::app::frontend::skirmish_session::MultiplayerShellRuntime,
     pub(crate) skirmish_shell_chrome:
         Option<crate::render::skirmish_shell_chrome::SkirmishShellChromeAtlas>,
+    /// The `DialogBackground.Image/.Palette` pair the shell chrome atlas was
+    /// built with. A game load that resolves a different pair drops the atlas
+    /// so it rebuilds with the side's three dialog slots.
+    pub(crate) shell_dialog_background: Option<(String, String)>,
     pub(crate) main_menu_shell_state: crate::ui::main_menu_shell::MainMenuShellState,
     pub(crate) single_player_shell_state: crate::ui::single_player_shell::SinglePlayerShellState,
     /// Shared descriptor-driven input authority for the front-end shell dialogs
@@ -108,6 +122,8 @@ pub(crate) struct FrontendState {
     /// One Westwood Online visit (`WOL_Main` `0x0077B2A0`): welcome, login,
     /// waits, boxes and the lobby entry, from Internet until WOL is left.
     pub(crate) wol: Option<crate::app::shell_wol::WolVisit>,
+    /// Retains only the departing online visit's bounded HTTP cleanup owner.
+    pub(crate) online_cleanup: crate::app::shell_wol::OnlineCleanup,
     /// The login chain's process globals (nickname, password, Remember,
     /// changed byte); they outlive every WOL visit.
     pub(crate) wol_account: crate::ui::wol_login::WolAccountGlobals,

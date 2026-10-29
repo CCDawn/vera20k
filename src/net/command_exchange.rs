@@ -6,8 +6,9 @@ use crate::sim::command_queue::FrameInfo;
 use crate::sim::world::{NetworkCommandQueues, NetworkQueueError};
 
 use super::event_packet::{
-    EncodeBlock, EventPacketCodec, NATIVE_EVENT_PACKET_CAPACITY, PacketDecodeError,
-    PacketEncodeError, decode_frame_info, decode_frame_sync, encode_frame_sync,
+    EncodeBlock, EventPacketCodec, EventPacketHeader, NATIVE_EVENT_PACKET_CAPACITY,
+    PacketDecodeError, PacketEncodeError, decode_frame_info, decode_frame_sync,
+    encode_live_frame_sync, live_command_frontier,
 };
 use super::lockstep::NetworkSendPolicy;
 
@@ -21,13 +22,14 @@ mod tests;
 pub struct CommandPeerProgress {
     house_id: i8,
     frame: i32,
-    advertised_commands: u32,
-    received_commands: u32,
+    advertised_commands: u64,
+    received_commands: u64,
     initial_response: bool,
     ///Peer+C: last FRAMESYNC response relative to the current wait entry.
     response_elapsed_buckets: u32,
     ///Peer+14: raw timeGetTime at Wait entry (648881..64889E).
     bar_reference_millis: u32,
+    lag_frames: i32,
 }
 
 impl CommandPeerProgress {
@@ -40,6 +42,7 @@ impl CommandPeerProgress {
             initial_response: false,
             response_elapsed_buckets: 0,
             bar_reference_millis: 0,
+            lag_frames: 0,
         }
     }
 
@@ -49,11 +52,15 @@ impl CommandPeerProgress {
     pub const fn frame(&self) -> i32 {
         self.frame
     }
-    pub const fn advertised_commands(&self) -> u32 {
+    pub const fn advertised_commands(&self) -> u64 {
         self.advertised_commands
     }
-    pub const fn received_commands(&self) -> u32 {
+    pub const fn received_commands(&self) -> u64 {
         self.received_commands
+    }
+
+    pub const fn lag_frames(&self) -> i32 {
+        self.lag_frames
     }
 
     ///64A861..64A927: keep the unsigned bucket lag separate from the
@@ -92,6 +99,8 @@ pub enum CommandExchangeError {
     UnknownPeer(i8),
     #[error("a command packet requires a complete FRAMEINFO or FRAMESYNC header")]
     InvalidHeader,
+    #[error("connection House {source_house} claimed event House {claimed_house}")]
+    SourceMismatch { source_house: i8, claimed_house: i8 },
     #[error("peer {house_id} initial checksum {received:08x} differs from {expected:08x}")]
     InitialChecksum {
         house_id: i8,
@@ -106,12 +115,18 @@ pub enum CommandExchangeError {
     Decode(#[from] PacketDecodeError),
     #[error("local packet encoder stopped at {0:?}")]
     UnsupportedLocalEvent(EncodeBlock),
+    #[error("a retained network send cannot change frames")]
+    UnfinishedSend,
+    #[error("the multiplayer command counter overflowed")]
+    CounterOverflow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendPoll {
     /// Only the interface service runs off the protocol-2 send boundary.
     OffCadence,
+    /// Keep the same post-Logic frame while the reliable owner makes room.
+    Backpressure,
     Complete {
         commands: usize,
     },
@@ -123,7 +138,27 @@ pub enum SendPoll {
 pub struct CommandExchange {
     codec: EventPacketCodec,
     peers: Vec<CommandPeerProgress>,
-    sent_commands: u16,
+    sent_commands: u64,
+    sending: Option<SendingFrame>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SendingFrame {
+    frame: u32,
+    remaining: usize,
+    total: usize,
+    frontier: u64,
+    header: FrameInfo,
+}
+
+/// Read-only projection of the retained transaction; no encoded bytes or
+/// independently maintained send/backpressure state escape the exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedSendProgress {
+    pub frame: u32,
+    pub remaining: usize,
+    pub total: usize,
+    pub frontier: u64,
 }
 
 impl CommandExchange {
@@ -141,8 +176,33 @@ impl CommandExchange {
     pub fn peers(&self) -> &[CommandPeerProgress] {
         &self.peers
     }
-    pub const fn sent_commands(&self) -> u16 {
+    pub const fn sent_commands(&self) -> u64 {
         self.sent_commands
+    }
+
+    pub fn sending(&self) -> bool {
+        self.sending.is_some()
+    }
+
+    pub fn retained_send(&self) -> Option<RetainedSendProgress> {
+        self.sending.map(|sending| RetainedSendProgress {
+            frame: sending.frame,
+            remaining: sending.remaining,
+            total: sending.total,
+            frontier: sending.frontier,
+        })
+    }
+
+    /// UpdatePeerFrameLag652187..6521B2: only after a source advances its
+    /// authenticated frame. The measured Logic rate belongs to MainThrottle,
+    /// and RTT to the existing private connection response history.
+    pub fn record_peer_lag(&mut self, source: i8, frame: u32, logic_rate: u32, response: u32) {
+        if let Some(peer) = self.peers.iter_mut().find(|peer| peer.house_id == source) {
+            let transit_frames = logic_rate.wrapping_mul(response >> 1) / 60;
+            peer.lag_frames = (frame as i32)
+                .wrapping_sub(transit_frames as i32)
+                .wrapping_sub(peer.frame);
+        }
     }
 
     ///647825..6478CB resets progress and all packet caches. Reconnection after
@@ -153,6 +213,7 @@ impl CommandExchange {
             *peer = CommandPeerProgress::new(peer.house_id);
         }
         self.sent_commands = 0;
+        self.sending = None;
     }
 
     pub fn remove_peer(&mut self, house_id: i8) -> bool {
@@ -193,22 +254,26 @@ impl CommandExchange {
         max_ahead: u32,
         initial_checksum: u32,
         policy: NetworkSendPolicy,
-    ) -> Result<[u8; 14], CommandExchangeError> {
-        Ok(encode_frame_sync(FrameInfo {
-            house_id,
-            event_frame: policy.execute_frame(frame, max_ahead) as i32,
-            checksum: initial_checksum,
-            timing_word: self.sent_commands,
-            delay: max_ahead as u8,
-        })?)
+    ) -> Result<Vec<u8>, CommandExchangeError> {
+        let frontier = self
+            .sending
+            .map_or(self.sent_commands, |sending| sending.frontier);
+        Ok(encode_live_frame_sync(
+            FrameInfo {
+                house_id,
+                event_frame: policy.execute_frame(frame, max_ahead) as i32,
+                checksum: initial_checksum,
+                timing_word: frontier as u16,
+                delay: policy.delay(frame, max_ahead),
+            },
+            frontier,
+        )?)
     }
 
-    /// One SendOutList649CA0 call. The codec mirrors and removes each
-    /// accepted prefix before broadcast. Native649FA1 ignores the broadcast
-    /// return, even when one full peer FIFO refuses the entire packet; the
-    /// connection owner retries only packets it actually admitted. The caller
-    /// services that owner after every attempt (649FB5). The sent frontier
-    /// changes once at647FBE after the whole call, not once per packet.
+    /// SendOutList649CA0's codec and queue transfer, extended for large VERA
+    /// batches. A rejected broadcast changes neither codec cache, local FIFO,
+    /// mirror queue nor committed counter. The caller resumes this same frame
+    /// after servicing receives and ACKs through the reliable transport owner.
     pub fn send_frame(
         &mut self,
         queues: &mut NetworkCommandQueues<'_>,
@@ -222,43 +287,73 @@ impl CommandExchange {
         if !policy.should_send(frame) {
             return Ok(SendPoll::OffCadence);
         }
-        let header = FrameInfo {
-            house_id,
-            event_frame: policy.execute_frame(frame, max_ahead) as i32,
-            checksum,
-            timing_word: self.sent_commands,
-            delay: max_ahead as u8,
-        };
-        let mut remaining = queues.local_len().min(queues.mirror_allowance());
-        let mut commands = 0;
-        let result = (|| {
-            loop {
-                let records = queues.local_records()?;
-                let records = &records[..records.len().min(remaining)];
-                let encoded = self.codec.encode_packet(
-                    records,
-                    header,
-                    frame as i32,
-                    NATIVE_EVENT_PACKET_CAPACITY,
-                )?;
-                let count = encoded.consumed_records();
-                queues.commit_local_mirrors(&encoded.mirrors)?;
-                commands += count;
-                remaining -= count;
-                let _accepted = broadcast_and_service(&encoded.bytes, count != 0);
-                if let Some(reason) = encoded
-                    .blocked
-                    .filter(|reason| *reason != EncodeBlock::Capacity)
-                {
-                    return Err(CommandExchangeError::UnsupportedLocalEvent(reason));
-                }
-                if remaining == 0 || count == 0 {
-                    return Ok(SendPoll::Complete { commands });
-                }
+        if let Some(sending) = &self.sending {
+            if sending.frame != frame {
+                return Err(CommandExchangeError::UnfinishedSend);
             }
-        })();
-        self.sent_commands = self.sent_commands.wrapping_add(commands as u16);
-        result
+        } else {
+            let total = queues.local_len();
+            let frontier = self
+                .sent_commands
+                .checked_add(total as u64)
+                .ok_or(CommandExchangeError::CounterOverflow)?;
+            self.sending = Some(SendingFrame {
+                frame,
+                total,
+                remaining: total,
+                frontier,
+                header: FrameInfo {
+                    house_id,
+                    event_frame: policy.execute_frame(frame, max_ahead) as i32,
+                    checksum,
+                    timing_word: frontier as u16,
+                    delay: policy.delay(frame, max_ahead),
+                },
+            });
+        }
+        loop {
+            let sending = self.sending.expect("retained frame");
+            if sending.remaining > queues.mirror_allowance() {
+                return Ok(SendPoll::Backpressure);
+            }
+            let records = queues.local_records()?;
+            let records = &records[..records.len().min(sending.remaining)];
+            let Some(encoded) = self.codec.encode_packet_if_accepted(
+                records,
+                EventPacketHeader::Vera {
+                    frame_info: sending.header,
+                    command_frontier: sending.frontier,
+                },
+                frame as i32,
+                NATIVE_EVENT_PACKET_CAPACITY,
+                |packet| broadcast_and_service(&packet.bytes, packet.consumed_records() != 0),
+            )?
+            else {
+                return Ok(SendPoll::Backpressure);
+            };
+            let count = encoded.consumed_records();
+            queues.commit_local_mirrors(&encoded.mirrors)?;
+            self.sent_commands = self
+                .sent_commands
+                .checked_add(count as u64)
+                .ok_or(CommandExchangeError::CounterOverflow)?;
+            self.sending.as_mut().unwrap().remaining -= count;
+            if let Some(reason) = encoded
+                .blocked
+                .filter(|reason| *reason != EncodeBlock::Capacity)
+            {
+                return Err(CommandExchangeError::UnsupportedLocalEvent(reason));
+            }
+            if self.sending.as_ref().unwrap().remaining == 0 {
+                self.sending = None;
+                return Ok(SendPoll::Complete {
+                    commands: sending.total,
+                });
+            }
+            if count == 0 {
+                return Ok(SendPoll::Backpressure);
+            }
+        }
     }
 
     /// Receive64A0C0 updates peer progress before decoding; queue overflow
@@ -272,7 +367,7 @@ impl CommandExchange {
         initial_checksum: u32,
         queues: &mut NetworkCommandQueues<'_>,
         wait_elapsed_buckets: u32,
-    ) -> Result<(), CommandExchangeError> {
+    ) -> Result<bool, CommandExchangeError> {
         let peer = self
             .peers
             .iter_mut()
@@ -281,14 +376,23 @@ impl CommandExchange {
         let info = decode_frame_info(packet)
             .or_else(|| decode_frame_sync(packet))
             .ok_or(CommandExchangeError::InvalidHeader)?;
+        // VERA transport security: original64A0C0 trusts this header. Our
+        // authenticated endpoint supplies its House, so a peer cannot submit
+        // orders or checksum progress under another participant's identity.
+        if info.house_id != source_house {
+            return Err(CommandExchangeError::SourceMismatch {
+                source_house,
+                claimed_house: info.house_id,
+            });
+        }
+        let frontier = live_command_frontier(packet).ok_or(CommandExchangeError::InvalidHeader)?;
+        peer.advertised_commands = peer.advertised_commands.max(frontier);
         let reported_frame = info.event_frame.wrapping_sub(i32::from(info.delay));
-        if reported_frame > peer.frame {
+        let advanced = reported_frame > peer.frame;
+        if advanced {
             peer.initial_response |= peer.frame == -1;
             peer.frame = reported_frame;
         }
-        //64A402 uses unsigned max against the zero-extended low16, not
-        // sequence-number wrap comparison. The decoded count is a DWORD.
-        peer.advertised_commands = peer.advertised_commands.max(u32::from(info.timing_word));
         if decode_frame_sync(packet).is_some() {
             if info.checksum != initial_checksum {
                 return Err(CommandExchangeError::InitialChecksum {
@@ -300,20 +404,22 @@ impl CommandExchange {
             //64A606..64A60D, after the seed comparison. Ordinary FRAMEINFO
             //does not refresh this field. Router MEGAFRAMEINFO is separate.
             peer.response_elapsed_buckets = wait_elapsed_buckets;
-            return Ok(());
+            return Ok(advanced);
         }
         let decoded = self
             .codec
             .decode_packet(packet, |record| queues.admit_received(record))?;
         peer.received_commands = peer
             .received_commands
-            .wrapping_add((decoded.command_count(packet) & 0xffff) as u32);
-        Ok(())
+            .checked_add(decoded.command_count(packet) as u64)
+            .ok_or(CommandExchangeError::CounterOverflow)?;
+        Ok(advanced)
     }
 
     /// Wait_For_Players648710's two independent gates at649595..64961F.
     /// Both frame comparisons are signed; minimum starts at frame+1000 and
-    /// ties retain the first peer. Counts compare unsigned DWORDs.
+    /// ties retain the first peer. VERA retains the full unsigned u64 frontier
+    /// instead of the native packet's wrapping low16 projection.
     pub fn frame_wait(&self, frame: i32, max_ahead: i32) -> FrameWait {
         let mut minimum = frame.wrapping_add(1000);
         let mut slowest = None;

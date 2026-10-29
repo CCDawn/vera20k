@@ -1202,6 +1202,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retail_disc_attack_binds_and_loops_the_attached_drain_ray() {
+        let Some(battle) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+            return;
+        };
+        let (_, assets) = crate::rules::retail_ini_fixture::retail_assets().unwrap();
+        let mut rules = battle.rules;
+        // Use the loader's closure instead of this module's manually bound ART.
+        let roots = crate::rules::effect_asset_catalog::tolerant_anim_class_roots(&rules);
+        rules.bind_anim_class_assets(&roots, &assets, "TEM", "TEMPERATE");
+        let name = rules.combat_damage.drain_animation_type.as_deref().unwrap();
+        assert_eq!(name, "DISKRAY");
+        let physical_frames = crate::assets::shp_file::ShpFile::frame_count_from_bytes(
+            assets.get_ref("DISKRAY.SHP").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            rules
+                .art()
+                .anim_runtime_config(name)
+                .unwrap()
+                .raw_shp_frame_count,
+            Some(i32::from(physical_frames)),
+            "physical DISKRAY.SHP must bind before the drain shot"
+        );
+
+        let mut sim = Simulation::with_seed(0x70FD70);
+        let grid = crate::sim::arena_fixture::flat_arena(&mut sim, &rules);
+        let yuri = house(&mut sim, "YuriCountry", true, 500);
+        house(&mut sim, "Americans", true, 5_000);
+        sim.intern_rule_type_ids(&rules);
+        sim.resolve_type_handles(&rules);
+        sim.resolve_rule_animation_lists(&rules);
+        base(&mut sim, &rules, "YuriCountry", 4, 4);
+        let plant = sim
+            .spawn_object("GAPOWR", "Americans", 20, 20, 0, &rules)
+            .unwrap();
+        let disk = sim
+            .spawn_object("DISK", "YuriCountry", 21, 23, 0, &rules)
+            .unwrap();
+        // Start over the target's marked cell; approach timing is unrelated to
+        // the loader regression. The ordinary Attack still creates the link.
+        move_disc(&mut sim, disk, 21, 21);
+        sim.fog_mut_for_test().mark_visible_for_owner(yuri, 20, 20);
+        let order = cmd(
+            &sim,
+            "YuriCountry",
+            1,
+            Command::Attack {
+                attacker_id: disk,
+                target_id: plant,
+            },
+        );
+        let result = sim.advance_tick(&[order], Some(&rules), Some(&grid), None, 67);
+        assert_eq!(result.executed_commands, 1);
+        for _ in 0..120 {
+            run_ticks(&mut sim, &rules, 1);
+            if sim.entities().get(disk).unwrap().drain.target() == Some(plant) {
+                break;
+            }
+        }
+        assert_eq!(
+            sim.entities().get(disk).unwrap().drain.target(),
+            Some(plant)
+        );
+        let ray = assert_drain_anim(&sim, disk);
+        let anim = sim.anim(ray).unwrap();
+        assert_eq!(anim.draw_flags(), 0x600);
+        assert_eq!(
+            anim.world_coord(),
+            crate::sim::anim_class::AnimWorldCoord { x: 0, y: 0, z: 0 }
+        );
+        assert_eq!(sim.anim_absolute_coord(ray), sim.anim_owner_coords(disk));
+        assert!(sim.display_layers().layer_of(ray).is_some());
+        let mut frames = std::collections::BTreeSet::new();
+        for _ in 0..120 {
+            run_ticks(&mut sim, &rules, 1);
+            let anim = sim.anim(ray).expect("the same attached ray keeps looping");
+            frames.insert(anim.runtime().current_frame);
+            assert_eq!(sim.anim_absolute_coord(ray), sim.anim_owner_coords(disk));
+        }
+        // AnimClass::AI4246FC..42470A treats ART LoopEnd as exclusive.
+        assert_eq!(frames, (0..4).collect());
+        move_disc(&mut sim, disk, 16, 16);
+        run_ticks(&mut sim, &rules, 16);
+        assert_eq!(sim.entities().get(disk).unwrap().drain.target(), None);
+        assert!(
+            anim_uninited(&sim, ray),
+            "leaving the building removes the ray"
+        );
+    }
+
     /// The drain re-check (`0x007361A9..0x00736204`) precedes
     /// `TemporalClass::Update` (`0x00736204`), so a disc being erased still
     /// drops a ray left with no link.

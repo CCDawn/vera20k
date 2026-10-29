@@ -484,6 +484,10 @@ second Python implementation of the algorithm.
   establishing its live registers, memory and x87 state. Multiple legitimate stop
   boundaries can be a tuple. This low-level API supports custom fixtures; it cannot
   certify their initialization or detect every patch a caller makes.
+* Check fixture inputs and hook observations with `require(condition, message)`,
+  not `assert`, and never put a call inside a check: `python -O` strips asserts.
+  To adapt a shared Python fixture in memory, `exec(edited_source(function, (anchor,
+  replacement), ...))` fails when an anchor is missing or repeated.
 * Declare necessary intermediate addresses with `required_addresses=[...]` when
   reaching an endpoint alone could conceal a bypass. They record instruction-hook
   visits, not proof of instruction effects or of full path equivalence. Endpoints

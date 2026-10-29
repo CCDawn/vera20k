@@ -135,7 +135,7 @@ pub(crate) fn type_refund(
 /// `TechnoClass::GetRefund @ 0x0070ADA0` (vt+0x2BC) for object `id`: its
 /// type's [`type_refund`] to its owner (`+0x21C`), `full` clear. None when
 /// the object, its type or its house is gone.
-pub(crate) fn techno_refund(sim: &Simulation, rules: &RuleSet, id: u64) -> Option<i32> {
+pub fn techno_refund(sim: &Simulation, rules: &RuleSet, id: u64) -> Option<i32> {
     let entity = sim.substrate.entities.get(id)?;
     let object = sim.object_type(entity.type_ref(), rules)?;
     let owner = entity.owner();
@@ -147,6 +147,46 @@ pub(crate) fn techno_refund(sim: &Simulation, rules: &RuleSet, id: u64) -> Optio
         sim.session.game_mode_nonzero(),
         false,
     ))
+}
+
+/// `FootClass::On_Sold @ 0x004D9F70`'s computer-owned branch, called by
+/// `BuildingClass::MissionRepairAndProduce @ 0x0044B780` after its
+/// `RepairTick` response. The depot checks the contacted Techno+3D0 latch at
+/// `0x0044C4BC` and the contact's current House through
+/// `HouseClass::IsControlledByHuman @ 0x0050B730`; only an AI owner reaches
+/// GetRefund (`0x0070ADA0`), Add_Credits (`0x004F9950`), Foot Stun
+/// (`0x004D5660`), Limbo (`0x007440B0`) and Foot UnInit (`0x004DE5D0`).
+/// The human branch's EVA/presentation work is not part of this gate.
+pub(crate) fn sell_useless_repair_contact(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    id: u64,
+    context: UninitContext<'_>,
+) -> bool {
+    let Some((owner, useless)) = sim
+        .substrate
+        .entities
+        .get(id)
+        .map(|entity| (entity.owner(), entity.is_useless()))
+    else {
+        return false;
+    };
+    if !useless
+        || sim
+            .houses
+            .get(&owner)
+            .is_none_or(|house| house.is_controlled_by_human(sim.session.game_mode_nonzero()))
+    {
+        return false;
+    }
+    let Some(refund) = techno_refund(sim, rules, id) else {
+        return false;
+    };
+    crate::sim::credit_income::add_credits(&mut sim.houses, owner, refund);
+    sim.stun(id, context);
+    sim.techno_limbo_with_context(id, context);
+    sim.uninit_with_context(id, context);
+    true
 }
 
 /// Who orders a sale; `BuildingClass::Sell_Back @ 0x00447110` reads its

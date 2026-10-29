@@ -45,6 +45,11 @@ pub enum LanMessageKind {
     JoinRequest,
     JoinAccepted,
     JoinDenied,
+    /// VERA admission controls; a challenge is not committed membership.
+    JoinConfirm,
+    JoinConfirmed,
+    CancelJoin,
+    JoinCanceled,
     Departure,
     Go,
     ReadyToGo,
@@ -67,6 +72,10 @@ impl LanMessageKind {
             Self::JoinRequest => 6,
             Self::JoinAccepted => 7,
             Self::JoinDenied => 8,
+            Self::JoinConfirm => 0x564a_0001,
+            Self::JoinConfirmed => 0x564a_0002,
+            Self::CancelJoin => 0x564a_0003,
+            Self::JoinCanceled => 0x564a_0004,
             Self::Departure => 10,
             Self::Go => 0x0b,
             Self::ReadyToGo => 0x13,
@@ -85,6 +94,9 @@ pub enum LanNamedMessage {
     GameQuery,
     Keepalive,
     Departure,
+    JoinConfirm,
+    CancelJoin,
+    JoinCanceled,
 }
 
 impl LanNamedMessage {
@@ -94,6 +106,9 @@ impl LanNamedMessage {
             Self::GameQuery => LanMessageKind::GameQuery,
             Self::Keepalive => LanMessageKind::Keepalive,
             Self::Departure => LanMessageKind::Departure,
+            Self::JoinConfirm => LanMessageKind::JoinConfirm,
+            Self::CancelJoin => LanMessageKind::CancelJoin,
+            Self::JoinCanceled => LanMessageKind::JoinCanceled,
         }
     }
 }
@@ -156,10 +171,55 @@ pub struct LanAcceptance {
     pub observer_row: i32,
 }
 
+/// VERA admission scope shared by LAN setup, map resources, loading and the
+/// direct gameplay transport. LanService alone creates/adopts this identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionScope {
+    pub epoch: [u8; 16],
+    pub revision: u64,
+}
+
+impl SessionScope {
+    pub const LEN: usize = 24;
+
+    pub fn encode(self) -> [u8; Self::LEN] {
+        let mut bytes = [0; Self::LEN];
+        bytes[..16].copy_from_slice(&self.epoch);
+        bytes[16..].copy_from_slice(&self.revision.to_le_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::LEN {
+            return None;
+        }
+        Some(Self {
+            epoch: bytes[..16].try_into().ok()?,
+            revision: u64::from_le_bytes(bytes[16..].try_into().ok()?),
+        })
+    }
+}
+
+/// VERA adds this bounded extension in unused control-message tail bytes.
+/// It is never placed over native chat/options text; full options use VS31.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanSessionProof {
+    pub scope: SessionScope,
+    pub join_nonce: [u8; 16],
+    pub admission_nonce: [u8; 16],
+    pub version: String,
+    pub rules_digest: String,
+}
+
+const SESSION_PROOF_OFFSET: usize = 0x80;
+const SESSION_PROOF_MAGIC: &[u8; 4] = b"VLS3";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum LanMessageError {
     #[error("LAN application message has {actual} bytes, expected455")]
     WrongLength { actual: usize },
+    #[error("invalid VERA LAN session proof")]
+    InvalidSessionProof,
     #[error("LAN {field} is {actual} narrow bytes, maximum{maximum}")]
     TextTooLong {
         field: &'static str,
@@ -204,6 +264,10 @@ impl LanMessage {
             6 => LanMessageKind::JoinRequest,
             7 => LanMessageKind::JoinAccepted,
             8 => LanMessageKind::JoinDenied,
+            0x564a_0001 => LanMessageKind::JoinConfirm,
+            0x564a_0002 => LanMessageKind::JoinConfirmed,
+            0x564a_0003 => LanMessageKind::CancelJoin,
+            0x564a_0004 => LanMessageKind::JoinCanceled,
             10 => LanMessageKind::Departure,
             0x0b => LanMessageKind::Go,
             0x13 => LanMessageKind::ReadyToGo,
@@ -270,7 +334,11 @@ impl LanMessage {
     }
 
     pub fn acceptance_fields(&self) -> Option<LanAcceptance> {
-        (self.kind() == LanMessageKind::JoinAccepted).then(|| {
+        matches!(
+            self.kind(),
+            LanMessageKind::JoinAccepted | LanMessageKind::JoinConfirmed
+        )
+        .then(|| {
             let (country, color) = self.country_color();
             LanAcceptance {
                 country,
@@ -315,6 +383,76 @@ impl LanMessage {
         Ok(message)
     }
 
+    pub fn with_session_proof(mut self, proof: &LanSessionProof) -> Result<Self, LanMessageError> {
+        if !matches!(
+            self.kind(),
+            LanMessageKind::JoinRequest
+                | LanMessageKind::JoinAccepted
+                | LanMessageKind::JoinDenied
+                | LanMessageKind::JoinConfirm
+                | LanMessageKind::JoinConfirmed
+                | LanMessageKind::CancelJoin
+                | LanMessageKind::JoinCanceled
+                | LanMessageKind::Go
+                | LanMessageKind::ReadyToGo
+                | LanMessageKind::PlayerChoices
+                | LanMessageKind::StartPrompt
+                | LanMessageKind::ParticipantDetails
+                | LanMessageKind::Departure
+                | LanMessageKind::Keepalive
+                | LanMessageKind::Options
+        ) || proof.version.len() > 128
+            || proof.rules_digest.len() > 64
+        {
+            return Err(LanMessageError::InvalidSessionProof);
+        }
+        let out = &mut self.bytes[SESSION_PROOF_OFFSET..];
+        out.fill(0);
+        out[..4].copy_from_slice(SESSION_PROOF_MAGIC);
+        out[4..28].copy_from_slice(&proof.scope.encode());
+        out[28..44].copy_from_slice(&proof.join_nonce);
+        out[44..60].copy_from_slice(&proof.admission_nonce);
+        out[60] = proof.version.len() as u8;
+        let end = 61 + proof.version.len();
+        out[61..end].copy_from_slice(proof.version.as_bytes());
+        out[end] = proof.rules_digest.len() as u8;
+        out[end + 1..end + 1 + proof.rules_digest.len()]
+            .copy_from_slice(proof.rules_digest.as_bytes());
+        Ok(self)
+    }
+
+    pub fn session_proof(&self) -> Result<Option<LanSessionProof>, LanMessageError> {
+        let bytes = &self.bytes[SESSION_PROOF_OFFSET..];
+        if &bytes[..4] != SESSION_PROOF_MAGIC {
+            return Ok(None);
+        }
+        let version_len = usize::from(bytes[60]);
+        if version_len > 128 {
+            return Err(LanMessageError::InvalidSessionProof);
+        }
+        let end = 61 + version_len;
+        let rules_len = usize::from(bytes[end]);
+        if rules_len > 64 {
+            return Err(LanMessageError::InvalidSessionProof);
+        }
+        Ok(Some(LanSessionProof {
+            scope: SessionScope::decode(&bytes[4..28])
+                .ok_or(LanMessageError::InvalidSessionProof)?,
+            join_nonce: bytes[28..44]
+                .try_into()
+                .map_err(|_| LanMessageError::InvalidSessionProof)?,
+            admission_nonce: bytes[44..60]
+                .try_into()
+                .map_err(|_| LanMessageError::InvalidSessionProof)?,
+            version: std::str::from_utf8(&bytes[61..end])
+                .map_err(|_| LanMessageError::InvalidSessionProof)?
+                .to_owned(),
+            rules_digest: std::str::from_utf8(&bytes[end + 1..end + 1 + rules_len])
+                .map_err(|_| LanMessageError::InvalidSessionProof)?
+                .to_owned(),
+        }))
+    }
+
     pub fn join_request(
         name: &str,
         serial: &[u8],
@@ -338,6 +476,12 @@ impl LanMessage {
         message.put_country_color(fields.country, fields.color);
         message.put_u32(0x53, fields.assigned_row as u32);
         message.put_u32(0x57, fields.observer_row as u32);
+        Ok(message)
+    }
+
+    pub fn join_confirmed(host_name: &str, fields: LanAcceptance) -> Result<Self, LanMessageError> {
+        let mut message = Self::join_accepted(host_name, fields)?;
+        message.put_u32(0, LanMessageKind::JoinConfirmed.raw());
         Ok(message)
     }
 
@@ -420,6 +564,8 @@ fn c_string(bytes: &[u8]) -> &[u8] {
 #[path = "lan_messages_tests.rs"]
 mod tests;
 
+pub mod cooperative;
+pub mod extended_setup;
 pub mod setup;
 
 pub mod ingame;

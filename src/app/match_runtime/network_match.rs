@@ -14,11 +14,30 @@ use std::collections::{BTreeMap, VecDeque};
 
 use crate::app::AppState;
 use crate::app::match_runtime::session::{MatchSession, SessionMode, WallBucketTimer};
-use crate::net::live_commands::{LiveWaitInfo, LiveWaitKind};
+use crate::net::live_commands::{LiveCommandMode, LiveWaitInfo, LiveWaitKind};
 use crate::sim::intern::InternedId;
 use crate::sim::world::Simulation;
 use crate::ui::lan_shell::LanChatLine;
-use crate::ui::shell::connection::ConnectionPage;
+use crate::ui::shell::connection::{ConnectionPage, ConnectionRow};
+
+/// The simulation owns FPS/MaxAhead; the live channel owns sampled peer lag.
+/// Presentation and the frame pacer consume the same combined interval.
+pub(crate) fn frame_budget(state: &AppState) -> Option<(u16, u32)> {
+    if let Some(fps) = state
+        .match_state
+        .live_network
+        .as_ref()
+        .and_then(|live| live.fixed_frames_per_second())
+    {
+        return Some((fps, 0));
+    }
+    let session = state.match_state.sim_runtime.as_ref()?.simulation.session();
+    let timing = session.network_command_timing()?;
+    let delay = state.match_state.live_network.as_ref().map_or(0, |live| {
+        live.pacing_delay_millis(session.network_max_ahead_frames().unwrap_or(0))
+    });
+    Some((timing.frames_per_second(), delay))
+}
 
 /// DestroyConnection's error argument (`EDX`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +46,8 @@ pub(crate) enum ConnectionError {
     /// `TXT_LEFT_GAME`, nothing queued by DestroyConnection itself.
     Left,
     /// 1: the connection was lost. `TXT_CONNECTION_LOST`; Flag_To_Die at
-    /// frame 0, REMOVEPLAYER otherwise.
+    /// frame 0, REMOVEPLAYER otherwise. Installed VERA timing also needs
+    /// synchronized source retirement when a live frame-zero vote removes it.
     Lost,
 }
 
@@ -110,18 +130,38 @@ pub(crate) fn destroy_connection(
         )),
         None => None,
     };
+    // VERA startup agreement: native649148 tallies a mutable node count,
+    // and5DA86A..875 flags frame-zero loss locally. An installed match cannot
+    // change its certified set/world before release. Abort that startup and
+    // retain the same shared state; before-install loading stays native.
+    let startup_pending = live
+        .as_ref()
+        .is_some_and(|(live, _)| live.startup_pending());
     if !session.disconnect_network_participant(source_index, error.code()) {
         return None;
     }
+    log::warn!(
+        "Network connection destroyed: source={source_index}, house={:?}, reason={}, native_frame={}, startup_pending={startup_pending}",
+        sim.houses().index_of(owner),
+        error.code(),
+        sim.session().binary_frame(),
+    );
     if let Some((live, house)) = live {
+        log_live_progress(session, sim, live, "destroy_connection");
         //5DA85D removes the private connection after the Human guard, before
         //the reason-specific effects. Progress shares that connection's life.
         live.remove_peer(house);
     }
-    if error == ConnectionError::Lost {
-        if sim.session().binary_frame() == 0 {
+    if error == ConnectionError::Lost && !startup_pending {
+        let frame = sim.session().binary_frame();
+        if frame == 0 && sim.session().network_command_timing().is_none() {
             sim.flag_house_to_die(owner);
-        } else {
+        }
+        // VERA UDP/relay adaptation: native5DA86A..5DA87A only flags at zero.
+        // A vote can remove a source after live timing was installed but
+        // before the initial frame commits. Reuse the existing shared event
+        // so its timing row retires through DoList, never a local peer list.
+        if frame != 0 || sim.session().network_command_timing().is_some() {
             // EVENT_REMOVEPLAYER from PlayerPtr with the House's index
             // (0x005DA898..0x005DA8F0); it kills the House on every peer.
             let local = sim.session().current_house();
@@ -141,7 +181,7 @@ pub(crate) fn destroy_connection(
     // 0x005DA8F7..0x005DA90F: a WOL tournament game kills the House of a
     // player who left (error 0). RESIDUAL: mode 4's ladder-stats call
     // (0x005DA921..) is backend.
-    if error == ConnectionError::Left && sim.session().wol_tournament_game() {
+    if !startup_pending && error == ConnectionError::Left && sim.session().wol_tournament_game() {
         sim.flag_house_to_die(owner);
     }
     Some(ConnectionDestroyed {
@@ -159,6 +199,11 @@ pub(crate) fn receive_departure(
     wait: &mut NetworkMatchWait,
     endpoint: std::net::SocketAddrV4,
 ) -> Option<ConnectionDestroyed> {
+    // In sequenced play only the relay's committed departure can mutate
+    // gameplay membership. Global shell traffic has no simulation authority.
+    if live.uses_sequenced_lockstep() {
+        return None;
+    }
     let house = live.connections().peer_id(endpoint)?;
     let source = house_source(session, sim, house)?;
     let destroyed = destroy_connection(session, sim, source, ConnectionError::Left, Some(live))?;
@@ -325,15 +370,21 @@ fn wait_periods(mode: SessionMode) -> (u32, u32) {
     }
 }
 
-///Active LAN call arguments: initial647919..647954; ordinary64800E..648067.
-fn live_wait_periods(info: LiveWaitInfo) -> (u32, u32) {
+/// ProcessNetwork's original call arguments: initial647919..647954;
+/// ordinary64800E..648067. Both index GameMode's row at837340: WOL's
+/// +4/+8/+C are1800/720/7200, LAN's are900/420/2400. Source: gamemd.exe.
+pub(crate) fn live_wait_periods(info: LiveWaitInfo) -> (u32, u32) {
+    let (initial, floor, timeout) = match info.mode {
+        LiveCommandMode::Lan => (900, 420, 2400),
+        LiveCommandMode::Wol => (1800, 720, 7200),
+    };
     let dialog = match info.kind {
-        LiveWaitKind::Initial => 900,
+        LiveWaitKind::Initial => initial,
         LiveWaitKind::Ordinary => {
-            (info.response_time_at_entry.wrapping_mul(3) as i32).max(420) as u32
+            (info.response_time_at_entry.wrapping_mul(3) as i32).max(floor) as u32
         }
     };
-    (dialog, 2400)
+    (dialog, timeout)
 }
 
 /// One `Wait_For_Players` call.
@@ -341,8 +392,7 @@ fn live_wait_periods(info: LiveWaitInfo) -> (u32, u32) {
 struct ConnectionWait {
     /// `local_6c0`: the entry bucket; `[0x00AFA418]` is the time since.
     entry: u32,
-    ///None selects the established controlled-service path. Live timing is
-    ///LAN-only; WOL router recovery remains a separate dependency.
+    ///None selects the established controlled-service path.
     live_kind: Option<LiveWaitKind>,
     periods: (u32, u32),
     /// `local_6f4`: opens 0xEA the first time it expires.
@@ -536,6 +586,66 @@ pub(crate) fn house_source(session: &MatchSession, sim: &Simulation, house: i32)
     session.network_owner_source(sim.interner().resolve(*owner))
 }
 
+/// Numeric projections only: never format transports, endpoints, errors or
+/// packet bodies. The peer vector is bounded by the admitted match roster.
+/// UDP counters cover the retained aggregate since the last live poll, not
+/// lifetime traffic; the existing report consumer/reset semantics are unchanged.
+pub(crate) fn log_live_progress(
+    session: &MatchSession,
+    sim: &Simulation,
+    live: &crate::net::live_commands::LiveCommandSession,
+    point: &'static str,
+) {
+    if !log::log_enabled!(log::Level::Info) {
+        return;
+    }
+    let peers: Vec<_> = live
+        .peers()
+        .iter()
+        .map(|peer| {
+            let house = peer.house_id();
+            (
+                house_source(session, sim, i32::from(house)),
+                house,
+                peer.frame(),
+                peer.advertised_commands(),
+                peer.received_commands(),
+                live.queued_send_count(house),
+                live.peer_response_time(house),
+            )
+        })
+        .collect();
+    let report = live.service_report();
+    let udp_counts = report.map(|report| {
+        (
+            report.received_datagrams,
+            report.sent_datagrams,
+            report.malformed_datagrams,
+            report.rejected_connections,
+            report.rejected_global,
+            report.discarded_global_sends,
+            report.send_would_block,
+            report.failed_peer,
+        )
+    });
+    let io_failure = report.and_then(|report| report.first_io_error.as_ref());
+    log::info!(
+        "Network progress: point={point}, local_source={:?}, native_frame={}, phase={:?}, wait={:?}, sent_commands={}, retained_send={:?}, frame_wait={:?}, local_commands={}, synchronized_commands={}, mirror_allowance={}, udp_poll_received_sent_malformed_private_rejected_global_rejected_discarded_sends_would_block_failed_peer={udp_counts:?}, udp_poll_io_failure={}, udp_poll_os_error={:?}, peers_source_house_frame_advertised_received_send_queued_rtt_buckets={peers:?}",
+        local_source(session),
+        sim.session().binary_frame(),
+        live.phase(),
+        live.wait_info(),
+        live.sent_commands(),
+        live.retained_send(),
+        live.frame_wait(),
+        sim.pending_local_command_count(),
+        sim.synchronized_network_command_count(),
+        sim.network_mirror_allowance(),
+        io_failure.is_some(),
+        io_failure.and_then(|failure| failure.error.raw_os_error()),
+    );
+}
+
 ///Global NET_KICK proposal64AAE0: a fixed455-byte packet, independent of
 ///EventClass FRAMEINFO (which happens to share opcode0x1C).
 pub(crate) fn encode_kick_proposal(
@@ -713,8 +823,10 @@ fn open_dialog(state: &mut AppState, elapsed: u64) {
     let session = &state.match_state.session;
     let rows = nodes(session)
         .into_iter()
-        .take(crate::ui::shell::connection::CONNECTION_ROWS)
-        .map(|source| participant_name(session, source))
+        .map(|source_index| ConnectionRow {
+            source_index,
+            name: participant_name(session, source_index),
+        })
         .collect();
     let wol = state.match_state.session_mode() == SessionMode::Wol;
     let reconnecting = lowest_record(state)
@@ -849,9 +961,9 @@ pub(crate) fn service_wait(state: &mut AppState, now_ms: u64) -> WaitPass {
         return WaitPass::Running;
     }
     let mode = state.match_state.session_mode();
-    // This live owner is the direct-LAN path. WOL router timers and recovery
-    // remain outside it; the existing controlled-service WOL path is retained.
-    let live = mode == SessionMode::Lan && state.match_state.live_network.is_some();
+    // Both physical routes feed the same live progress owner. Online relay
+    // framing cannot substitute a controlled-service progress row for it.
+    let live = state.match_state.live_network.is_some();
     if live {
         let info = state
             .match_state
@@ -950,7 +1062,35 @@ pub(crate) fn service_wait(state: &mut AppState, now_ms: u64) -> WaitPass {
         }
         //64B410 chooses the first minimum signed peer frame. Recovery restarts
         //all three countdowns but retains entry, page, votes and peer+14.
-        if let Some(source) = lowest_record(state) {
+        let source = lowest_record(state);
+        let runtime = state.match_state.sim_runtime.as_ref();
+        let house = source.and_then(|source| {
+            source_house(&state.match_state.session, &runtime?.simulation, source)
+        });
+        let wait = state
+            .match_state
+            .network_wait
+            .wait
+            .as_ref()
+            .expect("expired wait");
+        log::warn!(
+            "Network ordinary wait expired: now_bucket={now}, entered_bucket={}, deadline_bucket={:?}, period_buckets={}, remaining_buckets={}, native_frame={:?}, source={source:?}, house={house:?}, reason={}",
+            wait.entry,
+            wait.timeout_timer.deadline_bucket(),
+            wait.periods.1,
+            wait.timeout_timer.remaining(now),
+            runtime.map(|runtime| runtime.simulation.session().binary_frame()),
+            ConnectionError::Lost.code(),
+        );
+        if let (Some(runtime), Some(live)) = (runtime, state.match_state.live_network.as_ref()) {
+            log_live_progress(
+                &state.match_state.session,
+                &runtime.simulation,
+                live,
+                "ordinary_wait_expired",
+            );
+        }
+        if let Some(source) = source {
             kick(state, source, ConnectionError::Lost);
         }
         if let Some(wait) = state.match_state.network_wait.wait.as_mut() {
@@ -996,11 +1136,18 @@ pub(crate) fn request_leave(state: &mut AppState) {
 /// (`0x0064AB6A..0x0064AB98`); otherwise it sends the proposal to every
 /// other node and counts the local vote.
 pub(crate) fn propose_kick(state: &mut AppState, row: usize) {
-    let nodes = nodes(&state.match_state.session);
-    if row >= nodes.len() {
+    let Some(target) = state
+        .match_state
+        .network_wait
+        .page()
+        .and_then(|page| page.row_source(row))
+    else {
         return;
-    }
-    if row == 0 {
+    };
+    let Some(local) = local_source(&state.match_state.session) else {
+        return;
+    };
+    if target == local {
         let line = csf(state, "TXT_RECONNECT_KICK_SELF");
         append_line_and_show_last(state, &line);
         return;
@@ -1015,8 +1162,18 @@ pub(crate) fn propose_kick(state: &mut AppState, row: usize) {
         append_line_and_show_last(state, &line);
         return;
     }
-    state.match_state.session.request_kick_proposal(nodes[row]);
-    add_vote(state, nodes[0], nodes[row]);
+    // The initial names stay fixed while nodes can disappear during a wait.
+    // A disconnected row is inert; it can never nominate its former successor.
+    if !state
+        .match_state
+        .session
+        .network_connected_source_indices()
+        .contains(&target)
+    {
+        return;
+    }
+    state.match_state.session.request_kick_proposal(target);
+    add_vote(state, local, target);
 }
 
 #[cfg(test)]
@@ -1047,8 +1204,36 @@ mod tests {
     }
 
     #[test]
+    fn online_wait_uses_online_initial_and_ordinary_deadlines() {
+        let info = LiveWaitInfo {
+            mode: LiveCommandMode::Wol,
+            kind: LiveWaitKind::Initial,
+            entered_at: 100,
+            response_time_at_entry: 0,
+        };
+        let mut wait = NetworkMatchWait::default();
+        wait.observe_live_wait(info);
+        assert_eq!(wait.wait.as_ref().unwrap().dialog_timer.remaining(1899), 1);
+        assert_eq!(wait.timeout_action(7299), None);
+        assert_eq!(wait.timeout_action(7300), Some(WaitTimeout::InitialFailure));
+        let ordinary = LiveWaitInfo {
+            kind: LiveWaitKind::Ordinary,
+            ..info
+        };
+        assert_eq!(live_wait_periods(ordinary), (720, 7200));
+        assert_eq!(
+            live_wait_periods(LiveWaitInfo {
+                response_time_at_entry: 241,
+                ..ordinary
+            }),
+            (723, 7200)
+        );
+    }
+
+    #[test]
     fn live_wait_uses_reached_entry_and_signed_wrapping_response_delay() {
         let info = LiveWaitInfo {
+            mode: LiveCommandMode::Lan,
             kind: LiveWaitKind::Initial,
             entered_at: 100,
             response_time_at_entry: u32::MAX,
@@ -1063,6 +1248,7 @@ mod tests {
         assert_eq!(wait.timeout_action(2499), None);
         assert_eq!(wait.timeout_action(2500), Some(WaitTimeout::InitialFailure));
         let ordinary = LiveWaitInfo {
+            mode: LiveCommandMode::Lan,
             kind: LiveWaitKind::Ordinary,
             ..info
         };
@@ -1081,6 +1267,7 @@ mod tests {
     #[test]
     fn ordinary_recovery_retains_entry_page_votes_and_original_arguments() {
         let info = LiveWaitInfo {
+            mode: LiveCommandMode::Lan,
             kind: LiveWaitKind::Ordinary,
             entered_at: 100,
             response_time_at_entry: 141,
@@ -1090,6 +1277,7 @@ mod tests {
         let wait = owner.wait.as_mut().unwrap();
         wait.votes.insert(1, vec![0]);
         wait.page = Some(ConnectionPage::default());
+        assert_eq!(wait.timeout_timer.deadline_bucket(), Some(2500));
         wait.restart_timers(2500);
         owner.observe_live_wait(LiveWaitInfo {
             response_time_at_entry: 500,
@@ -1098,6 +1286,7 @@ mod tests {
         let wait = owner.wait.as_ref().unwrap();
         assert_eq!(wait.entry, 100);
         assert_eq!(wait.periods, (423, 2400));
+        assert_eq!(wait.timeout_timer.deadline_bucket(), Some(4900));
         assert!(wait.page.is_some());
         assert_eq!(wait.votes.get(&1), Some(&vec![0]));
         assert_eq!(wait.dialog_timer.remaining(2922), 1);
@@ -1160,6 +1349,7 @@ mod tests {
         assert!(!output.tick.frame_committed);
         let mut owner = NetworkMatchWait::default();
         owner.observe_live_wait(LiveWaitInfo {
+            mode: LiveCommandMode::Lan,
             kind: LiveWaitKind::Initial,
             entered_at: 100,
             response_time_at_entry: 0,
@@ -1277,10 +1467,21 @@ mod tests {
         )
         .unwrap();
         let mut live = crate::net::live_commands::LiveCommandSession::new(
+            crate::net::live_commands::StartupAgreement::new(
+                [(0, 1), (1, 0)],
+                [0, 1],
+                19,
+                10,
+                30,
+                std::num::NonZeroU32::new(2).unwrap(),
+                sim.state_hash(),
+            )
+            .unwrap(),
             transport,
             0,
             19,
             std::num::NonZeroU32::new(2).unwrap(),
+            LiveCommandMode::Lan,
         )
         .unwrap();
         let mut wait = NetworkMatchWait::default();
@@ -1327,6 +1528,334 @@ mod tests {
         assert!(
             receive_departure(&mut session, &mut sim, &mut live, &mut wait, endpoint).is_none()
         );
+    }
+
+    #[test]
+    fn frame_zero_loss_is_native_before_install_and_aborts_uncertified_startup() {
+        use crate::net::reliable::{LanConnectionConfig, LanConnections, RetryTiming};
+        use crate::net::udp::{LanUdpTransport, UdpBindConfig};
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        use std::num::{NonZeroU8, NonZeroU32};
+
+        for installed in [false, true] {
+            let (mut session, mut sim) = vote_fixture();
+            let launch = session.network_setup().unwrap().clone();
+            session.enter_network(super::super::session::NetworkReturnContext::Wol);
+            session.accept_network_setup(launch, false, None).unwrap();
+            session.prepare_wol_timing([0; 2], false).unwrap();
+            let endpoint = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30125);
+            let remote_name = session.network_setup().unwrap().humans[0].name.clone();
+            session
+                .bind_network_endpoint(&remote_name, endpoint)
+                .unwrap();
+            session.freeze_network_start(19).unwrap();
+            let local = sim.houses().order()[0];
+            let remote = sim.houses().order()[1];
+            sim.session_mut_for_test().set_game_mode(SessionMode::Wol);
+            sim.session_mut_for_test()
+                .set_current_house_for_test(Some(local));
+            sim.install_network_timing(session.network_max_ahead_frames().unwrap());
+            if installed {
+                sim.network_command_queues()
+                    .install_timing(1, NonZeroU8::new(5).unwrap(), [0, 1]);
+            }
+            let timing = sim.session().network_command_timing().cloned();
+            let mut live = installed.then(|| {
+                let mut connections = LanConnections::new(
+                    LanConnectionConfig::default(),
+                    RetryTiming::LAN_GUEST_COMPLETED_GLOBAL,
+                );
+                connections.add_peer(1, endpoint).unwrap();
+                let bind = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+                let transport = LanUdpTransport::bind(
+                    UdpBindConfig {
+                        primary: bind,
+                        alternate: bind,
+                    },
+                    connections,
+                )
+                .unwrap();
+                crate::net::live_commands::LiveCommandSession::new(
+                    crate::net::live_commands::StartupAgreement::new(
+                        [(0, 1), (1, 0)],
+                        [0, 1],
+                        19,
+                        10,
+                        30,
+                        NonZeroU32::new(5).unwrap(),
+                        sim.state_hash(),
+                    )
+                    .unwrap(),
+                    transport,
+                    0,
+                    19,
+                    NonZeroU32::new(5).unwrap(),
+                    LiveCommandMode::Wol,
+                )
+                .unwrap()
+            });
+            assert_eq!(sim.session().binary_frame(), 0);
+            let removed = destroy_connection(
+                &mut session,
+                &mut sim,
+                0,
+                ConnectionError::Lost,
+                live.as_mut(),
+            )
+            .unwrap();
+            assert_eq!(removed.owner, remote);
+            assert_eq!(removed.key, "TXT_CONNECTION_LOST");
+            assert_eq!(session.network_connected_source_indices(), &[1]);
+            if let Some(live) = live.as_ref() {
+                assert!(live.peers().is_empty());
+                assert!(live.connections().peers().next().is_none());
+            }
+            assert_eq!(sim.houses()[&remote].is_to_die(), !installed);
+            assert_eq!(sim.session().network_command_timing(), timing.as_ref());
+            let records = sim
+                .network_command_queues()
+                .local_records()
+                .unwrap()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            if !installed {
+                assert!(
+                    records.is_empty(),
+                    "loading before timing installation stays native"
+                );
+                continue;
+            }
+            assert_eq!(sim.network_command_queues().timing_host_house(), Some(1));
+            assert!(
+                records.is_empty(),
+                "uncertified source loss cannot mutate shared admission"
+            );
+            let error = live
+                .as_mut()
+                .unwrap()
+                .poll(
+                    &mut sim.network_command_queues(),
+                    crate::sim::world::NetworkQueueContext {
+                        frame: 0,
+                        checksum: 7,
+                    },
+                    10,
+                    100,
+                    1600,
+                    0,
+                    0,
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::net::live_commands::LiveCommandError::Startup(
+                    crate::net::live_commands::StartupError::Aborted
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn asymmetric_initial_vote_aborts_without_certifying_different_worlds() {
+        use crate::net::live_commands::{
+            LiveCommandError, LiveCommandSession, StartupAgreement, StartupError,
+        };
+        use crate::net::reliable::{Delivery, LanConnectionConfig, LanConnections, RetryTiming};
+        use crate::net::udp::{LanUdpTransport, UdpBindConfig};
+        use crate::sim::world::{NetworkQueueContext, NetworkQueuePass};
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        use std::num::NonZeroU32;
+        use std::time::{Duration, Instant};
+        let bind = || {
+            LanUdpTransport::bind(
+                UdpBindConfig {
+                    primary: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+                    alternate: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+                },
+                LanConnections::new(
+                    LanConnectionConfig::default(),
+                    RetryTiming {
+                        retry_delta: 0,
+                        max_retries: u32::MAX,
+                        timeout: u32::MAX,
+                    },
+                ),
+            )
+            .unwrap()
+        };
+        let mut host = bind();
+        let mut first = bind();
+        let mut second = bind();
+        let endpoints = [
+            host.primary_addr().unwrap(),
+            first.primary_addr().unwrap(),
+            second.primary_addr().unwrap(),
+        ];
+        let fixture = |local_source: usize| {
+            let (session, mut sim) = vote_fixture();
+            let mut launch = session.network_setup().unwrap().clone();
+            let mut third = launch.humans[0].clone();
+            third.name = "Third".into();
+            third.raw_slot_index = Some(2);
+            third.slot.color_index = 3;
+            launch.humans.push(third);
+            launch.local_player_index = local_source;
+            let mut session = MatchSession::default();
+            session.enter_network(super::super::session::NetworkReturnContext::Wol);
+            session.accept_network_setup(launch, false, None).unwrap();
+            let name = session.network_source_owner(2).unwrap();
+            let owner = sim.intern(&name);
+            sim.houses_mut_for_test()
+                .register(crate::sim::house_state::HouseState::new(
+                    owner, 2, None, true, 0, 10,
+                ));
+            for source in 0..3 {
+                let name = session.network_setup().unwrap().humans[source].name.clone();
+                session
+                    .bind_network_endpoint(&name, endpoints[source])
+                    .unwrap();
+            }
+            session.prepare_wol_timing([0; 3], false).unwrap();
+            session.freeze_network_start(19).unwrap();
+            sim.session_mut_for_test().set_game_mode(SessionMode::Wol);
+            let local = *sim
+                .houses()
+                .order()
+                .get(if local_source == 1 { 0 } else { 2 })
+                .unwrap();
+            sim.session_mut_for_test()
+                .set_current_house_for_test(Some(local));
+            sim.install_network_timing(10);
+            sim.network_command_queues().install_timing(
+                1,
+                std::num::NonZeroU8::new(5).unwrap(),
+                [0, 1, 2],
+            );
+            (session, sim)
+        };
+        let (mut a, mut wa) = fixture(1);
+        let (b, mut wb) = fixture(2);
+        assert_eq!(wa.state_hash(), wb.state_hash());
+        let original_hash = wa.state_hash();
+        first.connections_mut().add_peer(1, endpoints[0]).unwrap();
+        first.connections_mut().add_peer(2, endpoints[2]).unwrap();
+        second.connections_mut().add_peer(1, endpoints[0]).unwrap();
+        second.connections_mut().add_peer(0, endpoints[1]).unwrap();
+        host.connections_mut().add_peer(2, endpoints[2]).unwrap();
+        let rate = NonZeroU32::new(5).unwrap();
+        let agreement = StartupAgreement::new(
+            [(0, 1), (1, 0), (2, 2)],
+            [0, 1, 2],
+            19,
+            10,
+            30,
+            rate,
+            original_hash,
+        )
+        .unwrap();
+        let mut first =
+            LiveCommandSession::new(agreement.clone(), first, 0, 19, rate, LiveCommandMode::Wol)
+                .unwrap();
+        let mut second =
+            LiveCommandSession::new(agreement, second, 2, 19, rate, LiveCommandMode::Wol).unwrap();
+        let probe = crate::net::command_exchange::CommandExchange::new([0, 2])
+            .unwrap()
+            .frame_probe(
+                1,
+                0,
+                10,
+                19,
+                crate::net::lockstep::NetworkSendPolicy::FrameSendRate2 {
+                    frame_send_rate: rate,
+                },
+            )
+            .unwrap();
+        // Original source0 answers only source2, then disappears. Source1's
+        // ordinary first poll sends its real probe and reliable HELLO to2.
+        assert!(
+            host.connections_mut()
+                .send_to(2, &probe, Delivery::Unreliable)
+        );
+        host.service(1);
+        let context = NetworkQueueContext {
+            frame: 0,
+            checksum: 7,
+        };
+        assert_eq!(
+            first
+                .poll(
+                    &mut wa.network_command_queues(),
+                    context,
+                    10,
+                    100,
+                    1600,
+                    0,
+                    0
+                )
+                .unwrap(),
+            NetworkQueuePass::Waiting
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while second.peers().iter().any(|peer| peer.frame() < 0) {
+            assert_eq!(
+                second
+                    .poll(
+                        &mut wb.network_command_queues(),
+                        context,
+                        10,
+                        101,
+                        1616,
+                        0,
+                        0
+                    )
+                    .unwrap(),
+                NetworkQueuePass::Waiting
+            );
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        // The native node-count tally is asymmetric when the reverse vote is
+        // delayed. It is the real production decision, not an injected result.
+        let kicked = tally_kicks(vec![1, 0, 2], &votes(&[(0, &[1, 2])]));
+        assert_eq!(kicked, vec![(0, ConnectionError::Lost)]);
+        assert!(tally_kicks(vec![2, 0, 1], &votes(&[(0, &[2])])).is_empty());
+        for (source, error) in kicked {
+            destroy_connection(&mut a, &mut wa, source, error, Some(&mut first)).unwrap();
+        }
+        assert_eq!(a.network_connected_source_indices(), &[1, 2]);
+        assert_eq!(b.network_connected_source_indices(), &[0, 1, 2]);
+        assert_eq!(wa.state_hash(), original_hash);
+        assert_eq!(wb.state_hash(), original_hash);
+        assert!(matches!(
+            first.poll(
+                &mut wa.network_command_queues(),
+                context,
+                10,
+                102,
+                1632,
+                0,
+                0
+            ),
+            Err(LiveCommandError::Startup(StartupError::Aborted))
+        ));
+        assert_eq!(
+            second
+                .poll(
+                    &mut wb.network_command_queues(),
+                    context,
+                    10,
+                    102,
+                    1632,
+                    0,
+                    0
+                )
+                .unwrap(),
+            NetworkQueuePass::Waiting
+        );
+        assert!(second.startup_pending());
+        assert_eq!(second.sent_commands(), 0);
+        assert_eq!(wa.network_command_queues().local_len(), 0);
     }
 
     fn votes(entries: &[(usize, &[usize])]) -> BTreeMap<usize, Vec<usize>> {

@@ -532,6 +532,9 @@ pub struct CoopScorePage {
     /// A won mission's carry-over record (`0x004C6180`), saved before the
     /// world retired.
     pub saved: Option<crate::sim::campaign_carry_over::CampaignCarryOver>,
+    /// After the last stage's win, the campaign-end dialog `0xBC7` that
+    /// Quit opens (`+0xA4`), resolved while the Houses were resident.
+    pub campaign_end: Option<crate::ui::campaign_score_shell::CampaignEndModel>,
 }
 
 #[cfg(test)]

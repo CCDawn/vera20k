@@ -347,6 +347,9 @@ impl Probe {
                 viewport: self.size.map(|value| value as f32),
                 origin_y: view.world_origin_y,
                 world_height: view.world_height,
+                viewer: None,
+                fog: None,
+                fog_of_war: false,
             },
             &mut bodies,
         );
@@ -663,6 +666,7 @@ impl Probe {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             crate::app::presentation::render::draw_pooled_cell_bodies(
                 &mut pass,
@@ -1204,6 +1208,9 @@ fn assert_retail_cell_body_then_shadow(packet: &Value) {
                 viewport: size.map(|v| v as f32),
                 origin_y: view.world_origin_y,
                 world_height: view.world_height,
+                viewer: None,
+                fog: None,
+                fog_of_war: false,
             },
             &mut bodies,
         );

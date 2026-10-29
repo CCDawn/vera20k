@@ -270,7 +270,7 @@ fn native_radar_outline_instances(
     // g_SidebarSurface before SidebarClass copies/scales that retained raster.
     // Reproduce that architecture by selecting the integer destination pixels
     // whose centres nearest-sample the source line. Directly submitting a
-    // `ui_scale`-wide float quad is not equivalent: batch_shader rounds its two
+    // scaled-width float quad is not equivalent: batch_shader rounds its two
     // vertices independently and a 0.5-source-pixel quad can collapse.
     let edges = [
         ([left, top], [right, top]),

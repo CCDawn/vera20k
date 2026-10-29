@@ -79,7 +79,7 @@ fn apply(sim: &mut Simulation, rules: &RuleSet, raw: &str) -> bool {
     .unwrap()
     .entries()[0]
         .clone();
-    let action = RuntimeDefinitions::default().resolve_action(entry, None, None);
+    let action = RuntimeDefinitions::default().resolve_action(entry, None, None, None);
     sim.apply_live_trigger_action(
         &action,
         TriggerActionContext {

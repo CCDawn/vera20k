@@ -42,6 +42,7 @@ fn run(sim: &mut Simulation, rules: &RuleSet, kind: i32) -> bool {
         entries["CASE"].entries()[0].clone(),
         None,
         None,
+        None,
     );
     let house = sim.interner.intern("IgnoredIncomingHouse");
     sim.apply_live_trigger_action(
@@ -140,6 +141,7 @@ fn counted_trigger_dispatches_both_strikes_then_continues() {
     sim.initialize_trigger_definitions(
         &map,
         &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
+        None,
         None,
         None,
     );

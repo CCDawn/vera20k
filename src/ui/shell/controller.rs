@@ -16,7 +16,7 @@
 //! drives its tooltip/timer exactly as before.
 
 use std::collections::BTreeSet;
-use std::time::Instant;
+use crate::util::time::Instant;
 
 use super::descriptor::DialogId;
 use super::layout::LaidOutControl;
@@ -122,6 +122,30 @@ impl DialogController {
 
     pub fn hovered(&self) -> Option<u16> {
         self.stack.last().and_then(|i| i.hovered)
+    }
+
+    /// The press of the topmost live `id` instance, wherever it sits in the
+    /// stack: a dialog under a modal keeps painting its own state.
+    pub fn pressed_in(&self, id: DialogId) -> Option<u16> {
+        self.instance(id).and_then(|i| i.pressed)
+    }
+
+    /// The hover of the topmost live `id` instance (see [`Self::pressed_in`]).
+    pub fn hovered_in(&self, id: DialogId) -> Option<u16> {
+        self.instance(id).and_then(|i| i.hovered)
+    }
+
+    fn instance(&self, id: DialogId) -> Option<&DialogInstance> {
+        self.stack.iter().rev().find(|i| i.id == id)
+    }
+
+    /// `id` was destroyed and its next instance starts with no press, hover or
+    /// runtime-disabled control. Every live `id` instance restarts in place, so
+    /// the stack and keyboard route above and below it stay as they are.
+    pub fn restart_instance(&mut self, id: DialogId) {
+        for inst in self.stack.iter_mut().filter(|i| i.id == id) {
+            *inst = DialogInstance::new(id, inst.accepts_keys);
+        }
     }
 
     pub fn hover_started_at(&self) -> Option<Instant> {

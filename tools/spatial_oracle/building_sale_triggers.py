@@ -16,6 +16,7 @@ from tools.rules_oracle.bridge_child_sound import sections
 from tools.spatial_oracle.refinery_dock import place_building, cell
 from tools.spatial_oracle.tag_lifecycle import REGISTRIES, initialize_registries
 from tools.spatial_oracle.unit_source_scatter import SCENARIO
+from tools.native_oracle import require
 
 BLD, HOUSE, SP = engineer.BLD, engineer.HOUSE, engineer.SP
 BEGIN, END = 0x44A1E8, 0x44A22C
@@ -171,12 +172,12 @@ def read_definitions(inputs, definitions):
         triggers[name] = pointer
     m.make_ini(definitions)
     for pointer in triggers.values():
-        assert m.invoke(0x727240, pointer, (INI,)) & 255
+        require(m.invoke(0x727240, pointer, (INI,)) & 255, 'native 0x727240 returned an unexpected result')
     tags = {}
     for name in definitions.get('Tags', {}):
         pointer = m.alloc(0x100)
         m.invoke(0x6E5B60, pointer, (m.cstring(name),))
-        assert m.invoke(m.read32(m.read32(pointer) + 0x64), pointer, (INI,)) & 255
+        require(m.invoke(m.read32(m.read32(pointer) + 0x64), pointer, (INI,)) & 255, f'{name}: tag INI read refused')
         tags[name] = pointer
     return tags
 

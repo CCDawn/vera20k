@@ -149,6 +149,14 @@ pub(crate) struct RetailOptionsProfile {
     /// service instead of showing `TXT_APIMISSING`: the Options page's
     /// developer box. Off by default; no real service exists yet.
     pub(crate) wol_test_service: bool,
+    /// `[VERA] SoloSkirmish=`: Start accepts a skirmish whose AI rows are all
+    /// `None`, for an undisturbed test match. Off by default, so retail's
+    /// "at least two players" gate stays.
+    pub(crate) solo_skirmish: bool,
+    /// `[VERA] TranslateChat=`: the language received online chat is
+    /// translated into, or `None`, the default, for off. Only the `/translate`
+    /// chat command changes it ([`Self::commit_chat_translation`]).
+    pub(crate) translate_chat: Option<crate::ui::chat_translation::ChatLanguage>,
     /// `[VERA] Display=`: the screen the game opens on, by the window system's
     /// own name (`\\.\DISPLAY1`). Absent or empty means the system's choice,
     /// which is how every earlier build behaved. A name no longer attached
@@ -217,6 +225,8 @@ impl Default for RetailOptionsProfile {
             shift_queue: false,
             shift_queue_count: DEFAULT_SHIFT_QUEUE_COUNT,
             wol_test_service: false,
+            solo_skirmish: false,
+            translate_chat: None,
             display: crate::ui::main_menu_dialogs::options::DisplayTarget::Auto,
         }
     }
@@ -234,7 +244,7 @@ pub(crate) struct FormattedProfileSections {
     pub(crate) audio: [(&'static str, String); 7],
     pub(crate) network: [(&'static str, String); 4],
     /// VERA's own section, written after the native ones.
-    pub(crate) vera: [(&'static str, String); 11],
+    pub(crate) vera: [(&'static str, String); 12],
 }
 
 impl RetailOptionsLoad {
@@ -254,7 +264,7 @@ impl RetailOptionsLoad {
     /// [`Self::without_settings`] so user profile state cannot contaminate sealed
     /// capture output.
     pub(crate) fn from_settings(ra2_dir: &Path, startup: &RetailStartupOptions) -> Self {
-        Self::from_settings_with(ra2_dir, startup, |path| std::fs::read(path))
+        Self::from_settings_with(ra2_dir, startup, |path| crate::util::file_system::read(path))
     }
 
     /// Injectable form of [`Self::from_settings`] used to prove that both
@@ -441,6 +451,10 @@ impl RetailOptionsProfile {
                 vera.read_int("ShiftQueueCount", self.shift_queue_count as i32),
             );
             self.wol_test_service = vera.read_bool("WolTestService", self.wol_test_service);
+            self.solo_skirmish = vera.read_bool("SoloSkirmish", self.solo_skirmish);
+            if let Some(value) = vera.read_name("TranslateChat", 16) {
+                self.translate_chat = crate::ui::chat_translation::ChatLanguage::from_tag(value);
+            }
             if let Some(value) = vera.read_name("Display", DISPLAY_CAPACITY) {
                 self.display =
                     crate::ui::main_menu_dialogs::options::DisplayTarget::from_ini_value(value);
@@ -536,6 +550,7 @@ impl RetailOptionsProfile {
                     "WolTestService",
                     format_bool(self.wol_test_service).to_string(),
                 ),
+                ("SoloSkirmish", format_bool(self.solo_skirmish).to_string()),
                 (
                     "RenderInterpolation",
                     format_bool(self.render_interpolation).to_string(),
@@ -605,6 +620,16 @@ impl RetailOptionsProfile {
     /// `INIClass::Save`. Every other section and key is left as it is.
     pub(crate) fn commit_wol_preferences(&self, ra2_dir: &Path) -> io::Result<()> {
         profile_file::update(ra2_dir, |input| self.transform_wol_preferences(input))
+    }
+
+    /// The `/translate` command's writer: `[VERA] TranslateChat=` alone.
+    pub(crate) fn commit_chat_translation(&self, ra2_dir: &Path) -> io::Result<()> {
+        profile_file::update(ra2_dir, |input| self.transform_chat_translation(input))
+    }
+
+    fn transform_chat_translation(&self, input: &[u8]) -> Vec<u8> {
+        let tag = self.translate_chat.map_or("off", |language| language.tag());
+        set_ini_values(input, VERA_SECTION, &[("TranslateChat", tag)])
     }
 
     fn transform_wol_preferences(&self, input: &[u8]) -> Vec<u8> {
@@ -720,35 +745,6 @@ fn flip_net_id_units(units: &[u16]) -> Vec<u16> {
         .collect()
 }
 
-/// CRT `wcstol(token, NULL, 10)`: leading wide whitespace, optional sign,
-/// decimal digits; no digits yields 0 and overflow saturates.
-fn wcstol_decimal(token: &[u16]) -> i32 {
-    let is_space = |unit: u16| matches!(unit, 0x09..=0x0D | 0x20);
-    let mut rest = token;
-    while let Some((&first, tail)) = rest.split_first() {
-        if !is_space(first) {
-            break;
-        }
-        rest = tail;
-    }
-    let negative = rest.first() == Some(&u16::from(b'-'));
-    if matches!(rest.first(), Some(&unit) if unit == u16::from(b'-') || unit == u16::from(b'+')) {
-        rest = &rest[1..];
-    }
-    let mut value: i64 = 0;
-    for &unit in rest {
-        if !(u16::from(b'0')..=u16::from(b'9')).contains(&unit) {
-            break;
-        }
-        value = value * 10 + i64::from(unit - u16::from(b'0'));
-        if value > i64::from(i32::MAX) + 1 {
-            break;
-        }
-    }
-    let value = if negative { -value } else { value };
-    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-}
-
 /// Decode `[Network] NetID` into movie progress. Both fields start at -1, the
 /// first two `wcstok(L" ")` tokens are read with `wcstol` minus one, and a
 /// value outside -1..=7 falls back to -1.
@@ -760,9 +756,9 @@ fn decode_net_id(network: &IniSection) -> crate::ui::movies_credits_shell::Movie
         .filter(|token| !token.is_empty());
     let mut progress = crate::ui::movies_credits_shell::MovieProgress::default();
     if let Some(token) = tokens.next() {
-        progress.soviet = wcstol_decimal(token).wrapping_sub(1);
+        progress.soviet = crate::util::native_string::crt_wcstol(token, 10).wrapping_sub(1);
         if let Some(token) = tokens.next() {
-            progress.allied = wcstol_decimal(token).wrapping_sub(1);
+            progress.allied = crate::util::native_string::crt_wcstol(token, 10).wrapping_sub(1);
         }
     }
     let clamp = |value: i32| if (-1..8).contains(&value) { value } else { -1 };
@@ -1329,6 +1325,8 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
         assert!(!defaults.retained_profile.shift_queue);
         // Internet shows TXT_APIMISSING, as on retail, until it is ticked.
         assert!(!defaults.retained_profile.wol_test_service);
+        // The retail minimum-player gate stays until SoloSkirmish= is enabled.
+        assert!(!defaults.retained_profile.solo_skirmish);
         assert_eq!(
             defaults.retained_profile.shift_queue_count,
             DEFAULT_SHIFT_QUEUE_COUNT
@@ -1336,7 +1334,7 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
 
         let load = load_snapshot(
             &RetailStartupOptions::default(),
-            b"[VERA]\nFullScreen=yes\nZoom=2\nOriginalShape=yes\nSidebar=150\nShiftQueue=yes\nShiftQueueCount=8\nWolTestService=yes\n",
+            b"[VERA]\nFullScreen=yes\nZoom=2\nOriginalShape=yes\nSidebar=150\nShiftQueue=yes\nShiftQueueCount=8\nWolTestService=yes\nSoloSkirmish=yes\n",
         );
         assert!(load.retained_profile.full_screen);
         // The first release saved the whole factor.
@@ -1346,6 +1344,7 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
         assert!(!load.retained_profile.yr_original_style);
         assert!(load.retained_profile.shift_queue);
         assert!(load.retained_profile.wol_test_service);
+        assert!(load.retained_profile.solo_skirmish);
         assert_eq!(load.retained_profile.shift_queue_count, 8);
         // A value this build doesn't know reads as Auto.
         let unknown = load_snapshot(&RetailStartupOptions::default(), b"[VERA]\nZoom=9\n");
@@ -1360,6 +1359,7 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
             shift_queue: true,
             shift_queue_count: 7,
             wol_test_service: true,
+            solo_skirmish: true,
             ..RetailOptionsProfile::default()
         };
         let output =
@@ -1367,7 +1367,7 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
                 .unwrap();
         assert!(
             output.contains(
-                "[VERA]\r\nFullScreen=yes\r\nZoom=150\r\nOriginalShape=yes\r\nSidebar=200\r\nYROriginalStyle=yes\r\nShiftQueue=yes\r\nShiftQueueCount=7\r\nWolTestService=yes\r\n"
+                "[VERA]\r\nFullScreen=yes\r\nZoom=150\r\nOriginalShape=yes\r\nSidebar=200\r\nYROriginalStyle=yes\r\nShiftQueue=yes\r\nShiftQueueCount=7\r\nWolTestService=yes\r\nSoloSkirmish=yes\r\n"
             ),
             "{output}"
         );
@@ -1379,7 +1379,36 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
         assert!(reread.retained_profile.yr_original_style);
         assert!(reread.retained_profile.shift_queue);
         assert!(reread.retained_profile.wol_test_service);
+        assert!(reread.retained_profile.solo_skirmish);
         assert_eq!(reread.retained_profile.shift_queue_count, 7);
+    }
+
+    #[test]
+    fn chat_translation_writes_only_its_own_key_and_reads_back() {
+        use crate::ui::chat_translation::ChatLanguage;
+        let startup = RetailStartupOptions::default();
+        let profile = RetailOptionsProfile {
+            translate_chat: Some(ChatLanguage::SimplifiedChinese),
+            ..RetailOptionsProfile::default()
+        };
+        let output = profile.transform_chat_translation(b"[VERA]\r\nZoom=150\r\n");
+        let text = String::from_utf8(output.clone()).unwrap();
+        assert!(
+            text.contains("Zoom=150") && text.contains("TranslateChat=zh-Hans"),
+            "{text}"
+        );
+        let reread = load_snapshot(&startup, &output);
+        assert_eq!(
+            reread.retained_profile.translate_chat,
+            Some(ChatLanguage::SimplifiedChinese)
+        );
+        let off = RetailOptionsProfile::default().transform_chat_translation(&output);
+        assert_eq!(
+            load_snapshot(&startup, &off)
+                .retained_profile
+                .translate_chat,
+            None
+        );
     }
 
     #[test]

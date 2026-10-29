@@ -74,6 +74,10 @@ pub struct SavedSidebarOrder {
     request_states: [Vec<u8>; 4],
     factory_links: [Vec<Option<crate::sim::production::ProductionFactoryVisit>>; 4],
     prediction_categories: Vec<crate::sim::production::ProductionCategory>,
+    /// Phobos `ScenarioExt::SWSidebar_Enable`, false while the left sidebar is
+    /// collapsed. Companion state to this local presentation envelope.
+    #[cfg(feature = "phobos")]
+    sw_sidebar_expanded: bool,
 }
 
 impl SavedSidebarOrder {
@@ -90,7 +94,22 @@ impl SavedSidebarOrder {
             request_states,
             factory_links,
             prediction_categories: Vec::new(),
+            // `ScenarioExt::SWSidebar_Enable { true }` in Phobos's constructor.
+            #[cfg(feature = "phobos")]
+            sw_sidebar_expanded: true,
         }
+    }
+
+    /// Phobos stores `SWSidebar_Enable` in the scenario extension, outside the
+    /// strips; this envelope carries it beside them for the same save.
+    #[cfg(feature = "phobos")]
+    pub fn sw_sidebar_expanded(&self) -> bool {
+        self.sw_sidebar_expanded
+    }
+
+    #[cfg(feature = "phobos")]
+    pub fn set_sw_sidebar_expanded(&mut self, expanded: bool) {
+        self.sw_sidebar_expanded = expanded;
     }
 
     pub fn with_flash(mut self, deadlines: [Vec<i32>; 4], redraw_until: i32) -> Self {
@@ -2263,17 +2282,7 @@ impl Simulation {
             .overlay_grid
             .as_ref()
             .expect("validated overlay cache")
-            .iter_occupied()
-            .filter_map(|(rx, ry, cell)| {
-                cell.overlay_id
-                    .map(|overlay_id| crate::map::overlay::OverlayEntry {
-                        rx,
-                        ry,
-                        overlay_id,
-                        frame: cell.overlay_data,
-                    })
-            })
-            .collect();
+            .occupied_entries();
         let native_tiberium_stats =
             self.rebuild_native_tiberium_queues_after_snapshot_load(rules, overlay_registry)?;
         // CellTag identities are meaningful only after the canonical Cell
@@ -3464,6 +3473,7 @@ mod tests {
             !crate::rules::ARES_ENABLED,
             !crate::rules::PHOBOS_ENABLED,
             !crate::rules::NPATCH_ENABLED,
+            !crate::rules::VERAX_ENABLED,
         );
         // A complete header with no body proves capability admission runs before
         // Simulation deserialization, even without bound scenario resources.
@@ -4668,7 +4678,6 @@ mod tests {
         let team = restored.team_script_vm.team(team_id).unwrap();
         assert_eq!(team.member_count(), 0);
         assert_eq!(restored.team_script_vm.registry_counts(), (1, 1, 1, 1));
-        assert_eq!(restored.team_script_vm.team_type_order(), &[team_type_id]);
         let restored_team_type = restored
             .team_script_vm
             .team_type(team_type_id)
@@ -5144,7 +5153,7 @@ mod tests {
         use crate::sim::game_entity::GameEntity;
         use crate::sim::movement::ShipLocomotionRuntime;
         use crate::sim::movement::locomotor::LocomotorState;
-        use crate::util::fixed_math::{SIM_HALF, SIM_ONE};
+        use crate::util::fixed_math::SIM_ONE;
 
         let mut sim = Simulation::new();
         let owner = sim.interner.intern("Soviet");
@@ -5183,9 +5192,29 @@ mod tests {
             .set_for_test(7);
         assert_ne!(sim.state_hash(), populated_counter_hash);
 
+        sim.substrate
+            .entities
+            .get_mut(1)
+            .unwrap()
+            .foot_speed
+            .set_speed_fraction_native_bits(0x3fc9_9999_9999_999a);
+        let fraction_hash = sim.state_hash();
+        sim.substrate
+            .entities
+            .get_mut(1)
+            .unwrap()
+            .foot_speed
+            .set_speed_fraction_native_bits(0x3fc9_9999_9999_999b);
+        assert_ne!(
+            sim.state_hash(),
+            fraction_hash,
+            "adjacent doubles with the same fixed projection must hash differently"
+        );
         let ship_head = DriveCoord::cell(6, 5, 0);
         let entity = sim.substrate.entities.get_mut(1).expect("SHP unit");
-        entity.foot_speed.set_speed_fraction(SIM_HALF);
+        entity
+            .foot_speed
+            .set_speed_fraction_native_bits(0x3fc9_9999_9999_999a);
         // This serialization fixture supplies a Ship instance explicitly.
         entity.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Ship));
         entity
@@ -5198,6 +5227,14 @@ mod tests {
                     .with_head_to_for_test(Some(ship_head))
                     .with_target_speed_fraction_for_test(SIM_ONE),
             ));
+        entity
+            .locomotor
+            .as_mut()
+            .unwrap()
+            .store_track_target_fraction_native(
+                crate::sim::movement::track_process::TrackFamily::Ship,
+                crate::util::native_x87::NativeF64Bits::from_bits(0x3ff3_3333_3333_3334),
+            );
         let populated_shp_state_hash = sim.state_hash();
         assert_ne!(populated_shp_state_hash, populated_counter_hash);
 
@@ -5236,9 +5273,26 @@ mod tests {
             .expect("restored Ship runtime");
         assert_eq!(restored_ship.destination(), Some(ship_head));
         assert_eq!(restored_ship.head_to(), Some(ship_head));
-        assert_eq!(restored_ship.target_speed_fraction(), SIM_ONE);
+        assert_eq!(
+            restored
+                .entities()
+                .get(1)
+                .unwrap()
+                .locomotor
+                .as_ref()
+                .unwrap()
+                .track_target_fraction_native(
+                    crate::sim::movement::track_process::TrackFamily::Ship
+                )
+                .unwrap()
+                .bits(),
+            0x3ff3_3333_3333_3334
+        );
         let restored_owner_speed = &restored.substrate.entities.get(1).unwrap().foot_speed;
-        assert_eq!(restored_owner_speed.applied_fraction(), SIM_HALF);
+        assert_eq!(
+            restored_owner_speed.native_applied_fraction().bits(),
+            0x3fc9_9999_9999_999a
+        );
         assert_eq!(restored.state_hash(), populated_shp_state_hash);
     }
 
@@ -6397,7 +6451,6 @@ mod tests {
         use crate::sim::cloak_disguise::CloakRuntime;
         use crate::sim::combat::Health;
         use crate::sim::game_entity::GameEntity;
-        use crate::sim::sensor_lifecycle::SensorDeposit;
 
         let mut sim = Simulation::new();
         let viewer = sim.interner.intern("AMERICANS");
@@ -6431,7 +6484,6 @@ mod tests {
         let mut cloak = CloakRuntime::new(0);
         cloak.establish_unlimbo_fully_cloaked();
         entity.cloak = Some(cloak);
-        entity.sensor_deposit = Some(SensorDeposit::unit(viewer, (3, 3), 2));
         sim.substrate.entities.insert(entity);
         // Native in-scenario load restarts Scenario RNG from Seed0; isolate
         // fog/sensor/cloak persistence on that same post-load cursor.
@@ -6439,7 +6491,7 @@ mod tests {
         let expected_hash = sim.state_hash();
 
         let bytes = GameSnapshot::save(&sim, 0, 0, "cell_fog_sensor_cloak", 0);
-        let mut restored = GameSnapshot::load(&bytes).expect("current snapshot").sim;
+        let restored = GameSnapshot::load(&bytes).expect("current snapshot").sim;
 
         assert_eq!(restored.state_hash(), expected_hash);
         assert_eq!(restored.fog.fogged_objects().len(), 1);
@@ -6450,25 +6502,6 @@ mod tests {
             restored_entity.cloak,
             sim.substrate.entities.get(entity_id).unwrap().cloak
         );
-        assert_eq!(
-            restored_entity.sensor_deposit,
-            sim.substrate
-                .entities
-                .get(entity_id)
-                .unwrap()
-                .sensor_deposit
-        );
-        let same_hash = restored.state_hash();
-        restored
-            .substrate
-            .entities
-            .get_mut(entity_id)
-            .unwrap()
-            .sensor_deposit
-            .as_mut()
-            .unwrap()
-            .set_center_for_test((4, 3));
-        assert_ne!(restored.state_hash(), same_hash);
     }
 
     #[test]

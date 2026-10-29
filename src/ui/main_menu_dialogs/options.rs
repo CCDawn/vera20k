@@ -486,6 +486,15 @@ pub(crate) enum LauncherCue {
     ComboClose,
 }
 
+impl From<crate::ui::shell::combobox::ComboCue> for LauncherCue {
+    fn from(cue: crate::ui::shell::combobox::ComboCue) -> Self {
+        match cue {
+            crate::ui::shell::combobox::ComboCue::Open => Self::ComboOpen,
+            crate::ui::shell::combobox::ComboCue::Close => Self::ComboClose,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 /// gamemd-derived: notification order in launcher primary-proc slice
 /// `0x0055FDB0..0x0056047A`; owner `OptionsClass__ShowLauncherDialog @
@@ -736,8 +745,11 @@ impl OptionsDialogState {
         &self.displays
     }
 
-    pub(crate) const fn launcher_audio_available(&self) -> bool {
-        self.launcher_audio_available
+    /// Whether a trackbar window is enabled: `0x00560361..0x00560467` (as
+    /// `0x6B6300` does for its own three) enables the audio ones only with an
+    /// output device (`Audio__HasOutputDevice @ 0x00407000`).
+    pub(crate) const fn trackbar_enabled(&self, id: LauncherTrackbarId) -> bool {
+        !id.is_audio() || self.launcher_audio_available
     }
 
     /// gamemd-derived: the parent snapshot consumed by
@@ -776,7 +788,7 @@ impl OptionsDialogState {
     /// captions and queues preview/cue work only after the integer position
     /// actually changes; the accepted projection remains owned by `0x0055FAA0`.
     fn set_trackbar_position(&mut self, id: LauncherTrackbarId, position: u8) {
-        if position > id.maximum() || (id.is_audio() && !self.launcher_audio_available) {
+        if position > id.maximum() || !self.trackbar_enabled(id) {
             return;
         }
         let slot = match id {
@@ -825,7 +837,7 @@ impl OptionsDialogState {
         id: LauncherTrackbarId,
         frame: PhysicalControlFrame,
     ) {
-        if id.is_audio() && !self.launcher_audio_available {
+        if !self.trackbar_enabled(id) {
             return;
         }
         let press = trackbar_press(

@@ -14,6 +14,7 @@ from unicorn import Uc, UC_ARCH_X86, UC_MODE_32
 from unicorn.x86_const import *
 from tools.native_oracle import (load_image, run_checked, call, SCRATCH,
     STACK_BASE, STACK_SIZE, RET_MAGIC, finish_vectors, provenance)
+from tools.native_oracle import require
 
 TYPE = SCRATCH
 SECTION = SCRATCH + 0x3000
@@ -198,10 +199,10 @@ def generate_lights():
         rows.append(dict(name=name, **f.light_pass(values, admitted=admitted)))
     # The literal constructor tint must also survive an admitted section
     # whose nonzero intensity is explicit but all three tint keys are absent.
-    assert f.light_constructor() == constructor
+    require(f.light_constructor() == constructor, 'light constructor stores changed')
     rows.append(dict(name='constructor_tints_with_explicit_intensity',
                      reset_constructor=True, **f.light_pass(dict(LightIntensity='.2'))))
-    assert f.light_constructor() == constructor
+    require(f.light_constructor() == constructor, 'light constructor stores changed')
     rows.append(dict(name='stock_snow_day', reset_constructor=True,
                      **f.light_pass(dict(LightVisibility='3000', LightIntensity='0.005',
                                          LightRedTint='0.1', LightGreenTint='0.1', LightBlueTint='0.00'))))

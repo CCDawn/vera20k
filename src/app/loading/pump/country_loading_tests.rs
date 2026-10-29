@@ -58,6 +58,7 @@ fn prepare_map(session: &mut LoadingSession) {
     let initial = MapLoadInitial::from_test_map_source(
         map,
         crate::map::source::LoadedMapSource::Loose {
+            cache_lease: Default::default(),
             path: "fixture.map".into(),
             payload_len: 0,
             source_sha256: crate::util::sha256::sha256_hex(b"synthetic authored map"),

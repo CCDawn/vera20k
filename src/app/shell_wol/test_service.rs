@@ -36,7 +36,7 @@ use crate::ui::wol_lobby::{
     EX_INFO_VERSION, GAME_CHANNEL, MEMBER_OPERATOR, MEMBER_VOICE, WolChannel, WolMember,
 };
 use crate::ui::wol_login::WolCredential;
-use std::time::Instant;
+use crate::util::time::Instant;
 
 /// Event 9's status that completes the server-list wait.
 const SERVER_STATUS_READY: u32 = 0x0004_012F;
@@ -126,6 +126,11 @@ fn answer_setup(state: &mut AppState, request: NetworkSetupRequest) {
         }
         return;
     }
+    // 0x0078F000: the stand-in server keeps the host's new record.
+    if request == NetworkSetupRequest::Advertise {
+        super::lobby::republish_channel(state);
+        return;
+    }
     // C9 Back waits for the leave's OnPart; C2 Back closes at once.
     if request == NetworkSetupRequest::Leave && !state.match_state.session.host() {
         service_event(state, WolServiceEvent::ChannelLeft);
@@ -182,7 +187,10 @@ fn guest_answer(state: &mut AppState, request: &NetworkSetupRequest) {
             let mut pings = [-1; 8];
             pings[1] = 60;
             for event in [
-                NetworkSetupEvent::GameStarted { users, pings },
+                NetworkSetupEvent::GameStarted {
+                    users,
+                    pings: pings.to_vec(),
+                },
                 NetworkSetupEvent::VerifyStarted { pairs: true },
                 NetworkSetupEvent::PeerConnected { node: 1 },
                 NetworkSetupEvent::Negotiated { result: 2 },
@@ -334,7 +342,8 @@ fn host_options(
         NetworkSetupEvent::HostSetup(crate::app::shell_network_setup::HostOptions {
             launch,
             map_metadata,
-            vacancies: [crate::app::match_runtime::session::NetworkVacancy::Open; 8],
+            vacancies: [crate::app::match_runtime::session::NetworkVacancy::Open;
+                crate::skirmish_launch::NETWORK_PLAYER_SLOT_COUNT],
             observer_row: None,
             cooperative_difficulty: 0,
             seed: Some(HOST_SEED),
@@ -519,13 +528,16 @@ fn answer(state: &mut AppState, request: WolServiceRequest) {
         // Nothing to cancel or deliver: nobody is online.
         WolServiceRequest::SetLocale(_)
         | WolServiceRequest::LeaveChannel
+        | WolServiceRequest::MatchReturned
         | WolServiceRequest::Logout
         | WolServiceRequest::CancelWait
         | WolServiceRequest::Chat { .. }
         | WolServiceRequest::Emote { .. }
         // Server-side page/find/language enforcement is not simulated.
         | WolServiceRequest::SetLangFilter(_)
-        | WolServiceRequest::SetFindPage { .. } => return,
+        | WolServiceRequest::SetFindPage { .. }
+        // Translation is online-only; the stand-in service never queues it.
+        | WolServiceRequest::Translate { .. } => return,
     };
     service_event(state, event);
 }
@@ -740,7 +752,7 @@ fn match_requested(state: &mut AppState) {
         ansi: true,
         options,
     };
-    let players = format!("{local},0,0,0,0,0,0,0,0,{GUEST},1,0,0,0,0,0,0,0");
+    let players = format!("{local},0,0,0,0,0,0,0,{GUEST},1,0,0,0,0,0,0");
     for event in [
         line("Working".into(), true, None),
         line("Pool 2".into(), false, None),
@@ -824,7 +836,8 @@ pub(crate) fn matchbot_options(
     Ok(crate::app::shell_network_setup::HostOptions {
         launch,
         map_metadata: crate::app::shell_network_setup::local_map_metadata(state, &file)?,
-        vacancies: [crate::app::match_runtime::session::NetworkVacancy::Open; 8],
+        vacancies: [crate::app::match_runtime::session::NetworkVacancy::Open;
+            crate::skirmish_launch::NETWORK_PLAYER_SLOT_COUNT],
         observer_row: None,
         cooperative_difficulty: 0,
         seed: Some(HOST_SEED),

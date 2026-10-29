@@ -411,12 +411,38 @@ impl IniSection {
             })
     }
 
+    /// Ares `ValueableIdx<ColorScheme>` 1001CC70: ReadString 2048, then
+    /// `find`, the ColorScheme Find 1001BB30 with shade count 1. A found
+    /// scheme stores its index and `none`/`<none>` (10003950) stores -1;
+    /// anything else, or an absent key, keeps `current`. Phobos's
+    /// `ValueableIdx<ColorScheme>::Read` (`Utilities/TemplateDef.h`) is the
+    /// same read over `ColorScheme::FindIndex(name, 1)` and `IsBlank`.
+    #[cfg(any(feature = "ares", feature = "phobos"))]
+    pub(crate) fn read_ares_color_scheme_index(
+        &self,
+        key: &str,
+        current: i32,
+        find: impl Fn(&str) -> Option<i32>,
+    ) -> i32 {
+        let Some(name) = self.read_name(key, 2048) else {
+            return current;
+        };
+        find(name).unwrap_or(
+            if crate::rules::ini_parser::is_native_none_type_name(name) {
+                -1
+            } else {
+                current
+            },
+        )
+    }
+
     /// CCINIClass::ReadEdge475980: ReadString into128 bytes with an empty
-    /// default. Empty retains the caller's value; case-insensitive cardinal
-    /// names map to0..3 and every other nonempty name returns literal-1.
+    /// default. Empty retains the caller's value; Edge_From_Name 0x0048DB80
+    /// matches the five names of table 0x007E1B60 case-insensitively (North,
+    /// East, South, West, Air → 0..4) and every other nonempty name returns -1.
     pub fn read_edge(&self, key: &str, default: i32) -> i32 {
         self.read_string_with(key, 128, default, |_, value| {
-            ["North", "East", "South", "West"]
+            ["North", "East", "South", "West", "Air"]
                 .iter()
                 .position(|name| name.eq_ignore_ascii_case(value))
                 .map_or(-1, |index| index as i32)
@@ -483,6 +509,16 @@ impl IniSection {
         })
     }
 
+    /// Ares Nullable<int>::Read 10008CC0 (SideExt SurvivorDivisor at 1002E59F,
+    /// TechnoTypeExt TurretROT at 1003F267) sets presence only after its
+    /// Valueable<int> read succeeds. Absent, empty and invalid input keep the
+    /// previous value and presence.
+    pub fn read_ares_nullable_int(&self, key: &str, current: Option<i32>) -> Option<i32> {
+        self.read_string_with(key, 2048, current, |previous, value| {
+            parse_ares_int(value).or(previous)
+        })
+    }
+
     /// Ares/Phobos `PartialVector2D<int>` (`Utilities/TemplateDef.h`'s
     /// `read<PartialVector2D<int>>` over `MultiParser<int>::Parse(value, out, 2)`):
     /// ReadString(2048), then at most two comma-separated [`parse_ares_int`]
@@ -501,6 +537,32 @@ impl IniSection {
                 low: fields[0],
                 high: fields[1],
                 values,
+            }
+        })
+    }
+
+    /// Ares coordinate reader100406D0 -> MultiParser1000C7E0. Each comma
+    /// token uses the shared Parser<int> and a 128-byte scanf_s buffer.
+    /// A partial native parse copies uninitialized trailing locals; retain
+    /// the prior coordinate for that malformed-input boundary in Rust.
+    #[cfg(feature = "ares")]
+    pub(crate) fn read_ares_coord3(&self, key: &str, current: [i32; 3]) -> [i32; 3] {
+        self.read_string_with(key, 2048, current, |previous, value| {
+            if value.split(',').take(3).any(|token| {
+                token
+                    .as_bytes()
+                    .iter()
+                    .skip_while(|byte| is_crt_space(**byte))
+                    .count()
+                    >= 128
+            }) {
+                return previous;
+            }
+            let mut fields = previous;
+            if scan_partial_int_fields(value, &mut fields) == 3 {
+                fields
+            } else {
+                previous
             }
         })
     }
@@ -526,13 +588,20 @@ impl IniSection {
     /// The shared scanner/percent kernel also serves the stock reader.
     pub fn read_ares_double_bits(&self, key: &str, default: NativeF64Bits) -> NativeF64Bits {
         self.read_string_with(key, 2048, default, |current, value| {
-            try_parse_leading_f64(value, FloatScanRounding::AresChop).map_or(current, |number| {
-                NativeF64Bits::from_bits(if value.contains('%') {
-                    scale_percent(number).to_bits()
-                } else {
-                    number.to_bits()
-                })
-            })
+            parse_ares_double_bits(value).unwrap_or(current)
+        })
+    }
+
+    /// Ares Nullable<double>10008CE0 ->10008E90 ->10076B60: only a
+    /// successful shared double parse sets presence. `none` is invalid,
+    /// so it retains the pair instead of clearing a prior value.
+    pub fn read_ares_nullable_double_bits(
+        &self,
+        key: &str,
+        current: Option<NativeF64Bits>,
+    ) -> Option<NativeF64Bits> {
+        self.read_string_with(key, 2048, current, |current, value| {
+            parse_ares_double_bits(value).or(current)
         })
     }
 
@@ -603,6 +672,37 @@ impl IniSection {
         })
     }
 
+    /// Phobos `Valueable<Point2D>`: `INI_EX::Read2Integers` (ReadString(2048),
+    /// then `Parser<int, 2>`, the [`scan_partial_int_fields`] scan) converts
+    /// each token straight into the value, so a one-token read changes only X
+    /// and a read that converts nothing keeps both.
+    pub fn read_phobos_int_pair(&self, key: &str, current: [i32; 2]) -> [i32; 2] {
+        self.read_string_with(key, 2048, current, |current, raw| {
+            let mut fields = current;
+            scan_partial_int_fields(raw, &mut fields);
+            fields
+        })
+    }
+
+    /// Phobos `Nullable<Point2D>`: the clearing tokens of
+    /// [`Self::read_phobos_nullable_with`], then the same in-place
+    /// `Read2Integers` scan. Only a read that converts both tokens sets the
+    /// value; a partial read updates a value that is already set.
+    pub fn read_phobos_nullable_int_pair(
+        &self,
+        key: &str,
+        current: Option<[i32; 2]>,
+    ) -> Option<[i32; 2]> {
+        self.read_string_with(key, 2048, current, |current, raw| {
+            if raw.eq_ignore_ascii_case("<default>") || is_native_none_type_name(raw) {
+                return None;
+            }
+            let mut fields = current.unwrap_or_default();
+            let values = scan_partial_int_fields(raw, &mut fields);
+            (values == 2 || current.is_some()).then_some(fields)
+        })
+    }
+
     /// Phobos shares Ares's `Parser<int>::TryParse`, including `$%d`.
     pub fn read_phobos_nullable_int(&self, key: &str, current: Option<i32>) -> Option<i32> {
         self.read_phobos_nullable_with(key, current, parse_ares_int)
@@ -612,27 +712,19 @@ impl IniSection {
         self.read_phobos_nullable_with(key, current, read_bool_decision)
     }
 
-    /// Phobos b90ab4bc Utilities/Parser.h:248..271: `strtod`, cast to
-    /// binary32, optional binary32 percent scaling, then widen to double.
+    /// Phobos `Nullable<double>`: the clearing tokens of
+    /// [`Self::read_phobos_nullable_with`], then [`parse_phobos_double`].
     /// Unlike stock ReadDouble, a failed conversion keeps the old nullable.
     pub fn read_phobos_nullable_double(&self, key: &str, current: Option<f64>) -> Option<f64> {
-        self.read_phobos_nullable_with(key, current, |raw| {
-            let parsed = try_parse_leading_f64(raw, FloatScanRounding::Nearest)?;
-            // strtod reports ERANGE on overflow and underflow. Reuse the
-            // decimal scanner's token to distinguish underflow from literal 0.
-            let token = leading_float_token(raw)?;
-            let mantissa = token.split(['e', 'E']).next().unwrap_or(token);
-            if !parsed.is_finite()
-                || (parsed != 0.0 && parsed.abs() < f64::MIN_POSITIVE)
-                || (parsed == 0.0 && mantissa.bytes().any(|byte| matches!(byte, b'1'..=b'9')))
-            {
-                return None;
-            }
-            let mut value = parsed as f32;
-            if raw.contains('%') {
-                value *= 0.01_f32;
-            }
-            Some(f64::from(value))
+        self.read_phobos_nullable_with(key, current, parse_phobos_double)
+    }
+
+    /// Phobos `Valueable<double>` (`INI_EX::ReadDouble`): ReadString(2048),
+    /// then [`parse_phobos_double`]. Absent, empty and failed reads keep the
+    /// current value.
+    pub fn read_phobos_double(&self, key: &str, current: f64) -> f64 {
+        self.read_string_with(key, 2048, current, |current, raw| {
+            parse_phobos_double(raw).unwrap_or(current)
         })
     }
 
@@ -1665,6 +1757,38 @@ impl PartialIntPair {
     }
 }
 
+/// Phobos b90ab4bc Utilities/Parser.h:248..271 `Parser<double>`: `strtod`,
+/// cast to binary32, optional binary32 percent scaling, then widen to double.
+/// `None` where `strtod` converts nothing or reports ERANGE.
+fn parse_phobos_double(raw: &str) -> Option<f64> {
+    let parsed = try_parse_leading_f64(raw, FloatScanRounding::Nearest)?;
+    // strtod reports ERANGE on overflow and underflow. Reuse the decimal
+    // scanner's token to distinguish underflow from literal 0.
+    let token = leading_float_token(raw)?;
+    let mantissa = token.split(['e', 'E']).next().unwrap_or(token);
+    if !parsed.is_finite()
+        || (parsed != 0.0 && parsed.abs() < f64::MIN_POSITIVE)
+        || (parsed == 0.0 && mantissa.bytes().any(|byte| matches!(byte, b'1'..=b'9')))
+    {
+        return None;
+    }
+    let mut value = parsed as f32;
+    if raw.contains('%') {
+        value *= 0.01_f32;
+    }
+    Some(f64::from(value))
+}
+
+/// Installed Ares Parser<double>10076B60, shared by value and nullable reads.
+fn parse_ares_double_bits(value: &str) -> Option<NativeF64Bits> {
+    let number = try_parse_leading_f64(value, FloatScanRounding::AresChop)?;
+    Some(NativeF64Bits::from_bits(if value.contains('%') {
+        scale_percent(number).to_bits()
+    } else {
+        number.to_bits()
+    }))
+}
+
 /// The single Ares Parser<int> core, also used by compound int/bool readers.
 fn parse_ares_int(value: &str) -> Option<i32> {
     if let Some(decimal) = value.strip_prefix('$') {
@@ -1876,6 +2000,13 @@ mod tests {
                 "{row}"
             );
         }
+    }
+
+    #[test]
+    fn read_edge_maps_air_to_the_fifth_table_name() {
+        let mut section = IniSection::new("Control".to_string());
+        section.set("Edge", "air");
+        assert_eq!(section.read_edge("Edge", -1), 4);
     }
 
     #[test]
