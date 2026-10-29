@@ -126,6 +126,25 @@ const DEFENSE_COMMIT_MIN: usize = 4;
 /// flight sitting outside the perimeter still draws the recall.
 const ALARM_RADIUS: i16 = 24;
 
+/// The naval layer (Layer 2.7): combat ships the side fields once its
+/// naval yard stands — the basic hull line up to this quota, then the AA
+/// escort when its extra prerequisite honestly passes `can_build`.
+const NAVAL_SHIP_QUOTA: usize = 3;
+
+/// How far from a yard the naval survey scans for a legal shoreline cell:
+/// the naval yard's foundation needs a WaterSet tile inside the base's own
+/// build area, so the survey rides the same admission the placement runs.
+const NAVAL_SITE_RADIUS: i16 = 14;
+
+/// Pacing between shoreline surveys, in ticks — the ring scan probes a
+/// placement per cell, so a landlocked base must not rescan every growth
+/// slot.
+const NAVAL_PROBE_TICKS: u32 = 900;
+
+/// The survey budget: this many failed probes and the navy is dead for the
+/// game (no legal shoreline near any yard).
+const NAVAL_PROBE_MAX: u8 = 3;
+
 /// How many combat units must stand gathered (idle or on the guard post)
 /// before a wave launches as one mass: production has to outpace attrition
 /// first. Sized for the three-factory expansion — the faster queue gathers
@@ -631,6 +650,18 @@ struct Opening {
     defense_basic: &'static str,
     defense_aa: &'static str,
     defense_heavy: &'static str,
+    /// The side's naval yard (`Naval=yes`, so it founds on a WaterSet tile):
+    /// one stands when the naval survey finds a legal shoreline cell inside
+    /// the base's build area. Prerequisites are the ladder's own conyard,
+    /// power and refinery, so the yard queues as a growth rung.
+    naval_yard: &'static str,
+    /// The side's basic combat ship — prerequisite the yard alone, so it is
+    /// the line the naval quota fills first: the Allied Destroyer, the
+    /// Soviet Typhoon, Yuri's Boomer (the side's only combat hull).
+    naval_ship: &'static str,
+    /// The side's naval AA escort behind its extra prerequisite (the Aegis
+    /// Cruiser's radar, the Giant Squid's battle lab), when one exists.
+    naval_aa: Option<&'static str>,
     /// Aircraft-tab types the air wing fields, preference order (Korea's
     /// Black Eagle `BEAG` first, the shared Intruder `ORCA` behind — the
     /// cameo's country gate skips the one this house may not take). Only
@@ -758,6 +789,9 @@ const OPENINGS: [Opening; 3] = [
         defense_basic: "GAPILL",
         defense_aa: "NASAM",
         defense_heavy: "ATESLA",
+        naval_yard: "GAYARD",
+        naval_ship: "DEST",
+        naval_aa: Some("AEGIS"),
         aircraft: &["BEAG", "ORCA"],
         scout: "ADOG",
         fortress: Some("BFRT"),
@@ -852,6 +886,9 @@ const OPENINGS: [Opening; 3] = [
         defense_basic: "NALASR",
         defense_aa: "NAFLAK",
         defense_heavy: "TESLA",
+        naval_yard: "NAYARD",
+        naval_ship: "SUB",
+        naval_aa: Some("SQD"),
         aircraft: &[],
         scout: "DOG",
         fortress: None,
@@ -933,6 +970,9 @@ const OPENINGS: [Opening; 3] = [
         defense_basic: "YAGGUN",
         defense_aa: "YAGGUN",
         defense_heavy: "YAPSYT",
+        naval_yard: "YAYARD",
+        naval_ship: "BSUB",
+        naval_aa: None,
         aircraft: &[],
         scout: "INIT",
         fortress: None,
@@ -977,6 +1017,20 @@ pub struct SuperAi {
     /// posts until the stance lifts. Pinned state, never read from the
     /// runtime.
     defenders: Vec<u64>,
+    /// The naval survey's latched shoreline cell for the naval yard: the
+    /// one legal WaterSet placement inside the base's build area, so the
+    /// ready yard never has to search for it at placement time. Pinned
+    /// state, never read from the runtime.
+    naval_site: Option<(u16, u16)>,
+    /// The tick the next shoreline survey may run; see
+    /// [`NAVAL_PROBE_TICKS`]. Pinned state, never read from the runtime.
+    naval_probe_due: u32,
+    /// Shoreline surveys spent without a find; see [`NAVAL_PROBE_MAX`].
+    /// Pinned state, never read from the runtime.
+    naval_probes: u8,
+    /// Whether the navy is dead for this game (no legal shoreline near any
+    /// yard). Pinned state, never read from the runtime.
+    naval_abandoned: bool,
     /// Earliest tick each idle unit may take another single-unit order; see
     /// [`IDLE_REORDER_TICKS`]. Pinned state, never read from the runtime.
     order_gate: std::collections::HashMap<u64, u32>,
@@ -1153,6 +1207,10 @@ impl SuperAi {
             next_wave_tick: 0,
             defense_focus: None,
             defenders: Vec::new(),
+            naval_site: None,
+            naval_probe_due: 0,
+            naval_probes: 0,
+            naval_abandoned: false,
             order_gate: std::collections::HashMap::new(),
             next_airstrike_tick: 0,
             next_sw_fire_tick: 0,
@@ -1610,7 +1668,21 @@ impl SuperAi {
                 } else {
                     None
                 };
-                far_site.or_else(|| {
+                far_site
+                    .or_else(|| {
+                        // The naval yard's latched shoreline cell (Layer
+                        // 2.7): the survey already paid for the ring scan,
+                        // so the ready shipyard lands exactly there.
+                        // Terrain does not move, and anything that drifted
+                        // onto the cell is scattered by the placement's
+                        // own flush.
+                        if sim.interner.get(opening.naval_yard) == Some(ready.type_id) {
+                            self.naval_site
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
                     // The expansion routing: the first expansion's refinery
                     // (before its remote latch arms, with the second yard
                     // already standing) and anything the growth plan marked
@@ -2187,10 +2259,17 @@ impl SuperAi {
 
             // Layer-3 futility gate folded into the Layer-2 post split: a
             // unit whose identical post order keeps landing unmoved stops
-            // spending its reorder windows on it for a while.
+            // spending its reorder windows on it for a while. Naval hulls
+            // never post — their defense is the idle perimeter's Attack,
+            // not a land ring.
             let poster = self
                 .due_idle_unit(&idle, tick)
-                .filter(|&unit| !self.futility_suppressed(unit, FutilityKind::GuardPost, tick));
+                .filter(|&unit| !self.futility_suppressed(unit, FutilityKind::GuardPost, tick))
+                .filter(|&unit| {
+                    sim.substrate.entities.get(unit).is_none_or(|entity| {
+                        !Self::is_naval_type(opening, sim.interner.resolve(entity.type_ref()))
+                    })
+                });
             if let Some(unit) = poster {
                 // Spread the guard posts on a ring around the yard by unit
                 // id: defenders hold neighboring cells instead of stacking
@@ -3170,6 +3249,48 @@ impl SuperAi {
                         )];
                     }
                 }
+                // The naval survey (Layer 2.7): the naval yard founds on a
+                // WaterSet tile inside the base's own build area, so before
+                // its rung may queue one the survey must latch a legal
+                // shoreline cell — the same admission the placement itself
+                // runs, found by scanning rings around every standing yard.
+                // A ready yard with no site to land at would wedge the one
+                // placement slot for the rest of the game, the ATESLA
+                // lesson again. The scan probes a placement per cell, so it
+                // is paced and budgeted: a landlocked base (no water in any
+                // yard's reach) abandons the navy after
+                // [`NAVAL_PROBE_MAX`] surveys instead of rescanning every
+                // growth slot.
+                if !self.naval_abandoned
+                    && self.naval_site.is_none()
+                    && self.count_structures_of_type(sim, opening.naval_yard) == 0
+                    && tick >= self.naval_probe_due
+                {
+                    self.naval_probe_due = tick + NAVAL_PROBE_TICKS;
+                    self.naval_probes += 1;
+                    if self.naval_probes >= NAVAL_PROBE_MAX {
+                        self.naval_abandoned = true;
+                    }
+                    if let Some(yard_ty) = rules.object(opening.naval_yard)
+                        && let Some(site) =
+                            self.own_yard_centers(sim, opening).iter().find_map(|&yard| {
+                                find_site_around_capped(
+                                    sim,
+                                    rules,
+                                    &runtime.resources.overlay_registry,
+                                    yard_ty,
+                                    yard,
+                                    self.house,
+                                    Some(owner.as_str()),
+                                    NAVAL_SITE_RADIUS,
+                                )
+                            })
+                    {
+                        self.naval_site = Some(site);
+                        self.naval_probes = 0;
+                        self.naval_abandoned = false;
+                    }
+                }
                 let growth = [
                     (
                         // The far-entry cap (Layer 2 G's companion): the
@@ -3226,6 +3347,17 @@ impl SuperAi {
                     (
                         refineries < REFINERY_CAP && miners >= refineries * 2,
                         opening.refinery,
+                    ),
+                    (
+                        // The naval yard (Layer 2.7): the lowest growth
+                        // priority — the land base feeds and arms itself
+                        // first, then the shoreline the survey latched
+                        // gets its shipyard. Razed, the count re-arms the
+                        // rung and the survey's cell places the rebuild.
+                        !self.naval_abandoned
+                            && self.naval_site.is_some()
+                            && self.count_structures_of_type(sim, opening.naval_yard) == 0,
+                        opening.naval_yard,
                     ),
                 ];
                 for (behind, name) in growth {
@@ -3499,6 +3631,15 @@ impl SuperAi {
             Some(mcv)
         } else if economy_first {
             opening.harvester
+        } else if self.owns_structure_of_type(sim, opening.naval_yard)
+            && let Some(name) = self.naval_pick(sim, rules, opening)
+        {
+            // The naval line (Layer 2.7): a standing shipyard turns the
+            // vehicle queue's turn toward the sea — the basic hull line
+            // first, the AA escort once its prerequisite honestly passes —
+            // before the tank core resumes. The quota rests the limb on
+            // its own; the banked-credits gate below prices the hulls.
+            Some(name)
         } else if self.vehicle_slots < CORE_BEFORE_SPECIALISTS as u32 {
             Some(core_tank)
         } else if self.vehicle_slots % SPECIALIST_EVERY_VEHICLE == SPECIALIST_EVERY_VEHICLE - 1 {
@@ -4390,7 +4531,10 @@ impl SuperAi {
                         crate::map::entities::EntityCategory::Unit
                             | crate::map::entities::EntityCategory::Infantry
                     )
-                    && roster.contains(&sim.interner.resolve(entity.type_ref()))
+                    && {
+                        let name = sim.interner.resolve(entity.type_ref());
+                        roster.contains(&name) || Self::is_naval_type(opening, name)
+                    }
                     && matches!(
                         entity.passive_acquire_mission(),
                         crate::sim::mission::MissionType::None
@@ -4598,6 +4742,51 @@ impl SuperAi {
     /// raiders out (their orders run separately), and the fortress out
     /// while its seats are open and boarding is in progress — the loading
     /// infantry have to reach it first.
+    /// Whether the type is one of the side's naval hulls — the combat
+    /// tables are land rosters, so the ships join the idle and standing
+    /// defense pools by name instead. The wave's zone gate keeps them out
+    /// of ground marches on its own (their water rows never connect to a
+    /// land aim), and the guard-post limb filters them back out: a ship
+    /// cannot hold a land ring.
+    fn is_naval_type(opening: &Opening, name: &str) -> bool {
+        name == opening.naval_ship || opening.naval_aa == Some(name)
+    }
+
+    /// The naval layer's production pick (Layer 2.7): the basic hull line
+    /// up to [`NAVAL_SHIP_QUOTA`], with the AA escort claiming one turn
+    /// once its extra prerequisite honestly passes `can_build` (the
+    /// country-lock lesson: the cameo's brightness knows nothing of
+    /// prerequisites). `None` rests the limb — no yard, quota met, or
+    /// nothing honestly buildable yet.
+    fn naval_pick(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+    ) -> Option<&'static str> {
+        let hulls = self.count_units_of_type(sim, opening.naval_ship);
+        if hulls >= NAVAL_SHIP_QUOTA {
+            return None;
+        }
+        if let Some(aa) = opening.naval_aa
+            && hulls >= 1
+            && self.count_units_of_type(sim, aa) < 1
+            && rules.object(aa).is_some_and(|ty| {
+                crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                    == crate::sim::production::CanBuild::Yes
+            })
+        {
+            return Some(aa);
+        }
+        rules
+            .object(opening.naval_ship)
+            .filter(|ty| {
+                crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                    == crate::sim::production::CanBuild::Yes
+            })
+            .map(|_| opening.naval_ship)
+    }
+
     fn standing_combat_units(
         &self,
         sim: &crate::sim::world::Simulation,
@@ -4614,8 +4803,11 @@ impl SuperAi {
                         crate::map::entities::EntityCategory::Unit
                             | crate::map::entities::EntityCategory::Infantry
                     )
-                    && roster.contains(&sim.interner.resolve(entity.type_ref()))
-                    && sim.interner.resolve(entity.type_ref()) != opening.hero
+                    && {
+                        let name = sim.interner.resolve(entity.type_ref());
+                        (roster.contains(&name) || Self::is_naval_type(opening, name))
+                            && name != opening.hero
+                    }
                     && !self.boarders.contains(id)
                     && !self.raiders.contains(id)
                     && !(Some(sim.interner.resolve(entity.type_ref())) == opening.fortress
