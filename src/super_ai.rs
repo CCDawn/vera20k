@@ -105,6 +105,51 @@ const WAVE_RETRY_TICKS: u32 = 300;
 /// neighborhood, so it runs paced, never per tick.
 const SURVEY_RETRY_TICKS: u32 = 300;
 
+/// Ticks between two broken-bridge surveys. The survey reads the map's
+/// bridge-repair huts and the hostile structures the breach cut off, so it
+/// runs paced, never per tick.
+const BRIDGE_SURVEY_TICKS: u32 = 200;
+
+/// Ticks before the repair limb may re-issue its capture order or its
+/// engineer commission: a dropped [`Command::CaptureBuilding`], or an
+/// engineer the queue has not produced yet, must not soak the one-command
+/// budget every tick the way an unpaced re-issue once starved the branches
+/// below.
+const BRIDGE_RETRY_TICKS: u32 = 150;
+
+/// The wallet bar the repair engineer's commission waits for: the commission
+/// rides the infantry queue like any unit, so it is only worth a slot while
+/// the base's growth is comfortably funded (the air wing's top-up guard, in
+/// miniature — a broke base expands, a rich one repairs).
+const BRIDGE_ENGINEER_CREDITS: i32 = 2000;
+
+/// The stock bridge-repair hut (retail `BridgeRepairHut=yes`; stock CABHUT
+/// is the only one, `object_type.rs`). Resolved through the interner at
+/// survey time like every other rules name: a map whose rules lack the type
+/// simply skips the limb.
+const BRIDGE_HUT_TYPE: &str = "CABHUT";
+
+/// The capture infantry that repairs a hut's bridge (retail ENGINEER).
+const BRIDGE_ENGINEER_TYPE: &str = "ENGINEER";
+
+/// Blocker shoves one opening MCV gets while it stands on the same cell:
+/// past the cap the site counts as failed and the stuck window below owns
+/// the MCV (observed: 582 shove orders across 145 units while one MCV stood
+/// at one cell from tick 4000 to 20772, never deploying).
+const SHOVE_ATTEMPTS: u32 = 5;
+
+/// Ticks an opening MCV may stand stuck on one cell, refused its deploy
+/// spot, before the site is abandoned: a reachable legal foundation is
+/// walked to once, or the MCV is latched dead for the deploy branch —
+/// anything but shoving forever.
+const MCV_STUCK_TICKS: u32 = 600;
+
+/// Cells an opening MCV must travel from its latched site before the
+/// per-foundation budgets (deploy attempts, shoves, the stuck window)
+/// re-arm: a cell of jiggle must not renew them (the old budget reset
+/// re-armed on any movement at all, which is how the shove loop spun).
+const MCV_RESITE_DISTANCE: u16 = 4;
+
 /// Every side's war factory type (retail `UIName`s): the structures a wave
 /// razes first to starve the enemy's reinforcements.
 const WAR_FACTORY_TYPES: [&str; 3] = ["GAWEAP", "NAWEAP", "YAWEAP"];
@@ -779,6 +824,32 @@ pub struct SuperAi {
     /// [`SPECIALIST_EVERY_VEHICLE`].
     vehicle_slots: u32,
     infantry_slots: u32,
+    /// The tick the next broken-bridge survey may run; see
+    /// [`BRIDGE_SURVEY_TICKS`]. Pinned state, never read from the runtime.
+    bridge_survey_due: u32,
+    /// The latched bridge-repair hut worth an engineer. Pinned state, never
+    /// read from the runtime.
+    bridge_hut: Option<u64>,
+    /// The engineer walking to the latched hut. Pinned state, never read
+    /// from the runtime.
+    bridge_engineer: Option<u64>,
+    /// The tick the repair limb's next dispatch or commission may issue;
+    /// see [`BRIDGE_RETRY_TICKS`]. Pinned state, never read from the runtime.
+    bridge_retry_due: u32,
+    /// Blocker shoves spent per opening MCV, keyed by entity id, each
+    /// budget keyed to the latched cell it was spent at; see
+    /// [`SHOVE_ATTEMPTS`]. Pinned state, never read from the runtime.
+    shove_attempts: std::collections::HashMap<u64, u32>,
+    /// The cell each MCV's shove budget is keyed to; see
+    /// [`Self::shove_attempts`]. Pinned state, never read from the runtime.
+    shove_origin: std::collections::HashMap<u64, (u16, u16)>,
+    /// The cell and tick each opening MCV was last seen standing still at;
+    /// see [`MCV_STUCK_TICKS`]. Pinned state, never read from the runtime.
+    mcv_stuck_since: std::collections::HashMap<u64, ((u16, u16), u32)>,
+    /// Opening MCVs whose site was abandoned (no reachable foundation and
+    /// the shove budget spent): the deploy branch draws them no more
+    /// orders. Pinned state, never read from the runtime.
+    mcv_abandoned: std::collections::HashMap<u64, ()>,
 }
 
 impl SuperAi {
@@ -814,6 +885,14 @@ impl SuperAi {
             rally_gate: std::collections::HashMap::new(),
             vehicle_slots: 0,
             infantry_slots: 0,
+            bridge_survey_due: 0,
+            bridge_hut: None,
+            bridge_engineer: None,
+            bridge_retry_due: 0,
+            shove_attempts: std::collections::HashMap::new(),
+            shove_origin: std::collections::HashMap::new(),
+            mcv_stuck_since: std::collections::HashMap::new(),
+            mcv_abandoned: std::collections::HashMap::new(),
         }
     }
 
@@ -865,6 +944,7 @@ impl SuperAi {
         // landed (observed: 42000 ticks of empty orders, the MCV standing
         // until the enemy found it).
         if let Some(mcv) = self.deployable_mcv(sim, rules)
+            && !self.mcv_abandoned.contains_key(&mcv)
             && let Some(entity) = sim.substrate.entities.get(mcv)
             && let Some(yard_name) = rules
                 .object(sim.interner.resolve(entity.type_ref()))
@@ -924,23 +1004,43 @@ impl SuperAi {
                 && let Some(unit) = blocker
                 && self.order_gate.get(&unit).is_none_or(|&due| tick >= due)
             {
-                self.gate_idle_order(unit, tick);
-                return vec![CommandEnvelope::new(
-                    self.house,
-                    at,
-                    Command::Move {
-                        entity_id: unit,
-                        target_rx: (mx + 6).max(1) as u16,
-                        target_ry: my.max(1) as u16,
-                    },
-                )];
+                // The shove budget is keyed to the MCV's own latched cell:
+                // churn among the blockers must not renew it (observed: the
+                // shove loop re-armed forever while the MCV stood still, 582
+                // orders across 145 shoved units in one game).
+                let here = (entity.position.rx(), entity.position.ry());
+                if self.shove_origin.get(&mcv) != Some(&here) {
+                    self.shove_origin.insert(mcv, here);
+                    self.shove_attempts.insert(mcv, 0);
+                }
+                let attempts = self.shove_attempts.entry(mcv).or_insert(0);
+                if *attempts < SHOVE_ATTEMPTS {
+                    *attempts += 1;
+                    self.gate_idle_order(unit, tick);
+                    return vec![CommandEnvelope::new(
+                        self.house,
+                        at,
+                        Command::Move {
+                            entity_id: unit,
+                            target_rx: (mx + 6).max(1) as u16,
+                            target_ry: my.max(1) as u16,
+                        },
+                    )];
+                }
+                // The budget is spent at this cell — and the shove target
+                // itself may be the problem, a blocker the zone grid cannot
+                // connect to (mx+6,my) nulls its walk and jams back. Fall
+                // through to the stuck window below; no more shoves here.
             }
             if !clear && blocker.is_none() {
                 // The ground itself refuses this start: walk the MCV to
                 // the nearest foundation the placement test admits (its
                 // rings skip every origin the standing MCV itself would
                 // block) and deploy from its center on arrival. A walking
-                // MCV is not idle and draws no order until it stops.
+                // MCV is not idle and draws no order until it stops. The
+                // walk is a deliberate re-site, so the per-foundation
+                // budgets re-arm here — a foundation the ring one cell
+                // over never crosses the resite distance.
                 if let Some((ox, oy)) = find_site_around(
                     sim,
                     rules,
@@ -949,6 +1049,9 @@ impl SuperAi {
                     (mx, my),
                     self.house,
                 ) {
+                    self.deploy_attempts = 0;
+                    self.shove_attempts.remove(&mcv);
+                    self.shove_origin.remove(&mcv);
                     return vec![CommandEnvelope::new(
                         self.house,
                         at,
@@ -972,6 +1075,53 @@ impl SuperAi {
                     Command::DeployMcv { entity_id: mcv },
                 )];
             }
+            // The stuck window: an MCV that has stood on one cell for
+            // [`MCV_STUCK_TICKS`] and is still refused its deploy spot is
+            // not going to deploy here. A reachable legal foundation is
+            // walked to once (the zone gate keeps the walk from aiming
+            // across a breach); none at all abandons the site — this MCV
+            // draws no more orders from the branch, instead of shoving
+            // forever. A real re-site (below) re-arms everything.
+            if !clear {
+                let here = (entity.position.rx(), entity.position.ry());
+                let stuck = self.mcv_stuck_since.entry(mcv).or_insert((here, tick));
+                if stuck.0 != here {
+                    *stuck = (here, tick);
+                } else if tick >= stuck.1 + MCV_STUCK_TICKS {
+                    let resite = find_site_around(
+                        sim,
+                        rules,
+                        &runtime.resources.overlay_registry,
+                        yard_ty,
+                        (mx, my),
+                        self.house,
+                    )
+                    .filter(|&(ox, oy)| {
+                        zones_connected(
+                            sim,
+                            crate::rules::locomotor_type::MovementZone::Normal,
+                            here,
+                            (ox + 1, oy + 1),
+                        )
+                    });
+                    if let Some((ox, oy)) = resite {
+                        self.mcv_stuck_since.insert(mcv, ((ox + 1, oy + 1), tick));
+                        self.deploy_attempts = 0;
+                        self.shove_attempts.remove(&mcv);
+                        self.shove_origin.remove(&mcv);
+                        return vec![CommandEnvelope::new(
+                            self.house,
+                            at,
+                            Command::Move {
+                                entity_id: mcv,
+                                target_rx: ox + 1,
+                                target_ry: oy + 1,
+                            },
+                        )];
+                    }
+                    self.mcv_abandoned.insert(mcv, ());
+                }
+            }
             // Fork: attempts spent or pacing between them, the MCV waits —
             // it must not starve every branch below. Returning empty here
             // froze the whole game when a second AMCV appeared mid-run and
@@ -981,15 +1131,31 @@ impl SuperAi {
             // opening this fall-through is inert — no yard, no factories,
             // nothing ready: every branch below has nothing to issue.
         }
-        // A walked MCV re-arms the deploy budget: the attempts are spent
-        // per foundation, and transient refusals while the clearing Moves
-        // were still walking must not spend the whole game's five.
+        // A walked MCV re-arms the per-foundation budgets: the deploy
+        // attempts, the shove budget and the stuck window are spent per
+        // site, and transient refusals while the clearing Moves were still
+        // walking must not spend the whole game's five. The re-arm is keyed
+        // to a real re-site — [`MCV_RESITE_DISTANCE`] from the latched one —
+        // not to any movement at all: a jiggle of one cell must not renew
+        // the budgets the way it renewed the shove loop (observed).
         if let Some(mcv) = self.deployable_mcv(sim, rules)
             && let Some(entity) = sim.substrate.entities.get(mcv)
-            && self.deploy_origin != Some((entity.position.rx(), entity.position.ry()))
         {
-            self.deploy_origin = Some((entity.position.rx(), entity.position.ry()));
-            self.deploy_attempts = 0;
+            let here = (entity.position.rx(), entity.position.ry());
+            let resited = match self.deploy_origin {
+                Some((ox, oy)) => {
+                    ox.abs_diff(here.0).max(oy.abs_diff(here.1)) >= MCV_RESITE_DISTANCE
+                }
+                None => true,
+            };
+            if resited {
+                self.deploy_origin = Some(here);
+                self.deploy_attempts = 0;
+                self.shove_attempts.remove(&mcv);
+                self.shove_origin.remove(&mcv);
+                self.mcv_stuck_since.remove(&mcv);
+                self.mcv_abandoned.remove(&mcv);
+            }
         }
         // Everything below the deploy speaks through the side's opening,
         // which resolves through the standing yard — the branch above is
@@ -1187,6 +1353,20 @@ impl SuperAi {
             )];
         }
 
+        // The broken-bridge limb. A breach the zone grid already knows about
+        // cuts the base off from every hostile structure beyond it, and the
+        // old ungated waves walked into it one dead Move at a time (observed:
+        // 582 unreachable orders at one bridgehead across 16000 ticks). The
+        // limb's halves both live in [`Self::bridge_repair_orders`], paced so
+        // they never soak the one-command budget: a survey latches a hut
+        // worth repairing, and the dispatch sends an idle engineer with the
+        // engine's own capture click — the repair runs before the capture
+        // checks and rebuilds the span synchronously, republishing the zones
+        // and reopening the wave targets the gates below hold shut.
+        if let Some(command) = self.bridge_repair_orders(sim, rules, opening, tick) {
+            return vec![CommandEnvelope::new(self.house, at, command)];
+        }
+
         // Home defense and the offensive. Idle combat units first engage the
         // nearest intruder inside the base perimeter. Otherwise the offense
         // moves in waves: once `ATTACK_WAVE_SIZE` units stand gathered (idle
@@ -1233,84 +1413,130 @@ impl SuperAi {
                 // `launched` list bounds the episode: a dispatch the command
                 // layer drops (its unit stays standing) is never re-ordered
                 // within the episode, so the branch cannot spin on it and
-                // starve the branches below.
-                let next = standing
-                    .iter()
-                    .find(|&&unit| !self.launched.contains(&unit))
-                    .copied();
-                match next {
-                    Some(unit) if standing.len() > GUARD_RESERVE => {
-                        self.launched.push(unit);
-                        // Each unit attack-moves on one enemy structure's own
-                        // cell, cycled by unit id — the wave fans out over the
-                        // target base instead of converging on one cell, and a
-                        // live building's cell is always reachable-adjacent,
-                        // unlike a centroid plus offset, which can land on
-                        // impassable ground. With no structure left the wave
-                        // falls back to the hostile mobiles' centroid.
+                // starve the branches below. A destination is also gated on
+                // the zone grid before any order rides out: from the unit's
+                // own cell the wave tries the enemy structures in the unit's
+                // rotation order (then, without structures, the fallback
+                // offsets in the same rotation) and takes the first the
+                // ground rows connect. A target across a collapsed bridge is
+                // passed over — the sim would null the walk at the breach,
+                // the unit would idle there, and the next episode would
+                // re-order the same unreachable cell every retry (observed:
+                // 582 dead Moves at one broken bridge) — and an episode
+                // whose every un-launched unit is cut off simply ends here
+                // instead of marching to the water's edge.
+                let mut dispatch: Option<(u64, (u16, u16))> = None;
+                if standing.len() > GUARD_RESERVE {
+                    for unit in standing
+                        .iter()
+                        .copied()
+                        .filter(|unit| !self.launched.contains(unit))
+                    {
+                        let Some(entity) = sim.substrate.entities.get(unit) else {
+                            continue;
+                        };
+                        let from = (entity.position.rx(), entity.position.ry());
+                        let movement_zone = rules
+                            .object(sim.interner.resolve(entity.type_ref()))
+                            .map(|ty| ty.movement_zone)
+                            .unwrap_or_default();
                         let destination = if enemy_targets.is_empty() {
-                            enemy_center.map(|center| {
-                                let spread = SPREAD_OFFSETS[(unit as usize) % SPREAD_OFFSETS.len()];
-                                on_map_cell(
-                                    sim,
-                                    (
-                                        center.0 + i16::from(spread.0),
-                                        center.1 + i16::from(spread.1),
-                                    ),
-                                    center,
-                                )
+                            enemy_center.and_then(|center| {
+                                (0..SPREAD_OFFSETS.len())
+                                    .map(|index| {
+                                        (unit as usize + index) % SPREAD_OFFSETS.len()
+                                    })
+                                    .find_map(|index| {
+                                        let spread = SPREAD_OFFSETS[index];
+                                        let cell = on_map_cell(
+                                            sim,
+                                            (
+                                                center.0 + i16::from(spread.0),
+                                                center.1 + i16::from(spread.1),
+                                            ),
+                                            center,
+                                        );
+                                        zones_connected(sim, movement_zone, from, cell)
+                                            .then_some(cell)
+                                    })
                             })
                         } else {
-                            enemy_targets
-                                .get(unit as usize % enemy_targets.len())
-                                .map(|&(_, cell)| (cell.0 as u16, cell.1 as u16))
+                            (0..enemy_targets.len())
+                                .map(|attempt| {
+                                    enemy_targets[(unit as usize + attempt) % enemy_targets.len()]
+                                })
+                                .find_map(|(_, cell)| {
+                                    let cell = (cell.0 as u16, cell.1 as u16);
+                                    zones_connected(sim, movement_zone, from, cell).then_some(cell)
+                                })
                         };
-                        if let Some((rx, ry)) = destination {
-                            return vec![CommandEnvelope::new(
-                                self.house,
-                                at,
-                                Command::AttackMove {
-                                    entity_id: unit,
-                                    target: None,
-                                    destination: Some(crate::sim::combat::TargetKind::Cell(rx, ry)),
-                                },
-                            )];
+                        if let Some(cell) = destination {
+                            dispatch = Some((unit, cell));
+                            break;
                         }
-                        self.wave_launching = false;
-                        self.next_wave_tick = tick + WAVE_RETRY_TICKS;
-                    }
-                    _ => {
-                        // The reserve is home (a full pulse) or every standing
-                        // unit was already dispatched (dropped orders): end
-                        // the episode and let production fill the next one.
-                        self.wave_launching = false;
-                        self.next_wave_tick = tick + WAVE_RETRY_TICKS;
                     }
                 }
+                if let Some((unit, (rx, ry))) = dispatch {
+                    self.launched.push(unit);
+                    return vec![CommandEnvelope::new(
+                        self.house,
+                        at,
+                        Command::AttackMove {
+                            entity_id: unit,
+                            target: None,
+                            destination: Some(crate::sim::combat::TargetKind::Cell(rx, ry)),
+                        },
+                    )];
+                }
+                // The reserve is home, every standing unit was already
+                // dispatched (dropped orders), or no un-launched unit has a
+                // destination the zone grid still connects: end the episode
+                // and let production fill the next one — the units held back
+                // are not spent, so a repaired span re-opens them.
+                self.wave_launching = false;
+                self.next_wave_tick = tick + WAVE_RETRY_TICKS;
             }
             if let Some(unit) = self.due_idle_unit(&idle, tick) {
-                self.gate_idle_order(unit, tick);
                 // Spread the guard posts on a ring around the yard by unit
                 // id: defenders hold neighboring cells instead of stacking
                 // on the yard itself. Clamped onto the map for the same
-                // reason as the wave destination.
-                let spread = SPREAD_OFFSETS[(unit as usize) % SPREAD_OFFSETS.len()];
-                let post = on_map_cell(
-                    sim,
-                    (
-                        center.0 + i16::from(spread.0),
-                        center.1 + i16::from(spread.1),
-                    ),
-                    center,
-                );
-                return vec![CommandEnvelope::new(
-                    self.house,
-                    at,
-                    Command::Guard {
-                        entity_id: unit,
-                        target: Some(crate::sim::combat::TargetKind::Cell(post.0, post.1)),
-                    },
-                )];
+                // reason as the wave destination, and zone-gated in the
+                // unit's own rotation order like the wave: a post across a
+                // breach is not a post, and no connected offset at all
+                // spends only the unit's idle window (the order gate below
+                // paces the retry) instead of marching it into the water.
+                let post = sim.substrate.entities.get(unit).and_then(|entity| {
+                    let from = (entity.position.rx(), entity.position.ry());
+                    let movement_zone = rules
+                        .object(sim.interner.resolve(entity.type_ref()))
+                        .map(|ty| ty.movement_zone)
+                        .unwrap_or_default();
+                    (0..SPREAD_OFFSETS.len())
+                        .map(|index| (unit as usize + index) % SPREAD_OFFSETS.len())
+                        .find_map(|index| {
+                            let spread = SPREAD_OFFSETS[index];
+                            let cell = on_map_cell(
+                                sim,
+                                (
+                                    center.0 + i16::from(spread.0),
+                                    center.1 + i16::from(spread.1),
+                                ),
+                                center,
+                            );
+                            zones_connected(sim, movement_zone, from, cell).then_some(cell)
+                        })
+                });
+                self.gate_idle_order(unit, tick);
+                if let Some((px, py)) = post {
+                    return vec![CommandEnvelope::new(
+                        self.house,
+                        at,
+                        Command::Guard {
+                            entity_id: unit,
+                            target: Some(crate::sim::combat::TargetKind::Cell(px, py)),
+                        },
+                    )];
+                }
             }
         }
 
@@ -1511,7 +1737,20 @@ impl SuperAi {
                                 EXPANSION_MIN_DISTANCE,
                             )
                         })
-                        .map(|(ox, oy)| (ox + 1, oy + 1));
+                        .map(|(ox, oy)| (ox + 1, oy + 1))
+                        // The walk aim must sit in ground the zone grid
+                        // connects to home: a legal foundation across a
+                        // breach is a death walk the sim nulls at the water
+                        // (the same class the wave gate holds back). A
+                        // filtered-out aim drops into the re-survey below.
+                        .filter(|&(ax, ay)| {
+                            zones_connected(
+                                sim,
+                                crate::rules::locomotor_type::MovementZone::Normal,
+                                (home.0.max(0) as u16, home.1.max(0) as u16),
+                                (ax, ay),
+                            )
+                        });
                 }
                 let Some((tx, tyy)) = self.expansion_deploy_target else {
                     self.expansion2_site = None;
@@ -2424,10 +2663,191 @@ impl SuperAi {
                     EXPANSION_MIN_DISTANCE,
                 )
                 .is_some()
+                    // The field itself must sit in ground the zone grid
+                    // connects to home: a richer field across a breach
+                    // starves behind water no miner crosses.
+                    && zones_connected(
+                        sim,
+                        crate::rules::locomotor_type::MovementZone::Normal,
+                        (from.0.max(0) as u16, from.1.max(0) as u16),
+                        (*rx, *ry),
+                    )
             }),
             None => candidates.first(),
         };
         pick.map(|(cell, _)| *cell)
+    }
+
+    /// The broken-bridge limb's per-tick step; see the call site in
+    /// [`Self::orders`] for the shape. `None` — nothing to issue this tick.
+    ///
+    /// A paced survey ([`BRIDGE_SURVEY_TICKS`]) latches one hut worth an
+    /// engineer: a hostile structure must stand cut off from home (if the
+    /// zone grid still connects everything, the breach costs nothing), the
+    /// hut must want repair ([`crate::sim::world::bridge_orchestrator::
+    /// bridge_hut_can_repair`]), and the hut must itself sit on the home
+    /// side of the breach — an engineer that cannot walk there repairs
+    /// nothing. The dispatch half then sends an idle engineer with the
+    /// engine's own capture click; the engine walks it in, runs the repair
+    /// before the capture checks and consumes the engineer, which clears
+    /// the tracker below and lets a future breach re-arm the limb.
+    fn bridge_repair_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        tick: u32,
+    ) -> Option<Command> {
+        // Forget a consumed or lost engineer. The engine consumes the
+        // engineer on hut entry, so a successful repair clears the tracker
+        // here; a killed one stops the re-issues until the next survey.
+        if let Some(engineer) = self.bridge_engineer
+            && !sim.substrate.entities.get(engineer).is_some_and(|entity| {
+                entity.owner() == self.house && entity.lifecycle.object_alive()
+            })
+        {
+            self.bridge_engineer = None;
+        }
+
+        if tick >= self.bridge_survey_due {
+            self.bridge_survey_due = tick + BRIDGE_SURVEY_TICKS;
+            self.bridge_hut = None;
+            let Some(home) = self.structure_center(sim, opening.construction_yard) else {
+                return None;
+            };
+            let home_cell = (home.0.max(0) as u16, home.1.max(0) as u16);
+            let cut_off = |cell: (u16, u16)| {
+                !zones_connected(
+                    sim,
+                    crate::rules::locomotor_type::MovementZone::Normal,
+                    home_cell,
+                    cell,
+                )
+            };
+            // Worthiness: some hostile structure is unreachable from home.
+            let enemy_cut_off = sim.substrate.entities.iter_sorted().any(|(_, entity)| {
+                entity.category() == crate::map::entities::EntityCategory::Structure
+                    && !entity.lifecycle.in_limbo()
+                    && self.is_enemy(sim, entity.owner())
+                    && cut_off((entity.position.rx(), entity.position.ry()))
+            });
+            // The hut may be the map's neutral prop, so the scan is not
+            // owner-filtered; the type resolves through the interner like
+            // every other rules name (a rules set without it skips the limb).
+            if enemy_cut_off {
+                let hut = sim.substrate.entities.iter_sorted().find(|(_, entity)| {
+                    entity.category() == crate::map::entities::EntityCategory::Structure
+                        && sim.interner.resolve(entity.type_ref()) == BRIDGE_HUT_TYPE
+                        && entity.lifecycle.object_alive()
+                        && crate::sim::world::bridge_orchestrator::bridge_hut_can_repair(
+                            sim,
+                            (entity.position.rx(), entity.position.ry()),
+                        )
+                        && !cut_off((entity.position.rx(), entity.position.ry()))
+                });
+                self.bridge_hut = hut.map(|(id, _)| id);
+            }
+        }
+
+        // The dispatch half. The latched hut must still want repair — a span
+        // already rebuilt (by this engineer or another house's) stops here.
+        let hut = self.bridge_hut?;
+        let Some(hut_entity) = sim.substrate.entities.get(hut) else {
+            self.bridge_hut = None;
+            return None;
+        };
+        let hut_cell = (hut_entity.position.rx(), hut_entity.position.ry());
+        if !crate::sim::world::bridge_orchestrator::bridge_hut_can_repair(sim, hut_cell) {
+            self.bridge_hut = None;
+            return None;
+        }
+        // A walking engineer is in flight and not re-ordered; one whose order
+        // the command layer dropped (idle again) is re-pointed after the
+        // retry window, never per tick.
+        if tick < self.bridge_retry_due
+            || self.bridge_engineer.is_some_and(|engineer| {
+                sim.substrate.entities.get(engineer).is_some_and(|entity| {
+                    !matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    )
+                })
+            })
+        {
+            return None;
+        }
+        if let Some((engineer, _)) = sim.substrate.entities.iter_sorted().find(|(id, entity)| {
+            entity.owner() == self.house
+                && entity.category() == crate::map::entities::EntityCategory::Infantry
+                && sim.interner.resolve(entity.type_ref()) == BRIDGE_ENGINEER_TYPE
+                && entity.lifecycle.object_alive()
+                && self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                && matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                )
+        }) {
+            self.bridge_engineer = Some(engineer);
+            self.gate_idle_order(engineer, tick);
+            self.bridge_retry_due = tick + BRIDGE_RETRY_TICKS;
+            return Some(Command::CaptureBuilding {
+                engineer_id: engineer,
+                target_building_id: hut,
+            });
+        }
+        self.commission_repair_engineer(sim, rules, opening, tick)
+    }
+
+    /// Queue the one repair engineer through its own production queue when
+    /// none stands and none is on the line: only behind a barracks, a
+    /// buildable type and a comfortably fat wallet ([`BRIDGE_ENGINEER_
+    /// CREDITS`]), so the commission never wedges the growth ladder the way
+    /// a broke base's queue would (the air wing's top-up guard, in
+    /// miniature). The retry window paces it like any dispatch.
+    fn commission_repair_engineer(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        tick: u32,
+    ) -> Option<Command> {
+        if tick < self.bridge_retry_due
+            || self.count_structures_of_type(sim, opening.barracks) == 0
+            || sim.substrate.entities.iter_sorted().any(|(_, entity)| {
+                entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Infantry
+                    && sim.interner.resolve(entity.type_ref()) == BRIDGE_ENGINEER_TYPE
+                    && entity.lifecycle.object_alive()
+            })
+        {
+            return None;
+        }
+        let owner = sim.interner.resolve(self.house);
+        let queue = crate::sim::production::queue_view_for_owner(sim, rules, owner);
+        if queue
+            .iter()
+            .any(|item| sim.interner.resolve(item.type_id) == BRIDGE_ENGINEER_TYPE)
+        {
+            return None;
+        }
+        let Some(engineer_ty) = rules.object(BRIDGE_ENGINEER_TYPE) else {
+            return None;
+        };
+        if crate::sim::production::can_build(sim, rules, self.house, engineer_ty, false, false)
+            != crate::sim::production::CanBuild::Yes
+            || crate::sim::production::credits_for_owner(sim, owner) < BRIDGE_ENGINEER_CREDITS
+        {
+            return None;
+        }
+        let type_id = sim.interner.get(BRIDGE_ENGINEER_TYPE)?;
+        self.bridge_retry_due = tick + BRIDGE_RETRY_TICKS;
+        Some(Command::QueueProduction { type_id })
     }
 
     /// The house's structures as `(entity id, type name)` pairs, in the
@@ -2847,7 +3267,9 @@ impl SuperAi {
 
     /// The nearest hostile entity inside `BASE_DEFENSE_RADIUS` cells of
     /// `center`, ties broken by the substrate's stable order. Passive houses
-    /// (observers, civilians) and allies do not count as intruders.
+    /// (observers, civilians) and allies do not count as intruders. An
+    /// entity still held by its constructor sits in limbo at (0,0) by native
+    /// semantics, so it is not an intruder anywhere.
     fn nearest_intruder(
         &self,
         sim: &crate::sim::world::Simulation,
@@ -2856,7 +3278,7 @@ impl SuperAi {
         let limit = i32::from(BASE_DEFENSE_RADIUS) * i32::from(BASE_DEFENSE_RADIUS);
         let mut best: Option<(i32, u64)> = None;
         for (id, entity) in sim.substrate.entities.iter_sorted() {
-            if !self.is_enemy(sim, entity.owner()) {
+            if entity.lifecycle.in_limbo() || !self.is_enemy(sim, entity.owner()) {
                 continue;
             }
             let dx = i32::from(entity.position.rx() as i16 - center.0);
@@ -2878,7 +3300,10 @@ impl SuperAi {
     /// any hostile structure when no factory stands. Allies and passive
     /// houses never count as hostile. Wave dispatches cycle this list by unit
     /// id, so the group fans out over the target base; each destination is a
-    /// live building's own cell, which is always reachable-adjacent.
+    /// live building's own cell, which is always reachable-adjacent. An
+    /// entity still held by its constructor sits in limbo at (0,0) by native
+    /// semantics (`telemetry.rs`), so an under-construction factory is not a
+    /// (0,0) target — the replay's other half of the bridgehead jam.
     fn enemy_priority_targets(
         &self,
         sim: &crate::sim::world::Simulation,
@@ -2887,6 +3312,7 @@ impl SuperAi {
         let mut structures = Vec::new();
         for (id, entity) in sim.substrate.entities.iter_sorted() {
             if entity.category() != crate::map::entities::EntityCategory::Structure
+                || entity.lifecycle.in_limbo()
                 || !self.is_enemy(sim, entity.owner())
             {
                 continue;
@@ -2907,7 +3333,9 @@ impl SuperAi {
 
     /// The hostile mass center for the endgame fallback, when no hostile
     /// building stands: the centroid of their mobile forces. Sums over the
-    /// entity set, so the result does not depend on iteration order.
+    /// entity set, so the result does not depend on iteration order. Limbo
+    /// entities sit at (0,0) by native semantics and would drag the centroid
+    /// off-map, so constructor-held units stay out.
     fn enemy_center(&self, sim: &crate::sim::world::Simulation) -> Option<(i16, i16)> {
         let centroid = |want_structure: bool| -> Option<(i16, i16)> {
             let mut sum_x = 0i64;
@@ -2916,7 +3344,10 @@ impl SuperAi {
             for (_, entity) in sim.substrate.entities.iter_sorted() {
                 let is_structure =
                     entity.category() == crate::map::entities::EntityCategory::Structure;
-                if is_structure != want_structure || !self.is_enemy(sim, entity.owner()) {
+                if is_structure != want_structure
+                    || entity.lifecycle.in_limbo()
+                    || !self.is_enemy(sim, entity.owner())
+                {
                     continue;
                 }
                 sum_x += i64::from(entity.position.rx());
@@ -2962,6 +3393,36 @@ fn on_map_cell(
     let max_x = (terrain.width() as i16).saturating_sub(1);
     let max_y = (terrain.height() as i16).saturating_sub(1);
     (cell.0.clamp(0, max_x) as u16, cell.1.clamp(0, max_y) as u16)
+}
+
+/// Whether ground movement connects `from` to `to`: the native zone rows
+/// (`MapClass::GetZoneID @ 0x0056D230`, the query the sim's own team builder
+/// asks in `ai_team_creation`) resolve both cells under `movement_zone`'s raw
+/// row and compare — the O(1) read of "can a walker get there". Zone edges
+/// republish synchronously when a bridge collapses or an engineer rebuilds
+/// one, so this is the whole gate. Unavailable topology at either end is not
+/// a negative: the caller keeps its order rather than acting on an answer the
+/// map cannot give (the same fail-open the team builder's zone comparison
+/// takes with `None`).
+fn zones_connected(
+    sim: &crate::sim::world::Simulation,
+    movement_zone: crate::rules::locomotor_type::MovementZone,
+    from: (u16, u16),
+    to: (u16, u16),
+) -> bool {
+    let Some(zones) = sim.zone_grid.as_ref() else {
+        return true;
+    };
+    let Some(terrain) = sim.resolved_terrain.as_ref() else {
+        return true;
+    };
+    match (
+        zones.get_zone_id_native(terrain, from, movement_zone, false),
+        zones.get_zone_id_native(terrain, to, movement_zone, false),
+    ) {
+        (Some(from_zone), Some(to_zone)) => from_zone == to_zone,
+        _ => true,
+    }
 }
 
 /// The first legal placement origin for `ty`, scanning outward from `center`
@@ -4638,5 +5099,786 @@ mod tests {
             storm.is_none_or(|sw| !sw.is_active()),
             "the storm special is never granted while the toggle is off"
         );
+    }
+
+    // ---- broken-bridge gating and the engineer repair chain ----
+    //
+    // The retail Pacific scene the sim's own bridge witnesses use
+    // (`bridge_test_evidence`): an actual CABHUT beside an actual high
+    // bridge over water, so the zone rows really split at a real breach.
+
+    /// The Pacific bridge scene's fixed landmarks (the evidence's own
+    /// coordinates): the repair hut, the deck receiver the damage enters
+    /// at, and the shore cell the witnesses' engineer starts from.
+    const PACIFIC_HUT: (u16, u16) = (72, 93);
+    const PACIFIC_BRIDGE: (u16, u16) = (81, 95);
+    const PACIFIC_SHORE: (u16, u16) = (70, 95);
+
+    /// A loaded Pacific.mmx one-human Battle (no roaming units), the AI
+    /// house bound to the session's local house, and a hostile house at war
+    /// with it for the far-shore target.
+    fn pacific_bridge_battle() -> (
+        crate::headless_scenario::HeadlessScenario,
+        InternedId,
+        InternedId,
+    ) {
+        use crate::skirmish_launch::LaunchCountry;
+
+        let ra2 = std::path::PathBuf::from(
+            std::env::var("RA2_DIR").expect("set RA2_DIR to the retail RA2/YR install directory"),
+        );
+        let map = "Pacific.mmx";
+        let mut session = crate::headless_scenario::battle_session(map, &[]);
+        session.options.unit_count = 0;
+        let mut scenario =
+            crate::headless_scenario::load_session(&ra2, map, 0x0B21_D6E5, session).unwrap();
+        let ai = scenario
+            .sim()
+            .houses
+            .iter()
+            .find(|(_, house)| house.is_controlled_by_human(true))
+            .map(|(&id, _)| id)
+            .expect("the local house");
+        let enemy = scenario.add_human_house("WaveTargetHouse", LaunchCountry::Russia);
+        (scenario, ai, enemy)
+    }
+
+    /// Spawn `type_name` for `owner` at the first legal cell scanning a
+    /// small spiral outward from `at` (a spawn refuses occupied or illegal
+    /// ground), so the tests do not hard-code Pacific's clear cells.
+    fn spawn_near(
+        scenario: &mut crate::headless_scenario::HeadlessScenario,
+        type_name: &str,
+        owner: InternedId,
+        at: (u16, u16),
+    ) -> u64 {
+        let owner_name = scenario.sim().interner.resolve(owner).to_owned();
+        let runtime = &mut scenario.runtime;
+        for radius in 0..10i32 {
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    if dx.abs() != radius && dy.abs() != radius {
+                        continue;
+                    }
+                    let (x, y) = (i32::from(at.0) + dx, i32::from(at.1) + dy);
+                    if x < 0 || y < 0 {
+                        continue;
+                    }
+                    if let Some(id) = runtime.simulation.spawn_object_with_overlay_registry(
+                        type_name,
+                        &owner_name,
+                        x as u16,
+                        y as u16,
+                        0,
+                        &runtime.resources.rules,
+                        &runtime.resources.overlay_registry,
+                    ) {
+                        return id;
+                    }
+                }
+            }
+        }
+        panic!("no spawn cell for {type_name} near {at:?}");
+    }
+
+    /// Collapse the scene's high bridge the way the sim's own bridge
+    /// witnesses do: ordinary HE damage past the bridge strength at the
+    /// deck receiver until the structural facts clear.
+    fn collapse_pacific_bridge(
+        scenario: &mut crate::headless_scenario::HeadlessScenario,
+    ) {
+        use crate::sim::bridge_state::BridgeDamageEvent;
+
+        let runtime = &mut scenario.runtime;
+        let damage = runtime.resources.rules.bridge_rules.strength + 1;
+        let mut collapsed = false;
+        for _ in 0..8 {
+            let event = BridgeDamageEvent {
+                rx: PACIFIC_BRIDGE.0,
+                ry: PACIFIC_BRIDGE.1,
+                damage,
+                warhead_ref: runtime.simulation.intern("HE"),
+                impact_z_leptons: 624,
+                is_ion_cannon: false,
+            };
+            collapsed |= crate::sim::world::bridge_orchestrator::apply_bridge_damage_events_with_overlay_registry(
+                &mut runtime.simulation,
+                &runtime.resources.rules,
+                &[event],
+                Some(&runtime.resources.overlay_registry),
+                crate::sim::world::FrameEffects::default(),
+            );
+            if !runtime
+                .simulation
+                .resolved_terrain
+                .as_ref()
+                .unwrap()
+                .cell(PACIFIC_BRIDGE.0, PACIFIC_BRIDGE.1)
+                .unwrap()
+                .bridge_facts
+                .has_structural_bridge()
+            {
+                break;
+            }
+        }
+        assert!(
+            collapsed,
+            "the retail bridge must collapse under ordinary HE damage"
+        );
+        assert!(
+            !runtime
+                .simulation
+                .resolved_terrain
+                .as_ref()
+                .unwrap()
+                .cell(PACIFIC_BRIDGE.0, PACIFIC_BRIDGE.1)
+                .unwrap()
+                .bridge_facts
+                .has_structural_bridge()
+        );
+    }
+
+    /// The engine's own Normal-row zone id for `cell` — the oracle the
+    /// gating assertions read (the helper under test wraps exactly this
+    /// query, so the oracle stays the sim's, not the wrapper's).
+    fn ground_zone(
+        scenario: &crate::headless_scenario::HeadlessScenario,
+        cell: (u16, u16),
+    ) -> u32 {
+        let sim = scenario.sim();
+        sim.zone_grid
+            .as_ref()
+            .expect("the retail map's zone grid")
+            .get_zone_id_native(
+                sim.resolved_terrain.as_ref().expect("map terrain"),
+                cell,
+                crate::rules::locomotor_type::MovementZone::Normal,
+                false,
+            )
+            .expect("the retail map's zone topology")
+    }
+
+    /// The map CABHUT entity nearest the evidence's hut coordinate, with
+    /// its cell.
+    fn pacific_hut(
+        scenario: &crate::headless_scenario::HeadlessScenario,
+    ) -> (u64, (u16, u16)) {
+        scenario
+            .sim()
+            .substrate
+            .entities
+            .iter_sorted()
+            .find(|(_, entity)| {
+                scenario.sim().interner.resolve(entity.type_ref()) == super::BRIDGE_HUT_TYPE
+            })
+            .map(|(id, entity)| {
+                (
+                    id,
+                    (entity.position.rx(), entity.position.ry()),
+                )
+            })
+            .expect("the retail map's bridge repair hut")
+    }
+
+    /// The loaded span's ground endpoints: the zone grid's own bridge
+    /// record whose endpoints sit nearest the evidence's deck receiver.
+    fn span_endpoints(
+        scenario: &crate::headless_scenario::HeadlessScenario,
+    ) -> ((u16, u16), (u16, u16)) {
+        let record = scenario
+            .sim()
+            .zone_grid
+            .as_ref()
+            .expect("the retail map's zone grid")
+            .bridge_records()
+            .iter()
+            .copied()
+            .min_by_key(|record| {
+                chebyshev(record.endpoint_a, PACIFIC_BRIDGE)
+                    .min(chebyshev(record.endpoint_b, PACIFIC_BRIDGE))
+            })
+            .expect("the retail span's bridge record");
+        (record.endpoint_a, record.endpoint_b)
+    }
+
+    /// The far-shore span end: the endpoint further from the witnesses'
+    /// home-shore start.
+    fn far_shore(scenario: &crate::headless_scenario::HeadlessScenario) -> (u16, u16) {
+        let (a, b) = span_endpoints(scenario);
+        if chebyshev(a, PACIFIC_SHORE) > chebyshev(b, PACIFIC_SHORE) {
+            a
+        } else {
+            b
+        }
+    }
+
+    /// The broken-bridge gate at the wave dispatch: with the span intact a
+    /// gathered wave attack-moves onto the far-shore structure; after a
+    /// programmatic collapse the same wave arms, finds no connected target
+    /// in its whole rotation, and holds every unit home — no order lands in
+    /// the far zone. The internal `launched` list proves the episode really
+    /// armed and ended clean (it is cleared at arm and nothing re-enters).
+    #[test]
+    #[ignore = "slow; retail; loads a retail map with a real bridge"]
+    fn broken_bridge_gate_holds_the_wave_at_the_breach() {
+        let (mut scenario, ai_house, enemy_house) = pacific_bridge_battle();
+        let far = far_shore(&scenario);
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+        // Home base on the hut's shore, the hostile structure on the far
+        // shore, and a full wave's worth of standing tanks at home. An
+        // under-construction enemy war factory (constructor-held limbo,
+        // native-semantics position (0,0)) is also on the map: factories
+        // are the wave's prioritized class, so an unfiltered enumeration
+        // would aim the wave at the origin.
+        spawn_near(&mut scenario, "GACNST", ai_house, (64, 92));
+        spawn_near(&mut scenario, "GAPOWR", enemy_house, far);
+        {
+            let enemy_name = scenario.sim().interner.resolve(enemy_house).to_owned();
+            let runtime = &mut scenario.runtime;
+            runtime
+                .simulation
+                .spawn_object_limbo_at_height(
+                    "NAWEAP",
+                    &enemy_name,
+                    far.0,
+                    far.1,
+                    0,
+                    0,
+                    &runtime.resources.rules,
+                )
+                .expect("the under-construction factory");
+        }
+        for _ in 0..super::ATTACK_WAVE_SIZE + 1 {
+            spawn_near(&mut scenario, "MTNK", ai_house, (64, 94));
+        }
+        let far_target = far_target_cell(&scenario);
+
+        // Intact span: the wave launches across it. Every destination is
+        // the far structure's own cell — never the limbo factory's (0,0).
+        let mut intact_far_moves = 0;
+        for tick in 0..24u32 {
+            for order in ai.orders(&scenario.runtime, tick) {
+                if let crate::sim::command::Command::AttackMove {
+                    destination: Some(crate::sim::combat::TargetKind::Cell(rx, ry)),
+                    ..
+                } = order.payload
+                {
+                    assert_ne!(
+                        (rx, ry),
+                        (0, 0),
+                        "a constructor-held factory is not a target (tick {tick})"
+                    );
+                    assert_eq!(
+                        (rx, ry),
+                        far_target,
+                        "an intact span sends the wave at the far structure"
+                    );
+                    intact_far_moves += 1;
+                }
+            }
+        }
+        assert!(
+            intact_far_moves > 0,
+            "the wave must launch across the intact span (positive control)"
+        );
+        assert!(
+            !ai.launched.is_empty(),
+            "the intact-span episode dispatched its units"
+        );
+
+        collapse_pacific_bridge(&mut scenario);
+        let far_zone = ground_zone(&scenario, far_target);
+        assert_ne!(
+            far_zone,
+            ground_zone(&scenario, PACIFIC_SHORE),
+            "the breach must split the zone rows (setup oracle)"
+        );
+
+        // Broken span: several wave-retry windows' worth of ticks — long
+        // enough for the marched tanks to idle out at the breach and rejoin
+        // the standing set. No order of any kind may land in the cut-off
+        // zone, and an armed episode must end with nothing launched: the
+        // pinned `launched` list entered a call non-empty (the intact-span
+        // dispatches), the arm clears it, and no unreachable destination
+        // refills it — that one-tick transition is observable from outside.
+        let mut guard_posts = 0;
+        let mut armed_and_blocked = false;
+        for tick in 24..8 * super::WAVE_RETRY_TICKS {
+            let launched_before = !ai.launched.is_empty();
+            for order in ai.orders(&scenario.runtime, tick) {
+                let destination = match &order.payload {
+                    crate::sim::command::Command::AttackMove { destination, .. }
+                    | crate::sim::command::Command::Guard {
+                        target: destination,
+                        ..
+                    } => *destination,
+                    crate::sim::command::Command::Move {
+                        target_rx,
+                        target_ry,
+                        ..
+                    } => Some(crate::sim::combat::TargetKind::Cell(*target_rx, *target_ry)),
+                    _ => None,
+                };
+                if let Some(crate::sim::combat::TargetKind::Cell(rx, ry)) = destination {
+                    assert_ne!(
+                        (rx, ry),
+                        (0, 0),
+                        "no order may target the limbo origin (tick {tick})"
+                    );
+                    assert_ne!(
+                        ground_zone(&scenario, (rx, ry)),
+                        far_zone,
+                        "no order may land in the zone the breach cut off (tick {tick}, \
+                         order {:?} at ({rx},{ry}))",
+                        order.payload
+                    );
+                    if matches!(order.payload, crate::sim::command::Command::Guard { .. }) {
+                        guard_posts += 1;
+                    }
+                }
+            }
+            if launched_before && !ai.wave_launching && ai.launched.is_empty() {
+                armed_and_blocked = true;
+            }
+        }
+        assert!(
+            armed_and_blocked,
+            "the wave must re-arm after the breach and end with no dispatch"
+        );
+        assert_eq!(
+            ai.launched,
+            Vec::<u64>::new(),
+            "no unit may launch into the cut-off zone after the breach"
+        );
+        assert!(
+            guard_posts > 0,
+            "the held-back units must still take their home guard posts"
+        );
+    }
+
+    /// The far-shore structure's cell (the wave's one target).
+    fn far_target_cell(
+        scenario: &crate::headless_scenario::HeadlessScenario,
+    ) -> (u16, u16) {
+        scenario
+            .sim()
+            .substrate
+            .entities
+            .iter_sorted()
+            .find(|(_, entity)| {
+                entity.owner() != crate::sim::intern::InternedId::default()
+                    && entity.category() == crate::map::entities::EntityCategory::Structure
+                    && scenario.sim().interner.resolve(entity.type_ref()) == "GAPOWR"
+            })
+            .map(|(_, entity)| (entity.position.rx(), entity.position.ry()))
+            .expect("the far-shore hostile structure")
+    }
+
+    /// The full repair chain: after the breach the limb latches the hut and
+    /// sends the idle engineer with the engine's capture click; the walk
+    /// repairs the span (the hut stops wanting repair, the zone rows fuse
+    /// again), the consumed engineer clears the tracker, and the wave —
+    /// which held at the breach the whole walk — attack-moves onto the
+    /// far-shore structure again, with no re-issued capture in between.
+    #[test]
+    #[ignore = "slow; retail; loads a retail map and drives a real engineer walk"]
+    fn engineer_repairs_the_breach_and_the_wave_crosses() {
+        let (mut scenario, ai_house, enemy_house) = pacific_bridge_battle();
+        let far = far_shore(&scenario);
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+        spawn_near(&mut scenario, "GACNST", ai_house, (64, 92));
+        spawn_near(&mut scenario, "GAPOWR", enemy_house, far);
+        for _ in 0..super::ATTACK_WAVE_SIZE + 1 {
+            spawn_near(&mut scenario, "MTNK", ai_house, (64, 94));
+        }
+        collapse_pacific_bridge(&mut scenario);
+        let engineer = spawn_near(&mut scenario, "ENGINEER", ai_house, PACIFIC_SHORE);
+        let (hut_id, hut_cell) = pacific_hut(&scenario);
+        assert!(
+            crate::sim::world::bridge_orchestrator::bridge_hut_can_repair(
+                scenario.sim(),
+                hut_cell
+            ),
+            "setup: the collapsed span wants repair"
+        );
+
+        // The limb's first survey runs on the first tick: the capture order
+        // is due within a handful of ticks, addressed to our engineer at
+        // the map's own hut.
+        let mut capture = None;
+        for tick in 0..10u32 {
+            for order in ai.orders(&scenario.runtime, tick) {
+                if let crate::sim::command::Command::CaptureBuilding {
+                    engineer_id,
+                    target_building_id,
+                } = order.payload
+                {
+                    capture = Some((engineer_id, target_building_id));
+                }
+            }
+        }
+        assert_eq!(
+            capture,
+            Some((engineer, hut_id)),
+            "the limb must send the idle engineer to the broken hut (tracker {:?})",
+            ai.bridge_hut
+        );
+
+        // Drive the real walk: the engineer enters the hut, the repair runs
+        // and republishes. The budget mirrors the sim witnesses' own walk
+        // bound with headroom.
+        let mut repaired = false;
+        for tick in 10..4000u32 {
+            let orders = ai.orders(&scenario.runtime, tick);
+            scenario
+                .runtime
+                .advance_frame(
+                    &orders,
+                    crate::headless_scenario::SIM_TICK_MS,
+                    crate::sim::world::TickLane::Ordinary,
+                    crate::sim::world::FrameEffects::default(),
+                )
+                .expect("simulation frame failed");
+            if !crate::sim::world::bridge_orchestrator::bridge_hut_can_repair(
+                scenario.sim(),
+                hut_cell,
+            ) {
+                repaired = true;
+                break;
+            }
+        }
+        assert!(
+            repaired,
+            "the dispatched engineer must rebuild the span within the budget"
+        );
+        assert_eq!(
+            ground_zone(&scenario, far_target_cell(&scenario)),
+            ground_zone(&scenario, PACIFIC_SHORE),
+            "the repair must fuse the zone rows again"
+        );
+        assert!(
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .get(engineer)
+                .is_none_or(|entity| !entity.lifecycle.object_alive()),
+            "the engine consumes the engineer on hut entry"
+        );
+
+        // With the span back the held wave crosses: the next episode sends
+        // attack-moves at the far structure, and the repair limb stays
+        // quiet — no re-issued capture, the tracker cleared with the
+        // consumed engineer.
+        let mut far_moves = 0;
+        let mut recaptures = 0;
+        for tick in 4001..4001 + 3 * super::WAVE_RETRY_TICKS {
+            for order in ai.orders(&scenario.runtime, tick) {
+                match order.payload {
+                    crate::sim::command::Command::CaptureBuilding { .. } => recaptures += 1,
+                    crate::sim::command::Command::AttackMove {
+                        destination: Some(crate::sim::combat::TargetKind::Cell(rx, ry)),
+                        ..
+                    } => {
+                        assert_eq!(
+                            ground_zone(&scenario, (rx, ry)),
+                            ground_zone(&scenario, far_target_cell(&scenario)),
+                            "the resumed wave crosses to the far zone"
+                        );
+                        far_moves += 1;
+                    }
+                    _ => {}
+                }
+            }
+            if far_moves > 0 {
+                break;
+            }
+        }
+        assert!(
+            far_moves > 0,
+            "the wave must resume onto the far structure once the span stands"
+        );
+        assert_eq!(
+            recaptures, 0,
+            "a standing span must not re-arm the repair limb"
+        );
+    }
+
+    /// The helper's two answers on the real map: an intact span connects
+    /// the two shores under the ground rows, the collapse cuts them, and
+    /// the home shore itself stays connected throughout.
+    #[test]
+    #[ignore = "slow; retail; loads a retail map with a real bridge"]
+    fn zones_connected_tracks_the_bridge_span() {
+        let (mut scenario, _ai, _enemy) = pacific_bridge_battle();
+        let home = PACIFIC_SHORE;
+
+        // The far shore: the loaded span's own records name its two ground
+        // endpoints; the one further from home is the far side.
+        let record = scenario
+            .sim()
+            .zone_grid
+            .as_ref()
+            .expect("zone grid")
+            .bridge_records()
+            .iter()
+            .min_by_key(|record| {
+                std::cmp::min(
+                    chebyshev(record.endpoint_a, PACIFIC_BRIDGE),
+                    chebyshev(record.endpoint_b, PACIFIC_BRIDGE),
+                )
+            })
+            .copied()
+            .expect("the retail span's bridge record");
+        let far = if chebyshev(record.endpoint_a, home) > chebyshev(record.endpoint_b, home) {
+            record.endpoint_a
+        } else {
+            record.endpoint_b
+        };
+
+        assert!(
+            super::zones_connected(
+                scenario.sim(),
+                crate::rules::locomotor_type::MovementZone::Normal,
+                home,
+                far,
+            ),
+            "an intact span connects the shores"
+        );
+        assert!(
+            super::zones_connected(
+                scenario.sim(),
+                crate::rules::locomotor_type::MovementZone::Normal,
+                home,
+                PACIFIC_HUT,
+            ),
+            "the hut sits on the home shore"
+        );
+
+        collapse_pacific_bridge(&mut scenario);
+        {
+            let sim = scenario.sim();
+            for record in sim.zone_grid.as_ref().unwrap().bridge_records() {
+                eprintln!(
+                    "PROBE record a={:?} b={:?} active={} high={}",
+                    record.endpoint_a,
+                    record.endpoint_b,
+                    record.active,
+                    record.is_high()
+                );
+            }
+            for y in [70u16, 95, 120] {
+                let mut row = String::new();
+                for x in (60..126).step_by(4) {
+                    let zone = sim
+                        .zone_grid
+                        .as_ref()
+                        .unwrap()
+                        .get_zone_id_native(
+                            sim.resolved_terrain.as_ref().unwrap(),
+                            (x, y),
+                            crate::rules::locomotor_type::MovementZone::Normal,
+                            false,
+                        );
+                    row.push_str(&format!("{x}:{:?} ", zone));
+                }
+                eprintln!("PROBE y={y} {row}");
+            }
+        }
+        assert!(
+            !super::zones_connected(
+                scenario.sim(),
+                crate::rules::locomotor_type::MovementZone::Normal,
+                home,
+                far,
+            ),
+            "the breach must cut the shores"
+        );
+        assert!(
+            super::zones_connected(
+                scenario.sim(),
+                crate::rules::locomotor_type::MovementZone::Normal,
+                home,
+                PACIFIC_HUT,
+            ),
+            "the home shore stays connected behind the breach"
+        );
+    }
+
+    /// Chebyshev distance between two cells, for the test's endpoint pick.
+    fn chebyshev(a: (u16, u16), b: (u16, u16)) -> u32 {
+        i32::from(a.0).abs_diff(i32::from(b.0))
+            .max(i32::from(a.1).abs_diff(i32::from(b.1))) as u32
+    }
+
+    /// The MCV blocker-shove budget: an opening MCV jammed by its own idle
+    /// unit gets at most [`SHOVE_ATTEMPTS`] shove Moves while it stands on
+    /// one cell (the old loop re-armed on any movement and shoved all
+    /// game), and past the cap the stuck window owns it — a bounded number
+    /// of re-site walks, then silence. No yard stands, so the deploy branch
+    /// is the only thing speaking.
+    #[test]
+    #[ignore = "slow; retail; loads a retail map"]
+    fn jammed_mcv_shoves_bounded_then_resites_or_stops() {
+        let (mut scenario, ai_house, _enemy) = pacific_bridge_battle();
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+        // The jam: one MCV, one idle own tank inside its foundation, no
+        // yard anywhere (the deploy branch owns the whole command budget).
+        // The anchor is the witnesses' known-land shore.
+        let mcv = spawn_near(&mut scenario, "AMCV", ai_house, (68, 94));
+        spawn_near(&mut scenario, "MTNK", ai_house, (68, 94));
+
+        let mut shoves = 0;
+        let mut mcv_moves = 0;
+        let mut shoves_after_cap = 0;
+        for tick in 0..8 * super::WAVE_RETRY_TICKS {
+            for order in ai.orders(&scenario.runtime, tick) {
+                match order.payload {
+                    crate::sim::command::Command::Move {
+                        entity_id,
+                        target_rx,
+                        target_ry,
+                    } => {
+                        assert_ne!(
+                            (target_rx, target_ry),
+                            (0, 0),
+                            "no order targets the origin (tick {tick})"
+                        );
+                        if entity_id == mcv {
+                            mcv_moves += 1;
+                        } else {
+                            shoves += 1;
+                            if tick > super::SHOVE_ATTEMPTS * super::IDLE_REORDER_TICKS {
+                                shoves_after_cap += 1;
+                            }
+                        }
+                    }
+                    crate::sim::command::Command::DeployMcv { entity_id } if entity_id == mcv => {
+                        // a deploy draw means the site cleared; bounded either way
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            shoves <= super::SHOVE_ATTEMPTS,
+            "one stuck MCV gets at most {} shoves per cell (saw {shoves})",
+            super::SHOVE_ATTEMPTS
+        );
+        assert_eq!(
+            shoves_after_cap, 0,
+            "the shove cap must hold past the budget window"
+        );
+        assert!(
+            mcv_moves <= 4,
+            "the stuck window re-sites the MCV a bounded number of times (saw {mcv_moves})"
+        );
+    }
+
+    /// TEMPORARY probe: which retail maps actually split a ground zone when
+    /// a bridge span collapses.
+    #[test]
+    #[ignore = "temporary probe"]
+    fn probe_zone_split_maps() {
+        use crate::sim::bridge_state::BridgeDamageEvent;
+
+        for map in [
+            "XMP22S8.MAP",
+            "Hills.mmx",
+            "C3Y03MD.MAP",
+            "XShrapnel.MAP",
+            "XMP03T4.MAP",
+        ] {
+            let ra2 = std::path::PathBuf::from(std::env::var_os("RA2_DIR").unwrap());
+            let Ok(mut scenario) = crate::headless_scenario::load(&ra2, map, 0x0B21_D6E5) else {
+                eprintln!("PROBE {map}: LOAD FAILED");
+                continue;
+            };
+            let rules = scenario.runtime.resources.rules.clone();
+            let registry = scenario.runtime.resources.overlay_registry.clone();
+            let records: Vec<_> = scenario
+                .sim()
+                .zone_grid
+                .as_ref()
+                .unwrap()
+                .bridge_records()
+                .to_vec();
+            eprintln!("PROBE {map}: {} records", records.len());
+            for record in &records {
+                if !record.is_high() {
+                    continue;
+                }
+                let (a, b) = (record.endpoint_a, record.endpoint_b);
+                let mid = ((a.0 + b.0) / 2, (a.1 + b.1) / 2);
+                let z = scenario
+                    .sim()
+                    .resolved_terrain
+                    .as_ref()
+                    .and_then(|t| t.cell(mid.0, mid.1))
+                    .map(|c| i32::from(c.level) * 208)
+                    .unwrap_or(416);
+                let connected_before = super::zones_connected(
+                    scenario.sim(),
+                    crate::rules::locomotor_type::MovementZone::Normal,
+                    a,
+                    b,
+                );
+                let damage = rules.bridge_rules.strength + 1;
+                let mut collapsed = false;
+                'span: for _ in 0..10 {
+                    for (dx, dy) in
+                        [(0i32, 0i32), (1, 0), (0, 1), (-1, 0), (0, -1), (2, 0), (0, 2)]
+                    {
+                        let (rx, ry) = (
+                            i32::from(mid.0) + dx,
+                            i32::from(mid.1) + dy,
+                        );
+                        if rx < 0 || ry < 0 {
+                            continue;
+                        }
+                        let event = BridgeDamageEvent {
+                            rx: rx as u16,
+                            ry: ry as u16,
+                            damage,
+                            warhead_ref: scenario.runtime.simulation.intern("HE"),
+                            impact_z_leptons: z,
+                            is_ion_cannon: false,
+                        };
+                        collapsed |= crate::sim::world::bridge_orchestrator::apply_bridge_damage_events_with_overlay_registry(
+                            &mut scenario.runtime.simulation,
+                            &rules,
+                            &[event],
+                            Some(&registry),
+                            crate::sim::world::FrameEffects::default(),
+                        );
+                        let still = scenario
+                            .sim()
+                            .resolved_terrain
+                            .as_ref()
+                            .and_then(|t| t.cell(mid.0, mid.1))
+                            .is_some_and(|c| c.bridge_facts.has_structural_bridge());
+                        if collapsed && !still {
+                            break 'span;
+                        }
+                    }
+                }
+                let connected_after = super::zones_connected(
+                    scenario.sim(),
+                    crate::rules::locomotor_type::MovementZone::Normal,
+                    a,
+                    b,
+                );
+                eprintln!(
+                    "PROBE {map} span {a:?}-{b:?} mid={mid:?} z={z} collapsed={collapsed} \
+                     before={connected_before} after={connected_after}"
+                );
+            }
+        }
     }
 }
