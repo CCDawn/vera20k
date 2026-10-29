@@ -64,6 +64,39 @@ const EXPANSION_MIN_DISTANCE: i16 = 30;
 /// later MCV and must not swallow its deploys.
 const EXPANSION_DEPLOY_ATTEMPTS: u32 = 5;
 
+/// How far from the expansion yard the sub-base's site search scans, in
+/// cells: the engine's own build-area admission (`Adjacent+1` ring, default
+/// `Adjacent=3`) already bounds every legal foundation to the yard's
+/// neighborhood, so a wider scan would only walk origins the placement
+/// order can never land — the scan stays tight and validates each
+/// candidate with the engine's real predicate.
+const EXPANSION_SITE_RADIUS: i16 = 5;
+
+/// Structures within this many cells of a yard count as that base's
+/// cluster: the expansion limbs read the sub-base's power and refinery
+/// standing against this ring, and the per-base defense quotas count each
+/// yard's guns inside it.
+const BASE_CLUSTER_RADIUS: i16 = 8;
+
+/// A standing yard this close (Chebyshev) to the latched far ore field
+/// admits the remote-refinery routing around that field: a foundation the
+/// scan picks beside a yard-less field sits in no friendly build area and
+/// the placement order can never land (observed as OutOfBuildArea
+/// rejections soaking the one building slot), so until a yard walked out
+/// there the ready refinery takes the home rings or the expansion yard's.
+const EXPANSION_YARD_PROXIMITY: i16 = 8;
+
+/// Ore cells within this distance of any standing refinery — any owner's,
+/// including other houses' — read as that field's contested half: the ore
+/// survey prefers the uncontested fields, so neighboring bases stop
+/// latching the same ground.
+const ORE_FIELD_EXCLUSION_RADIUS: i16 = 10;
+
+/// How many of the fan-out offsets anchor idle defenders around the
+/// expansion yard: half the home set, enough posts for the sub-base's
+/// guard reserve without thinning the home perimeter's own spread.
+const EXPANSION_GUARD_OFFSETS: usize = 8;
+
 /// Miners the vehicle queue builds before it switches to tanks: enough to
 /// feed two refineries' docks while the army starts coming out.
 const HARVESTER_TARGET: usize = 5;
@@ -123,6 +156,23 @@ const BRIDGE_RETRY_TICKS: u32 = 150;
 /// miniature — a broke base expands, a rich one repairs).
 const BRIDGE_ENGINEER_CREDITS: i32 = 2000;
 
+/// Ticks between the building-repair limb's surveys. A survey walks the
+/// house's whole structure set (health, repair byte, priority rank), so it
+/// runs paced, never per tick; one repair activation at a time latches
+/// between surveys anyway.
+const REPAIR_SURVEY_TICKS: u32 = 300;
+
+/// The wallet bar a repair activation waits for: repair steps pay as they
+/// heal, so a broke base would park a half-paid repair that the engine's
+/// own step aborts the moment the wallet dips — the air wing's top-up
+/// guard, in miniature. A broke base expands; a funded one repairs.
+const STRUCTURE_REPAIR_CREDITS: i32 = 1500;
+
+/// A structure whose health fraction drops under 3/5 earns a repair
+/// activation (integer-safe comparison: `health * 5 < strength * 3`).
+const REPAIR_FRACTION_NUMERATOR: i32 = 3;
+const REPAIR_FRACTION_DENOMINATOR: i32 = 5;
+
 /// The stock bridge-repair hut (retail `BridgeRepairHut=yes`; stock CABHUT
 /// is the only one, `object_type.rs`). Resolved through the interner at
 /// survey time like every other rules name: a map whose rules lack the type
@@ -153,6 +203,11 @@ const MCV_RESITE_DISTANCE: u16 = 4;
 /// Every side's war factory type (retail `UIName`s): the structures a wave
 /// razes first to starve the enemy's reinforcements.
 const WAR_FACTORY_TYPES: [&str; 3] = ["GAWEAP", "NAWEAP", "YAWEAP"];
+
+/// Every side's refinery section name: the ore survey's exclusivity term
+/// reads standing structures of any of these — any owner's — so
+/// neighboring bases stop latching the same field.
+const REFINERY_TYPES: [&str; 3] = ["GAREFN", "NAREFN", "YAREFN"];
 
 /// How long an idle unit that was just given a one-unit order waits before
 /// taking another: an order the command layer drops leaves the unit's
@@ -239,6 +294,22 @@ const HEAVY_DEFENSE_CAP: usize = 2;
 /// a perimeter, not an armament program.
 const DEFENSE_FLOOR: usize = 2;
 
+/// Per-base defense quotas (Layer 2): the house-wide caps above split per
+/// standing yard — each base carries its own pillboxes and AA, the heavy
+/// tower one per yard — so the expansion yard is not a naked foundation
+/// while the home ring holds every gun. The house-wide bound stays at
+/// twice the old caps, so the split can only move guns around, never
+/// inflate the armament program as a whole.
+const DEFENSE_PER_YARD_BASIC: usize = 2;
+const DEFENSE_PER_YARD_AA: usize = 2;
+const DEFENSE_PER_YARD_HEAVY: usize = 1;
+
+/// The late-game defense sink: past this wallet, with every economy cap
+/// met and the power grid in the black, each yard's heavy quota gains one
+/// tier — wealth converts to defense depth, and to nothing else (no new
+/// economy opens past the caps).
+const LATE_SINK_CREDITS: i32 = 20_000;
+
 /// Growth caps: refineries stop here once the miner fleet saturates
 /// the standing docks (two miners each); factories once six stand —
 /// retail's MultipleFactory=0.8 per extra one has shrinking returns.
@@ -264,6 +335,16 @@ const FACTORY_CREDITS: i32 = 1500;
 /// power-hungry base and the refinery and factory rules behind it never
 /// take a turn (observed: two growth plants and no fourth factory).
 const POWER_CAP: usize = 8;
+
+/// The power margin (Layer 2): while the grid's headroom (`output - drain`)
+/// sits below the draw of one more war factory plus refinery — a fixed
+/// estimate, the retail plants' drain is a few dozen points apiece — a
+/// plant queues ahead of the next factory line, but only while the
+/// factory fleet is still inside its standard build-out. Past the
+/// build-out the deficit rule alone owns power: a war-damaged grid must
+/// not claim every growth slot the way the old unbounded margin once did
+/// (observed: five plants while refineries sat at two).
+const POWER_HEADROOM_TARGET: i32 = 250;
 
 /// Deterministic fan-out offsets (cells) that keep the AI's destinations
 /// from converging on one point: rallies, guard posts and wave destinations
@@ -850,6 +931,24 @@ pub struct SuperAi {
     /// the shove budget spent): the deploy branch draws them no more
     /// orders. Pinned state, never read from the runtime.
     mcv_abandoned: std::collections::HashMap<u64, ()>,
+    /// Where the growth plan wants the building it just queued placed: the
+    /// type plus whether it routes to the expansion yard's rings instead of
+    /// the home yard's. Set at every building queue site (defense guns for
+    /// the under-quota base, the expansion cluster's power and refinery),
+    /// read by the placement branch and overwritten at the next queue — a
+    /// canceled intent's type is never ready, so a stale entry cannot
+    /// misroute a different item. Pinned state, never read from the
+    /// runtime.
+    placement_intent: Option<(InternedId, bool)>,
+    /// The structure the repair limb switched repair on for: the command is
+    /// a toggle (a re-issue would switch the repair back off), so the
+    /// activation latches until the building's repair byte reads off again
+    /// — repaired whole, unpaid, dead or sold. Pinned state, never read
+    /// from the runtime.
+    repairing_structure: Option<u64>,
+    /// Earliest tick the repair limb's next survey may run; see
+    /// [`REPAIR_SURVEY_TICKS`]. Pinned state, never read from the runtime.
+    repair_due: u32,
 }
 
 impl SuperAi {
@@ -893,6 +992,9 @@ impl SuperAi {
             shove_origin: std::collections::HashMap::new(),
             mcv_stuck_since: std::collections::HashMap::new(),
             mcv_abandoned: std::collections::HashMap::new(),
+            placement_intent: None,
+            repairing_structure: None,
+            repair_due: 0,
         }
     }
 
@@ -1177,6 +1279,28 @@ impl SuperAi {
         // (observed: the census saw the refinery; the latch never did,
         // and the whole expansion froze behind it).
         let home_center = self.structure_center(sim, opening.construction_yard);
+        // The standing yards (Layer 2): the first in the substrate's stable
+        // order is the home base every legacy ring scan centers on; once a
+        // second yard stands, the one furthest from home — or nearest the
+        // expansion MCV's latched field, when that walk is still armed — is
+        // the expansion base the growth limbs route to.
+        let yard_centers = self.own_yard_centers(sim, opening);
+        let expansion_center = if yard_centers.len() >= 2 {
+            match self.expansion2_site {
+                Some(site) => yard_centers.iter().copied().min_by_key(|cell| {
+                    (cell.0 - site.0 as i16).abs().max(cell.1 - site.1 as i16).abs()
+                }),
+                None => {
+                    let home = home_center.unwrap_or(yard_centers[0]);
+                    yard_centers
+                        .iter()
+                        .copied()
+                        .max_by_key(|cell| (cell.0 - home.0).abs().max(cell.1 - home.1).abs())
+                }
+            }
+        } else {
+            None
+        };
         if self.expansion_site.is_none()
             && !self.remote_refinery_stood
             && tick >= self.survey_due
@@ -1245,41 +1369,93 @@ impl SuperAi {
             .filter(|item| !self.place_pause_until.contains_key(&item.type_id))
             .last()
             && let Some(ty) = rules.object(sim.interner.resolve(ready.type_id))
-            // The expansion refinery routes around its far ore field, not
-            // the home yard: the ring-scan starts at the latched site, so
-            // the refinery lands on the distant ore the home rings cannot
-            // reach. Every other ready building keeps the home center. The
-            // remote foundation must itself keep the expansion distance
-            // from home — the ring scan starts at the field and can pull a
-            // foundation toward home, and a refinery inside the distance
-            // never arms the second-base chain behind it.
-            && let Some((rx, ry)) = if sim.interner.resolve(ready.type_id) == opening.refinery
-                && self.expansion_site.is_some()
-                && !self.remote_refinery_stood
-            {
-                self.expansion_site
-                    .and_then(|(sx, sy)| {
-                        home_center.map(|home| {
-                            find_site_beyond(
+            // Routing, in order: the first expansion's refinery may still
+            // route around its latched far ore field — but only once a yard
+            // stands near that field, because the engine admits a placement
+            // only inside a friendly structure's build area and a
+            // yard-less far site wedged the ready item on OutOfBuildArea
+            // rejections. Every other expansion-intent item (the growth
+            // plan's mark, `placement_intent`) places in the expansion
+            // yard's tight, build-area-validated rings; everything else —
+            // and any expansion item whose ring scan fails — falls back to
+            // the home rings, so a ready building can never wedge the one
+            // placement slot (the old fallback's discipline, kept).
+            && let Some((rx, ry)) = {
+                let type_name = sim.interner.resolve(ready.type_id);
+                let far_site = if type_name == opening.refinery
+                    && self.expansion_site.is_some()
+                    && !self.remote_refinery_stood
+                    && self.yard_near_site(
+                        sim,
+                        opening,
+                        self.expansion_site,
+                        EXPANSION_YARD_PROXIMITY,
+                    )
+                {
+                    self.expansion_site
+                        .and_then(|(sx, sy)| {
+                            home_center.map(|home| {
+                                find_site_beyond(
+                                    sim,
+                                    rules,
+                                    &runtime.resources.overlay_registry,
+                                    ty,
+                                    (sx as i16, sy as i16),
+                                    self.house,
+                                    home,
+                                    EXPANSION_MIN_DISTANCE,
+                                )
+                            })
+                        })
+                        .flatten()
+                } else {
+                    None
+                };
+                far_site.or_else(|| {
+                    // The expansion routing: the first expansion's refinery
+                    // (before its remote latch arms, with the second yard
+                    // already standing) and anything the growth plan marked
+                    // for the expansion base. The remote foundation must
+                    // itself keep the expansion distance from home — the
+                    // ring scan starts at the field and can pull a
+                    // foundation toward home, and a refinery inside the
+                    // distance never arms the second-base chain behind it.
+                    let expansion_route = expansion_center.filter(|_| {
+                        (type_name == opening.refinery
+                            && self.expansion_site.is_some()
+                            && !self.remote_refinery_stood)
+                            || self
+                                .placement_intent
+                                .is_some_and(|(intent_type, expansion)| {
+                                    intent_type == ready.type_id && expansion
+                                })
+                    });
+                    match expansion_route {
+                        Some(center) => {
+                            find_site_around_capped(
                                 sim,
                                 rules,
                                 &runtime.resources.overlay_registry,
                                 ty,
-                                (sx as i16, sy as i16),
+                                center,
                                 self.house,
-                                home,
-                                EXPANSION_MIN_DISTANCE,
+                                Some(owner.as_str()),
+                                EXPANSION_SITE_RADIUS,
                             )
-                        })
-                    })
-                    .flatten()
-                    .or_else(|| {
-                        // The routed remote center can fail its whole ring
-                        // scan (a dense ore field with no clear foundation
-                        // in reach); the ready item must never wedge the
-                        // one building slot, so the home rings take it
-                        // instead.
-                        home_center.and_then(|home| {
+                            .or_else(|| {
+                                home_center.and_then(|home| {
+                                    find_site_around(
+                                        sim,
+                                        rules,
+                                        &runtime.resources.overlay_registry,
+                                        ty,
+                                        home,
+                                        self.house,
+                                    )
+                                })
+                            })
+                        }
+                        None => home_center.and_then(|home| {
                             find_site_around(
                                 sim,
                                 rules,
@@ -1288,18 +1464,8 @@ impl SuperAi {
                                 home,
                                 self.house,
                             )
-                        })
-                    })
-            } else {
-                home_center.and_then(|home| {
-                    find_site_around(
-                        sim,
-                        rules,
-                        &runtime.resources.overlay_registry,
-                        ty,
-                        home,
-                        self.house,
-                    )
+                        }),
+                    }
                 })
             }
         {
@@ -1364,6 +1530,17 @@ impl SuperAi {
         // checks and rebuilds the span synchronously, republishing the zones
         // and reopening the wave targets the gates below hold shut.
         if let Some(command) = self.bridge_repair_orders(sim, rules, opening, tick) {
+            return vec![CommandEnvelope::new(self.house, at, command)];
+        }
+
+        // The building-repair limb (Layer 2). A damaged structure sits at a
+        // fraction of its strength until something repairs it, and nothing
+        // in the chain below ever does: the survey latches the worthiest
+        // damaged structure and the toggle turns its paid repair on — one
+        // activation at a time, economy and factories first, paced so it
+        // never soaks the one-command budget. See
+        // [`Self::structure_repair_orders`].
+        if let Some(command) = self.structure_repair_orders(sim, rules, opening, &owner, tick) {
             return vec![CommandEnvelope::new(self.house, at, command)];
         }
 
@@ -1505,27 +1682,29 @@ impl SuperAi {
                 // breach is not a post, and no connected offset at all
                 // spends only the unit's idle window (the order gate below
                 // paces the retry) instead of marching it into the water.
-                let post = sim.substrate.entities.get(unit).and_then(|entity| {
-                    let from = (entity.position.rx(), entity.position.ry());
-                    let movement_zone = rules
-                        .object(sim.interner.resolve(entity.type_ref()))
-                        .map(|ty| ty.movement_zone)
-                        .unwrap_or_default();
-                    (0..SPREAD_OFFSETS.len())
-                        .map(|index| (unit as usize + index) % SPREAD_OFFSETS.len())
-                        .find_map(|index| {
-                            let spread = SPREAD_OFFSETS[index];
-                            let cell = on_map_cell(
-                                sim,
-                                (
-                                    center.0 + i16::from(spread.0),
-                                    center.1 + i16::from(spread.1),
-                                ),
-                                center,
-                            );
-                            zones_connected(sim, movement_zone, from, cell).then_some(cell)
-                        })
-                });
+                // With a second yard standing, half the idle defenders
+                // (odd unit ids) anchor the expansion yard's own post set
+                // instead — a sub-base with no posts leaves its guns
+                // uncovered — and a unit with no connected post on its
+                // assigned ring falls back to the other base's, so the
+                // order gate is spent on a held post either way.
+                let home_post = pick_guard_post(sim, rules, unit, center, &SPREAD_OFFSETS);
+                let post = if let Some(expansion) = expansion_center {
+                    let expansion_post = pick_guard_post(
+                        sim,
+                        rules,
+                        unit,
+                        expansion,
+                        &SPREAD_OFFSETS[..EXPANSION_GUARD_OFFSETS],
+                    );
+                    if unit % 2 == 1 {
+                        expansion_post.or(home_post)
+                    } else {
+                        home_post.or(expansion_post)
+                    }
+                } else {
+                    home_post
+                };
                 self.gate_idle_order(unit, tick);
                 if let Some((px, py)) = post {
                     return vec![CommandEnvelope::new(
@@ -1933,34 +2112,76 @@ impl SuperAi {
         let any_tank = self.count_units_of_type(sim, opening.main_tank)
             + self.count_units_of_type(sim, opening.tier2_tank)
             > 0;
-        // A gun still below its cap while the yard stands and tanks roll.
+        // A gun still below its quota while the yard stands and tanks roll.
         // The limb's own ordering, hoisted once: the savings hold and the
         // limb itself must claim the same gun or the hold banks the wallet
         // for a queue that never fires. Anti-air answers air that actually
         // fields, the heavy tower waits behind the radar its prerequisite
         // names, and the pillbox quota holds the perimeter once tanks roll.
+        // Per-base quotas (Layer 2): the caps split across the standing
+        // yards, each base carrying its own guns — the expansion yard used
+        // to stand bare while the home ring held every one. A gun's base
+        // reads as the yard whose [`BASE_CLUSTER_RADIUS`] ring it stands
+        // in; with no yard at all the legacy single-base behavior holds
+        // (the structure center anchors a virtual base, as the old
+        // house-wide caps effectively did). The heavy quota gains one tier
+        // per yard only under the late-game sink: a rich, capped base
+        // converts wealth to defense depth, and to nothing else.
+        let bases: Vec<(i16, i16)> = if yard_centers.is_empty() {
+            self.structure_center(sim, opening.construction_yard)
+                .into_iter()
+                .collect()
+        } else {
+            yard_centers.clone()
+        };
+        let late_sink = crate::sim::production::credits_for_owner(sim, &owner) > LATE_SINK_CREDITS
+            && self.count_structures_of_type(sim, opening.war_factory) >= FACTORY_BUILDOUT
+            && self.count_structures_of_type(sim, opening.refinery) >= REFINERY_CAP
+            && bases.len() >= 2;
+        let heavy_per_yard = DEFENSE_PER_YARD_HEAVY + usize::from(late_sink);
         let defenses = [
             (
-                self.enemy_air_count(sim) > 0
-                    && self.count_structures_of_type(sim, opening.defense_aa) < AA_DEFENSE_CAP,
                 opening.defense_aa,
+                DEFENSE_PER_YARD_AA,
+                AA_DEFENSE_CAP * 2,
+                self.enemy_air_count(sim) > 0,
             ),
             (
-                self.count_structures_of_type(sim, radar_name) >= 1
-                    && self.count_structures_of_type(sim, opening.defense_heavy)
-                        < HEAVY_DEFENSE_CAP,
                 opening.defense_heavy,
+                heavy_per_yard,
+                HEAVY_DEFENSE_CAP * 2 + usize::from(late_sink) * bases.len(),
+                self.count_structures_of_type(sim, radar_name) >= 1,
             ),
             (
-                self.count_structures_of_type(sim, opening.defense_basic) < BASIC_DEFENSE_TARGET,
                 opening.defense_basic,
+                DEFENSE_PER_YARD_BASIC,
+                BASIC_DEFENSE_TARGET * 2,
+                true,
             ),
         ];
+        // The first gated type with a base under its quota claims the next
+        // gun, that base's rings the placement intent's target; an empty
+        // list — every base at every quota — rests the limb.
+        let gun_wants: Vec<(&'static str, bool)> = defenses
+            .iter()
+            .filter_map(|&(name, per_yard, global_bound, gate)| {
+                if !gate || self.count_structures_of_type(sim, name) >= global_bound {
+                    return None;
+                }
+                bases
+                    .iter()
+                    .position(|&cell| {
+                        self.count_structures_of_type_near(sim, name, cell, BASE_CLUSTER_RADIUS)
+                            < per_yard
+                    })
+                    .map(|index| (name, index >= 1))
+            })
+            .collect();
         let guns_wanted = any_tank
             && self
                 .structure_center(sim, opening.construction_yard)
                 .is_some()
-            && defenses.iter().any(|(behind, _)| *behind);
+            && !gun_wants.is_empty();
         // The floor's savings hold: the limb's full-cost gate can wait
         // forever in a war-poor game — each unit item banks only its own
         // cost, so the hundred-credit soldier ladder keeps the wallet
@@ -1976,10 +2197,10 @@ impl SuperAi {
                 + self.count_structures_of_type(sim, opening.defense_aa)
                 + self.count_structures_of_type(sim, opening.defense_heavy)
                 < DEFENSE_FLOOR
-            && defenses
+            && gun_wants
                 .iter()
-                .find_map(|&(behind, name)| {
-                    rules.object(name).filter(|_| behind).and_then(|ty| {
+                .find_map(|&(name, _)| {
+                    rules.object(name).and_then(|ty| {
                         crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
                             .enabled
                             .then_some(ty.cost)
@@ -2001,23 +2222,23 @@ impl SuperAi {
             // yard-centered ring scan every other building uses; Yuri's
             // Gatling Cannon serves both the AA and the pillbox slots.
             if any_tank {
-                for (behind, name) in defenses {
-                    if !behind {
-                        continue;
-                    }
+                for (name, expansion) in gun_wants {
                     // Guns queue only from a wallet that can pay for them
                     // outright: a broke base that queues a 1500-credit
                     // Prism Tower parks it in the one building slot at
                     // zero progress forever (observed: factories stuck at
                     // three while ATESLA held the queue for the rest of
                     // the game), starving the growth tail behind it. Poor
-                    // bases expand; rich bases arm.
+                    // bases expand; rich bases arm. The placement intent
+                    // marks the under-quota base, so the gun lands on the
+                    // base that asked for it instead of the home rings.
                     if let Some(ty) = rules.object(name)
                         && crate::sim::production::credits_for_owner(sim, &owner) >= ty.cost
                         && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
                             .enabled
                         && let Some(type_id) = sim.interner.get(name)
                     {
+                        self.placement_intent = Some((type_id, expansion));
                         return vec![CommandEnvelope::new(
                             self.house,
                             at,
@@ -2089,6 +2310,9 @@ impl SuperAi {
                     // rules load; a miss would only skip this candidate.
                     && let Some(type_id) = sim.interner.get(*name)
                 {
+                    // The fixed ladder places at home — clear any expansion
+                    // intent a previous plan item left behind.
+                    self.placement_intent = None;
                     return vec![CommandEnvelope::new(
                         self.house,
                         at,
@@ -2122,9 +2346,67 @@ impl SuperAi {
                     .harvester
                     .map(|miner| self.count_units_of_type(sim, miner))
                     .unwrap_or(usize::MAX);
+                // The expansion growth (Layer 2): a second yard is a
+                // sub-base, not a monument. Before the house-wide growth
+                // array, the cluster around the expansion yard claims what
+                // it lacks — one power plant while its ring browns, one
+                // refinery while its ring holds no dock and the house-wide
+                // economy is one past its own cap — each routed to the
+                // expansion yard's rings by the placement intent. A ring
+                // scan that finds no legal site falls back home in the
+                // placement branch, and the strike/pause machinery paces
+                // the retry, so a refusing neighborhood can wedge neither
+                // the queue nor the chain.
+                if let Some(expansion) = expansion_center {
+                    let cluster_power =
+                        self.count_structures_of_type_near(sim, opening.power, expansion, BASE_CLUSTER_RADIUS);
+                    let cluster_refineries = self.count_structures_of_type_near(
+                        sim,
+                        opening.refinery,
+                        expansion,
+                        BASE_CLUSTER_RADIUS,
+                    );
+                    if cluster_power < 1
+                        && self.count_structures_of_type(sim, opening.power) < POWER_CAP
+                        && let Some(ty) = rules.object(opening.power)
+                        && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
+                            .enabled
+                        && let Some(type_id) = sim.interner.get(opening.power)
+                    {
+                        self.placement_intent = Some((type_id, true));
+                        return vec![CommandEnvelope::new(
+                            self.house,
+                            at,
+                            Command::QueueProduction { type_id },
+                        )];
+                    }
+                    if cluster_refineries < 1
+                        && refineries < REFINERY_CAP + 1
+                        && let Some(ty) = rules.object(opening.refinery)
+                        && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
+                            .enabled
+                        && let Some(type_id) = sim.interner.get(opening.refinery)
+                    {
+                        self.placement_intent = Some((type_id, true));
+                        return vec![CommandEnvelope::new(
+                            self.house,
+                            at,
+                            Command::QueueProduction { type_id },
+                        )];
+                    }
+                }
                 let growth = [
                     (
-                        self.expansion_site.is_some() && !self.remote_refinery_stood,
+                        // The far-entry cap (Layer 2 G's companion): the
+                        // old entry queued one refinery after another
+                        // until the remote latch armed, and the routing
+                        // now lands them beside the expansion yard — a
+                        // borderline-distance yard could keep the latch
+                        // quiet while the docks multiplied. The expansion
+                        // economy's own cap bounds it instead.
+                        self.expansion_site.is_some()
+                            && !self.remote_refinery_stood
+                            && refineries < REFINERY_CAP + 1,
                         opening.refinery,
                     ),
                     (
@@ -2143,6 +2425,19 @@ impl SuperAi {
                     ),
                     (
                         output - drain < 0
+                            && self.count_structures_of_type(sim, opening.power) < POWER_CAP,
+                        opening.power,
+                    ),
+                    (
+                        // The power margin (Layer 2): one more factory
+                        // plus refinery must not brown out the grid it
+                        // joins — a plant queues while the headroom sits
+                        // under [`POWER_HEADROOM_TARGET`], bounded by the
+                        // standard build-out so a war-damaged late game
+                        // keeps the deficit rule alone in charge.
+                        output - drain >= 0
+                            && output - drain < POWER_HEADROOM_TARGET
+                            && factories < FACTORY_BUILDOUT
                             && self.count_structures_of_type(sim, opening.power) < POWER_CAP,
                         opening.power,
                     ),
@@ -2167,12 +2462,47 @@ impl SuperAi {
                             .enabled
                         && let Some(type_id) = sim.interner.get(name)
                     {
+                        // House-wide growth places at home — the intent's
+                        // expansion marks belong to the block above.
+                        self.placement_intent = None;
                         return vec![CommandEnvelope::new(
                             self.house,
                             at,
                             Command::QueueProduction { type_id },
                         )];
                     }
+                }
+                // The roster's tech-center rung (Layer 2): a roster entry
+                // whose `needs` gate names a structure the fixed ladder
+                // never builds — the Robot Control Center behind the Robot
+                // Tank, the only such entry in the retail tables — is a
+                // commission the mix can never fire while the gate stands
+                // unsatisfied (observed: a Robot Tank cameo lit since the
+                // lab and never once produced, the control center absent
+                // from every build list). The rung queues the center once
+                // the battle lab stands, gated on roster membership so a
+                // side whose tables name no such entry never queues one,
+                // and the count check keeps it a rebuild too.
+                let tech_center = opening
+                    .vehicles
+                    .iter()
+                    .chain(opening.infantry.iter())
+                    .filter_map(|entry| entry.needs)
+                    .find(|&name| name != opening.battle_lab);
+                if let Some(center) = tech_center
+                    && self.count_structures_of_type(sim, center) == 0
+                    && self.count_structures_of_type(sim, opening.battle_lab) >= 1
+                    && let Some(ty) = rules.object(center)
+                    && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
+                        .enabled
+                    && let Some(type_id) = sim.interner.get(center)
+                {
+                    self.placement_intent = None;
+                    return vec![CommandEnvelope::new(
+                        self.house,
+                        at,
+                        Command::QueueProduction { type_id },
+                    )];
                 }
             }
         }
@@ -2650,30 +2980,63 @@ impl SuperAi {
         // Highest score first; the stable sort keeps the earliest
         // (row-major) cell on ties, the single-pass scan's tie order.
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        // The exclusivity term (Layer 2): a cell within
+        // [`ORE_FIELD_EXCLUSION_RADIUS`] of any standing refinery — any
+        // owner's, this house's included — reads as that field's contested
+        // half. Neighboring bases used to latch the same richest central
+        // field and mine each other's docks; the survey now prefers the
+        // uncontested candidates outright and only falls back to a
+        // contested one when no free field qualifies (a small map's
+        // reality), so the pick never dead-ends.
+        let refinery_cells: Vec<(u16, u16)> = sim
+            .substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.category() == crate::map::entities::EntityCategory::Structure
+                    && !entity.lifecycle.in_limbo()
+                    && REFINERY_TYPES.contains(&sim.interner.resolve(entity.type_ref()))
+            })
+            .map(|(_, entity)| (entity.position.rx(), entity.position.ry()))
+            .collect();
+        let contested = |cell: &(u16, u16)| {
+            refinery_cells.iter().any(|(rx, ry)| {
+                (cell.0 as i16 - *rx as i16)
+                    .abs()
+                    .max((cell.1 as i16 - *ry as i16).abs())
+                    <= ORE_FIELD_EXCLUSION_RADIUS
+            })
+        };
+        let (free, taken): (Vec<&((u16, u16), i32)>, Vec<&((u16, u16), i32)>) =
+            candidates.iter().partition(|(cell, _)| !contested(cell));
         let pick = match validate.and_then(|name| rules.object(name)) {
-            Some(ty) => candidates.iter().find(|((rx, ry), _)| {
-                find_site_beyond(
-                    sim,
-                    rules,
-                    overlay_registry,
-                    ty,
-                    (*rx as i16, *ry as i16),
-                    self.house,
-                    from,
-                    EXPANSION_MIN_DISTANCE,
-                )
-                .is_some()
-                    // The field itself must sit in ground the zone grid
-                    // connects to home: a richer field across a breach
-                    // starves behind water no miner crosses.
-                    && zones_connected(
+            Some(ty) => free
+                .iter()
+                .copied()
+                .chain(taken.iter().copied())
+                .find(|((rx, ry), _)| {
+                    find_site_beyond(
                         sim,
-                        crate::rules::locomotor_type::MovementZone::Normal,
-                        (from.0.max(0) as u16, from.1.max(0) as u16),
-                        (*rx, *ry),
+                        rules,
+                        overlay_registry,
+                        ty,
+                        (*rx as i16, *ry as i16),
+                        self.house,
+                        from,
+                        EXPANSION_MIN_DISTANCE,
                     )
-            }),
-            None => candidates.first(),
+                    .is_some()
+                        // The field itself must sit in ground the zone grid
+                        // connects to home: a richer field across a breach
+                        // starves behind water no miner crosses.
+                        && zones_connected(
+                            sim,
+                            crate::rules::locomotor_type::MovementZone::Normal,
+                            (from.0.max(0) as u16, from.1.max(0) as u16),
+                            (*rx, *ry),
+                        )
+                }),
+            None => free.first().or_else(|| taken.first()).copied(),
         };
         pick.map(|(cell, _)| *cell)
     }
@@ -3374,6 +3737,151 @@ impl SuperAi {
         let entity = sim.substrate.entities.get(pick.0)?;
         Some((entity.position.rx() as i16, entity.position.ry() as i16))
     }
+
+    /// The cells of the house's standing construction yards, in the
+    /// substrate's stable order: the first is the home base every legacy
+    /// ring scan centers on; any later one is an expansion the growth
+    /// limbs route to.
+    fn own_yard_centers(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+    ) -> Vec<(i16, i16)> {
+        self.own_structures(sim)
+            .iter()
+            .filter(|(_, name)| name == opening.construction_yard)
+            .filter_map(|(id, _)| {
+                sim.substrate
+                    .entities
+                    .get(*id)
+                    .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))
+            })
+            .collect()
+    }
+
+    /// How many of the house's structures of exactly this retail type name
+    /// stand within `radius` cells (Chebyshev) of `center`: the per-base
+    /// cluster readings — the expansion ring's power and refinery standing,
+    /// each yard's gun count for the defense quotas.
+    fn count_structures_of_type_near(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        type_name: &str,
+        center: (i16, i16),
+        radius: i16,
+    ) -> usize {
+        self.own_structures(sim)
+            .iter()
+            .filter(|(_, name)| name == type_name)
+            .filter(|(id, _)| {
+                sim.substrate.entities.get(*id).is_some_and(|entity| {
+                    (entity.position.rx() as i16 - center.0)
+                        .abs()
+                        .max((entity.position.ry() as i16 - center.1).abs())
+                        <= radius
+                })
+            })
+            .count()
+    }
+
+    /// Whether a standing yard of this house sits within `radius` cells
+    /// (Chebyshev) of `site` — the remote-refinery routing's admission:
+    /// the engine admits a placement only inside a friendly structure's
+    /// build area, so a foundation beside a yard-less far field can never
+    /// land.
+    fn yard_near_site(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+        site: Option<(u16, u16)>,
+        radius: i16,
+    ) -> bool {
+        let Some((sx, sy)) = site else {
+            return false;
+        };
+        self.own_yard_centers(sim, opening).iter().any(|cell| {
+            (i32::from(cell.0) - i32::from(sx)).abs().max((i32::from(cell.1) - i32::from(sy)).abs())
+                <= i32::from(radius)
+        })
+    }
+
+    /// The building-repair limb's per-tick step; see the call site in
+    /// [`Self::orders`]. `None` — nothing to issue this tick.
+    ///
+    /// A paced survey ([`REPAIR_SURVEY_TICKS`]) picks the worthiest
+    /// damaged structure: health under three fifths of strength, no repair
+    /// already running (the byte reading on — whoever turned it on), the
+    /// wallet comfortably past [`STRUCTURE_REPAIR_CREDITS`]. Economy
+    /// first: refineries, power plants and war factories outrank the rest;
+    /// then the lowest health fraction wins, ties by the substrate's
+    /// stable order. The issued [`Command::ToggleRepair`] is a toggle —
+    /// a re-issue would switch the repair back off — so the activation
+    /// latches in `repairing_structure` until the byte reads off again:
+    /// repaired whole, unpaid, dead or sold.
+    fn structure_repair_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        owner: &str,
+        tick: u32,
+    ) -> Option<Command> {
+        // Forget an activation whose repair no longer runs: the engine's
+        // repair step stops the byte at full health or an empty wallet,
+        // and a dead or captured structure stops being a repair job.
+        if let Some(id) = self.repairing_structure
+            && !sim.substrate.entities.get(id).is_some_and(|entity| {
+                entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Structure
+                    && entity.lifecycle.object_alive()
+                    && entity.repairing.is_on()
+            })
+        {
+            self.repairing_structure = None;
+        }
+        if tick < self.repair_due || self.repairing_structure.is_some() {
+            return None;
+        }
+        self.repair_due = tick + REPAIR_SURVEY_TICKS;
+        if crate::sim::production::credits_for_owner(sim, owner) < STRUCTURE_REPAIR_CREDITS {
+            return None;
+        }
+        // The economy structures first: their downtime starves every other
+        // limb behind them, so their damage outranks a wounded barracks.
+        let economy = |name: &str| {
+            name == opening.refinery || name == opening.power || name == opening.war_factory
+        };
+        let mut best: Option<(u64, (usize, i32))> = None;
+        for (id, entity) in sim.substrate.entities.iter_sorted() {
+            if entity.owner() != self.house
+                || entity.category() != crate::map::entities::EntityCategory::Structure
+                || entity.lifecycle.in_limbo()
+                || !entity.lifecycle.object_alive()
+                || entity.repairing.is_on()
+            {
+                continue;
+            }
+            let name = sim.interner.resolve(entity.type_ref());
+            let Some(ty) = rules.object(name) else {
+                continue;
+            };
+            let health = entity.health.current();
+            // Health fraction under three fifths, integer-safe: whole and
+            // barely-scratched structures stay out.
+            if health * REPAIR_FRACTION_DENOMINATOR >= ty.strength * REPAIR_FRACTION_NUMERATOR {
+                continue;
+            }
+            let rank = (usize::from(!economy(name)), ty.strength - health);
+            if best.as_ref().is_none_or(|(_, kept_rank)| rank < *kept_rank) {
+                best = Some((id, rank));
+            }
+        }
+        if let Some((id, _)) = best {
+            self.repairing_structure = Some(id);
+            return Some(Command::ToggleRepair { entity_id: id });
+        }
+        None
+    }
 }
 
 /// Clamp an offset destination into the map. An offset target off the map
@@ -3435,7 +3943,28 @@ fn find_site_around(
     center: (i16, i16),
     house: InternedId,
 ) -> Option<(u16, u16)> {
-    for radius in 1..=SITE_SEARCH_RADIUS {
+    find_site_around_capped(sim, rules, registry, ty, center, house, None, SITE_SEARCH_RADIUS)
+}
+
+/// [`find_site_around`] with a capped radius and, when `build_area_owner`
+/// names a house, the engine's own build-area predicate as an extra
+/// candidate filter — the same admission `PlaceReadyBuilding` runs at
+/// apply time, so a candidate that passes here cannot be refused for
+/// adjacency (`production_placement::is_within_build_area`, the
+/// `Adjacent+1` ring over friendly `BaseNormal` providers). The legacy
+/// home scans pass no filter: they center on a standing yard whose build
+/// area already covers the reach those scans ever win on.
+fn find_site_around_capped(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    ty: &crate::rules::object_type::ObjectType,
+    center: (i16, i16),
+    house: InternedId,
+    build_area_owner: Option<&str>,
+    max_radius: i16,
+) -> Option<(u16, u16)> {
+    for radius in 1..=max_radius {
         for dy in -radius..=radius {
             for dx in -radius..=radius {
                 if dx.abs() != radius && dy.abs() != radius {
@@ -3454,13 +3983,53 @@ fn find_site_around(
                     Some(house),
                     None,
                     None,
-                ) {
+                ) && build_area_owner.is_none_or(|owner| {
+                    crate::sim::production::is_within_build_area(
+                        sim,
+                        rules,
+                        owner,
+                        ty,
+                        origin.0 as u16,
+                        origin.1 as u16,
+                    )
+                }) {
                     return Some((origin.0 as u16, origin.1 as u16));
                 }
             }
         }
     }
     None
+}
+
+/// The first guard-post cell around `base` that the ground rows connect the
+/// unit to, rotating the fixed fan-out offsets by unit id so a group
+/// spreads over neighboring cells instead of stacking on one. `None` — no
+/// connected offset; the caller spends only the unit's idle window (the
+/// order gate paces the retry) instead of marching it into the water.
+fn pick_guard_post(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    unit: u64,
+    base: (i16, i16),
+    offsets: &[(i8, i8)],
+) -> Option<(u16, u16)> {
+    let entity = sim.substrate.entities.get(unit)?;
+    let from = (entity.position.rx(), entity.position.ry());
+    let movement_zone = rules
+        .object(sim.interner.resolve(entity.type_ref()))
+        .map(|ty| ty.movement_zone)
+        .unwrap_or_default();
+    (0..offsets.len())
+        .map(|index| (unit as usize + index) % offsets.len())
+        .find_map(|index| {
+            let spread = offsets[index];
+            let cell = on_map_cell(
+                sim,
+                (base.0 + i16::from(spread.0), base.1 + i16::from(spread.1)),
+                base,
+            );
+            zones_connected(sim, movement_zone, from, cell).then_some(cell)
+        })
 }
 
 /// The first legal foundation for `ty` around `center` that also keeps
@@ -5880,5 +6449,362 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- Layer 2: base growth and survival ----
+
+    /// The expansion base grows (Layer 2 A/B): once a second construction
+    /// yard stands, its cluster must fill in — at least two non-yard
+    /// structures (the power plant, the refinery, the guns) inside its
+    /// [`BASE_CLUSTER_RADIUS`] ring with at least one defense — instead of
+    /// standing bare for the rest of the game (the observed "only grabs
+    /// ore, builds nothing" expansion base).
+    #[test]
+    #[ignore = "slow; retail; loads a match and drives tens of thousands of frames"]
+    fn expansion_grows_around_second_yard() {
+        let (mut scenario, human) = retail_battle();
+        let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
+
+        let structures_of_type = |scenario: &crate::headless_scenario::HeadlessScenario,
+                                  name: &str| {
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == human
+                        && entity.category() == crate::map::entities::EntityCategory::Structure
+                        && scenario.sim().interner.resolve(entity.type_ref()) == name
+                })
+                .count()
+        };
+        let yard_cells = |scenario: &crate::headless_scenario::HeadlessScenario| {
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == human
+                        && entity.category() == crate::map::entities::EntityCategory::Structure
+                        && scenario.sim().interner.resolve(entity.type_ref()) == "GACNST"
+                })
+                .map(|(_, entity)| (entity.position.rx() as i16, entity.position.ry() as i16))
+                .collect::<Vec<_>>()
+        };
+
+        // Phase 1: the second yard stands — the ladder arms the MCV
+        // commission, the escort walks it out, the deploy lands.
+        let tick = drive_until(&mut scenario, &mut ai, 42000, |scenario| {
+            structures_of_type(scenario, "GACNST") >= 2
+        });
+        assert!(
+            structures_of_type(&scenario, "GACNST") >= 2,
+            "the expansion yard deployed (tick {tick}, yards {})",
+            structures_of_type(&scenario, "GACNST")
+        );
+        // Phase 2: the growth limbs fill the expansion cluster. Manual
+        // pacing keeps the AI's tick clock monotonic across the two drives
+        // (`drive_until` restarts its own counter at zero).
+        let mut tick = tick;
+        let budget = tick + 12000;
+        while tick < budget {
+            let orders = ai.orders(&scenario.runtime, tick);
+            scenario
+                .runtime
+                .advance_frame(
+                    &orders,
+                    crate::headless_scenario::SIM_TICK_MS,
+                    crate::sim::world::TickLane::Ordinary,
+                    crate::sim::world::FrameEffects::default(),
+                )
+                .expect("simulation frame failed");
+            tick += 1;
+        }
+
+        // The expansion yard: the one furthest from the home yard (the
+        // first in stable order), the AI's own pick mirrored.
+        let yards = yard_cells(&scenario);
+        let home = yards[0];
+        let expansion = *yards
+            .iter()
+            .max_by_key(|cell| (cell.0 - home.0).abs().max(cell.1 - home.1).abs())
+            .expect("two yards stood");
+        let cluster = |names: &[&str]| {
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == human
+                        && entity.category() == crate::map::entities::EntityCategory::Structure
+                        && names.contains(&scenario.sim().interner.resolve(entity.type_ref()))
+                })
+                .filter(|(_, entity)| {
+                    (entity.position.rx() as i16 - expansion.0)
+                        .abs()
+                        .max((entity.position.ry() as i16 - expansion.1).abs())
+                        <= super::BASE_CLUSTER_RADIUS
+                })
+                .count()
+        };
+        let non_yard = cluster(&[
+            "GAPOWR",
+            "GAREFN",
+            "GAPILE",
+            "GAWEAP",
+            "GAAIRC",
+            "AMRADR",
+            "GATECH",
+            "GADEPT",
+            "GAPILL",
+            "NASAM",
+            "ATESLA",
+        ]);
+        let defenses_near = cluster(&["GAPILL", "NASAM", "ATESLA"]);
+        assert!(
+            non_yard >= 2 && defenses_near >= 1,
+            "the expansion cluster stayed bare: expansion yard at {expansion:?}, non-yard \
+             structures {non_yard}, defenses {defenses_near}, yards {yards:?}, tick {tick}, \
+             ai_state={:?}",
+            (
+                ai.expansion_site,
+                ai.remote_refinery_stood,
+                ai.expansion_yard_issued,
+                ai.expansion_abandoned,
+                ai.expansion2_site,
+                ai.placement_intent.map(|(ty, expansion)| (
+                    expansion,
+                    scenario.sim().interner.resolve(ty).to_string()
+                )),
+            ),
+        );
+    }
+
+    /// The building-repair limb (Layer 2 C): a damaged refinery under the
+    /// health threshold earns exactly one ToggleRepair activation — the
+    /// command is a toggle, so the limb must never re-issue on its latched
+    /// target and flip the paid repair back off.
+    #[test]
+    #[ignore = "slow; retail; loads a retail map"]
+    fn repair_toggles_on_damaged_structure() {
+        let (mut scenario, ai_house, _enemy) = pacific_bridge_battle();
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+        // A yard (the opening table resolves through it) and a refinery on
+        // the witnesses' known-land shore; the launch options' 10000-credit
+        // wallet clears the limb's bar. The refinery sits at half strength,
+        // under the three-fifths threshold.
+        spawn_near(&mut scenario, "GACNST", ai_house, (64, 92));
+        let refinery = spawn_near(&mut scenario, "GAREFN", ai_house, (66, 92));
+        {
+            let runtime = &mut scenario.runtime;
+            let strength = runtime
+                .resources
+                .rules
+                .object("GAREFN")
+                .expect("the retail refinery type")
+                .strength;
+            let entity = runtime
+                .simulation
+                .substrate
+                .entities
+                .get_mut(refinery)
+                .expect("the spawned refinery");
+            entity.health.set_for_test(strength / 2);
+        }
+        assert!(
+            !scenario
+                .sim()
+                .substrate
+                .entities
+                .get(refinery)
+                .expect("the spawned refinery")
+                .repairing
+                .is_on(),
+            "setup: the damaged refinery repairs for nobody yet"
+        );
+
+        // One activation within the first survey; no re-issue — not on the
+        // later surveys, not after the healed structure stops wanting one.
+        let mut toggles = 0;
+        for tick in 0..4 * super::REPAIR_SURVEY_TICKS {
+            let orders = ai.orders(&scenario.runtime, tick);
+            for order in &orders {
+                if let crate::sim::command::Command::ToggleRepair { entity_id } = &order.payload {
+                    assert_eq!(
+                        *entity_id, refinery,
+                        "the limb repairs the wounded economy structure, nothing else"
+                    );
+                    toggles += 1;
+                }
+            }
+            scenario
+                .runtime
+                .advance_frame(
+                    &orders,
+                    crate::headless_scenario::SIM_TICK_MS,
+                    crate::sim::world::TickLane::Ordinary,
+                    crate::sim::world::FrameEffects::default(),
+                )
+                .expect("simulation frame failed");
+        }
+        assert_eq!(
+            toggles, 1,
+            "one activation, never flipped again while the repair byte reads on"
+        );
+        assert!(
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .get(refinery)
+                .is_some_and(|entity| {
+                    let strength = scenario
+                        .runtime
+                        .resources
+                        .rules
+                        .object("GAREFN")
+                        .expect("the retail refinery type")
+                        .strength;
+                    entity.repairing.is_on() || entity.health.is_full(strength)
+                }),
+            "the activation left the refinery repairing (or repaired)"
+        );
+    }
+
+    /// The Robot Tank fix (Layer 2 E): America's Robot Control Center rung
+    /// queues once the battle lab stands, and a Robot Tank — the roster
+    /// entry whose `needs` gate the center satisfies — rolls out. The
+    /// commission used to be dead forever: the center named in no build
+    /// list, the gate never cleared, the cameo lit all game.
+    #[test]
+    #[ignore = "slow; retail; loads a match and drives tens of thousands of frames"]
+    fn robot_center_fields_robots() {
+        let (mut scenario, human) = retail_battle();
+        let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
+
+        let structures_of_type = |scenario: &crate::headless_scenario::HeadlessScenario,
+                                  name: &str| {
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == human
+                        && entity.category() == crate::map::entities::EntityCategory::Structure
+                        && scenario.sim().interner.resolve(entity.type_ref()) == name
+                })
+                .count()
+        };
+        let units_of_type = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == human
+                        && matches!(
+                            entity.category(),
+                            crate::map::entities::EntityCategory::Unit
+                                | crate::map::entities::EntityCategory::Infantry
+                        )
+                        && scenario.sim().interner.resolve(entity.type_ref()) == name
+                })
+                .count()
+        };
+
+        let tick = drive_until(&mut scenario, &mut ai, 60000, |scenario| {
+            structures_of_type(scenario, "GAROBO") >= 1 && units_of_type(scenario, "ROBO") >= 1
+        });
+        assert!(
+            structures_of_type(&scenario, "GAROBO") >= 1,
+            "the Robot Control Center stood (tick {tick}, battle lab {})",
+            structures_of_type(&scenario, "GATECH")
+        );
+        assert!(
+            units_of_type(&scenario, "ROBO") >= 1,
+            "a Robot Tank rolled out once its control center stood (tick {tick})"
+        );
+    }
+
+    /// The ore-field exclusivity (Layer 2 F): a candidate field with a
+    /// standing refinery beside it — here a hostile one — loses the survey
+    /// to the free ground beyond the exclusion radius, so neighboring
+    /// bases stop latching the same field.
+    #[test]
+    #[ignore = "slow; retail; loads a retail map"]
+    fn ore_field_exclusivity_prefers_the_free_field() {
+        let (mut scenario, human) = retail_battle();
+        let enemy_house = scenario
+            .sim()
+            .houses
+            .iter()
+            .find(|(_, house)| !house.is_controlled_by_human(true))
+            .map(|(&id, _)| id)
+            .expect("the battle's opponent");
+        let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
+
+        // No yard stands yet, so the launch MCV's cell anchors the survey
+        // exactly as the latch does at game time.
+        let mcv_cell = scenario
+            .sim()
+            .substrate
+            .entities
+            .iter_sorted()
+            .find(|(_, entity)| {
+                entity.owner() == human
+                    && entity.category() == crate::map::entities::EntityCategory::Unit
+                    && scenario.sim().interner.resolve(entity.type_ref()) == "AMCV"
+            })
+            .map(|(_, entity)| (entity.position.rx() as i16, entity.position.ry() as i16))
+            .expect("the launch MCV");
+        let survey = |scenario: &crate::headless_scenario::HeadlessScenario,
+                      ai: &SuperAi,
+                      from: (i16, i16)| {
+            ai.best_ore_field(
+                scenario.sim(),
+                &scenario.runtime.resources.rules,
+                &scenario.runtime.resources.overlay_registry,
+                from,
+                None,
+                Some("GAREFN"),
+            )
+        };
+        let first = survey(&scenario, &ai, mcv_cell)
+            .expect("the retail battle map hosts a reachable far ore field");
+
+        // A hostile refinery stands beside the winning field; the same
+        // survey must now hand back different ground, out of the exclusion
+        // radius — or no ground at all when the map has no second field.
+        let neighbor = spawn_near(&mut scenario, "NAREFN", enemy_house, first);
+        let neighbor_cell = scenario
+            .sim()
+            .substrate
+            .entities
+            .get(neighbor)
+            .map(|entity| (entity.position.rx(), entity.position.ry()))
+            .expect("the spawned neighbor refinery");
+        let second = survey(&scenario, &ai, mcv_cell);
+        let distance = |a: (u16, u16), b: (u16, u16)| {
+            (i32::from(a.0) - i32::from(b.0))
+                .abs()
+                .max((i32::from(a.1) - i32::from(b.1)).abs()) as u32
+        };
+        assert!(
+            second.is_none_or(|cell| cell != first
+                && distance(cell, neighbor_cell) >= super::ORE_FIELD_EXCLUSION_RADIUS as u32),
+            "the survey latched the contested field again: first {first:?}, second {second:?}, \
+             neighbor refinery at {neighbor_cell:?}"
+        );
+        assert!(
+            distance(first, neighbor_cell) < super::ORE_FIELD_EXCLUSION_RADIUS as u32,
+            "setup: the neighbor refinery must contest the first pick (at {neighbor_cell:?})"
+        );
     }
 }
