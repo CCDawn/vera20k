@@ -106,6 +106,26 @@ const HARVESTER_TARGET: usize = 5;
 /// idle units inside it hold an Area Guard post on the yard.
 const BASE_DEFENSE_RADIUS: i16 = 16;
 
+/// The base alarm's recency window (Layer 3.5): a building hit this
+/// recently — by the house's native damage admission stamp — arms the
+/// active-defense limb.
+const BASE_ALARM_TICKS: u32 = 90;
+
+/// How long the defense stance holds after its last refresh, in ticks: the
+/// defenders keep the focus through the mop-up instead of disbanding the
+/// instant the last hit lands.
+const DEFENSE_HOLD_TICKS: u32 = 450;
+
+/// The defense stance's commit floor: units are pulled off their guard
+/// posts onto the focus until this many defenders stand on it. The
+/// [`GUARD_RESERVE`] alone cannot hold a determined push.
+const DEFENSE_COMMIT_MIN: usize = 4;
+
+/// The alarm limb's intruder search radius, cells — wider than the idle
+/// perimeter's [`BASE_DEFENSE_RADIUS`] so stand-off artillery or a raiding
+/// flight sitting outside the perimeter still draws the recall.
+const ALARM_RADIUS: i16 = 24;
+
 /// How many combat units must stand gathered (idle or on the guard post)
 /// before a wave launches as one mass: production has to outpace attrition
 /// first. Sized for the three-factory expansion — the faster queue gathers
@@ -335,8 +355,13 @@ const FACTORY_CREDITS: i32 = 1500;
 /// Growth power cap. Without one the deficit rule (queue a plant the
 /// moment drain overtakes output) claims every growth slot in a
 /// power-hungry base and the refinery and factory rules behind it never
-/// take a turn (observed: two growth plants and no fourth factory).
-const POWER_CAP: usize = 8;
+/// take a turn (observed: two growth plants and no fourth factory). The
+/// Layer 2.5 preemption raised the real cap from eight: a two-yard base's
+/// drain (robot control −100, repair bay −200, the lab-and-radar climb,
+/// the gun ring) runs past eight Allied plants' 1600 output well before
+/// the game ends, and the old cap pinned late-game grids into a permanent
+/// brownout (observed live: blackouts at eight plants standing).
+const POWER_CAP: usize = 16;
 
 /// The power margin (Layer 2): while the grid's headroom (`output - drain`)
 /// sits below the draw of one more war factory plus refinery — a fixed
@@ -944,6 +969,14 @@ pub struct SuperAi {
     /// and bounds the damage a wave of entirely dropped dispatches can do to
     /// one order per unit per interval.
     next_wave_tick: u32,
+    /// The base-alarm stance's focus cell and the tick it lifts; see
+    /// [`Self::base_defense_orders`]. Pinned state, never read from the
+    /// runtime.
+    defense_focus: Option<((u16, u16), u32)>,
+    /// Units committed to the active base-alarm stance, off their guard
+    /// posts until the stance lifts. Pinned state, never read from the
+    /// runtime.
+    defenders: Vec<u64>,
     /// Earliest tick each idle unit may take another single-unit order; see
     /// [`IDLE_REORDER_TICKS`]. Pinned state, never read from the runtime.
     order_gate: std::collections::HashMap<u64, u32>,
@@ -1118,6 +1151,8 @@ impl SuperAi {
             wave_launching: false,
             launched: Vec::new(),
             next_wave_tick: 0,
+            defense_focus: None,
+            defenders: Vec::new(),
             order_gate: std::collections::HashMap::new(),
             next_airstrike_tick: 0,
             next_sw_fire_tick: 0,
@@ -1708,10 +1743,20 @@ impl SuperAi {
             return vec![CommandEnvelope::new(self.house, at, command)];
         }
 
-        // Home defense and the offensive. Idle combat units first engage the
-        // nearest intruder inside the base perimeter. Otherwise the offense
-        // moves in waves: once `ATTACK_WAVE_SIZE` units stand gathered (idle
-        // or on their guard post), the wave launches — one standing unit per
+        // Home defense and the offensive. The base alarm (Layer 3.5) comes
+        // first: a building hit inside [`BASE_ALARM_TICKS`] arms an
+        // active-defense stance that dispatches idle units onto the
+        // intruder and, short of [`DEFENSE_COMMIT_MIN`] defenders, pulls
+        // the nearest posted units off their guard posts and onto the
+        // focus — the old limb answered only with whatever idle unit
+        // happened to stand inside [`BASE_DEFENSE_RADIUS`], so a base
+        // whose army was away fighting waved the enemy through
+        // (observed live: razed yards, no reaction). While the stance
+        // stands no new wave departs; the wave already marching stays
+        // out. Otherwise idle combat units engage the nearest intruder
+        // inside any yard's perimeter. Otherwise the offense moves in
+        // waves: once `ATTACK_WAVE_SIZE` units stand gathered (idle or on
+        // their guard post), the wave launches — one standing unit per
         // tick attack-moves on the enemy center, so the group departs
         // together and arrives as a mass — until only the guard reserve
         // remains home; production then rebuilds the next wave while the
@@ -1721,8 +1766,19 @@ impl SuperAi {
         // so no spam follows, and a wave that dies lets the next one form.
         if let Some(center) = self.structure_center(sim, opening.construction_yard) {
             let idle = self.idle_combat_units(sim, opening);
+            let alarm_armed = self.base_alarm_armed(sim, tick);
+            if alarm_armed || self.defense_focus.is_some() {
+                if let Some(command) =
+                    self.base_defense_orders(sim, rules, opening, &idle, tick, alarm_armed)
+                {
+                    return vec![CommandEnvelope::new(self.house, at, command)];
+                }
+            }
             if let Some(attacker) = self.due_idle_unit(&idle, tick)
-                && let Some(target) = self.nearest_intruder(sim, center)
+                && let Some(target) = self
+                    .own_yard_centers(sim, opening)
+                    .into_iter()
+                    .find_map(|yard| self.nearest_intruder(sim, yard, BASE_DEFENSE_RADIUS))
             {
                 self.gate_idle_order(attacker, tick);
                 return vec![CommandEnvelope::new(
@@ -1742,6 +1798,7 @@ impl SuperAi {
                 None
             };
             if !self.wave_launching
+                && self.defense_focus.is_none()
                 && tick >= self.next_wave_tick
                 && standing.len() >= ATTACK_WAVE_SIZE
                 && (!enemy_targets.is_empty() || enemy_center.is_some())
@@ -2831,6 +2888,40 @@ impl SuperAi {
             .is_some()
             && !building_busy
         {
+            // The power preemption (Layer 2.5). The grid's margin prices
+            // the queue's unlanded drain in, and a grid that would run red
+            // owes a power plant before anything else in this block: the
+            // guns and the ladder below used to claim the empty slot
+            // first, so a defended base chained one Powered gun after
+            // another into a deepening brownout — guns that stand offline
+            // in low power defend nothing — and by the time the growth
+            // tail's deficit rule finally ran, the blackout had already
+            // slowed every factory through the native power factor
+            // (observed live: blackouts mid-game with plants still owed
+            // behind the gun ring). The wallet gate keeps an unpayable
+            // plant from parking in the one building slot forever.
+            let (output, drain) =
+                crate::sim::production::power_balance_for_owner(sim, rules, &owner);
+            let pending = self.pending_structure_drain(sim, rules, &owner);
+            if output - drain - pending < 0
+                && self.count_structures_of_type(sim, opening.power) < POWER_CAP
+                && let Some(ty) = rules.object(opening.power)
+                && crate::sim::production::credits_for_owner(sim, &owner) >= ty.cost
+                && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
+                && let Some(type_id) = sim.interner.get(opening.power)
+            {
+                self.placement_intent = None;
+                return vec![CommandEnvelope::new(
+                    self.house,
+                    at,
+                    Command::QueueProduction { type_id },
+                )];
+            }
+            // A grid already in the red adds no Powered gun: the coil and
+            // the AA gun stand offline below full power, so their credits
+            // buy nothing until a plant lands. The pillbox (`Power=0`)
+            // waits with them for simplicity — one plant restores the lot.
+            let grid_black = output >= drain;
             // The defense limb runs before the ladder walk. Behind it the
             // guns are dead code: the walk doubles as the rebuild scan, so
             // a destroyed late rung re-arms every slot-free tick and the
@@ -2838,7 +2929,7 @@ impl SuperAi {
             // behind a superweapon rebuild). Placement rides the same
             // yard-centered ring scan every other building uses; Yuri's
             // Gatling Cannon serves both the AA and the pillbox slots.
-            if any_tank {
+            if any_tank && grid_black {
                 for (name, expansion) in gun_wants {
                     // Guns queue only from a wallet that can pay for them
                     // outright: a broke base that queues a 1500-credit
@@ -2955,8 +3046,10 @@ impl SuperAi {
             // still passes its own cameo, so a limb the house cannot build
             // falls through to the next instead of wedging the queue.
             if any_tank {
-                let (output, drain) =
-                    crate::sim::production::power_balance_for_owner(sim, rules, &owner);
+                // The grid readings are the block's hoisted ones — the
+                // preemption's `output`, `drain` and `pending` above — so
+                // the deficit and margin rules below price the queue's
+                // unlanded drain in too.
                 let refineries = self.count_structures_of_type(sim, opening.refinery);
                 let factories = self.count_structures_of_type(sim, opening.war_factory);
                 let miners = opening
@@ -3011,6 +3104,56 @@ impl SuperAi {
                             Command::QueueProduction { type_id },
                         )];
                     }
+                    // The expansion's own production lines (Layer 2.6): a
+                    // sub-base fields its own army and miners. The house's
+                    // queues are shared, but a unit exits the factory that
+                    // builds it — without a barracks and a war factory in
+                    // the expansion's ring, every soldier and every miner
+                    // it is owed rolls out of the home base and walks the
+                    // whole map first (observed live: the expansion's
+                    // miners crossing two bridges to reach its dock). The
+                    // extra lines also pay the native MultipleFactory
+                    // speedup house-wide. Each is one per cluster, the
+                    // factory still inside the house-wide cap.
+                    let cluster_barracks = self.count_structures_of_type_near(
+                        sim,
+                        opening.barracks,
+                        expansion,
+                        BASE_CLUSTER_RADIUS,
+                    );
+                    let cluster_factories = self.count_structures_of_type_near(
+                        sim,
+                        opening.war_factory,
+                        expansion,
+                        BASE_CLUSTER_RADIUS,
+                    );
+                    if cluster_barracks < 1
+                        && let Some(ty) = rules.object(opening.barracks)
+                        && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
+                            .enabled
+                        && let Some(type_id) = sim.interner.get(opening.barracks)
+                    {
+                        self.placement_intent = Some((type_id, true));
+                        return vec![CommandEnvelope::new(
+                            self.house,
+                            at,
+                            Command::QueueProduction { type_id },
+                        )];
+                    }
+                    if cluster_factories < 1
+                        && factories < FACTORY_CAP
+                        && let Some(ty) = rules.object(opening.war_factory)
+                        && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
+                            .enabled
+                        && let Some(type_id) = sim.interner.get(opening.war_factory)
+                    {
+                        self.placement_intent = Some((type_id, true));
+                        return vec![CommandEnvelope::new(
+                            self.house,
+                            at,
+                            Command::QueueProduction { type_id },
+                        )];
+                    }
                 }
                 let growth = [
                     (
@@ -3041,7 +3184,7 @@ impl SuperAi {
                         opening.service_depot,
                     ),
                     (
-                        output - drain < 0
+                        output - drain - pending < 0
                             && self.count_structures_of_type(sim, opening.power) < POWER_CAP,
                         opening.power,
                     ),
@@ -3052,8 +3195,8 @@ impl SuperAi {
                         // under [`POWER_HEADROOM_TARGET`], bounded by the
                         // standard build-out so a war-damaged late game
                         // keeps the deficit rule alone in charge.
-                        output - drain >= 0
-                            && output - drain < POWER_HEADROOM_TARGET
+                        output - drain - pending >= 0
+                            && output - drain - pending < POWER_HEADROOM_TARGET
                             && factories < FACTORY_BUILDOUT
                             && self.count_structures_of_type(sim, opening.power) < POWER_CAP,
                         opening.power,
@@ -4499,17 +4642,18 @@ impl SuperAi {
             && !crate::map::houses::is_allied_with(alliances, them, me)
     }
 
-    /// The nearest hostile entity inside `BASE_DEFENSE_RADIUS` cells of
-    /// `center`, ties broken by the substrate's stable order. Passive houses
-    /// (observers, civilians) and allies do not count as intruders. An
-    /// entity still held by its constructor sits in limbo at (0,0) by native
-    /// semantics, so it is not an intruder anywhere.
+    /// The nearest hostile entity inside `radius` cells of `center`, ties
+    /// broken by the substrate's stable order. Passive houses (observers,
+    /// civilians) and allies do not count as intruders. An entity still
+    /// held by its constructor sits in limbo at (0,0) by native semantics,
+    /// so it is not an intruder anywhere.
     fn nearest_intruder(
         &self,
         sim: &crate::sim::world::Simulation,
         center: (i16, i16),
+        radius: i16,
     ) -> Option<u64> {
-        let limit = i32::from(BASE_DEFENSE_RADIUS) * i32::from(BASE_DEFENSE_RADIUS);
+        let limit = i32::from(radius) * i32::from(radius);
         let mut best: Option<(i32, u64)> = None;
         for (id, entity) in sim.substrate.entities.iter_sorted() {
             if entity.lifecycle.in_limbo() || !self.is_enemy(sim, entity.owner()) {
@@ -4526,6 +4670,186 @@ impl SuperAi {
             }
         }
         best.map(|(_, id)| id)
+    }
+
+    /// Whether the base alarm is armed: the house's native damage admission
+    /// stamped a building hit within [`BASE_ALARM_TICKS`]. The stamp rides
+    /// the strategy emergency block (`BuildingReceivePrelude` writes the
+    /// current frame on every building damage admission), in the same tick
+    /// units as `tick`. Zero is the never-hit native initial value.
+    fn base_alarm_armed(&self, sim: &crate::sim::world::Simulation, tick: u32) -> bool {
+        let Some(house) = sim.houses.get(&self.house) else {
+            return false;
+        };
+        let last = house.strategy_emergency().last_building_attack_frame();
+        last > 0 && i64::from(tick) - i64::from(last) <= i64::from(BASE_ALARM_TICKS)
+    }
+
+    /// The base-alarm limb's one order for this tick, or `None` to fall
+    /// through to the idle perimeter and the branches below. `armed` says
+    /// the damage stamp is fresh; the stance itself lives until the focus
+    /// hold passes, so the defenders keep the mop-up after the last hit
+    /// and the wave gate stays closed that whole while.
+    fn base_defense_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        idle: &[u64],
+        tick: u32,
+        armed: bool,
+    ) -> Option<Command> {
+        // Latch or refresh the focus: the intruder nearest any yard at the
+        // alarm radius points it — stand-off fire sits outside the idle
+        // perimeter — else a fresh alarm with no visible intruder (an air
+        // pass already gone, artillery that died to the return fire) keeps
+        // the standing focus or seeds one on the worst-wounded structure.
+        let yards = self.own_yard_centers(sim, opening);
+        let intruder = yards
+            .iter()
+            .find_map(|&yard| self.nearest_intruder(sim, yard, ALARM_RADIUS));
+        if let Some(target) = intruder
+            && let Some(entity) = sim.substrate.entities.get(target)
+        {
+            self.defense_focus = Some((
+                (entity.position.rx(), entity.position.ry()),
+                tick + DEFENSE_HOLD_TICKS,
+            ));
+        } else if armed {
+            let until = tick + DEFENSE_HOLD_TICKS;
+            let cell = self
+                .defense_focus
+                .map(|(cell, _)| cell)
+                .or_else(|| self.worst_wounded_cell(sim, rules));
+            self.defense_focus = cell.map(|cell| (cell, until));
+        }
+        // The stance lifts when its hold passes: the defenders return to
+        // the idle flow (the guard-post limb re-posts them) and the wave
+        // gate re-arms.
+        if !self.defense_focus.is_some_and(|(_, until)| tick < until) {
+            self.defense_focus = None;
+            self.defenders.clear();
+            return None;
+        }
+        // Dead defenders leave the roster — the substrate drops them.
+        self.defenders
+            .retain(|&unit| sim.substrate.entities.get(unit).is_some());
+        let (focus, _) = self.defense_focus?;
+        // A due idle unit attacks the intruder outright.
+        if let Some(attacker) = self.due_idle_unit(idle, tick)
+            && let Some(target) = intruder
+        {
+            self.gate_idle_order(attacker, tick);
+            return Some(Command::Attack {
+                attacker_id: attacker,
+                target_id: target,
+            });
+        }
+        // Short of the commit floor, the nearest standing unit leaves its
+        // post and attack-moves on the focus cell, fighting whatever it
+        // meets on the way. The standing set holds the posted and idle
+        // combat roster (hero, boarders and raiders already excluded), so
+        // this is the recall: the base's own garrison turns toward the
+        // fight instead of holding its ring while the yards burn.
+        if self.defenders.len() < DEFENSE_COMMIT_MIN {
+            let standing = self.standing_combat_units(sim, opening);
+            let mut best: Option<(i32, u64)> = None;
+            for unit in standing {
+                if self.defenders.contains(&unit)
+                    || !self.order_gate.get(&unit).is_none_or(|&at| tick >= at)
+                {
+                    continue;
+                }
+                let Some(entity) = sim.substrate.entities.get(unit) else {
+                    continue;
+                };
+                let dx = i32::from(entity.position.rx() as i16 - focus.0 as i16);
+                let dy = i32::from(entity.position.ry() as i16 - focus.1 as i16);
+                let distance_squared = dx * dx + dy * dy;
+                if best.is_none_or(|(kept, _)| distance_squared < kept) {
+                    best = Some((distance_squared, unit));
+                }
+            }
+            if let Some((_, unit)) = best {
+                self.defenders.push(unit);
+                self.gate_idle_order(unit, tick);
+                return Some(Command::AttackMove {
+                    entity_id: unit,
+                    target: None,
+                    destination: Some(crate::sim::combat::TargetKind::Cell(focus.0, focus.1)),
+                });
+            }
+        }
+        // Enough defenders committed and no idle unit due: the stance holds
+        // without spending this tick's order — the branches below keep
+        // running (production, repairs, the growth chain).
+        None
+    }
+
+    /// The cell of the house's worst-wounded standing structure, ranked by
+    /// damage fraction — the alarm limb's fallback focus when no intruder
+    /// is visible: the freshest fight's address is whatever bleeds hardest.
+    fn worst_wounded_cell(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+    ) -> Option<(u16, u16)> {
+        let mut best: Option<(i64, u16, u16)> = None;
+        for (_, entity) in sim.substrate.entities.iter_sorted() {
+            if entity.owner() != self.house
+                || entity.category() != crate::map::entities::EntityCategory::Structure
+                || entity.lifecycle.in_limbo()
+                || !entity.lifecycle.object_alive()
+            {
+                continue;
+            }
+            let Some(ty) = rules.object(sim.interner.resolve(entity.type_ref())) else {
+                continue;
+            };
+            let health = i64::from(entity.health.current().max(1));
+            let strength = i64::from(ty.strength.max(1));
+            // Health fraction in thousandths, lower = worse: cross-type
+            // wounds compare fairly without floats.
+            let fraction = health * 1000 / strength;
+            if best.is_none_or(|(kept, _, _)| fraction < kept) {
+                best = Some((
+                    fraction,
+                    entity.position.rx(),
+                    entity.position.ry(),
+                ));
+            }
+        }
+        best.map(|(_, rx, ry)| (rx, ry))
+    }
+
+    /// The total drain of the house's queued-but-unlanded buildings: every
+    /// Building and Defense item still in the production queues, priced at
+    /// its retail `Power` (negative = drain; a queued plant's positive
+    /// output pays nothing back until it stands, so only the drain side
+    /// counts). Drain bites the instant an item places, so the margin rules
+    /// must price the whole queue in — a grid that reads black with two
+    /// coils queued browns out the moment they land.
+    fn pending_structure_drain(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        owner: &str,
+    ) -> i32 {
+        crate::sim::production::queue_view_for_owner(sim, rules, owner)
+            .into_iter()
+            .filter(|item| {
+                matches!(
+                    item.queue_category,
+                    crate::sim::production::ProductionCategory::Building
+                        | crate::sim::production::ProductionCategory::Defense
+                )
+            })
+            .filter_map(|item| {
+                rules
+                    .object(sim.interner.resolve(item.type_id))
+                    .map(|ty| ty.power.min(0))
+            })
+            .sum()
     }
 
     /// The hostile structures a wave marches on, in the substrate's stable
