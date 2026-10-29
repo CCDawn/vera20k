@@ -879,15 +879,21 @@ fn a_computer_house_without_a_yard_hunts_and_deploys_its_mcv() {
 /// [`house_fixture`] with a tank and an infantryman for `Americans` and a
 /// tank for a human `Russians` house, each holding an archive target.
 fn ground_force_fixture(human: bool) -> (Simulation, RuleSet, u64, [u64; 3]) {
-    let text = "[InfantryTypes]\n0=E1\n[AircraftTypes]\n[VehicleTypes]\n0=AMCV\n1=MTNK\n\
+    ground_force_fixture_with(human, "")
+}
+
+fn ground_force_fixture_with(human: bool, general: &str) -> (Simulation, RuleSet, u64, [u64; 3]) {
+    let text = format!(
+        "[General]\n{general}\n[InfantryTypes]\n0=E1\n[AircraftTypes]\n[VehicleTypes]\n0=AMCV\n1=MTNK\n\
          [BuildingTypes]\n0=YARD\n[AI]\nBuildConst=YARD\n\
-         [AMCV]\nStrength=1000\nSpeed=5\nROT=5\nLocomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\nDeploysInto=YARD\n\
-         [MTNK]\nStrength=400\nSpeed=6\nROT=5\nLocomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n\
-         [E1]\nStrength=125\nSpeed=4\nLocomotor={4A582744-9839-11d1-B709-00A024DDAFD1}\n\
+         [AMCV]\nStrength=1000\nSpeed=5\nROT=5\nLocomotor={{4A582741-9839-11d1-B709-00A024DDAFD1}}\nDeploysInto=YARD\n\
+         [MTNK]\nStrength=400\nSpeed=6\nROT=5\nLocomotor={{4A582741-9839-11d1-B709-00A024DDAFD1}}\n\
+         [E1]\nStrength=125\nSpeed=4\nLocomotor={{4A582744-9839-11d1-B709-00A024DDAFD1}}\n\
          [YARD]\nStrength=1000\nConstructionYard=yes\nDeployFacing=4\n\
-         [Hunt]\nRate=0.016\n[Guard]\nRate=0.016\n[Unload]\nRate=0.016\n[Clear]\nBuildable=yes\n";
+         [Hunt]\nRate=0.016\n[Guard]\nRate=0.016\n[Unload]\nRate=0.016\n[Clear]\nBuildable=yes\n"
+    );
     let rules = RuleSet::from_ini_with_fixed_art_for_test(
-        &IniFile::from_str(text),
+        &IniFile::from_str(&text),
         &IniFile::from_str("[YARD]\nFoundation=4x3\n"),
     )
     .unwrap();
@@ -992,6 +998,31 @@ fn a_computer_yard_deploy_sends_its_ground_force_to_the_base() {
             .unwrap()
             .0;
         assert!(!ordered(yard_id));
+    }
+}
+
+/// Phobos `[General] GatherWhenMCVDeploy=no` skips only the native call at
+/// `0x00739926`: the yard still deploys and every earlier write stays.
+#[cfg(feature = "phobos")]
+#[test]
+fn gather_when_mcv_deploy_no_leaves_the_ground_force_alone() {
+    let (mut sim, rules, _mcv, [tank, infantry, _enemy]) =
+        ground_force_fixture_with(false, "GatherWhenMCVDeploy=no");
+    for _ in 0..140 {
+        if !yard_cells(&sim).is_empty() {
+            break;
+        }
+        tick(&mut sim, &rules, None);
+    }
+    assert_eq!(yard_cells(&sim).len(), 1, "the yard still deploys");
+    let entity = |id| sim.substrate.entities.get(id).unwrap();
+    for id in [tank, infantry] {
+        assert!(entity(id).archive_target().is_some());
+        assert!(entity(id).navigation.nav_com().is_none());
+        assert!(
+            entity(id).mission.current() != MissionId::from_known(MissionType::Move)
+                && entity(id).mission.queued() != MissionId::from_known(MissionType::Move)
+        );
     }
 }
 

@@ -109,14 +109,6 @@ pub fn build_options_for_owner(sim: &Simulation, rules: &RuleSet, owner: &str) -
         .collect()
 }
 
-/// True if this owner has at least one buildable production option — useful
-/// for picking a likely local player house in UI code.
-pub fn has_build_option_for_owner(sim: &Simulation, rules: &RuleSet, owner: &str) -> bool {
-    super::production_tech::all_build_options_for_owner(sim, rules, owner)
-        .iter()
-        .any(|o| o.enabled)
-}
-
 /// StripClass::AI6A8DC6 visits the local sidebar's retained Factory links.
 /// HasChanged4C9C60 is consumed before IsComplete4CA130, in entry order; a
 /// remote or absent strip never consumes that Factory's notification. Mobile
@@ -282,7 +274,11 @@ pub(in crate::sim) fn exit_produced_object(
     // Exit443C81 sets Techno+3D5 before RTTI, admission or Unlimbo.
     entity.in_playfield.enter();
     let product_type_id = entity.type_ref();
-    let Some(product_type) = sim.object_type(product_type_id, rules) else {
+    let product_category = entity.category();
+    let Some(product_type) =
+        sim.interner
+            .object_type_in_category(product_type_id, product_category.into(), rules)
+    else {
         return BuildingExit::Failed;
     };
     // The native RTTI6 jump-table arm delegates to the existing building
@@ -298,18 +294,20 @@ pub(in crate::sim) fn exit_produced_object(
             effects,
         );
     }
-    let Some(kind) = UnitChoiceKind::of(product_type.category) else {
-        return BuildingExit::Failed;
-    };
     let Some((owner_id, producer_type)) =
         sim.substrate
             .entities
             .get(producer_id)
             .and_then(|producer| {
-                sim.object_type(producer.type_ref(), rules)
+                sim.entity_object_type(producer, rules)
                     .map(|object| (producer.owner(), object))
             })
     else {
+        return BuildingExit::Failed;
+    };
+    // NPSE 2.0 Exit_Object C33940..C33998 reads the producer's Naval,
+    // unlike capped starts and abandonment, which read the product's type.
+    let Some(kind) = UnitChoiceKind::of(product_type.category, producer_type.naval) else {
         return BuildingExit::Failed;
     };
     //444096..4440D7 skips FreeRadio65ADC0 for Hospital, Armory and WeaponsFactory.
@@ -344,6 +342,27 @@ pub(in crate::sim) fn exit_produced_object(
         );
         if let Some(house) = sim.houses.get_mut(&owner_id) {
             house.ai_unit_choices_mut().clear(kind);
+            // Phobos `BuildingClass_KickOutUnit_UnitType/InfantryType/
+            // AircraftType` (`0x444119`, `0x444131`, `0x443CCA`) clears the
+            // house's factory slot at this prefix, before FreeRadio and
+            // placement retries can leave the product held.
+            #[cfg(feature = "phobos")]
+            if rules.parallel_ai_queues().allows_parallel() {
+                let slot = crate::sim::ai_base_building::AiFactorySlot::for_product(
+                    product_type.category,
+                    producer_type.naval,
+                );
+                house
+                    .ai_production_mut()
+                    .clear_parallel_factory(slot, producer_id);
+            }
+            // NPSE 2.0 C2EF95 (aircraft), C3395E/C3397F (vehicle),
+            // C2F184 (infantry): release at this prefix, before later
+            // placement/FreeRadio retries can leave the object held.
+            #[cfg(feature = "npatch")]
+            house
+                .ai_production_mut()
+                .release_parallel(product_type.category, producer_type.naval);
         }
     }
     if kind == UnitChoiceKind::Aircraft {
@@ -600,7 +619,7 @@ fn exit_land(
     let coord = crate::sim::movement::building_exit_coordinate(
         crate::sim::movement::ground_pose::position_world_coord(&producer.position),
         sim.interner
-            .object_type(producer.type_ref(), rules)
+            .object_type_in_category(producer.type_ref(), producer.category().into(), rules)
             .expect("the producer has a type"),
         || {
             crate::sim::movement::ground_pose::object_get_coords(
@@ -702,7 +721,7 @@ fn exit_at_dock(
             sim,
             rules,
             producer_id,
-            product_type.id.as_str(),
+            product_type,
             overlay_registry,
             effects,
         );
@@ -765,7 +784,7 @@ fn exit_cloning_vat_copies(
     sim: &mut Simulation,
     rules: &RuleSet,
     producer_id: u64,
-    product_type_name: &str,
+    product_type: &crate::rules::object_type::ObjectType,
     overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     effects: FrameEffects<'_>,
 ) {
@@ -774,7 +793,7 @@ fn exit_cloning_vat_copies(
     };
     let owner = producer.owner();
     let clones = sim
-        .object_type(producer.type_ref(), rules)
+        .entity_object_type(producer, rules)
         .is_some_and(|producer_type| {
             producer_type.factory_type()
                 == Some(crate::rules::object_type::FactoryType::InfantryType)
@@ -791,7 +810,7 @@ fn exit_cloning_vat_copies(
     for vat_id in vat_ids {
         let Some((vat_owner, is_cloning_vat)) =
             sim.substrate.entities.get(vat_id).and_then(|vat| {
-                let object = sim.object_type(vat.type_ref(), rules)?;
+                let object = sim.entity_object_type(vat, rules)?;
                 Some((vat.owner(), object.cloning))
             })
         else {
@@ -803,8 +822,8 @@ fn exit_cloning_vat_copies(
         let vat_owner_name = sim.interner.resolve(vat_owner).to_owned();
         // Create_Object takes only the vat's House (`0x00444A24..0x00444A2B`);
         // the new object waits in limbo for the vat's exit to place it.
-        let Some(clone_id) = sim.construct_object_limbo_at_height(
-            product_type_name,
+        let Some(clone_id) = sim.construct_resolved_object_limbo_at_height(
+            product_type,
             &vat_owner_name,
             0,
             0,
@@ -940,7 +959,7 @@ impl ExitProducer {
     fn of(sim: &Simulation, rules: &RuleSet, producer_id: u64) -> Option<Self> {
         let producer = sim.substrate.entities.get(producer_id)?;
         let house = producer.owner();
-        let object = sim.object_type(producer.type_ref(), rules);
+        let object = sim.entity_object_type(producer, rules);
         Some(Self {
             house,
             computer: sim.houses.get(&house).is_some_and(|house| {

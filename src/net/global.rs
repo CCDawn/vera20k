@@ -10,6 +10,9 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 use super::reliable::{Delivery, RetryTiming, SendQueue, connection_prefix, sequence};
 
+mod loading_observation;
+pub use loading_observation::{LoadingObservation, LoadingObservationLog};
+
 pub const GLOBAL_HEADER_LEN: usize = 16;
 pub const GLOBAL_DISCRIMINATOR: u16 = 0x1236;
 
@@ -22,6 +25,15 @@ pub struct GlobalConfig {
     pub max_payload_bytes: usize,
     pub send_capacity: usize,
     pub receive_capacity: usize,
+    pub acknowledgments: GlobalAcknowledgments,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalAcknowledgments {
+    /// Original53FCF9 compares sequence only.
+    Native,
+    /// VERA online authenticates the sender and matches its destination.
+    AuthenticatedSource,
 }
 
 impl Default for GlobalConfig {
@@ -32,6 +44,7 @@ impl Default for GlobalConfig {
             max_payload_bytes: 455,
             send_capacity: 160,
             receive_capacity: 320,
+            acknowledgments: GlobalAcknowledgments::Native,
         }
     }
 }
@@ -77,6 +90,17 @@ pub enum GlobalReceiveError {
     ShortHeader,
     #[error("global discriminator {actual:#06x} does not match {expected:#06x}")]
     WrongDiscriminator { expected: u16, actual: u16 },
+    #[error("global acknowledgment does not match a sent message to its authenticated source")]
+    UnmatchedAcknowledgment,
+}
+
+/// Observation from the existing send owner at ACK retirement, in wall-clock
+/// buckets. This is consumed during startup; it never advances simulation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalResponseTime {
+    pub destination: GlobalDestination,
+    pub sequence: u32,
+    pub elapsed: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +165,8 @@ pub struct GlobalChannel {
     seen: Vec<SeenMessage>,
     next_seen: usize,
     total_received: u32,
+    responses: VecDeque<GlobalResponseTime>,
+    loading_observation: Option<LoadingObservationLog>,
 }
 
 impl GlobalChannel {
@@ -172,6 +198,8 @@ impl GlobalChannel {
             ],
             next_seen: 0,
             total_received: 0,
+            responses: VecDeque::new(),
+            loading_observation: None,
         }
     }
 
@@ -183,6 +211,49 @@ impl GlobalChannel {
 
     pub fn set_timing(&mut self, timing: RetryTiming) {
         self.timing = timing;
+    }
+
+    pub fn require_authenticated_acknowledgments(&mut self) {
+        self.config.acknowledgments = GlobalAcknowledgments::AuthenticatedSource;
+    }
+
+    /// Read-only capture fact from the actual ACK matching policy.
+    pub fn authenticated_acknowledgments(&self) -> bool {
+        self.config.acknowledgments == GlobalAcknowledgments::AuthenticatedSource
+    }
+
+    pub fn available_send_slots(&self) -> usize {
+        self.send.available_slots()
+    }
+    pub fn next_send_sequence(&self) -> u32 {
+        self.send.total_enqueued()
+    }
+    pub fn pop_response_time(&mut self) -> Option<GlobalResponseTime> {
+        self.responses.pop_front()
+    }
+
+    /// Explicit capture opt-in; observations never participate in admission,
+    /// retry, ACK matching, row mutation or the simulation hash.
+    pub fn observe_loading(&mut self) {
+        self.loading_observation
+            .get_or_insert_with(Default::default);
+    }
+
+    pub fn loading_observation(&self) -> Option<&LoadingObservationLog> {
+        self.loading_observation.as_ref()
+    }
+
+    pub fn observe_loading_application(
+        &mut self,
+        source: usize,
+        sequence: u32,
+        percent: i32,
+        displayed: f64,
+        applied: bool,
+    ) {
+        if let Some(log) = self.loading_observation.as_mut() {
+            log.application(source, sequence, percent, displayed, applied);
+        }
     }
 
     pub const fn discriminator(&self) -> u16 {
@@ -232,7 +303,11 @@ impl GlobalChannel {
             sequence_override
         };
         let frame = self.frame(kind, outgoing_sequence, payload);
-        self.send.enqueue(frame, destination)
+        let admitted = self.send.enqueue(frame, destination);
+        if admitted && let Some(log) = self.loading_observation.as_mut() {
+            log.admitted(payload, destination, outgoing_sequence, kind == 0);
+        }
+        admitted
     }
 
     /// Global53FCB0 accepts new sources. It compares the discriminator, not
@@ -257,17 +332,41 @@ impl GlobalChannel {
             });
         }
         let incoming_sequence = sequence(frame);
+        let mut normalized_source = source;
+        if source_port_override != 0 {
+            normalized_source.set_port(source_port_override);
+        }
         if frame[2] == 2 {
             // Original53FCF9..53FD2F deliberately does not compare source.
-            self.send.acknowledge(incoming_sequence);
+            // The online adaptation has authenticated source identities:
+            // another admitted member cannot acknowledge this destination.
+            let strict = self.config.acknowledgments == GlobalAcknowledgments::AuthenticatedSource;
+            let matched = self
+                .send
+                .acknowledge(incoming_sequence, strict, |destination| {
+                    if !strict {
+                        return true;
+                    }
+                    match destination {
+                        GlobalDestination::Direct {
+                            mut endpoint,
+                            port_override,
+                        } => {
+                            if port_override != 0 {
+                                endpoint.set_port(port_override);
+                            }
+                            endpoint == normalized_source
+                        }
+                        GlobalDestination::Broadcast { .. } => false,
+                    }
+                });
+            if strict && !matched {
+                return Err(GlobalReceiveError::UnmatchedAcknowledgment);
+            }
             return Ok(GlobalReceiveOutcome::Acknowledgment);
         }
         if frame[2] > 1 {
             return Ok(GlobalReceiveOutcome::IgnoredKind);
-        }
-        let mut normalized_source = source;
-        if source_port_override != 0 {
-            normalized_source.set_port(source_port_override);
         }
         let duplicate = frame[2] == 0
             && self
@@ -321,7 +420,33 @@ impl GlobalChannel {
         now_ticks: u32,
         send: &mut impl FnMut(GlobalDestination, &[u8]),
     ) -> bool {
-        if !self.send.service(now_ticks, self.timing, send) {
+        let observe = self.config.acknowledgments == GlobalAcknowledgments::AuthenticatedSource;
+        let responses = &mut self.responses;
+        let capacity = self.config.send_capacity;
+        let loading = &mut self.loading_observation;
+        if !self.send.service(
+            now_ticks,
+            self.timing,
+            send,
+            &mut |destination, sequence, elapsed| {
+                if let Some(log) = loading.as_mut() {
+                    log.retired(destination, sequence);
+                }
+                if observe {
+                    // Derived observations are bounded by the send owner's cap.
+                    // Startup consumes them every service pass; no history is
+                    // retained after the corresponding latency probe completes.
+                    if responses.len() == capacity {
+                        responses.pop_front();
+                    }
+                    responses.push_back(GlobalResponseTime {
+                        destination,
+                        sequence,
+                        elapsed,
+                    });
+                }
+            },
+        ) {
             return false;
         }
         self.retire_consumed();
@@ -399,6 +524,24 @@ impl GlobalChannel {
     pub fn cancel_sends_to(&mut self, host: Ipv4Addr, port_override: u16) -> usize {
         self.send
             .cancel(|destination| destination.host_and_override() == (host, port_override))
+    }
+
+    /// VERA direct-LAN lifecycle cancellation includes the UDP port. Several
+    /// admitted clients may share one host; native540340's host-only match
+    /// remains available for its original consumers above.
+    pub fn cancel_sends_to_endpoint(&mut self, endpoint: SocketAddrV4) -> usize {
+        self.send.cancel(|destination| match destination {
+            GlobalDestination::Direct {
+                endpoint: mut sent,
+                port_override,
+            } => {
+                if port_override != 0 {
+                    sent.set_port(port_override);
+                }
+                sent == endpoint
+            }
+            GlobalDestination::Broadcast { .. } => false,
+        })
     }
 
     fn frame(&self, kind: u8, sequence: u32, payload: &[u8]) -> Vec<u8> {

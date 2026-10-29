@@ -115,7 +115,7 @@ impl JumpjetFlightHost for CruiseHost<'_> {
         self.sim.deselect_over_player_shroud(id, |sim, owner| {
             sim.session.current_house() == Some(owner)
         });
-        if let Some(player) = self.sim.jumpjet_discovery_due(id) {
+        for player in self.sim.jumpjet_discovery_due(id) {
             let context = super::UninitContext::new(self.rules, self.registry)
                 .with_effects(self.frame_effects);
             runtime.with_owner_call(self.sim, id, |sim| {
@@ -677,17 +677,23 @@ impl Simulation {
     /// put (`0x0047E953..0x0047E9DC`, [`Self::discover_cell_put_object`]) has
     /// already discovered every object it puts down, so the probe only acts
     /// in a campaign. Answers the player when the probe discovers.
-    fn jumpjet_discovery_due(&self, id: u64) -> Option<crate::sim::intern::InternedId> {
-        let player = self.session.current_house()?;
-        let terrain = self.resolved_terrain.as_ref()?;
-        let entity = self.substrate.entities.get(id)?;
-        if entity.discovery.discovered_by_current_house() || entity.owner() == player {
-            return None;
-        }
+    fn jumpjet_discovery_due(&self, id: u64) -> Vec<crate::sim::intern::InternedId> {
+        let Some(terrain) = self.resolved_terrain.as_ref() else {
+            return Vec::new();
+        };
+        let Some(entity) = self.substrate.entities.get(id) else {
+            return Vec::new();
+        };
         let location = crate::sim::movement::ground_pose::object_location(entity, Some(terrain));
         let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
-        (!crate::sim::vision::point_is_shrouded(&self.fog, &cells, player, location))
-            .then_some(player)
+        self.represented_player_maps()
+            .into_iter()
+            .filter(|&player| {
+                !self.techno_discovered_by_viewer(id, player)
+                    && entity.owner() != player
+                    && !crate::sim::vision::point_is_shrouded(&self.fog, &cells, player, location)
+            })
+            .collect()
     }
 
     /// `INotifyProc::Notify(0x117B)` of a `BalloonHover=` or `JumpJet=` owner

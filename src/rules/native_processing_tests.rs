@@ -1855,6 +1855,9 @@ fn retail_rulesmd_artmd_constructor_trace_matches_verified_base_oracle() {
         .expect("stock base Rules pass processes");
     let events = processed.native_type_construction_trace().events();
 
+    // Regression pins, not native goldens: no checked gamemd run produces this
+    // stream. The count and FNV hash first appear in 2df8bef0e without a
+    // producer (#745).
     assert_eq!(events.len(), 1_975);
     assert_eq!(native_type_event_oracle_hash(events), 0x24516fbd1a096a12);
 
@@ -1957,6 +1960,9 @@ fn retail_cold_start_and_noncampaign_prepass_match_verified_native_oracles() {
     )
     .expect("stock cold startup processes");
 
+    // The cold-start, prepass and cumulative hashes below are projections of
+    // static retail data (two independent projections in bc841b754, adopted by
+    // 9145bd87e), not checked gamemd executions (#745).
     assert_eq!(startup_boundaries, [1, 608, 612, 1_014, 1_070]);
     assert_eq!(startup.event_count(), 1_070);
     assert_eq!(

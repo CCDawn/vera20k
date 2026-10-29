@@ -166,8 +166,12 @@ impl CombatLightRenderer {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Combat Light Exact RGB565 Pipeline Layout"),
-            bind_group_layouts: &[&camera_layout, &scene_bind_group_layout, &mask_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[
+                Some(&camera_layout),
+                Some(&scene_bind_group_layout),
+                Some(&mask_layout),
+            ],
+            immediate_size: 0,
         });
         let attributes = wgpu::vertex_attr_array![0 => Sint32x2, 1 => Uint32, 2 => Uint32];
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -196,7 +200,7 @@ impl CombatLightRenderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -358,8 +362,8 @@ impl CombatLightRenderer {
         self.targets.render_view.clone()
     }
 
-    /// Texture behind [`Self::composition_view`]. Screenshot retention copies
-    /// it at the UI/cursor boundary before the cursor pass modifies it.
+    /// Live world composition behind [`Self::composition_view`]. Wheel zoom
+    /// resolves this into a separate frame before screen-fixed UI is added.
     pub(crate) fn composition_texture(&self) -> &wgpu::Texture {
         &self.targets.texture
     }
@@ -432,6 +436,7 @@ impl CombatLightRenderer {
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
@@ -441,31 +446,6 @@ impl CombatLightRenderer {
         pass.set_scissor_rect(tactical[0], tactical[1], tactical[2], tactical[3]);
         pass.draw(0..6, index..index + 1);
         true
-    }
-
-    /// Copy the completed tactical frame into the swapchain or upscale input.
-    pub(crate) fn copy_to(&self, encoder: &mut wgpu::CommandEncoder, destination: &wgpu::Texture) {
-        debug_assert_eq!(destination.width(), self.targets.width);
-        debug_assert_eq!(destination.height(), self.targets.height);
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.targets.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: destination,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: self.targets.width,
-                height: self.targets.height,
-                depth_or_array_layers: 1,
-            },
-        );
     }
 }
 

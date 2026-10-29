@@ -336,7 +336,7 @@ fn chrono_reinforcement_reader_dispatch_placement_and_process_match_original() {
         let mut action = sim
             .trigger_runtime
             .definitions
-            .resolve_action(entry, None, None);
+            .resolve_action(entry, None, None, None);
         if let Some(waypoint) = input["waypoint_override"].as_i64() {
             action.entry.waypoint_index = Some(waypoint as u32);
         }

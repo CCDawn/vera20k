@@ -2,6 +2,52 @@
 //! up the supplied native storage; every operation calls the production owner.
 
 use super::*;
+
+#[test]
+fn team_lookup_events_preserve_names_order_and_do_not_allocate() {
+    use crate::rules::{ini_parser::IniFile, team_ai_ini::TeamAiIniRegistry};
+
+    let long_name = "N".repeat(48);
+    let fixed = IniFile::from_str(&format!(
+        "[TeamTypes]\n0=MISSING\n1=FIRST\n2=SECOND\n\
+         [FIRST]\nName=SECOND\n[SECOND]\nName={long_name}Z\n"
+    ));
+    let map = crate::map::map_file::MapFile::from_ini(IniFile::from_str(&format!(
+        "[Map]\nTheater=TEMPERATE\nSize=0,0,2,1\nLocalSize=0,0,2,1\n\
+         [IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n\
+         [TeamTypes]\n0=CASE_MISSING\n1=case_missing\n\
+         [case_missing]\nName=PHANTOM\nTag=BAD\n\
+         [Triggers]\nT=Neutral,<none>,lookup,0,1,1,1,0\n\
+         [Events]\nT=5,1,1,SECOND,1,1,GHOST,1,1, SECOND,1,1,{long_name},1,1,PHANTOM\n\
+         [Actions]\nT=1,7,1,LATE,0,0,0,0,A\n"
+    )))
+    .unwrap();
+    let teams = TeamAiIniRegistry::from_sources(&fixed, &map.ini, true);
+    let definitions = RuntimeDefinitions::read_map(&map, &teams, None, None, None);
+
+    // 6F19B0 constructs MISSING even though its section read fails; Event
+    // 71F595 never constructs GHOST or trims the leading space. The action
+    // factory runs after these events and alone appends LATE. CASE_MISSING
+    // keeps its first spelling, so [case_missing] cannot import Name or Tag.
+    assert_eq!(
+        definitions.team_types,
+        ["MISSING", "FIRST", "SECOND", "CASE_MISSING", "LATE"]
+    );
+    assert_eq!(definitions.team_tags, [None; 5]);
+    assert!(
+        definitions.tag_types.is_empty(),
+        "retained-case body is absent"
+    );
+    let event_names: Vec<_> = definitions.trigger_types[0]
+        .events
+        .iter()
+        .map(|event| event.team_name.as_deref())
+        .collect();
+    assert_eq!(
+        event_names,
+        [None, Some("SECOND"), None, None, Some("FIRST")]
+    );
+}
 use crate::sim::world::{DeferredDeleteQueue, DeferredDeleteTicket};
 use crate::util::save_codec;
 use serde_json::{Value, json};
@@ -149,7 +195,7 @@ fn loss_threshold_events_bind_retail_all04_reinforcement_operands() {
         Some(&map.ini),
     );
     sim.install_team_ai_registry(&teams, &rules).unwrap();
-    sim.initialize_trigger_definitions(&map, &teams, None, None);
+    sim.initialize_trigger_definitions(&map, &teams, None, None, None);
     let routes = corpus["retail_routes"].as_array().unwrap();
     assert_eq!(routes.len(), 2);
     for route in routes {
@@ -479,7 +525,7 @@ fn naval_event_retail_all05_removal_enables_black_eagle_support_once() {
         &IniFile::from_bytes(assets.get_ref("EVAMD.INI").unwrap()).unwrap(),
     );
     let cue = eva.index_of("Mis_xA5_EvaBlackEagles").unwrap();
-    sim.initialize_trigger_definitions(&excerpt, &Default::default(), Some(&eva), None);
+    sim.initialize_trigger_definitions(&excerpt, &Default::default(), Some(&eva), None, None);
     sim.classify_map_triggers(&rules);
     let tag_type = sim.trigger_runtime.definitions.tag_type(tag_id).unwrap();
     let tag = sim.shared_trigger_tag(tag_type);
@@ -805,7 +851,7 @@ fn funds_event_sov06_retail_cash_taunt_reaches_named_eva_once() {
         crate::sim::credit_income::available_money(&sim.houses, owner),
         70000
     );
-    sim.initialize_trigger_definitions(&map, &Default::default(), Some(&eva), None);
+    sim.initialize_trigger_definitions(&map, &Default::default(), Some(&eva), None, None);
     let typ = sim
         .trigger_runtime
         .definitions
@@ -983,7 +1029,7 @@ fn building_loss_event_retail_all04_sets_the_rescue_route_local() {
     );
     let owner = sim.house_by_country_index(CountryIdx(9), &rules).unwrap();
     assert_eq!(sim.interner.resolve(owner), "YuriCountry");
-    sim.initialize_trigger_definitions(&map, &Default::default(), None, None);
+    sim.initialize_trigger_definitions(&map, &Default::default(), None, None, None);
     let typ = sim
         .trigger_runtime
         .definitions
@@ -1682,6 +1728,7 @@ fn all01_due_charge_and_damage_share_the_production_house_power_phase() {
         &teams,
         Some(audio.eva()),
         Some(audio.sounds().as_ref()),
+        None,
     );
     // Preserve every actual list position. Shrinking the list would change
     // repeat0's synchronous removal/cursor advancement at indices72/107.
@@ -1984,7 +2031,7 @@ fn native_all01_super_charge_dispatch_uses_retail_type_and_retained_operands() {
             .entries()[0]
             .clone();
         assert_eq!(json!(entry.auxiliary_value()), row["read"]["auxiliary"]);
-        let action = definitions.resolve_action(entry, None, None);
+        let action = definitions.resolve_action(entry, None, None, None);
         assert_eq!(json!(action.value), row["read"]["value"]);
         sim.trigger_runtime.definitions = definitions;
         let rng_before = (
@@ -2094,7 +2141,7 @@ fn native_damage_at_waypoint_dispatch_matches_original_controls() {
             .unwrap()
             .entries()[0]
             .clone();
-        let action = definitions.resolve_action(entry, None, None);
+        let action = definitions.resolve_action(entry, None, None, None);
         assert_eq!(json!(action.value), row["read"]["value"], "{name}: +90");
         sim.trigger_runtime.definitions = definitions;
         let before = (
@@ -2287,10 +2334,11 @@ fn native_all01_reactor_damage_uses_retail_rules_and_shared_power_owner() {
     crate::sim::power_system::assess_house_power(
         sim.power_states.get_mut(&owner).unwrap(),
         &sim.substrate.entities,
+        &[1],
         &rules,
-        owner,
         &sim.interner,
         sim.session.binary_frame(),
+        false,
     );
     assert_eq!(
         json!(sim.power_states[&owner].total_output()),
@@ -2312,7 +2360,7 @@ fn native_all01_reactor_damage_uses_retail_rules_and_shared_power_owner() {
         .find(|entry| entry.kind == ACTION_DAMAGE_AT_WAYPOINT)
         .unwrap()
         .clone();
-    let action = definitions.resolve_action(entry, None, None);
+    let action = definitions.resolve_action(entry, None, None, None);
     sim.trigger_runtime.definitions = definitions;
     // Import the original post-constructor boundary. Damage crossing yellow
     // must retain the shared smoke owner's one Scenario selection draw.
@@ -2387,10 +2435,11 @@ fn native_all01_reactor_damage_uses_retail_rules_and_shared_power_owner() {
     crate::sim::power_system::assess_house_power(
         sim.power_states.get_mut(&owner).unwrap(),
         &sim.substrate.entities,
+        &[1],
         &rules,
-        owner,
         &sim.interner,
         sim.session.binary_frame(),
+        false,
     );
     assert_eq!(
         json!(sim.power_states[&owner].total_output()),
@@ -2531,7 +2580,7 @@ fn native_trigger_reveal_action_matches_original_controls() {
             .unwrap()
             .entries()[0]
             .clone();
-        let action = definitions.resolve_action(entry, None, None);
+        let action = definitions.resolve_action(entry, None, None, None);
         assert_eq!(
             json!(action.value),
             row["read"]["value"],
@@ -2901,7 +2950,7 @@ fn action_11_inline_labels_and_ordered_effects_match_original_controls() {
         let mut sim = Simulation::new();
         let mut definitions = RuntimeDefinitions::default();
         let typ = definitions.trigger_type("LABEL").unwrap();
-        let action = definitions.resolve_action(entry, None, None);
+        let action = definitions.resolve_action(entry, None, None, None);
         sim.trigger_runtime.definitions = definitions;
         let preceding = TriggerEffect::InputLockChanged {
             locked: true,
@@ -3081,7 +3130,7 @@ fn physical_team_tag_references_match_original_retention_and_long_id_controls() 
             };
             let map = crate::map::map_file::MapFile::from_bytes(scenario.as_bytes()).unwrap();
             let teams = TeamAiIniRegistry::from_sources(&fixed, &map.ini, false);
-            let definitions = RuntimeDefinitions::read_map(&map, &teams, None, None);
+            let definitions = RuntimeDefinitions::read_map(&map, &teams, None, None, None);
             assert_eq!(definitions.team_types, ["TT"]);
             assert_eq!(
                 json!(
@@ -3369,7 +3418,7 @@ fn definition_factories_match_all_original_action_reference_controls() {
         let record = crate::map::actions::parse_actions(&ini)
             .remove("REFERENCE")
             .unwrap();
-        let resolved = definitions.resolve_action(record.entries()[0].clone(), None, None);
+        let resolved = definitions.resolve_action(record.entries()[0].clone(), None, None, None);
         let names: Vec<_> = match parameter_type {
             1 | 5 => definitions.team_types.iter().map(String::as_str).collect(),
             2 => definitions
@@ -3547,7 +3596,7 @@ fn physical_retail_sov01_registration_and_enable_timers_match_original_at_all_di
                     house, 0, country, false, 0, 10,
                 ));
         }
-        sim.initialize_trigger_definitions(&map, &teams, Some(&eva), None);
+        sim.initialize_trigger_definitions(&map, &teams, Some(&eva), None, None);
         sim.trigger_runtime.fixture_difficulty = Some(integer(&row["input"]["difficulty"]));
         let runtime = &sim.trigger_runtime;
         let final_order = row["type_orders"].as_array().unwrap().last().unwrap();
@@ -4363,8 +4412,9 @@ pub(super) fn replay_native_histories(rows: impl Iterator<Item = Value>) -> usiz
                 restored_hash.finish(),
                 "{name}/{step} saved hash"
             );
-            // Continue through the restored authority at every boundary. Only
-            // cumulative test observers are transferred outside serialization.
+            // Continue through the restored authority at every boundary.
+            // Test priors and cumulative observers stay outside serialization.
+            restored.fixture_difficulty = sim.trigger_runtime.fixture_difficulty;
             restored.action_trace = std::mem::take(&mut sim.trigger_runtime.action_trace);
             restored.dispatch_trace = std::mem::take(&mut sim.trigger_runtime.dispatch_trace);
             restored.freed_trace = std::mem::take(&mut sim.trigger_runtime.freed_trace);
@@ -4451,6 +4501,7 @@ fn native_trigger_reveal_initial_event48_tags_receive_neutral_discovery_dispatch
         sim.initialize_trigger_definitions(
             &map,
             &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
+            None,
             None,
             None,
         );

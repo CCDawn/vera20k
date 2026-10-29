@@ -6,19 +6,29 @@ use crate::app::{App, AppState};
 use crate::ui::lan_shell::LanEditKey;
 use crate::ui::main_menu_dialogs::options::LauncherCue;
 use crate::ui::multiplayer_setup::*;
+use crate::ui::shell::combobox::ComboPress;
 use crate::ui::shell::trackbar::TrackbarPress;
-use std::time::Instant;
+use crate::util::time::Instant;
 use winit::event::{KeyEvent, MouseButton};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
 pub(crate) fn layout(state: &AppState) -> MultiplayerSetupLayout {
     let (w, h) = shell_layout::shell_screen_size(state);
-    MultiplayerSetupLayout::new(
+    let mut layout = MultiplayerSetupLayout::new(
         crate::app::shell_network_setup::dialog(state),
         w as i32,
         h as i32,
         shell_layout::fills_window(state),
-    )
+    );
+    if state
+        .match_state
+        .session
+        .network_setup_capacity()
+        .is_some_and(|rows| rows > 8)
+    {
+        layout.arrange_extended_rows();
+    }
+    layout
 }
 
 pub(crate) fn update_geometry(state: &mut AppState) {
@@ -48,7 +58,9 @@ fn transfer_active(state: &AppState) -> bool {
         .frontend
         .network_setup_protocol
         .as_ref()
-        .is_some_and(|protocol| protocol.transfer_progress().is_some())
+        .is_some_and(|protocol| {
+            protocol.blocking_map_transfer() && protocol.transfer_progress().is_some()
+        })
 }
 
 fn notice_feed(state: &AppState) -> [crate::ui::shell::layout::LaidOutControl; 1] {
@@ -81,6 +93,32 @@ pub(crate) fn key(state: &mut AppState, event: &KeyEvent) {
     };
     key_press(state, code, event.text.as_deref());
 }
+
+/// The chat NewEdit while it takes keys, for the input method
+/// (`app::input::ime`): [`key_press`] reaches the focused chat with no
+/// transfer, verify box, page dialog, notice or ChooseMap over the dialog.
+pub(crate) fn ime_chat_rect(state: &AppState) -> Option<crate::ui::shell::geom::RectPx> {
+    let routed = state.frontend.screen == crate::ui::game_screen::GameScreen::MainMenu
+        && state.frontend.shell_route.network_setup()
+        && state
+            .frontend
+            .skirmish_shell_state
+            .choose_map_modal
+            .is_none()
+        && !shell_transition::blocks_shell_input(state)
+        && !transfer_active(state)
+        && crate::app::shell_network_setup::verify(state).is_none()
+        && !crate::app::shell_wol::page::open(state)
+        && !notice_active(state)
+        && crate::app::shell_network_setup::view(state).is_some();
+    state
+        .frontend
+        .multiplayer_setup
+        .as_ref()
+        .filter(|ui| routed && ui.focused_control == CHAT)
+        .map(|_| layout(state).chat)
+}
+
 pub(crate) fn key_press(state: &mut AppState, code: Option<KeyCode>, text: Option<&str>) {
     if transfer_active(state) {
         return;
@@ -264,40 +302,31 @@ pub(crate) fn mouse(state: &mut AppState, button: MouseButton, pressed: bool) {
     let mut cue = None;
     if pressed {
         if let Some(popup) = ui.popup_geometry(&view, &layout) {
-            if let Some(part) = popup.scroll_part_at(x, y) {
-                ui.popup.scroll.press(
-                    part,
-                    popup.scroll_geometry(),
-                    &mut ui.popup.top_index,
-                    y,
-                    Instant::now(),
-                );
-            } else {
-                if let Some(index) = popup.row_at(x, y)
-                    && let Some(control) = ui.popup.control
-                    && let Some(item) = view
-                        .combo(control)
-                        .and_then(|combo| combo.choices.get(index))
-                {
-                    action = Some(SetupAction::Select {
-                        control,
-                        value: item.value,
-                    });
-                }
-                ui.popup.close();
-                cue = Some(LauncherCue::ComboClose);
+            let open = ui.popup.control;
+            let press = ui.popup.press_list(popup, x, y, Instant::now());
+            if let ComboPress::Pick(index) = press
+                && let Some(control) = open
+                && let Some(item) = view
+                    .combo(control)
+                    .and_then(|combo| combo.choices.get(index))
+            {
+                action = Some(SetupAction::Select {
+                    control,
+                    value: item.value,
+                });
             }
+            cue = press.cue().map(LauncherCue::from);
         } else if let Some(control) = over {
             if let Some(combo) = view.combo(control) {
-                if crate::ui::skirmish_shell::combo_arrow_hit_rect(
+                let press = ui.popup.press_face(
+                    control,
                     layout.control_rect(control).expect("combo rect"),
                     layout.page.scale,
-                )
-                .contains(x, y)
-                {
-                    ui.popup.open(control, combo.selected);
-                }
-                cue = Some(LauncherCue::ComboOpen);
+                    combo.selected,
+                    x,
+                    y,
+                );
+                cue = press.cue().map(LauncherCue::from);
             } else if CHECKBOXES.contains(&control) {
                 if crate::ui::skirmish_shell::checkbox_icon_rect(
                     layout.control_rect(control).expect("checkbox rect"),
@@ -352,6 +381,8 @@ pub(crate) fn mouse(state: &mut AppState, button: MouseButton, pressed: bool) {
                 CHOOSE_MAP => Some(SetupAction::ChooseMap),
                 EMOTE => Some(SetupAction::Emote),
                 PAGE => Some(SetupAction::Page),
+                PREVIOUS_ROWS => Some(SetupAction::RosterPage { forward: false }),
+                NEXT_ROWS => Some(SetupAction::RosterPage { forward: true }),
                 _ => None,
             };
         }
@@ -368,6 +399,9 @@ pub(crate) fn mouse(state: &mut AppState, button: MouseButton, pressed: bool) {
 /// Original scrollbar timers: one callback, no catch-up burst; no wheel or
 /// arrow-key path exists in the native ComboDropWin/list subclasses.
 pub(crate) fn poll(state: &mut AppState) -> Option<Instant> {
+    if crate::app::shell_network_setup::verify(state).is_some() {
+        return crate::app::shell_network_setup::verify_poll_scroll(state);
+    }
     if transfer_active(state) {
         return None;
     }

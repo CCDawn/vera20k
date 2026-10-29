@@ -240,8 +240,7 @@ impl LauncherOptionsLayout {
                     (LauncherCheckboxId::ShiftQueue, dlu(93, 128, 130, 10)),
                     (LauncherCheckboxId::MouseWheelZoom, dlu(93, 143, 130, 10)),
                     // Developer Options, in the main page's UI Options band.
-                    (LauncherCheckboxId::WolTestService, dlu(93, 188, 140, 10)),
-                    (LauncherCheckboxId::FpsCounter, dlu(93, 203, 130, 10)),
+                    (LauncherCheckboxId::FpsCounter, dlu(93, 188, 130, 10)),
                 ],
                 vec![(
                     LauncherButton::Page(OptionsPage::Main),
@@ -977,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn vera_page_holds_every_vera_control_clear_of_the_others() {
+    fn vera_page_holds_visible_controls_clear_of_the_others() {
         let state = vera_state();
         let layout = vera_layout();
         assert!(layout.trackbars.is_empty());
@@ -996,7 +995,7 @@ mod tests {
                 ),
             ]
         );
-        // Each box is on exactly one page.
+        // Each visible box is on exactly one page.
         let main = main_layout();
         let all: Vec<_> = main
             .checkboxes
@@ -1004,7 +1003,7 @@ mod tests {
             .chain(&layout.checkboxes)
             .map(|(id, _)| *id)
             .collect();
-        assert_eq!(all.len(), 11);
+        assert_eq!(all.len(), 10);
         for id in &all {
             assert_eq!(all.iter().filter(|other| *other == id).count(), 1, "{id:?}");
         }
@@ -1041,7 +1040,6 @@ mod tests {
             (YrOriginalStyle, ui, developer),
             (ShiftQueue, ui, developer),
             (MouseWheelZoom, ui, developer),
-            (WolTestService, developer, layout.status_help),
             (FpsCounter, developer, layout.status_help),
         ] {
             let rect = checkbox(&layout, id);
@@ -1160,7 +1158,6 @@ mod tests {
             (YrOriginalStyle, YR_ORIGINAL_STYLE_HELP),
             (ShiftQueue, SHIFT_QUEUE_HELP),
             (MouseWheelZoom, MOUSE_WHEEL_ZOOM_HELP),
-            (WolTestService, WOL_TEST_SERVICE_HELP),
             (FpsCounter, FPS_COUNTER_HELP),
         ] {
             assert_eq!(at(checkbox(&layout, id)), text(help), "{id:?}");
@@ -1504,11 +1501,6 @@ mod tests {
                 LauncherOptionsEvent::MouseWheelZoomChanged,
             ),
             (
-                WolTestService,
-                WOL_TEST_SERVICE_LABEL,
-                LauncherOptionsEvent::WolTestServiceChanged,
-            ),
-            (
                 FpsCounter,
                 FPS_COUNTER_LABEL,
                 LauncherOptionsEvent::FpsCounterChanged,
@@ -1530,6 +1522,33 @@ mod tests {
                 "{id:?}"
             );
         }
+    }
+
+    #[test]
+    fn normal_vera_page_cannot_toggle_the_diagnostic_wol_test_service() {
+        let mut state = vera_state();
+        state.values.wol_test_service = true;
+        let layout = vera_layout();
+        assert!(
+            layout
+                .checkboxes
+                .iter()
+                .all(|(id, _)| *id != LauncherCheckboxId::WolTestService)
+        );
+        // FPS takes the first developer row; the former second row is inert.
+        let fps = checkbox(&layout, LauncherCheckboxId::FpsCounter);
+        state.shell_mouse_down(fps.x + 5, fps.y + 5, &layout);
+        assert_eq!(
+            state.drain_output().events,
+            [
+                LauncherOptionsEvent::Cue(LauncherCue::Checkbox),
+                LauncherOptionsEvent::FpsCounterChanged(true)
+            ]
+        );
+        let old_fps = dlu_rect(93, 203, 130, 10);
+        state.shell_mouse_down(old_fps.x + 5, old_fps.y + 5, &layout);
+        assert!(state.drain_output().events.is_empty());
+        assert!(state.shell_checkbox_checked(LauncherCheckboxId::WolTestService));
     }
 
     #[test]

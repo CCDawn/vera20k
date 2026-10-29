@@ -313,6 +313,7 @@ from unicorn.x86_const import (UC_X86_REG_EAX, UC_X86_REG_EBP, UC_X86_REG_EBX,
 from tools.ai_base_building_oracle import FAKE, RULES, SCENARIO, STUBS, Emu, u32
 from tools.native_oracle import (NATIVE_FPCW, RET_MAGIC, STACK_BASE, STACK_SIZE, OracleError,
                                  finish_vectors, provenance, run_checked)
+from tools.native_oracle import require
 
 FRAME = 0xA8ED84
 SW_TYPES = 0xA8E334
@@ -4652,7 +4653,7 @@ def unit_light():
     startup = {key: rows[0][key] for key in ('scalars', 'nuke_level', 'geometry_initializers')}
     for row in rows:
         for key, value in startup.items():
-            assert row.pop(key) == value
+            require(row.pop(key) == value, f'{key} differs from the shared value')
     return dict(startup=startup, rows=rows, retail=dict(
         physical=physical['physical'],
         cases=retail))

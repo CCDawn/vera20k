@@ -22,7 +22,9 @@ use crate::sim::lifecycle_request::{LifecycleRequest, UninitReason};
 use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::radio::{self, RadioMessage, RadioPayload};
-use crate::sim::world::{FrameAdvanceError, FrameEffects, Simulation, UninitContext};
+use crate::sim::world::{
+    FrameAdvanceError, FrameEffects, SimSoundEvent, Simulation, UninitContext,
+};
 
 /// NavCom (`+0x5A4`) compared by pointer with `object`.
 fn nav_com_is(entity: &crate::sim::game_entity::GameEntity, object: u64) -> bool {
@@ -791,6 +793,57 @@ impl Simulation {
             let at = position_world_coord(&entity.position);
             ((at.x / 256) as i16 as u16, (at.y / 256) as i16 as u16)
         });
+        #[cfg(feature = "ares")]
+        if reason == PerCellReason::Arrival {
+            //519675 ->10049820: Capture only; exact NavCom equality with
+            //the first Unit, then Aircraft, then vehicle-like Building.
+            let capture_target = self.substrate.entities.get(id).and_then(|actor| {
+                if actor.mission.current().known() != Some(MissionType::Capture) {
+                    return None;
+                }
+                let NavTargetRef::Object { id: target } = actor.navigation.nav_com()? else {
+                    return None;
+                };
+                let layer = if actor.on_bridge() {
+                    MovementLayer::Bridge
+                } else {
+                    MovementLayer::Ground
+                };
+                let candidate = self.enter_candidate(entry_cell?, layer, true)?;
+                if candidate != target {
+                    return None;
+                }
+                let entity = self.substrate.entities.get(candidate)?;
+                if entity.category() == EntityCategory::Structure
+                    && !self
+                        .entity_object_type(entity, rules)
+                        .is_some_and(|ty| ty.is_1x1_with_undeploy())
+                {
+                    return None;
+                }
+                Some(target)
+            });
+            if let Some(target) = capture_target {
+                let outcome = self
+                    .ares_capture_vehicle(id, target, rules, registry, effects)
+                    .map_err(|cause| {
+                        FrameAdvanceError::new(
+                            self.session.tick(),
+                            self.session.binary_frame(),
+                            id,
+                            cause,
+                        )
+                    })?;
+                if outcome.consumed {
+                    //True joins ORIGINAL51A010: the actor's own event48 then
+                    //UnInit. The separate AI hook raises no actor event48.
+                    let context = UninitContext::new(rules, registry).with_effects(effects);
+                    self.dispatch_object_tag_event(id, 48, Some(id), None, context);
+                    self.uninit_with_context(id, context);
+                }
+                return Ok(outcome.bridge_state_changed);
+            }
+        }
         if reason == PerCellReason::Arrival
             && self.infantry_per_cell_occupy(id, rules, registry, effects)?
         {
@@ -843,8 +896,20 @@ impl Simulation {
                     rules,
                     effects,
                 );
-                // 0x0051A812..0x0051A84A plays VoiceComment's second sound;
-                // retail rules give no type one.
+                // 0x0051A812..0x0051A84A: a type with two or more
+                // VoiceComment sounds plays the second at the arrival's
+                // Location (PlayAt7509E0, no owner gate or draw).
+                if let Some(event) = self.substrate.entities.get(id).and_then(|actor| {
+                    let object = self.object_type(actor.type_ref(), rules)?;
+                    Some(SimSoundEvent::voc_at_location(
+                        object.voice_comment.get(1)?.clone(),
+                        actor,
+                        self.resolved_terrain.as_ref(),
+                    ))
+                }) {
+                    self.sound_events.emit(event);
+                    effects.flush_sound(self, rules);
+                }
                 if let Some(cell) = entry_cell {
                     bridge_state_changed |=
                         self.infantry_full_cell_scatter(id, cell, rules, registry, effects)?;
@@ -1514,18 +1579,16 @@ impl Simulation {
         (rx, ry): (u16, u16),
         context: UninitContext<'_>,
     ) {
-        let Some(viewer) = self.session.current_house() else {
-            return;
-        };
-        let Some(entity) = self.substrate.entities.get(id) else {
-            return;
-        };
-        if entity.discovery.discovered_by_current_house()
-            || !self.fog.is_ground_open(viewer, rx, ry)
-        {
-            return;
+        //6F5140..6F516C runs for PlayerPtr on every native client. Use
+        //each represented human's retained admission and own ground plane.
+        for viewer in self.represented_player_maps() {
+            if self.techno_discovered_by_viewer(id, viewer)
+                || !self.fog.is_ground_open(viewer, rx, ry)
+            {
+                continue;
+            }
+            self.discover_techno(id, viewer, context);
         }
-        self.discover_techno(id, viewer, context);
     }
 
     /// The range stop (`0x004D882F..0x004D896E`): the class

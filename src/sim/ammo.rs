@@ -65,6 +65,15 @@ impl TechnoAmmo {
         self.current
     }
 
+    /// Installed Ares conversion100437A0..100437B3 keeps the lesser signed
+    /// count. Dock/release state and the Techno reload clock are preserved;
+    /// InitialAmmo belongs only to construction.
+    #[cfg(feature = "ares")]
+    pub(crate) fn change_type_capacity(&mut self, maximum: i32) {
+        self.current = self.current.min(maximum);
+        self.max = maximum;
+    }
+
     /// The type's `Ammo=`; only the rearm reads it in production.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) const fn max(&self) -> i32 {
@@ -83,9 +92,11 @@ impl TechnoAmmo {
 
     /// TechnoClass::DecreaseAmmo70D670, virtual+390: only positive counts
     /// debit. Aircraft overrides the slot with RET41B900 at the caller.
-    pub(crate) fn decrease(&mut self) {
-        if self.current > 0 {
-            self.current = self.current.wrapping_sub(1);
+    /// Ares100441F0 calls the same DecreaseAmmo slot once per positive
+    /// weapon Ammo. Its closed form preserves negative/unlimited counts.
+    pub(crate) fn decrease_by(&mut self, amount: i32) {
+        if self.current > 0 && amount > 0 {
+            self.current -= amount.min(self.current);
         }
     }
 

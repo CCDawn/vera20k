@@ -12,10 +12,9 @@ use crate::assets::pal_file::{Color, Palette};
 use crate::assets::pcx_file::PcxFile;
 use crate::assets::shp_file::ShpFile;
 use crate::render::batch::{BatchRenderer, BatchTexture};
+use crate::render::chrome_atlas::{ChromeAtlasEntry, ChromePiece, pack_chrome_atlas};
 use crate::render::gpu::GpuContext;
 use crate::render::native_surface_format::ACTIVE_RETAIL_RGB565_PRESENTATION;
-
-const ATLAS_PADDING: u32 = 2;
 
 /// Synthetic atlas label for the 1x1 white texel used to draw the solid backing
 /// fill (G3) as a tinted quad. Not an asset on disk.
@@ -190,12 +189,7 @@ impl LoadingArtManifest {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LoadingScreenEntry {
-    pub uv_origin: [f32; 2],
-    pub uv_size: [f32; 2],
-    pub pixel_size: [f32; 2],
-}
+pub type LoadingScreenEntry = ChromeAtlasEntry;
 
 /// CPU-side selected-map preview prepared by the loading composition owner.
 ///
@@ -262,6 +256,9 @@ impl From<LoadingArtVariant> for LoadingScreenArtInput<'_> {
 pub struct LoadingParticipantArtInput {
     pub variant: Option<LoadingArtVariant>,
     pub ramp: [Color; 16],
+    /// Row insignia file the Country selection resolves through
+    /// `Game_GetFlagSurface @ 0x1001DCE0`, replacing the stock chain name.
+    pub side_icon: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -295,11 +292,15 @@ pub struct LoadingScreenAtlas {
     pub solid_texel: LoadingScreenEntry,
 }
 
-struct RenderedLoadingEntry {
-    label: String,
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
+/// Row insignia file selected for a loading row. A Country row with retained
+/// Ares state answers from its own `File.Flag` through `Game_GetFlagSurface @
+/// 0x1001DCE0` (patch site `0x4E3562`); every other selection keeps the stock
+/// chain name from `0x00844AE8..0x00844B14`.
+fn side_icon_name<'a>(
+    variant: Option<LoadingArtVariant>,
+    country_file: Option<&'a str>,
+) -> Option<&'a str> {
+    country_file.or_else(|| variant.map(LoadingArtVariant::side_icon_pcx))
 }
 
 /// Resolve the one background layer before atlas packing. Explicit Country
@@ -308,7 +309,7 @@ fn render_loading_background(
     assets: &AssetManager,
     art: LoadingScreenArtInput<'_>,
     width: LoadingScreenWidth,
-) -> Option<Option<RenderedLoadingEntry>> {
+) -> Option<Option<ChromePiece>> {
     if let Some(background) = art.background {
         // Original DrawLoading 5535C1..5535CE skips the background if either
         // Convert or SHP is null, then resumes progress drawing at 553603.
@@ -392,8 +393,7 @@ pub fn build_loading_screen_atlas_with_composition<'a>(
     // Side-icon is non-fatal: if its PCX is missing or malformed the bar still
     // draws. Record its label so it can be looked up after packing.
     let side_icon_label = variant.and_then(|variant| {
-        let side_icon_name = variant.side_icon_pcx();
-        let entry = render_pcx_entry(assets, side_icon_name)?;
+        let entry = render_pcx_entry(assets, variant.side_icon_pcx())?;
         let label = entry.label.clone();
         rendered.push(entry);
         Some(label)
@@ -412,21 +412,22 @@ pub fn build_loading_screen_atlas_with_composition<'a>(
             rendered.push(entry);
             label
         };
-        let icon_label = participant.variant.and_then(|variant| {
-            let icon_name = variant.side_icon_pcx();
-            if rendered.iter().any(|entry| entry.label == icon_name) {
-                Some(icon_name.to_string())
-            } else {
-                let entry = render_pcx_entry(assets, icon_name)?;
-                let label = entry.label.clone();
-                rendered.push(entry);
-                Some(label)
-            }
-        });
+        let icon_label = side_icon_name(participant.variant, participant.side_icon.as_deref())
+            .and_then(|name| {
+                let label = name.to_ascii_lowercase();
+                if rendered.iter().any(|entry| entry.label == label) {
+                    Some(label)
+                } else {
+                    let entry = render_pcx_entry(assets, name)?;
+                    let label = entry.label.clone();
+                    rendered.push(entry);
+                    Some(label)
+                }
+            });
         participant_labels.push((frame_label, icon_label));
     }
 
-    let (texture, packed) = pack_entries(gpu, batch, &rendered)?;
+    let (texture, packed) = pack_chrome_atlas(gpu, batch, "Loading", &rendered)?;
     let by_label: HashMap<String, LoadingScreenEntry> = rendered
         .iter()
         .map(|entry| entry.label.clone())
@@ -471,7 +472,7 @@ pub fn build_transfer_progress_atlas(
         mandatory_shp(assets, "PROGBARM.SHP", &palette, 0, "TEMPERAT.PAL")?,
         solid_texel_entry(),
     ];
-    let (texture, packed) = pack_entries(gpu, batch, &entries)?;
+    let (texture, packed) = pack_chrome_atlas(gpu, batch, "Loading", &entries)?;
     Some(LoadingScreenAtlas {
         texture,
         background: None,
@@ -507,7 +508,7 @@ pub fn build_campaign_loading_screen_atlas(
 ) -> Option<LoadingScreenAtlas> {
     let rendered =
         render_campaign_entries(assets, width, background_name, background_palette_name)?;
-    let (texture, packed) = pack_entries(gpu, batch, &rendered)?;
+    let (texture, packed) = pack_chrome_atlas(gpu, batch, "Loading", &rendered)?;
     let by_label: HashMap<String, LoadingScreenEntry> = rendered
         .iter()
         .map(|entry| entry.label.clone())
@@ -533,7 +534,7 @@ fn render_campaign_entries(
     width: LoadingScreenWidth,
     background_name: &str,
     background_palette_name: &str,
-) -> Option<Vec<RenderedLoadingEntry>> {
+) -> Option<Vec<ChromePiece>> {
     if background_name.is_empty() {
         return None;
     }
@@ -574,7 +575,7 @@ fn append_optional_composition_entries(
     assets: &AssetManager,
     remap_base_palette: &Palette,
     composition: Option<LoadingScreenCompositionAtlasInput<'_>>,
-    rendered: &mut Vec<RenderedLoadingEntry>,
+    rendered: &mut Vec<ChromePiece>,
 ) -> (Option<String>, Vec<(u8, String)>) {
     let Some(composition) = composition else {
         return (None, Vec::new());
@@ -621,7 +622,7 @@ fn append_optional_composition_entries(
     (Some(preview_label), marker_labels)
 }
 
-fn prepared_preview_entry(preview: &PreparedLoadingPreviewRgba) -> Option<RenderedLoadingEntry> {
+fn prepared_preview_entry(preview: &PreparedLoadingPreviewRgba) -> Option<ChromePiece> {
     let expected_len = preview
         .width
         .checked_mul(preview.height)
@@ -636,7 +637,7 @@ fn prepared_preview_entry(preview: &PreparedLoadingPreviewRgba) -> Option<Render
         );
         return None;
     }
-    Some(RenderedLoadingEntry {
+    Some(ChromePiece {
         label: LOADING_PREVIEW_LABEL.to_string(),
         width: preview.width,
         height: preview.height,
@@ -668,8 +669,8 @@ fn lookup_optional_atlas_entries(
 
 /// A 1x1 opaque-white texel. Drawn scaled and tinted to produce the G3 solid
 /// backing fill; tinting an all-white texel yields a flat color rect.
-fn solid_texel_entry() -> RenderedLoadingEntry {
-    RenderedLoadingEntry {
+fn solid_texel_entry() -> ChromePiece {
+    ChromePiece {
         label: SOLID_TEXEL_LABEL.to_string(),
         width: 1,
         height: 1,
@@ -679,7 +680,7 @@ fn solid_texel_entry() -> RenderedLoadingEntry {
 
 /// Decode a country-insignia PCX into an atlas entry using the native
 /// RGB-magenta transparency key.
-fn render_pcx_entry(assets: &AssetManager, file_name: &str) -> Option<RenderedLoadingEntry> {
+fn render_pcx_entry(assets: &AssetManager, file_name: &str) -> Option<ChromePiece> {
     let bytes = assets.get_ref(file_name)?;
     let pcx = PcxFile::from_bytes(bytes)
         .map_err(|err| {
@@ -690,7 +691,7 @@ fn render_pcx_entry(assets: &AssetManager, file_name: &str) -> Option<RenderedLo
     let mut rgba = pcx.to_rgba(None);
     ACTIVE_RETAIL_RGB565_PRESENTATION
         .apply_packed_color_key_rgba8(&mut rgba, SIDE_ICON_TRANSPARENT_RGB);
-    Some(RenderedLoadingEntry {
+    Some(ChromePiece {
         label: file_name.to_ascii_lowercase(),
         width: pcx.width as u32,
         height: pcx.height as u32,
@@ -720,7 +721,7 @@ fn mandatory_shp(
     palette: &Palette,
     frame: usize,
     palette_name: &str,
-) -> Option<RenderedLoadingEntry> {
+) -> Option<ChromePiece> {
     render_shp_entry(assets, file_name, palette, frame).or_else(|| {
         log::warn!(
             "Missing mandatory loading asset {file_name} frame {frame} decoded with {palette_name}"
@@ -734,7 +735,7 @@ fn render_shp_entry(
     file_name: &str,
     palette: &Palette,
     frame: usize,
-) -> Option<RenderedLoadingEntry> {
+) -> Option<ChromePiece> {
     let Some(load) = assets.load_file_from_mix(file_name) else {
         log::warn!("Missing loading SHP {file_name}");
         return None;
@@ -780,81 +781,12 @@ fn render_shp_entry(
         }
         canvas
     };
-    Some(RenderedLoadingEntry {
+    Some(ChromePiece {
         label: file_name.to_ascii_lowercase(),
         width: canvas_w,
         height: canvas_h,
         rgba,
     })
-}
-
-fn pack_entries(
-    gpu: &GpuContext,
-    batch: &BatchRenderer,
-    entries: &[RenderedLoadingEntry],
-) -> Option<(BatchTexture, Vec<LoadingScreenEntry>)> {
-    if entries.is_empty() {
-        return None;
-    }
-
-    let atlas_width = entries
-        .iter()
-        .map(|entry| entry.width)
-        .max()
-        .unwrap_or(1)
-        .max(1024);
-    let mut x = 0u32;
-    let mut y = 0u32;
-    let mut row_h = 0u32;
-    let mut placements = Vec::with_capacity(entries.len());
-
-    for entry in entries {
-        if x > 0 && x + entry.width + ATLAS_PADDING > atlas_width {
-            x = 0;
-            y += row_h + ATLAS_PADDING;
-            row_h = 0;
-        }
-        placements.push((x, y));
-        x += entry.width + ATLAS_PADDING;
-        row_h = row_h.max(entry.height);
-    }
-
-    let atlas_height = (y + row_h).next_power_of_two().max(1);
-    let mut rgba = vec![0u8; (atlas_width * atlas_height * 4) as usize];
-
-    for (entry, (px, py)) in entries.iter().zip(placements.iter().copied()) {
-        for row in 0..entry.height {
-            let src = (row * entry.width * 4) as usize;
-            let dst = (((py + row) * atlas_width + px) * 4) as usize;
-            let len = (entry.width * 4) as usize;
-            rgba[dst..dst + len].copy_from_slice(&entry.rgba[src..src + len]);
-        }
-    }
-
-    log::info!(
-        "Loading atlas: {}x{} px, {} pieces",
-        atlas_width,
-        atlas_height,
-        entries.len()
-    );
-
-    let texture = batch.create_texture(gpu, &rgba, atlas_width, atlas_height);
-    let atlas_entries = entries
-        .iter()
-        .zip(placements)
-        .map(|(entry, (px, py))| LoadingScreenEntry {
-            uv_origin: [
-                px as f32 / atlas_width as f32,
-                py as f32 / atlas_height as f32,
-            ],
-            uv_size: [
-                entry.width as f32 / atlas_width as f32,
-                entry.height as f32 / atlas_height as f32,
-            ],
-            pixel_size: [entry.width as f32, entry.height as f32],
-        })
-        .collect();
-    Some((texture, atlas_entries))
 }
 
 #[cfg(test)]

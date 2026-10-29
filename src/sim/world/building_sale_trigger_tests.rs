@@ -115,6 +115,7 @@ fn campaign_scene(map_name: &str, remove_home: bool) -> HeadlessScenario {
         &teams,
         Some(audio.eva()),
         Some(audio.sounds().as_ref()),
+        None,
     );
     let (mut fill_rng, main_rng) = sim.terrain_load_draws();
     let mut fill_draw = |lo, hi| fill_rng.next_range_u32_inclusive(lo, hi);
@@ -206,6 +207,9 @@ fn campaign_scene(map_name: &str, remove_home: bool) -> HeadlessScenario {
     sim.session.publish_started();
     sim.hash_state_every(std::num::NonZeroU64::new(10_000).unwrap());
     HeadlessScenario {
+        source: crate::map::source::LoadedMapSource::LegacyFallback {
+            label: map_name.to_owned(),
+        },
         runtime: crate::sim::runtime::SimRuntime {
             simulation: sim,
             resources: crate::sim::runtime::SimResources {

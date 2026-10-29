@@ -570,7 +570,7 @@ fn a_guarding_aircraft_scans_passively_unless_its_type_may_not_and_takes_nothing
     }
 }
 
-/// The loop on a retail map through the production loader and the player's
+/// The loop on stock XMP03T4 through the production loader and the player's
 /// order path: two Harriers of a human house, beside its Airforce Command
 /// (`GAAIRC`, four docks), strike an enemy Rhino, fly home, land on the pads
 /// their radio contacts name, reload and guard there, then die when the
@@ -586,7 +586,8 @@ fn retail_harriers_strike_return_reload_and_guard_at_their_airfield() {
         airfield,
         harriers,
         target: rhino,
-    } = crate::sim::arena_fixture::retail_harrier_dock_scene(&retail).expect("retail scene");
+    } = crate::sim::arena_fixture::retail_harrier_dock_scene_on_map(&retail, "XMP03T4.MAP")
+        .expect("retail scene");
     let tick = runtime.simulation.session.tick() + 1;
     let orders: Vec<CommandEnvelope> = harriers
         .iter()

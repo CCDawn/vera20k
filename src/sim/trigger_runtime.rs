@@ -32,6 +32,11 @@ const ACTION_ENABLE_TRIGGER: i32 = 53;
 const ACTION_DISABLE_TRIGGER: i32 = 54;
 const ACTION_SET_LOCAL: i32 = 56;
 const ACTION_CLEAR_LOCAL: i32 = 57;
+// VERA untrusted-map admission, not native Spring7265C0 semantics. Force22
+// bypasses Tag's dispatch guard. Bound acyclic nesting and repeated branching
+// too, so an authored graph cannot overflow the stack or expand exponentially.
+const MAX_TRIGGER_SPRING_DEPTH: usize = 32;
+const MAX_TRIGGER_SPRING_ACTIONS: usize = 4096;
 const ACTION_DAMAGE_AT_WAYPOINT: i32 = 63;
 const ACTION_ANNOUNCE_WIN: i32 = 67;
 const ACTION_ANNOUNCE_LOSE: i32 = 68;
@@ -54,9 +59,8 @@ const EVENT_TECHTYPE_EXISTS: i32 = 60;
 const EVENT_TECHTYPE_DOES_NOT_EXIST: i32 = 61;
 const LOGICAL_FRAMES_PER_SECOND: i32 = crate::util::fixed_math::RA2_LOGIC_FRAMES_PER_SECOND as i32;
 
-/// Action20's music operand. Theme owns the immutable process catalog, so a
-/// type8 name is kept verbatim until that owner resolves it. This preserves
-/// Read6DD7E0's From_Name721210 result without a second music registry in sim.
+/// Action20's music operand. Fresh reads retain the process catalog's index;
+/// Name remains supported for old saved actions/effects and existing callers.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ThemeRequest {
     Name(String),
@@ -226,7 +230,7 @@ struct TagType {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-struct RuntimeDefinitions {
+pub(crate) struct RuntimeDefinitions {
     team_types: Vec<String>,
     /// TeamType+D0 references resolved during physical Read6F1341. This is
     /// the sole owner; Team constructors consume the retained ordinal and
@@ -237,6 +241,27 @@ struct RuntimeDefinitions {
 }
 
 impl RuntimeDefinitions {
+    /// TeamTypeClass::FindByIDOrName @ 0x006F0FC0 (retail gamemd.exe).
+    /// Scan the constructor vector, ID then Name for each entry; callers own
+    /// token preprocessing. This never allocates, trims or handles sentinels.
+    pub(crate) fn find_team_type(
+        &self,
+        requested: &str,
+        teams: &crate::rules::team_ai_ini::TeamAiIniRegistry,
+    ) -> Option<&str> {
+        self.team_types
+            .iter()
+            .find(|id| {
+                id.eq_ignore_ascii_case(requested)
+                    || teams.team_type_name(id).eq_ignore_ascii_case(requested)
+            })
+            .map(String::as_str)
+    }
+
+    pub(crate) fn team_type_ids(&self) -> impl Iterator<Item = &str> {
+        self.team_types.iter().map(String::as_str)
+    }
+
     fn team_type(&mut self, name: &str) -> Option<usize> {
         if is_native_none_type_name(name) {
             return None;
@@ -297,6 +322,7 @@ impl RuntimeDefinitions {
         entry: ActionEntry,
         eva: Option<&crate::rules::sound_ini::EvaRegistry>,
         sounds: Option<&crate::rules::sound_ini::SoundRegistry>,
+        themes: Option<&crate::rules::theme_ini::ThemeCatalog>,
     ) -> RuntimeAction {
         let reference = match entry.definition_reference() {
             Some(ActionDefinitionReference::Team(selector)) => match selector {
@@ -323,23 +349,34 @@ impl RuntimeDefinitions {
             None => None,
         };
         let parameter_type = entry.params.first().map_or(0, |v| crt_atoi(v));
-        let value = if parameter_type == 6 {
-            // Original753250 scans the raw, untrimmed name. Missing names
-            // materialize -1; no cue-name resolution runs during Execute.
-            Some(
+        let value = match parameter_type {
+            // TAction::Read6DD7BC/6DD7CE stores the raw name's EVA753250
+            // or Voc7514D0 ordinal in +90 for every action, including timer
+            // Execute27 at6DE5C9. Unknown names materialize -1, not zero.
+            6 | 7 => Some(
                 entry
                     .params
                     .get(1)
-                    .and_then(|name| eva.and_then(|catalog| catalog.index_of(name)))
+                    .and_then(|name| {
+                        if parameter_type == 6 {
+                            eva?.index_of(name)
+                        } else {
+                            sounds?.index_of(name)
+                        }
+                    })
                     .unwrap_or(-1),
-            )
-        } else {
-            entry.literal_value()
+            ),
+            // TActionClass::Read6DD7E0..6DD7EB, original instruction listing:
+            // From_Name721210 stores its signed result at +90 for every
+            // ActionID, independently of playback admission. Reuse the same
+            // process-selected catalog as Theme; raw missing names become -1.
+            8 => Some(entry.params.get(1).map_or(-1, |name| {
+                themes.map_or(-1, |catalog| catalog.from_name(name))
+            })),
+            _ => entry.literal_value(),
         };
         // FindIndex7514D0 compares the untrimmed token case-insensitively.
-        let sound = if parameter_type == 7 {
-            entry.params.get(1).and_then(|name| sounds?.get(name))
-        } else if matches!(entry.kind, 19 | 98 | 99) {
+        let sound = if parameter_type == 7 || matches!(entry.kind, 19 | 98 | 99) {
             //Execute's Voc call consumes +90 regardless of the authored
             //parameter type. Resolve a literal ordinal once in this reader,
             //through the same fixed catalog as a type7 name.
@@ -355,19 +392,15 @@ impl RuntimeDefinitions {
             sound,
         }
     }
-    fn read_map(
-        map: &crate::map::map_file::MapFile,
-        teams: &crate::rules::team_ai_ini::TeamAiIniRegistry,
-        eva: Option<&crate::rules::sound_ini::EvaRegistry>,
-        sounds: Option<&crate::rules::sound_ini::SoundRegistry>,
-    ) -> Self {
+    pub(crate) fn read_teams(teams: &crate::rules::team_ai_ini::TeamAiIniRegistry) -> Self {
         let mut definitions = Self::default();
         // Full_Init687984/68798D: reads are transactions, not the final merged
         // TeamType vector. Team.Tag can first-construct TagTypes here.
-        for team in teams.team_type_read_sequence() {
-            let Some(index) = definitions.team_type(&team.id) else {
+        for (id, read) in teams.team_type_registration_sequence() {
+            let Some(index) = definitions.team_type(id) else {
                 continue;
             };
+            let Some(team) = read else { continue };
             // Read6F131E retains +D0 on an absent/empty ReadString; a
             // nonempty value calls6E6310, including either null literal.
             // Only this physical pass can construct a new TagType identity.
@@ -377,6 +410,17 @@ impl RuntimeDefinitions {
                 definitions.team_tags[index] = resolved;
             }
         }
+        definitions
+    }
+
+    fn read_map(
+        map: &crate::map::map_file::MapFile,
+        teams: &crate::rules::team_ai_ini::TeamAiIniRegistry,
+        eva: Option<&crate::rules::sound_ini::EvaRegistry>,
+        sounds: Option<&crate::rules::sound_ini::SoundRegistry>,
+        themes: Option<&crate::rules::theme_ini::ThemeCatalog>,
+    ) -> Self {
+        let mut definitions = Self::read_teams(teams);
         // LoadFromINIList7275D0/6E5ED0 find or allocate each key's Type,
         // ignoring case, and ReadINI727240/6E6080 read every record by that
         // Type's own ID, exact case. A key differing from an earlier one only
@@ -406,13 +450,12 @@ impl RuntimeDefinitions {
                     .events
                     .get(&id)
                     .map_or_else(Vec::new, |record| record.conditions().to_vec());
-                // Events are prepended, but their reference factories ran in
-                // source order before the retained reverse traversal.
+                // TEvent::Read71F595 is find-only and runs before this
+                // Trigger's action factories. Unknown references stay null.
                 for event in events.iter_mut().rev() {
                     if let Some(team) = event.team_name.as_deref() {
-                        event.team_name = definitions
-                            .team_type(team)
-                            .map(|index| definitions.team_types[index].clone());
+                        event.team_name =
+                            definitions.find_team_type(team, teams).map(str::to_owned);
                     }
                 }
                 //727530..7275A3: a present entry rebuilds the action list.
@@ -421,7 +464,7 @@ impl RuntimeDefinitions {
                         .entries()
                         .iter()
                         .cloned()
-                        .map(|entry| definitions.resolve_action(entry, eva, sounds))
+                        .map(|entry| definitions.resolve_action(entry, eva, sounds, themes))
                         .collect::<Vec<_>>()
                 });
                 let typ = &mut definitions.trigger_types[index];
@@ -527,10 +570,12 @@ impl RuntimeDefinitions {
 // Original jump-table bytes71F700/71F744/71F780/71F7C0 and6E3F08.
 // These are classification only, never substitutes for event predicates.
 fn event_classification(kind: i32) -> u8 {
-    // Ares3.0 GetFlags1004F6A0: EMP62..65 are attached-object events;
-    // Persistable1004F610 returns false for every one of them.
+    // Ares3.0 GetFlags1004F6A0 (table1004F704): EMP62..65, driver killed
+    //67/68 and vehicle taken69/70 are attached object events. The table
+    // also flags 66 and 71..74, which VERA never raises. This is independent
+    // of the Persistable predicate.
     #[cfg(feature = "ares")]
-    if matches!(kind, 62..=65) {
+    if matches!(kind, 62..=65 | 67..=70) {
         return 2;
     }
     let mut flags = 0;
@@ -643,7 +688,14 @@ pub struct TriggerRuntime {
     map_cursor: i32,
     definitions_prepared: bool,
     classified: bool,
+    /// Scratch for one synchronous Spring call tree. Empty between dispatches;
+    /// save/restore and checksums keep only the authoritative trigger state.
+    #[serde(skip)]
+    spring_depth: usize,
+    #[serde(skip)]
+    spring_actions_left: usize,
     #[cfg(any(test, feature = "test-support"))]
+    #[serde(skip)]
     fixture_difficulty: Option<i32>,
     #[cfg(any(test, feature = "test-support"))]
     #[serde(skip)]
@@ -788,6 +840,7 @@ impl TriggerRuntime {
         condition: &EventCondition,
         current_frame: u32,
         simulation: &Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
     ) -> bool {
         match condition.kind {
             EVENT_ELAPSED_SCENARIO_TIME => {
@@ -813,29 +866,27 @@ impl TriggerRuntime {
                 values.contains(&(condition.value as u32))
                     == matches!(condition.kind, EVENT_GLOBAL_IS_SET | EVENT_LOCAL_IS_SET)
             }
-            EVENT_TECHTYPE_EXISTS => {
-                let sim = simulation;
-                let min_count = condition.value;
-                let Some(type_id) = condition.type_name.as_deref() else {
+            EVENT_TECHTYPE_EXISTS | EVENT_TECHTYPE_DOES_NOT_EXIST => {
+                // TEventClass::HasOccurred, original gamemd.exe:
+                // 71E96B/71EA30 select the last global TechnoType with an
+                // exact stored ID before comparing concrete type pointers.
+                // Reuse Action106's registry owner, including its explicit
+                // unrepresentable truncated-identity boundary.
+                let Some(object) = condition
+                    .type_name
+                    .as_deref()
+                    .and_then(|name| rules.native_techno_type_exact(name))
+                else {
                     return false;
                 };
-                if type_id.is_empty() {
-                    return false;
+                let count = count_techtype(simulation, object);
+                if condition.kind == EVENT_TECHTYPE_EXISTS {
+                    // 71EA19 checks the signed threshold inside the scan:
+                    // zero/negative still requires a nonempty Techno vector.
+                    !simulation.entities().is_empty() && count as i64 >= i64::from(condition.value)
+                } else {
+                    count == 0
                 }
-                // Native71EA03 tests the signed threshold inside its scan:
-                // even a nonpositive threshold requires at least one Techno.
-                !sim.entities().is_empty()
-                    && count_techtype(sim, type_id) as i64 >= i64::from(min_count)
-            }
-            EVENT_TECHTYPE_DOES_NOT_EXIST => {
-                let sim = simulation;
-                let Some(type_id) = condition.type_name.as_deref() else {
-                    return false;
-                };
-                if type_id.is_empty() {
-                    return false;
-                }
-                count_techtype(sim, type_id) == 0
             }
             _ => false,
         }
@@ -1076,6 +1127,50 @@ impl Simulation {
         Ok(())
     }
 
+    /// Install fixed AIMD plus scenario AI definitions after RuleSet identities
+    /// are interned and before the first gameplay tick. This is data ingress
+    /// only: the installed VM contains no live TeamClass instances.
+    ///
+    /// A fixed-AIMD definition that fails RuleSet resolution refuses the whole
+    /// install (`Err`, nothing installed); scenario-origin omissions install
+    /// and come back as logged, nonfatal diagnostics.
+    pub fn install_team_ai_registry(
+        &mut self,
+        registry: &crate::rules::team_ai_ini::TeamAiIniRegistry,
+        rules: &crate::rules::ruleset::RuleSet,
+    ) -> Result<
+        Vec<crate::sim::team_script_vm::TeamAiInstallDiagnostic>,
+        Vec<crate::sim::team_script_vm::TeamAiInstallDiagnostic>,
+    > {
+        // Cold callers stage the same physical Team prefix. Ordinary loaders
+        // already prepared the map and its action-created identities; never
+        // replay those reads or replace that tail during AI installation.
+        let staged = (!self.trigger_runtime.definitions_prepared)
+            .then(|| RuntimeDefinitions::read_teams(registry));
+        let definitions = staged.as_ref().unwrap_or(&self.trigger_runtime.definitions);
+        let (vm, diagnostics) =
+            crate::sim::team_script_vm::TeamScriptVm::from_prepared_ini_registry(
+                registry,
+                definitions,
+                &mut self.interner,
+                rules,
+            );
+        if diagnostics
+            .iter()
+            .any(crate::sim::team_script_vm::TeamAiInstallDiagnostic::is_fixed_source_refusal)
+        {
+            return Err(diagnostics);
+        }
+        if let Some(definitions) = staged {
+            self.trigger_runtime.definitions = definitions;
+        }
+        self.team_script_vm = vm;
+        for diagnostic in &diagnostics {
+            log::warn!("Team AI install diagnostic: {diagnostic:?}");
+        }
+        Ok(diagnostics)
+    }
+
     pub(crate) fn trigger_definitions_prepared(&self) -> bool {
         self.trigger_runtime.definitions_prepared
     }
@@ -1102,6 +1197,7 @@ impl Simulation {
         teams: &crate::rules::team_ai_ini::TeamAiIniRegistry,
         eva: Option<&crate::rules::sound_ini::EvaRegistry>,
         sounds: Option<&crate::rules::sound_ini::SoundRegistry>,
+        themes: Option<&crate::rules::theme_ini::ThemeCatalog>,
     ) {
         // ReadLocal689B2E clears names only. Missing second tokens and slots
         // absent from the map keep their current value;689C24 writes explicit
@@ -1119,7 +1215,7 @@ impl Simulation {
             }
         }
         self.trigger_runtime = TriggerRuntime {
-            definitions: RuntimeDefinitions::read_map(map, teams, eva, sounds),
+            definitions: RuntimeDefinitions::read_map(map, teams, eva, sounds, themes),
             definitions_prepared: true,
             locals_set,
             ..TriggerRuntime::default()
@@ -1487,6 +1583,24 @@ impl Simulation {
             .clone();
         match condition.kind {
             #[cfg(feature = "ares")]
+            67..=70 => {
+                // Ares HasOccurred71E949 ->100503E0: driver killed
+                //1004F881..1004F8C7 and vehicle taken1004F8CA..1004F91F.
+                // Each requires the affected Techno;68 and70 additionally
+                // compare the source's raw House+30. No persistence write.
+                // Original71F950 stays false for these kinds, so they never latch.
+                input.kind == condition.kind
+                    && input
+                        .actor
+                        .is_some_and(|id| self.substrate.entities.contains(id))
+                    && (matches!(condition.kind, 67 | 69)
+                        || input
+                            .source
+                            .and_then(|id| self.substrate.entities.get(id))
+                            .and_then(|source| self.base_reservation_house_index(source.owner()))
+                            .is_some_and(|index| index == condition.value))
+            }
+            #[cfg(feature = "ares")]
             62..=65 => {
                 // Installed HasOccurred71E949 ->100503E0/1004F7DC..870.
                 // The actor is the affected Techno. House-specific63/65
@@ -1509,6 +1623,13 @@ impl Simulation {
                 }
                 (actor.emp_remaining() > 0) == matches!(condition.kind, 62 | 63)
             }
+            // TEventClass::HasOccurred, original gamemd.exe:
+            // 0x0071E950/0x0071EC83 bypass the raised-kind/editor gates for
+            // negative or >=62 kinds; 0x0071F084 reaches AL1 at0x0071F1B4.
+            // No persistence or retained-House write. Keep Ares' replacement
+            // dispatcher and the known0..61 predicates separate.
+            #[cfg(not(feature = "ares"))]
+            kind if !(0..=61).contains(&kind) => true,
             53 => {
                 // HasOccurred71ECF5..71ED56, original gamemd: raised53
                 // and clear A8ED6B admit a forced GetDisplayOwner(+D0,1).
@@ -1875,9 +1996,12 @@ impl Simulation {
             }
             //71F28B selects the generic true tail71F1B4, no persistence write.
             EVENT_ANY => true,
-            _ => self
-                .trigger_runtime
-                .evaluate_event(&condition, self.session.binary_frame(), self),
+            _ => self.trigger_runtime.evaluate_event(
+                &condition,
+                self.session.binary_frame(),
+                self,
+                rules,
+            ),
         }
     }
 
@@ -2570,12 +2694,23 @@ impl Simulation {
         if !trigger.enabled || trigger.pending {
             return false;
         }
+        if self.trigger_runtime.spring_depth >= MAX_TRIGGER_SPRING_DEPTH {
+            return false;
+        }
         let type_index = trigger.type_index;
         let count = self.trigger_runtime.definitions.trigger_types[type_index]
             .actions
             .len();
+        if self.trigger_runtime.spring_depth == 0 {
+            self.trigger_runtime.spring_actions_left = MAX_TRIGGER_SPRING_ACTIONS;
+        }
+        self.trigger_runtime.spring_depth += 1;
         let mut result = false;
         for ordinal in 0..count {
+            if self.trigger_runtime.spring_actions_left == 0 {
+                break;
+            }
+            self.trigger_runtime.spring_actions_left -= 1;
             //7265E7..726602 repeats the authored Country lookup for every
             //action and preserves Spring's incoming actor and packed Cell.
             let context = self.trigger_action_context(type_index, Some(index), input, rules);
@@ -2590,6 +2725,7 @@ impl Simulation {
                 frame_effects,
             );
         }
+        self.trigger_runtime.spring_depth -= 1;
         result
     }
 
@@ -2698,8 +2834,12 @@ impl Simulation {
                         );
                         result = true;
                         detach_all = true;
+                    } else {
+                        // TagClass::ProcessTriggerEvent, original gamemd.exe:
+                        // refs1 takes 0x006E5463 to 0x006E5484, skipping the
+                        // source-cleanup flag write at 0x006E547F.
+                        detach_attachment = true;
                     }
-                    detach_attachment = true;
                 }
                 2 => {
                     self.spring_live_trigger(
@@ -3120,6 +3260,57 @@ impl Simulation {
         self.trigger_runtime
             .action_trace
             .push((action.entry.kind, action.value.unwrap_or(0)));
+        // Force22 must stay outside Execute's large nonrecursive action frame.
+        // Even a finite authored chain otherwise multiplies that frame until a
+        // client with a smaller thread stack aborts before the depth guard.
+        // Execute6DF0E7..6DF134 (original instructions) iterates the live registry in order and ignores Spring's
+        // result. Re-read its live length after every synchronous callback.
+        if action.entry.kind == ACTION_FORCE_TRIGGER {
+            if let Some(DefinitionReference::Trigger(target)) = action.reference {
+                let mut ordinal = 0;
+                while ordinal < self.trigger_runtime.trigger_order.len() {
+                    let live = self.trigger_runtime.trigger_order[ordinal];
+                    if self
+                        .trigger_runtime
+                        .trigger(live)
+                        .is_some_and(|trigger| trigger.type_index == target)
+                    {
+                        self.spring_live_trigger(
+                            live,
+                            context.input,
+                            effects,
+                            rules,
+                            overlay_registry,
+                            frame_effects,
+                        );
+                    }
+                    ordinal += 1;
+                }
+            }
+            return true;
+        }
+        self.execute_live_trigger_action(
+            action,
+            context,
+            effects,
+            rules,
+            overlay_registry,
+            frame_effects,
+        )
+    }
+
+    // Keep this frame out of the Force22 recursion path, also in optimized
+    // builds. The common dispatcher above owns tracing and forced dispatch.
+    #[inline(never)]
+    fn execute_live_trigger_action(
+        &mut self,
+        action: &RuntimeAction,
+        context: TriggerActionContext,
+        effects: &mut Vec<TriggerEffect>,
+        rules: &crate::rules::ruleset::RuleSet,
+        overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        frame_effects: FrameEffects<'_>,
+    ) -> bool {
         let reference = action.reference;
         let value = action.value;
         let sound = action.sound.as_deref();
@@ -3265,15 +3456,15 @@ impl Simulation {
             20 => {
                 // Steam gamemd: Execute6DE8E4..6DE903 passes +90
                 // to Theme720B20 and returns AL1, even when audio is gated.
-                // Type8 is an untrimmed section key, not Sound= or an ordinal.
-                // The process catalog is immutable, so its existing owner can
-                // resolve the retained name at delivery; numeric sentinels
-                // pass through unchanged. No scenario RNG/timer/detach here.
-                let request = if action.params.first().map_or(0, |v| crt_atoi(v)) == 8 {
-                    ThemeRequest::Name(action.params.get(1).cloned().unwrap_or_default())
-                } else {
-                    ThemeRequest::Index(value.unwrap_or(-1))
-                };
+                // Fresh type8 reads already retained From_Name's index. Keep
+                // late Name delivery only for older saved None operands;
+                // numeric sentinels pass unchanged. No RNG/timer/detach here.
+                let request =
+                    if value.is_none() && action.params.first().map_or(0, |v| crt_atoi(v)) == 8 {
+                        ThemeRequest::Name(action.params.get(1).cloned().unwrap_or_default())
+                    } else {
+                        ThemeRequest::Index(value.unwrap_or(-1))
+                    };
                 effects.push(TriggerEffect::MusicTheme { request });
             }
             0 => {
@@ -3542,11 +3733,22 @@ impl Simulation {
                 };
                 let c4 = self.interner.intern(c4_name);
                 let mut matched = false;
+                // VERA untrusted-map security deviation from DestroyAttached
+                // 6E2050 (original instructions): a refused C4 receiver must
+                // not spin at6E20DF or the outer6E20EA rescan forever. In
+                // particular, Building442230 preserves Immune repair huts.
+                // Retain that immunity; skip only this call's nonprogressing
+                // receivers. Ordinary damage/cleanup order remains unchanged.
+                let mut refused = BTreeSet::new();
                 loop {
                     let mut visited_match = false;
                     let mut ordinal = 0;
                     while ordinal < self.substrate.entities.techno_registry_len() {
                         let id = self.substrate.entities.techno_registry_at(ordinal).unwrap();
+                        if refused.contains(&id) {
+                            ordinal += 1;
+                            continue;
+                        }
                         let health = self.substrate.entities.get(id).and_then(|entity| {
                             (entity.health.current() > 0
                                 && entity.lifecycle.object_alive()
@@ -3578,6 +3780,14 @@ impl Simulation {
                             event,
                             frame_effects,
                         );
+                        if self
+                            .substrate
+                            .entities
+                            .get(id)
+                            .is_some_and(|entity| entity.health.current() >= health)
+                        {
+                            refused.insert(id);
+                        }
                         matched = true;
                         visited_match = true;
                         //6E20DF decrements the slot before the loop increment:
@@ -4301,7 +4511,7 @@ impl Simulation {
                 };
                 effects.push(TriggerEffect::InputLockChanged { locked, was_locked });
             }
-            ACTION_FORCE_TRIGGER | ACTION_ENABLE_TRIGGER | ACTION_DISABLE_TRIGGER => {
+            ACTION_ENABLE_TRIGGER | ACTION_DISABLE_TRIGGER => {
                 if let Some(DefinitionReference::Trigger(target)) = reference {
                     let difficulty = self.trigger_difficulty();
                     let mut ordinal = 0;
@@ -4313,16 +4523,6 @@ impl Simulation {
                             .is_some_and(|t| t.type_index == target)
                         {
                             match action.kind {
-                                ACTION_FORCE_TRIGGER => {
-                                    self.spring_live_trigger(
-                                        live,
-                                        context.input,
-                                        effects,
-                                        rules,
-                                        overlay_registry,
-                                        frame_effects,
-                                    );
-                                }
                                 ACTION_ENABLE_TRIGGER => {
                                     if self.trigger_runtime.definitions.trigger_types[target]
                                         .admits_difficulty(difficulty)
@@ -4746,12 +4946,25 @@ impl Simulation {
                 //6DDCB1/6DDD23 and6DF399..6DF3CE use PlayerPtr, not the
                 //incoming Trigger House. The shared House result/timer
                 //owner drives normal frame termination and ScenarioExit.
-                return self.trigger_house_outcome(
-                    action.kind,
-                    value.unwrap_or(0),
-                    rules,
-                    frame_effects,
-                );
+                use crate::sim::house_state::HouseOutcomeKind;
+                use crate::sim::world::PlayerOutcomeRequest;
+                let request = match action.kind {
+                    1 | 2 => PlayerOutcomeRequest::Country {
+                        country_index: value.unwrap_or(0),
+                        win_on_match: action.kind == 1,
+                    },
+                    ACTION_ANNOUNCE_WIN | ACTION_ANNOUNCE_LOSE => PlayerOutcomeRequest::Flag {
+                        kind: if action.kind == ACTION_ANNOUNCE_WIN {
+                            HouseOutcomeKind::Victory
+                        } else {
+                            HouseOutcomeKind::Defeat
+                        },
+                        skip_timer: true,
+                    },
+                    ACTION_END_SCENARIO => PlayerOutcomeRequest::EndScenario,
+                    _ => unreachable!("matched native outcome action"),
+                };
+                return self.request_player_outcome(request, rules, frame_effects);
             }
             _ => return false,
         }
@@ -4875,25 +5088,30 @@ impl TriggerRuntime {
     pub(crate) fn mark_crate_pickup_event(&mut self) {
         self.dirty[3] = true;
     }
-    ///6E57C0 reads each linked LIVE Trigger's Type+A0, without enabled,
-    /// pending or difficulty tests.5F5B50 replaces refs, never moves the
-    /// Engineer's attachment and never deletes the old zero-ref Tag here.
-    pub(crate) fn transfer_engineer_tag_to_building(&mut self, engineer: u64, building: u64) {
-        let attachment = TagAttachment::Object(engineer);
-        let Some(&tag) = self.attachments.get(&attachment) else {
-            return;
-        };
-        let transfer = self.tag(tag).is_some_and(|tag| {
-            tag.triggers.iter().any(|&live| {
-                self.trigger(live).is_some_and(|trigger| {
-                    self.definitions.trigger_types[trigger.type_index].transfer_on_capture
+    /// TagClass::IsTransferable6E57C0 reads each linked LIVE Trigger's
+    /// Type+A0, without enabled, pending or difficulty tests (retail gamemd).
+    pub(crate) fn object_tag_is_transferable(&self, object: u64) -> bool {
+        self.attachments
+            .get(&TagAttachment::Object(object))
+            .and_then(|&tag| self.tag(tag))
+            .is_some_and(|tag| {
+                tag.triggers.iter().any(|&live| {
+                    self.trigger(live).is_some_and(|trigger| {
+                        self.definitions.trigger_types[trigger.type_index].transfer_on_capture
+                    })
                 })
             })
-        });
-        if transfer {
-            //519F66 re-reads after the gate; keep the native attachment owner.
+    }
+
+    /// ObjectClass::SetTag5F5B50 after IsTransferable6E57C0: engineer
+    /// capture519F66, thief capture520439 and vehicle crew738374 all copy
+    /// the attachment. The source keeps its reference; the old zero-ref Tag
+    /// is not deleted here. Source: retail gamemd.exe instructions.
+    pub(crate) fn transfer_object_tag(&mut self, source: u64, target: u64) {
+        if self.object_tag_is_transferable(source) {
+            let attachment = TagAttachment::Object(source);
             let tag = self.attachments.get(&attachment).copied();
-            self.replace_trigger_tag_attachment(TagAttachment::Object(building), tag);
+            self.replace_trigger_tag_attachment(TagAttachment::Object(target), tag);
         }
     }
 }
@@ -4944,21 +5162,28 @@ fn parse_visible_map_area(fields: &[String]) -> Option<[i32; 4]> {
     Some([atoi(2)?, atoi(3)?, atoi(4)?, atoi(5)?])
 }
 
-fn count_techtype(sim: &Simulation, type_id: &str) -> usize {
+fn count_techtype(sim: &Simulation, object: &crate::rules::object_type::ObjectType) -> usize {
+    // HasOccurred71EA03/71EAC0 walks all stored Technos, including Limbo
+    // and Health0, comparing virtual84's concrete type pointer. Category
+    // plus interned ID preserves that identity for representable types.
+    let Some(type_id) = sim.interner.get(&object.id) else {
+        return 0;
+    };
+    let category = crate::map::entities::EntityCategory::from(object.category);
     sim.substrate
         .entities
         .values()
-        .filter(|e| {
-            sim.interner
-                .resolve(e.type_ref())
-                .eq_ignore_ascii_case(type_id)
-        })
+        .filter(|e| e.category() == category && e.type_ref() == type_id)
         .count()
 }
 
 #[cfg(test)]
 #[path = "trigger_runtime_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "trigger_runtime_factory_owner_tests.rs"]
+mod factory_owner_tests;
 
 #[cfg(test)]
 #[path = "trigger_runtime_duplicate_ini_tests.rs"]
@@ -5134,7 +5359,7 @@ mod meteor_action_tests {
                     ry: 40,
                 },
             )]));
-        let action = RuntimeDefinitions::default().resolve_action(entry, None, None);
+        let action = RuntimeDefinitions::default().resolve_action(entry, None, None, None);
         let mut effects = Vec::new();
         assert!(sim.apply_live_trigger_action(
             &action,
@@ -5203,3 +5428,7 @@ mod building_sale_trigger_tests;
 #[cfg(test)]
 #[path = "trigger_runtime_building_sale_tests.rs"]
 mod building_sale_native_tests;
+
+#[cfg(test)]
+#[path = "trigger_runtime_skirmish_map_tests.rs"]
+mod skirmish_map_tests;

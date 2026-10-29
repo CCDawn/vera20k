@@ -51,7 +51,7 @@ fn sov07_discovery_recruits_the_nine_authored_group_members_after_reload() {
         &map.ini,
     );
     sim.install_team_ai_registry(&teams, &rules).unwrap();
-    sim.initialize_trigger_definitions(&map, &teams, None, None);
+    sim.initialize_trigger_definitions(&map, &teams, None, None, None);
     // The arena exercises the attached discovery Tag. Its nine original
     // MapEntity records retain health, missions, recruitment bytes and Group;
     // only their coordinates are clustered to bound formation and movement.

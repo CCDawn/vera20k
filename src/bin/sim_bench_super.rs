@@ -181,7 +181,8 @@ pub(crate) fn run(args: &super::Args) -> Result<(), String> {
             // to `UNLIMITED_WALLET_FLOOR` every tick, the same rule the
             // launch's sim_tick applies. Fair stays untouched.
             if args.super_tier == SuperAiDifficulty::Unlimited {
-                let owner = runtime.simulation.interner.resolve(super_house).to_string();
+                let owner =
+                    runtime.simulation.interner().resolve(super_house).to_string();
                 let wallet =
                     vera20k_core::sim::production::credits_for_owner(&runtime.simulation, &owner);
                 let floor = UNLIMITED_WALLET_FLOOR;

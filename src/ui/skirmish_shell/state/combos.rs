@@ -4,11 +4,9 @@ use crate::map::scenario_menu::MapMenuEntry;
 use crate::skirmish_launch::{
     HOUSE_COLOR_COUNT, LaunchCountry, LaunchStartPosition, SKIRMISH_PLAYER_SLOT_COUNT,
 };
-use crate::ui::shell::combobox::ComboPopup;
+use crate::ui::shell::combobox::{ComboPopup, ComboPress};
 
-use super::super::layout::{
-    DropdownMetrics, RectPx, SkirmishShellLayout, combo_arrow_hit_rect, combo_face_rect,
-};
+use super::super::layout::{DropdownMetrics, RectPx, SkirmishShellLayout, combo_face_rect};
 use super::super::scroll::ScrollModel;
 use super::{
     DropdownScrollDragState, DropdownScrollbarPart, DropdownScrollbarPressState, OpenComboDropdown,
@@ -285,21 +283,35 @@ pub fn combo_items(
 /// Shared4E3A00 country catalog: registered source order, Multiplay enabled,
 /// and a nonempty HouseType UIName. Random is the first entry.
 pub fn country_choices(rules: &crate::rules::ruleset::RuleSet) -> Vec<SkirmishComboItem> {
+    let mut countries: Vec<(i32, usize, LaunchCountry)> = rules
+        .cooperative_country_candidates()
+        .enumerate()
+        .filter(|(_, (id, _))| {
+            rules.country_multiplay(id)
+                && rules
+                    .country_display_name_sources(id)
+                    .0
+                    .is_some_and(|key| !key.is_empty())
+        })
+        .filter_map(|(index, (id, _))| {
+            let list_index = rules.country_list_index(id);
+            (list_index >= 0).then(|| {
+                (
+                    list_index,
+                    index,
+                    LaunchCountry::from_country_index(index as u32),
+                )
+            })
+        })
+        .collect();
+    // Ares ListIndex, then the Country registry index. A stock build returns
+    // the common 100, so this preserves source order.
+    countries.sort_by_key(|&(list_index, index, _)| (list_index, index));
     std::iter::once(SkirmishCountryChoice::Random)
         .chain(
-            rules
-                .cooperative_country_candidates()
-                .enumerate()
-                .filter(|(_, (id, _))| {
-                    rules.country_multiplay(id)
-                        && rules
-                            .country_display_name_sources(id)
-                            .0
-                            .is_some_and(|key| !key.is_empty())
-                })
-                .map(|(index, _)| {
-                    SkirmishCountryChoice::Country(LaunchCountry::from_country_index(index as u32))
-                }),
+            countries
+                .into_iter()
+                .map(|(_, _, country)| SkirmishCountryChoice::Country(country)),
         )
         .map(SkirmishComboItem::Country)
         .collect()
@@ -328,7 +340,7 @@ pub fn available_start_choices(
     let claimed: Vec<_> = claimed.into_iter().collect();
     std::iter::once(SkirmishComboItem::Start(LaunchStartPosition::Auto))
         .chain(
-            (0..capacity.min(SKIRMISH_PLAYER_SLOT_COUNT))
+            (0..capacity.min(crate::skirmish_launch::NETWORK_PLAYER_SLOT_COUNT))
                 .map(|index| LaunchStartPosition::Position(index as u8))
                 .filter(|start| selected == Some(*start) || !claimed.contains(start))
                 .map(SkirmishComboItem::Start),
@@ -562,38 +574,19 @@ fn combo_hit_order() -> Vec<SkirmishComboId> {
     ids
 }
 
-fn combo_arrow_at(
-    state: &SkirmishShellState,
-    layout: &SkirmishShellLayout,
-    maps: &[MapMenuEntry],
-    x: i32,
-    y: i32,
-) -> Option<SkirmishComboId> {
-    combo_hit_order().into_iter().find(|id| {
-        combo_enabled(state, maps, *id)
-            && combo_rect(layout, *id)
-                .map(|rect| combo_arrow_hit_rect(rect, layout.scale).contains(x, y))
-                .unwrap_or(false)
-    })
-}
-
-/// A click anywhere on the collapsed combo face — not just the arrow zone.
-/// The owner-draw combo plays the open sound on any face click; only a click
-/// inside the rightmost arrow zone actually toggles the dropdown open. Splitting
-/// these two reachable areas lets us play the sound on a text-portion click
-/// while still gating the open on the arrow zone.
+/// The enabled combo whose collapsed face is under the press, with its
+/// control rect.
 fn combo_face_at(
     state: &SkirmishShellState,
     layout: &SkirmishShellLayout,
     maps: &[MapMenuEntry],
     x: i32,
     y: i32,
-) -> Option<SkirmishComboId> {
-    combo_hit_order().into_iter().find(|id| {
-        combo_enabled(state, maps, *id)
-            && combo_rect(layout, *id)
-                .map(|rect| combo_face_rect(rect, layout.scale).contains(x, y))
-                .unwrap_or(false)
+) -> Option<(SkirmishComboId, RectPx)> {
+    combo_hit_order().into_iter().find_map(|id| {
+        let rect = combo_rect(layout, id)?;
+        (combo_enabled(state, maps, id) && combo_face_rect(rect, layout.scale).contains(x, y))
+            .then_some((id, rect))
     })
 }
 
@@ -748,44 +741,26 @@ pub(super) fn handle_combo_mouse_down(
             }
             return true;
         }
-        if let Some(dropdown) = combo_dropdown_rect(state, layout, maps, open.id) {
-            if let Some(content) = combo_dropdown_content_rect(state, layout, maps, open.id)
-                && content.contains(x, y)
-            {
-                let row = open.top_index + ((y - content.y) / metrics.row_h) as usize;
-                if let Some(item) = combo_items(state, maps, open.id).get(row).copied() {
-                    apply_combo_selection(state, open.id, item);
-                }
-                state.open_combo_dropdown = None;
-                state.dropdown_scroll_drag = None;
-                state.dropdown_scroll_press = None;
-                state.push_ui_sound(SkirmishShellUiSound::GuiComboCloseSound);
-                return true;
-            }
-            if dropdown.contains(x, y) {
-                // The click landed in popup chrome rather than a row; native
-                // ComboDropWin consumes it without closing the popup.
-                return true;
-            }
+        // Past this dialog's own scrollbar, ComboDropWin picks or dismisses.
+        let press = combo_popup(state, layout, maps, open.id, open.top_index)
+            .map_or(ComboPress::Dismiss, |popup| popup.press(x, y));
+        if let ComboPress::Pick(row) = press
+            && let Some(item) = combo_items(state, maps, open.id).get(row).copied()
+        {
+            apply_combo_selection(state, open.id, item);
         }
-        // The open dropdown is a captured popup: any mouse-down outside its
-        // content/scrollbar is delivered to the popup, which plays the close
-        // sound and closes itself. Because the popup consumed the click, it
-        // does NOT propagate to a second combo — switching combos takes two
-        // clicks (this one closes, a later one opens). So even when the click
-        // lands on another combo's arrow, we only close here.
         state.open_combo_dropdown = None;
         state.dropdown_scroll_drag = None;
         state.dropdown_scroll_press = None;
-        state.push_ui_sound(SkirmishShellUiSound::GuiComboCloseSound);
+        if let Some(cue) = press.cue() {
+            state.push_ui_sound(SkirmishShellUiSound::combo(cue));
+        }
         return true;
     }
 
-    // A click anywhere on a collapsed combo face plays the open sound. Only a
-    // click inside the rightmost arrow zone actually opens the dropdown.
-    if let Some(id) = combo_face_at(state, layout, maps, x, y) {
-        state.push_ui_sound(SkirmishShellUiSound::GuiComboOpenSound);
-        if combo_arrow_at(state, layout, maps, x, y) == Some(id) {
+    if let Some((id, rect)) = combo_face_at(state, layout, maps, x, y) {
+        let press = ComboPress::on_face(rect, layout.scale, x, y);
+        if press == ComboPress::Open {
             state.open_combo_dropdown = Some(OpenComboDropdown {
                 id,
                 top_index: 0,
@@ -793,6 +768,9 @@ pub(super) fn handle_combo_mouse_down(
             });
             state.dropdown_scroll_drag = None;
             state.dropdown_scroll_press = None;
+        }
+        if let Some(cue) = press.cue() {
+            state.push_ui_sound(SkirmishShellUiSound::combo(cue));
         }
         return true;
     }

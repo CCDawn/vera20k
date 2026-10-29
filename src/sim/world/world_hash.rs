@@ -495,14 +495,14 @@ fn hash_mission_leaf(leaf: &crate::sim::mission::MissionLeafState, hasher: &mut 
 impl Simulation {
     /// Read-only Rust diagnostic projections through the existing hash owners.
     /// These are attribution receipts, never gameplay/native golden inputs.
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn hash_owner_diagnostics_for_test(&self) -> [(&'static str, u64); 14] {
+    pub fn state_hash_owners(&self) -> [(&'static str, u64); 15] {
         fn digest(fold: impl FnOnce(&mut StateHasher)) -> u64 {
             let mut hasher = StateHasher::new();
             fold(&mut hasher);
             hasher.finish()
         }
         [
+            ("fold_before_fog", digest(|h| self.fold_before_fog(h))),
             ("houses", digest(|h| self.hash_houses(h))),
             (
                 "entities",
@@ -555,6 +555,15 @@ impl Simulation {
             ("planning", digest(|h| self.planning.hash_state(h))),
             ("projectiles", digest(|h| self.hash_projectiles(h))),
         ]
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn hash_owner_diagnostics_for_test(&self) -> [(&'static str, u64); 14] {
+        // Preserve the existing snapshot tests' owner selection; the new
+        // production prefix additionally includes clocks and Scenario RNG.
+        self.state_hash_owners()[1..]
+            .try_into()
+            .expect("14 retained owner groups")
     }
 
     /// Deterministic state hash over canonicalized simulation state.
@@ -759,12 +768,16 @@ impl Simulation {
         shared_dummy_overlay.hash(hasher);
         if bridge_keeps_dummy
             || cells_or_entities_retain_dummy
+            || self
+                .resolved_terrain
+                .as_ref()
+                .is_some_and(|terrain| self.team_script_vm.retains_dummy_cell(terrain))
             || self.projectiles.iter().any(|(_, projectile)| {
                 projectile.target() == crate::sim::projectile::ProjectileTarget::DummyCell
             })
         {
-            // Retained Cell pointers make the live coordinate affect
-            // future range, approach and projectile behavior.
+            // Retained Cell pointers make the live coordinate affect future
+            // range, Team orders, approach and projectile behavior.
             b"shared-cell-dummy-target-v3".hash(hasher);
             shared_dummy.coord.hash(hasher);
         }
@@ -1055,7 +1068,20 @@ impl Simulation {
             }
             house.side_index().hash(hasher);
             house.is_human().hash(hasher);
-            house.player_control().hash(hasher);
+            if self.session.game_mode().is_network() {
+                // Lifecycle discovery projects every represented human before
+                // shared Event5 reads this notification; it is no longer a
+                // process-local cache in a network world.
+                house.discovered_by_current_house().hash(hasher);
+            }
+            // CreateHouses688109..68810F sets PlayerControl(+1ED) only on
+            // this process's source. LAN/WOL peers intentionally differ in
+            // that local input/EVA selector; IsHuman remains shared authority.
+            // Campaign admission/initial credits still read PlayerControl.
+            // Source: original gamemd.exe instructions.
+            if !self.session.game_mode().is_network() {
+                house.player_control().hash(hasher);
+            }
             (house.difficulty() as i32).hash(hasher);
             house.rof_bias().bits().hash(hasher);
             house.is_defeated().hash(hasher);
@@ -1069,6 +1095,9 @@ impl Simulation {
             house.outcome().hash(hasher);
             house.map_is_clear().hash(hasher);
             house.spy_sat_active().hash(hasher);
+            // The initial sight latch drives future per-House fog callbacks.
+            // Network sight updates every represented human viewpoint, so this
+            // retained invalidation state is shared and must remain checked.
             if house.initial_sight_refresh_pending() {
                 b"house-initial-sight-refresh-v1".hash(hasher);
             }
@@ -1423,8 +1452,12 @@ impl Simulation {
     /// spread over threads in large worlds.
     fn entity_digests(&self, entities: &[&GameEntity]) -> Vec<u64> {
         let frame = self.session.binary_frame();
+        let network = self.session.game_mode().is_network();
         state_hasher::digests(entities, entities.len() >= 4096, |entity, hasher| {
-            hash_entity(entity, frame, hasher)
+            hash_entity(entity, frame, hasher);
+            if network {
+                entity.discovery.hash_network(hasher);
+            }
         })
     }
 
@@ -1524,6 +1557,16 @@ fn hash_particle(p: &crate::sim::particles::Particle, hasher: &mut impl Hasher) 
 /// `frame` is the binary frame the pending timers measure against.
 fn hash_entity(entity: &GameEntity, frame: u32, hasher: &mut StateHasher) {
     entity.stable_id().hash(hasher);
+    if entity.production_start_price() != 0 {
+        // Techno+300 survives factory release and can suppress FreeUnit at
+        // Grand_Opening446AF2. Native ComputeCRC70C3C6 also consumes it.
+        b"production-start-price".hash(hasher);
+        entity.production_start_price().hash(hasher);
+    }
+    if entity.is_useless() {
+        // Native Techno+3D0 affects a later Repair-depot sale (`0x0044C4BC`).
+        b"techno-useless-v1".hash(hasher);
+    }
     // Shared count presence and the raw Techno reload clock affect future
     // firing/reload, including a signed -1 reached from InitialAmmo=-2.
     b"techno-ammo-reload-v1".hash(hasher);
@@ -1768,6 +1811,10 @@ fn hash_entity(entity: &GameEntity, frame: u32, hasher: &mut StateHasher) {
     if !entity.unit_delivery_provides_base_space() {
         b"unit-delivery-no-base-v1".hash(hasher);
     }
+    if let Some(origin) = entity.hunter_seeker_origin() {
+        b"hunter-seeker-source-v1".hash(hasher);
+        origin.hash(hasher);
+    }
     // Building+662 and Techno+1C8 (`sim::powered_unit`), folded only
     // while set.
     if entity.building_powered_center.is_counted() {
@@ -1836,7 +1883,12 @@ fn hash_entity(entity: &GameEntity, frame: u32, hasher: &mut StateHasher) {
     // The flash countdown (+F0) is not folded: TechnoClass::Flash's gate and
     // the MegaMission event's flash read the current player, so lockstep
     // peers hold different values, and no gameplay decision reads it.
-    entity.crate_multipliers.armor().bits().hash(hasher);
+    entity.crate_multipliers.crate_armor().bits().hash(hasher);
+    #[cfg(feature = "ares")]
+    if entity.crate_multipliers.armor() != entity.crate_multipliers.crate_armor() {
+        b"attached-armor-v1".hash(hasher);
+        entity.crate_multipliers.armor().bits().hash(hasher);
+    }
     // Folded only once a Firepower crate changed it, so the legacy
     // hash stream of every untouched object is preserved.
     if entity.crate_multipliers.crate_firepower() != crate::util::native_x87::NativeF64Bits::ONE {
@@ -1923,7 +1975,7 @@ fn hash_entity(entity: &GameEntity, frame: u32, hasher: &mut StateHasher) {
     }
     entity.navigation.pending_destination_setter().hash(hasher);
 
-    entity.foot_speed.applied_fraction().hash(hasher);
+    entity.foot_speed.native_applied_fraction().hash(hasher);
     if entity.foot_speed.crush_slowdown() {
         0x6b5_u32.hash(hasher);
         true.hash(hasher);
@@ -1994,6 +2046,9 @@ fn hash_entity(entity: &GameEntity, frame: u32, hasher: &mut StateHasher) {
     entity.building_light.spotlight_capable().hash(hasher);
     entity.building_light.light().hash(hasher);
     entity.low_bridge_tube_state.hash(hasher);
+    entity.stealth_ability.granted().hash(hasher);
+    #[cfg(feature = "ares")]
+    entity.stealth_ability.attached().hash(hasher);
     if let Some(cloak) = entity.cloak.as_ref() {
         1u8.hash(hasher);
         cloak.state().hash(hasher);
@@ -2004,20 +2059,6 @@ fn hash_entity(entity: &GameEntity, frame: u32, hasher: &mut StateHasher) {
         cloak.step_timer().timer().duration().hash(hasher);
         cloak.recloak_delay().start_frame().hash(hasher);
         cloak.recloak_delay().duration().hash(hasher);
-    } else {
-        0u8.hash(hasher);
-    }
-    if let Some(deposit) = entity.sensor_deposit {
-        1u8.hash(hasher);
-        deposit.owner().hash(hasher);
-        deposit.center().hash(hasher);
-        deposit.add_radius().hash(hasher);
-        deposit.remove_radius().hash(hasher);
-        deposit.building_array().hash(hasher);
-        // The cached `DetectDisguiseRange=` circle. It is the
-        // radius Limbo will decrement, so it selects which
-        // cells leave the disguise-detect plane.
-        deposit.detect_disguise_radius().hash(hasher);
     } else {
         0u8.hash(hasher);
     }
@@ -2355,6 +2396,10 @@ fn hash_entity(entity: &GameEntity, frame: u32, hasher: &mut StateHasher) {
         }
         None => 0u8.hash(hasher),
     }
+    if let Some(anim) = entity.parachute_animation() {
+        b"parachute-animation-v1".hash(hasher);
+        anim.hash(hasher);
+    }
     // Preserve the idle hash while retaining every nonzero fall word.
     // Landing retains the rate/+84/+8F for a later DropAsBomb.
     if entity.is_falling_down()
@@ -2467,8 +2512,8 @@ fn hash_locomotor_payload(
             state.landing_effect_latched().hash(hasher);
             state.airport_bound().hash(hasher);
             state.fall_counter().hash(hasher);
-            state.target_speed().to_bits().hash(hasher);
-            state.current_speed().to_bits().hash(hasher);
+            state.target_speed().bits().hash(hasher);
+            state.current_speed().bits().hash(hasher);
         }
         LocomotorRuntimePayload::Jumpjet(state) => {
             10u8.hash(hasher);
@@ -4536,6 +4581,11 @@ mod bridge161_hash_projection_tests {
             true,
         );
         let mut locomotor = LocomotorState::for_test_kind(kind);
+        if let Some(fly) = locomotor.fly_runtime_mut() {
+            let tenth = crate::util::native_x87::NativeF64Bits::from_bits(0x3fb9_9999_9999_999a);
+            fly.set_target_speed_bits_for_test(tenth);
+            fly.set_current_speed_bits_for_test(tenth);
+        }
         if stashed {
             assert!(locomotor.begin_piggyback(LocomotorKind::Teleport, 0));
         }
@@ -4559,6 +4609,15 @@ mod bridge161_hash_projection_tests {
                 _ => unreachable!(),
             },
             LocomotorRuntimePayload::Hover(state) => state.set_head(Some(coord)),
+            LocomotorRuntimePayload::Fly(state) => {
+                // Adjacent binary64 values share the same old Q16 projection.
+                let next = crate::util::native_x87::NativeF64Bits::from_bits(0x3fb9_9999_9999_999b);
+                match field {
+                    0 => state.set_target_speed_bits_for_test(next),
+                    1 => state.set_current_speed_bits_for_test(next),
+                    _ => unreachable!(),
+                }
+            }
             LocomotorRuntimePayload::Jumpjet(state) => {
                 *state = match field {
                     0 => state.clone().with_destination_for_test(coord),
@@ -4594,6 +4653,7 @@ mod bridge161_hash_projection_tests {
         for (kind, fields) in [
             (LocomotorKind::Walk, 4),
             (LocomotorKind::Hover, 1),
+            (LocomotorKind::Fly, 2),
             (LocomotorKind::Jumpjet, 7),
         ] {
             for stashed in [false, true] {

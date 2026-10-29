@@ -2,7 +2,54 @@
 //! Installed10058520/10058E00/100588E0/10042C30; see docs/ares-attach-effect.md.
 use super::GameEntity;
 use crate::sim::intern::InternedId;
+use crate::util::native_x87::NativeF64Bits;
 use std::hash::{Hash, Hasher};
+
+/// Native instance+0 holds the shared descriptor pointer, belonging either
+/// to a Warhead or to a concrete TechnoType (10058ED1 compares its owner).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+enum EffectOrigin {
+    Warhead(InternedId),
+    TechnoType(crate::rules::object_type::ObjectCategory, InternedId),
+}
+
+impl EffectOrigin {
+    fn settings<'a>(
+        self,
+        rules: &'a crate::rules::ruleset::RuleSet,
+        interner: &crate::sim::intern::StringInterner,
+    ) -> Option<&'a crate::rules::ares_warhead::AttachEffectRules> {
+        match self {
+            Self::Warhead(id) => rules
+                .warhead(interner.try_resolve(id)?)
+                .and_then(|wh| wh.ares_rules())
+                .map(|ext| ext.attach_effect()),
+            Self::TechnoType(category, id) => interner
+                .object_type_in_category(id, category, rules)
+                .and_then(|kind| kind.self_attach_effect()),
+        }
+    }
+
+    fn for_type(entity: &GameEntity) -> Self {
+        Self::TechnoType(entity.category().into(), entity.type_ref())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+enum SelfEffectState {
+    Pending(i32),
+    // The native +2C counter survives while +31 is Applied/Disabled. A type
+    // conversion clears only that flag, exposing the same counter again.
+    Applied(i32),
+    Disabled(i32),
+}
+impl Default for SelfEffectState {
+    fn default() -> Self {
+        // TechnoExt allocation10042CD7: +2C starts INT_MAX. Update10058F9D
+        // substitutes the current descriptor's InitialDelay on first use.
+        Self::Pending(i32::MAX)
+    }
+}
 
 #[cfg(test)]
 #[path = "attach_speed_tests.rs"]
@@ -12,18 +59,57 @@ mod speed_tests;
 #[path = "attach_firepower_tests.rs"]
 mod firepower_tests;
 
+#[cfg(test)]
+#[path = "attach_decloak_tests.rs"]
+mod decloak_tests;
+
+#[cfg(test)]
+#[path = "attach_self_cloak_tests.rs"]
+mod self_cloak_tests;
+
+#[cfg(test)]
+#[path = "attach_armor_tests.rs"]
+mod armor_tests;
+
+#[cfg(test)]
+#[path = "attach_rof_tests.rs"]
+mod rof_tests;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 struct AttachedEffect {
-    warhead: InternedId,
+    origin: EffectOrigin,
     animation: Option<u64>,
     remaining: i32,
     source_house: Option<InternedId>,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(super) struct AttachEffects {
     entries: Vec<AttachedEffect>,
     animations_hidden: bool,
+    self_effect: SelfEffectState,
+    rof_multiplier: NativeF64Bits,
+}
+
+impl Default for AttachEffects {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            animations_hidden: false,
+            self_effect: SelfEffectState::default(),
+            // Installed Ares TechnoExt constructor10042D98..10042DAC:
+            // FLD1; FST qword[Ext+78], independent of crate baselines.
+            rof_multiplier: NativeF64Bits::ONE,
+        }
+    }
+}
+
+struct AttachedStats {
+    firepower: NativeF64Bits,
+    speed: NativeF64Bits,
+    armor: NativeF64Bits,
+    cloak: bool,
+    rof: NativeF64Bits,
 }
 
 impl GameEntity {
@@ -31,13 +117,7 @@ impl GameEntity {
         &self,
         rules: &crate::rules::ruleset::RuleSet,
         interner: &crate::sim::intern::StringInterner,
-    ) -> Result<
-        (
-            crate::util::native_x87::NativeF64Bits,
-            crate::util::native_x87::NativeF64Bits,
-        ),
-        &'static str,
-    > {
+    ) -> Result<AttachedStats, &'static str> {
         use crate::util::native_x87::MaskedX87Chop53 as X;
         //100460A0: Ext+80/+90 are permanent crate baselines. Firepower
         //10046176..180 spills binary64 after EACH ordered entry; Foot speed
@@ -45,24 +125,44 @@ impl GameEntity {
         //values: rules_oracle/ares_attach_firepower and ares_attach_speed.
         let mut firepower = self.crate_multipliers.crate_firepower();
         let mut speed = X::load_f64(self.foot_speed.crate_multiplier());
+        let mut armor = self.crate_multipliers.crate_armor();
+        let mut cloak = false;
+        let mut rof = NativeF64Bits::ONE;
         for entry in &self.attach_effects.entries {
-            let settings = interner
-                .try_resolve(entry.warhead)
-                .and_then(|name| rules.warhead(name))
-                .and_then(|wh| wh.ares_rules())
-                .ok_or("attachment warhead is absent from restored rules")?;
+            let settings = entry
+                .origin
+                .settings(rules, interner)
+                .ok_or("attachment descriptor is absent from restored rules")?;
             firepower = X::store_f64_masked_chop(X::mul(
-                X::load_f64(settings.attach_effect().firepower_multiplier()),
+                X::load_f64(settings.firepower_multiplier()),
                 X::load_f64(firepower),
             ));
+            // Ares TechnoExt::RecalculateStats @10046192..10046199:
+            // each ordered ArmorMultiplier multiplies Ext+88's aggregate,
+            // spilling binary64 before the next entry; final Techno+158
+            // is consumed by stock ReceiveDamage @701939 and EstimateDamage.
+            armor = X::store_f64_masked_chop(X::mul(
+                X::load_f64(settings.armor_multiplier()),
+                X::load_f64(armor),
+            ));
+            // Installed Ares RecalculateStats10046184..1004618B:
+            // descriptor+28, with a binary64 spill after each ordered factor.
+            rof = X::store_f64_masked_chop(X::mul(
+                X::load_f64(settings.rof_multiplier()),
+                X::load_f64(rof),
+            ));
             if self.category().is_foot() {
-                speed = X::mul(
-                    speed,
-                    X::load_f64(settings.attach_effect().speed_multiplier()),
-                );
+                speed = X::mul(speed, X::load_f64(settings.speed_multiplier()));
             }
+            cloak |= settings.cloakable();
         }
-        Ok((firepower, X::store_f64_masked_chop(speed)))
+        Ok(AttachedStats {
+            firepower,
+            speed: X::store_f64_masked_chop(speed),
+            armor,
+            cloak,
+            rof,
+        })
     }
 
     /// One100460A0 projection from the canonical attachment vector. Each
@@ -72,13 +172,23 @@ impl GameEntity {
         rules: &crate::rules::ruleset::RuleSet,
         interner: &crate::sim::intern::StringInterner,
     ) {
-        let (firepower, speed) = self
+        let stats = self
             .attached_stats_from_entries(rules, interner)
             .expect("live attachment belongs to the scenario rules");
-        self.crate_multipliers.set_attached_firepower(firepower);
+        self.crate_multipliers
+            .set_attached_firepower(stats.firepower);
+        self.crate_multipliers.set_attached_armor(stats.armor);
+        self.stealth_ability.set_attached(stats.cloak);
+        // RecalculateStats10046130..10046134 commits Ext+78. The reload
+        // consumer samples it on a later GetROF; existing timers stay intact.
+        self.attach_effects.rof_multiplier = stats.rof;
         if self.category().is_foot() {
-            self.foot_speed.set_attached_speed(speed);
+            self.foot_speed.set_attached_speed(stats.speed);
         }
+    }
+
+    pub(crate) fn attached_rof_multiplier(&self) -> NativeF64Bits {
+        self.attach_effects.rof_multiplier
     }
 
     pub(crate) fn attached_effect_anims(&self) -> impl Iterator<Item = u64> + '_ {
@@ -96,7 +206,11 @@ impl GameEntity {
         }
     }
     pub(crate) fn hash_attach_effects<H: Hasher>(&self, hasher: &mut H) {
-        if !self.attach_effects.entries.is_empty() || self.attach_effects.animations_hidden {
+        if !self.attach_effects.entries.is_empty()
+            || self.attach_effects.animations_hidden
+            || self.attach_effects.self_effect != SelfEffectState::default()
+            || self.attach_effects.rof_multiplier != NativeF64Bits::ONE
+        {
             b"ares-attach-effects-v1".hash(hasher);
             self.attach_effects.hash(hasher);
         }
@@ -415,8 +529,8 @@ mod receiver {
             if settings.duration() == 0 {
                 return;
             }
-            // Ground WH speed/firepower share the existing aggregate owner.
-            // Armor/ROF, decloak, Temporal and self-effects remain explicit
+            // Ground WH speed/firepower/armor share the existing aggregate owner.
+            // ROF and Temporal remain explicit
             // later mechanisms; never apply a misleading visual-only substitute.
             if !settings.visual_combat_path() {
                 log::debug!(
@@ -453,51 +567,109 @@ mod receiver {
                     || f64::from_bits(warhead.interaction(kind.armor_id()).multiplier().bits())
                         .abs()
                         < 0.001
-                    || (!settings.penetrates_iron_curtain()
-                        && crate::sim::superweapon::invulnerability::is_invulnerable(
-                            victim.invulnerability.as_ref(),
-                            self.session.binary_frame(),
-                        ))
                 {
                     continue;
                 }
                 let wh = self.interner.intern(&warhead.id);
-                let repeated = (!settings.cumulative())
-                    .then(|| {
-                        self.substrate
-                            .entities
-                            .get(target)
-                            .unwrap()
-                            .attach_effects
-                            .entries
-                            .iter()
-                            .position(|entry| entry.warhead == wh)
-                    })
-                    .flatten();
-                if let Some(index) = repeated {
-                    let victim = self.substrate.entities.get_mut(target).unwrap();
-                    victim.attach_effects.entries[index].remaining = settings.duration();
-                    //100585BB preserves the first source House on reapplication.
-                    if settings.animation().is_some() && settings.anim_reset_on_reapply() {
-                        self.create_attached_effect_anim(target, index, rules);
-                    }
-                } else {
-                    let victim = self.substrate.entities.get_mut(target).unwrap();
-                    let index = victim.attach_effects.entries.len();
-                    victim.attach_effects.entries.push(AttachedEffect {
-                        warhead: wh,
-                        animation: None,
-                        remaining: settings.duration(),
-                        source_house,
-                    });
+                self.attach_ares_effect(
+                    target,
+                    EffectOrigin::Warhead(wh),
+                    settings.duration(),
+                    source_house,
+                    rules,
+                );
+            }
+        }
+
+        /// AttachEffectTypeClass::Attach10058520 is shared by ground WH and
+        /// self descriptors. It owns IC admission, refresh, animation creation,
+        /// aggregate publication and forced-uncloak ordering for both callers.
+        fn attach_ares_effect(
+            &mut self,
+            target: u64,
+            origin: EffectOrigin,
+            duration: i32,
+            source_house: Option<InternedId>,
+            rules: &RuleSet,
+        ) -> bool {
+            let Some(settings) = origin.settings(rules, &self.interner) else {
+                return false;
+            };
+            let Some(victim) = self.substrate.entities.get(target) else {
+                return false;
+            };
+            if !settings.penetrates_iron_curtain()
+                && crate::sim::superweapon::invulnerability::is_invulnerable(
+                    victim.invulnerability.as_ref(),
+                    self.session.binary_frame(),
+                )
+            {
+                return false;
+            }
+            let repeated = (!settings.cumulative())
+                .then(|| {
+                    self.substrate
+                        .entities
+                        .get(target)
+                        .unwrap()
+                        .attach_effects
+                        .entries
+                        .iter()
+                        .position(|entry| entry.origin == origin)
+                })
+                .flatten();
+            if let Some(index) = repeated {
+                let victim = self.substrate.entities.get_mut(target).unwrap();
+                victim.attach_effects.entries[index].remaining = settings.duration();
+                //100585BB preserves the first source House on reapplication.
+                if settings.animation().is_some() && settings.anim_reset_on_reapply() {
                     self.create_attached_effect_anim(target, index, rules);
-                    //1005869F follows animation creation; callbacks before
-                    //that call still see the previously committed stats.
-                    if let Some(victim) = self.substrate.entities.get_mut(target) {
-                        victim.recompute_ares_attached_stats(rules, &self.interner);
-                    }
+                }
+            } else {
+                let victim = self.substrate.entities.get_mut(target).unwrap();
+                let index = victim.attach_effects.entries.len();
+                victim.attach_effects.entries.push(AttachedEffect {
+                    origin,
+                    animation: None,
+                    remaining: duration,
+                    source_house,
+                });
+                self.create_attached_effect_anim(target, index, rules);
+                //1005869F follows animation creation; callbacks before
+                //that call still see the previously committed stats.
+                if let Some(victim) = self.substrate.entities.get_mut(target) {
+                    victim.recompute_ares_attached_stats(rules, &self.interner);
                 }
             }
+            // Ares AttachEffectTypeClass::Attach @100586A4..100586C0:
+            // new and refreshed entries share this tail, after animation
+            // creation and any aggregate. Virtual +45C(true) is stock
+            // StartUncloaking @7036C0; its owner rejects states 0/3 and
+            // suppresses the sound without restarting an active transition.
+            if settings.force_decloak() {
+                let speed = self
+                    .substrate
+                    .entities
+                    .get(target)
+                    .and_then(|victim| self.interner.object_type(victim.type_ref(), rules))
+                    .map(|kind| kind.cloaking_speed);
+                if let Some(speed) = speed
+                    && let Some(cloak) = self
+                        .substrate
+                        .entities
+                        .get_mut(target)
+                        .and_then(|victim| victim.cloak.as_mut())
+                {
+                    cloak.start_uncloaking(
+                        self.session.binary_frame() as i32,
+                        speed,
+                        rules.general.cloaking_stages,
+                        true,
+                    );
+                }
+            }
+
+            true
         }
 
         fn create_attached_effect_anim(&mut self, target: u64, index: usize, rules: &RuleSet) {
@@ -514,10 +686,10 @@ mod receiver {
                 return;
             };
             let source = entry.source_house;
-            let Some(name) = rules
-                .warhead(self.interner.resolve(entry.warhead))
-                .and_then(|wh| wh.ares_rules())
-                .and_then(|extension| extension.attach_effect().animation())
+            let Some(name) = entry
+                .origin
+                .settings(rules, &self.interner)
+                .and_then(|settings| settings.animation())
             else {
                 return;
             };
@@ -579,14 +751,24 @@ mod receiver {
             {
                 return;
             }
-            if victim.attach_effects.entries.is_empty() {
+            if victim.attach_effects.entries.is_empty()
+                && !matches!(
+                    victim.attach_effects.self_effect,
+                    SelfEffectState::Pending(_)
+                )
+            {
                 return;
             }
+            let own_origin = EffectOrigin::for_type(victim);
+            let own_settings = own_origin.settings(rules, &self.interner);
+            let deactivated = victim.deactivated.is_offline();
             let hidden = matches!(
                 victim.cloak.as_ref().map(|cloak| cloak.state()),
                 Some(1 | 2)
             );
-            if hidden != victim.attach_effects.animations_hidden {
+            if !victim.attach_effects.entries.is_empty()
+                && hidden != victim.attach_effects.animations_hidden
+            {
                 let len = victim.attach_effects.entries.len();
                 for index in 0..len {
                     if hidden {
@@ -602,20 +784,30 @@ mod receiver {
                     .attach_effects
                     .animations_hidden = hidden;
             }
-            //10058EC0 decrements positive durations after the visibility work.
+            // Update10058EC0..10058EEF decrements positive counters. Only
+            // a descriptor owned by the actor's current Type has self-effect
+            // deactivation/expiry semantics; ordinary WH effects are unchanged.
             let mut index = 0;
             let mut expired = false;
             loop {
-                let Some(entry) = self
-                    .substrate
-                    .entities
-                    .get_mut(target)
-                    .and_then(|victim| victim.attach_effects.entries.get_mut(index))
-                else {
+                let Some(victim) = self.substrate.entities.get_mut(target) else {
+                    break;
+                };
+                let Some(entry) = victim.attach_effects.entries.get_mut(index) else {
                     break;
                 };
                 if entry.remaining > 0 {
                     entry.remaining -= 1;
+                }
+                if entry.origin == own_origin {
+                    if deactivated {
+                        entry.remaining = 0;
+                    }
+                    if entry.remaining == 0 {
+                        victim.attach_effects.self_effect = SelfEffectState::Pending(
+                            own_settings.expect("current self descriptor").delay(),
+                        );
+                    }
                 }
                 if entry.remaining == 0 {
                     expired = true;
@@ -635,6 +827,91 @@ mod receiver {
             //10058F79 aggregate. Visibility-only work never recomputes it.
             if expired && let Some(victim) = self.substrate.entities.get_mut(target) {
                 victim.recompute_ares_attached_stats(rules, &self.interner);
+            }
+            //10058F82..10058FE7 runs after compaction/recompute. Positive
+            // delays count even while deactivated; zero retries IC admission,
+            // and a negative delay stays pending without attaching.
+            let Some(SelfEffectState::Pending(saved_delay)) = self
+                .substrate
+                .entities
+                .get(target)
+                .map(|victim| victim.attach_effects.self_effect)
+            else {
+                return;
+            };
+            let Some(settings) = own_settings else {
+                return;
+            };
+            if settings.duration() == 0 {
+                self.substrate
+                    .entities
+                    .get_mut(target)
+                    .unwrap()
+                    .attach_effects
+                    .self_effect = SelfEffectState::Disabled(saved_delay);
+                return;
+            }
+            if !settings.visual_combat_path() {
+                return;
+            }
+            let delay = if saved_delay == i32::MAX {
+                settings.initial_delay()
+            } else {
+                saved_delay
+            };
+            if delay > 0 {
+                self.substrate
+                    .entities
+                    .get_mut(target)
+                    .unwrap()
+                    .attach_effects
+                    .self_effect = SelfEffectState::Pending(delay - 1);
+            } else if delay == 0 && !deactivated {
+                let owner = self.substrate.entities.get(target).unwrap().owner();
+                if self.attach_ares_effect(
+                    target,
+                    own_origin,
+                    settings.duration(),
+                    Some(owner),
+                    rules,
+                ) {
+                    self.substrate
+                        .entities
+                        .get_mut(target)
+                        .unwrap()
+                        .attach_effects
+                        .self_effect = SelfEffectState::Applied(saved_delay);
+                }
+            }
+        }
+
+        /// Ares conversion10043792 -> vector RemoveType100589F0 clears the
+        /// applied flag without resetting its counter, then erases the first
+        /// descriptor owned by the old Type. Warhead-owned effects survive.
+        pub(crate) fn reset_self_attach_effect_for_type_change(
+            &mut self,
+            target: u64,
+            old_type: InternedId,
+            rules: &RuleSet,
+        ) {
+            let Some(victim) = self.substrate.entities.get_mut(target) else {
+                return;
+            };
+            let origin = EffectOrigin::TechnoType(victim.category().into(), old_type);
+            let delay = match victim.attach_effects.self_effect {
+                SelfEffectState::Pending(delay)
+                | SelfEffectState::Applied(delay)
+                | SelfEffectState::Disabled(delay) => delay,
+            };
+            victim.attach_effects.self_effect = SelfEffectState::Pending(delay);
+            let animation = victim
+                .attach_effects
+                .entries
+                .iter()
+                .position(|entry| entry.origin == origin)
+                .and_then(|index| victim.attach_effects.entries.remove(index).animation);
+            if let Some(animation) = animation {
+                self.destroy_anim_with_context(animation, rules);
             }
         }
 
@@ -660,10 +937,10 @@ mod receiver {
             let interner = &self.interner;
             let victim = self.substrate.entities.get_mut(target).unwrap();
             victim.attach_effects.entries.retain(|entry| {
-                !rules
-                    .warhead(interner.resolve(entry.warhead))
-                    .and_then(|wh| wh.ares_rules())
-                    .is_some_and(|extension| extension.attach_effect().discard_on_entry())
+                !entry
+                    .origin
+                    .settings(rules, interner)
+                    .is_some_and(|settings| settings.discard_on_entry())
             });
             //100588E0's removal result gates1004B197. Merely hiding held
             //animations leaves the previously committed stats untouched.
@@ -699,17 +976,29 @@ mod receiver {
                 let expected = victim
                     .attached_stats_from_entries(rules, &self.interner)
                     .map_err(|reason| (id, reason))?;
-                if victim.crate_multipliers.firepower() != expected.0 {
+                if victim.crate_multipliers.firepower() != expected.firepower {
                     return Err((
                         id,
                         "saved attached firepower differs from its baseline and effects",
                     ));
                 }
-                if victim.foot_speed.effective_multiplier() != expected.1 {
+                if victim.foot_speed.effective_multiplier() != expected.speed {
                     return Err((
                         id,
                         "saved attached speed differs from its baseline and effects",
                     ));
+                }
+                if victim.crate_multipliers.armor() != expected.armor {
+                    return Err((
+                        id,
+                        "saved attached armor differs from its baseline and effects",
+                    ));
+                }
+                if victim.stealth_ability.attached() != expected.cloak {
+                    return Err((id, "saved attached cloak ability differs from its effects"));
+                }
+                if victim.attached_rof_multiplier() != expected.rof {
+                    return Err((id, "saved attached ROF differs from its effects"));
                 }
             }
             Ok(())

@@ -313,6 +313,7 @@ pub struct MessageBoxLayout {
     pub ok: RectPx,
     pub cancel: Option<RectPx>,
     pub third: Option<RectPx>,
+    pub scale: geom::ShellScale,
 }
 
 pub fn message_box_layout(kind: ModalKind, screen_w: i32, screen_h: i32) -> MessageBoxLayout {
@@ -331,6 +332,31 @@ pub fn message_box_layout(kind: ModalKind, screen_w: i32, screen_h: i32) -> Mess
             .then(|| modal_child(dialog, geom::child_window(207, 175, 83, 15))),
         third: includes_third(kind)
             .then(|| modal_child(dialog, geom::child_window(207, 155, 83, 15))),
+        scale: geom::ShellScale::RETAIL,
+    }
+}
+
+/// Keep ShellMessageBox__Run (0x005D3490)'s template and CenterWindow
+/// (0x00777080)'s centering in authored pixels, then apply the front-end
+/// shell's uniform mapping. Retail 640/800 layouts keep their native size.
+/// Source: gamemd.exe RT_DIALOG CE/120/121 and tools/storage_oracle/saved_game_layout.json.
+pub fn message_box_layout_on(
+    kind: ModalKind,
+    screen_w: i32,
+    screen_h: i32,
+    scale: geom::ShellScale,
+) -> MessageBoxLayout {
+    if scale.is_retail() {
+        return message_box_layout(kind, screen_w, screen_h);
+    }
+    let base = message_box_layout(kind, geom::SHELL_BASE_W, geom::SHELL_BASE_H);
+    MessageBoxLayout {
+        dialog: scale.scale_rect(base.dialog),
+        body: scale.scale_rect(base.body),
+        ok: scale.scale_rect(base.ok),
+        cancel: base.cancel.map(|rect| scale.scale_rect(rect)),
+        third: base.third.map(|rect| scale.scale_rect(rect)),
+        scale,
     }
 }
 
@@ -398,6 +424,25 @@ pub fn wait_box_layout(screen_w: i32, screen_h: i32) -> WaitBoxLayout {
         disconnect: modal_child(dialog, geom::child_window(109, 105, 83, 15)),
         check_status: modal_child(dialog, geom::child_window(109, 130, 83, 15)),
         animation: modal_child(dialog, geom::child_window(68, 163, 165, 20)),
+    }
+}
+
+/// WOL wait proc 0x00792CF0 uses the same shell mapping for art and hit rectangles.
+pub fn wait_box_layout_on(
+    screen_w: i32,
+    screen_h: i32,
+    scale: geom::ShellScale,
+) -> WaitBoxLayout {
+    if scale.is_retail() {
+        return wait_box_layout(screen_w, screen_h);
+    }
+    let base = wait_box_layout(geom::SHELL_BASE_W, geom::SHELL_BASE_H);
+    WaitBoxLayout {
+        dialog: scale.scale_rect(base.dialog),
+        text: scale.scale_rect(base.text),
+        disconnect: scale.scale_rect(base.disconnect),
+        check_status: scale.scale_rect(base.check_status),
+        animation: scale.scale_rect(base.animation),
     }
 }
 

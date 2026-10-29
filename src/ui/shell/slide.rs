@@ -20,7 +20,7 @@
 //! start cue (`GUIMoveInSound`, stock `MenuSlideIn`) and the end cue
 //! (`ShellButtonSlideSound`, empty in stock rules).
 
-use std::time::{Duration, Instant};
+use crate::util::time::{Duration, Instant};
 
 use super::descriptor::DialogId;
 use super::geom::RightPanelRects;
@@ -397,6 +397,16 @@ pub(crate) const RENDERED_SHELL_SLIDES: &[SlideDialogSpec] = &[
     // 0/0/1 (`0x0062290E..0x006229CE`).
     SlideDialogSpec {
         dialog_id: 0x0103,
+        top_buttons: 0,
+        bottom_button: true,
+        map_button: false,
+        top_panel: false,
+        campaign_score: true,
+    },
+    // The LAN Cooperative campaign end `0xBC7`: the same record, Continue
+    // (`0x6D1`) alone in the bottom list.
+    SlideDialogSpec {
+        dialog_id: 0x0BC7,
         top_buttons: 0,
         bottom_button: true,
         map_button: false,

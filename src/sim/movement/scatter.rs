@@ -84,6 +84,11 @@ pub(super) fn unit_scatter_admitted(
     rules: &RuleSet,
     binary_frame: u32,
 ) -> bool {
+    // Techno CanScatter6F3283 -> Ares10049F90/6F32C5: no driver, no scatter.
+    #[cfg(feature = "ares")]
+    if unit.driver_killed() {
+        return false;
+    }
     if matches!(unit.mission.effective().raw(), 0 | 6 | 16) {
         return false;
     }
@@ -299,11 +304,11 @@ impl Simulation {
         let Some(entity) = self.substrate.entities.get(id) else {
             return Ok(false);
         };
-        // RESIDUAL: VERA builds no locomotor for a zero-`Speed=` Foot whose
-        // locomotor is neither Drive nor Ship (`should_construct_locomotor`);
-        // native always has one, whose answers would decide the gates and the
-        // Scatter body. No retail Foot type is built that way. Such a Foot
-        // never takes this Scatter.
+        // RESIDUAL: VERA builds no locomotor for a zero-`Speed=` Unit or
+        // Aircraft whose locomotor is neither Drive nor Ship
+        // (`should_construct_locomotor`); native always has one, whose answers
+        // would decide the gates and the Scatter body. No retail Foot type is
+        // built that way. Such a Foot never takes this Scatter.
         if entity.locomotor.is_none() {
             return Ok(false);
         }

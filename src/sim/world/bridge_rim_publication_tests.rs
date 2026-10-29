@@ -375,6 +375,7 @@ fn install_event31_cell_tags(sim: &mut Simulation, rules: &RuleSet, tags: &[(u16
         &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
         None,
         None,
+        None,
     );
     sim.install_authored_cell_trigger_tags(&map);
     sim.classify_map_triggers(rules);

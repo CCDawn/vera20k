@@ -3,7 +3,7 @@
 //! and creates `0x94`; Back (`0x686`, result -1) tears `0x94` down and state 1
 //! recreates Single Player.
 
-use std::time::Instant;
+use crate::util::time::Instant;
 
 use super::{App, AppState};
 use crate::app::shell_route::ShellRoute;
@@ -249,7 +249,10 @@ impl App {
                 side.campaign_name(),
                 state.persistence.options_profile.difficulty,
                 None,
-                None,
+                crate::app::match_bootstrap::CampaignLaunchOptions::for_speed_control(
+                    state.frontend.campaign_speed_control,
+                    state.persistence.options_profile.game_speed,
+                ),
                 &mut clock,
             )
         });

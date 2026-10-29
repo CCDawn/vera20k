@@ -3,7 +3,7 @@
 //! The model is [`crate::ui::wol_my_info`]; `wolinfoMD.ini` goes through
 //! [`super::persona`].
 
-use std::time::Instant;
+use crate::util::time::Instant;
 
 use super::WolPage;
 use super::service::{self, WolServiceRequest};
@@ -11,6 +11,7 @@ use crate::app::frontend::{shell_layout, shell_transition::ShellExitThen};
 use crate::app::persistence::wol_profile::WolPersona;
 use crate::app::{App, AppState};
 use crate::ui::main_menu_dialogs::options::LauncherCue;
+use crate::ui::shell::combobox::ComboPress;
 use crate::ui::skirmish_shell::{SkirmishComboItem, SkirmishCountryChoice};
 use crate::ui::wol_my_info::*;
 
@@ -348,21 +349,12 @@ pub(super) fn mouse(state: &mut AppState, pressed: bool) {
             action = page.activate(control);
         }
     } else if let Some(popup) = page.popup_geometry(&layout) {
-        if let Some(part) = popup.scroll_part_at(x, y) {
-            page.popup.scroll.press(
-                part,
-                popup.scroll_geometry(),
-                &mut page.popup.top_index,
-                y,
-                Instant::now(),
-            );
-        } else {
-            if let (Some(row), Some(control)) = (popup.row_at(x, y), page.popup.control) {
-                action = page.select(control, row);
-            }
-            page.popup.close();
-            cue = Some(LauncherCue::ComboClose);
+        let open = page.popup.control;
+        let press = page.popup.press_list(popup, x, y, Instant::now());
+        if let (ComboPress::Pick(row), Some(control)) = (press, open) {
+            action = page.select(control, row);
         }
+        cue = press.cue().map(LauncherCue::from);
     } else {
         match over {
             Some(control) if PAGE.button(control).is_some() => {
@@ -372,14 +364,12 @@ pub(super) fn mouse(state: &mut AppState, pressed: bool) {
                 }
             }
             Some(control) if COMBOS.contains(&control) => {
-                if page.enabled(control) {
-                    if layout.face(control).is_some_and(|face| {
-                        crate::ui::skirmish_shell::combo_arrow_hit_rect(face, scale).contains(x, y)
-                    }) {
-                        let selected = page.combo(control).and_then(|combo| combo.selected);
-                        page.popup.open(control, selected);
-                    }
-                    cue = Some(LauncherCue::ComboOpen);
+                if page.enabled(control)
+                    && let Some(face) = layout.face(control)
+                {
+                    let selected = page.combo(control).and_then(|combo| combo.selected);
+                    let press = page.popup.press_face(control, face, scale, selected, x, y);
+                    cue = press.cue().map(LauncherCue::from);
                 }
             }
             Some(control @ (AUTO_LOGIN | MATCH_SAME_RES)) => {

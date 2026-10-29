@@ -28,7 +28,8 @@ const LAYER_RULES: &[(&str, &[&str])] = &[
     ("rules", &["sim", "map"]),
     ("map", &["sim", "render", "app"]),
     ("render", &["app"]),
-    ("ui", &["app", "skirmish_scenarios"]),
+    // render draws ui view models; ui stays render-agnostic.
+    ("ui", &["app", "render", "skirmish_scenarios"]),
     ("sim", &["render", "ui", "audio", "net"]),
 ];
 
@@ -71,8 +72,9 @@ fn production_dependency_edges_match_frozen_ledger_inventory() {
 
 /// F09: `Simulation::advance_master_frame` and `advance_app_frame` accept
 /// swappable rules/map/path resources, so their production call sites are
-/// pinned — the master frame is reached only inside `sim/world/mod.rs`, the
-/// app frame only there and in `SimRuntime::advance_frame`. Every other
+/// pinned — the master frame is reached only inside
+/// `sim/world/master_frame.rs`, the app frame only there and in
+/// `SimRuntime::advance_frame`. Every other
 /// caller must be `#[cfg(test)]` (the `advance_tick` fixture adapter and the
 /// replay `run_fixture*` runners are compile-time gated already); production
 /// and tooling advance exclusively through the bound-resource runtime.
@@ -80,8 +82,11 @@ fn production_dependency_edges_match_frozen_ledger_inventory() {
 fn master_frame_adapters_have_pinned_production_callers() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let allowed: &[(&str, &[&str])] = &[
-        ("advance_master_frame", &["sim/world/mod.rs"]),
-        ("advance_app_frame", &["sim/world/mod.rs", "sim/runtime.rs"]),
+        ("advance_master_frame", &["sim/world/master_frame.rs"]),
+        (
+            "advance_app_frame",
+            &["sim/world/master_frame.rs", "sim/runtime.rs"],
+        ),
     ];
     let mut violations: Vec<String> = Vec::new();
     for file in source_files(&src_root) {
@@ -1224,7 +1229,12 @@ fn mutable_handouts_and_setters_are_owner_operations() {
             "install_receipt",
             "the map read builds the tube receipt in place once; binding takes it once",
         ),
-        ("net/lockstep.rs", "payload_mut", PAYLOAD),
+        (
+            "net/udp.rs",
+            "deref_mut",
+            "UdpWriteGuard construction is private to LanUdpTransport::write; its only callers \
+             project the existing LanConnections and GlobalChannel owners, whose fields are private",
+        ),
         (
             "rules/art_data.rs",
             "get_mut",
@@ -1317,10 +1327,21 @@ fn mutable_handouts_and_setters_are_owner_operations() {
             "the +0x6CC writers and PointerExpired's clear",
         ),
         (
+            "sim/building_entry.rs",
+            "set_nearest_occupiable_seek",
+            "Ares writes the +0x691 seek latch with its scan's answer (0x10046A8B/0x10046ACC)",
+        ),
+        (
             "sim/combat/attack_target.rs",
             "set",
             "the TarCom class setter; callers port each native writer, such as \
              PointerExpired's NULL store (0x00707A33)",
+        ),
+        (
+            "sim/cloak_disguise.rs",
+            "set_attached",
+            "Ares RecalculateStats 0x1004613B/0x1004617D commits the cloak aggregate \
+             derived from the canonical attachment vector; permanent crate capability stays separate",
         ),
         (
             "sim/combat/base_defense_response.rs",
@@ -1337,6 +1358,12 @@ fn mutable_handouts_and_setters_are_owner_operations() {
             "set",
             "the Strength store of the native death paths (Crush 0x007416A0, \
              KillPassengers 0x00707CB0, KillOccupants 0x004585C0)",
+        ),
+        (
+            "sim/game_entity.rs",
+            "set_useless",
+            "Mission_Harvest alone writes Techno+3D0 at 0x0073E8FA/0x0073E925; \
+             depot admission reads the same latch",
         ),
         (
             "sim/house_state.rs",
@@ -1394,6 +1421,12 @@ fn mutable_handouts_and_setters_are_owner_operations() {
             "Horizontal_Step's height target (0x004CF3F6, 0x004CF4B6, 0x004CF4CF)",
         ),
         (
+            "sim/movement/navcom.rs",
+            "set_nav_com_aux",
+            "FootClass::Set_NavComAux (0x004D94A0) stores Foot+0x5A0; EventClass::Execute \
+             calls it after Set_Destination (0x004C74BA)",
+        ),
+        (
             "sim/movement/teleport_movement.rs",
             "set_pending_state",
             "Techno+280, published by the reinforcement (0x0065F29F)",
@@ -1413,6 +1446,12 @@ fn mutable_handouts_and_setters_are_owner_operations() {
             "sim/movement/teleport_movement.rs",
             "set_warping_in",
             "Techno+0x271, cleared by TimerCheck's expiry and state 7",
+        ),
+        (
+            "sim/object_fall.rs",
+            "set_parachute_animation",
+            "ObjectClass::Paradrop publishes Object+88 at 0x005F5AF1 before \
+             SetOwnerObject 0x005F5AFE; creation failure and matching expiry clear it",
         ),
         (
             "sim/pathfinding/zone_map.rs",
@@ -1442,6 +1481,12 @@ fn mutable_handouts_and_setters_are_owner_operations() {
              carry-over restores that word separately from the incoming restart record",
         ),
         (
+            "sim/snapshot.rs",
+            "set_sw_sidebar_expanded",
+            "the save boundary copies the app-owned Phobos SWSidebar_Enable into its \
+             neutral presentation envelope; this does not mutate live simulation state",
+        ),
+        (
             "sim/snapshot/scenario_resources.rs",
             "set_elapsed_buckets",
             "ScenarioSave stops +0x614 into the +0x61C accumulator (0x00689360..0x0068936F) \
@@ -1467,6 +1512,18 @@ fn mutable_handouts_and_setters_are_owner_operations() {
             "sim/superweapon/mod.rs",
             "set_recharge_time",
             "SuperClass::SetRechargeTime (0x006CC280, TAction 132) changes only Super+24",
+        ),
+        (
+            "sim/vehicle_theft.rs",
+            "set_killed_from_owner",
+            "Ares copies the new owner's MultiplayPassive into the driver-killed flag \
+             (0x100456E8..0x100456F5)",
+        ),
+        (
+            "sim/vehicle_theft.rs",
+            "set_vehicle_seek",
+            "the Ares vehicle-seek latch (Ext+0xB0), written by its scan and by script actions \
+             64/67 (dispatcher 0x1003A110)",
         ),
         (
             "sim/world/mod.rs",

@@ -669,6 +669,48 @@ impl Simulation {
         Ok(action == MoveAction::Move)
     }
 
+    /// Foot What_Action's shroud rung over an object
+    /// (`FootClass::What_Action_OnObject @ 0x004DDED0`), which every Foot
+    /// class asks before its own rungs (Unit `0x0073FD62`, Infantry
+    /// `0x0051E44C`, Aircraft `0x00417CD3`): in a campaign (Session GameMode
+    /// `[0x00A8B238]` 0, `0x004DDF5C..0x004DDF63`), Techno's nonzero answer
+    /// (`0x004DDF58`) over an object whose coordinate (vt+0x48) on its ground,
+    /// raised to a bridge deck (`0x004DDEE7..0x004DDF41`), `viewer`'s map
+    /// shrouds (`IsShrouded 0x00586360`) becomes Move for a `MoveToShroud=`
+    /// type (TechnoType+0xC8D), else NoMove (`0x004DDF65..0x004DDF7B`). The
+    /// key rungs' answers (Shift, Alt, Ctrl+Alt) are Techno's too. Unlike the
+    /// Cell wrapper (`0x004DDE64..0x004DDEBE`), it asks neither the playfield
+    /// nor the planning action, and only in a campaign.
+    ///
+    /// The caller asks it only of a nonzero answer. None keeps that answer,
+    /// as for a Building, which has no Foot wrapper.
+    pub fn foot_object_shroud_action(
+        &self,
+        viewer: InternedId,
+        id: u64,
+        target: u64,
+        rules: &RuleSet,
+    ) -> Option<MoveAction> {
+        let entity = self.substrate.entities.get(id)?;
+        if entity.category() == EntityCategory::Structure
+            || self.session.game_mode() != crate::sim::scenario_session::ScenarioGameMode::Campaign
+        {
+            return None;
+        }
+        let object = self.interner.object_type(entity.type_ref(), rules)?;
+        let cells = NativeCellQuery::isolated(self.resolved_terrain.as_ref()?);
+        let coords =
+            ground_pose::target_get_coords(TargetKind::Entity(target), self, Some(&cells))?;
+        let point = grounded_coordinate(&cells, coords.x, coords.y).ok()?;
+        crate::sim::vision::point_is_shrouded(&self.fog, &cells, viewer, point).then_some(
+            if object.move_to_shroud {
+                MoveAction::Move
+            } else {
+                MoveAction::NoMove
+            },
+        )
+    }
+
     /// The class rungs of a Foot's What_Action over an object that turn the
     /// Techno action `action` into another Move action; each ClickedAction
     /// wrapper's re-ask (`0x007388A1`, `0x0051F1A1`) answers them too:
@@ -1204,11 +1246,15 @@ fn clicked_coordinate(
         },
         0,
     );
-    let mut point = DriveCoord {
-        x: centre.x,
-        y: centre.y,
-        z: 0,
-    };
+    grounded_coordinate(cells, centre.x, centre.y)
+}
+
+/// The point `(x, y)` on its ground (`Map__GetGroundHeightAtCoord
+/// 0x00578080`), raised to a bridge deck where the Cell under it has one
+/// (Cell `+0x140 & 0x100`): [`clicked_coordinate`] from a Cell's centre, and
+/// Foot What_Action's object coordinate (`0x004DDEE7..0x004DDF41`).
+fn grounded_coordinate(cells: &NativeCellQuery<'_>, x: i32, y: i32) -> Result<DriveCoord, String> {
+    let mut point = DriveCoord { x, y, z: 0 };
     point.z = query_ground(cells, point)?;
     //4DE242/4DE38C are separate Map calls after the height query.
     if cells.flags(cells.lookup_world(point.x, point.y)) & 0x100 != 0 {

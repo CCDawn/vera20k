@@ -222,6 +222,11 @@ MatchSession ownership. The `lan-*-loading-first` targets stop at the genuine
 network loading boundary. The target list is in
 `src/app/diagnostics/shell_capture/movies/lan.rs`.
 
+Set `[paths] settings_dir` to a separate private directory outside RA2_DIR.
+WOL persona fixtures require the same physical `.vera20k-lan-capture-root`
+marker described below in that settings directory before writing `wolinfoMD.ini`.
+Never point captures at the normal player profile.
+
 `lan-transfer-loading-first` writes the original `XMP29U2.MAP` bytes as
 `CONTROLLED.MAP` at the declared file-delivery boundary, then asserts the
 production parser's loose filename, length and SHA256. Its isolated retail

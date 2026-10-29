@@ -74,7 +74,7 @@ fn authored_waypoint_explosions_detonate_the_selected_weapon_at_the_waypoint() {
             sim.scenario_rng.native_state_hex(),
             sim.mapgen_rng.native_state_hex(),
         ];
-        let action = RuntimeDefinitions::default().resolve_action(entry, None, None);
+        let action = RuntimeDefinitions::default().resolve_action(entry, None, None, None);
         let context = TriggerActionContext {
             live_index: None,
             incoming_house: None,

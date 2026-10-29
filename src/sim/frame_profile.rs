@@ -2,9 +2,8 @@
 //!
 //! The dashboard reports one tick cost and one frame rate, but a report that
 //! answers "where did the time go" needs the frame split into phases. This
-//! module is the accumulator; the phase boundaries themselves are stamped in
-//! `Simulation::advance_master_frame`, next to the phase comments that already
-//! document that function.
+//! module is the accumulator; `Simulation::advance_master_frame` stamps the
+//! slot `FrameStep::profile_slot` names after each master-frame step.
 //!
 //! ## One ledger, two readings
 //! The frame is stamped at every subsystem boundary and kept as a flat array of
@@ -24,7 +23,7 @@
 //!   zero; they do not claim an independently measured subsystem.
 
 use std::ops::Range;
-use std::time::{Duration, Instant};
+use crate::util::time::{Duration, Instant};
 
 /// A local, enabled-only observer; never held by or serialized with the world.
 pub(crate) struct FrameClock {
@@ -55,7 +54,9 @@ impl FrameClock {
 }
 
 /// Slots in the per-frame ledger, in the order `advance_master_frame` runs
-/// them. Names are stable keys: the dashboard's i18n table is indexed by them.
+/// them, except that `TEAM_AI` runs between the two stretches `BOMBS` folds
+/// (Kamikaze, then the Disk walk). Names are stable keys: the dashboard's
+/// i18n table is indexed by them. `DOCKS` has no step and stays zero.
 pub mod phase {
     pub const COMMANDS_INGRESS: usize = 0;
     pub const COMMANDS_ADMIT: usize = 1;

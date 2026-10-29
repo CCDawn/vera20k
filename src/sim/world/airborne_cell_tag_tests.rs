@@ -53,7 +53,7 @@ fn install_tag(
         i32::from(cell.1) * 1000 + i32::from(cell.0),
     );
     let map = MapFile::from_bytes(text.as_bytes()).unwrap();
-    sim.initialize_trigger_definitions(&map, &TeamAiIniRegistry::default(), None, None);
+    sim.initialize_trigger_definitions(&map, &TeamAiIniRegistry::default(), None, None, None);
     sim.install_authored_cell_trigger_tags(&map);
     sim.classify_map_triggers(rules);
     sim.session.install_waypoints(&map.waypoints);

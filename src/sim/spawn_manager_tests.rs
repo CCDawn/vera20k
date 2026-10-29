@@ -651,7 +651,7 @@ fn v3_launches_its_rocket_into_the_kamikaze_window() {
     // starts the tilt.
     assert!(rocket.is_moving());
     assert_eq!(
-        rocket.destination_for_test(),
+        rocket.destination(),
         crate::sim::components::DriveCoord {
             x: 20 * 256 + 128,
             y: 20 * 256 + 128,
@@ -2750,12 +2750,12 @@ fn every_hornet_of_a_carrier_wing_flies_a_whole_strafe_pass() {
 
 /// After its pass a Hornet is recalled with the Carrier itself as its NavCom
 /// (`Assign_Destination(owner, 1)`, `0x006B766D`), and Mission_Move flies it
-/// home. Over the Carrier's cell, stopped, Fly's landing trigger
-/// (`0x004CE3C0`) sets it down on the deck, a landing zone a Spawned aircraft
-/// may share with its spawner (`0x004DDC60`), and the manager takes it in to
-/// reload.
+/// home. SpawnManagerClass::AI (0x006B7230, intake at 6B7793..6B780F) takes
+/// it in to reload over the Carrier's cell below 20 leptons above its owner, before
+/// Fly necessarily reaches the exact deck height. Limbo's Stop_Driver can
+/// replace the recalled object destination with the current cell.
 #[test]
-fn a_recalled_hornet_flies_home_and_lands_on_the_carrier() {
+fn a_recalled_hornet_returns_to_the_carrier_reload_slot() {
     use crate::sim::spawn_manager::SpawnSlotState;
     let sortie = strafing_carrier_sortie("Landable=yes\nROT=3\n");
     let carrier = sortie.sim.substrate.entities.get(sortie.carrier).unwrap();
@@ -2763,17 +2763,21 @@ fn a_recalled_hornet_flies_home_and_lands_on_the_carrier() {
     let slots = &carrier.spawn_manager.as_ref().unwrap().slots;
     for hornet in &sortie.wing {
         let navs = &sortie.navs[hornet];
-        assert_eq!(
-            navs.iter().rev().find_map(|&(_, nav)| nav),
-            Some(crate::sim::components::NavTargetRef::Object { id: sortie.carrier }),
+        assert!(
+            navs.iter().any(|&(_, nav)| nav
+                == Some(crate::sim::components::NavTargetRef::Object { id: sortie.carrier })),
             "Hornet {hornet} is sent home to the Carrier: {navs:?}"
         );
         let h = sortie.sim.substrate.entities.get(*hornet).unwrap();
         let landed = crate::sim::movement::ground_pose::position_world_coord(&h.position);
         assert_eq!(
-            ((landed.x / 256, landed.y / 256), landed.z),
-            ((deck.x / 256, deck.y / 256), deck.z),
-            "Hornet {hornet} lands on the deck"
+            (landed.x / 256, landed.y / 256),
+            (deck.x / 256, deck.y / 256),
+            "Hornet {hornet} returns over the Carrier"
+        );
+        assert!(
+            (0..20).contains(&landed.z.wrapping_sub(deck.z)),
+            "Hornet {hornet} is within the native intake height"
         );
         assert!(h.lifecycle.in_limbo(), "Hornet {hornet} is taken in");
         let slot = slots
@@ -2930,8 +2934,16 @@ fn retail_missiles_keep_their_launch_coordinate_from_unlimbo() {
     // The production readers agree with the original's reads of the inputs.
     for (name, row) in native["types"].as_object().unwrap() {
         let art = rules.art().get(name).unwrap();
-        assert_eq!(art.primary_fire_flh, flh(&row["weapon_flh"][0]), "{name}");
-        assert_eq!(art.secondary_fire_flh, flh(&row["weapon_flh"][1]), "{name}");
+        assert_eq!(
+            rules.object(name).unwrap().weapon_flh(0, false),
+            flh(&row["weapon_flh"][0]),
+            "{name}"
+        );
+        assert_eq!(
+            rules.object(name).unwrap().weapon_flh(1, false),
+            flh(&row["weapon_flh"][1]),
+            "{name}"
+        );
         assert_eq!(
             art.second_spawn_offset,
             flh(&row["second_spawn_offset"]),

@@ -3,7 +3,7 @@
 //! compact popup (background mode 2) with owner-draw buttons, NewEdits and
 //! an owner-draw list.
 
-use std::time::Instant;
+use crate::util::time::Instant;
 
 use super::SHELL_LABEL_TEXT_RGB;
 use super::controls::list_controls;
@@ -404,6 +404,7 @@ pub(crate) fn paint_wol_verify(
             pressed,
             state.renderer.gpu.config.width as i32,
             state.renderer.gpu.config.height as i32,
+            ShellScale::RETAIL,
         );
         let buttons: Vec<ModalButton> = buttons
             .into_iter()
@@ -427,8 +428,21 @@ pub(crate) fn paint_wol_verify(
         return paint;
     };
     let chrome = atlas.control_chrome();
-    for (node, name) in verify.names.iter().enumerate() {
-        let rect = layout.boxes[node];
+    if let Some(geometry) = verify.list_geometry(layout) {
+        super::list::paint_list(
+            &mut paint.controls,
+            atlas,
+            geometry,
+            verify.visible_nodes(layout).start,
+            None,
+            verify.pressed_scroll_part(),
+            false,
+            SCALE,
+        );
+    }
+    for node in verify.visible_nodes(layout) {
+        let name = &verify.names[node];
+        let rect = verify.node_rect(layout, node).expect("visible verify node");
         super::controls::paint_control(
             &mut paint.controls,
             &chrome,

@@ -23,7 +23,7 @@ fn action(kind: i32, raw: &str, tail: &str) -> RuntimeAction {
         .unwrap()
         .entries()[0]
         .clone();
-    RuntimeDefinitions::default().resolve_action(entry, None, None)
+    RuntimeDefinitions::default().resolve_action(entry, None, None, None)
 }
 
 fn run(
@@ -306,6 +306,7 @@ fn counted_tag_pauses_drivers_preserves_saved_gate_and_reenables_due_timers() {
     sim.initialize_trigger_definitions(
         &map,
         &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
+        None,
         None,
         None,
     );

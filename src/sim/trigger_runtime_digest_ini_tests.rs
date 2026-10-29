@@ -68,7 +68,7 @@ fn digest_checked_loose_map_uses_the_enabled_second_trigger_section() {
         10,
     ));
     sim.session.set_current_house_for_test(Some(player));
-    sim.initialize_trigger_definitions(&loaded.map, &Default::default(), None, None);
+    sim.initialize_trigger_definitions(&loaded.map, &Default::default(), None, None, None);
     sim.install_authored_cell_trigger_tags(&loaded.map);
     sim.classify_map_triggers(&rules);
 

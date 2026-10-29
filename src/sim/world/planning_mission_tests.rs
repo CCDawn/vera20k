@@ -126,7 +126,7 @@ fn planned(
     command: Command,
 ) {
     let record = sim
-        .encode_planning_order_record(owner, &command)
+        .encode_planning_order_record(owner, &command, None)
         .expect("resolved click is representable");
     let command = sim
         .decode_native_command_record(&record, sim.session.tick())
@@ -177,7 +177,7 @@ fn targetless_mobile_self_click_does_not_create_a_planning_node() {
     // Event633BC0 returns (-1,-1,-1) for three NULL tokens; PlanMgr638158
     // rejects that coordinate. A self-click is not the deploy key's Event9.
     let record = sim
-        .encode_planning_order_record(owner, &Command::DeployMcv { entity_id: actor })
+        .encode_planning_order_record(owner, &Command::DeployMcv { entity_id: actor }, None)
         .unwrap();
     let command = sim.decode_native_command_record(&record, 0).unwrap();
     assert!(!sim.apply_command("Americans", &command.payload, Some(&rules)));

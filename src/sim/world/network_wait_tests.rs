@@ -137,6 +137,57 @@ fn repeated_network_waits_resume_only_dispatch_and_commit_after_one_logic_visit(
 }
 
 #[test]
+fn natural_outcome_waits_for_terminal_network_dispatch_and_score_snapshot() {
+    let mut sim = world();
+    let owner = sim.interner.get("Human").unwrap();
+    sim.session.set_current_house_for_test(Some(owner));
+    let house = sim.houses.get_mut(&owner).unwrap();
+    house.economy_mut().set_score_for_test(120);
+    assert!(house.accept_win_result(0, 0, false));
+    let boundary = Boundary {
+        visits: Cell::new(0),
+        checksums: Cell::new(0),
+        wait_visits: 1,
+        skip: false,
+    };
+    let effects = FrameEffects::empty().with_network_commands(&boundary);
+    let waiting = sim
+        .advance_app_frame(
+            &[],
+            RuleSet::empty_for_test(),
+            None,
+            33,
+            TickLane::Ordinary,
+            effects,
+        )
+        .unwrap();
+    assert!(waiting.network_waiting);
+    assert!(sim.session.outcome_request().is_some());
+    assert!(sim.terminal_score_snapshot().is_none());
+    assert!(sim.ready_outcome_for_owner(owner).is_none());
+    assert_eq!(sim.session.game_options().game_speed, 3);
+    let rng_before_score = sim.scenario_rng.state();
+
+    let complete = sim
+        .resume_network_wait(RuleSet::empty_for_test(), None, effects)
+        .unwrap();
+    assert!(!complete.network_waiting);
+    assert!(!complete.tick.frame_committed);
+    assert!(complete.tick.terminal_score_finalized);
+    assert!(complete.tick.state_hash.is_some());
+    assert_eq!(complete.tick.executed_commands, 1);
+    assert_eq!(sim.session.game_options().game_speed, 4);
+    assert_eq!(sim.session.binary_frame(), 0);
+    assert_eq!(sim.terminal_score_snapshot().unwrap().rows.len(), 1);
+    assert_ne!(sim.scenario_rng.state(), rng_before_score);
+    assert_eq!(
+        sim.ready_outcome_for_owner(owner).unwrap().kind,
+        crate::sim::house_state::HouseOutcomeKind::Victory
+    );
+    assert_eq!(boundary.checksums.get(), 1);
+}
+
+#[test]
 fn skipped_network_dispatch_commits_without_consuming_or_retiring_dolist() {
     let mut sim = world();
     let boundary = Boundary {

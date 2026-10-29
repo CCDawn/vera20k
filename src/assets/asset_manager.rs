@@ -54,18 +54,75 @@ impl LooseAsset {
     /// only requested payloads; root indexing must not copy entire MIX archives.
     /// This is Rust storage policy, not native raw-file cache equivalence.
     fn snapshot(&self) -> &Option<Arc<[u8]>> {
-        self.bytes.get_or_init(|| match std::fs::read(&self.path) {
-            Ok(bytes) => Some(bytes.into()),
-            Err(err) => {
-                log::debug!("Skipping loose {}: {}", self.path.display(), err);
-                None
-            }
+        self.bytes.get_or_init(|| {
+            self.read_snapshot(None)
+                .expect("unbounded asset snapshots cannot exceed a read limit")
         })
+    }
+
+    fn read_snapshot(&self, maximum: Option<usize>) -> Result<Option<Arc<[u8]>>, AssetError> {
+        let read = || -> Result<Vec<u8>, AssetError> {
+            let Some(maximum) = maximum else {
+                return Ok(crate::util::file_system::read(&self.path)?);
+            };
+            #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+            {
+                let bytes = crate::util::file_system::read_shared(&self.path)?;
+                check_asset_read_limit(bytes.len() as u64, maximum)?;
+                Ok(bytes.to_vec())
+            }
+            #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+            {
+                use std::io::Read;
+                let file = std::fs::File::open(&self.path)?;
+                check_asset_read_limit(file.metadata()?.len(), maximum)?;
+                let mut bytes = Vec::new();
+                // A file can grow after metadata inspection. Never allocate or
+                // read the rest of that growth before refusing the source.
+                file.take((maximum as u64).saturating_add(1))
+                    .read_to_end(&mut bytes)?;
+                check_asset_read_limit(bytes.len() as u64, maximum)?;
+                Ok(bytes)
+            }
+        };
+        match read() {
+            Ok(bytes) => Ok(Some(bytes.into())),
+            Err(AssetError::Io(err)) => {
+                log::debug!("Skipping loose {}: {}", self.path.display(), err);
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn bytes(&self) -> Option<&[u8]> {
         self.snapshot().as_deref()
     }
+
+    fn bytes_bounded(&self, maximum: usize) -> Result<Option<&[u8]>, AssetError> {
+        if self.bytes.get().is_none() {
+            let snapshot = self.read_snapshot(Some(maximum))?;
+            // A budget refusal never poisons the shared first-read snapshot.
+            // Concurrent readers still use whichever snapshot was set first.
+            let _ = self.bytes.set(snapshot);
+        }
+        let bytes = self
+            .bytes
+            .get()
+            .expect("snapshot was initialized")
+            .as_deref();
+        if let Some(bytes) = bytes {
+            check_asset_read_limit(bytes.len() as u64, maximum)?;
+        }
+        Ok(bytes)
+    }
+}
+
+fn check_asset_read_limit(actual: u64, maximum: usize) -> Result<(), AssetError> {
+    if actual > maximum as u64 {
+        return Err(AssetError::ReadLimitExceeded { maximum, actual });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -719,22 +776,53 @@ impl AssetManager {
 
     /// Resolve one file through the normal first-match archive lookup.
     pub fn resolve_ref(&self, name: &str) -> Option<AssetResolutionRef<'_>> {
-        if let Some((loose, bytes)) = self.loose_bytes(name) {
-            return Some(AssetResolutionRef {
-                bytes,
-                source_archive: loose.source_name.as_str(),
-                entry_id: mix_hash(name),
-            });
+        self.resolve_ref_with_limit(name, None)
+            .expect("unbounded asset resolution cannot exceed a read limit")
+    }
+
+    /// Resolve the same VFS winner while bounding a first loose-file read.
+    /// An oversized winner is an error, never permission to select a smaller
+    /// archive fallback. Existing snapshots and mapped MIX entries stay borrowed.
+    pub fn resolve_ref_bounded(
+        &self,
+        name: &str,
+        maximum: usize,
+    ) -> Result<Option<AssetResolutionRef<'_>>, AssetError> {
+        self.resolve_ref_with_limit(name, Some(maximum))
+    }
+
+    fn resolve_ref_with_limit(
+        &self,
+        name: &str,
+        maximum: Option<usize>,
+    ) -> Result<Option<AssetResolutionRef<'_>>, AssetError> {
+        if let Some(loose) = self.loose_asset(name) {
+            let bytes = match maximum {
+                Some(maximum) => loose.bytes_bounded(maximum)?,
+                None => loose.bytes(),
+            };
+            if let Some(bytes) = bytes {
+                return Ok(Some(AssetResolutionRef {
+                    bytes,
+                    source_archive: loose.source_name.as_str(),
+                    entry_id: mix_hash(name),
+                }));
+            }
         }
-        let (named, entry_id) = self.lookup_asset_entry(name)?;
-        named
-            .archive
-            .get_by_id(entry_id)
-            .map(|bytes| AssetResolutionRef {
-                bytes,
-                source_archive: named.name.as_str(),
-                entry_id,
-            })
+        let Some((named, entry_id)) = self.lookup_asset_entry(name) else {
+            return Ok(None);
+        };
+        let Some(bytes) = named.archive.get_by_id(entry_id) else {
+            return Ok(None);
+        };
+        if let Some(maximum) = maximum {
+            check_asset_read_limit(bytes.len() as u64, maximum)?;
+        }
+        Ok(Some(AssetResolutionRef {
+            bytes,
+            source_archive: named.name.as_str(),
+            entry_id,
+        }))
     }
 
     /// Load through retail's `LoadFileFromMIX @ 0x005B40B0` boundary.
@@ -989,10 +1077,10 @@ impl AssetManager {
     ///
     /// This is meant for tooling. Runtime code does not call it.
     pub fn load_all_disk_mixes(&mut self) -> Result<usize, AssetError> {
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(&self.ra2_dir)?
+        let mut paths: Vec<PathBuf> = crate::util::file_system::read_dir(&self.ra2_dir)?
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
             .filter(|path| {
-                path.is_file()
+                crate::util::file_system::is_file(&path)
                     && path
                         .extension()
                         .and_then(OsStr::to_str)
@@ -1110,10 +1198,10 @@ impl AssetManager {
         let mut path = self.ra2_dir.clone();
         for component in relative.split(['\\', '/']).filter(|part| !part.is_empty()) {
             let exact = path.join(component);
-            path = if exact.exists() {
+            path = if crate::util::file_system::exists(&exact) {
                 exact
             } else {
-                std::fs::read_dir(&path)
+                crate::util::file_system::read_dir(&path)
                     .ok()?
                     .filter_map(Result::ok)
                     .map(|entry| entry.path())
@@ -1125,7 +1213,7 @@ impl AssetManager {
                     })?
             };
         }
-        std::fs::read(&path).ok()
+        crate::util::file_system::read(&path).ok()
     }
 
     fn lookup_asset_entry(&self, name: &str) -> Option<(&NamedArchive, i32)> {
@@ -1266,7 +1354,7 @@ impl AssetManager {
         let directory = relative_directory
             .map(|relative| self.ra2_dir.join(relative))
             .unwrap_or_else(|| self.ra2_dir.clone());
-        let entries = match std::fs::read_dir(&directory) {
+        let entries = match crate::util::file_system::read_dir(&directory) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(WildcardMount::default());
@@ -1503,10 +1591,10 @@ impl AssetManager {
     fn open_loose_root(ra2_dir: &Path) -> Result<HashMap<String, LooseAsset>, AssetError> {
         let mut files = HashMap::new();
 
-        for entry in std::fs::read_dir(ra2_dir)? {
+        for entry in crate::util::file_system::read_dir(ra2_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if !path.is_file() {
+            if !crate::util::file_system::is_file(&path) {
                 continue;
             }
             let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
@@ -1582,7 +1670,7 @@ fn loose_lookup_key(name: &str) -> Option<String> {
 /// hidden, system, directory or temporary attribute (`0x116`). The asset search
 /// and the scenario listings share it.
 pub(crate) fn retail_enumerated_file(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
+    let Ok(metadata) = crate::util::file_system::metadata(path) else {
         return false;
     };
     if !metadata.is_file() {
@@ -1896,6 +1984,85 @@ mod tests {
         assert!(
             !manager.contains("taunts\\tauam01.wav"),
             "the startup loose catalog stays top-level"
+        );
+    }
+
+    #[test]
+    fn bounded_loose_resolution_refuses_sparse_winner_without_snapshot_or_mix_fallback() {
+        let dir = TestDirectory::new("bounded-sparse-loose");
+        let path = dir.path().join("child.ini");
+        let sparse = std::fs::File::create(&path).unwrap();
+        sparse.set_len(64 * 1024 * 1024).unwrap();
+        drop(sparse);
+        let mut manager = empty_manager(dir.path());
+        manager.archives.push(NamedArchive {
+            name: "fallback.mix".into(),
+            archive: make_new_format_mix("child.ini", b"small"),
+        });
+        manager.rebuild_indexes();
+        assert!(matches!(
+            manager.resolve_ref_bounded("CHILD.INI", 32 * 1024 * 1024),
+            Err(AssetError::ReadLimitExceeded {
+                actual: 67_108_864,
+                ..
+            })
+        ));
+        assert!(
+            manager
+                .loose_asset("child.ini")
+                .unwrap()
+                .bytes
+                .get()
+                .is_none()
+        );
+
+        std::fs::write(&path, b"loose").unwrap();
+        let selected = manager
+            .resolve_ref_bounded("child.ini", 5)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.bytes, b"loose");
+        assert!(selected.source_archive.starts_with("loose:"));
+        std::fs::write(&path, b"replacement").unwrap();
+        assert!(matches!(
+            manager.resolve_ref_bounded("child.ini", 4),
+            Err(AssetError::ReadLimitExceeded { actual: 5, .. })
+        ));
+        assert_eq!(manager.resolve_ref("child.ini").unwrap().bytes, b"loose");
+    }
+
+    #[test]
+    fn bounded_resolution_keeps_unreadable_loose_fallback_and_archive_borrows() {
+        let dir = TestDirectory::new("bounded-mix-winner");
+        let path = dir.path().join("child.ini");
+        std::fs::write(&path, b"loose").unwrap();
+        let mut manager = empty_manager(dir.path());
+        for (name, bytes) in [("first.mix", &b"archived"[..]), ("second.mix", &b"ok"[..])] {
+            manager.archives.push(NamedArchive {
+                name: name.into(),
+                archive: make_new_format_mix("child.ini", bytes),
+            });
+        }
+        manager.rebuild_indexes();
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            manager.resolve_ref_bounded("child.ini", 2),
+            Err(AssetError::ReadLimitExceeded { actual: 8, .. })
+        ));
+        let bounded = manager
+            .resolve_ref_bounded("child.ini", 8)
+            .unwrap()
+            .unwrap();
+        let ordinary = manager.resolve_ref("child.ini").unwrap();
+        assert_eq!(bounded.bytes, b"archived");
+        assert!(std::ptr::eq(bounded.bytes, ordinary.bytes));
+        assert_eq!(bounded.source_archive, "first.mix");
+        assert_eq!(bounded.entry_id, ordinary.entry_id);
+        assert!(
+            manager
+                .resolve_ref_bounded("missing.ini", 0)
+                .unwrap()
+                .is_none()
         );
     }
 

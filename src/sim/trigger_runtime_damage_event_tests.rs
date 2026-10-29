@@ -42,6 +42,119 @@ fn rng_states(sim: &Simulation) -> Value {
 }
 
 #[test]
+fn explosion_damage_tag_chain_respects_depth_and_recovers_on_a_small_stack() {
+    // Fix the stack size so a larger RUST_MIN_STACK cannot hide recursive
+    // Execute -> AreaDamage -> ObjectHealth -> Tag -> Spring frames.
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let (mut sim, rules, overlays, houses) = super::tests::event_ingress_fixture_with_rules(
+                // This fixture appends rules inside TAGUNIT's section. Root
+                // the weapon before the production WeaponType reading pass.
+                "Primary=ChainBlast\n\
+             [ChainBlast]\nDamage=1\nROF=1\nRange=1\nProjectile=ChainInviso\nWarhead=ChainWH\n\
+             [ChainInviso]\nInviso=yes\n\
+             [ChainWH]\nCellSpread=0\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
+            );
+            assert_eq!(rules.weapon_by_array_index(0).unwrap().id, "ChainBlast");
+            assert_eq!(rules.weapon_by_array_index(0).unwrap().warhead.as_deref(), Some("ChainWH"));
+            let count = MAX_TRIGGER_SPRING_DEPTH + 1;
+            let (mut triggers, mut tags, mut events, mut actions, mut waypoints) = (
+                String::from("[Triggers]\n"),
+                String::from("[Tags]\n"),
+                String::from("[Events]\n"),
+                String::from("[Actions]\n"),
+                String::from("[Waypoints]\n"),
+            );
+            let mut targets = Vec::new();
+            for index in 0..=count {
+                let cell = (10 + 2 * (index % 6) as u16, 10 + 2 * (index / 6) as u16);
+                targets.push(spawn_event_ingress_unit(&mut sim, &rules, houses[0], cell));
+                triggers.push_str(&format!("TR{index:02}=Country0,<none>,Chain,0,1,1,1,0\n"));
+                // One-shot Tags avoid latched callbacks springing again on the
+                // same receiver's later events while the first chain unwinds.
+                tags.push_str(&format!("TAG{index:02}=0,Chain,TR{index:02}\n"));
+                events.push_str(&format!("TR{index:02}=1,41,0,0\n"));
+                waypoints.push_str(&format!(
+                    "{}={}\n",
+                    26 + index,
+                    u32::from(cell.1) * 1000 + u32::from(cell.0)
+                ));
+                if index + 1 < count {
+                    // Two-letter tokens AA.. begin at waypoint 26.
+                    let next = (index + 1) as u8;
+                    let token = format!(
+                        "{}{}",
+                        char::from(b'A' + next / 26),
+                        char::from(b'A' + next % 26)
+                    );
+                    actions.push_str(&format!("TR{index:02}=1,42,0,0,0,0,0,0,{token}\n"));
+                } else {
+                    let marker = if index == count { 10 } else { 9 };
+                    actions.push_str(&format!("TR{index:02}=1,28,0,{marker},0,0,0,0,A\n"));
+                }
+            }
+            let map = install_event_ingress_map(
+                &mut sim,
+                &rules,
+                &format!("{triggers}{tags}{events}{actions}{waypoints}"),
+            );
+            sim.session.install_waypoints(&map.waypoints);
+            for (index, &target) in targets.iter().enumerate() {
+                sim.attach_object_trigger_tag(target, Some(&format!("TAG{index:02}")));
+            }
+            super::tests::event_ingress_damage(
+                &mut sim,
+                &rules,
+                &overlays,
+                targets[0],
+                crate::sim::combat::RAD_NO_ATTACKER,
+                1,
+                FrameEffects::default(),
+            );
+            assert_eq!(
+                sim.trigger_runtime
+                    .action_trace
+                    .iter()
+                    .filter(|row| row.0 == 42)
+                    .count(),
+                MAX_TRIGGER_SPRING_DEPTH,
+            );
+            assert_eq!(
+                sim.entities()
+                    .get(targets[count - 1])
+                    .unwrap()
+                    .health
+                    .current(),
+                99,
+                "real damage reaches the refused Tag"
+            );
+            assert!(
+                !sim.global_variables()[9],
+                "the next nested Spring is refused"
+            );
+            sim.trigger_runtime.action_trace.clear();
+            super::tests::event_ingress_damage(
+                &mut sim,
+                &rules,
+                &overlays,
+                targets[count],
+                crate::sim::combat::RAD_NO_ATTACKER,
+                1,
+                FrameEffects::default(),
+            );
+            assert!(
+                sim.global_variables()[10],
+                "the next production damage dispatch recovers"
+            );
+            assert_eq!(sim.trigger_runtime.action_trace, [(28, 10)]);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn retail_no_dock_crash_springs_41_before_record_kill() {
     use crate::sim::world::LifecycleTestEvent;
 
@@ -535,7 +648,7 @@ fn retail_damage_scene(route: &Value) -> Option<RetailDamageScene> {
     sim.install_team_ai_registry(&teams, &rules).unwrap();
     let eva =
         EvaRegistry::from_ini(&IniFile::from_bytes(assets.get_ref("EVAMD.INI").unwrap()).unwrap());
-    sim.initialize_trigger_definitions(&excerpt, &teams, Some(&eva), None);
+    sim.initialize_trigger_definitions(&excerpt, &teams, Some(&eva), None, None);
     sim.classify_map_triggers(&rules);
     // Declared clear geometry isolates the selected received-damage route.
     // Retail rules/roster/definitions remain intact; whole campaign timing,

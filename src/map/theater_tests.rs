@@ -524,14 +524,12 @@ fn active_retail_tile_shadow_route_is_dormant() {
             expected["sha256"].as_str().unwrap(),
             "{name}: active retail theater bytes"
         );
-        let ini = IniFile::from_bytes(&theater.ini_data).unwrap();
-        for ordinal in 0..theater.lookup.bounds().len() {
-            let section = ini.section(&format!("TileSet{ordinal:04}")).unwrap();
+        for (ordinal, bounds) in theater.lookup.bounds().iter().enumerate() {
             assert!(
-                !section.read_bool("ShadowCaster", false),
+                (bounds.start..bounds.start + bounds.count)
+                    .all(|tile| !theater.lookup.casts_tile_shadow(tile)),
                 "{name}/TileSet{ordinal:04}: requires native tile-shadow support"
             );
-            assert_eq!(section.read_int("ShadowTiles", 0), 0);
             checked_sets += 1;
         }
 
@@ -563,6 +561,74 @@ fn active_retail_tile_shadow_route_is_dormant() {
         );
     }
     assert_eq!(checked_sets, 565, "all six active theater registries");
+}
+
+#[test]
+fn tile_shadow_flag_needs_shadow_caster_and_nonzero_shadow_tiles() {
+    // ReadTheater545150 reads ShadowCaster (546204) and, only when it is set,
+    // ShadowTiles (546248) from the TileSet section; 5464A6 stores +2E1 when
+    // both are nonzero. A SetName section is never consulted for them.
+    let lookup = parse_tileset_ini(
+        b"[TileSet0000]\nTilesInSet=1\nFileName=a\nSetName=A\nShadowCaster=yes\n\
+          [TileSet0001]\nTilesInSet=1\nFileName=b\nSetName=B\nShadowTiles=3\n\
+          [TileSet0002]\nTilesInSet=1\nFileName=c\nSetName=C\nShadowCaster=yes\nShadowTiles=3\n\
+          [TileSet0003]\nTilesInSet=1\nFileName=d\nSetName=D\n\
+          [D]\nShadowCaster=yes\nShadowTiles=3\n",
+        "tem",
+    )
+    .unwrap();
+    assert_eq!(
+        (0..4)
+            .map(|tile| lookup.casts_tile_shadow(tile))
+            .collect::<Vec<_>>(),
+        [false, false, true, false]
+    );
+}
+
+#[test]
+fn retail_theaters_read_signed_bridge_pieces_once() {
+    // load_theater is the one reader of the ten ReadTheater545150 piece keys
+    // (545B4D..545C2E); rim cleanup and the BridgeMiddle tile view share it.
+    let Some((_, mut assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+        return;
+    };
+    let corpus = native_general_corpus();
+    for (name, _) in THEATER_DEFS {
+        let theater = load_theater(&mut assets, name).expect("load stock theater");
+        let values = &corpus["physical"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["file"].as_str() == Some(theater_def(name).unwrap().ini_name))
+            .expect("physical theater provenance")["values"];
+        let pair = |key: &str| {
+            [1, 2].map(|n| i32::try_from(values[format!("{key}{n}")].as_i64().unwrap()).unwrap())
+        };
+        let rim = theater.high_bridge_rim_tiles;
+        assert_eq!(
+            [
+                rim.top_left,
+                rim.bottom_right,
+                rim.top_right,
+                rim.bottom_left,
+                rim.middle
+            ],
+            [
+                pair("BridgeTopLeft"),
+                pair("BridgeBottomRight"),
+                pair("BridgeTopRight"),
+                pair("BridgeBottomLeft"),
+                pair("BridgeMiddle"),
+            ],
+            "{name}: signed bridge pieces"
+        );
+        assert_eq!(
+            rim.base,
+            theater.cliff_ranges.bridge_set.map_or(-1, i32::from),
+            "{name}: published BridgeSet base"
+        );
+        assert_eq!(theater.bridge_middles(), [Some(7), Some(12)], "{name}");
+    }
 }
 
 #[test]
@@ -844,7 +910,7 @@ fn active_retail_automatic_shell_corpus_is_exact() {
         let expected_bridge_middles = ["BridgeMiddle1", "BridgeMiddle2"]
             .map(|key| u16::try_from(expected["values"][key].as_i64().unwrap()).ok());
         assert_eq!(
-            [theater.bridge_middle_1, theater.bridge_middle_2],
+            theater.bridge_middles(),
             expected_bridge_middles,
             "loaded {theater_name} BridgeMiddle keys"
         );
@@ -1153,8 +1219,10 @@ fn synthetic_theater_with_bridge_keys(
         bridge_set: Some(0),
         wood_bridge_set: None,
         slope_set_pieces: None,
-        bridge_middle_1,
-        bridge_middle_2,
+        high_bridge_rim_tiles: crate::map::bridge_rim_tiles::HighBridgeRimTiles {
+            middle: [bridge_middle_1, bridge_middle_2].map(|key| key.map_or(-1, i32::from)),
+            ..crate::map::bridge_rim_tiles::HighBridgeRimTiles::ABSENT
+        },
         tunnels: None,
         track_tunnels: None,
         dirt_tunnels: None,

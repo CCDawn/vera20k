@@ -62,6 +62,8 @@ pub(crate) fn render_sound_shell(
                 rect,
                 thumb_left: dialog.thumb_left(id, rect),
                 plaque: true,
+                // B8 opens only with an output device ([`SoundState`]).
+                disabled: false,
             },
             ShellScale::RETAIL,
         );

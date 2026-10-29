@@ -467,6 +467,7 @@ fn remote_house_human_selector_and_reset_keep_drain_one_time_and_leaf_ready_guar
             &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
             None,
             None,
+            None,
         );
         sim.classify_map_triggers(&rules);
         sim.advance_triggers(&rules, None, FrameEffects::default());

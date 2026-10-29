@@ -404,7 +404,20 @@ const MIN_DISTINCT_DECK_CELLS: usize = 6;
 // source. This remains a Rust regression pin, not a native game golden.
 // Previous: 0x8BD4_EE67_3F59_0830.
 // Hash composition includes constructor planning registration and the shared ammo reload clock.
-const BRIDGE_HARNESS_FINAL_HASH: u64 = 0x4FC5_48E8_B854_D13D;
+// The native-speed migration (60da53f9c) replaces fixed fraction hashes with
+// binary64 and reaches the far cell at frame147 instead of146. Compared with
+// e59f6914f, the final facing timer moves166->167 and track residual7->6;
+// route, per-frame replay equality and all three absolute RNG pins still hold.
+// Residual: the fog/alliance digest also differs; final visibility planes match.
+// #3099 adds the permanent-stealth grant byte for every entity, false here.
+// Omitting only that hash fold recovers 0x8934_6F95_0887_B80C; the unchanged
+// replay, route and absolute RNG assertions pass with either hash composition.
+// #3234 removed the entity hash's sensor deposit, a None byte for every object
+// here. It sat in the same run of zero bytes as that grant byte, so the pin
+// returns to the value above. Hash composition only: a temporary control
+// restoring the byte gave the previous value, with every tripwire above green.
+// Control removed. Previous: 0x57D9_C8C7_DA7A_FBD6.
+const BRIDGE_HARNESS_FINAL_HASH: u64 = 0x8934_6F95_0887_B80C;
 
 fn bridge_ini() -> IniFile {
     // One armed ground vehicle and one distant infantryman on a second house, so

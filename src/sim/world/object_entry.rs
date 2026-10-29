@@ -526,13 +526,24 @@ impl Simulation {
     /// up (the native argument is the `CellClass`).
     pub(crate) fn aircraft_can_enter_cell(&self, id: u64, cell: Cell) -> u8 {
         let e = self.substrate.entities.get(id).unwrap();
-        // Aircraft4196BC queries Team6EC300 before owner/mission/shroud.
-        if self.member_team_is_moving_outside_playfield(id) {
-            return 0;
-        }
         let Some(terrain) = self.resolved_terrain.as_ref() else {
             return 0;
         };
+        // AircraftClass::Can_Enter_Cell @ 0x004196B0 calls
+        // IsMovingToWaypointOutsidePlayfield @ 0x006EC300; when true, it
+        // checks the candidate retained Cell with
+        // MapClass::Is_Cell_In_Playfield_CellClass @ 0x00578540 (mode 1).
+        // Only an outside cell returns before the owner checks.
+        if self.member_team_is_moving_outside_playfield(id) {
+            let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+            if !crate::sim::cell_rect::retained_cell_is_in_playfield(
+                cell,
+                self.playfield_bounds,
+                &cells,
+            ) {
+                return 0;
+            }
+        }
         if self.session.game_mode_nonzero()
             || !e.discovery.owned_by_current_house()
             || e.is_mission_only()
@@ -568,7 +579,7 @@ impl Simulation {
             .ok_or("Can_Enter_Cell of a retired building")?;
         let obj = self
             .interner
-            .object_type(e.type_ref(), rules)
+            .object_type_in_category(e.type_ref(), e.category().into(), rules)
             .ok_or("Can_Enter_Cell of a building without its type")?;
         let terrain = self
             .resolved_terrain
@@ -671,7 +682,7 @@ fn classify_entry(
     let obj = live
         .sim
         .interner
-        .object_type(e.type_ref(), live.rules)
+        .object_type_in_category(e.type_ref(), e.category().into(), live.rules)
         .ok_or("repair admission missing ObjectType")?;
     if e.category() == EntityCategory::Structure {
         return building_impassable(live, e, obj, cell, None).map(|hard| if hard { 7 } else { 0 });
@@ -693,11 +704,12 @@ struct EntryMover<'a> {
     weapon0: Option<&'a crate::rules::weapon_type::WeaponType>,
     crusher: bool,
     /// Answers of `allied(mover owner, house)` already asked, and blocker
-    /// types already resolved by name; the alliance graph and rules are fixed
-    /// for the receiver's lifetime. A search asks these for every blocker it
+    /// types already resolved by concrete class and name. Alliances and rules
+    /// are fixed for the receiver's lifetime. A search asks these for every blocker it
     /// meets.
     allies: InternedCache<bool>,
-    types: InternedCache<&'a ObjectType>,
+    // Native blocker GetTechnoType; same-name classes cannot alias a slot.
+    types: [InternedCache<&'a ObjectType>; 4],
     /// The receiver's `weapon_damage_value`, which the Infantry branches
     /// compare with zero for each enemy blocker. The receiver is borrowed
     /// unchanged for the mover's lifetime, so one computation serves them all.
@@ -744,7 +756,7 @@ impl<'a> EntryMover<'a> {
             weapon0,
             crusher,
             allies: InternedCache::new(),
-            types: InternedCache::new(),
+            types: std::array::from_fn(|_| InternedCache::new()),
             damage: std::cell::OnceCell::new(),
         }
     }
@@ -761,9 +773,22 @@ impl<'a> EntryMover<'a> {
         })
     }
 
-    fn object_type(&self, live: &EntryReadContext<'a>, id: InternedId) -> Option<&'a ObjectType> {
-        self.types
-            .get_or(id, || live.sim.interner.object_type(id, live.rules))
+    fn object_type(
+        &self,
+        live: &EntryReadContext<'a>,
+        entity: &GameEntity,
+    ) -> Option<&'a ObjectType> {
+        use crate::rules::object_type::ObjectCategory;
+        let category: ObjectCategory = entity.category().into();
+        let slot = match category {
+            ObjectCategory::Building => 0,
+            ObjectCategory::Infantry => 1,
+            ObjectCategory::Vehicle => 2,
+            ObjectCategory::Aircraft => 3,
+        };
+        self.types[slot].get_or(entity.type_ref(), || {
+            live.sim.entity_object_type(entity, live.rules)
+        })
     }
 
     fn allied_with(&self, live: &EntryReadContext<'_>, house: InternedId) -> bool {
@@ -855,7 +880,7 @@ impl Simulation {
             .ok_or("Foot entry requires a live Infantry or Unit receiver")?;
         let obj = self
             .interner
-            .object_type(e.type_ref(), rules)
+            .object_type_in_category(e.type_ref(), e.category().into(), rules)
             .ok_or("repair admission missing ObjectType")?;
         let mover = EntryMover::new(&live, id, e, obj);
         Ok(FootEntryReceiver { live, mover })
@@ -1185,7 +1210,7 @@ fn full_foot_entry<'a>(
             return Ok(0);
         }
         let bt = mover
-            .object_type(live, b.type_ref)
+            .object_type(live, blocker)
             .ok_or("repair list missing blocker type")?;
         if infantry && e.slave.owner() == Some(blocker_id) {
             let query = crate::sim::slave_deposit::SlaveDepositQuery {
@@ -1813,8 +1838,9 @@ mod tests {
             entity.locomotor =
                 Some(crate::sim::movement::locomotor::LocomotorState::from_object_type(&object, 0));
             // The answer is the one Aircraft owner's; canonical lookups
-            // reproduce the shared-dummy stamps, so a dummy cell is readable.
-            let probe = |sim: &mut Simulation| {
+            // reproduce the shared-dummy stamps, so both real and dummy cells
+            // use the production retained-cell path.
+            let probe = |sim: &Simulation, cell| {
                 aircraft_entry(
                     &EntryReadContext {
                         sim,
@@ -1823,20 +1849,20 @@ mod tests {
                         facts: None,
                     },
                     &entity,
-                    Cell::Dummy,
+                    cell,
                 )
             };
             sim.session.set_game_mode(
                 crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false),
             );
             assert_eq!(
-                probe(&mut sim),
+                probe(&sim, Cell::Dummy),
                 Ok(sim.aircraft_can_enter_cell(id, Cell::Dummy))
             );
             sim.session.set_game_mode(
                 crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
             );
-            assert_eq!(probe(&mut sim), Ok(0));
+            assert_eq!(probe(&sim, Cell::Dummy), Ok(0));
             let script_id = sim.intern("REPAIR_WAYPOINT_EFFECT");
             sim.team_script_vm
                 .register_script(crate::sim::team_script_vm::TeamScriptDefinition {
@@ -1854,10 +1880,46 @@ mod tests {
                 sim.session.binary_frame() as i32,
             );
             assert!(sim.member_team_is_moving_outside_playfield(id));
+            sim.substrate
+                .entities
+                .get_mut(id)
+                .unwrap()
+                .discovery
+                .set_owned_by_current_house_for_test(true);
+            sim.session.set_game_mode(
+                crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(false),
+            );
+
+            let terrain = sim.resolved_terrain.as_ref().unwrap();
+            let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+            let valid = cells.lookup((15, 15));
+            assert!(crate::sim::cell_rect::retained_cell_is_in_playfield(
+                valid,
+                sim.playfield_bounds,
+                &cells,
+            ));
+            assert!(crate::sim::vision::cell_is_shrouded(
+                &sim.fog,
+                &cells,
+                entity.owner(),
+                (15, 15),
+            ));
             assert_eq!(
-                probe(&mut sim),
+                probe(&sim, valid),
+                Ok(7),
+                "a valid shrouded cell continues after the Team outside-playfield test"
+            );
+
+            let outside = cells.lookup((0, 0));
+            assert!(!crate::sim::cell_rect::retained_cell_is_in_playfield(
+                outside,
+                sim.playfield_bounds,
+                &cells,
+            ));
+            assert_eq!(
+                probe(&sim, outside),
                 Ok(0),
-                "the shared Team waypoint receiver runs before the mode gate"
+                "only a cell outside the playfield is rejected by the Team branch"
             );
         }
     }

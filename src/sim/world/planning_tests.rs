@@ -160,14 +160,15 @@ fn append(sim: &mut Simulation, rules: &RuleSet, owner: InternedId, actor: u64, 
                 target_rx: cell.0,
                 target_ry: cell.1,
             },
+            None,
         )
         .unwrap();
     apply(sim, rules, record);
 }
 
 #[test]
-fn stop_repair_or_uninit_detaches_only_its_actor_from_shared_nodes() {
-    for action in ["stop", "repair_dead", "uninit"] {
+fn stop_repair_sale_or_uninit_detaches_only_its_actor_from_shared_nodes() {
+    for action in ["stop", "repair_dead", "sale_dead", "uninit"] {
         let (mut sim, rules, owner) = fixture();
         for actor in [1, 2] {
             append(&mut sim, &rules, owner, actor, (12, 15));
@@ -179,15 +180,20 @@ fn stop_repair_or_uninit_detaches_only_its_actor_from_shared_nodes() {
                 "UnInit retains +514 until destruction"
             );
             sim.process_pending_delete_with(&rules, None, Default::default(), 1, false);
-        } else if action == "repair_dead" {
+        } else if action == "repair_dead" || action == "sale_dead" {
             sim.substrate
                 .entities
                 .get_mut(1)
                 .unwrap()
                 .lifecycle
                 .set_object_alive_for_test(false);
-            // Event4C6EE0 detaches before the target's +90/alive refusal.
-            let record = sim.encode_repair_record(owner, 1).unwrap();
+            // REPAIR4C6EE0 / SELL4C6F20 detach before +90/alive refusal.
+            let record = if action == "repair_dead" {
+                sim.encode_repair_record(owner, 1)
+            } else {
+                sim.encode_object_action_record(owner, &Command::SellBuilding { entity_id: 1 })
+            }
+            .unwrap();
             let envelope = sim.decode_native_command_record(&record, 0).unwrap();
             assert!(!sim.apply_command("Americans", &envelope.payload, Some(&rules)));
         } else {
@@ -541,6 +547,7 @@ fn same_batch_commit_precedes_staged_edit_and_next_batch_commit_starts_path() {
                 target_rx: 12,
                 target_ry: 15,
             },
+            None,
         )
         .unwrap();
     let commit = sim.encode_plan_commit_record(owner).unwrap();
@@ -724,6 +731,7 @@ fn object_nodes_follow_live_xyz_share_and_retain_target_through_connect_delete()
                 attacker_id: 1,
                 target_id: 3,
             },
+            None,
         )
         .unwrap();
     apply(&mut sim, &rules, record);
@@ -743,6 +751,7 @@ fn object_nodes_follow_live_xyz_share_and_retain_target_through_connect_delete()
                 attacker_id: 2,
                 target_id: 3,
             },
+            None,
         )
         .unwrap();
     apply(&mut sim, &rules, record);
@@ -792,6 +801,7 @@ fn object_node_sharing_compares_z_and_screen_hit_box_is_half_open() {
                     attacker_id: actor,
                     target_id: target,
                 },
+                None,
             )
             .unwrap();
         apply(&mut sim, &rules, record);
@@ -826,6 +836,7 @@ fn planning_target_priority_is_secondary_auxiliary_destination() {
     use crate::sim::command::{MegaMissionOrder, MegaMissionRecord, MegaMissionTarget};
     let mut record = CommandRecord::encode(4, 0, 0, &[]).unwrap();
     MegaMissionRecord {
+        auxiliary: MegaMissionTarget::Null,
         house_id: 0,
         frame: 0,
         source_id: 1,
@@ -869,6 +880,7 @@ fn planning_append_rejects_exact_sixteen_and_any_loop() {
                 target_rx: 16,
                 target_ry: 15,
             },
+            None,
         )
         .unwrap();
     assert!(!sim.apply_planning_record(
@@ -888,6 +900,7 @@ fn planning_append_rejects_exact_sixteen_and_any_loop() {
                 target_rx: 16,
                 target_ry: 15,
             },
+            None,
         )
         .unwrap();
     assert!(!sim.apply_planning_record(
@@ -922,14 +935,15 @@ fn connect_rotates_source_loop_suffix_and_preserves_auxiliary_provenance() {
             Some(usize::from(clicked == 0))
         );
         assert!(sim.planning.paths[&2].loop_changed);
+        let template = sim.planning.nodes[&(clicked as u64)].order(1).unwrap();
         let record = sim.planning.nodes[&(clicked as u64)].order(2).unwrap();
         assert_eq!(
             i32::from_le_bytes(record.payload()[0..4].try_into().unwrap()),
             2
         );
         assert_eq!(
-            i32::from_le_bytes(record.payload()[17..21].try_into().unwrap()),
-            1,
+            &record.payload()[17..22],
+            &template.payload()[17..22],
             "connect rewrites only source, preserving native auxiliary provenance"
         );
         let bytes = save_codec::serialize(&sim.planning).unwrap();
@@ -981,6 +995,7 @@ fn cell_attack_and_area_guard_tails_are_terminal_for_append() {
         let (mut sim, rules, owner) = fixture();
         let mut record = CommandRecord::encode(4, 0, 0, &[]).unwrap();
         MegaMissionRecord {
+            auxiliary: MegaMissionTarget::Null,
             house_id: 0,
             frame: 0,
             source_id: 1,
@@ -998,6 +1013,7 @@ fn cell_attack_and_area_guard_tails_are_terminal_for_append() {
                     target_rx: 16,
                     target_ry: 15,
                 },
+                None,
             )
             .unwrap();
         assert!(!sim.apply_planning_record(
@@ -1032,6 +1048,7 @@ fn planned_force_attack_preserves_admitted_friendly_target_through_native_dispat
                 attacker_id: 1,
                 target_id: 2,
             },
+            None,
         )
         .unwrap();
     apply(&mut sim, &rules, record);
@@ -1194,6 +1211,7 @@ fn overlapping_connect_consumption_preserves_occurrences_and_loop_first_record()
                     attacker_id: 1,
                     target_id: 3,
                 },
+                None,
             )
             .unwrap();
         apply(&mut sim, &rules, attack);
@@ -1256,6 +1274,7 @@ fn connect_suffix_copies_the_selected_source_actor_order_at_shared_node() {
                 attacker_id: 3,
                 target_id: 1,
             },
+            None,
         )
         .unwrap();
     apply(&mut sim, &rules, attack);
@@ -1438,6 +1457,7 @@ fn attack_move_loop_keeps_task_badges_on_entry_and_closing_legs() {
                     target: None,
                     destination: Some(TargetKind::Cell(x, y)),
                 },
+                None,
             )
             .unwrap();
         apply(&mut sim, &rules, record);
@@ -1625,6 +1645,7 @@ fn retained_highlight_keeps_hidden_node_coordinates_and_full_membership() {
                 target_rx: 12,
                 target_ry: 15,
             },
+            None,
         )
         .unwrap();
     let envelope = sim
@@ -1893,6 +1914,7 @@ fn finalized_target_pruning_retains_the_empty_token_and_its_house_charge() {
                 attacker_id: 1,
                 target_id: 3,
             },
+            None,
         )
         .unwrap();
     apply(&mut sim, &rules, record);
@@ -1903,7 +1925,9 @@ fn finalized_target_pruning_retains_the_empty_token_and_its_house_charge() {
         "the retired target remains registered until actual destruction"
     );
     let frame = sim.session.binary_frame();
-    assert!(sim.commit_frame_tail(&rules, None, 33, sim.session.tick() + 1, Default::default()));
+    let inputs =
+        crate::sim::world::master_frame::FrameInputs::new(&rules, None, 33, Default::default());
+    assert!(sim.commit_frame_tail(inputs, sim.session.tick() + 1));
     assert_eq!(sim.session.binary_frame(), frame.wrapping_add(1));
     assert!(!sim.substrate.entities.contains(3));
     assert!(!sim.planning_has_remaining_nodes(1));

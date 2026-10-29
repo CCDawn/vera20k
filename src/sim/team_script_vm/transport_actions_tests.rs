@@ -62,7 +62,7 @@ fn sov02_discovered_battle_fortresses_focus_then_load_after_reload() {
         &map.ini,
     );
     sim.install_team_ai_registry(&registry, &rules).unwrap();
-    sim.initialize_trigger_definitions(&map, &registry, None, None);
+    sim.initialize_trigger_definitions(&map, &registry, None, None, None);
     let mut placements: Vec<_> = map
         .entities
         .iter()

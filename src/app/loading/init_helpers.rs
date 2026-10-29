@@ -29,8 +29,6 @@ use crate::rules::ruleset::RuleSet;
 
 use crate::sim::world::Simulation;
 
-use crate::app::frontend::skirmish::deployable_building_types;
-
 pub(crate) fn build_sidebar_cameo_atlas(
     gpu: &GpuContext,
     batch: &BatchRenderer,
@@ -95,6 +93,17 @@ pub(crate) fn load_sidebar_cameo_palette(asset_manager: &AssetManager) -> Option
     }
     log::warn!("Sidebar cameo palette not found");
     None
+}
+
+/// `RA2_DEBUG_SPAWN_UNITS` owner: the scenario's current House (`A83D4C`), so
+/// every run spawns for the local player. A world without one has no player to
+/// own the spawn, and the spawn is skipped.
+pub(crate) fn debug_spawn_owner(sim: &Simulation) -> Option<String> {
+    let owner = crate::app::match_runtime::state::scenario_local_owner(sim).map(str::to_owned);
+    if owner.is_none() {
+        log::warn!("RA2_DEBUG_SPAWN_UNITS ignored: the scenario has no current House");
+    }
+    owner
 }
 
 /// `RA2_DEBUG_SPAWN_UNITS` stress spawn list: `TYPE` places one, `TYPE:COUNT`
@@ -416,6 +425,16 @@ pub(crate) fn startup_crate_anim_remap_keys(
     .collect()
 }
 
+#[path = "presentation_jobs.rs"]
+mod presentation_jobs;
+pub(crate) use presentation_jobs::PresentationAtlasJob;
+
+pub(crate) struct PreparedManifest {
+    unit_work: Option<(unit_atlas::UnitRasterWork, unit_atlas::UnitAtlasUpload)>,
+    sprite_work: Option<sprite_atlas::PreparedSpriteAtlas>,
+    palette_set: Option<crate::render::palette_textures::PaletteSet>,
+}
+
 /// The presentation-side atlas bundle the app builds AFTER GPU-free scenario
 /// construction (F09): derived from immutable resources plus the constructed
 /// simulation, never fed back into it.
@@ -477,45 +496,60 @@ pub(crate) fn build_presentation_manifest(
     theater_unit_palette: Option<&Palette>,
     theater_iso_palette: Option<&Palette>,
 ) -> PresentationManifest {
+    prepare_presentation_manifest(
+        sim,
+        asset_manager,
+        gpu,
+        batch,
+        theater_ext,
+        theater_name,
+        rules,
+        overlay_registry,
+        house_colors,
+        theater_unit_palette,
+        theater_iso_palette,
+    )
+    .finish(gpu, batch)
+}
+
+pub(crate) fn prepare_presentation_manifest(
+    sim: &Simulation,
+    asset_manager: &AssetManager,
+    gpu: &GpuContext,
+    _batch: &BatchRenderer,
+    theater_ext: &str,
+    theater_name: &str,
+    rules: Option<&RuleSet>,
+    overlay_registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    house_colors: &HouseColorMap,
+    theater_unit_palette: Option<&Palette>,
+    theater_iso_palette: Option<&Palette>,
+) -> PreparedManifest {
     let art = rules.map(RuleSet::art);
     // `load_theater_unit_and_iso_palettes` owns both theater palettes:
     // `load_theater` publishes them and mid-match atlas growth re-reads them.
     // Without a loaded theater nothing renders, so no entity atlas is built.
     let palette = theater_unit_palette;
-    let unit_atlas: Option<UnitAtlas> = if palette.is_some() {
-        unit_atlas::build_unit_atlas(
-            &gpu.device,
-            &gpu.queue,
-            batch,
+    let unit_work = palette.map(|_| {
+        unit_atlas::prepare_unit_atlas(
             sim.entities(),
             asset_manager,
             rules,
-            None, // initial build — no existing cache
+            None,
             Some(sim.interner()),
         )
-    } else {
-        None
-    };
-    // Pre-load building types that can be spawned at runtime (e.g., ConYards from MCV deploy).
-    let extra_buildings: Vec<&str> = deployable_building_types(rules);
-    let mut anim_remap_keys = sprite_atlas::collect_anim_remap_base_keys(sim, house_colors);
-    if let Some(rules) = rules {
-        anim_remap_keys.extend(startup_crate_anim_remap_keys(rules, overlay_registry));
-    }
-    let cell_drawer_type_ids: HashSet<String> = sim
-        .resolved_terrain()
-        .into_iter()
-        .flat_map(|terrain| terrain.tile_animations())
-        .map(|anim| anim.anim_name.to_ascii_uppercase())
-        .collect();
-    let frozen_keys = rules.map_or_else(HashSet::new, |rules| {
-        sprite_atlas::collect_fogged_sprite_keys(sim, rules, house_colors)
     });
-    let shp_atlas: Option<SpriteAtlas> = palette.and_then(|pal| {
-        sprite_atlas::build_sprite_atlas(
-            &gpu.device,
-            &gpu.queue,
-            batch,
+    // Mid-match growth collects the same coverage; only the scenario-start
+    // crate remaps are load-only.
+    let mut coverage = sprite_atlas::EntityAtlasCoverage::collect(sim, rules, house_colors);
+    if let Some(rules) = rules {
+        coverage
+            .anim_remap_keys
+            .extend(startup_crate_anim_remap_keys(rules, overlay_registry));
+    }
+    let sprite_work = palette.map(|pal| {
+        sprite_atlas::prepare_sprite_atlas(
+            gpu.device.limits().max_texture_dimension_2d,
             sim.entities(),
             asset_manager,
             pal,
@@ -524,10 +558,10 @@ pub(crate) fn build_presentation_manifest(
             rules,
             art,
             house_colors,
-            &extra_buildings,
-            &anim_remap_keys,
-            &cell_drawer_type_ids,
-            &frozen_keys,
+            &coverage.extra_buildings,
+            &coverage.anim_remap_keys,
+            &coverage.cell_drawer_type_ids,
+            &coverage.frozen_keys,
             theater_iso_palette,
             None, // initial build — no existing cache
             Some(sim.interner()),
@@ -551,9 +585,9 @@ pub(crate) fn build_presentation_manifest(
             let active = voxel_palette_demand(house_colors, rules);
             crate::render::palette_textures::PaletteSet::new(gpu, pal, global, house_ramps, &active)
         });
-    PresentationManifest {
-        unit_atlas,
-        sprite_atlas: shp_atlas,
+    PreparedManifest {
+        unit_work,
+        sprite_work,
         palette_set,
     }
 }
@@ -593,6 +627,32 @@ pub(crate) fn finish_presentation_assets(
         }
     }
     let sidebar_cameo_atlas = build_sidebar_cameo_atlas(gpu, batch, asset_manager, Some(rules));
+    #[cfg(feature = "phobos")]
+    let uimd_bytes = asset_manager.get_ref("UIMD.INI");
+    #[cfg(feature = "phobos")]
+    let sw_sidebar_ui = uimd_bytes
+        .map(crate::rules::phobos_sw_sidebar::SuperWeaponSidebarUi::from_uimd_bytes)
+        .unwrap_or_default();
+    // The same loaded `uimd.ini` carries the pause-menu switch; Phobos reads
+    // both from `[Sidebar]` at startup.
+    #[cfg(feature = "phobos")]
+    let center_pause_menu_background = uimd_bytes
+        .map(crate::rules::phobos_pause_menu::PauseMenuUi::from_uimd_bytes)
+        .unwrap_or_default()
+        .center_background;
+    #[cfg(feature = "phobos")]
+    let sw_sidebar_art = sw_sidebar_ui
+        .enabled
+        .then(|| {
+            crate::render::sw_sidebar_art::build_sw_sidebar_art(
+                gpu,
+                batch,
+                asset_manager,
+                rules,
+                simulation.session().scenario_side(),
+            )
+        })
+        .flatten();
     let sidebar_chrome = crate::render::sidebar_chrome::build_sidebar_chrome_set(
         gpu,
         batch,
@@ -600,6 +660,30 @@ pub(crate) fn finish_presentation_assets(
         rules,
         simulation.session().scenario_side(),
     )?;
+    // `Game_LoadUI_LoadSideData` (0x1002F4A0) hands the local side's
+    // `GraphicalText.Image=` / `.Palette=` to the overlay slot writer at
+    // 0x1002ECC0 on every game load, freeing the previous match's surfaces
+    // first. Only a side that names one of the two keys differs from the
+    // process InitGame art, so the override atlas belongs to this world.
+    #[cfg(feature = "ares")]
+    let outcome_banner_side_art = {
+        let (image, palette) = rules
+            .side_graphical_text(simulation.session().scenario_side())
+            .unwrap_or((None, None));
+        if image.is_some() || palette.is_some() {
+            crate::app::presentation::outcome_banner::OutcomeBannerArt::build_for_side(
+                gpu,
+                batch,
+                asset_manager,
+                image,
+                palette,
+            )
+        } else {
+            None
+        }
+    };
+    #[cfg(not(feature = "ares"))]
+    let outcome_banner_side_art = None;
     let fnt_file = asset_manager.get_ref("GAME.FNT").and_then(|data| {
         crate::assets::fnt_file::FntFile::from_bytes(data)
             .map_err(|error| log::warn!("Failed to parse GAME.FNT: {error}"))
@@ -633,6 +717,13 @@ pub(crate) fn finish_presentation_assets(
         bridge_atlas: overlays.bridge_atlas,
         sidebar_cameo_atlas,
         sidebar_chrome,
+        #[cfg(feature = "phobos")]
+        sw_sidebar_ui,
+        #[cfg(feature = "phobos")]
+        center_pause_menu_background,
+        #[cfg(feature = "phobos")]
+        sw_sidebar_art,
+        outcome_banner_side_art,
         software_cursor,
         overlay_names: overlays.overlay_names,
         overlay_radar_colors: overlays.overlay_radar_colors,

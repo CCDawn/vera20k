@@ -159,7 +159,7 @@ fn native_reveal_zone_dispatch_uses_literal_waypoint_raw_zone_and_radius_two() {
             .unwrap()
             .entries()[0]
             .clone();
-        let action = definitions.resolve_action(entry, None, None);
+        let action = definitions.resolve_action(entry, None, None, None);
         assert_eq!(json!(action.value), row["read"]["value"]);
         assert_eq!(json!(action.entry.waypoint_index), row["read"]["waypoint"]);
         let waypoint = number(&row["read"]["value"]) as u32;

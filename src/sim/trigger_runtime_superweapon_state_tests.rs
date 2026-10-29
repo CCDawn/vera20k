@@ -153,7 +153,7 @@ fn all03_authored_nuke_order_preserves_current_timer_and_recharges_at_override()
         );
         sim.session.install_waypoints(&map.waypoints);
         sim.install_team_ai_registry(&teams, &rules).unwrap();
-        sim.initialize_trigger_definitions(&map, &teams, None, None);
+        sim.initialize_trigger_definitions(&map, &teams, None, None, None);
         let owner = sim.interner.get("YuriCountry").unwrap();
         let enemy = sim.interner.get("Americans").unwrap();
         let id = sim.interner.get("NukeSpecial").unwrap();
@@ -361,7 +361,7 @@ fn dispatch_matches_original_signed_override_waypoint_and_incoming_house_gates()
                     .install_waypoints(&[(index, waypoint)].into_iter().collect());
             }
         }
-        let action = RuntimeDefinitions::default().resolve_action(entry, None, None);
+        let action = RuntimeDefinitions::default().resolve_action(entry, None, None, None);
         let context = TriggerActionContext {
             live_index: None,
             incoming_house: input["owner_present"].as_bool().unwrap().then_some(owner),

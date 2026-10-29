@@ -215,6 +215,7 @@ impl Simulation {
             .is_operational()
             == operational
         {
+            self.update_building_working_sound(id, rules, frame_effects);
             return;
         }
         // `0x0043FB6D..0x0043FBE3`: the working sound precedes the dispatcher.
@@ -602,71 +603,6 @@ impl Simulation {
             admit,
             radius,
         );
-    }
-
-    /// The live4ADEE0/4ADCD0 bracket visits gap candidates even if they had no
-    /// prior deposit. Only this viewer's269/26C changes;6C8 stays untouched.
-    /// Returns hostile cell re-admissions and whether ANY (also friendly)
-    /// successful add clears House240 after the bulk mapping store.
-    pub(super) fn prepare_spy_sat_gap_reentry(
-        &mut self,
-        viewer: InternedId,
-        rules: &RuleSet,
-    ) -> (Vec<vision::GapGeneratorSource>, bool) {
-        let config = self.sight_reveal_config(rules);
-        let viewer_defeated = self
-            .houses
-            .get(&viewer)
-            .is_some_and(|house| house.is_defeated());
-        let candidates: Vec<_> = self
-            .substrate
-            .entities
-            .iter_sorted()
-            .filter_map(|(id, entity)| {
-                let (operational, radius) = self.gap_operational_state(id, rules)?;
-                // The allied-Building arm is ordinary sight ONLY; every other
-                // object the brackets visit takes its gap callback
-                // (`0x004ADFC1..0x004ADFD9`, `0x004ADEA7..0x004ADEBF`). The
-                // known-own multiplayer discovery domain is shared with the caller.
-                (entity.owner() == viewer
-                    || !self.takes_allied_building_arm(entity, viewer, &config))
-                .then_some((id, operational, radius))
-            })
-            .collect();
-        let mut reentry = Vec::new();
-        let mut admitted = false;
-        for (id, operational, radius) in candidates {
-            let entity = self.substrate.entities.get_mut(id).unwrap();
-            let deposit = entity.gap_generator.viewers.entry(viewer).or_default();
-            // Removal first; cached radius survives. Original add subsequently
-            //rechecks current operational state, not the last Building sample.
-            if deposit.radius == 0 && (deposit.active || operational) {
-                deposit.radius = radius;
-            }
-            deposit.active = operational;
-            admitted |= operational;
-            let radius = deposit.radius;
-            // The generator's house asks about the viewer, as the add does
-            // (`0x006FB2CF`).
-            // CreateGap @ 0x006FB170 takes the PlayerPtr+0x1F5 branch for a
-            // defeated viewer, updating +0x13C instead of the hostile +0x134
-            // gap count. The map bracket's post-callback must not re-add that gap.
-            if operational
-                && !viewer_defeated
-                && !crate::map::houses::is_allied_with(
-                    self.house_alliances.as_map(),
-                    self.interner.resolve(entity.owner()),
-                    self.interner.resolve(viewer),
-                )
-            {
-                reentry.push(building_gap_source(
-                    entity,
-                    radius,
-                    self.resolved_terrain.as_ref(),
-                ));
-            }
-        }
-        (reentry, admitted)
     }
 }
 

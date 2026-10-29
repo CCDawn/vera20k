@@ -56,7 +56,7 @@ mod object_stages_gpu_tests;
 
 use anyhow::Result;
 #[cfg(feature = "telemetry-dashboard")]
-use std::time::{Duration, Instant};
+use crate::util::time::{Duration, Instant};
 
 // Re-export shared types so any remaining `use crate::app::presentation::render::Foo` imports still compile.
 // New code should import from `crate::app::types` directly.
@@ -201,10 +201,39 @@ pub(crate) fn render_game(
     );
 
     let local_owner = preferred_local_owner_name(state);
+    let translucent_fog = state.translucent_fog_enabled();
+    let sandbox = state.match_state.sandbox_full_visibility;
     // Effective viewport in world pixels — zoom shrinks what's visible.
     let z = state.match_state.input.zoom_level;
     let vsw = sw / z;
     let vsh = sh / z;
+
+    // Wheel zoom is a presentation copy of the fully resolved world. Keep all
+    // native source/depth/packed operations on the same one-texel lattice;
+    // filtering each sprite (or its palette indices) loses edges and details.
+    if z == 1.0 {
+        state.renderer.world_zoom_pass = None;
+    } else {
+        let renderer = &mut state.renderer;
+        let gpu = &renderer.gpu;
+        let target = [sw as u32, sh as u32];
+        if let Some(pass) = renderer.world_zoom_pass.as_mut() {
+            pass.set_view(&gpu.device, &gpu.queue, target, z);
+        } else {
+            renderer.world_zoom_pass = Some(crate::render::upscale_pass::WorldZoomPass::new(
+                &gpu.device,
+                &gpu.queue,
+                gpu.surface_format,
+                target,
+                z,
+            ));
+        }
+        renderer.batch_renderer.set_native_world_resolution(
+            &gpu.queue,
+            renderer.world_zoom_pass.as_ref().unwrap().source_size(),
+        );
+    }
+    let world_camera = state.renderer.batch_renderer.camera_uniform();
 
     let selected_building = state
         .match_state
@@ -246,6 +275,9 @@ pub(crate) fn render_game(
     #[cfg(feature = "telemetry-dashboard")]
     let phase1_started = render_started.map(|_| Instant::now());
     let mut world = build_instances::build_world_instances(state, vsw, vsh, bracket_palette);
+    for layer in &mut world.object_layers {
+        object_extras::defer_health_to_frame(layer, world_camera.camera_pos, z);
+    }
     #[cfg(feature = "telemetry-dashboard")]
     let after_world = render_started.map(|_| Instant::now());
 
@@ -354,18 +386,18 @@ pub(crate) fn render_game(
     state.renderer.combat_light_renderer.prepare(
         &state.renderer.gpu,
         &combat_lights,
-        [sw, sh],
+        world_camera.screen_size,
         [
             state.match_state.input.camera_x,
             state.match_state.input.camera_y,
         ],
-        state.match_state.input.zoom_level,
+        world_camera.zoom,
     );
     let composition_view = state.renderer.combat_light_renderer.composition_view();
     let (_, tactical_y, _, _) = crate::app::input::camera::tactical_viewport_px(state);
     // Shader row coordinates are unscaled world pixels; scissor uses target
     // pixels. Native zoom1 is exact, and scaled views preserve that unit frame.
-    let native_z_origin_y = tactical_y as f32 / state.match_state.input.zoom_level;
+    let native_z_origin_y = (tactical_y as f32 / z).floor();
     state
         .renderer
         .batch_renderer
@@ -392,7 +424,11 @@ pub(crate) fn render_game(
     state.renderer.terrain_draw_renderer.prepare(
         &state.renderer.gpu.device,
         state.renderer.combat_light_renderer.composition_texture(),
-        &state.renderer.depth_view,
+        state
+            .renderer
+            .world_zoom_pass
+            .as_ref()
+            .map_or(&state.renderer.depth_view, |zoom| zoom.depth_view()),
         state.renderer.batch_renderer.camera_uniform(),
     );
 
@@ -418,7 +454,12 @@ pub(crate) fn render_game(
         state.match_state.input.selection_order_pending,
     );
     let armed_super_weapon = state.armed_super_weapon_type().map(str::to_owned);
-    let cursor_cell = armed_super_weapon.as_ref().map(|_| {
+    // Phobos's enhancer rings (`0x6DBEA3`) draw while a building is placed.
+    #[cfg(feature = "phobos")]
+    let armed_building = state.armed_building_type().map(str::to_owned);
+    #[cfg(not(feature = "phobos"))]
+    let armed_building: Option<String> = None;
+    let cursor_cell = (armed_super_weapon.is_some() || armed_building.is_some()).then(|| {
         crate::app::match_runtime::sim_tick::screen_point_to_world_cell(
             state,
             state.match_state.input.cursor_x,
@@ -430,13 +471,29 @@ pub(crate) fn render_game(
     let rules = sim_runtime
         .map(|runtime| &runtime.resources.rules)
         .or(state.frontend.frontend_rules.as_ref());
+    let show_power_plant_enhancer_range = {
+        #[cfg(feature = "phobos")]
+        {
+            rules.is_some_and(|rules| rules.power_plant_enhancer.show_range)
+                && state
+                    .match_state
+                    .match_presentation
+                    .show_power_plant_enhancer_range
+        }
+        #[cfg(not(feature = "phobos"))]
+        {
+            false
+        }
+    };
     let match_presentation = &mut state.match_state.match_presentation;
     let radials = crate::app::presentation::radial_indicators::build(
         simulation,
         rules,
         &radial_selection,
         armed_super_weapon.as_deref(),
+        armed_building.as_deref(),
         cursor_cell,
+        show_power_plant_enhancer_range,
         &mut match_presentation.superweapon_range_pulse,
         &match_presentation.house_color_map,
         viewport,
@@ -477,11 +534,38 @@ pub(crate) fn render_game(
         state.match_state.sim_runtime.as_mut(),
         &mut state.frontend.frontend_main_rng,
     );
+    let sim = state
+        .match_state
+        .sim_runtime
+        .as_ref()
+        .map(|runtime| runtime.view().simulation());
+    let viewer = local_owner
+        .as_deref()
+        .and_then(|name| sim?.interner().get(name));
+    // Use the same authoritative cell visibility as object admission. The
+    // shaded screen A plane can include edge blends and height projection;
+    // its brightness is not a separate visibility decision.
+    let effect_hidden = |x: i32, y: i32| {
+        let (rx, ry) = crate::app::presentation::instances::lepton_cell(x, y);
+        translucent_fog
+            && !sandbox
+            && sim.is_some_and(|sim| {
+                crate::app::presentation::instances::translucent_fog_conceals_cell(
+                    viewer,
+                    Some(sim.fog()),
+                    rx,
+                    ry,
+                    sim.session().game_options().fog_of_war,
+                )
+            })
+    };
     let bolt_lines = {
         presentation.lasers.composite(&mut main);
         presentation
             .electric_bolts
-            .composite(viewport, palette, &mut main)
+            .composite(viewport, palette, &mut main, |birth| {
+                !effect_hidden(birth.to.x, birth.to.y)
+            })
     };
     // Tactical6D48F1 follows Laser/Bolt Main requests and interleaves the
     // opaque action stores with each owning Airstrike designation. Uploads
@@ -492,29 +576,49 @@ pub(crate) fn render_game(
         &main,
         viewport,
     );
-    let sim = state
-        .match_state
-        .sim_runtime
-        .as_ref()
-        .map(|runtime| runtime.view().simulation());
-    let segments = presentation.line_trails.composite(|id| {
-        let sim = sim?;
-        sim.projectiles().get(id).map(|bullet| {
-            presentation
-                .interpolation
-                .sample_point(
-                    crate::app::presentation::interpolation::PointKind::Bullet,
-                    id,
-                    crate::app::presentation::interpolation::PointPose::bullet(bullet),
-                    sim.session().binary_frame(),
-                )
-                .projectile_coord()
-        })
-    });
+    let segments = presentation.line_trails.composite(
+        |id| {
+            let sim = sim?;
+            let bullet = sim.projectiles().get(id)?;
+            Some(
+                presentation
+                    .interpolation
+                    .sample_point(
+                        crate::app::presentation::interpolation::PointKind::Bullet,
+                        id,
+                        crate::app::presentation::interpolation::PointPose::bullet(bullet),
+                        sim.session().binary_frame(),
+                    )
+                    .projectile_coord(),
+            )
+        },
+        |owner, coord| {
+            if !translucent_fog || sandbox {
+                return true;
+            }
+            let Some(sim) = sim else {
+                return true;
+            };
+            if let Some(bullet) = owner.and_then(|id| sim.projectiles().get(id)) {
+                return !crate::app::presentation::instances::translucent_fog_conceals_bullet(
+                    sim,
+                    bullet,
+                    [coord.x, coord.y, coord.z],
+                    local_owner.as_deref(),
+                    viewer,
+                    sim.session().game_options().fog_of_war,
+                );
+            }
+            !effect_hidden(coord.x, coord.y)
+        },
+    );
     let frame_rate = presentation.detail.borrow().frame_rate();
-    presentation.radiation_beams.composite(frame_rate, viewport);
+    presentation
+        .radiation_beams
+        .composite(frame_rate, viewport, |birth| {
+            !effect_hidden(birth.to.x, birth.to.y)
+        });
     let shroud = presentation.shroud_buffer.as_ref();
-    let sandbox = state.match_state.sandbox_full_visibility;
     let mut alpha = |point: [i32; 2]| {
         if sandbox {
             127
@@ -534,10 +638,14 @@ pub(crate) fn render_game(
     let terrain = &mut state.renderer.terrain_draw_renderer;
     let gpu = &state.renderer.gpu;
     terrain.begin_surface_lines();
+    let laser_draws = presentation
+        .lasers
+        .draws()
+        .filter(|draw| !effect_hidden(draw.to.x, draw.to.y));
     let surface_effects = terrain.prepare_surface_lines(
         &gpu.device,
         &gpu.queue,
-        presentation.lasers.draws(),
+        laser_draws,
         bolt_lines
             .iter()
             .copied()
@@ -618,7 +726,7 @@ pub(crate) fn render_game(
         &state.renderer.gpu.device,
         &state.renderer.gpu.queue,
         &ion_blasts,
-        z,
+        world_camera.zoom,
     );
 
     // Phase 7: Dispatch draw calls in render order.
@@ -680,7 +788,7 @@ pub(crate) fn tactical_surface_line_viewport(
         .map(|v| v.floor() as i32),
         clip: [x, y, w, h].map(|v| (v as f32 / z) as i32),
         z_origin_y: (y as f32 / z) as i32,
-        zoom: z,
+        zoom: 1.0,
     }
 }
 
@@ -717,6 +825,22 @@ fn upload_to_gpu(
     // top-right identity box; empty outside Phobos builds.
     let (build_text_fill, build_text_text) =
         crate::app::presentation::build_text::build_instances(state);
+
+    #[cfg(feature = "ares")]
+    let bounty_text = {
+        let presentation = &state.match_state.match_presentation;
+        if presentation.chrono_screen.overrides_tactical_draw() {
+            Vec::new()
+        } else {
+            let (width, height) = crate::app::input::camera::tactical_viewport_size(state);
+            presentation.flying_credits.borrow_mut().build_instances(
+                &state.renderer.bit_font,
+                [state.match_state.input.camera_x, state.match_state.input.camera_y],
+                state.match_state.input.zoom_level,
+                [width, height],
+            )
+        }
+    };
 
     let pool: &mut InstanceBufferPool = &mut state.renderer.instance_pool;
 
@@ -771,6 +895,8 @@ fn upload_to_gpu(
     pool.upload(&state.renderer.gpu, "super_timer_text", &super_timer_text);
     pool.upload(&state.renderer.gpu, "build_text_fill", &build_text_fill);
     pool.upload(&state.renderer.gpu, "build_text_text", &build_text_text);
+    #[cfg(feature = "ares")]
+    pool.upload(&state.renderer.gpu, "bounty_text", &bounty_text);
 
     // UI overlays
     for (house, beacons) in ui.beacons.iter().enumerate() {
@@ -779,6 +905,8 @@ fn upload_to_gpu(
     pool.upload(&state.renderer.gpu, "drag", &ui.drag);
     pool.upload(&state.renderer.gpu, "software_cursor", &ui.software_cursor);
     pool.upload(&state.renderer.gpu, "placement", &ui.placement);
+    #[cfg(feature = "phobos")]
+    pool.upload(&state.renderer.gpu, "placement_ghost", &ui.placement_ghost);
     pool.upload(
         &state.renderer.gpu,
         "factory_rally_first",
@@ -826,6 +954,39 @@ fn upload_to_gpu(
         &sidebar.cameo_overlay,
     );
     pool.upload(&state.renderer.gpu, "sidebar_text", &sidebar.text);
+    #[cfg(feature = "phobos")]
+    {
+        pool.upload(
+            &state.renderer.gpu,
+            "sw_sidebar_chrome",
+            &sidebar.sw_sidebar_chrome,
+        );
+        pool.upload(
+            &state.renderer.gpu,
+            "sw_sidebar_cameo",
+            &sidebar.sw_sidebar_cameo,
+        );
+        pool.upload(
+            &state.renderer.gpu,
+            "sw_sidebar_gclock",
+            &sidebar.sw_sidebar_gclock,
+        );
+        pool.upload(
+            &state.renderer.gpu,
+            "sw_sidebar_hover",
+            &sidebar.sw_sidebar_hover,
+        );
+        pool.upload(
+            &state.renderer.gpu,
+            "sw_sidebar_overlay",
+            &sidebar.sw_sidebar_overlay,
+        );
+        pool.upload(
+            &state.renderer.gpu,
+            "sw_sidebar_text",
+            &sidebar.sw_sidebar_text,
+        );
+    }
     pool.upload(&state.renderer.gpu, "message_text", &message_text);
     pool.upload(&state.renderer.gpu, "message_fill", &message_fill);
     pool.upload(&state.renderer.gpu, "outcome_shape", &outcome_shape);

@@ -253,8 +253,10 @@ about that state. An explicit `null` means no installed track state was observed
 The explicit profile schema belongs to
 `src/app/diagnostics/tactical_capture/map_observation.rs`. Start from
 [`map_observation.example.json`](map_observation.example.json), whose launch is the
-existing Rust `SkirmishLaunchSession` DTO. Change `launch.selected_map_file` to the
-chosen retail map. Keep explicit countries, colors and distinct start slots, and
+existing Rust `SkirmishLaunchSession` DTO. Its v2 `cursor_position` parks the cursor
+over the sidebar: the post-load centre of the tactical view can rest on the local
+MCV, whose Select cursor fails the static-cursor check. Change
+`launch.selected_map_file` to the chosen retail map. Keep explicit countries, colors and distinct start slots, and
 keep `pre_fill_house_roster` consistent with the opponents. Rust validates launch
 admission; Python does not maintain a second launch parser or synthesize defaults.
 
@@ -655,6 +657,25 @@ queued/head voice actions, physical sample/finite PCM and event/channel
 retirement. Loading and service can advance Main before the order, so a launch
 seed alone does not determine which entry a multi-entry list chooses.
 
+The [magnetic Wave profile](map_observation.magnetic-wave.example.json) uses
+stock sleeping TELE/MTNK actors at `(44,48)` and `(50,48)` plus a distant enemy
+survivor. Generate the flat scene with the existing fixture owner:
+
+```sh
+python tools/render_depth_fixture.py /absolute/ordinary-tele-magnetic.map --magnetic-wave
+```
+
+Copy the profile and set its selected map to that absolute path. Use the capture
+command below with an isolated settings directory and `input_delay_ticks = 2`
+in its `config.toml`. Attack at step 12 and Stop at step 24 exercise firing,
+lifting, interrupted fade and Wave cleanup through ordinary commands. For a
+shot-in-progress image, copy the profile with `ticks = 20` and remove commands
+at or after step 20. Run the same map/profile/config bytes before and after the
+change, then use `tools.map_observation compare` on the completed captures.
+These exact-step captures disable render interpolation: they check ordinary
+output and cleanup, while the production interpolation regression covers an
+interpolated foldback that reproduces the scanline overflow.
+
 The [Dolphin Sonic profile](map_observation.sonic-wave.example.json) uses a
 stock DLPH, enemy CARRIER and a distant enemy survivor. Extract the physical
 `multimd.mix/XMP03T4.MAP` with the existing asset tools, then generate the scene:
@@ -697,20 +718,6 @@ on the retained Hills scene: change it if a different terrain template shifts th
 hit, since a type selector cannot bind a still-limboed DRON. The profile does not
 prescribe a successful hit or native timing and is not an original scene/pixel
 comparison.
-
-The [building power-status profile](map_observation.building-power-status.example.json)
-selects an ordinary full-health owned GAPOWR in the existing clear-ground scene:
-
-```sh
-python tools/render_depth_fixture.py target/building-power-status.map --building-brackets
-```
-
-Copy the profile and set the generated map's absolute path. Its three owned
-plants keep their retail Power, health and rules. Inspect the selected building's
-localized House power/drain text, then the same scene after an ordinary right-click
-deselect. The text reads the House's retained totals; it does not sum buildings or
-assess power during drawing. The existing Building-array text pass draws after
-Ground2, with the same physical GAME.FNT and House color as PRIMARY labels.
 
 The [Ivan bomb-clock profile](map_observation.bomb-clock.example.json) uses an
 ordinary Crazy Ivan planting order on a friendly stock tank:
@@ -2426,7 +2433,11 @@ statistics, surface format and actual BGRA bytes. Clock policies must match; a
 legacy wall-clock observation and a diagnostic-clock observation are `INVALID`
 together even when their pixels match.
 Differences name precise field paths and before/after values. There are no pixel
-tolerances or omitted atlas fields.
+tolerances or omitted atlas fields. Process Main RNG reads (`rng.main` and every
+`main_rng_cursor`) are listed in `main_rng_differences` instead and do not decide
+`MATCH`: Main (`0x886B88`) is outside the state hash and saves, and the audio
+service draws it for SFX and Theme on wall time, so two runs of the same inputs
+can legitimately differ there. Scenario and Mapgen streams stay compared.
 Current v8 pairs also compare the complete command, rule-handle inventory,
 actor/building/animation/unit/miner/radio/House/terrain transcript and camera,
 including the delayed-shot and color/fade observations when requested. Historical

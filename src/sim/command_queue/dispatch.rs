@@ -4,11 +4,61 @@ use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
-use crate::sim::command::{CommandRecord, MEGAMISSION_OPCODE, stage_megamission};
+use crate::sim::command::{
+    CommandRecord, MEGAMISSION_OPCODE, MEGAMISSION_STAGE_CAPACITY, stage_megamission,
+};
 use crate::sim::intern::InternedId;
 
 pub const DO_LIST_CAPACITY: usize = 0x4000;
 const FRAMEINFO_OPCODE: u8 = 0x1c;
+
+/// Derived occupancy of the one DoList, including a temporarily moved scan.
+/// Source counts bound authenticated multiplayer traffic without rescanning
+/// the complete FIFO for every actor in a large input batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeCommandOccupancy {
+    pub total: usize,
+    by_house: [usize; 128],
+}
+
+impl Default for NativeCommandOccupancy {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            by_house: [0; 128],
+        }
+    }
+}
+
+impl NativeCommandOccupancy {
+    pub fn for_house(&self, house: i8) -> usize {
+        usize::try_from(house)
+            .ok()
+            .map_or(0, |index| self.by_house[index])
+    }
+
+    fn add<T: DoListEvent>(&mut self, entry: &T) {
+        if entry.consumes_native_dolist_slot() {
+            self.total += 1;
+            if let Some(house) = entry.native_record().map(|record| record.house_id())
+                && let Ok(index) = usize::try_from(house)
+            {
+                self.by_house[index] += 1;
+            }
+        }
+    }
+
+    fn remove<T: DoListEvent>(&mut self, entry: &T) {
+        if entry.consumes_native_dolist_slot() {
+            self.total -= 1;
+            if let Some(house) = entry.native_record().map(|record| record.house_id())
+                && let Ok(index) = usize::try_from(house)
+            {
+                self.by_house[index] -= 1;
+            }
+        }
+    }
+}
 
 /// The two clocks have different authorities. Native headers always use the
 /// signed binary frame; Rust-only commands retain their monotonic schedule.
@@ -83,6 +133,39 @@ pub struct DoListRetimeWindow {
 }
 
 impl DoListRetimeWindow {
+    /// EventClass::Execute4C800C..4C8077 publishes the next scan's window.
+    /// Only widening MaxAhead or send rate requires rescheduling. The active
+    /// scan still uses its entry snapshot (Execute_DoList64C380).
+    pub fn apply_timing_update(
+        &mut self,
+        event_frame: i32,
+        previous_max_ahead: u16,
+        previous_frame_send_rate: std::num::NonZeroU8,
+        proposed_max_ahead: u16,
+        proposed_frame_send_rate: std::num::NonZeroU8,
+        scenario_subtracts_ten: bool,
+    ) -> u16 {
+        let adjusted = if scenario_subtracts_ten {
+            proposed_max_ahead.wrapping_sub(10)
+        } else {
+            proposed_max_ahead
+        };
+        if adjusted > previous_max_ahead || proposed_frame_send_rate > previous_frame_send_rate {
+            let rate = i32::from(proposed_frame_send_rate.get());
+            self.set(
+                event_frame,
+                event_frame
+                    .wrapping_add(i32::from(adjusted))
+                    .wrapping_add(rate - 1)
+                    .wrapping_div(rate)
+                    .wrapping_mul(rate),
+            );
+        } else {
+            self.set(0, 0);
+        }
+        adjusted
+    }
+
     pub fn set(&mut self, start: i32, end: i32) {
         self.start = start;
         self.end = end;
@@ -136,34 +219,36 @@ pub struct DispatchSummary {
 /// The one synchronized FIFO owner. Fresh admission clears only the processed
 /// flag; restoring, splitting and rejoining existing entries preserve it.
 #[derive(Debug, Clone, Serialize)]
-pub struct DoList<T> {
+pub struct DoList<T, const CAPACITY: usize = DO_LIST_CAPACITY> {
     entries: VecDeque<T>,
     retime_window: DoListRetimeWindow,
     /// Derived occupancy, never saved. Mutable external access invalidates it;
     /// the next admission rebuilds it once before resuming constant-time checks.
     #[serde(skip)]
-    native_count: Option<usize>,
+    native_count: Option<NativeCommandOccupancy>,
 }
 
-impl<T: PartialEq> PartialEq for DoList<T> {
+impl<T: PartialEq, const CAPACITY: usize> PartialEq for DoList<T, CAPACITY> {
     fn eq(&self, other: &Self) -> bool {
         self.entries == other.entries && self.retime_window == other.retime_window
     }
 }
 
-impl<T: Eq> Eq for DoList<T> {}
+impl<T: Eq, const CAPACITY: usize> Eq for DoList<T, CAPACITY> {}
 
-impl<T> Default for DoList<T> {
+impl<T, const CAPACITY: usize> Default for DoList<T, CAPACITY> {
     fn default() -> Self {
         Self {
             entries: VecDeque::new(),
             retime_window: DoListRetimeWindow::default(),
-            native_count: Some(0),
+            native_count: Some(NativeCommandOccupancy::default()),
         }
     }
 }
 
-impl<'de, T: Deserialize<'de> + DoListEvent> Deserialize<'de> for DoList<T> {
+impl<'de, T: Deserialize<'de> + DoListEvent, const CAPACITY: usize> Deserialize<'de>
+    for DoList<T, CAPACITY>
+{
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct Stored<T> {
@@ -171,13 +256,11 @@ impl<'de, T: Deserialize<'de> + DoListEvent> Deserialize<'de> for DoList<T> {
             retime_window: DoListRetimeWindow,
         }
         let stored = Stored::<T>::deserialize(deserializer)?;
-        let native_count = stored
-            .entries
-            .iter()
-            .filter(|entry| entry.consumes_native_dolist_slot())
-            .take(DO_LIST_CAPACITY + 1)
-            .count();
-        if native_count > DO_LIST_CAPACITY {
+        let mut native_count = NativeCommandOccupancy::default();
+        for entry in &stored.entries {
+            native_count.add(entry);
+        }
+        if native_count.total > CAPACITY {
             return Err(serde::de::Error::custom(
                 "saved synchronized event queue exceeds native capacity",
             ));
@@ -190,7 +273,7 @@ impl<'de, T: Deserialize<'de> + DoListEvent> Deserialize<'de> for DoList<T> {
     }
 }
 
-impl<T> DoList<T> {
+impl<T, const CAPACITY: usize> DoList<T, CAPACITY> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -229,12 +312,12 @@ impl<T> DoList<T> {
     {
         let mut taken = Vec::new();
         let mut kept = VecDeque::with_capacity(self.entries.len());
-        let mut native_count = 0;
+        let mut native_count = NativeCommandOccupancy::default();
         for entry in std::mem::take(&mut self.entries) {
             if predicate(&entry) {
                 taken.push(entry);
             } else {
-                native_count += usize::from(entry.consumes_native_dolist_slot());
+                native_count.add(&entry);
                 kept.push_back(entry);
             }
         }
@@ -250,31 +333,45 @@ impl<T> DoList<T> {
         let index = self.entries.iter().position(predicate)?;
         let entry = self.entries.remove(index)?;
         if let Some(native_count) = &mut self.native_count {
-            *native_count -= usize::from(entry.consumes_native_dolist_slot());
+            native_count.remove(&entry);
         }
         Some(entry)
     }
 
     pub fn clear(&mut self) {
         self.entries.clear();
-        self.native_count = Some(0);
+        self.native_count = Some(NativeCommandOccupancy::default());
     }
 }
 
-impl<T: DoListEvent> DoList<T> {
+impl<T: DoListEvent, const CAPACITY: usize> DoList<T, CAPACITY> {
     pub fn native_len(&self) -> usize {
+        self.native_occupancy().total
+    }
+
+    pub fn native_occupancy(&self) -> NativeCommandOccupancy {
         self.native_count.unwrap_or_else(|| {
-            self.entries
-                .iter()
-                .filter(|entry| entry.consumes_native_dolist_slot())
-                .count()
+            let mut count = NativeCommandOccupancy::default();
+            for entry in &self.entries {
+                count.add(entry);
+            }
+            count
         })
     }
 
+    pub fn native_house_len(&self, house: i8) -> usize {
+        if let Some(count) = &self.native_count {
+            count.for_house(house)
+        } else {
+            self.native_occupancy().for_house(house)
+        }
+    }
+
     fn refresh_native_count(&mut self) -> usize {
-        let native_count = self.native_len();
-        self.native_count = Some(native_count);
-        native_count
+        if self.native_count.is_none() {
+            self.native_count = Some(self.native_occupancy());
+        }
+        self.native_count.as_ref().unwrap().total
     }
 
     /// New DoList admission consumes a refused event without evicting another
@@ -285,15 +382,42 @@ impl<T: DoListEvent> DoList<T> {
 
     /// During a host callback the active scan may be temporarily moved out of
     /// its host. Reserve its still-occupied slots when admitting new events.
-    pub fn admit_with_reserved_native(&mut self, mut entry: T, reserved: usize) -> bool {
+    pub fn admit_with_reserved_native(&mut self, entry: T, reserved: usize) -> bool {
+        self.admit_bounded(
+            entry,
+            NativeCommandOccupancy {
+                total: reserved,
+                ..Default::default()
+            },
+            CAPACITY,
+            usize::MAX,
+        )
+    }
+
+    pub fn admit_bounded(
+        &mut self,
+        mut entry: T,
+        reserved: NativeCommandOccupancy,
+        maximum: usize,
+        maximum_per_house: usize,
+    ) -> bool {
         let native = entry.consumes_native_dolist_slot();
         let native_count = self.refresh_native_count();
-        if native && native_count.saturating_add(reserved) >= DO_LIST_CAPACITY {
+        if native && native_count.saturating_add(reserved.total) >= maximum.min(CAPACITY) {
+            return false;
+        }
+        if native
+            && let Some(house) = entry.native_record().map(|record| record.house_id())
+            && self
+                .native_house_len(house)
+                .saturating_add(reserved.for_house(house))
+                >= maximum_per_house
+        {
             return false;
         }
         entry.clear_processed();
+        self.native_count.as_mut().unwrap().add(&entry);
         self.entries.push_back(entry);
-        self.native_count = Some(native_count + usize::from(native));
         true
     }
 
@@ -304,15 +428,15 @@ impl<T: DoListEvent> DoList<T> {
         let mut native_count = self.refresh_native_count();
         for entry in other.entries.drain(..) {
             let native = entry.consumes_native_dolist_slot();
-            if native && native_count >= DO_LIST_CAPACITY {
+            if native && native_count >= CAPACITY {
                 continue;
             }
             native_count += usize::from(native);
+            self.native_count.as_mut().unwrap().add(&entry);
             self.entries.push_back(entry);
             retained += 1;
         }
-        self.native_count = Some(native_count);
-        other.native_count = Some(0);
+        other.native_count = Some(NativeCommandOccupancy::default());
         retained
     }
 
@@ -349,6 +473,12 @@ impl<T: DoListEvent> DoList<T> {
             }
             let mut staged = Vec::new();
             let mut staged_late = Vec::new();
+            let stage_capacity =
+                if mode == CommandDispatchMode::Network && CAPACITY > DO_LIST_CAPACITY {
+                    super::NETWORK_SOURCE_DOLIST_CAPACITY
+                } else {
+                    MEGAMISSION_STAGE_CAPACITY
+                };
             for entry in self.entries.iter_mut().take(scan_len) {
                 if entry.is_processed() {
                     continue;
@@ -396,7 +526,7 @@ impl<T: DoListEvent> DoList<T> {
                     Some(0x22) => {}
                     Some(0x0c) if !house.current_player => {}
                     Some(MEGAMISSION_OPCODE) => {
-                        if stage_megamission(&mut staged, entry) {
+                        if stage_megamission(&mut staged, entry, stage_capacity) {
                             staged_late.push(is_late);
                         } else {
                             summary.megamission_dropped += 1;
@@ -451,7 +581,7 @@ impl<T: DoListEvent> DoList<T> {
                 .pop_front()
                 .expect("the retirement head exists");
             if let Some(native_count) = &mut self.native_count {
-                *native_count -= usize::from(entry.consumes_native_dolist_slot());
+                native_count.remove(&entry);
             }
             summary.retired += 1;
         }
@@ -566,42 +696,59 @@ mod tests {
 
     #[test]
     fn occupancy_cache_survives_mutation_rejoin_restore_and_blocked_retirement() {
-        let mut queue = DoList::new();
+        let mut queue: DoList<Event> = DoList::new();
         assert!(queue.admit(native(5)));
         assert!(queue.admit(extension(0)));
-        assert_eq!((queue.len(), queue.native_count), (2, Some(1)));
+        assert_eq!(
+            (queue.len(), queue.native_count.map(|count| count.total)),
+            (2, Some(1))
+        );
 
         let same_entries = queue.clone();
         drop(queue.iter_mut());
-        assert_eq!(queue.native_count, None);
+        assert_eq!(queue.native_count.map(|count| count.total), None);
         assert_eq!(queue, same_entries, "cache validity is not gameplay state");
 
         *queue.iter_mut().next().unwrap() = extension(0);
         assert_eq!(queue.native_len(), 0);
         assert_eq!(
-            queue.native_count, None,
+            queue.native_count.map(|count| count.total),
+            None,
             "shared reads do not write the cache"
         );
         assert!(queue.admit(native(5)));
-        assert_eq!(queue.native_count, Some(1), "admission refreshes once");
+        assert_eq!(
+            queue.native_count.map(|count| count.total),
+            Some(1),
+            "admission refreshes once"
+        );
         assert!(
             queue
                 .remove_first(|entry| entry.native_record().is_some())
                 .is_some()
         );
-        assert_eq!(queue.native_count, Some(0));
+        assert_eq!(queue.native_count.map(|count| count.total), Some(0));
         assert!(queue.admit(native(5)));
         let extensions = queue.take_where(|entry| entry.native_record().is_none());
         assert_eq!(extensions.len(), 2);
-        assert_eq!((queue.len(), queue.native_count), (1, Some(1)));
+        assert_eq!(
+            (queue.len(), queue.native_count.map(|count| count.total)),
+            (1, Some(1))
+        );
 
         let mut tail = DoList::new();
         assert!(tail.admit(native(0)));
         assert!(tail.admit(extension(0)));
         tail.iter_mut().last().unwrap().mark_processed();
         assert_eq!(queue.append_retained(&mut tail), 2);
-        assert_eq!((tail.len(), tail.native_count), (0, Some(0)));
-        assert_eq!((queue.len(), queue.native_count), (3, Some(2)));
+        assert_eq!(
+            (tail.len(), tail.native_count.map(|count| count.total)),
+            (0, Some(0))
+        );
+        assert_eq!(
+            (queue.len(), queue.native_count.map(|count| count.total)),
+            (3, Some(2))
+        );
         assert!(queue.iter().last().unwrap().is_processed());
 
         let houses = [CommandDispatchHouse::new(
@@ -623,7 +770,7 @@ mod tests {
             .unwrap();
         assert_eq!((summary.executed, summary.retired), (1, 0));
         assert_eq!(
-            queue.native_count,
+            queue.native_count.map(|count| count.total),
             Some(2),
             "processed entries still occupy slots behind a future head"
         );
@@ -633,7 +780,7 @@ mod tests {
         assert!(saved.get("native_count").is_none());
         let mut restored: DoList<Event> = serde_json::from_value(saved).unwrap();
         assert_eq!(restored, queue);
-        assert_eq!(restored.native_count, Some(2));
+        assert_eq!(restored.native_count.map(|count| count.total), Some(2));
         assert!(restored.iter().nth(1).unwrap().is_processed());
         let summary = restored
             .dispatch(
@@ -648,9 +795,21 @@ mod tests {
             .unwrap();
         assert_eq!((summary.executed, summary.retired), (1, 3));
         assert_eq!(host.executed, 2);
-        assert_eq!((restored.len(), restored.native_count), (0, Some(0)));
+        assert_eq!(
+            (
+                restored.len(),
+                restored.native_count.map(|count| count.total)
+            ),
+            (0, Some(0))
+        );
         assert!(restored.admit(native(6)));
         restored.clear();
-        assert_eq!((restored.len(), restored.native_count), (0, Some(0)));
+        assert_eq!(
+            (
+                restored.len(),
+                restored.native_count.map(|count| count.total)
+            ),
+            (0, Some(0))
+        );
     }
 }

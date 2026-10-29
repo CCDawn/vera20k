@@ -231,6 +231,7 @@ fn live_tag_rgb_overrides_reach_packets_and_survive_ambient_writes_during_storm(
         &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
         None,
         None,
+        None,
     );
     sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
     sim.publish_scenario_started();
@@ -341,6 +342,14 @@ fn a_bound_radiation_type_tints_the_field_with_its_own_color() {
     );
     let sample = |bound: Option<&str>| {
         let mut sim = Simulation::with_seed(0);
+        let mut lights = MatchLighting::default();
+        lights.install(
+            CellLightGrid::new(),
+            LightingConfig::default(),
+            2,
+            Some((&terrain, &sim)),
+            None,
+        );
         let mut sources = std::mem::take(sim.lighting_sources_mut_for_test());
         sim.radiation_mut_for_test().apply_detonation(
             crate::sim::radiation::RadDetonation {
@@ -359,7 +368,6 @@ fn a_bound_radiation_type_tints_the_field_with_its_own_color() {
             &mut sources,
         );
         *sim.lighting_sources_mut_for_test() = sources;
-        let mut lights = MatchLighting::default();
         lights.apply_events(&terrain, sim.lighting_sources().pending());
         let cell = lights.grid.cell_light_at((10, 10)).expect("lit cell");
         lights.grid.palette_rgb(cell.profile_id)

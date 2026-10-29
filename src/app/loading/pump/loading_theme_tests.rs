@@ -142,6 +142,7 @@ fn ares_campaign_theme_plays_once_after_map_parse_through_the_asset_lease() {
         slot.take().unwrap(),
         true,
         Some(directory.path().to_owned()),
+        None,
     )
     .unwrap();
     assert!(matches!(session.stage, LoadingStage::Prepared(_)));
@@ -163,6 +164,7 @@ fn ares_campaign_theme_plays_once_after_map_parse_through_the_asset_lease() {
         session,
         false,
         Some(directory.path().to_owned()),
+        None,
     )
     .unwrap();
     assert_eq!(

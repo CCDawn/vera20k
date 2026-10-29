@@ -577,7 +577,7 @@ impl WolCapture {
             state,
             NetworkSetupEvent::GameStarted {
                 users: vec![user(NICKNAME, 1), user(PEER, 0)],
-                pings,
+                pings: pings.to_vec(),
             },
         )?;
         let names = setup::verify(state).map(|verify| verify.names.clone());

@@ -441,6 +441,7 @@ fn initial_unknown_type_keeps_provider_trigger_and_saved_click_lifecycle() {
         &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
         None,
         None,
+        None,
     );
     sim.classify_map_triggers(&rules);
     sim.advance_triggers(&rules, None, FrameEffects::default());

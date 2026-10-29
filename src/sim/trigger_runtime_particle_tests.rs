@@ -19,7 +19,7 @@ fn action(kind: i32, value: i32) -> RuntimeAction {
         .unwrap()
         .entries()[0]
         .clone();
-    RuntimeDefinitions::default().resolve_action(entry, None, None)
+    RuntimeDefinitions::default().resolve_action(entry, None, None, None)
 }
 
 fn run(sim: &mut Simulation, action: &RuntimeAction, rules: Option<&RuleSet>) -> bool {

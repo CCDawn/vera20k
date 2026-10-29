@@ -78,6 +78,12 @@ pub struct SoundState {
     pub dragging: Option<SoundSlider>,
     pub hovered: Option<SoundControl>,
     pub scroll: super::list::ListScrollInteraction,
+    /// `0x6B6300`'s init enables the three trackbars only with an output
+    /// device (`Audio__HasOutputDevice @ 0x00407000`, `0x006B635F..0x006B6483`);
+    /// a disabled window takes no press. B8 never opens without one (BBB
+    /// disables its Sound button, `0x004E2201..0x004E2223`), so only `0xD6`
+    /// from WOL Options clears it.
+    pub sliders_enabled: bool,
 }
 impl SoundState {
     pub fn new(positions: [u8; 3], rows: Vec<SoundTrackRow>, current: i32) -> Self {
@@ -97,6 +103,7 @@ impl SoundState {
             dragging: None,
             hovered: None,
             scroll: Default::default(),
+            sliders_enabled: true,
         }
     }
     pub fn selected_theme(&self) -> Option<i32> {
@@ -128,7 +135,8 @@ impl SoundState {
     /// rows admit it; the thumb starts a drag, the rail jumps once. Returns
     /// the changed volume.
     pub fn press_slider(&mut self, id: SoundSlider, rect: RectPx, x: i32, y: i32) -> Option<f32> {
-        if !crate::ui::shell::trackbar::admits_press_y(y - rect.y, rect.h) {
+        if !self.sliders_enabled || !crate::ui::shell::trackbar::admits_press_y(y - rect.y, rect.h)
+        {
             return None;
         }
         let left = rect.x + self.thumb_left(id, rect);
@@ -427,5 +435,17 @@ mod tests {
         assert_eq!(s.set_from_pointer(SoundSlider::Music, r, 1000), Some(1.0));
         assert_eq!(s.set_from_pointer(SoundSlider::Music, r, 1000), None);
         assert_eq!(s.positions, [10, 5, 5]);
+    }
+    #[test]
+    fn disabled_sliders_take_no_press() {
+        let mut s = SoundState::new([5, 5, 5], Vec::new(), -1);
+        s.sliders_enabled = false;
+        let r = RectPx::new(236, 98, 263, 21);
+        let thumb = r.x + s.thumb_left(SoundSlider::Sound, r);
+        for x in [r.x + 1, thumb] {
+            assert_eq!(s.press_slider(SoundSlider::Sound, r, x, r.y + 10), None);
+        }
+        assert_eq!(s.positions, [5, 5, 5]);
+        assert_eq!(s.dragging, None);
     }
 }

@@ -206,6 +206,11 @@ impl TemporalState {
         self.link.is_some()
     }
 
+    /// `TemporalClass+0x48 WarpRemaining` on this object's own link.
+    pub fn warp_remaining(&self) -> Option<i32> {
+        self.link.as_ref().map(|link| link.warp_remaining)
+    }
+
     /// Every object id this state names, for the snapshot reference check.
     pub(crate) fn references(&self) -> impl Iterator<Item = u64> + '_ {
         self.head.into_iter().chain(
@@ -961,7 +966,7 @@ impl Simulation {
     /// `ClearLinkedList @ 0x0071ADE0`: frees the target, then walks Next and
     /// Prev, unlinking a neighbour's back-link only where it points here
     /// (`0x0071AE02`, `0x0071AE19`), and idles each attacker last.
-    fn temporal_clear_linked_list(
+    pub(crate) fn temporal_clear_linked_list(
         &mut self,
         attacker: u64,
         rules: &RuleSet,

@@ -10,9 +10,9 @@ use crate::rules::ruleset::RuleSet;
 use crate::sim::capture_manager::{CaptureManagerState, MindControlLink};
 use crate::sim::combat::{RAD_NO_ATTACKER, ReceiverCallFlags};
 use crate::sim::game_entity::GameEntity;
-use crate::sim::house_state::HouseState;
+use crate::sim::house_state::{HouseOutcomeKind, HouseState};
 use crate::sim::intern::InternedId;
-use crate::sim::world::Simulation;
+use crate::sim::world::{PlayerOutcomeRequest, Simulation};
 use crate::util::save_codec;
 
 /// `[Sides]` listing country `Country{n}` as side `n`, the one at
@@ -152,13 +152,10 @@ fn observer_defeat_waits_for_hostile_players_then_finishes_without_loss_voice() 
         sim.houses[&owners[0]].outcome_timer(),
         crate::sim::timer::CdTimer::started(100, 30)
     );
+    assert!(sim.houses[&owners[1]].has_lost());
     assert!(
-        !sim.houses[&owners[1]].has_lost(),
-        "only PlayerPtr gets the result"
-    );
-    assert!(
-        !sim.houses[&owners[2]].has_won(),
-        "remote survivor does not acquire this client's result"
+        sim.houses[&owners[2]].has_won(),
+        "VERA retains each network human's result identically on all clients"
     );
     assert!(
         !sim.sound_events
@@ -193,7 +190,213 @@ fn cooperative_defeated_local_waits_for_partner_and_shares_completed_victory() {
         .set_for_test(0, &[], (0, 0, 0), &[]);
     sim.check_defeat(None, None);
     assert!(sim.houses[&owners[0]].has_won());
-    assert!(!sim.houses[&owners[1]].has_won());
+    assert!(sim.houses[&owners[1]].has_won());
+}
+
+fn network_result_world(local: usize) -> (Simulation, Vec<InternedId>) {
+    let (mut sim, owners) = sim_with_houses(&[0, 1, 2]);
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Lan);
+    sim.session.install_network_timing(10);
+    sim.session.set_current_house_for_test(Some(owners[local]));
+    sim.session
+        .install_multiplayer_house_identity(crate::skirmish_modes::MpModeClass::Battle, None);
+    for (index, owner) in owners.iter().enumerate() {
+        let house = sim.houses.get_mut(owner).unwrap();
+        house.set_is_human_for_test(index < 2);
+        house.set_multiplay_passive_for_test(index == 2);
+        house.tracking_mut().set_for_test(1, &[], (0, 0, 0), &[]);
+    }
+    (sim, owners)
+}
+
+fn result_state(
+    sim: &Simulation,
+    owners: &[InternedId],
+) -> Vec<(bool, bool, bool, crate::sim::timer::CdTimer)> {
+    owners
+        .iter()
+        .map(|owner| {
+            let house = &sim.houses[owner];
+            (
+                house.is_to_die(),
+                house.has_won(),
+                house.has_lost(),
+                house.outcome_timer(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn network_completion_keeps_shared_house_results_and_only_local_exit_and_vox() {
+    use crate::sim::house_state::HouseOutcomeKind;
+    use crate::sim::world::{FrameEffects, OutcomeWaitBoundary, SimSoundEvent};
+    struct LocalVox {
+        owner: InternedId,
+        calls: std::cell::Cell<usize>,
+    }
+    impl OutcomeWaitBoundary for LocalVox {
+        fn wait_complete(&self, owner: InternedId, _: HouseOutcomeKind) -> bool {
+            assert_eq!(
+                owner, self.owner,
+                "remote results cannot start local Vox waits"
+            );
+            self.calls.set(self.calls.get() + 1);
+            true
+        }
+    }
+    let rules = rules(3);
+    let mut snapshots = Vec::new();
+    for local in [0, 1] {
+        let (mut sim, owners) = network_result_world(local);
+        sim.houses
+            .get_mut(&owners[1])
+            .unwrap()
+            .tracking_mut()
+            .set_for_test(0, &[], (0, 0, 0), &[]);
+        sim.check_defeat(Some(&rules), None);
+        assert!(sim.houses[&owners[0]].has_won());
+        assert!(sim.houses[&owners[1]].has_lost());
+        assert!(sim.houses[&owners[2]].outcome().is_none());
+        assert!(sim.ready_outcome_for_owner(owners[local]).is_none());
+        let expected = if local == 0 {
+            HouseOutcomeKind::Victory
+        } else {
+            HouseOutcomeKind::Defeat
+        };
+        let announcements: Vec<_> = sim
+            .sound_events
+            .iter()
+            .filter_map(|event| match event {
+                SimSoundEvent::MatchOutcome { owner, kind } => Some((*owner, *kind)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(announcements, [(owners[local], expected)]);
+        let accepted = (result_state(&sim, &owners), sim.state_hash());
+        let timer = sim.houses[&owners[local]].outcome_timer();
+        sim.session
+            .set_binary_frame_for_test(timer.start_frame().wrapping_add(timer.duration()) as u32);
+        let vox = LocalVox {
+            owner: owners[local],
+            calls: std::cell::Cell::new(0),
+        };
+        sim.house_rung(
+            &rules,
+            None,
+            false,
+            FrameEffects::empty().with_outcome_wait(&vox),
+            None,
+        )
+        .unwrap();
+        assert_eq!(vox.calls.get(), 1);
+        assert_eq!(
+            sim.ready_outcome_for_owner(owners[local]).unwrap().kind,
+            expected
+        );
+        assert!(sim.ready_outcome_for_owner(owners[1 - local]).is_none());
+        snapshots.push((accepted, (result_state(&sim, &owners), sim.state_hash())));
+    }
+    assert_eq!(snapshots[0], snapshots[1]);
+}
+
+#[test]
+fn network_country_result_actions_keep_each_human_decision_in_both_views() {
+    use crate::sim::house_state::HouseOutcomeKind;
+    let rules = rules(3);
+    for action in [1, 2] {
+        let mut snapshots = Vec::new();
+        for local in [0, 1] {
+            let (mut sim, owners) = network_result_world(local);
+            assert!(sim.request_player_outcome(
+                PlayerOutcomeRequest::Country {
+                    country_index: 0,
+                    win_on_match: action == 1
+                },
+                &rules,
+                Default::default(),
+            ));
+            assert_eq!(sim.houses[&owners[0]].has_won(), action == 1);
+            assert_eq!(sim.houses[&owners[1]].has_won(), action == 2);
+            assert_eq!(sim.houses[&owners[0]].has_lost(), action == 2);
+            assert_eq!(sim.houses[&owners[1]].has_lost(), action == 1);
+            assert!(sim.houses[&owners[2]].outcome().is_none());
+            let accepted = result_state(&sim, &owners);
+            let timer = sim.houses[&owners[local]].outcome_timer();
+            sim.session.set_binary_frame_for_test(
+                timer.start_frame().wrapping_add(timer.duration()) as u32,
+            );
+            sim.house_rung(&rules, None, false, Default::default(), None)
+                .unwrap();
+            let expected = if (local == 0) == (action == 1) {
+                HouseOutcomeKind::Victory
+            } else {
+                HouseOutcomeKind::Defeat
+            };
+            assert_eq!(
+                sim.ready_outcome_for_owner(owners[local]).unwrap().kind,
+                expected
+            );
+            snapshots.push((accepted, result_state(&sim, &owners)));
+        }
+        assert_eq!(snapshots[0], snapshots[1]);
+    }
+}
+
+#[test]
+fn network_results_preserve_the_shared_to_die_and_allow_win_timer() {
+    let rules = rules(3);
+    let mut snapshots = Vec::new();
+    for local in [0, 1] {
+        let (mut sim, owners) = network_result_world(local);
+        let dying = owners[0];
+        assert!(sim.flag_house_to_die(dying));
+        let house = sim.houses.get_mut(&dying).unwrap();
+        house.register_allow_win_tag_type();
+        house.removed_allow_win_tag(100);
+        assert!(sim.request_player_outcome(
+            PlayerOutcomeRequest::Flag {
+                kind: HouseOutcomeKind::Victory,
+                skip_timer: true
+            },
+            &rules,
+            Default::default()
+        ));
+        assert!(sim.request_player_outcome(
+            PlayerOutcomeRequest::EndScenario,
+            &rules,
+            Default::default()
+        ));
+        let house = sim.houses.get_mut(&dying).unwrap();
+        assert!(!house.has_won(), "FlagToDie blocks AnnounceWin/EndScenario");
+        assert_eq!(
+            house.outcome_timer(),
+            crate::sim::timer::CdTimer::started(100, 60)
+        );
+        assert!(!house.take_due_to_die(159));
+        assert!(
+            house.take_due_to_die(160),
+            "AllowWin removal postpones the same destruction timer"
+        );
+        // Action68 preserves that timer after the destruction latch clears;
+        // it must not create a separate result-only countdown.
+        assert!(sim.request_player_outcome(
+            PlayerOutcomeRequest::Flag {
+                kind: HouseOutcomeKind::Defeat,
+                skip_timer: true
+            },
+            &rules,
+            Default::default()
+        ));
+        assert!(sim.houses[&dying].has_lost());
+        assert_eq!(
+            sim.houses[&dying].outcome_timer(),
+            crate::sim::timer::CdTimer::started(100, 60)
+        );
+        snapshots.push(result_state(&sim, &owners));
+    }
+    assert_eq!(snapshots[0], snapshots[1]);
 }
 
 /// Added selected mode in the existing House oracle. These rows execute the
@@ -262,7 +465,11 @@ fn native_flag_result_and_savour_controls() {
         let returned = match input["operation"].as_str().unwrap() {
             "win" => sim.flag_house_to_win(owner, &rules, skip, Default::default()),
             "lose" => sim.flag_house_to_lose(owner, &rules, skip, Default::default()),
-            "end" => sim.trigger_house_outcome(69, 0, &rules, Default::default()),
+            "end" => sim.request_player_outcome(
+                PlayerOutcomeRequest::EndScenario,
+                &rules,
+                Default::default(),
+            ),
             other => panic!("unhandled control {other}"),
         };
         let house = &sim.houses[&owner];

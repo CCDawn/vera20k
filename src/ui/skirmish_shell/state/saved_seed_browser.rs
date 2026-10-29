@@ -217,18 +217,12 @@ impl SavedSeedDescriptionEdit {
     }
 
     pub fn description(&self) -> SeedDescription {
-        // Save driver727D60 trims wide units <=0x20 after reading at most79.
-        let start = self
-            .units
-            .iter()
-            .position(|u| *u > 0x20)
-            .unwrap_or(self.units.len());
-        let end = self
-            .units
-            .iter()
-            .rposition(|u| *u > 0x20)
-            .map_or(start, |i| i + 1);
-        SeedDescription::from_units(self.units[start..end].iter().copied())
+        // The save driver trims with wcstrim 727D60 after reading at most 79.
+        SeedDescription::from_units(
+            crate::util::native_string::wcstrim(&self.units)
+                .iter()
+                .copied(),
+        )
     }
 
     pub fn display_text(&self) -> String {
@@ -250,6 +244,26 @@ impl SavedSeedDescriptionEdit {
     /// The painted text from the first visible unit on.
     pub fn painted_text(&self) -> String {
         self.painted_range(self.first_visible_unit, self.units.len())
+    }
+
+    /// NewEdit__DrawTextAndCaret `0x00623880` with an open IME composition
+    /// (`0x006238D0..0x006239C2`): the composition units are spliced in at the
+    /// caret, the painted caret sits at the composition cursor and the scroll
+    /// keeps that position visible. Returns the painted editor and the
+    /// composition's unit range in it.
+    pub fn with_composition(
+        &self,
+        composition: &[u16],
+        cursor: usize,
+        available: u32,
+        measure: impl Fn(&str) -> u32,
+    ) -> (Self, std::ops::Range<usize>) {
+        let caret = self.caret.min(self.units.len());
+        let mut view = self.clone();
+        view.units.splice(caret..caret, composition.iter().copied());
+        view.caret = caret + cursor.min(composition.len());
+        view.scroll_to_caret(available, measure);
+        (view, caret..caret + composition.len())
     }
 
     /// Keep the insertion point visible using the active font's measured width.
@@ -274,9 +288,9 @@ pub struct SavedSeedBrowserState<I = NativeFileName> {
     pub description_edit: SavedSeedDescriptionEdit,
     pub pressed_control: Option<SavedSeedControl>,
     pub prompt: Option<SavedSeedPrompt<I>>,
-    pub scroll_repeat_at: Option<std::time::Instant>,
-    pub opened_at: std::time::Instant,
-    pub last_list_press: Option<(std::time::Instant, i32, i32)>,
+    pub scroll_repeat_at: Option<crate::util::time::Instant>,
+    pub opened_at: crate::util::time::Instant,
+    pub last_list_press: Option<(crate::util::time::Instant, i32, i32)>,
     current_description: SeedDescription,
 }
 
@@ -305,6 +319,25 @@ impl SavedSeedBrowserState<NativeFileName> {
             new_slot_time,
             visible_rows,
         )
+    }
+}
+
+impl<I> SavedSeedBrowserState<I> {
+    /// Raise a message box over the browser. It takes the edit focus and ends
+    /// any held press or scroll repeat; its buttons own input until answered.
+    pub fn show_prompt(&mut self, prompt: SavedSeedPrompt<I>) {
+        self.description_edit.focused = false;
+        self.pressed_control = None;
+        self.scroll_repeat_at = None;
+        self.prompt = Some(prompt);
+    }
+
+    /// Window focus loss: the release that would end the held press, the
+    /// scroll repeat and the double-click pair never arrives.
+    pub fn reset_interaction(&mut self) {
+        self.pressed_control = None;
+        self.scroll_repeat_at = None;
+        self.last_list_press = None;
     }
 }
 
@@ -360,7 +393,7 @@ impl<I: Clone + PartialEq> SavedSeedBrowserState<I> {
             pressed_control: None,
             prompt: None,
             scroll_repeat_at: None,
-            opened_at: std::time::Instant::now(),
+            opened_at: crate::util::time::Instant::now(),
             last_list_press: None,
             current_description,
         };
@@ -513,6 +546,24 @@ mod tests {
                 description: SeedDescription::default(),
             })
         );
+    }
+
+    #[test]
+    fn open_composition_splices_at_the_caret_and_scrolls_to_its_cursor() {
+        let mut edit = SavedSeedDescriptionEdit::default();
+        edit.insert_text("abcd");
+        edit.left();
+        edit.left();
+        let composition: Vec<u16> = "xyz".encode_utf16().collect();
+        // Ten pixels a unit: thirty pixels show three units.
+        let (view, units) = edit.with_composition(&composition, 2, 30, |text| {
+            text.encode_utf16().count() as u32 * 10
+        });
+        assert_eq!(view.display_text(), "abxyzcd");
+        assert_eq!(units, 2..5);
+        assert_eq!(view.caret, 4, "the caret sits at the composition cursor");
+        assert_eq!(view.first_visible_unit, 1, "scrolled to keep it in view");
+        assert_eq!(edit.display_text(), "abcd", "the edit keeps its own text");
     }
 
     #[test]

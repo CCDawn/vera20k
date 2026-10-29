@@ -76,8 +76,8 @@ const FLAG_VISIBLE: u8 = 0x02;
 /// Entities on gap-covered cells are hidden from the local player; terrain
 /// renders black (treated as unrevealed).
 const FLAG_GAP_COVERED: u8 = 0x04;
-/// Bit flag: cell is covered by a friendly (own/allied) gap generator (rebuilt
-/// each tick). This bookkeeping does not darken the owner's terrain.
+/// Cell+13C's positive signed count, consumed by the radar's half-bright fog.
+/// CreateGap/DestroyGap update it; ordinary frame projection preserves it.
 const FLAG_GAP_FOG: u8 = 0x08;
 // Native70AF50/70B1D0 contribute/remove sustained sight via MapCell4A9CA0.
 // Fire4876F0 and Psychic6CD773/6CD79C do not leave that contribution alive.
@@ -93,23 +93,24 @@ const FLAG_EFFECTIVE_GAP_SIGHT: u8 = 0x80;
 /// CellClass `+0x12C` ground bits as VERA's sight cache and the cell writers
 /// keep them: ground visible (`0x08`) and ground open (`0x10`). Sight sets
 /// both; `0x004A9CA0` sets or clears both with `ShroudKnowledge::open`;
-/// `0x004AA050` sets `0x08`, and `0x10` where its frame is open. The gap
-/// and some whole-map writers move `ShroudKnowledge::open` alone (#1117),
-/// so `MapClass::IsShrouded` reads that copy ([`cell_ground_mapped`]); the
-/// edge frames and the aircraft fire-location query
-/// ([`FogState::is_ground_open`]) read this one.
+/// `0x004AA050` sets `0x08`, and `0x10` where its frame is open. Every
+/// writer, including the gap writers (`add_gap_cell`,
+/// `remove_gap_cell`) and the whole-map stores, moves `0x08`
+/// together with `ShroudKnowledge::open`. `MapClass::IsShrouded` reads that
+/// published copy ([`cell_ground_mapped`]); the edge frames and the aircraft
+/// fire-location query ([`FogState::is_ground_open`]) read this one.
 const GROUND_VISIBLE: u8 = 0x08;
 const GROUND_OPEN: u8 = 0x10;
 
-/// The cell flags [`ShroudKnowledge::published_flags`] derives from a cell's knowledge; the
-/// friendly gap fog is the only flag outside them.
+/// The cell flags [`ShroudKnowledge::published_flags`] derives from retained knowledge.
 const PUBLISHED_FLAGS: u8 = FLAG_REVEALED
     | FLAG_VISIBLE
     | FLAG_GAP_COVERED
     | FLAG_SUSTAINED_SIGHT
     | FLAG_EFFECTIVE_GAP_SIGHT
     | FLAG_PENDING_GAP_CONCEAL
-    | FLAG_HOSTILE_GAP_PRESENT;
+    | FLAG_HOSTILE_GAP_PRESENT
+    | FLAG_GAP_FOG;
 
 /// Map5678E0 clamps its visited disc to10. Native source cached260 retains
 /// the raw effective radius; the independent border traversal clamps to11.
@@ -232,8 +233,8 @@ pub(crate) fn visit_every_cell() -> bool {
     false
 }
 
-/// The cells [`OwnerVisibility::clear_frame_sight`] and the friendly gap pass
-/// change, so a frame's work follows what changed rather than the map size.
+/// The cells [`OwnerVisibility::clear_frame_sight`] changes, so a frame's
+/// work follows what changed rather than the map size.
 /// Derived from the grids: when `complete`, every cell's published bits match
 /// its knowledge (`publish_knowledge`) and each list holds every cell of its
 /// kind, perhaps more than once. A load or a writer that bypasses publishing
@@ -243,8 +244,6 @@ struct TrackedCells {
     complete: bool,
     /// Cells whose `transient_visible` was set.
     transient: Vec<u32>,
-    /// Cells holding [`FLAG_GAP_FOG`].
-    gap_fog: Vec<u32>,
     /// Cells published visible while their ground bits lacked
     /// `GROUND_VISIBLE | GROUND_OPEN`.
     unground: Vec<u32>,
@@ -327,27 +326,6 @@ impl OwnerVisibility {
         self.tracked.transient.push(index as u32);
     }
 
-    /// Clear the friendly gap fog: a tracked grid's listed cells, or else
-    /// every cell.
-    fn clear_gap_fog(&mut self) {
-        if self.tracked.complete && !visit_every_cell() {
-            for &index in &self.tracked.gap_fog {
-                self.cells[index as usize] &= !FLAG_GAP_FOG;
-            }
-        } else {
-            for cell in &mut self.cells {
-                *cell &= !FLAG_GAP_FOG;
-            }
-        }
-        self.tracked.gap_fog.clear();
-    }
-
-    /// Put `index` under a friendly Gap Generator's fog.
-    fn set_gap_fog(&mut self, index: usize) {
-        self.cells[index] |= FLAG_GAP_FOG;
-        self.tracked.gap_fog.push(index as u32);
-    }
-
     /// Mark a cell visible and revealed in this frame's sight, and set its
     /// ground bits.
     /// Production MapCell mapping delivers CleanFog after its synchronous
@@ -381,8 +359,8 @@ impl OwnerVisibility {
     }
 
     /// The sight pass's clear, preserving revealed flags: a visible cell
-    /// first gets its ground bits; the friendly gap fog and transient sight
-    /// end; each cell's bits are published again from its knowledge.
+    /// first gets its ground bits; transient sight ends and its published
+    /// bits follow the retained knowledge, including friendly gap counts.
     ///
     /// Returns whether the grid was tracked ([`TrackedCells`]): then only
     /// the listed cells can change, and only they are visited.
@@ -401,7 +379,6 @@ impl OwnerVisibility {
             }
         }
         self.tracked.unground.clear();
-        self.clear_gap_fog();
         let mut transient = std::mem::take(&mut self.tracked.transient);
         for &index in &transient {
             self.shroud_knowledge[index as usize].end_frame_sight();
@@ -417,7 +394,7 @@ impl OwnerVisibility {
     }
 
     /// [`Self::clear_frame_sight`] over every cell, which also makes the
-    /// grid tracked: afterwards no cell is transient or holds gap fog, every
+    /// grid tracked: afterwards no cell is transient, every
     /// visible cell has its ground bits, and publishing lists the rest.
     fn clear_every_cell(&mut self) {
         for knowledge in &mut self.shroud_knowledge {
@@ -437,7 +414,6 @@ impl OwnerVisibility {
                 | FLAG_EFFECTIVE_GAP_SIGHT);
         }
         self.tracked.transient.clear();
-        self.tracked.gap_fog.clear();
         self.tracked.unground.clear();
         // This pass marks every retained footprint.
         self.tracked.cleared.clear();
@@ -489,6 +465,12 @@ impl OwnerVisibility {
         self.publish_knowledge(index);
     }
 
+    /// The friendly native +13C event leaf; every published flag has one owner.
+    fn count_friendly_gap_cell(&mut self, index: usize, active: bool) {
+        self.shroud_knowledge[index].count_friendly_gap(active);
+        self.publish_knowledge(index);
+    }
+
     /// Panics unless a tracked grid holds what [`TrackedCells`] promises.
     #[cfg(any(test, feature = "test-support"))]
     fn assert_tracked(&self) {
@@ -503,7 +485,6 @@ impl OwnerVisibility {
             listed
         };
         let transient = listed(&self.tracked.transient);
-        let gap_fog = listed(&self.tracked.gap_fog);
         let unground = listed(&self.tracked.unground);
         for (index, (&cell, knowledge)) in self.cells.iter().zip(&self.shroud_knowledge).enumerate()
         {
@@ -515,10 +496,6 @@ impl OwnerVisibility {
             assert!(
                 !knowledge.transient_visible() || transient[index],
                 "cell {index}: unlisted transient sight"
-            );
-            assert!(
-                cell & FLAG_GAP_FOG == 0 || gap_fog[index],
-                "cell {index}: unlisted gap fog"
             );
             assert!(
                 cell & FLAG_VISIBLE == 0
@@ -556,6 +533,19 @@ impl OwnerVisibility {
             hasher,
             ShroudKnowledge::hash_record,
         );
+        // Cell+13C can be negative while its rendered bit is clear; retain it
+        // in the hash because it changes later gap events. Keep zero planes'
+        // existing hash stream.
+        if self
+            .shroud_knowledge
+            .iter()
+            .any(|cell| cell.friendly_gap_counter() != 0)
+        {
+            b"friendly-gap-counts-v1".hash(hasher);
+            for cell in &self.shroud_knowledge {
+                cell.friendly_gap_counter().hash(hasher);
+            }
+        }
         // The CellClass ground bits the aircraft queries read.
         self.ground_flags.hash(hasher);
         self.hash_map_cell_edge_cache(hasher);
@@ -576,7 +566,7 @@ impl OwnerVisibility {
                 expanded.map_cell_edge_cache[new] = self.map_cell_edge_cache[old];
             }
         }
-        // The copied transient and gap-fog cells are not listed.
+        // The copied transient cells are not listed.
         expanded.tracked.complete = false;
         expanded.edge_cells = EdgeCells::default();
         expanded
@@ -736,6 +726,11 @@ pub struct FogState {
     /// Per-viewer hostile admission receipts; preserved across save/load so a
     /// continuing generator does not become a fresh write after restoration.
     gap_sources: BTreeMap<InternedId, std::collections::BTreeSet<GapGeneratorSource>>,
+    /// Synthetic input latches for tests that supply sources without Buildings.
+    /// Production admission remains Building+269; these drive its event owner.
+    #[cfg(any(test, feature = "test-support"))]
+    #[serde(skip)]
+    gap_source_inputs: BTreeMap<InternedId, std::collections::BTreeSet<GapGeneratorSource>>,
     /// Bumps each time presentation prepares a view (F10); the fog mask
     /// renderer and minimap dirty-gate on it. Runtime only: never saved or
     /// hashed, so it restarts at 0 after a load.
@@ -955,14 +950,19 @@ impl FogState {
         &mut self,
         id: u64,
         viewer: InternedId,
+        source_owner: InternedId,
         admission: &SightAdmission,
     ) {
         assert!(
             !self.source_sight_is_latched(id, viewer),
             "source sight is already latched"
         );
-        self.sight_sources
-            .insert((id, viewer), SightSource::from(admission));
+        // The native cache has source geometry; ordinary ReReveal takes its
+        // House gate from the source owner, even when UpdateReveal's explicit
+        // alternate House received the actual map contribution (70B0CB..B12C).
+        let mut source = SightSource::from(admission);
+        source.owner = source_owner;
+        self.sight_sources.insert((id, viewer), source);
     }
 
     /// Native ReReveal clears this logical client's +0x250 before its final
@@ -1304,6 +1304,13 @@ impl FogState {
         }
     }
 
+    /// Set the live fog flag the way a freeze or reveal would, for client
+    /// fixtures that cannot reach the FogOfWar cell walk.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_object_fogged_for_test(&mut self, viewer: InternedId, id: u64, fogged: bool) {
+        self.set_object_fogged(viewer, id, fogged);
+    }
+
     pub(crate) fn forget_fogged_live_object(&mut self, id: u64) {
         self.fogged_live_objects
             .retain(|(_, candidate)| *candidate != id);
@@ -1620,7 +1627,7 @@ impl FogState {
     /// `BuildingClass::AddDetectDisguiseAt @ 0x00455A80` — the same strict
     /// outer-Y/inner-X circle the sensor deposit walks, incrementing
     /// `CellClass+0xAC[house]` (`CellClass::IncrementDisguiseDetectCount`).
-    /// The caller owns the powered gate (native vt+0x350).
+    /// The caller owns the Is_Operational gate (native vt+0x350).
     pub fn disguise_detect_add_at(
         &mut self,
         house: InternedId,
@@ -2123,6 +2130,7 @@ impl FogState {
             #[cfg(any(test, feature = "test-support"))]
             {
                 frame.sized = true;
+                self.gap_source_inputs.clear();
             }
             self.by_owner.clear();
             self.gap_sources.clear();
@@ -2170,55 +2178,6 @@ pub(crate) fn holds_sight(
         && (!config.require_playfield_membership || entity.in_playfield())
         && !entity.passenger_role.is_inside_transport()
         && !config.passive_owner(entity.owner())
-}
-
-/// The ordinary `TechnoClass::UpdateReveal @ 0x0070AF50` footprint for
-/// the entity's own House. Exact zero type Sight is rejected at `0x0070AF87`;
-/// an admitted zero effective radius can still retain an empty footprint.
-/// Returns `None` without a fog plane. Callers own [`holds_sight`] eligibility.
-pub(crate) fn entity_own_sight(
-    fog: &FogState,
-    entity: &crate::sim::game_entity::GameEntity,
-    config: &VisionConfig,
-    height_grid: Option<CellLevels<'_>>,
-    terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
-    sight_ability: bool,
-) -> Option<SightAdmission> {
-    entity_sight_admission(
-        fog,
-        entity,
-        entity.owner(),
-        config,
-        height_grid,
-        terrain,
-        sight_ability,
-        None,
-    )
-}
-
-/// The footprint `TechnoClass::UpdateReveal @ 0x0070AF50` reveals for
-/// `entity`'s sight, computed as the ordinary writer computes it and recorded
-/// as a reveal by `revealer`; none for a zero radius (`0x0070B186`).
-pub(crate) fn entity_sight_footprint(
-    fog: &FogState,
-    entity: &crate::sim::game_entity::GameEntity,
-    config: &VisionConfig,
-    height_grid: Option<CellLevels<'_>>,
-    terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
-    sight_ability: bool,
-    revealer: InternedId,
-) -> Option<SightAdmission> {
-    entity_sight_admission(
-        fog,
-        entity,
-        revealer,
-        config,
-        height_grid,
-        terrain,
-        sight_ability,
-        None,
-    )
-    .filter(|admission| admission.radius != 0)
 }
 
 /// The footprint `TechnoClass::UpdateReveal @ 0x0070AF50` reveals for
@@ -2815,15 +2774,14 @@ pub fn point_is_shrouded(
 
 /// `viewer` has mapped `cell`'s ground, the `Cell+0x12C & 0x08` that
 /// `MapClass::IsShrouded @ 0x00586360` tests: [`ShroudKnowledge::open`] as
-/// published to [`FogState::is_cell_revealed`], the copy every native writer
-/// of that bit reaches (the gap `0x006FB170`/`0x006FB470` and some
-/// whole-map writers still move it alone). The canonical Dummy answers its
-/// retained record, which only the
-/// cell writers touch. [`point_is_shrouded`] and the Foot click queries use
-/// it; Display4AE5D0 reads this same bit on its unprojected plane receiver.
-/// This read-only decision is public so app consumers use the same authority,
-/// rather than the legacy edge-frame ground cache. Gap6FB3B8 clears bit8;
-/// every such writer reaches the published knowledge this owner reads.
+/// published to [`FogState::is_cell_revealed`]. Every native writer of that
+/// bit, including the gap `0x006FB170`/`0x006FB470` (Gap6FB3B8 clears it)
+/// and the whole-map stores, moves it together with the ground byte. The
+/// canonical Dummy answers its retained record, which only the cell writers
+/// touch. [`point_is_shrouded`] and the Foot click queries use it;
+/// Display4AE5D0 reads this same bit on its unprojected plane receiver. This
+/// read-only decision is public so app consumers use the same authority,
+/// rather than the legacy edge-frame ground cache.
 pub fn cell_ground_mapped(
     fog: &FogState,
     terrain: &crate::map::resolved_terrain::ResolvedTerrainGrid,
@@ -3075,9 +3033,12 @@ pub(crate) fn apply_gap_generator_sources(
         gap_generators,
         interner,
         &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
     );
 }
 
+/// Synthetic source edges use the same event owner as Building+269. A viewer's
+/// defeat alone is not an edge and must not reclassify an existing deposit.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn apply_gap_generator_sources_with_spy_sat(
     fog: &mut FogState,
@@ -3085,48 +3046,35 @@ pub(crate) fn apply_gap_generator_sources_with_spy_sat(
     gap_generators: &[GapGeneratorSource],
     interner: &StringInterner,
     spy_sat_active_owners: &std::collections::BTreeSet<InternedId>,
+    defeated_viewers: &std::collections::BTreeSet<InternedId>,
 ) {
-    let width = usize::from(fog.width);
-    let height = usize::from(fog.height);
-    if width == 0 || height == 0 {
-        return;
-    }
-    for (&viewer, vis) in fog.by_owner.iter_mut() {
-        let previous = fog.gap_sources.entry(viewer).or_default();
-        let mut admitted = std::collections::BTreeSet::new();
-        vis.clear_gap_fog();
-        for &generator in gap_generators {
-            if generator.radius <= 0 {
-                continue;
-            }
-            if !is_allied_with(
+    let current: std::collections::BTreeSet<_> = gap_generators
+        .iter()
+        .copied()
+        .filter(|source| source.radius > 0)
+        .collect();
+    let viewers: Vec<_> = fog.by_owner.keys().copied().collect();
+    for viewer in viewers {
+        let previous = fog
+            .gap_source_inputs
+            .insert(viewer, current.clone())
+            .unwrap_or_default();
+        for (&source, active) in previous
+            .difference(&current)
+            .map(|source| (source, false))
+            .chain(current.difference(&previous).map(|source| (source, true)))
+        {
+            publish_gap_generator_event(
+                fog,
                 alliances,
-                interner.resolve(generator.owner),
-                interner.resolve(viewer),
-            ) {
-                admitted.insert(generator);
-            } else {
-                for index in gap_footprint(generator, width, height) {
-                    vis.set_gap_fog(index);
-                }
-            }
+                viewer,
+                source,
+                active,
+                defeated_viewers.contains(&viewer),
+                interner,
+                spy_sat_active_owners,
+            );
         }
-        // Reconciliation is not a new generator write. Only actual source
-        // removal/admission executes6FB470/6FB170, preserving pending20.
-        for &generator in previous.difference(&admitted) {
-            for index in gap_footprint(generator, width, height) {
-                vis.remove_gap_cell(index, spy_sat_active_owners.contains(&viewer));
-            }
-        }
-        for &generator in admitted.difference(previous) {
-            for index in gap_footprint(generator, width, height) {
-                vis.add_gap_cell(index);
-            }
-        }
-        for index in 0..vis.cells.len() {
-            vis.publish_knowledge(index);
-        }
-        *previous = admitted;
     }
 }
 
@@ -3151,13 +3099,13 @@ fn gap_footprint(generator: GapGeneratorSource, width: usize, height: usize) -> 
     cells
 }
 
-/// One admitted6FB170/6FB470 event. The Building caller owns its269 latch;
-/// this ledger owns which viewer cell writes that deposit contributed. The
-/// generator's house asks whether it is allied with the viewer
-/// (`HouseClass::IsAlliedWith @ 0x004F9A50` at `0x006FB2CF`, `0x006FB5B9`,
-/// `0x006FB6B7`), as the other gap planes below do. `CreateGap`/`DestroyGap`
-/// (`0x006FB170`/`0x006FB470`) also test PlayerPtr+0x1F5: when defeated they
-/// update Cell+0x13C instead of the hostile +0x134 count modeled here.
+/// One admitted CreateGap6FB170/DestroyGap6FB470 event. Building owns +269;
+/// this owner writes hostile +134 receipts or friendly signed Cell+13C counts.
+/// The current alliance/defeat gate selects the leaf independently for each
+/// event (6FB2CF/6FB2E3 and 6FB6B7/6FB6CC). Source: gamemd.exe instructions.
+/// Skirmish self-alliance also represents IsHumanPlayer50B6F0's owner==viewer.
+/// Residual: campaign's additional human-control flags and shared dummy cells
+/// outside the rectangular map retain the existing bounded mapping.
 pub(crate) fn publish_gap_generator_event(
     fog: &mut FogState,
     alliances: &HouseAllianceMap,
@@ -3175,20 +3123,25 @@ pub(crate) fn publish_gap_generator_event(
     let height = usize::from(fog.height);
     if let Some(vis) = fog.by_owner.get_mut(&viewer) {
         let receipts = fog.gap_sources.entry(viewer).or_default();
+        let friendly = viewer_defeated
+            || is_allied_with(
+                alliances,
+                interner.resolve(source.owner),
+                interner.resolve(viewer),
+            );
+        if friendly {
+            for index in gap_footprint(source, width, height) {
+                vis.count_friendly_gap_cell(index, active);
+            }
+            return;
+        }
         if active {
-            if !viewer_defeated
-                && !is_allied_with(
-                    alliances,
-                    interner.resolve(source.owner),
-                    interner.resolve(viewer),
-                )
-                && receipts.insert(source)
-            {
+            if receipts.insert(source) {
                 for index in gap_footprint(source, width, height) {
                     vis.add_gap_cell(index);
                 }
             }
-        } else if !viewer_defeated {
+        } else {
             // Source-prefix lookup avoids scanning every generator on every
             // Building event. Static GAGAP keeps its admitted cell geometry;
             // mobile/warp/owner-transfer callback policy is outside this owner.
@@ -3214,45 +3167,6 @@ pub(crate) fn publish_gap_generator_event(
     }
 }
 
-/// Passive projection of retained deposits. It must never reclassify power or
-/// emit add/remove events during House, restore, or ordinary view rebuilding.
-/// Friendly Cell13C remains the existing boolean fog projection.
-pub(crate) fn materialize_gap_generator_sources(
-    fog: &mut FogState,
-    alliances: &HouseAllianceMap,
-    sources: &BTreeMap<InternedId, Vec<GapGeneratorSource>>,
-    interner: &StringInterner,
-) {
-    let width = usize::from(fog.width);
-    let height = usize::from(fog.height);
-    if width == 0 || height == 0 {
-        return;
-    }
-    for (&viewer, vis) in fog.by_owner.iter_mut() {
-        // Preserve the existing per-viewer receipt container, including empty
-        // sets. Materialization does not admit or remove any generator.
-        fog.gap_sources.entry(viewer).or_default();
-        vis.clear_gap_fog();
-        for &source in sources.get(&viewer).into_iter().flatten() {
-            if is_allied_with(
-                alliances,
-                interner.resolve(source.owner),
-                interner.resolve(viewer),
-            ) {
-                for index in gap_footprint(source, width, height) {
-                    vis.set_gap_fog(index);
-                }
-            }
-        }
-        // The gap fog is not a published bit, so a tracked grid's published
-        // bits still match its knowledge.
-        if !vis.tracked.complete || visit_every_cell() {
-            for index in 0..vis.cells.len() {
-                vis.publish_knowledge(index);
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tracked_cells_tests;

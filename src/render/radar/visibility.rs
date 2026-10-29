@@ -243,7 +243,9 @@ pub(super) struct RadarBuildingVisibilityFacts {
     pub cloak_state: i32,
     /// BuildingClass+0x6ED. No Rust production writer exists yet.
     pub building_cloak_stage: u8,
-    /// BuildingClass+0x6E7. No Rust production writer exists yet.
+    /// BuildingClass+0x6E7, the FogOfWar freeze flag. `freeze_building_in_fog`
+    /// and `clean_fog` write it as `FogState::is_object_fogged`; the radar
+    /// registration below does not feed it from there yet.
     pub building_cloak_flag: bool,
     pub has_sensor: bool,
     /// The current player's house asks (`PlayerPtr->IsAlliedWith(Owner)`,
@@ -413,8 +415,8 @@ pub(super) fn build_radar_object_update(
             fresh_in_playfield,
             both_corners_shrouded,
             cloak_state,
-            // Exact predicate fields are explicit; neutral production facts do
-            // not pretend the absent BuildingClass cloak writers are closed.
+            // Exact predicate fields are explicit. +0x6ED has no Rust writer;
+            // +0x6E7's FogOfWar writer is not consulted here yet.
             building_cloak_stage: 0,
             building_cloak_flag: false,
             has_sensor,

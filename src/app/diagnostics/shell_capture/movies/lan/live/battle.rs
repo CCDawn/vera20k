@@ -7,8 +7,8 @@ use crate::app::input::hotkeys::{self, HotkeyCommand, HotkeyResolution};
 use crate::app::input::{commands, dispatch, keyboard};
 use crate::sim::combat::TargetKind;
 use crate::sim::command::{
-    ArchiveRecord, Command, MegaMissionOrder, MegaMissionRecord, MegaMissionTarget, PlaceRecord,
-    ProductionEvent, ProductionRecord, RepairRecord, StopRecord,
+    ArchiveRecord, Command, MegaMissionOrder, MegaMissionRecord, MegaMissionTarget, ObjectAction,
+    ObjectActionRecord, PlaceRecord, ProductionEvent, ProductionRecord, RepairRecord, StopRecord,
 };
 use crate::sim::production::{ProductionCategory, ProductionSelection};
 use crate::sim::world::Simulation;
@@ -59,6 +59,9 @@ enum Step {
     RepairFirst,
     RepairOff,
     RepairFinishing,
+    SaleStarting,
+    SalePending,
+    SaleReentering,
     Done,
 }
 
@@ -105,8 +108,94 @@ struct RepairSnapshot {
     spent: i32,
 }
 
+/// Receipt-derived sale observations. The simulation retains every writable
+/// Building, Factory, wallet, crew and lifecycle decision in its existing owner.
+#[derive(Default, serde::Serialize)]
+struct SaleObservation {
+    #[serde(skip)]
+    produces: Vec<ProductionRecord>,
+    #[serde(skip)]
+    record: Option<ObjectActionRecord>,
+    #[serde(rename = "native_events")]
+    events: Vec<Value>,
+    baseline: Option<SaleSnapshot>,
+    head: Option<u64>,
+    head_birth: Option<SaleSnapshot>,
+    first_charge: Option<SaleSnapshot>,
+    execution: Option<SaleSnapshot>,
+    phases: Vec<SaleSnapshot>,
+    advanced: Option<SaleSnapshot>,
+    charges: Vec<Value>,
+    #[serde(rename = "final")]
+    previous: Option<SaleSnapshot>,
+    refund: Option<i32>,
+    crew_count: Option<usize>,
+    before_e1: Vec<u64>,
+    #[serde(skip)]
+    cells: Vec<(u16, u16)>,
+    crew: Vec<u64>,
+    crew_birth: Vec<Value>,
+    crew_walk: Vec<Value>,
+    crew_settled: Vec<Value>,
+    exited: Option<SaleSnapshot>,
+    #[serde(skip)]
+    reentry: Option<MegaMissionRecord>,
+    reentry_arrival: Option<Value>,
+    stable: Option<SaleSnapshot>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct SaleFactorySnapshot {
+    order: u64,
+    head: Option<u64>,
+    progress: u16,
+    balance: i32,
+    running: bool,
+    suspended: bool,
+    rate: u16,
+    timer_start: i32,
+    timer_duration: i32,
+    queue: Vec<(String, u64)>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct SaleBuildingSnapshot {
+    health: i32,
+    estimated_health: i32,
+    repairing: bool,
+    in_limbo: bool,
+    mission: i32,
+    queued_mission: i32,
+    status: u32,
+    body: Option<i32>,
+    queued_body: Option<i32>,
+    ready: u8,
+    control: [i32; 3],
+    stage: i32,
+    rate: i32,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct SaleSnapshot {
+    native_frame: u32,
+    producer: u64,
+    owner: String,
+    credits: i32,
+    spent: i32,
+    tracking_buildings: i32,
+    buildings_lost: u32,
+    building: Option<SaleBuildingSnapshot>,
+    factory: Option<SaleFactorySnapshot>,
+    producer_ids: Vec<u64>,
+    occupied_cells: Vec<(u16, u16)>,
+    in_logic: bool,
+    display_layer: Option<u8>,
+    pending_delete: bool,
+}
+
 #[derive(Default)]
 pub(super) struct BattleOpening {
+    sale_enabled: bool,
     step: Step,
     mcv: Option<u64>,
     yard: Option<u64>,
@@ -146,6 +235,10 @@ pub(super) struct BattleOpening {
     stop_observation: Option<Value>,
     combat_events: Vec<Value>,
     repair: [RepairObservation; 2],
+    sale: [SaleObservation; 2],
+    sale_local_input: Option<Value>,
+    sale_local_cleanup: Option<Value>,
+    sale_local_move: Option<(u16, u16)>,
 }
 
 struct FactorySnapshot {
@@ -158,6 +251,13 @@ struct FactorySnapshot {
 }
 
 impl BattleOpening {
+    pub(super) fn new(sale_enabled: bool) -> Self {
+        Self {
+            sale_enabled,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn phase(&self) -> String {
         format!("{:?}", self.step)
     }
@@ -169,10 +269,17 @@ impl BattleOpening {
         host: bool,
         actions: &mut Vec<Value>,
     ) -> Result<()> {
+        ensure!(
+            host == state.match_state.session.host(),
+            "Battle input role differs from admitted Session"
+        );
         self.observe_fighters(state)?;
         self.observe_commands(state, frame)?;
         self.observe_due_orders(state, frame)?;
         self.observe_repair(state, frame)?;
+        if self.sale_enabled {
+            self.observe_sale(state, frame)?;
+        }
         self.observe_infantry(state, frame, actions)?;
         self.observe_hit(state, frame, actions)?;
         let mut action = None;
@@ -656,11 +763,90 @@ impl BattleOpening {
                 );
             }
             Step::RepairFinishing if self.repair[usize::from(!host)].full.is_some() => {
-                repair_mode_key(state, false)?;
-                self.step = Step::Done;
-                action = Some(
-                    "paid repair reached full actual/estimated health and stopped; Repair key off",
+                if self.sale_enabled {
+                    repair_mode_key(state, false)?;
+                    cameo(state, "E1", false)?;
+                    self.step = Step::SaleStarting;
+                    action = Some(
+                        "paid repair reached full health; Repair key off and real E1 sale-head Produce",
+                    );
+                } else {
+                    repair_mode_key(state, false)?;
+                    self.step = Step::Done;
+                    action = Some(
+                        "paid repair reached full actual/estimated health and stopped; Repair key off",
+                    );
+                }
+            }
+            Step::SaleStarting if self.sale[usize::from(!host)].first_charge.is_some() => {
+                let producer = self.barracks_product.context("original paid sale GAPILE")?;
+                cameo(state, "E1", false)?;
+                sell_mode_key(state, true)?;
+                click_entity(state, producer)?;
+                ensure!(
+                    state
+                        .match_state
+                        .match_presentation
+                        .sidebar_gadget_state
+                        .sell_mode_on,
+                    "ordinary Sell click did not retain sticky mode"
                 );
+                sell_mode_key(state, false)?;
+                select_entity(state, producer)?;
+                self.sale_local_input = Some(json!({"native_frame":frame,"producer":producer,
+                    "sell_mode_after_click":true,"sell_mode_after_key_release":false,
+                    "selected_before_execution":projected_selection(state)==[producer]}));
+                self.step = Step::SalePending;
+                action = Some(
+                    "real E1 successor then Sell key/GAPILE click; leave mode and select pending seller",
+                );
+            }
+            Step::SalePending => {
+                let index = usize::from(!host);
+                let sale = &self.sale[index];
+                if sale.exited.is_some()
+                    && sale.crew_settled.len() == sale.crew_count.context("sale crew count")?
+                {
+                    let id = self.fighter_ids()?[index];
+                    let sim = simulation(state)?;
+                    let rules = state.rules().context("retail reentry rules")?;
+                    let owner = sim.entities().get(id).context("paid reentry GI")?.owner();
+                    let goal = sale
+                        .cells
+                        .iter()
+                        .copied()
+                        .find(|&cell| {
+                            commands::ordinary_cell_move_goal(
+                                sim,
+                                rules,
+                                state.overlay_registry(),
+                                owner,
+                                id,
+                                cell,
+                                false,
+                            ) == Some(cell)
+                        })
+                        .context("no legal ordinary GI Move into the former GAPILE foundation")?;
+                    ground_order_with_mouse(state, id, goal)?;
+                    self.sale_local_move = Some(goal);
+                    self.step = Step::SaleReentering;
+                    action = Some(
+                        "sale crew settled; real original-GI Move into former factory foundation",
+                    );
+                }
+            }
+            Step::SaleReentering if self.sale[usize::from(!host)].stable.is_some() => {
+                ensure!(
+                    !state
+                        .match_state
+                        .match_presentation
+                        .sidebar_gadget_state
+                        .sell_mode_on,
+                    "Sell mode remained active after sale"
+                );
+                self.step = Step::Done;
+                action =
+                    Some("sale, queue refund, full-health crew and former-foundation Move settled");
             }
             _ => {}
         }
@@ -681,13 +867,13 @@ impl BattleOpening {
 
     fn observe_fighters(&mut self, state: &AppState) -> Result<()> {
         let sim = simulation(state)?;
-        for (index, name) in [HOST_NAME, GUEST_NAME].into_iter().enumerate() {
+        for (index, owner) in battle_owners(&state.match_state.session, sim)?
+            .into_iter()
+            .enumerate()
+        {
             if self.fighters[index].is_some() {
                 continue;
             }
-            let Some(owner) = sim.interner().get(name) else {
-                continue;
-            };
             if let Some(id) = sim
                 .production()
                 .factories()
@@ -749,6 +935,11 @@ impl BattleOpening {
     /// later mutable state as the command's immediate effect.
     fn observe_due_orders(&mut self, state: &AppState, frame: u32) -> Result<()> {
         for index in 0..2 {
+            // The canonical full-repair marker closes this earlier producer
+            // observation before subsequent authorized sale can remove it.
+            if self.repair[index].full.is_some() {
+                continue;
+            }
             let Some(record) = self.rally_records[index] else {
                 continue;
             };
@@ -897,6 +1088,9 @@ impl BattleOpening {
         let period = repair_period(state)?;
         for index in 0..2 {
             let observation = &mut self.repair[index];
+            if observation.full.is_some() {
+                continue;
+            }
             let Some(attack) = observation.attack else {
                 continue;
             };
@@ -1005,7 +1199,10 @@ impl BattleOpening {
                     );
                     ensure!(
                         frame == previous.native_frame + 1 && (frame - 1) % period == 0,
-                        "paid repair did not occur on its global native Logic frame"
+                        "paid repair did not occur on its global native Logic frame: previous={}, current={frame}, period={period}, before_health={}, after_health={}",
+                        previous.native_frame,
+                        previous.health,
+                        current.health
                     );
                     ensure!(
                         current.health - previous.health
@@ -1067,6 +1264,501 @@ impl BattleOpening {
         Ok(())
     }
 
+    fn observe_sale(&mut self, state: &AppState, frame: u32) -> Result<()> {
+        let sim = simulation(state)?;
+        let rules = state.rules().context("retail sale rules")?;
+        let object = rules.object("GAPILE").context("retail GAPILE")?;
+        let crew_type = rules
+            .general
+            .allied_crew
+            .as_deref()
+            .context("retail AlliedCrew")?;
+        ensure!(
+            crew_type == "E1",
+            "selected GAPILE sale control requires ordinary Allied E1 crew"
+        );
+        let crew_strength = rules
+            .object(crew_type)
+            .context("retail sale crew")?
+            .strength;
+        for index in 0..2 {
+            let observation = &mut self.sale[index];
+            let Some(first) = observation.produces.first().copied() else {
+                continue;
+            };
+            let producer = u64::try_from(
+                self.rally_records[index]
+                    .context("original paid seller")?
+                    .entity_id,
+            )?;
+            let owner = battle_owners(&state.match_state.session, sim)?[index];
+            if observation.cells.is_empty() {
+                let entity = sim
+                    .entities()
+                    .get(producer)
+                    .context("seller before production")?;
+                observation.cells = crate::sim::production::building_base_foundation_cells(
+                    entity.position.rx(),
+                    entity.position.ry(),
+                    &object.foundation,
+                );
+            }
+            let current = sale_snapshot(state, index, producer, &observation.cells, frame)?;
+            let first_frame = u32::try_from(first.frame)?;
+            if observation.baseline.is_none() && frame >= first_frame {
+                ensure!(
+                    frame == first_frame,
+                    "capture missed sale-queue pre-PRODUCE frame"
+                );
+                ensure!(
+                    current
+                        .building
+                        .as_ref()
+                        .is_some_and(|building| building.health == object.strength
+                            && building.estimated_health == object.strength
+                            && !building.repairing
+                            && !building.in_limbo),
+                    "sale began before completed paid repair"
+                );
+                let full = self.repair[index]
+                    .full
+                    .as_ref()
+                    .context("sale before this House completed repair")?;
+                ensure!(
+                    frame >= full.native_frame
+                        && current.credits == full.credits
+                        && current.spent == full.spent
+                        && current
+                            .building
+                            .as_ref()
+                            .is_some_and(|building| building.health == full.health
+                                && building.estimated_health == full.estimated_health
+                                && building.repairing == full.repairing),
+                    "sale baseline did not continue that House's completed repair health/cash"
+                );
+                ensure!(
+                    !current.occupied_cells.is_empty()
+                        && current.in_logic
+                        && current.display_layer.is_some()
+                        && current.producer_ids.contains(&producer),
+                    "sale baseline did not contain the live mapped producer"
+                );
+                observation.baseline = Some(current.clone());
+            }
+            if observation.head_birth.is_none() && frame >= first_frame + 1 {
+                ensure!(
+                    frame == first_frame + 1,
+                    "capture missed sale-head construction boundary"
+                );
+                let factory = current
+                    .factory
+                    .as_ref()
+                    .context("new paid sale-head Factory")?;
+                let head = factory.head.context("new paid sale head")?;
+                ensure!(
+                    !self.gi_products.iter().any(|product| product.id == head)
+                        && factory.progress == 0
+                        && factory.queue.is_empty(),
+                    "new sale head reused a delivered identity or advanced before Logic"
+                );
+                observation.head = Some(head);
+                observation.before_e1 = sim
+                    .entities()
+                    .values_sorted()
+                    .filter(|entity| {
+                        entity.owner() == owner && sim.interner().resolve(entity.type_ref()) == "E1"
+                    })
+                    .map(|entity| entity.stable_id())
+                    .collect();
+                observation.head_birth = Some(current.clone());
+            }
+            for &id in &observation.before_e1 {
+                if Some(id) == observation.head {
+                    continue;
+                }
+                ensure!(
+                    sim.entities()
+                        .get(id)
+                        .is_some_and(|entity| entity.is_alive()
+                            && !entity.in_limbo()
+                            && entity.owner() == owner
+                            && sim.interner().resolve(entity.type_ref()) == "E1"),
+                    "sale lost an existing original GI"
+                );
+            }
+            if observation.first_charge.is_none()
+                && observation
+                    .baseline
+                    .as_ref()
+                    .is_some_and(|baseline| current.spent > baseline.spent)
+            {
+                let factory = current
+                    .factory
+                    .as_ref()
+                    .context("charged sale-head Factory")?;
+                ensure!(
+                    factory.progress > 0
+                        && factory.progress < crate::sim::production::PRODUCTION_STEPS,
+                    "sale head had no unfinished paid progress"
+                );
+                observation.first_charge = Some(current.clone());
+            }
+            if let Some(record) = observation.record {
+                let due = u32::try_from(record.frame)? + 1;
+                if observation.execution.is_none() && frame >= due {
+                    ensure!(frame == due, "capture missed SELL execution boundary");
+                    let building = current
+                        .building
+                        .as_ref()
+                        .context("SELL removed producer immediately")?;
+                    let factory = current
+                        .factory
+                        .as_ref()
+                        .context("SELL canceled Factory at admission")?;
+                    ensure!(
+                        (building.mission == 0x13 || building.queued_mission == 0x13)
+                            && building.status == 0
+                            && !building.in_limbo
+                            && factory.head == observation.head
+                            && factory.queue.len() == 1
+                            && factory.queue[0].0 == "E1",
+                        "SELL did not retain selling producer and unfinished head/successor"
+                    );
+                    observation.refund = Some(
+                        crate::sim::production::techno_refund(sim, rules, producer)
+                            .context("live seller refund")?,
+                    );
+                    observation.crew_count = Some(usize::try_from(
+                        sim.building_survivor_count(rules, producer),
+                    )?);
+                    ensure!(
+                        observation.crew_count.is_some_and(|count| count > 0),
+                        "ordinary GAPILE has no expected crew"
+                    );
+                    observation.execution = Some(current.clone());
+                } else if frame < due {
+                    ensure!(
+                        current
+                            .building
+                            .as_ref()
+                            .is_some_and(|building| building.mission != 0x13
+                                && building.queued_mission != 0x13),
+                        "SELL began before retained event execution"
+                    );
+                }
+            }
+            if let Some(building) = &current.building {
+                if let Some(head) = observation.head {
+                    let factory = current
+                        .factory
+                        .as_ref()
+                        .context("on-map seller lost its Factory")?;
+                    ensure!(
+                        factory.head == Some(head)
+                            && factory.progress < crate::sim::production::PRODUCTION_STEPS
+                            && sim
+                                .entities()
+                                .get(head)
+                                .is_some_and(|entity| entity.in_limbo()),
+                        "unfinished sale head changed or escaped before actual map exit"
+                    );
+                }
+                if observation.execution.is_some() {
+                    ensure!(
+                        !building.in_limbo
+                            && !building.repairing
+                            && building.control == rules.buildup_control("GAPILE"),
+                        "seller lost bound Buildup or resumed repair"
+                    );
+                    let birth = observation.head_birth.as_ref().context("sale head birth")?;
+                    ensure!(
+                        current.factory.as_ref().map(|factory| factory.order)
+                            == birth.factory.as_ref().map(|factory| factory.order),
+                        "sale replaced its retained Factory"
+                    );
+                    let factory = current.factory.as_ref().context("live Selling Factory")?;
+                    ensure!(
+                        factory.running
+                            && !factory.suspended
+                            && observation
+                                .execution
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.factory.as_ref())
+                                .is_some_and(|at_sale| at_sale.queue == factory.queue),
+                        "Selling suspended the unfinished Factory or changed its queued successor early"
+                    );
+                    let changed = observation
+                        .phases
+                        .last()
+                        .and_then(|snapshot| snapshot.building.as_ref())
+                        .is_none_or(|previous| {
+                            previous.status != building.status
+                                || previous.body != building.body
+                                || previous.ready != building.ready
+                        });
+                    if changed {
+                        if let Some(previous) = observation
+                            .phases
+                            .last()
+                            .and_then(|snapshot| snapshot.building.as_ref())
+                        {
+                            ensure!(
+                                building.status == previous.status
+                                    || building.status == previous.status + 1,
+                                "Selling skipped a genuine mission stage"
+                            );
+                        }
+                        observation.phases.push(current.clone());
+                    }
+                    if observation.advanced.is_none()
+                        && building.status == 2
+                        && building.body == Some(0)
+                        && building.rate > 0
+                        && building.stage > building.control[0]
+                    {
+                        observation.advanced = Some(current.clone());
+                    }
+                    if building.status == 2 && observation.crew.is_empty() {
+                        observation.crew = sim
+                            .entities()
+                            .values_sorted()
+                            .filter(|entity| {
+                                entity.owner() == owner
+                                    && sim.interner().resolve(entity.type_ref()) == crew_type
+                                    && !observation.before_e1.contains(&entity.stable_id())
+                            })
+                            .map(|entity| entity.stable_id())
+                            .collect();
+                        ensure!(
+                            Some(observation.crew.len()) == observation.crew_count,
+                            "stage1 sale crew differs from owner count or paid identities"
+                        );
+                        for &id in &observation.crew {
+                            let crew = sim.entities().get(id).context("new sale crew")?;
+                            ensure!(
+                                crew.health.current() == crew_strength
+                                    && crew.estimated_health.get() == crew_strength
+                                    && crew.is_alive()
+                                    && !crew.in_limbo()
+                                    && sim.logic_order().contains(&id)
+                                    && sim.display_layers().layer_of(id).is_some()
+                                    && sim.occupancy().contains_entity(
+                                        crew.position.rx(),
+                                        crew.position.ry(),
+                                        id
+                                    ),
+                                "sale crew did not enter normally at full health"
+                            );
+                            observation
+                                .crew_birth
+                                .push(sale_crew_snapshot(state, id, frame)?);
+                        }
+                    }
+                }
+                if let Some(previous) = &observation.previous {
+                    let charge = current.spent - previous.spent;
+                    ensure!(
+                        charge >= 0 && current.credits == previous.credits - charge,
+                        "on-map sale Factory refunded early or charged wrong wallet"
+                    );
+                    if charge > 0 {
+                        observation
+                            .charges
+                            .push(json!({"logic_frame":frame-1,"before":previous,"after":current}));
+                    }
+                }
+            } else if observation.execution.is_some() && observation.exited.is_none() {
+                let previous = observation
+                    .previous
+                    .as_ref()
+                    .context("last live seller snapshot")?;
+                let baseline = observation
+                    .baseline
+                    .as_ref()
+                    .context("sale wallet baseline")?;
+                let refund = observation.refund.context("live sale refund")?;
+                ensure!(
+                    previous
+                        .building
+                        .as_ref()
+                        .is_some_and(|building| building.status == 2)
+                        && observation.advanced.is_some()
+                        && observation.phases.iter().any(|snapshot| snapshot
+                            .building
+                            .as_ref()
+                            .is_some_and(|building| building.status == 1)),
+                    "seller vanished without complete mission/Buildup stages"
+                );
+                ensure!(
+                    observation
+                        .charges
+                        .iter()
+                        .any(|charge| charge["after"]["building"]["status"].as_u64() == Some(2)),
+                    "paid Factory did not keep charging through reverse buildup"
+                );
+                ensure!(
+                    current.credits == baseline.credits + refund
+                        && current.spent == previous.spent
+                        && current.credits - previous.credits
+                            == refund + (current.spent - baseline.spent),
+                    "physical sale exit did not independently refund building and all paid-head charges"
+                );
+                ensure!(
+                    current.tracking_buildings == baseline.tracking_buildings - 1,
+                    "sale failed to remove exactly one tracked building"
+                );
+                ensure!(
+                    current.buildings_lost == baseline.buildings_lost,
+                    "ordinary sale counted a building loss"
+                );
+                observation.exited = Some(current.clone());
+            }
+            if let Some(exited) = &observation.exited {
+                ensure!(
+                    current.building.is_none()
+                        && current.factory.is_none()
+                        && observation
+                            .head
+                            .is_some_and(|head| !sim.entities().contains(head)
+                                && !sim.logic_order().contains(&head)
+                                && sim.display_layers().layer_of(head).is_none()
+                                && !sim.object_is_pending_delete(head))
+                        && !current.in_logic
+                        && current.display_layer.is_none()
+                        && !current.pending_delete
+                        && current.occupied_cells.is_empty()
+                        && current.producer_ids.is_empty(),
+                    "sale left producer/head/FIFO/occupancy/Logic/display/delete/producer membership"
+                );
+                ensure!(
+                    current.credits == exited.credits
+                        && current.spent == exited.spent
+                        && current.tracking_buildings == exited.tracking_buildings
+                        && current.buildings_lost == exited.buildings_lost,
+                    "sale tail changed refunded cash/tracking twice"
+                );
+                ensure!(
+                    !crate::sim::production::build_options_for_owner(sim, rules, &current.owner)
+                        .iter()
+                        .any(|option| sim.interner().resolve(option.type_id) == "E1"
+                            && option.enabled),
+                    "E1 remained enabled without a producer"
+                );
+                if sim.session().current_house() == Some(owner) && self.sale_local_cleanup.is_none()
+                {
+                    let e1 = sim.interner().get("E1").context("sale E1")?;
+                    let input = &state.match_state.input;
+                    let linked = state
+                        .match_state
+                        .match_presentation
+                        .sidebar_projection
+                        .cameo_factory(sim, owner, e1)
+                        .is_some();
+                    let cameo_present = state
+                        .match_state
+                        .match_presentation
+                        .sidebar_projection
+                        .cameo_strips()
+                        .items(crate::ui::sidebar::SidebarTab::for_category(
+                            ProductionCategory::Infantry,
+                        ))
+                        .iter()
+                        .any(|cameo| cameo.id == CameoId::Object(e1));
+                    ensure!(
+                        !projected_selection(state).contains(&producer)
+                            && !input.selection_order.contains(&producer)
+                            && !linked
+                            && !state
+                                .match_state
+                                .match_presentation
+                                .sidebar_gadget_state
+                                .sell_mode_on,
+                        "local sale selection/cameo/mode cleanup failed"
+                    );
+                    // Retention follows the existing House/sidebar recheck;
+                    // observe its actual disappearance without advancing it.
+                    if !cameo_present {
+                        self.sale_local_cleanup = Some(
+                            json!({"native_frame":frame,"producer":producer,
+                            "selected":projected_selection(state),"selection_ledger":input.selection_order,
+                            "cameo_factory":linked,"cameo_present":cameo_present,"sell_mode":false}),
+                        );
+                    }
+                }
+            }
+            for (crew_index, &id) in observation.crew.iter().enumerate() {
+                let crew = sim.entities().get(id).context("retained sale crew")?;
+                ensure!(
+                    crew.is_alive()
+                        && !crew.in_limbo()
+                        && crew.owner() == owner
+                        && crew.health.current() == crew_strength,
+                    "sale crew died, changed owner or lost full health"
+                );
+                let born = &observation.crew_birth[crew_index];
+                if !observation
+                    .crew_walk
+                    .iter()
+                    .any(|snapshot| snapshot["id"].as_u64() == Some(id))
+                    && json!(crew.position) != born["position"]
+                    && crew
+                        .locomotor
+                        .as_ref()
+                        .is_some_and(|walk| walk.walk_is_moving() == Some(true))
+                {
+                    observation
+                        .crew_walk
+                        .push(sale_crew_snapshot(state, id, frame)?);
+                }
+                if observation
+                    .crew_walk
+                    .iter()
+                    .any(|snapshot| snapshot["id"].as_u64() == Some(id))
+                    && !observation
+                        .crew_settled
+                        .iter()
+                        .any(|snapshot| snapshot["id"].as_u64() == Some(id))
+                    && crew.navigation.nav_com().is_none()
+                    && crew
+                        .locomotor
+                        .as_ref()
+                        .is_some_and(|walk| walk.walk_is_moving() == Some(false))
+                {
+                    observation
+                        .crew_settled
+                        .push(sale_crew_snapshot(state, id, frame)?);
+                }
+            }
+            if observation.reentry_arrival.is_none()
+                && let Some(record) = observation.reentry
+                && let MegaMissionOrder::Move { target_x, target_y } = record.order
+            {
+                let gi = sim
+                    .entities()
+                    .get(u64::try_from(record.source_id)?)
+                    .context("foundation reentry GI")?;
+                if frame > u32::try_from(record.frame)?
+                    && gi.navigation.nav_com().is_none()
+                    && (gi.position.rx(), gi.position.ry())
+                        == (u16::try_from(target_x)?, u16::try_from(target_y)?)
+                {
+                    observation.reentry_arrival =
+                        Some(sale_crew_snapshot(state, gi.stable_id(), frame)?);
+                }
+            }
+            if observation.stable.is_none()
+                && let Some(arrival) = &observation.reentry_arrival
+                && arrival["native_frame"]
+                    .as_u64()
+                    .is_some_and(|arrived| u64::from(frame) >= arrived + 60)
+            {
+                observation.stable = Some(current.clone());
+            }
+            observation.previous = Some(current);
+        }
+        Ok(())
+    }
+
     fn observe_commands(&mut self, state: &AppState, frame: u32) -> Result<()> {
         let Some(log) = &state.match_state.match_diagnostics.replay_log else {
             return Ok(());
@@ -1089,8 +1781,9 @@ impl BattleOpening {
                                 | Command::SetRally { .. }
                                 | Command::ArchiveObject { .. }
                                 | Command::ToggleRepair { .. }
+                                | Command::SellBuilding { .. }
                         ),
-                        "live Battle admitted a semantic mobile PLACE, Attack, rally or Repair"
+                        "live Battle admitted a semantic mobile PLACE, Attack, rally, Repair or Sell"
                     );
                     continue;
                 };
@@ -1117,21 +1810,79 @@ impl BattleOpening {
                     self.gi_events.push(json!({"admission_tick":tick.tick,"kind":"PLACE","house":place.house_id,"issue_frame":place.frame,"bytes":record.as_bytes().as_slice()}));
                 }
                 if let Some(produce) = ProductionRecord::decode(record)
-                    && produce.event == ProductionEvent::Produce
                     && produce.rtti == gi.rtti
-                    && produce.type_index == gi.type_index
+                    && (produce.type_index == gi.type_index || produce.type_index == -1)
                 {
                     ensure!(produce.naval == 0, "GI PRODUCE carried Naval");
-                    self.gi_produces.push(produce);
+                    let index = human_index_for_house(state, produce.house_id)?;
+                    // Admission can precede this peer's observation of the
+                    // completed repair. The first two PRODUCE events belong
+                    // to the opening; later ones start the sale queue.
+                    // observe_sale checks repair completion at their due frame.
+                    let initial_produces = self
+                        .gi_produces
+                        .iter()
+                        .filter(|event| event.house_id == produce.house_id)
+                        .count();
+                    let sale_queue = self.sale_enabled
+                        && (!self.sale[index].produces.is_empty()
+                            || (produce.event == ProductionEvent::Produce
+                                && initial_produces == 2));
+                    if sale_queue {
+                        let observation = &mut self.sale[index];
+                        if produce.event == ProductionEvent::Produce {
+                            ensure!(
+                                produce.type_index == gi.type_index
+                                    && observation.produces.len() < 2,
+                                "extra or wildcard sale-queue PRODUCE"
+                            );
+                            observation.produces.push(produce);
+                        }
+                        observation.events.push(json!({"kind":format!("{:?}",produce.event),
+                            "admission_tick":tick.tick,"admission_observed_frame":frame,
+                            "event_frame":produce.frame,"opcode":record.opcode(),"house":produce.house_id,
+                            "bytes":record.as_bytes().as_slice()}));
+                    } else if produce.event == ProductionEvent::Produce {
+                        ensure!(
+                            produce.type_index == gi.type_index,
+                            "initial GI PRODUCE wildcard"
+                        );
+                        self.gi_produces.push(produce);
+                        ensure!(
+                            self.gi_produces
+                                .iter()
+                                .filter(|event| event.house_id == produce.house_id)
+                                .count()
+                                <= 2,
+                            "a House admitted an extra initial GI PRODUCE"
+                        );
+                        self.gi_events.push(json!({"admission_tick":tick.tick,"kind":"PRODUCE","house":produce.house_id,"issue_frame":produce.frame,"bytes":record.as_bytes().as_slice()}));
+                    }
+                }
+                if self.sale_enabled
+                    && let Some(sell) = ObjectActionRecord::decode(record)
+                        .filter(|event| event.action == ObjectAction::Sell)
+                {
+                    let index = human_index_for_house(state, sell.house_id)?;
                     ensure!(
-                        self.gi_produces
-                            .iter()
-                            .filter(|event| event.house_id == produce.house_id)
-                            .count()
-                            <= 2,
-                        "a House admitted an extra GI PRODUCE"
+                        self.rally_records[index]
+                            .is_some_and(|archive| archive.entity_id == sell.entity_id),
+                        "raw SELL did not name this Human's original paid GAPILE"
                     );
-                    self.gi_events.push(json!({"admission_tick":tick.tick,"kind":"PRODUCE","house":produce.house_id,"issue_frame":produce.frame,"bytes":record.as_bytes().as_slice()}));
+                    let observation = &mut self.sale[index];
+                    ensure!(
+                        observation.record.is_none()
+                            && observation.produces.len() == 2
+                            && observation.produces[1].frame <= sell.frame,
+                        "SELL preceded ordered sale head+successor or was duplicated"
+                    );
+                    observation.record = Some(sell);
+                    observation
+                        .events
+                        .push(json!({"kind":"SELL","admission_tick":tick.tick,
+                        "admission_observed_frame":frame,"event_frame":sell.frame,
+                        "opcode":record.opcode(),"source":sell.entity_id,"house":sell.house_id,
+                        "bytes":record.as_bytes().as_slice()}));
                 }
                 if let Some(archive) = ArchiveRecord::decode(record) {
                     let sim = simulation(state)?;
@@ -1140,10 +1891,8 @@ impl BattleOpening {
                         .get(u64::try_from(archive.entity_id)?)
                         .context("admitted ARCHIVE source")?;
                     if sim.interner().resolve(source.type_ref()) == "GAPILE" {
-                        let index = [HOST_NAME, GUEST_NAME]
-                            .iter()
-                            .position(|name| *name == sim.interner().resolve(source.owner()))
-                            .context("rally Human")?;
+                        let index =
+                            battle_human_index(&state.match_state.session, sim, source.owner())?;
                         ensure!(
                             archive.house_id == house_id_for_owner(state, source.owner())?,
                             "raw GAPILE ARCHIVE issuing House differs from producer"
@@ -1179,10 +1928,7 @@ impl BattleOpening {
                         .order()
                         .get(usize::try_from(record.house_id())?)
                         .context("PLAN_COMMIT issuing House")?;
-                    let index = [HOST_NAME, GUEST_NAME]
-                        .iter()
-                        .position(|name| *name == sim.interner().resolve(owner))
-                        .context("PLAN_COMMIT Human")?;
+                    let index = battle_human_index(&state.match_state.session, sim, owner)?;
                     let archive = self.rally_records[index]
                         .context("PLAN_COMMIT admitted before its House's manual ARCHIVE")?;
                     ensure!(
@@ -1246,6 +1992,27 @@ impl BattleOpening {
                         self.staging[index] =
                             Some((u16::try_from(target_x)?, u16::try_from(target_y)?));
                     }
+                    if self.sale[index].exited.is_some()
+                        && let MegaMissionOrder::Move { target_x, target_y } = mission.order
+                    {
+                        let goal = (u16::try_from(target_x)?, u16::try_from(target_y)?);
+                        ensure!(
+                            self.sale[index].reentry.is_none()
+                                && self.sale[index].cells.contains(&goal),
+                            "extra Move or reentry destination outside the sold foundation"
+                        );
+                        if mission.house_id == local_house_id(state)? {
+                            ensure!(
+                                self.sale_local_move == Some(goal),
+                                "raw reentry differs from actual local Cell click"
+                            );
+                        }
+                        self.sale[index].reentry = Some(mission);
+                        self.sale[index].events.push(json!({"kind":"REENTRY","admission_tick":tick.tick,
+                            "admission_observed_frame":frame,"event_frame":mission.frame,
+                            "opcode":record.opcode(),"source":mission.source_id,"house":mission.house_id,
+                            "bytes":record.as_bytes().as_slice()}));
+                    }
                     if self.rally_records[index].is_some_and(|archive| {
                         mission.order
                             == (MegaMissionOrder::Attack {
@@ -1292,7 +2059,7 @@ impl BattleOpening {
                             mission.house_id == house_id_for_owner(state, entity.owner())?,
                             "raw Attack issuing House differs from the Host"
                         );
-                        if local_owner(state)? == HOST_NAME {
+                        if state.match_state.session.host() {
                             ensure!(
                                 self.attack_input_frame
                                     .is_some_and(|issued| mission.frame >= issued as i32),
@@ -1362,6 +2129,33 @@ impl BattleOpening {
         actions: &mut Vec<Value>,
     ) -> Result<()> {
         if self.gi_wallet.is_none() {
+            return Ok(());
+        }
+        if self.sale_enabled
+            && self.gi_products.len() == 2
+            && self
+                .gi_products
+                .iter()
+                .all(|product| product.rally_arrival.is_some())
+        {
+            let sim = simulation(state)?;
+            let owner = sim
+                .interner()
+                .get(&local_owner(state)?)
+                .context("original paid-GI House")?;
+            for product in &self.gi_products {
+                let entity = sim
+                    .entities()
+                    .get(product.id)
+                    .context("original paid GI after output phase")?;
+                ensure!(
+                    entity.is_alive()
+                        && !entity.in_limbo()
+                        && entity.owner() == owner
+                        && sim.interner().resolve(entity.type_ref()) == "E1",
+                    "original paid GI was lost or replaced"
+                );
+            }
             return Ok(());
         }
         let factory = factory(state, ProductionCategory::Infantry)?;
@@ -1551,7 +2345,23 @@ impl BattleOpening {
                     && observation.stopped.is_some()
                     && observation.full.is_some()
             })
-            && ["GAPOWR", "GAPILE"].iter().all(|type_id| {
+            && (!self.sale_enabled
+                || (self.sale.iter().all(|observation| {
+                    observation.produces.len() == 2
+                        && observation.record.is_some()
+                        && observation.execution.is_some()
+                        && observation.exited.is_some()
+                        && observation.stable.is_some()
+                        && observation.crew_count == Some(observation.crew_settled.len())
+                        && observation.reentry_arrival.is_some()
+                }) && self.sale_local_input.is_some()
+                    && self.sale_local_cleanup.is_some()))
+            && [
+                ("GAPOWR", 2),
+                ("GAPILE", if self.sale_enabled { 0 } else { 2 }),
+            ]
+            .iter()
+            .all(|(type_id, count)| {
                 sim.entities()
                     .values_sorted()
                     .filter(|entity| {
@@ -1561,14 +2371,14 @@ impl BattleOpening {
                             && sim.interner().resolve(entity.type_ref()) == *type_id
                     })
                     .count()
-                    == 2
+                    == *count
             })
             && self.all_gi_orders_admitted(state)?)
     }
 
     pub(super) fn receipt(&self, state: &AppState) -> Result<Value> {
         let sim = simulation(state)?;
-        Ok(json!({"phase":self.phase(),"mcv":self.mcv,"yard":self.yard,
+        let mut receipt = json!({"phase":self.phase(),"mcv":self.mcv,"yard":self.yard,
             "cancelled_product":self.first_product,"placed_product":self.placed_product,
             "owner":local_owner(state)?,"barracks_product":self.barracks_product,
             "starting_credits":self.starting_credits,"final_credits":self.final_credits,
@@ -1589,7 +2399,7 @@ impl BattleOpening {
                     "damage":observation.damage,"stop":observation.stop_execution,
                     "executions":observation.executions,"payments":observation.payments,
                     "stopped":observation.stopped,"full":observation.full,
-                    "final":observation.previous})).collect::<Vec<_>>()},
+                    "episode_end":observation.previous})).collect::<Vec<_>>()},
             "infantry":sim.entities().values_sorted().filter(|entity| sim.interner().resolve(entity.type_ref()) == "E1")
                 .map(|entity| json!({"id":entity.stable_id(),"owner":sim.interner().resolve(entity.owner()),
                     "alive":entity.is_alive(),"in_limbo":entity.in_limbo(),"position":entity.position,
@@ -1601,7 +2411,13 @@ impl BattleOpening {
             "houses":sim.houses().order().iter().filter_map(|owner| sim.houses().get(owner).map(|house|
                 json!({"owner":sim.interner().resolve(*owner),"credits":house.economy().credits(),"spent":house.economy().spent_credits(),
                     "power":sim.power_states().get(owner).map(|power| (power.total_output(),power.total_drain()))})
-            )).collect::<Vec<_>>() }))
+            )).collect::<Vec<_>>() });
+        if self.sale_enabled {
+            receipt["sale"] = json!({"local_input":self.sale_local_input,
+                "local_cleanup":self.sale_local_cleanup,"local_move":self.sale_local_move,
+                "episodes":self.sale});
+        }
+        Ok(receipt)
     }
 }
 
@@ -1658,6 +2474,188 @@ fn repair_snapshot(state: &AppState, id: u64, frame: u32) -> Result<RepairSnapsh
         credits: economy.credits(),
         spent: economy.spent_credits(),
     })
+}
+
+fn human_index_for_house(state: &AppState, house: i8) -> Result<usize> {
+    let sim = simulation(state)?;
+    let owner = *sim
+        .houses()
+        .order()
+        .get(usize::try_from(house)?)
+        .context("record Human House")?;
+    battle_human_index(&state.match_state.session, sim, owner)
+}
+
+fn sale_snapshot(
+    state: &AppState,
+    index: usize,
+    producer: u64,
+    cells: &[(u16, u16)],
+    frame: u32,
+) -> Result<SaleSnapshot> {
+    let sim = simulation(state)?;
+    let rules = state.rules().context("retail sale rules")?;
+    let owner = battle_owners(&state.match_state.session, sim)?[index];
+    let name = sim.interner().resolve(owner);
+    let house = sim.houses().get(&owner).context("sale House")?;
+    if let Some(entity) = sim.entities().get(producer) {
+        ensure!(
+            entity.owner() == owner && sim.interner().resolve(entity.type_ref()) == "GAPILE",
+            "original seller changed owner or type"
+        );
+    }
+    let view = sim
+        .production()
+        .factories()
+        .view(owner, ProductionCategory::Infantry);
+    let factory = if let Some(view) = view {
+        let factory = sim
+            .production()
+            .factories()
+            .iter_insertion_ordered()
+            .into_iter()
+            .find(|factory| {
+                factory.owner() == owner
+                    && factory.category() == ProductionCategory::Infantry
+                    && factory.insertion_seq() == view.construction_order()
+            })
+            .context("retained sale Factory identity")?;
+        Some(SaleFactorySnapshot {
+            order: factory.insertion_seq(),
+            head: factory.object().and_then(|object| object.entity_id),
+            progress: factory.progress(),
+            balance: factory.balance(),
+            running: view.is_running(),
+            suspended: factory.suspended(),
+            rate: factory.step_rate_frames(),
+            timer_start: factory.step_timer().start_frame(),
+            timer_duration: factory.step_timer().duration(),
+            queue: factory
+                .queue()
+                .iter()
+                .map(|entry| {
+                    (
+                        sim.interner().resolve(entry.type_id).into(),
+                        entry.enqueue_order,
+                    )
+                })
+                .collect(),
+        })
+    } else {
+        None
+    };
+    let building = sim
+        .entities()
+        .get(producer)
+        .map(|building| SaleBuildingSnapshot {
+            health: building.health.current(),
+            estimated_health: building.estimated_health.get(),
+            repairing: building.repairing.is_on(),
+            in_limbo: building.in_limbo(),
+            mission: building.mission.current().raw(),
+            queued_mission: building.mission.queued().raw(),
+            status: building.mission.handler_state(),
+            body: building.building_body_state(),
+            queued_body: building.queued_building_body_state(),
+            ready: building.building_ready_latch(),
+            control: building.building_construction_control(),
+            stage: building.construction_stage_value(),
+            rate: building.native_stage().rate(),
+        });
+    Ok(SaleSnapshot {
+        native_frame: frame,
+        producer,
+        owner: name.into(),
+        credits: house.economy().credits(),
+        spent: house.economy().spent_credits(),
+        tracking_buildings: house.tracking().buildings(),
+        buildings_lost: house.stats().buildings_lost(),
+        building,
+        factory,
+        producer_ids: crate::sim::production::producer_candidates_for_owner_category(
+            sim.entities(),
+            rules,
+            name,
+            ProductionCategory::Infantry,
+            true,
+            sim.interner(),
+        )
+        .into_iter()
+        .map(|(id, _, _, _)| id)
+        .collect(),
+        occupied_cells: cells
+            .iter()
+            .copied()
+            .filter(|&(x, y)| sim.occupancy().contains_entity(x, y, producer))
+            .collect(),
+        in_logic: sim.logic_order().contains(&producer),
+        display_layer: sim
+            .display_layers()
+            .layer_of(producer)
+            .map(|layer| layer.index()),
+        pending_delete: sim.object_is_pending_delete(producer),
+    })
+}
+
+fn sale_crew_snapshot(state: &AppState, id: u64, frame: u32) -> Result<Value> {
+    let sim = simulation(state)?;
+    let entity = sim.entities().get(id).context("sale crew")?;
+    Ok(
+        json!({"native_frame":frame,"id":id,"owner":sim.interner().resolve(entity.owner()),
+        "type":sim.interner().resolve(entity.type_ref()),"health":entity.health.current(),
+        "estimated_health":entity.estimated_health.get(),"nominal":entity.is_nominal_survivor(),
+        "in_limbo":entity.in_limbo(),"alive":entity.is_alive(),"position":entity.position,
+        "mission":entity.mission.current().raw(),"queued_mission":entity.mission.queued().raw(),
+        "destination":entity.navigation.nav_com(),"in_logic":sim.logic_order().contains(&id),
+        "display_layer":sim.display_layers().layer_of(id).map(|layer|layer.index()),
+        "occupied":sim.occupancy().contains_entity(entity.position.rx(),entity.position.ry(),id),
+        "walk":gi_rally_snapshot(entity,frame)}),
+    )
+}
+
+/// Host/guest are input roles, never literal account names or native House
+/// positions. Resolve through the same Session→House owner as real transport;
+/// LAN's local-first admission and online roster order may differ.
+fn battle_owners(
+    session: &crate::app::match_runtime::session::MatchSession,
+    sim: &Simulation,
+) -> Result<[crate::sim::intern::InternedId; 2]> {
+    let launch = session.network_setup().context("Battle network setup")?;
+    ensure!(
+        launch.humans.len() == 2 && launch.local_player_index < 2,
+        "Battle opening requires two admitted Humans"
+    );
+    let local = launch.local_player_index;
+    let remote = 1 - local;
+    let sources = if session.host() {
+        [local, remote]
+    } else {
+        [remote, local]
+    };
+    let owners = sources.map(|source| {
+        let house = crate::app::match_runtime::network_match::source_house(session, sim, source)
+            .context("Battle participant's canonical House")?;
+        sim.houses()
+            .order()
+            .get(usize::try_from(house)?)
+            .copied()
+            .context("Battle native House")
+    });
+    let [host, guest] = owners;
+    let [host, guest] = [host?, guest?];
+    ensure!(host != guest, "Battle participants share a House");
+    Ok([host, guest])
+}
+
+fn battle_human_index(
+    session: &crate::app::match_runtime::session::MatchSession,
+    sim: &Simulation,
+    owner: crate::sim::intern::InternedId,
+) -> Result<usize> {
+    battle_owners(session, sim)?
+        .iter()
+        .position(|candidate| *candidate == owner)
+        .context("command belongs to an unrepresented Battle Human")
 }
 
 fn local_house_id(state: &AppState) -> Result<i8> {
@@ -1805,8 +2803,10 @@ fn offset_toward(from: (u16, u16), toward: (u16, u16), cells: i32) -> (u16, u16)
 fn staging_centres(state: &AppState) -> Result<[(u16, u16); 2]> {
     let sim = simulation(state)?;
     let mut yards = [(0, 0); 2];
-    for (index, name) in [HOST_NAME, GUEST_NAME].into_iter().enumerate() {
-        let owner = sim.interner().get(name).context("encounter House")?;
+    for (index, owner) in battle_owners(&state.match_state.session, sim)?
+        .into_iter()
+        .enumerate()
+    {
         let yard = sim
             .entities()
             .values_sorted()
@@ -1887,8 +2887,371 @@ fn mouse_can_pick(state: &AppState, id: u64) -> Result<bool> {
 }
 
 fn ground_order_with_mouse(state: &mut AppState, id: u64, cell: (u16, u16)) -> Result<()> {
+    ground_order_with_mouse_timed(state, id, cell).map(|_| ())
+}
+
+fn ground_order_with_mouse_timed(
+    state: &mut AppState,
+    id: u64,
+    cell: (u16, u16),
+) -> Result<crate::app::match_diagnostics::ObservationTime> {
     select_entity(state, id)?;
     point_at_ground(state, cell)?;
+    Ok(left_click_timed(state))
+}
+
+fn left_click_timed(state: &mut AppState) -> crate::app::match_diagnostics::ObservationTime {
+    dispatch::handle_mouse_input(state, MouseButton::Left, ElementState::Pressed);
+    let at = crate::app::match_diagnostics::ObservationTime::now();
+    dispatch::handle_mouse_input(state, MouseButton::Left, ElementState::Released);
+    at
+}
+
+pub(super) struct LatencyInput {
+    pub at: crate::app::match_diagnostics::ObservationTime,
+    pub admission: Value,
+}
+
+/// Use the same presented-world picker as the physical click. Terrain
+/// passability alone cannot rule out selecting a friendly object.
+fn empty_ground_point(
+    world: impl crate::app::input::entity_pick::PickWorld,
+    point: (f32, f32),
+    owner: &str,
+) -> bool {
+    crate::app::input::entity_pick::hover_object_at_point(world, point.0, point.1, owner, false)
+        .is_none()
+}
+
+fn latency_input_admission(
+    sim: &mut Simulation,
+    before: usize,
+    actor: u64,
+    target: Option<(u16, u16)>,
+) -> Result<Value> {
+    use crate::sim::command::{MegaMissionOrder, MegaMissionRecord, StopRecord};
+    let after = sim.pending_local_command_count();
+    ensure!(
+        after == before + 1,
+        "latency input admitted {} OutList records; expected one",
+        after.saturating_sub(before)
+    );
+    // The general diagnostic snapshot decodes native records into semantic
+    // commands. Borrow the sender's raw OutList view instead; this never drains.
+    let queues = sim.network_command_queues();
+    let records = queues.local_records()?;
+    ensure!(
+        records.len() == after,
+        "latency OutList prefix is outside the sender's current allowance"
+    );
+    let record = records.get(before).context("latency OutList record")?;
+    let matched = match target {
+        Some((x, y)) => MegaMissionRecord::decode(&record).is_some_and(|command| {
+            command.source_id == actor as i32
+                && command.order
+                    == MegaMissionOrder::Move {
+                        target_x: x as i16,
+                        target_y: y as i16,
+                    }
+        }),
+        None => {
+            StopRecord::decode(&record).is_some_and(|command| command.entity_id == actor as i32)
+        }
+    };
+    ensure!(
+        matched,
+        "latency click admitted another command instead of the requested Move/Stop"
+    );
+    let record_hex: String = record
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(
+        json!({"outlist_before":before,"outlist_after":after,"record_hex":record_hex,
+        "house":record.house_id(),"opcode":record.opcode(),"issue_frame":record.frame_stamp()}),
+    )
+}
+
+/// Select and show the measured actor before readiness sampling. No Move/Stop
+/// is issued, and later measured inputs must retain this view and selection.
+pub(super) fn prepare_latency_view(state: &mut AppState) -> Result<(u64, (u16, u16))> {
+    let sim = simulation(state)?;
+    let owner = sim
+        .session()
+        .current_house()
+        .context("latency local House")?;
+    let entity = sim
+        .entities()
+        .values_sorted()
+        .filter(|entity| {
+            entity.owner() == owner
+                && entity.is_alive()
+                && !entity.in_limbo()
+                && entity.category() == crate::map::entities::EntityCategory::Unit
+                && entity.locomotor.is_some()
+        })
+        .max_by_key(|entity| (entity.health.current(), entity.stable_id()))
+        .context("latency capture requires an owned ground Unit")?;
+    let id = entity.stable_id();
+    let from = (entity.position.rx(), entity.position.ry());
+    select_entity(state, id)?;
+    crate::app::input::camera::center_camera_on_cell(state, from.0, from.1);
+    let world = ground_world_point(state, from)?;
+    point_at_world(state, world);
+    Ok((id, from))
+}
+
+/// The ordinary mouse path owns admission. Projection checks the prepared
+/// tactical viewport; a target outside it is an explicit diagnostic failure.
+pub(super) fn latency_move_with_mouse(
+    state: &mut AppState,
+    actor: u64,
+    origin: (u16, u16),
+    direction: usize,
+) -> Result<((u16, u16), LatencyInput)> {
+    ensure!(
+        projected_selection(state) == [actor],
+        "latency actor selection changed"
+    );
+    let sim = simulation(state)?;
+    let entity = sim
+        .entities()
+        .get(actor)
+        .context("latency actor disappeared")?;
+    let from = (entity.position.rx(), entity.position.ry());
+    let owner_name = local_owner(state)?;
+    let input = &state.match_state.input;
+    let camera = (input.camera_x, input.camera_y);
+    let zoom = input.zoom_level;
+    let viewport = crate::app::input::camera::tactical_viewport_px(state);
+    let offsets = [(6, 0), (-6, 0), (0, 6), (0, -6)];
+    let to = offsets
+        .into_iter()
+        .cycle()
+        .skip(direction % 4)
+        .take(4)
+        .find_map(|(dx, dy)| {
+            // Offsets from the partially stopped actor made this route drift
+            // out of view. The prepared origin keeps every waypoint bounded.
+            let desired = latency_waypoint(origin, (dx, dy))?;
+            legal_move_cell(state, actor, desired)
+                .ok()
+                .filter(|cell| *cell != from)
+                .filter(|cell| {
+                    state
+                        .resolved_terrain()
+                        .and_then(|terrain| terrain.cell(cell.0, cell.1))
+                        .is_some_and(|terrain| {
+                            let world = crate::app::input::camera::cell_centre_world_point(
+                                cell.0,
+                                cell.1,
+                                terrain.level,
+                            );
+                            fixed_view_cursor(world, camera, zoom, viewport).is_ok()
+                                && empty_ground_point(
+                                    crate::app::input::entity_pick::presented(state, sim),
+                                    world,
+                                    &owner_name,
+                                )
+                        })
+                })
+        })
+        .context("latency capture has no legal nearby Move goal")?;
+    let world = ground_world_point(state, to)?;
+    let input = &state.match_state.input;
+    let cursor = fixed_view_cursor(
+        world,
+        (input.camera_x, input.camera_y),
+        input.zoom_level,
+        crate::app::input::camera::tactical_viewport_px(state),
+    )?;
+    point_at_cursor(state, cursor);
+    let before = simulation(state)?.pending_local_command_count();
+    let at = left_click_timed(state);
+    let admission = latency_input_admission(
+        &mut state
+            .match_state
+            .sim_runtime
+            .as_mut()
+            .context("latency simulation")?
+            .simulation,
+        before,
+        actor,
+        Some(to),
+    )?;
+    Ok((to, LatencyInput { at, admission }))
+}
+
+fn latency_waypoint(origin: (u16, u16), offset: (i32, i32)) -> Option<(u16, u16)> {
+    Some((
+        u16::try_from(i32::from(origin.0) + offset.0).ok()?,
+        u16::try_from(i32::from(origin.1) + offset.1).ok()?,
+    ))
+}
+
+/// The bounded live-network input for maps with preplaced mobile units. It uses
+/// the same tactical selection, ground-click and key owners as the Battle route.
+pub(super) fn mobile_move_with_mouse(
+    state: &mut AppState,
+) -> Result<(u64, (u16, u16), (u16, u16))> {
+    let sim = simulation(state)?;
+    let owner = sim.session().current_house().context("local House")?;
+    let entity = sim
+        .entities()
+        .values_sorted()
+        .filter(|entity| {
+            entity.owner() == owner
+                && entity.is_alive()
+                && !entity.in_limbo()
+                && entity.locomotor.is_some()
+                && matches!(
+                    entity.category(),
+                    crate::map::entities::EntityCategory::Unit
+                        | crate::map::entities::EntityCategory::Infantry
+                )
+        })
+        // Real computer opponents can kill a starting infantryman before the
+        // command observation ends. Prefer a durable local mobile object.
+        .max_by_key(|entity| (entity.health.current(), entity.stable_id()))
+        .context("local mobile object")?;
+    let id = entity.stable_id();
+    let from = (entity.position.rx(), entity.position.ry());
+    let to = [(18, 0), (-18, 0), (0, 18), (0, -18)]
+        .into_iter()
+        .find_map(|(dx, dy)| {
+            let desired = (
+                u16::try_from(i32::from(from.0) + dx).ok()?,
+                u16::try_from(i32::from(from.1) + dy).ok()?,
+            );
+            legal_move_cell(state, id, desired)
+                .ok()
+                .filter(|cell| *cell != from)
+        })
+        .context("reachable tactical Move target")?;
+    ground_order_with_mouse(state, id, to)?;
+    Ok((id, from, to))
+}
+
+pub(super) fn mobile_stop_with_keyboard(state: &mut AppState, id: u64) -> Result<()> {
+    select_entity(state, id)?;
+    selected_stop_with_keyboard(state)
+}
+
+pub(super) fn selected_stop_with_keyboard(state: &mut AppState) -> Result<()> {
+    selected_stop_with_keyboard_timed(state).map(|_| ())
+}
+
+pub(super) fn latency_stop_with_keyboard(state: &mut AppState, actor: u64) -> Result<LatencyInput> {
+    ensure!(
+        projected_selection(state) == [actor],
+        "latency actor selection changed"
+    );
+    let before = simulation(state)?.pending_local_command_count();
+    let at = selected_stop_with_keyboard_timed(state)?;
+    let admission = latency_input_admission(
+        &mut state
+            .match_state
+            .sim_runtime
+            .as_mut()
+            .context("latency simulation")?
+            .simulation,
+        before,
+        actor,
+        None,
+    )?;
+    Ok(LatencyInput { at, admission })
+}
+
+fn selected_stop_with_keyboard_timed(
+    state: &mut AppState,
+) -> Result<crate::app::match_diagnostics::ObservationTime> {
+    let key = Key::Character("s".into());
+    ensure!(
+        state.match_state.input.hotkey_bindings.resolve_event(
+            &key,
+            KeyLocation::Standard,
+            state.match_state.input.hotkey_modifiers
+        ) == HotkeyResolution::Command(HotkeyCommand::StopObject),
+        "loaded S key is not the Stop binding"
+    );
+    let at = crate::app::match_diagnostics::ObservationTime::now();
+    chat_key(state, KeyCode::KeyS, &key, Some("s"));
+    Ok(at)
+}
+
+/// Select through the configured retail P binding twice: screen then map.
+pub(super) fn combatants_with_keyboard(state: &mut AppState) -> Result<()> {
+    let key = Key::Character("p".into());
+    ensure!(
+        state.match_state.input.hotkey_bindings.resolve_event(
+            &key,
+            KeyLocation::Standard,
+            state.match_state.input.hotkey_modifiers
+        ) == HotkeyResolution::Command(HotkeyCommand::CombatantSelect),
+        "loaded P key is not the CombatantSelect binding"
+    );
+    for _ in 0..2 {
+        chat_key(state, KeyCode::KeyP, &key, Some("p"));
+    }
+    Ok(())
+}
+
+/// Keep the full current selection and click ordinary empty ground.
+pub(super) fn selected_move_with_mouse(
+    state: &mut AppState,
+    actor: u64,
+    direction: usize,
+) -> Result<()> {
+    let sim = simulation(state)?;
+    let entity = sim.entities().get(actor).context("mass leader")?;
+    let from = (entity.position.rx(), entity.position.ry());
+    let mut chosen = None;
+    for distance in [18, 30, 48, 64] {
+        for (dx, dy) in [
+            (distance, 0),
+            (-distance, 0),
+            (0, distance),
+            (0, -distance),
+            (distance, distance),
+            (-distance, -distance),
+        ]
+        .into_iter()
+        .cycle()
+        .skip(direction)
+        .take(6)
+        {
+            let (Ok(x), Ok(y)) = (
+                u16::try_from(i32::from(from.0) + dx),
+                u16::try_from(i32::from(from.1) + dy),
+            ) else {
+                continue;
+            };
+            let Ok(cell) = legal_move_cell(state, actor, (x, y)) else {
+                continue;
+            };
+            let Some(terrain) = state
+                .resolved_terrain()
+                .and_then(|terrain| terrain.cell(cell.0, cell.1))
+            else {
+                continue;
+            };
+            let world =
+                crate::app::input::camera::cell_centre_world_point(cell.0, cell.1, terrain.level);
+            if empty_ground_point(
+                crate::app::input::entity_pick::presented(state, sim),
+                world,
+                &local_owner(state)?,
+            ) {
+                chosen = Some(cell);
+                break;
+            }
+        }
+        if chosen.is_some() {
+            break;
+        }
+    }
+    point_at_ground(state, chosen.context("empty ground for mass Move")?)?;
     for edge in [ElementState::Pressed, ElementState::Released] {
         dispatch::handle_mouse_input(state, MouseButton::Left, edge);
     }
@@ -1961,6 +3324,45 @@ fn repair_mode_key(state: &mut AppState, enabled: bool) -> Result<()> {
         ensure!(
             projected_selection(state).is_empty(),
             "Repair cursor did not clear projected selection"
+        );
+    }
+    Ok(())
+}
+
+fn sell_mode_key(state: &mut AppState, enabled: bool) -> Result<()> {
+    if state
+        .match_state
+        .match_presentation
+        .sidebar_gadget_state
+        .sell_mode_on
+        != enabled
+    {
+        let key = Key::Character("l".into());
+        let input = &state.match_state.input;
+        ensure!(
+            input.hotkey_bindings.resolve_event(
+                &key,
+                KeyLocation::Standard,
+                input.hotkey_modifiers
+            ) == HotkeyResolution::Command(HotkeyCommand::ToggleSell),
+            "loaded L does not resolve Sell; current binding={:?}",
+            input.hotkey_bindings.first_key(HotkeyCommand::ToggleSell)
+        );
+        chat_key(state, KeyCode::KeyL, &key, Some("l"));
+    }
+    ensure!(
+        state
+            .match_state
+            .match_presentation
+            .sidebar_gadget_state
+            .sell_mode_on
+            == enabled,
+        "real Sell key did not set the expected cursor mode"
+    );
+    if enabled {
+        ensure!(
+            projected_selection(state).is_empty(),
+            "Sell cursor did not clear projected selection"
         );
     }
     Ok(())
@@ -2052,18 +3454,58 @@ fn planning_rally_with_mouse(state: &mut AppState, id: u64, cell: (u16, u16)) ->
 }
 
 fn point_at_ground(state: &mut AppState, cell: (u16, u16)) -> Result<()> {
+    let world = ground_world_point(state, cell)?;
+    crate::app::input::camera::center_camera_on_cell(state, cell.0, cell.1);
+    point_at_world(state, world);
+    Ok(())
+}
+
+fn ground_world_point(state: &AppState, cell: (u16, u16)) -> Result<(f32, f32)> {
     let z = state
         .resolved_terrain()
         .and_then(|terrain| terrain.cell(cell.0, cell.1))
         .context("ground input terrain cell")?
         .level;
-    let world = crate::app::input::camera::cell_centre_world_point(cell.0, cell.1, z);
-    crate::app::input::camera::center_camera_on_cell(state, cell.0, cell.1);
+    Ok(crate::app::input::camera::cell_centre_world_point(
+        cell.0, cell.1, z,
+    ))
+}
+
+fn world_cursor(world: (f32, f32), camera: (f32, f32), zoom: f32) -> (f32, f32) {
+    ((world.0 - camera.0) * zoom, (world.1 - camera.1) * zoom)
+}
+
+fn fixed_view_cursor(
+    world: (f32, f32),
+    camera: (f32, f32),
+    zoom: f32,
+    viewport: (u32, u32, u32, u32),
+) -> Result<(f32, f32)> {
+    let cursor = world_cursor(world, camera, zoom);
+    let (x, y, w, h) = viewport;
+    ensure!(
+        cursor.0.is_finite()
+            && cursor.1.is_finite()
+            && cursor.0 >= x as f32
+            && cursor.0 < x.saturating_add(w) as f32
+            && cursor.1 >= y as f32
+            && cursor.1 < y.saturating_add(h) as f32,
+        "latency Move target leaves fixed tactical viewport: cursor={cursor:?}, viewport={viewport:?}"
+    );
+    Ok(cursor)
+}
+
+fn point_at_world(state: &mut AppState, world: (f32, f32)) {
+    let input = &state.match_state.input;
+    let cursor = world_cursor(world, (input.camera_x, input.camera_y), input.zoom_level);
+    point_at_cursor(state, cursor);
+}
+
+fn point_at_cursor(state: &mut AppState, cursor: (f32, f32)) {
     let input = &mut state.match_state.input;
-    input.cursor_x = (world.0 - input.camera_x) * input.zoom_level;
-    input.cursor_y = (world.1 - input.camera_y) * input.zoom_level;
+    input.cursor_x = cursor.0;
+    input.cursor_y = cursor.1;
     dispatch::handle_cursor_moved_in_game(state);
-    Ok(())
 }
 
 fn select_entity(state: &mut AppState, id: u64) -> Result<()> {
@@ -2101,7 +3543,7 @@ fn select_entity(state: &mut AppState, id: u64) -> Result<()> {
     Ok(())
 }
 
-fn projected_selection(state: &AppState) -> Vec<u64> {
+pub(super) fn projected_selection(state: &AppState) -> Vec<u64> {
     dispatch::selected_stable_ids_in_order(
         state
             .match_state
@@ -2217,10 +3659,7 @@ fn point_at_entity(state: &mut AppState, id: u64) -> Result<Option<u64>> {
     let world = crate::app::input::entity_pick::presented(state, simulation(state)?)
         .screen_position(entity);
     crate::app::input::camera::center_camera_on_cell(state, cell.0, cell.1);
-    let input = &mut state.match_state.input;
-    input.cursor_x = (world.0 - input.camera_x) * input.zoom_level;
-    input.cursor_y = (world.1 - input.camera_y) * input.zoom_level;
-    dispatch::handle_cursor_moved_in_game(state);
+    point_at_world(state, world);
     let sim = simulation(state)?;
     Ok(crate::app::input::entity_pick::hover_object_at_point(
         crate::app::input::entity_pick::presented(state, sim),
@@ -2265,4 +3704,204 @@ fn placement_cursor(state: &AppState, yard: u64, type_id: &str) -> Result<(u16, 
         }
     }
     anyhow::bail!("no legal {type_id} placement near deployed yard")
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::app::match_runtime::session::{MatchSession, NetworkReturnContext};
+    use crate::sim::house_state::HouseState;
+
+    #[test]
+    fn latency_waypoints_stay_anchored_and_do_not_wrap_at_map_edges() {
+        let origin = (52, 97);
+        assert_eq!(latency_waypoint(origin, (6, 0)), Some((58, 97)));
+        assert_eq!(latency_waypoint(origin, (-6, 0)), Some((46, 97)));
+        assert_eq!(latency_waypoint((3, 97), (-6, 0)), None);
+    }
+
+    #[test]
+    fn latency_fixed_view_projects_inside_and_rejects_offscreen_targets() {
+        let camera = (1_000., 2_000.);
+        let viewport = (0, 0, 472, 448);
+        assert_eq!(
+            fixed_view_cursor((1_100., 2_050.), camera, 2., viewport).unwrap(),
+            (200., 100.)
+        );
+        assert!(
+            fixed_view_cursor((1_236., 2_050.), camera, 2., viewport).is_err(),
+            "sidebar boundary must not recenter"
+        );
+        assert!(
+            fixed_view_cursor((999., 2_050.), camera, 2., viewport).is_err(),
+            "offscreen left must not recenter"
+        );
+    }
+
+    #[test]
+    fn latency_ground_target_rejects_the_friendly_object_picked_by_the_click() {
+        let mut sim = Simulation::new();
+        let owner = sim.intern("Human");
+        let typ = sim.intern("MTNK");
+        *sim.fog_mut_for_test() = crate::sim::vision::FogState::new(32, 32);
+        sim.fog_mut_for_test().reveal_all_for_owner(owner);
+        let mut unit = crate::sim::game_entity::GameEntity::new_at_frame_zero_for_test(
+            7,
+            10,
+            10,
+            0,
+            0,
+            owner,
+            crate::sim::combat::Health::new(100),
+            typ,
+            crate::map::entities::EntityCategory::Unit,
+            0,
+            5,
+            false,
+        );
+        unit.lifecycle.set_object_alive_for_test(true);
+        unit.lifecycle.set_in_limbo_for_test(false);
+        let point = crate::render::locomotor_visual::screen_position(&unit);
+        sim.entities_mut_for_test().insert(unit);
+        sim.resubmit_entity_display_for_test(7);
+        assert!(!empty_ground_point(&sim, point, "Human"));
+        assert!(empty_ground_point(&sim, (point.0 + 100., point.1), "Human"));
+    }
+
+    #[test]
+    fn latency_admission_requires_one_actual_matching_outlist_record() {
+        use crate::sim::command::{CommandEnvelope, CommandRecord, IDLE_OPCODE, StopRecord};
+        let mut sim = Simulation::new();
+        let owner = sim.intern("Human");
+        sim.houses_mut_for_test()
+            .register(HouseState::new(owner, 0, None, true, 0, 10));
+        sim.session_mut_for_test()
+            .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Wol);
+        sim.session_mut_for_test()
+            .set_current_house_for_test(Some(owner));
+        sim.entities_mut_for_test()
+            .insert(crate::sim::game_entity::GameEntity::test_default(
+                7, "MTNK", "Human", 10, 10,
+            ));
+        assert!(latency_input_admission(&mut sim, 0, 7, None).is_err());
+        let mut record = CommandRecord::encode(IDLE_OPCODE, 0, 0, &[]).unwrap();
+        StopRecord {
+            house_id: 0,
+            frame: 0,
+            entity_id: 7,
+        }
+        .write_into(&mut record);
+        assert!(sim.issue_local_command(CommandEnvelope::synchronized(record, 0)));
+        assert!(latency_input_admission(&mut sim, 0, 7, Some((10, 10))).is_err());
+        assert!(latency_input_admission(&mut sim, 0, 8, None).is_err());
+        let proof = latency_input_admission(&mut sim, 0, 7, None).unwrap();
+        assert_eq!(proof["outlist_before"], 0);
+        assert_eq!(proof["outlist_after"], 1);
+        assert_eq!(
+            sim.pending_local_command_count(),
+            1,
+            "observation must not drain OutList"
+        );
+    }
+
+    fn admitted_pair(
+        local_first: bool,
+    ) -> (
+        MatchSession,
+        Simulation,
+        [crate::sim::intern::InternedId; 2],
+    ) {
+        let fixture: Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/map_observation.command-bar.example.json",
+        ))
+        .unwrap();
+        let mut launch: crate::skirmish_launch::SkirmishLaunchSession =
+            serde_json::from_value(fixture["launch"].clone()).unwrap();
+        launch.opponents.clear();
+        launch.ai_player_count = 0;
+        launch.humans[0].name = "VH1a2b3c4d5e".into();
+        launch.humans[0].raw_slot_index = Some(0);
+        let mut guest = launch.humans[0].clone();
+        guest.name = "VG6f7a8b9c0d".into();
+        guest.raw_slot_index = Some(1);
+        guest.slot.color_index = 2;
+        launch.humans.push(guest);
+        launch.local_player_index = 1;
+        if local_first {
+            launch.humans.swap(0, 1);
+            launch.local_player_index = 0;
+        }
+        let mut session = MatchSession::default();
+        session.enter_network(if local_first {
+            NetworkReturnContext::LanLobby
+        } else {
+            NetworkReturnContext::Wol
+        });
+        session.accept_network_setup(launch, false, None).unwrap();
+        let mut sim = Simulation::new();
+        let host = sim.intern("VH1a2b3c4d5e");
+        let guest = sim.intern("VG6f7a8b9c0d");
+        let neutral = sim.intern("Neutral");
+        let special = sim.intern("Special");
+        // Deliberately distinct native/participant order, with nonparticipant
+        // Houses. Neither actual account name is a diagnostic role label.
+        for (index, (owner, human)) in [
+            (neutral, false),
+            (guest, true),
+            (special, false),
+            (host, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sim.houses_mut_for_test().register(HouseState::new(
+                owner,
+                index as u8,
+                None,
+                human,
+                0,
+                10,
+            ));
+        }
+        (session, sim, [host, guest])
+    }
+
+    #[test]
+    fn battle_roles_resolve_dynamic_accounts_through_the_actual_native_house_table() {
+        let (session, sim, owners) = admitted_pair(false);
+        assert_eq!(battle_owners(&session, &sim).unwrap(), owners);
+        assert_eq!(battle_human_index(&session, &sim, owners[0]).unwrap(), 0);
+        assert_eq!(battle_human_index(&session, &sim, owners[1]).unwrap(), 1);
+        assert_eq!(
+            crate::app::match_runtime::network_match::source_house(&session, &sim, 0),
+            Some(3)
+        );
+        assert_eq!(
+            crate::app::match_runtime::network_match::source_house(&session, &sim, 1),
+            Some(1)
+        );
+        let mut host_session = session.clone();
+        let mut launch = host_session.network_setup().unwrap().clone();
+        launch.local_player_index = 0;
+        host_session
+            .accept_network_setup(launch, true, None)
+            .unwrap();
+        assert_eq!(battle_owners(&host_session, &sim).unwrap(), owners);
+    }
+
+    #[test]
+    fn battle_roles_preserve_lan_local_first_admission_and_reject_foreign_houses() {
+        let (session, sim, owners) = admitted_pair(true);
+        assert_eq!(session.network_setup().unwrap().local_player_index, 0);
+        assert_eq!(
+            session.network_source_owner(0).as_deref(),
+            Some("VG6f7a8b9c0d")
+        );
+        assert_eq!(battle_owners(&session, &sim).unwrap(), owners);
+        assert_eq!(battle_human_index(&session, &sim, owners[0]).unwrap(), 0);
+        assert_eq!(battle_human_index(&session, &sim, owners[1]).unwrap(), 1);
+        assert!(
+            battle_human_index(&session, &sim, sim.interner().get("Neutral").unwrap()).is_err()
+        );
+    }
 }

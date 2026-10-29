@@ -438,6 +438,7 @@ pub(super) fn push_random_map_setup_modal_control_instances(
                 layout.scale,
             ),
             plaque: true,
+            disabled: false,
         },
         layout.scale,
     );

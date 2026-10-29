@@ -133,7 +133,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use crate::util::time::{Duration, Instant};
 
 use super::foot_path::MoverLift;
 use super::movement_path::MovePathFailure;
@@ -703,6 +703,15 @@ impl Simulation {
     /// `None` while the simulation searches serially, since then no pass runs.
     pub fn path_batch_stats(&self) -> Option<PathBatchStats> {
         Some(self.path_batch.as_ref()?.stats.stats())
+    }
+
+    /// Actor ids whose requests are waiting for the next live object pass.
+    /// A Foot can register more than once in a pass; callers needing a set
+    /// deduplicate this read-only projection of the existing pending queue.
+    pub fn pending_path_search_actor_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.path_batch
+            .iter()
+            .flat_map(|batch| batch.pending.iter().map(|&(id, _)| id))
     }
 
     /// The end of the live object pass: its answers expire.

@@ -1654,13 +1654,10 @@ pub(super) fn materialize_map_load_cells(
 ) -> Vec<MapCell> {
     let n = map.header.width;
     let m = map.header.height;
-    let Some(max_coord) = n.checked_add(m) else {
-        return Vec::new();
-    };
     // The native owner is a fixed 512x512 CellClass lookup. Retail maps fit
     // this boundary; reject malformed dimensions instead of iterating an
     // unbounded signed-bit-pattern value from the INI.
-    if n == 0 || m == 0 || max_coord > 512 {
+    if !map.header.fits_cell_grid() {
         return Vec::new();
     }
 

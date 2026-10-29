@@ -17,14 +17,7 @@ use crate::sim::movement::infantry_action::{DO_DEPLOY, DO_DEPLOYED, DO_DEPLOYED_
 use crate::sim::world::Simulation;
 
 fn retail_rules() -> Option<RuleSet> {
-    let art = crate::rules::retail_ini_fixture::retail_ini("artmd.ini")?;
-    let mut rules = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()?;
-    // The app's ART sequence binding, without which an infantryman's
-    // Do_Action refuses an action his sequence holds.
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-    );
-    Some(rules)
+    crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
 }
 
 /// The flat arena with the computer `Russians` and the human `Americans`.
@@ -817,6 +810,34 @@ fn a_computers_deployed_gi_undeploys_to_approach_a_target_out_of_reach() {
             None if !approaches => {}
             other => panic!("against {tank_cell:?}: NavCom {other:?}"),
         }
+    }
+}
+
+/// Phobos `InfantryAutoDeploy`: after the Foot body the hook at `0x00522373`
+/// enters the deploy arm, where a computer's still GI with the tank in his
+/// deploy weapon's reach deploys (Do_Action(0x1B), `0x00522472`). Without
+/// the key he takes only the Foot body.
+#[cfg(feature = "phobos")]
+#[test]
+fn a_computers_gi_auto_deploys_with_a_target_in_reach() {
+    let Some(mut rules) = retail_rules() else {
+        return;
+    };
+    for auto_deploy in [false, true] {
+        rules.general.infantry_auto_deploy = auto_deploy;
+        let mut sim = arena(&rules);
+        let gi = spawn(&mut sim, &rules, "E1", "Russians", (10, 10));
+        let tank = spawn(&mut sim, &rules, "MTNK", "Americans", (13, 10));
+        target(&mut sim, gi, tank);
+        start_mission(&mut sim, gi, MissionType::Attack);
+        sim.approach_target(gi, &rules, None, crate::sim::world::FrameEffects::default());
+        let entity = sim.substrate.entities.get(gi).unwrap();
+        let doing = entity.mission_leaf.as_infantry().unwrap().doing();
+        assert_eq!(
+            doing == DO_DEPLOY,
+            auto_deploy,
+            "InfantryAutoDeploy={auto_deploy}"
+        );
     }
 }
 

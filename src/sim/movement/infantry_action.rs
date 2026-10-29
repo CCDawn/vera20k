@@ -151,6 +151,32 @@ impl Simulation {
         }
     }
 
+    /// gamemd.exe InfantryClass::PlayIdleAnim521C60 (Foot virtual520).
+    /// Argument1 requests Idle2; every other value requests Idle1, with
+    /// force0/random-stage0. Do_Action owns admission and the retained clock.
+    /// Unit/Aircraft inherit the empty Foot41C120 receiver. No idle-action
+    /// timer rearm or VoiceComment selection belongs to this receiver.
+    pub(crate) fn foot_play_idle_animation(
+        &mut self,
+        id: u64,
+        variant: i32,
+        rules: &RuleSet,
+        effects: FrameEffects<'_>,
+    ) {
+        if !self
+            .substrate
+            .entities
+            .get(id)
+            .is_some_and(|actor| actor.category() == EntityCategory::Infantry)
+        {
+            return;
+        }
+        let action = if variant == 1 { DO_IDLE2 } else { DO_IDLE1 };
+        if let Err(cause) = self.infantry_do_action(id, action, false, rules, effects) {
+            log::debug!("infantry {id} PlayIdleAnim: {cause}");
+        }
+    }
+
     /// `InfantryClass::Do_Action` 0x0051D6F0 for `requested` with the
     /// caller's `force` and a random-frame argument 0, as the class's own
     /// receivers request it. Answers whether the action was accepted.
@@ -467,6 +493,14 @@ impl Simulation {
                 .set_foot_firing_sequence(0);
             self.infantry_do_action(id, requested, false, rules, effects)?;
         }
+        // InfantryClass::AI51BEC0 calls TryThiefVehicleCapture5202F0 before
+        // the second Ready/Commence. Success returns before Fear/Fire/Doing.
+        let capture = self.infantry_try_thief_capture(id, rules, registry, effects)?;
+        if capture.consumed {
+            let mut receipt = DamageCommitReceipt::default();
+            receipt.bridge_state_changed = capture.bridge_state_changed;
+            return Ok(receipt);
+        }
         self.object_ai_post_movement_promote_one(id, rules);
         //51BF0B is after Process and the second Ready/Commence, including a
         // retained death sequence. Shared DoAction decides stance refusal.
@@ -479,7 +513,7 @@ impl Simulation {
             registry,
             effects,
         );
-        receipt.bridge_state_changed |= bridge_changed;
+        receipt.bridge_state_changed |= bridge_changed || capture.bridge_state_changed;
         if self
             .substrate
             .entities

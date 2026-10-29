@@ -40,6 +40,10 @@ pub struct BeaconArt {
 }
 
 impl BeaconArt {
+    pub fn house_count(&self) -> usize {
+        self.tactical.len()
+    }
+
     /// `ramps` holds each beacon row's House ramp, in House order.
     pub fn new(
         device: &wgpu::Device,

@@ -46,6 +46,7 @@ fn fixture(threshold: i32, target_action: bool) -> Simulation {
         &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
         None,
         None,
+        None,
     );
     sim.classify_map_triggers(crate::rules::ruleset::RuleSet::empty_for_test());
     sim.session.publish_started();

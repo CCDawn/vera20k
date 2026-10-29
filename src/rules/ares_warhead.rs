@@ -13,6 +13,15 @@ pub(crate) struct AresWarheadRules {
     affects_enemies: bool,
     affects_owner: Option<bool>,
     attach_effect: AttachEffectRules,
+    #[cfg(feature = "ares")]
+    #[serde(default)]
+    kill_driver: KillDriverRules,
+    #[cfg(feature = "ares")]
+    #[serde(default)]
+    effects_require_damage: bool,
+    #[cfg(feature = "ares")]
+    #[serde(default = "default_effects_require_verses")]
+    effects_require_verses: bool,
 }
 impl Default for AresWarheadRules {
     fn default() -> Self {
@@ -23,6 +32,12 @@ impl Default for AresWarheadRules {
             affects_enemies: true,
             affects_owner: None,
             attach_effect: Default::default(),
+            #[cfg(feature = "ares")]
+            kill_driver: Default::default(),
+            #[cfg(feature = "ares")]
+            effects_require_damage: false,
+            #[cfg(feature = "ares")]
+            effects_require_verses: true,
         }
     }
 }
@@ -63,6 +78,18 @@ impl AresWarheadRules {
         self.affects_owner
     }
     #[cfg(feature = "ares")]
+    pub(crate) fn kill_driver(&self) -> &KillDriverRules {
+        &self.kill_driver
+    }
+    #[cfg(feature = "ares")]
+    pub(crate) fn effects_require_damage(&self) -> bool {
+        self.effects_require_damage
+    }
+    #[cfg(feature = "ares")]
+    pub(crate) fn effects_require_verses(&self) -> bool {
+        self.effects_require_verses
+    }
+    #[cfg(feature = "ares")]
     pub(crate) fn read_pass(
         &mut self,
         section: &IniSection,
@@ -76,12 +103,116 @@ impl AresWarheadRules {
         }
         self.affects_enemies = section.read_ares_bool("AffectsEnemies", self.affects_enemies);
         self.affects_owner = section.read_ares_nullable_bool("AffectsOwner", self.affects_owner);
+        self.kill_driver.read_pass(section);
+        // WarheadExt+130/+131, ctor10051A8E=false/true; reads1005231D/33.
+        self.effects_require_damage =
+            section.read_ares_bool("EffectsRequireDamage", self.effects_require_damage);
+        self.effects_require_verses =
+            section.read_ares_bool("EffectsRequireVerses", self.effects_require_verses);
         self.attach_effect.read_pass(section, animation);
     }
 }
 
-/// WarheadExt+88, constructor 10051890 and reader 10058A50. This is the
-/// descriptor, not the independently timed TechnoExt+20 instance vector.
+#[cfg(feature = "ares")]
+fn default_effects_require_verses() -> bool {
+    true
+}
+
+/// Installed house-selector table10095264, reader1000A660 and shared
+/// resolver10021310. The selector's random permission is a consumer input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[cfg(feature = "ares")]
+pub(crate) enum HouseSelector {
+    Default,
+    Invoker,
+    Killer,
+    Victim,
+    Civilian,
+    Special,
+    Neutral,
+    Random,
+}
+
+#[cfg(feature = "ares")]
+impl HouseSelector {
+    #[cfg(feature = "ares")]
+    fn read(self, section: &IniSection, key: &str) -> Self {
+        const VALUES: [(&str, HouseSelector); 8] = [
+            ("default", HouseSelector::Default),
+            ("invoker", HouseSelector::Invoker),
+            ("killer", HouseSelector::Killer),
+            ("victim", HouseSelector::Victim),
+            ("civilian", HouseSelector::Civilian),
+            ("special", HouseSelector::Special),
+            ("neutral", HouseSelector::Neutral),
+            ("random", HouseSelector::Random),
+        ];
+        section.read_string_with(key, 2048, self, |current, raw| {
+            VALUES
+                .iter()
+                .find_map(|(name, value)| name.eq_ignore_ascii_case(raw).then_some(*value))
+                .unwrap_or(current)
+        })
+    }
+}
+
+/// WarheadExt+5D..74, constructor1005194B/1005194E/10051A70/10051A77.
+/// ReadINI1005207E..100520D8 uses the exact full keys, without clamps.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[cfg(feature = "ares")]
+pub(crate) struct KillDriverRules {
+    enabled: bool,
+    kill_below_percent: NativeF64Bits,
+    chance: NativeF64Bits,
+    owner: HouseSelector,
+    remove_veterancy: bool,
+}
+
+#[cfg(feature = "ares")]
+impl Default for KillDriverRules {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            kill_below_percent: NativeF64Bits::ONE,
+            chance: NativeF64Bits::ONE,
+            owner: HouseSelector::Special,
+            remove_veterancy: false,
+        }
+    }
+}
+
+#[cfg(feature = "ares")]
+impl KillDriverRules {
+    #[cfg(feature = "ares")]
+    fn read_pass(&mut self, section: &IniSection) {
+        self.enabled = section.read_ares_bool("KillDriver", self.enabled);
+        self.kill_below_percent =
+            section.read_ares_double_bits("KillDriver.KillBelowPercent", self.kill_below_percent);
+        self.chance = section.read_ares_double_bits("KillDriver.Chance", self.chance);
+        self.owner = self.owner.read(section, "KillDriver.Owner");
+        self.remove_veterancy =
+            section.read_ares_bool("KillDriver.RemoveVeterancy", self.remove_veterancy);
+    }
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
+    }
+    pub(crate) fn kill_below_percent(&self) -> NativeF64Bits {
+        self.kill_below_percent
+    }
+    pub(crate) fn chance(&self) -> NativeF64Bits {
+        self.chance
+    }
+    pub(crate) fn owner(&self) -> HouseSelector {
+        self.owner
+    }
+    pub(crate) fn remove_veterancy(&self) -> bool {
+        self.remove_veterancy
+    }
+}
+
+/// Shared descriptor: WarheadExt+88 (constructor10051890) and
+/// TechnoTypeExt+290 (constructor1003CA84). Both call ReadINI10058A50;
+/// TechnoType does so at1003E8D4. Instances live in TechnoExt+20.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AttachEffectRules {
     duration: i32,
@@ -137,6 +268,9 @@ impl AttachEffectRules {
     pub(crate) fn discard_on_entry(&self) -> bool {
         self.discard_on_entry
     }
+    pub(crate) fn force_decloak(&self) -> bool {
+        self.force_decloak
+    }
     pub(crate) fn penetrates_iron_curtain(&self) -> bool {
         self.penetrates_iron_curtain
     }
@@ -146,17 +280,28 @@ impl AttachEffectRules {
     pub(crate) fn firepower_multiplier(&self) -> NativeF64Bits {
         self.firepower
     }
-    /// Ground WH effects support ordered speed and firepower aggregates. Other
-    /// stat/decloak/Temporal/self-effect consumers remain separate mechanisms.
+    pub(crate) fn armor_multiplier(&self) -> NativeF64Bits {
+        self.armor
+    }
+    pub(crate) fn rof_multiplier(&self) -> NativeF64Bits {
+        self.rof
+    }
+    pub(crate) fn cloakable(&self) -> bool {
+        self.cloakable
+    }
+    pub(crate) fn delay(&self) -> i32 {
+        self.delay
+    }
+    pub(crate) fn initial_delay(&self) -> i32 {
+        self.initial_delay
+    }
+    /// Warhead and self effects share the stat/cloak aggregates. Temporal
+    /// animation visibility remains a separate mechanism.
     pub(crate) fn visual_combat_path(&self) -> bool {
-        self.armor == NativeF64Bits::ONE
-            && self.rof == NativeF64Bits::ONE
-            && !self.cloakable
-            && !self.force_decloak
-            && !self.temporal_hides_anim
+        !self.temporal_hides_anim
     }
     #[cfg(feature = "ares")]
-    fn read_pass(&mut self, section: &IniSection, animation: Option<Option<String>>) {
+    pub(crate) fn read_pass(&mut self, section: &IniSection, animation: Option<Option<String>>) {
         // Exact 10058A59..10058B3A read order. Missing keys retain the live
         // constructor/prior-layer value; existing scalar readers own parsing.
         self.duration = section.read_ares_int("AttachEffect.Duration", self.duration);
@@ -197,6 +342,41 @@ mod tests {
         native_processing::{RulesLayerKind, RulesLayerStack},
         ruleset::RuleSet,
     };
+
+    #[test]
+    fn self_attach_effect_uses_retained_type_reader_and_build_gate() {
+        let root = IniFile::from_str(
+            "[VehicleTypes]\n0=SELF_TEST\n[Animations]\n0=GLOW\n\
+            [SELF_TEST]\nStrength=100\nAttachEffect.Duration=3\nAttachEffect.Delay=2\n\
+            AttachEffect.InitialDelay=2\nAttachEffect.Cloakable=yes\nAttachEffect.Animation=GLOW\n",
+        );
+        let read = |extra: &str| {
+            let mut layers = RulesLayerStack::new(root.clone());
+            layers.push(RulesLayerKind::Scenario, IniFile::from_str(extra));
+            RuleSet::from_processed_rules(&layers.process().unwrap()).unwrap()
+        };
+        let rules = read(
+            "[SELF_TEST]\nAttachEffect.Duration=junk\nAttachEffect.InitialDelay=0\nCloakable.Allowed=no\n",
+        );
+        let kind = rules.object("SELF_TEST").unwrap();
+        if crate::rules::ARES_ENABLED {
+            let effect = kind.self_attach_effect().unwrap();
+            assert_eq!(
+                (effect.duration(), effect.delay(), effect.initial_delay()),
+                (3, 2, 0)
+            );
+            assert!(effect.cloakable());
+            assert_eq!(effect.animation(), Some("GLOW"));
+            assert!(!kind.cloak_allowed());
+            assert_ne!(
+                rules.simulation_config_hash(),
+                read("[SELF_TEST]\nAttachEffect.Duration=5\n").simulation_config_hash()
+            );
+        } else {
+            assert!(kind.self_attach_effect().is_none());
+            assert!(kind.cloak_allowed());
+        }
+    }
 
     #[test]
     fn attach_effect_production_layers_retain_registry_references_and_feature_gate() {

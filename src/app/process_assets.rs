@@ -167,7 +167,10 @@ impl ProcessAssets {
             } else {
                 None
             };
-            let definitions = crate::rules::audio_sources::AudioDefinitions::select(assets);
+            let definitions = crate::rules::audio_sources::AudioDefinitions::select_admitting(
+                assets,
+                index.as_ref().map(|loaded| &loaded.index),
+            );
             let source_receipt = serde_json::json!({
                 "soundmd": definitions.sound_source(),
                 "evamd": definitions.eva_source(),
@@ -287,6 +290,58 @@ impl ProcessAssets {
         self.native_ini_hashes
     }
 
+    /// The VERA protocol compares the exact process-selected Rules/LANGRULE/ART
+    /// plus the selected mode and AIMD snapshots used by scenario loading.
+    /// The legacy advertisement CRC remains a separate native UI value.
+    pub(crate) fn multiplayer_rules_digest(&self, mode: &str) -> Result<String, String> {
+        use crate::rules::retail_sources::{select_ini, select_mode_ini};
+        let rules = self
+            .native_rules
+            .as_ref()
+            .ok_or("retail rules not loaded")?;
+        let assets = self.manager.as_ref().ok_or("retail sources are loading")?;
+        let ai = select_ini(assets, assets.ini_roots().ai())?;
+        let selected_mode = select_mode_ini(assets, Some(mode))?;
+        let mut digests = rules.multiplayer_source_digests().to_vec();
+        digests.push(Some(ai.ini.multiplayer_digest()));
+        digests.push(
+            selected_mode
+                .as_ref()
+                .map(crate::rules::ini_parser::IniFile::multiplayer_digest),
+        );
+        let mut bytes = b"VERA20k rules agreement v1\0".to_vec();
+        for digest in digests {
+            bytes.push(u8::from(digest.is_some()));
+            if let Some(digest) = digest {
+                bytes.extend_from_slice(digest.as_bytes());
+            }
+        }
+        Ok(crate::util::sha256::sha256_hex(&bytes))
+    }
+
+    /// A seed regenerates its map after Start, so its rules agreement also
+    /// covers the inputs selected by the ordinary generation preparation.
+    pub(crate) fn multiplayer_generated_rules_digest(
+        &mut self,
+        mode: &str,
+        options: &crate::map::rmg::RmgOptions,
+    ) -> Result<String, String> {
+        let rules = self.multiplayer_rules_digest(mode)?;
+        let assets = self.manager.as_mut().ok_or("retail sources are loading")?;
+        let mode_rules = crate::rules::retail_sources::select_mode_ini(assets, Some(mode))?;
+        let prepared = crate::app::shell_random_map::prepare_random_map_generation(
+            assets,
+            options,
+            self.native_rules.as_ref(),
+            mode_rules.as_ref(),
+        )
+        .ok_or("generated map theater is unavailable")?;
+        let mut bytes = b"VERA20k generated rules agreement v1\0".to_vec();
+        bytes.extend_from_slice(rules.as_bytes());
+        bytes.extend_from_slice(prepared.multiplayer_digest().as_bytes());
+        Ok(crate::util::sha256::sha256_hex(&bytes))
+    }
+
     /// Hash the process sources once (`crate::rules::native_ini_hash`):
     /// the selected rules root and ART, AIMD, each mode's INI by id
     /// `1..=count` and CoopCampMD.
@@ -362,6 +417,65 @@ impl ProcessAssets {
             .flat_map(|rules| rules.multiplayer_countries())
     }
 
+    #[cfg(feature = "ares")]
+    pub(crate) fn country_random_rows(&self) -> Vec<(&str, Option<&str>, bool, i32, i32)> {
+        self.native_rules
+            .as_ref()
+            .map(|rules| rules.country_random_rows())
+            .unwrap_or_default()
+    }
+
+    /// The side's `DialogBackground.Image/.Palette` pair for the shell dialog
+    /// chrome, or `None` to keep the stock per-side backgrounds.
+    #[cfg(feature = "ares")]
+    pub(crate) fn side_dialog_background(&self, side: i32) -> Option<(String, String)> {
+        self.native_rules
+            .as_ref()
+            .and_then(|rules| rules.side_dialog_background(side))
+            .map(|(image, palette)| (image.to_owned(), palette.to_owned()))
+    }
+
+    /// The score dialog's theme name for a side, or `None` for gamemd's
+    /// literal `SCORE`.
+    pub(crate) fn side_score_theme(
+        &self,
+        side: i32,
+        theme: crate::rules::ruleset::ScoreTheme,
+    ) -> Option<&str> {
+        self.native_rules
+            .as_ref()
+            .and_then(|rules| rules.side_score_theme(side, theme))
+    }
+
+    /// The shell side's `Game_LoadCampaignScoreAssets` /
+    /// `Game_LoadMultiplayerScoreAssets` file names. Every field `None` keeps
+    /// that name's fixed stock table entry.
+    pub(crate) fn side_score_art(&self, side: i32) -> crate::rules::ruleset::SideScoreArt<'_> {
+        self.native_rules
+            .as_ref()
+            .map(|rules| rules.side_score_art(side))
+            .unwrap_or_default()
+    }
+
+    /// `Game_GetFlagSurface @ 0x1001DCE0` country insignia by HouseType index,
+    /// for lobby/diplomacy rows that resolve before a match Rules projection
+    /// exists.
+    pub(crate) fn country_flag_surface(&self, index: u16) -> Option<String> {
+        #[cfg(feature = "ares")]
+        {
+            return self
+                .native_rules
+                .as_ref()
+                .and_then(|rules| rules.country_flag_surface(index))
+                .map(str::to_owned);
+        }
+        #[cfg(not(feature = "ares"))]
+        {
+            let _ = index;
+            None
+        }
+    }
+
     pub(crate) fn project_multiplayer_countries(
         &self,
         projection: &mut crate::rules::ruleset::RuleSet,
@@ -392,6 +506,19 @@ impl ProcessAssets {
     /// Shared borrow while the manager is home (`Available`).
     pub(crate) fn manager(&self) -> Option<&AssetManager> {
         self.manager.as_ref()
+    }
+
+    /// Field-level split borrow for a scenario rescan: the scan registers loose
+    /// YRO archives, and its PKT titles resolve through the process CSF. Both
+    /// fields live on this owner, so the pair is borrowed together.
+    #[cfg(feature = "verax")]
+    pub(crate) fn scenario_rescan_sources(
+        &mut self,
+    ) -> (
+        Option<&mut AssetManager>,
+        Option<&crate::assets::csf_file::CsfFile>,
+    ) {
+        (self.manager.as_mut(), self.csf.as_ref())
     }
 
     /// Field-level split borrow: the resident manager and the terrain-variant
@@ -459,6 +586,83 @@ impl ProcessAssets {
 mod tests {
     use super::{MediaArchiveMode, ProcessAssets};
     use crate::assets::asset_manager::AssetManager;
+
+    #[test]
+    fn generated_rules_agreement_covers_rmg_settings_and_theater_inputs() {
+        let dir = crate::assets::asset_manager::test_support::audio_test_install("rmg-agreement");
+        for (name, bytes) in [
+            ("rulesmd.ini", "[General]\nBuildSpeed=.7\n"),
+            ("artmd.ini", "[UNIT]\nVoxel=yes\n"),
+            ("aimd.ini", "[AI]\nValue=1\n"),
+            ("rmgmd.ini", "[General]\nMaxTrees=500\n"),
+            (
+                "temperatmd.ini",
+                "[General]\n[TileSet0000]\nFileName=clear\nTilesInSet=1\nMorphable=yes\n",
+            ),
+        ] {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        for name in ["unittem.pal", "isotem.pal", "temperat.pal"] {
+            std::fs::write(dir.path().join(name), [0_u8; 768]).unwrap();
+        }
+        let digest = || {
+            let mut process = ProcessAssets::new(MediaArchiveMode::STOCK_DIGITAL, false);
+            let assets = AssetManager::new(dir.path(), MediaArchiveMode::STOCK_DIGITAL).unwrap();
+            process.initialize_sources_if_needed(&assets).unwrap();
+            process.return_from_loading(assets);
+            process
+                .multiplayer_generated_rules_digest("", &crate::map::rmg::RmgOptions::default())
+                .unwrap()
+        };
+        let original = digest();
+        std::fs::write(dir.path().join("rmgmd.ini"), "[General]\nMaxTrees=501\n").unwrap();
+        assert_ne!(original, digest(), "generator tuning must agree");
+        std::fs::write(dir.path().join("rmgmd.ini"), "[General]\nMaxTrees=500\n").unwrap();
+        std::fs::write(
+            dir.path().join("temperatmd.ini"),
+            "[General]\n[TileSet0000]\nFileName=clear\nTilesInSet=1\nMorphable=no\n",
+        )
+        .unwrap();
+        assert_ne!(original, digest(), "resolved theater inputs must agree");
+    }
+
+    #[test]
+    fn multiplayer_agreement_covers_frozen_langrule_and_the_selected_mode() {
+        let dir =
+            crate::assets::asset_manager::test_support::audio_test_install("multiplayer-agreement");
+        for (name, bytes) in [
+            ("rulesmd.ini", "[General]\nBuildSpeed=.7\n"),
+            ("artmd.ini", "[UNIT]\nVoxel=yes\n"),
+            ("aimd.ini", "[AI]\nValue=1\n"),
+            (
+                "langrule.ini",
+                crate::rules::retail_ini_fixture::DIGESTED_LANGRULE_CONTROL,
+            ),
+            ("mode.ini", "[General]\nBuildSpeed=.6\n"),
+        ] {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        let mut process = ProcessAssets::new(MediaArchiveMode::STOCK_DIGITAL, false);
+        let assets = AssetManager::new(dir.path(), MediaArchiveMode::STOCK_DIGITAL).unwrap();
+        process.initialize_sources_if_needed(&assets).unwrap();
+        process.return_from_loading(assets);
+        let original = process.multiplayer_rules_digest("mode.ini").unwrap();
+        assert_ne!(original, process.multiplayer_rules_digest("").unwrap());
+        std::fs::remove_file(dir.path().join("langrule.ini")).unwrap();
+        assert_eq!(
+            original,
+            process.multiplayer_rules_digest("mode.ini").unwrap(),
+            "the live process retains its source snapshot"
+        );
+        let mut fresh = ProcessAssets::new(MediaArchiveMode::STOCK_DIGITAL, false);
+        let assets = AssetManager::new(dir.path(), MediaArchiveMode::STOCK_DIGITAL).unwrap();
+        fresh.initialize_sources_if_needed(&assets).unwrap();
+        fresh.return_from_loading(assets);
+        assert_ne!(
+            original,
+            fresh.multiplayer_rules_digest("mode.ini").unwrap()
+        );
+    }
 
     #[test]
     fn personal_rules_and_map_priority_participate_in_network_compatibility() {

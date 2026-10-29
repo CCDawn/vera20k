@@ -475,8 +475,11 @@ impl Simulation {
         // 5. `0x00441702..0x0044172F`: a computer house's `RevealToAll=`
         // building releases its sight for the current house
         // (`ReReveal(0, 0, 1, PlayerPtr)`).
-        if object.reveal_to_all && !self.house_is_human_player(owner) {
-            self.rereveal_sight_to_current_house(building_id, rules);
+        if object.reveal_to_all
+            && (self.session.game_mode().is_network() || !self.house_is_human_player(owner))
+        {
+            //441718 excludes only this represented player's own building.
+            self.rereveal_sight_to_current_house(building_id, rules, true);
         }
 
         // BuildingClass::DestructionEffects44173F..441779: after nested

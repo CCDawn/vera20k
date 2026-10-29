@@ -113,7 +113,7 @@ fn retail_local_defeat_delivers_radar_off_then_on_in_one_house_frame() {
             .as_bytes(),
         )
         .unwrap();
-        sim.initialize_trigger_definitions(&map, &Default::default(), None, None);
+        sim.initialize_trigger_definitions(&map, &Default::default(), None, None, None);
         sim.classify_map_triggers(&rules);
         while sim.session().binary_frame() <= 8 {
             frame(&mut sim, &rules, &boundary);

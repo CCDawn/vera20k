@@ -692,6 +692,7 @@ fn primary_event_failed_building_resolution_preserves_a_live_units_plan() {
                 target_rx: 12,
                 target_ry: 20,
             },
+            None,
         )
         .unwrap();
     let planned = sim.decode_native_command_record(&record, 0).unwrap();

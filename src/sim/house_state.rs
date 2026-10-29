@@ -181,13 +181,33 @@ pub struct HouseOutcomeState {
 ///
 /// The emergency block of `HouseClass::AI_Building_Strategy @ 0x004FD7A0`
 /// (`sim::house_strategy`) steps the mode; All_To_Hunt sets the latch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HouseStrategyEmergencyState {
     mode: i32,
     all_to_hunt_bias: bool,
     last_building_attack_frame: i32,
     #[serde(default = "last_attacker_house_index_default")]
     last_attacker_house_index: i32,
+    /// Phobos HouseExt `AIFireSaleDelayTimer` (persisted): None until the
+    /// first last-legs tick with a positive `[General] AIFireSaleDelay=`.
+    #[cfg(feature = "phobos")]
+    #[serde(default)]
+    ai_fire_sale_delay_timer: Option<CdTimer>,
+}
+
+impl std::hash::Hash for HouseStrategyEmergencyState {
+    fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
+        self.mode.hash(hasher);
+        self.all_to_hunt_bias.hash(hasher);
+        self.last_building_attack_frame.hash(hasher);
+        self.last_attacker_house_index.hash(hasher);
+        // Phobos extension state; keep the native-only hash while unset.
+        #[cfg(feature = "phobos")]
+        if let Some(timer) = self.ai_fire_sale_delay_timer {
+            b"phobos-ai-fire-sale-delay-v1".hash(hasher);
+            timer.hash(hasher);
+        }
+    }
 }
 
 const fn last_attacker_house_index_default() -> i32 {
@@ -214,6 +234,8 @@ impl Default for HouseStrategyEmergencyState {
             all_to_hunt_bias: false,
             last_building_attack_frame: 0,
             last_attacker_house_index: last_attacker_house_index_default(),
+            #[cfg(feature = "phobos")]
+            ai_fire_sale_delay_timer: None,
         }
     }
 }
@@ -274,6 +296,17 @@ impl HouseStrategyEmergencyState {
         false
     }
 
+    /// Phobos HouseExt `AIFireSaleDelayTimer`, None until first armed.
+    #[cfg(feature = "phobos")]
+    pub(crate) const fn ai_fire_sale_delay_timer(&self) -> Option<CdTimer> {
+        self.ai_fire_sale_delay_timer
+    }
+
+    #[cfg(feature = "phobos")]
+    pub(crate) fn start_ai_fire_sale_delay(&mut self, frame: i32, delay: i32) {
+        self.ai_fire_sale_delay_timer = Some(CdTimer::started(frame, delay));
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_mode_for_test(&mut self, mode: i32) {
         self.mode = mode;
@@ -315,6 +348,9 @@ pub struct BaseReservationState {
     min_y: i32,
     width: i32,
     height: i32,
+    /// Primary vector House+5720 (items5724, count5730), maintained by
+    /// Mark455F10/Clear4561F0 and consumed by FindBaseBuildingSite5060B0.
+    /// The separate defense-candidate vector+5738 is not this authority.
     perimeter_cells: Vec<u32>,
 }
 
@@ -339,6 +375,12 @@ impl BaseReservationState {
     pub(crate) fn update_bounds(&mut self, start_x: i32, start_y: i32, width: i32, height: i32) {
         Self::update_axis(&mut self.min_x, &mut self.width, start_x, width);
         Self::update_axis(&mut self.min_y, &mut self.height, start_y, height);
+    }
+
+    /// Original HouseClass::AI_ScanBasePerimeter508BA2..508BCC replaces
+    /// the four committed bounds after appending all generated plan nodes.
+    pub(crate) fn commit_perimeter_expansion(&mut self, bounds: (i32, i32, i32, i32)) {
+        (self.min_x, self.min_y, self.width, self.height) = bounds;
     }
 
     pub(crate) fn append_perimeter_cell_if_absent(&mut self, packed_cell: u32) {
@@ -1944,6 +1986,18 @@ impl HouseState {
         )
     }
 
+    /// Inputs for Ares `IsTargetConstraintsEligible`10032110: the house's
+    /// chosen enemy (`+0x5600`) and its scripted offensive cell (`+0x54F0`).
+    #[cfg(feature = "ares")]
+    pub fn target_constraints_observations(
+        &self,
+    ) -> crate::rules::superweapon_targeting::HouseTargetingObservations {
+        crate::rules::superweapon_targeting::HouseTargetingObservations {
+            has_enemy: self.enemy_house.is_some(),
+            offensive_cell: self.super_weapon_targets.preferred_target,
+        }
+    }
+
     /// The launch alert's stores (`0x004FB0BD`, `0x004FB0C9`), also made by
     /// House50DA20 from TAction1406E4460 with the current binary frame.
     pub(crate) fn alert_super_weapon_defense(&mut self, cell: (u16, u16), frame: i32) {
@@ -2356,6 +2410,19 @@ impl HouseState {
     /// `HouseClass__Update @ 0x004F8440` inlines the same branch shape.
     pub const fn is_controlled_by_human(&self, game_mode_nonzero: bool) -> bool {
         self.is_human || (!game_mode_nonzero && self.player_control)
+    }
+
+    /// HouseClass's power (AI_AssessPower508CBD..508CF0), radar
+    /// (UpdateTacticalRadarAvailability508ECD..508EF1) and SpySat
+    /// (Update_SpySat508FA2..508FDF) scans share this discovery admission.
+    /// Source: original gamemd instructions. Noncampaign scans admit hidden
+    /// providers, including the current player's; campaign computer Houses
+    /// do too. Only controlled campaign Houses require Techno+41B.
+    pub(crate) const fn building_services_require_discovery(
+        &self,
+        game_mode_nonzero: bool,
+    ) -> bool {
+        !game_mode_nonzero && self.is_controlled_by_human(game_mode_nonzero)
     }
 
     /// The cell the house bases itself around: the alternate base centre

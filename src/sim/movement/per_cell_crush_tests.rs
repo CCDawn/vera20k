@@ -143,7 +143,7 @@ fn retail_crush_releases_captives_before_destroyed_tag_changes_house() {
         .as_bytes(),
     )
     .unwrap();
-    sim.initialize_trigger_definitions(&map, &Default::default(), None, None);
+    sim.initialize_trigger_definitions(&map, &Default::default(), None, None, None);
     sim.classify_map_triggers(&rules);
     sim.attach_object_trigger_tag(controller, Some("TAG"));
     sim.attach_object_trigger_tag(captive, Some("TAG"));

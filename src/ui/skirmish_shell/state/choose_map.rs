@@ -6,7 +6,7 @@
 //! press below the last row is ignored, the scrollbar captures and repeats,
 //! and no key or wheel case exists (`0x00618D40..0x0061C600`).
 
-use std::time::{Duration, Instant};
+use crate::util::time::{Duration, Instant};
 
 use crate::map::skirmish_scenarios::{
     SkirmishScenarioRecord, filter_records_for_mode, upsert_random_map_sentinel,
@@ -341,6 +341,30 @@ impl ChooseMapModalState {
                     .position(|idx| *idx == record)
             });
             self.scroll_map_selection_to_top(layout);
+        }
+    }
+
+    /// `LB_ADDSTRING` then `LB_SETITEMDATA` on the map list: a row at the
+    /// end, the selection unchanged.
+    pub fn push_row(&mut self, record: usize, label: String) {
+        self.filtered_record_indices.push(record);
+        if let Some(labels) = self.row_labels.as_mut() {
+            labels.push(label);
+        }
+    }
+
+    /// The last row's `LB_DELETESTRING`; a selection on it first moves to
+    /// the row before (`LB_SETCURSEL(count - 2)`, none for a single row).
+    pub fn pop_row(&mut self) {
+        let Some(last) = self.filtered_record_indices.len().checked_sub(1) else {
+            return;
+        };
+        if self.highlighted_filtered_index == Some(last) {
+            self.highlighted_filtered_index = last.checked_sub(1);
+        }
+        self.filtered_record_indices.pop();
+        if let Some(labels) = self.row_labels.as_mut() {
+            labels.pop();
         }
     }
 

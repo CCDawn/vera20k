@@ -4,7 +4,7 @@ use crate::rules::ruleset::CountryIdx;
 use crate::sim::house_state::{HouseOutcomeKind, HouseState};
 use crate::sim::intern::InternedId;
 use crate::sim::scenario_session::ScenarioGameMode;
-use crate::sim::world::{MasterFrameTestRung, OutcomeWaitBoundary, TickLane};
+use crate::sim::world::{FrameStep, OutcomeWaitBoundary, TickLane};
 
 struct VoxIdle(std::cell::Cell<bool>);
 
@@ -104,9 +104,9 @@ fn admitted_victory_survives_a_later_house_tag_replacing_the_pending_result() {
     // Main_Tick (0x0055DE4F..0x0055DEC8) skips commit and deferred destruction.
     assert!(!frame.tick.frame_committed);
     assert_eq!((sim.session.binary_frame(), sim.session.tick()), (0, 0));
-    let rungs = sim.take_master_frame_test_trace();
-    assert!(!rungs.contains(&MasterFrameTestRung::FrameCommit));
-    assert!(!rungs.contains(&MasterFrameTestRung::PendingDelete));
+    let rungs = sim.take_frame_step_trace();
+    assert!(!rungs.contains(&FrameStep::FrameCommit));
+    assert!(!rungs.contains(&FrameStep::PendingDelete));
     assert!(!sim.pending_delete().is_empty());
     assert_eq!(sim.trigger_runtime.tags.iter().flatten().count(), 2);
     assert!(sim.trigger_runtime.freed_trace.is_empty());

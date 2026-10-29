@@ -20,6 +20,14 @@ pub struct SidebarChromeLayoutSpec {
     pub side2_height: f32,
     pub side3_height: f32,
     pub footer_allowance: i32,
+    /// Radar aperture offset from the sidebar's left edge, and its top, in
+    /// sidebar-surface pixels. `RadarClass::Init_For_House` places the radar
+    /// gadget at the shared base plus `(11, 4)` for GDI (`0x00652EDB`,
+    /// `0x00652EE9`) and `(14, 5)` for NOD (`0x00652F1F`, `0x00652F2D`); only
+    /// those four constants differ between the two arms, so the verified GDI
+    /// aperture keeps its position and the NOD table adds the native delta.
+    pub radar_x: f32,
+    pub radar_y: f32,
     pub repair_x: f32,
     pub repair_y: f32,
     pub sell_x: f32,
@@ -38,9 +46,6 @@ pub struct SidebarChromeLayoutSpec {
     pub scroll_pitch: f32,
     pub power_bar_x: f32,
     pub power_bar_tile_height: f32,
-    // VERA-local development controls do not reserve native chrome rows.
-    pub control_button_gap: f32,
-    pub control_block_top_pad: f32,
 }
 
 impl SidebarChromeLayoutSpec {
@@ -49,7 +54,15 @@ impl SidebarChromeLayoutSpec {
     }
 
     pub const fn for_theme(theme: SidebarTheme) -> Self {
-        let allied = matches!(theme, SidebarTheme::Allied);
+        Self::for_theme_and_positions(theme, matches!(theme, SidebarTheme::Allied))
+    }
+
+    /// Phobos `[SOMESIDE] Sidebar.GDIPositions=`: the artwork theme and the
+    /// hardcoded button coords are independent. `theme` still selects the
+    /// SIDEBAR MIX and chrome heights; `gdi_positions` selects the GDI
+    /// (allied) position table.
+    pub const fn for_theme_and_positions(theme: SidebarTheme, gdi_positions: bool) -> Self {
+        let allied = gdi_positions;
         Self {
             theme,
             sidebar_width: super::SIDEBAR_WIDTH_PX as f32,
@@ -57,6 +70,8 @@ impl SidebarChromeLayoutSpec {
             side2_height: 50.0,
             side3_height: 26.0,
             footer_allowance: if allied { 26 } else { 18 },
+            radar_x: if allied { 16.0 } else { 19.0 },
+            radar_y: if allied { 49.0 } else { 50.0 },
             repair_x: if allied { 20.0 } else { 33.0 },
             repair_y: if allied { 8.0 } else { 7.0 },
             sell_x: if allied { 84.0 } else { 85.0 },
@@ -75,8 +90,6 @@ impl SidebarChromeLayoutSpec {
             scroll_pitch: if allied { 46.0 } else { 45.0 },
             power_bar_x: if allied { 5.0 } else { 0.0 },
             power_bar_tile_height: 3.0,
-            control_button_gap: 2.0,
-            control_block_top_pad: 2.0,
         }
     }
 }
@@ -84,5 +97,36 @@ impl SidebarChromeLayoutSpec {
 impl Default for SidebarChromeLayoutSpec {
     fn default() -> Self {
         Self::stock()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gdi_positions_are_independent_of_the_art_theme() {
+        let allied = SidebarChromeLayoutSpec::for_theme(SidebarTheme::Allied);
+        let soviet = SidebarChromeLayoutSpec::for_theme(SidebarTheme::Soviet);
+        assert_eq!(allied.tab_x, 26.0);
+        assert_eq!(soviet.tab_x, 20.0);
+
+        let soviet_gdi =
+            SidebarChromeLayoutSpec::for_theme_and_positions(SidebarTheme::Soviet, true);
+        assert_eq!(soviet_gdi.theme, SidebarTheme::Soviet);
+        assert_eq!(soviet_gdi.tab_x, 26.0);
+        assert_eq!(soviet_gdi.tab_pitch, 29.0);
+        assert_eq!(soviet_gdi.cameo_gap_x, 3.0);
+        assert_eq!(soviet_gdi.power_bar_x, 5.0);
+        assert_eq!((soviet_gdi.radar_x, soviet_gdi.radar_y), (16.0, 49.0));
+
+        let allied_nod =
+            SidebarChromeLayoutSpec::for_theme_and_positions(SidebarTheme::Allied, false);
+        assert_eq!(allied_nod.theme, SidebarTheme::Allied);
+        assert_eq!(allied_nod.tab_x, 20.0);
+        assert_eq!(allied_nod.tab_pitch, 32.0);
+        assert_eq!(allied_nod.cameo_gap_x, 4.0);
+        assert_eq!(allied_nod.power_bar_x, 0.0);
+        assert_eq!((allied_nod.radar_x, allied_nod.radar_y), (19.0, 50.0));
     }
 }

@@ -25,7 +25,7 @@
 //! 6. `0x00481D86..0x00481DB3`: `MapClass` pickup removal (`0x0056C020`),
 //!    then, outside mode 0 with the lobby Crates option, one replacement
 //!    `MapClass::PlaceCrateAtRandomCell @ 0x0056BD40`.
-//! 7. `0x00481DB8..0x00481DE0`: Squad becomes Money; the slot's magnitude is
+//! 7. `0x00481DC3..0x00481DE0`: Squad becomes Money; the slot's magnitude is
 //!    loaded; slots above 17 skip to the anim; the jump table at
 //!    `0x004833C4` selects the arm.
 //! 8. `0x004832F5..0x00483389`: the slot's `[Powerups]` anim at the cell
@@ -60,6 +60,13 @@ use crate::util::native_x87::NativeF64Bits;
 /// shared constants: the table order is the binary's (`0x007E523C`).
 const POWERUP_CLOAK: usize = 3;
 const POWERUP_DARKNESS: usize = 7;
+/// The jump table's five residual effect slots. Retail `[Powerups]` weights
+/// them all 0, so only a map's stored selection or a mod reaches them.
+const POWERUP_EXPLOSION: usize = 4;
+const POWERUP_NAPALM: usize = 5;
+const POWERUP_ICBM: usize = 12;
+const POWERUP_GAS: usize = 16;
+const POWERUP_TIBERIUM: usize = 17;
 /// The last slot the jump table at `0x004833C4` covers (`CMP EBX,0x11`).
 const LAST_DISPATCHED_SLOT: usize = 0x11;
 /// `[General] CrateRadius=`'s MCV pre-empt credit floor (`0x00481BCC`).
@@ -137,12 +144,13 @@ pub(super) fn select_pickup_outcome(
     }
 }
 
-/// Pickup directly centers the retained signed `Cell+0x24` words and calls
-/// `ComputeGroundHeightAtCoord @ 0x0047B3A0` with offset `(0x80, 0x80)`.
-/// The existing Cell486840/480A30 kernel owns that same arithmetic. This
-/// caller adapter preserves the receiver instead of doing another Map578080
-/// lookup from the original requested words.
-fn crate_center(
+/// CellClass481AC8's retained signed `Cell+0x24` centre, shared with the Gas
+/// arm's nine-cell walk. Pickup directly centers the retained signed
+/// `Cell+0x24` words and calls `ComputeGroundHeightAtCoord @ 0x0047B3A0` with
+/// offset `(0x80, 0x80)`. The existing Cell486840/480A30 kernel owns that same
+/// arithmetic. This caller adapter preserves the receiver instead of doing
+/// another Map578080 lookup from the original requested words.
+pub(super) fn crate_center(
     sim: &Simulation,
     cell: (i16, i16),
     receiver: Option<NativeCellIdentity>,
@@ -258,11 +266,35 @@ pub(crate) fn multiplayer_eligible_slot(
         // `0x00481C32`: too much infantry, or a shore cell.
         POWERUP_SQUAD => house.tracking().infantry() <= SQUAD_CRATE_MAX_INFANTRY && !shore,
         // `0x00481D3A`: an already cloakable actor (`Techno+0x3D2`, seeded
-        // from the type's `Cloakable=`; the Cloak crate's permanent write is
-        // this module's residual).
-        POWERUP_CLOAK => !object.is_some_and(|object| object.cloakable),
-        // `0x00481C69`: an actor already armoured.
-        POWERUP_ARMOR => actor.crate_multipliers.armor() == NativeF64Bits::ONE,
+        // from the type's `Cloakable=` or permanently granted by a crate).
+        POWERUP_CLOAK => {
+            #[cfg(feature = "ares")]
+            {
+                // Cloak1@1005F8D0 calls builtin type/rank predicate10043450,
+                // then checks permanent Ext+98 and TypeExt+1FA. Temporary
+                // attachment cloak must not hide an unclaimed crate bonus.
+                let builtin = object.is_some_and(|kind| {
+                    kind.cloakable
+                        || crate::sim::combat::veterancy::has_weapon_ability(
+                            actor.veterancy.rank_kind(),
+                            kind,
+                            crate::rules::object_type::Ability::Cloak,
+                        )
+                });
+                !builtin
+                    && !actor.stealth_ability.granted()
+                    && object.is_none_or(|kind| kind.cloak_allowed())
+            }
+            #[cfg(not(feature = "ares"))]
+            {
+                !actor
+                    .stealth_ability
+                    .active(object.is_some_and(|kind| kind.cloakable))
+            }
+        }
+        // Stock 481C69; Ares Armor1@1005F840 instead reads the permanent
+        // Ext+88, so an attached armor bonus does not consume the crate.
+        POWERUP_ARMOR => actor.crate_multipliers.crate_armor() == NativeF64Bits::ONE,
         // `0x00481CDE`: an actor already sped up, or an Aircraft.
         POWERUP_SPEED => {
             actor.foot_speed.crate_multiplier() == NativeF64Bits::ONE
@@ -540,6 +572,15 @@ pub(crate) fn pickup_crate(
                     center,
                 );
             }
+            POWERUP_CLOAK => {
+                effects::apply_cloak_crate(
+                    &mut sim.substrate,
+                    rules,
+                    &sim.interner,
+                    center,
+                    radius,
+                );
+            }
             POWERUP_ARMOR => {
                 let owners = effects::apply_multiplier_crate(
                     &mut sim.substrate,
@@ -623,20 +664,50 @@ pub(crate) fn pickup_crate(
                     center,
                 );
             }
-            // RESIDUAL arms, each a zero weight in retail `[Powerups]` so no
+            // The residual jump-table arms. Every one jumps to the shared
+            // anim tail past the `0x004832F0` pickup sound, so none plays a
+            // crate sound here, and retail weights all five to 0 so no
             // random pickup reaches them (a map's stored selection or a mod
-            // can): Cloak (3, `0x00482840`: `Techno+0x3D2 = 1` on every Techno
-            // in the radius; VERA keeps no instance cloakable flag),
-            // Explosion (4, `0x00482565`: C4 damage on the actor and five
-            // random-offset blasts with two draws each), Napalm (5,
-            // `0x0048271E`: a fire anim and warhead damage), ICBM (12,
-            // `0x00482CA1`: grant the first ICBM super), Gas (16,
-            // `0x00481DE7`: poison gas particle systems on the nine cells)
-            // and Tiberium (17, `0x00481E99`: a random ore type and 10..20
-            // random placements, two draws each). Effect when reached: the
-            // crate is consumed with its anim and no effect, and the
-            // Explosion/Tiberium draws are not spent. Invulnerability (13),
-            // IonStorm (15) and Pod (18) have no native effect arm either.
+            // can). Invulnerability (13), IonStorm (15) and Pod (18) have no
+            // native effect arm either.
+            POWERUP_EXPLOSION => {
+                effects::apply_explosion_crate(
+                    sim,
+                    rules,
+                    Some(registry),
+                    actor_id,
+                    center,
+                    magnitude,
+                    frame_effects,
+                );
+            }
+            POWERUP_NAPALM => {
+                effects::apply_napalm_crate(
+                    sim,
+                    rules,
+                    Some(registry),
+                    actor_id,
+                    center,
+                    magnitude,
+                    frame_effects,
+                );
+            }
+            POWERUP_ICBM => {
+                effects::apply_icbm_crate(sim, rules, owner);
+            }
+            POWERUP_GAS => {
+                effects::apply_gas_crate(
+                    sim,
+                    rules,
+                    Some(registry),
+                    cell,
+                    magnitude,
+                    frame_effects,
+                );
+            }
+            POWERUP_TIBERIUM => {
+                effects::apply_tiberium_crate(sim, rules, registry, cell, center);
+            }
             _ => {}
         }
     }

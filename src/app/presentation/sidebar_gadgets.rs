@@ -67,7 +67,9 @@ pub(crate) fn update_sidebar_gadget_state(state: &mut AppState) {
     let Some(rules) = state.rules() else {
         return;
     };
-    let owner = preferred_local_owner_name(state).unwrap_or_else(|| "Americans".to_string());
+    let Some(owner) = preferred_local_owner_name(state) else {
+        return;
+    };
     let owner_iid = sim.interner().get(&owner).unwrap_or_default();
     let superweapon_views =
         crate::sim::superweapon::superweapon_views_for_owner(sim, rules, &owner_iid);

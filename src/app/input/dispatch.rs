@@ -17,9 +17,8 @@ use winit::keyboard::KeyCode;
 
 use crate::app::AppState;
 use crate::app::input::commands::{
-    cancel_build_by_type, cycle_active_producer, cycle_local_owner, place_ready_building_at_cell,
-    place_starter_base_for_local_owner, preferred_local_owner, preferred_local_owner_name,
-    queue_build_by_type, queue_house_cheer, schedule_command, spawn_test_units_for_local_owner,
+    cancel_build_by_type, place_ready_building_at_cell, preferred_local_owner,
+    preferred_local_owner_name, queue_build_by_type, queue_house_cheer, schedule_command,
     suspend_build,
 };
 use crate::app::input::context_order::{ContextOrderTarget, try_queue_context_order};
@@ -31,6 +30,7 @@ use crate::app::input::entity_pick::{
     map_entity_creation_order, pick_entity_at_point,
 };
 use crate::app::input::hotkeys::{HotkeyCommand, HotkeyFallback, HotkeyResolution};
+use crate::app::input::precedence::{ModalPage, modal_page};
 use crate::app::input::sidebar_eva;
 use crate::app::presentation::sidebar_render::current_sidebar_view;
 use crate::app::types::OrderMode;
@@ -46,6 +46,10 @@ mod area_guard_tests;
 #[cfg(test)]
 #[path = "player_scatter_tests.rs"]
 mod player_scatter_tests;
+
+#[cfg(test)]
+#[path = "mcv_group_tests.rs"]
+mod mcv_group_tests;
 
 /// Handle mouse button press/release for selection and move commands.
 ///
@@ -63,7 +67,9 @@ pub(crate) fn handle_mouse_input(
     button: MouseButton,
     btn_state: ElementState,
 ) {
-    if crate::app::match_runtime::network_failure::pending(state) {
+    // The window path routes these pages in its own handler from the same
+    // decision (`input::precedence`); captures enter here directly.
+    if modal_page(state) == Some(ModalPage::NetworkFailure) {
         crate::app::match_runtime::network_failure::mouse(state, button, btn_state.is_pressed());
         return;
     }
@@ -79,22 +85,27 @@ fn handle_mouse_input_inner(state: &mut AppState, button: MouseButton, btn_state
         .input
         .tactical_mouse
         .record_physical_button(button, pressed);
-    if state.frontend.keyboard_dialog.is_some() {
-        crate::app::input::keyboard::mouse(state, button, pressed);
-        return;
-    }
-    // 0xEA is pushed over the game and any open page.
-    if state.match_state.network_wait.dialog_open() {
-        if !pressed {
-            state.match_state.input.cancel_tactical_drag();
-            state
-                .match_state
-                .match_presentation
-                .in_game_gadgets
-                .cancel_pointer_capture();
+    match modal_page(state) {
+        // 0xEA is pushed over the game and any open page.
+        Some(ModalPage::NetworkWait) => {
+            if !pressed {
+                state.match_state.input.cancel_tactical_drag();
+                state
+                    .match_state
+                    .match_presentation
+                    .in_game_gadgets
+                    .cancel_pointer_capture();
+            }
+            crate::app::input::connection::mouse(state, button, pressed);
+            return;
         }
-        crate::app::input::connection::mouse(state, button, pressed);
-        return;
+        Some(ModalPage::Keyboard) => {
+            crate::app::input::keyboard::mouse(state, button, pressed);
+            return;
+        }
+        // The shell error card is main-menu only.
+        Some(ModalPage::ShellError | ModalPage::NetworkFailure | ModalPage::NetworkOptions)
+        | None => {}
     }
     // Paused in-game Options overlay owns the mouse: route press/release/checkbox/
     // Back here and CONSUME the click so it never reaches the tactical viewport or
@@ -184,6 +195,10 @@ fn handle_mouse_input_inner(state: &mut AppState, button: MouseButton, btn_state
     // button, press or release, and leaves the click to the game.
     if button == MouseButton::Right {
         crate::app::input::chat::right_button(state);
+    }
+    #[cfg(feature = "phobos")]
+    if crate::app::input::sw_sidebar::mouse(state, button, pressed) {
+        return;
     }
     match crate::app::input::gadget_input::handle_mouse_button_event(state, button, pressed) {
         GadgetConsume::Tactical => tactical_mouse(state, button, btn_state),
@@ -822,17 +837,20 @@ fn clamp_tactical_drag_endpoint(
 }
 
 pub(crate) fn handle_cursor_moved_in_game(state: &mut AppState) {
-    if crate::app::match_runtime::network_failure::pending(state) {
-        crate::app::match_runtime::network_failure::cursor_moved(state);
-        return;
-    }
-    if state.frontend.keyboard_dialog.is_some() {
-        crate::app::input::keyboard::cursor_moved(state);
-        return;
-    }
-    if state.match_state.network_wait.dialog_open() {
-        crate::app::input::connection::cursor_moved(state);
-        return;
+    match modal_page(state) {
+        Some(ModalPage::NetworkFailure) => {
+            crate::app::match_runtime::network_failure::cursor_moved(state);
+            return;
+        }
+        Some(ModalPage::NetworkWait) => {
+            crate::app::input::connection::cursor_moved(state);
+            return;
+        }
+        Some(ModalPage::Keyboard) => {
+            crate::app::input::keyboard::cursor_moved(state);
+            return;
+        }
+        Some(ModalPage::ShellError | ModalPage::NetworkOptions) | None => {}
     }
     // Paused in-game Options overlay: drive a live slider drag (visual/stored only —
     // cadence applies on close, KD-8) and swallow the move so it can't begin a
@@ -1091,7 +1109,13 @@ fn sidebar_cameo_press(
     // The linked Factory's state also decides whether Shift may repeat: a held
     // or finished build takes the resume/placement arm, not a fresh PRODUCE.
     let own_for_repeat = linked_factory.map(|(status, _)| status);
-    let click = sidebar_eva::cameo_click(
+    #[cfg(feature = "phobos")]
+    let building_production_queue = state
+        .rules()
+        .is_some_and(|rules| rules.general.building_production_queue);
+    #[cfg(not(feature = "phobos"))]
+    let building_production_queue = false;
+    let click = sidebar_eva::cameo_click_with_queue(
         &queue,
         category,
         type_iid,
@@ -1105,6 +1129,7 @@ fn sidebar_cameo_press(
         }),
         press,
         at_build_limit,
+        building_production_queue,
     );
     if click.clear_building_placement {
         state.match_state.input.cancel_building_placement();
@@ -1150,11 +1175,12 @@ fn sidebar_cameo_press(
             // repeats only while the Options page's Shift-Click Batch Queue
             // (`[VERA] ShiftQueue=`) is ticked, `[VERA] ShiftQueueCount=` times.
             let profile = &state.persistence.options_profile;
-            let repeat = sidebar_eva::shift_queue_repeat(
+            let repeat = sidebar_eva::shift_queue_repeat_with_queue(
                 category,
                 own_for_repeat,
                 shift && profile.shift_queue,
                 profile.shift_queue_count,
+                building_production_queue,
             );
             queue_build_by_type(state, type_id, repeat);
         }
@@ -1266,75 +1292,7 @@ fn apply_sidebar_action_inner(state: &mut AppState, action: SidebarAction) {
             sidebar_cameo_press(state, &type_id, press, at_build_limit, shift);
         }
         SidebarAction::SuperWeaponPress { section, right } => {
-            let selection = (|| {
-                let runtime = state.match_state.sim_runtime.as_ref()?;
-                let sim = &runtime.simulation;
-                let rules = &runtime.resources.rules;
-                let owner = sim.interner().get(&preferred_local_owner_name(state)?)?;
-                let type_id = sim.interner().get(&section)?;
-                let view = crate::sim::superweapon::superweapon_views_for_owner(sim, rules, &owner)
-                    .into_iter()
-                    .find(|view| view.type_id == type_id)?;
-                Some((view, rules.super_weapon(&section)?.action.clone()))
-            })();
-            let click = super::superweapon_cameo::press(
-                &mut state.match_state.input,
-                &mut state.match_state.match_presentation.sidebar_gadget_state,
-                selection.as_ref().map(|(view, _)| view),
-                selection.as_ref().and_then(|(_, action)| action.as_deref()),
-                right,
-            );
-            if click.gui_sound() {
-                let sound = state
-                    .rules()
-                    .and_then(|rules| rules.general.gui_build_sound.clone());
-                crate::app::App::play_shell_ui_sound_by_id(state, sound.as_deref());
-            }
-            match click {
-                super::superweapon_cameo::SuperWeaponClick::Refused
-                    if selection
-                        .as_ref()
-                        .is_some_and(|(view, _)| view.can_fire && !view.can_afford) =>
-                {
-                    let cue = state
-                        .rules()
-                        .and_then(|rules| {
-                            rules
-                                .super_weapon(&section)
-                                .map(|sw| crate::sim::superweapon::financial_type(rules, sw))
-                        })
-                        .and_then(|sw| sw.insufficient_funds_eva.clone());
-                    if let Some(cue) = cue {
-                        push_local_eva(state, &cue);
-                    }
-                }
-                super::superweapon_cameo::SuperWeaponClick::Target => {
-                    queue_selection_snapshot_command(state, Vec::new(), false);
-                    push_local_eva(state, sidebar_eva::EVA_SELECT_TARGET);
-                }
-                super::superweapon_cameo::SuperWeaponClick::Launch(sw_type_id) => {
-                    let owner = preferred_local_owner_name(state).unwrap_or_default();
-                    crate::app::input::commands::queue_super_weapon_click(
-                        state,
-                        &owner,
-                        sw_type_id,
-                        (0, 0),
-                    );
-                }
-                _ => {}
-            }
-        }
-        SidebarAction::CycleProducer(category) => {
-            cycle_active_producer(state, category);
-        }
-        SidebarAction::CycleOwner => {
-            cycle_local_owner(state);
-        }
-        SidebarAction::PlaceStarterBase => {
-            place_starter_base_for_local_owner(state);
-        }
-        SidebarAction::SpawnTestUnits => {
-            spawn_test_units_for_local_owner(state);
+            press_super_weapon(state, &section, right, true);
         }
         SidebarAction::ToggleRepairMode | SidebarAction::ToggleSellMode => {
             use crate::ui::sidebar::gadget_flash::SelectionMode;
@@ -1599,11 +1557,11 @@ pub(crate) fn handle_type_select_key_edge(
         if !is_type_select {
             return false;
         }
-        state
-            .match_state
-            .input
-            .type_select
-            .press(physical_code, std::time::Instant::now(), repeat);
+        state.match_state.input.type_select.press(
+            physical_code,
+            crate::util::time::Instant::now(),
+            repeat,
+        );
         return true;
     }
     if !is_type_select && !state.match_state.input.type_select.owns_key(physical_code) {
@@ -1613,7 +1571,7 @@ pub(crate) fn handle_type_select_key_edge(
         .match_state
         .input
         .type_select
-        .release(physical_code, std::time::Instant::now());
+        .release(physical_code, crate::util::time::Instant::now());
     if execute_tap {
         execute_type_select_tap(state);
     }
@@ -1853,7 +1811,7 @@ fn dispatch_retail_hotkey(state: &mut AppState, command: HotkeyCommand) {
                 .match_presentation
                 .minimap
                 .as_mut()
-                .and_then(|minimap| minimap.cycle_radar_event(std::time::Instant::now()));
+                .and_then(|minimap| minimap.cycle_radar_event(crate::util::time::Instant::now()));
             if let Some((rx, ry)) = event {
                 crate::app::input::camera::center_camera_on_cell(state, rx, ry);
             }
@@ -1906,6 +1864,110 @@ fn dispatch_retail_hotkey(state: &mut AppState, command: HotkeyCommand) {
         ),
         HotkeyCommand::PageUser => crate::app::input::page_user::execute(state),
         HotkeyCommand::PlaceBeacon => crate::app::input::beacon::execute_command(state),
+        #[cfg(feature = "phobos")]
+        HotkeyCommand::FireTacticalSw(index) => {
+            if state
+                .rules()
+                .is_some_and(|rules| rules.sw_sidebar.keys_enabled)
+                && let Some(entry) =
+                    crate::app::presentation::sw_sidebar::positional_entry(state, index)
+            {
+                let type_id = entry.type_id.clone();
+                press_super_weapon(state, &type_id, false, false);
+            }
+        }
+        #[cfg(feature = "phobos")]
+        HotkeyCommand::ToggleSwSidebar => {
+            if state
+                .rules()
+                .is_some_and(|rules| rules.sw_sidebar.toggle_key_enabled)
+                && crate::app::presentation::sw_sidebar::toggle(state)
+            {
+                crate::app::input::sw_sidebar::play_main_button_sound(state);
+                crate::app::presentation::sidebar_render::refresh_sidebar_projection(state);
+            }
+        }
+        #[cfg(feature = "verax")]
+        HotkeyCommand::AutoLoad => crate::app::input::autoload::hotkey_pressed(state),
+        #[cfg(not(feature = "verax"))]
+        HotkeyCommand::AutoLoad => {}
+    }
+}
+
+/// A superweapon cameo press. Phobos's `FireTacticalSW` keys call
+/// `LaunchSuper` without the `GUIBuildSound` its button's `Action` plays, so
+/// they pass `gui_sound: false`.
+fn press_super_weapon(state: &mut AppState, section: &str, right: bool, gui_sound: bool) {
+    let selection = (|| {
+        let runtime = state.match_state.sim_runtime.as_ref()?;
+        let sim = &runtime.simulation;
+        let rules = &runtime.resources.rules;
+        let owner = sim.interner().get(&preferred_local_owner_name(state)?)?;
+        let type_id = sim.interner().get(section)?;
+        let view = crate::sim::superweapon::superweapon_views_for_owner(sim, rules, &owner)
+            .into_iter()
+            .find(|view| view.type_id == type_id)?;
+        Some((view, rules.super_weapon(section)?.action.clone()))
+    })();
+    let click = super::superweapon_cameo::press(
+        &mut state.match_state.input,
+        &mut state.match_state.match_presentation.sidebar_gadget_state,
+        selection.as_ref().map(|(view, _)| view),
+        selection.as_ref().and_then(|(_, action)| action.as_deref()),
+        right,
+    );
+    if gui_sound && click.gui_sound() {
+        let sound = state
+            .rules()
+            .and_then(|rules| rules.general.gui_build_sound.clone());
+        crate::app::App::play_shell_ui_sound_by_id(state, sound.as_deref());
+    }
+    match click {
+        super::superweapon_cameo::SuperWeaponClick::Refused
+            if selection.as_ref().is_some_and(|(view, _)| {
+                #[cfg(feature = "ares")]
+                {
+                    view.ares_refusal
+                        == Some(crate::sim::superweapon::AresCameoRefusal::InsufficientFunds)
+                }
+                #[cfg(not(feature = "ares"))]
+                {
+                    view.can_fire && !view.can_afford
+                }
+            }) =>
+        {
+            let cue = state
+                .rules()
+                .and_then(|rules| {
+                    rules
+                        .super_weapon(section)
+                        .map(|sw| crate::sim::superweapon::financial_type(rules, sw))
+                })
+                .and_then(|sw| sw.insufficient_funds_eva.clone());
+            if let Some(cue) = cue {
+                push_local_eva(state, &cue);
+            }
+        }
+        super::superweapon_cameo::SuperWeaponClick::Target => {
+            queue_selection_snapshot_command(state, Vec::new(), false);
+            push_local_eva(state, sidebar_eva::EVA_SELECT_TARGET);
+        }
+        super::superweapon_cameo::SuperWeaponClick::Launch(sw_type_id) => {
+            let owner = preferred_local_owner_name(state).unwrap_or_default();
+            crate::app::input::commands::queue_super_weapon_click(
+                state,
+                &owner,
+                sw_type_id,
+                (0, 0),
+            );
+        }
+        _ => {}
+    }
+    #[cfg(feature = "ares")]
+    if click == super::superweapon_cameo::SuperWeaponClick::Refused
+        && let Some(refusal) = selection.as_ref().and_then(|(view, _)| view.ares_refusal)
+    {
+        crate::app::input::messages::post_ares_superweapon_refusal(state, section, refusal);
     }
 }
 
@@ -1955,6 +2017,15 @@ pub(crate) fn dispatch_command_bar(state: &mut AppState, command: usize, right: 
 // Native 653952 -> GameState1 -> 48C9BA/4F10E0 opens the pause menu.
 // The button and ordinary Options hotkey share this modal entry.
 fn open_pause_menu(state: &mut AppState) {
+    if state.match_state.multiplayer_paused() {
+        // No future EventClass tail exists until the relay resumes. Open the
+        // same local dialog directly so its shared Resume remains reachable.
+        crate::app::App::enter_in_game_menu_state(
+            state,
+            crate::ui::pause_menu::InGameMenuState::Menu,
+        );
+        return;
+    }
     if let Some(runtime) = state.match_state.sim_runtime.as_mut() {
         // Queue_Options647040 does not open the dialog. Its accepted local
         // OPTIONS event requests GameState1 at the due EventClass tail.
@@ -2293,12 +2364,24 @@ pub(crate) fn reconcile_selection_order_after_sim(
         state.match_state.input.type_select.reset_scope();
         return;
     };
+    let selected = logic_selects(outputs);
     reconcile_selection_order_for_sim(
         &mut state.match_state.input,
         &runtime.simulation,
         Some(&runtime.resources.rules),
-        &logic_selects(outputs),
+        &selected,
     );
+    // Phobos "Flashing Technos on selecting" sits in ObjectClass::Select
+    // (`0x005F46AE`/`0x005F4718`), so the frame's logic Selects flash too.
+    #[cfg(feature = "phobos")]
+    if state.match_state.match_presentation.show_flash_on_selecting
+        && !selected.is_empty()
+        && let Some(runtime) = state.match_state.sim_runtime.as_mut()
+    {
+        runtime
+            .simulation
+            .flash_selected_for_current_player(&selected, &runtime.resources.rules);
+    }
 }
 
 /// Reconcile the existing input owner against its bound simulation. Kept
@@ -2423,6 +2506,20 @@ fn apply_selection_mutation(
         &mutation,
     );
     state.match_state.input.follow_target = follow_target;
+    // Phobos "Flashing Technos on selecting": the client switch gates the
+    // `[AudioVisual] SelectionFlashDuration` the sim's flash owner reads.
+    // ObjectClass_Select flashes each newly selected Techno the current player
+    // controls (0x005F46AE/0x005F4718); an already-selected object makes no
+    // Select call and therefore no flash.
+    #[cfg(feature = "phobos")]
+    if state.match_state.match_presentation.show_flash_on_selecting
+        && !successful_adds.is_empty()
+        && let Some(runtime) = state.match_state.sim_runtime.as_mut()
+    {
+        runtime
+            .simulation
+            .flash_selected_for_current_player(&successful_adds, &runtime.resources.rules);
+    }
     if unselected_all {
         // Unselect_All's tail, BeaconManager ClearSelection (0x0048DCB8).
         state
@@ -2452,7 +2549,9 @@ fn apply_selection_mutation(
     }
     state.match_state.input.selection_order = ordered.clone();
     state.match_state.input.selection_order_pending = true;
-    let owner: String = preferred_local_owner(state).unwrap_or_else(|| "Americans".to_string());
+    let Some(owner) = preferred_local_owner(state) else {
+        return true;
+    };
     schedule_command(
         state,
         &owner,
@@ -2922,6 +3021,7 @@ mod item83_selection_order_tests {
                         target_rx: 5,
                         target_ry: 7,
                     },
+                    None,
                 )
                 .unwrap();
             let command = sim.decode_native_command_record(&record, 0).unwrap();
@@ -3042,6 +3142,7 @@ mod item83_selection_order_tests {
                         target_rx: 5,
                         target_ry: 7,
                     },
+                    None,
                 )
             } else {
                 sim.encode_plan_connect_record(local, actor, (5, 7))
@@ -3273,6 +3374,9 @@ fn queue_stop_for_selected(state: &mut AppState) {
         );
         return;
     }
+    if !super::commands::selection_input_has_capacity(state, selected_ids.len()) {
+        return;
+    }
     let Some(runtime) = state.match_state.sim_runtime.as_mut() else {
         return;
     };
@@ -3355,6 +3459,9 @@ fn queue_guard_for_selected(state: &mut AppState) {
         &state.match_state.input.selection_order,
         state.match_state.input.selection_order_pending,
     );
+    if !super::commands::selection_input_has_capacity(state, selected.len()) {
+        return;
+    }
     let Some(runtime) = state.match_state.sim_runtime.as_mut() else {
         return;
     };
@@ -3403,6 +3510,9 @@ fn queue_scatter_for_selected(state: &mut AppState) {
                 crate::app::input::planning_mode::PlanningRefusal::Scatter,
             );
         }
+        return;
+    }
+    if !super::commands::selection_input_has_capacity(state, selected.len()) {
         return;
     }
     let Some(runtime) = state.match_state.sim_runtime.as_mut() else {
@@ -3515,6 +3625,9 @@ fn queue_deploy_undeploy_for_selected(state: &mut AppState) {
         &state.match_state.input.selection_order,
         state.match_state.input.selection_order_pending,
     );
+    if !super::commands::selection_input_has_capacity(state, selected_ids.len()) {
+        return;
+    }
     let Some(sim) = state
         .match_state
         .sim_runtime
@@ -3526,8 +3639,10 @@ fn queue_deploy_undeploy_for_selected(state: &mut AppState) {
     if selected_ids.is_empty() {
         return;
     }
-    let owner: String = preferred_local_owner(state).unwrap_or_else(|| "Americans".to_string());
     // Collect commands first to avoid borrow conflict with schedule_command.
+    let Some(owner) = preferred_local_owner(state) else {
+        return;
+    };
     let local_owner = sim.interner().get(&owner);
     let commands = deploy_key_commands(sim, state.rules(), &selected_ids, local_owner);
     // Selection730AF0 sends DEPLOY9 through Techno6FFE00. During
@@ -3986,7 +4101,7 @@ fn handle_control_group_command(
             // A recall on an empty group still clears the selection: the
             // deselect-all runs before the select loop, unconditionally.
             state.match_state.input.last_control_group_press =
-                Some((group_idx, std::time::Instant::now()));
+                Some((group_idx, crate::util::time::Instant::now()));
             if let Some(selection) = team_selection(sim, action, &group, &selected) {
                 queue_team_selection(state, selection);
             }

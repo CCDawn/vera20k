@@ -2,11 +2,12 @@
 
 Start here before writing a session-local helper. Run commands from the checkout
 root with Python 3.12 or newer (the build runner alone supports 3.11). Individual native tools also require Unicorn;
-see [native setup](native_oracle.md). This index currently covers the shared entry
-points; the exhaustive oracle/tool inventory remains tracked in issue #746.
+see [native setup](native_oracle.md). This index covers the shared entry points;
+oracle families index their own fixtures and producers.
 
 | Job | Owner / entry point |
 | --- | --- |
+| Build the optional browser client and minimal preview page | [Wasm guide](../docs/wasm.md), `python3 tools/wasm/build.py` |
 | Observe match data or explicitly enable offline trainer/event tools | [Telemetry dashboard and debug build](telemetry-dashboard/README.md) |
 | Give a new worktree its ignored `ini/` and `config.toml`, or a clone its `config.toml`; report what the game, retail tests and oracles still need | `python -m tools.prepare_checkout` |
 | Run all Python tool and source-skill tests | `python -m tools.run_tests` (below) |
@@ -17,6 +18,7 @@ points; the exhaustive oracle/tool inventory remains tracked in issue #746.
 | Find a built or preserved host executable for shell use | `python -m tools.cargo_run --resolve asset --profile release` (below) |
 | Run retail corpus checks or export a decoder-baseline candidate | [retail corpus](retail_corpus.md) |
 | Check hermetic gameplay fixtures against production-selected retail sources | [retail fixture contracts](retail_fixture_contracts.md), ordinary library tests with `RA2_DIR` |
+| Run the ignored library tests the retail install alone satisfies; a missing input fails | [retail-backed ignored tests](#retail-backed-ignored-tests), `python -m tools.retail_tests run` |
 | Inspect exact retail INI values through production sources and readers | [INI lookup](ini_lookup.md), `asset ini-get` |
 | Select media archives without ambient argument parsing | [media policy](media_policy.md) |
 | Inspect/extract/render assets | [asset browser](asset_browser/README.md), `asset` binary |
@@ -34,6 +36,7 @@ points; the exhaustive oracle/tool inventory remains tracked in issue #746.
 | Replay a recorded annotation pass onto another copy of the Ghidra database | [Ghidra annotation passes](ghidra_pass.md), `ApplyGhidraPass.java` |
 | Reproduce Foot coordinates and bridge source-layer / reachability queries | [checked Foot bridge-layer oracle](spatial_oracle/foot_bridge_layer.md) |
 | Run native executable comparisons | [native oracle runner](native_oracle.md) |
+| Find a spatial, rules or shell/storage oracle's shared fixtures, producers and Rust consumers | [spatial](spatial_oracle/README.md), [rules](rules_oracle/README.md), [storage](storage_oracle/README.md) |
 | Reproduce occupied-Building weapon/foundation queries and the scan-bound slice | [garrison queries](garrison_oracle/weapon_range.py), with JSON goldens and coverage sidecar |
 | Preserve failed native execution context and diagnose timeouts | [native failure reports](native_oracle.md#investigating-a-failed-native-run) |
 | Compare shell captures | `python -m tools.shell_capture_diff --help` |
@@ -46,6 +49,48 @@ points; the exhaustive oracle/tool inventory remains tracked in issue #746.
 | Run one bounded child with retained diagnostics | `tools.child_process.run_child` (shared by capture wrappers) |
 | Check shell UI matrices | [exact shell matrix](exact_shell_ui_matrix/README.md) |
 | Synchronize authoritative skill sources | `python tools/skill_sync.py --write`, then `--check` |
+
+## Retail-backed ignored tests
+
+```sh
+export RA2_DIR="/path/to/Yuri's Revenge"
+python -m tools.retail_tests list
+python -m tools.retail_tests run
+python -m tools.retail_tests run --filter sim::world:: --filter headless_scenario:: -- --test-threads=4
+```
+
+Library tests that need the retail install, take minutes or need a device are
+`#[ignore]`d, so ordinary `--lib` runs and the platform workflows skip them.
+`run` is their routine run. Before any build it requires `RA2_DIR` to be the game
+folder (with `ra2md.mix` and `gamemd.exe`) and `ini/rulesmd.ini` to exist, the
+checks `prepare_checkout` reports; a missing one exits 2. It then lists the
+ignored tests of both crates through `cargo_run` (`--lib`), keeps the selected
+ones and runs them with `--ignored --exact`, `VERA20K_REQUIRE_RETAIL_INI=1` and
+`VERA20K_REQUIRE_RETAIL_ASSETS=1`, so a fixture without its input fails instead
+of printing `SKIPPED` and passing. The closing summary names each selected test
+that failed or printed no result (a crashed test binary, a batch that did not
+build); either exits nonzero. `--filter` keeps the selected tests whose path
+contains any of its texts, which is how to run a modest batch; arguments after
+`--` go to the test binaries.
+
+Each test's `#[ignore = "..."]` reason selects it; the first class that matches
+wins, and `list --all` shows where every test landed:
+
+| Class | Its reason mentions | Run |
+| --- | --- | --- |
+| `gpu` | GPU, wgpu, adapter, offscreen or readback | no |
+| `device` | X11 or an audio output device | no |
+| `input` | a `VERA20K_*` variable or the recorded retail corpus ([its own profile](retail_corpus.md)) | no |
+| `manual` | manual timing, a census, a benchmark or a local export | no |
+| `run` | starts with `slow;` or `physical`, or with `requires`/`needs` and names the retail install, archives or stock data | yes |
+| `other` | anything else, such as a recorded failure | no |
+
+An ignore reason must therefore name every input beyond `RA2_DIR` and `ini/`.
+Coverage stops there: the excluded classes stay manual, tests this platform
+compiles out are not listed, and a test that returns early on some condition other
+than a missing retail input still passes without checking anything. The tests run
+in the unoptimized test profile, so the debug cross-checks run with them. There
+are no integration test targets; `tests/` holds fixture data only.
 
 ## Dev chord builds
 

@@ -28,6 +28,18 @@ pub(crate) trait PickSource: Copy {
     fn first_ground_cell_object(&self, _cell: (u16, u16)) -> Option<CellObjectMember> {
         None
     }
+    /// The cell's first Building (`Look_up_building_in_cell @ 0x0047C520`)
+    /// when the session plays with FogOfWar (Scenario bit `0x1000`). A bare
+    /// EntityStore has neither.
+    fn fog_of_war_cell_building(&self, _cell: (u16, u16)) -> Option<u64> {
+        None
+    }
+    /// Has the presentation left this object out of the draw plan? No pick
+    /// may find what is not drawn. Only VERA's translucent fog does this;
+    /// native draws every object and lets the A buffer darken it.
+    fn conceals(&self, _entity: &crate::sim::game_entity::GameEntity) -> bool {
+        false
+    }
 }
 impl PickSource for &EntityStore {
     fn entities(&self) -> &EntityStore {
@@ -45,6 +57,16 @@ impl PickSource for &crate::sim::world::Simulation {
     fn first_ground_cell_object(&self, cell: (u16, u16)) -> Option<CellObjectMember> {
         crate::sim::world::Simulation::first_ground_cell_object(self, cell)
     }
+    fn fog_of_war_cell_building(&self, cell: (u16, u16)) -> Option<u64> {
+        if !self.session().game_options().fog_of_war {
+            return None;
+        }
+        self.occupancy().first_building_on_layer(
+            cell.0,
+            cell.1,
+            crate::sim::movement::locomotor::MovementLayer::Ground,
+        )
+    }
 }
 impl PickWorld for &crate::sim::world::Simulation {
     fn simulation(&self) -> &crate::sim::world::Simulation {
@@ -56,6 +78,8 @@ impl PickWorld for &crate::sim::world::Simulation {
 pub(crate) struct PresentedWorld<'a> {
     pub sim: &'a crate::sim::world::Simulation,
     pub interpolation: &'a crate::app::presentation::interpolation::RenderInterpolation,
+    /// [`crate::app::presentation::instances::translucent_fog_viewer`].
+    pub translucent_viewer: Option<InternedId>,
 }
 impl PickSource for PresentedWorld<'_> {
     fn entities(&self) -> &EntityStore {
@@ -70,6 +94,14 @@ impl PickSource for PresentedWorld<'_> {
     fn first_ground_cell_object(&self, cell: (u16, u16)) -> Option<CellObjectMember> {
         self.sim.first_ground_cell_object(cell)
     }
+    fn fog_of_war_cell_building(&self, cell: (u16, u16)) -> Option<u64> {
+        PickSource::fog_of_war_cell_building(&self.sim, cell)
+    }
+    fn conceals(&self, entity: &crate::sim::game_entity::GameEntity) -> bool {
+        self.translucent_viewer.is_some_and(|viewer| {
+            crate::app::presentation::instances::translucent_fog_conceals(self.sim, viewer, entity)
+        })
+    }
 }
 impl PickWorld for PresentedWorld<'_> {
     fn simulation(&self) -> &crate::sim::world::Simulation {
@@ -83,6 +115,7 @@ pub(crate) fn presented<'a>(
     PresentedWorld {
         sim,
         interpolation: &state.match_state.match_presentation.interpolation,
+        translucent_viewer: crate::app::presentation::instances::translucent_fog_viewer(state, sim),
     }
 }
 
@@ -293,11 +326,12 @@ pub(crate) fn compute_click_selection_snapshot_with_playfield(
 
     let picked = entities.get(picked_sid)?;
     let type_str = interner.map_or("", |i| i.resolve(picked.type_ref()));
-    // With no selection, DisplayDetermineAction69261B ->692762..692778
-    // refuses ACTION_SELECT for retained Techno+3D4. A nonempty selection
-    // delegates to WhatActionOnObject; its source/target and modifier gates
-    // differ. Don't apply this leaf to that path or forced/type selection.
-    let admitted = (!current_selection.is_empty() || !picked.is_mission_only())
+    // A nonempty selection delegates to WhatActionOnObject; its source/target
+    // and modifier gates differ. Don't apply the no-selection leaf to that
+    // path or forced/type selection.
+    let player = local_owner.and_then(|owner| interner.and_then(|i| i.get(owner)));
+    let admitted = (!current_selection.is_empty()
+        || !no_selection_refuses_select(picked, fog, player))
         && static_selection_gate(picked, type_str, rules, require_playfield_membership);
     // A shift-click adds when the selection it is joining is the local player's,
     // whatever was clicked. The native toggle-select arm (action 8,
@@ -416,11 +450,16 @@ pub(crate) fn band_rect_contains_drawn_object(
             return false;
         }
         if entity.category() == EntityCategory::Structure {
-            // Bulk-registered, shroud or no shroud.
+            // Bulk-registered, shroud or no shroud, frozen in fog or not:
+            // AppendVisibleBuildingSelectables 0x006D9CE0 tests only +0x90,
+            // +0x74 and Type+0x1701 (the last not ported here). Translucent
+            // fog leaves that alone; a frozen building's FoggedObject still
+            // draws in both fog modes.
             return true;
         }
         let owner_str = interner.map_or("", |i| i.resolve(entity.owner()));
-        is_drawn_for_local_owner(fog, local_owner, owner_str, entity, local_owner_id)
+        !source.conceals(entity)
+            && is_drawn_for_local_owner(fog, local_owner, owner_str, entity, local_owner_id)
     })
 }
 
@@ -461,7 +500,8 @@ pub(crate) fn pick_admits_object(
         || fog.has_sensor_for_house(player, entity.position.rx(), entity.position.ry())
 }
 
-/// Would the local player see this object drawn right now?
+/// Would the local player see this object drawn right now? Presentation's
+/// screen-selection rule ([`crate::app::presentation::instances::object_shown_to_local_owner`]).
 ///
 /// Deliberately distinct from the eligibility gate's visibility tail: with no
 /// fog state at all (the sandbox full-visibility switch) everything is drawn,
@@ -473,22 +513,19 @@ fn is_drawn_for_local_owner(
     entity: &crate::sim::game_entity::GameEntity,
     local_owner_id: Option<InternedId>,
 ) -> bool {
-    let Some(local_owner) = local_owner else {
-        return true;
-    };
     let Some((fog, alliances)) = fog else {
         // Sandbox full visibility: everything is drawn.
         return true;
     };
-    // VERA's policy, with no native ally test: the local player's allies are
-    // drawn, as the local player's house counts them.
-    if crate::map::houses::is_allied_with(alliances, local_owner, entity_owner) {
-        return true;
-    }
-    let owner_id = local_owner_id.unwrap_or_default();
-    let pos = &entity.position;
-    fog.is_cell_revealed(owner_id, pos.rx(), pos.ry())
-        && !fog.is_cell_gap_covered(owner_id, pos.rx(), pos.ry())
+    crate::app::presentation::instances::object_shown_to_local_owner(
+        local_owner,
+        local_owner_id,
+        fog,
+        alliances,
+        &entity.position,
+        entity_owner,
+        false,
+    )
 }
 
 /// Resolve a band-box release into the selection snapshot to commit.
@@ -630,23 +667,40 @@ pub(crate) fn compute_type_select_tap_with_playfield(
         }
     }
 
-    let mut seeds: Vec<InternedId> = Vec::new();
+    let mut seeds: Vec<TypeSelectionSeed> = Vec::new();
     for id in selected.iter().copied() {
         let Some(entity) = entities.get(id) else {
             continue;
         };
         let own = interner.map_or("", |i| i.resolve(entity.type_ref()));
-        push_exact_seed(&mut seeds, entity.type_ref());
-        if let Some(object) = rules.and_then(|r| r.object(own)) {
+        push_type_select_seed(
+            &mut seeds,
+            (entity.type_ref(), entity.category()),
+            rules,
+            interner,
+        );
+        if rules.is_none_or(RuleSet::type_select_uses_deploy)
+            && let Some(object) = rules.and_then(|r| r.object(own))
+        {
             if let Some(deploys_into) = object.deploys_into.as_deref()
                 && let Some(type_ref) = interner.and_then(|i| i.get(deploys_into))
             {
-                push_exact_seed(&mut seeds, type_ref);
+                push_type_select_seed(
+                    &mut seeds,
+                    (type_ref, EntityCategory::Structure),
+                    rules,
+                    interner,
+                );
             }
             if let Some(undeploys_into) = object.undeploys_into.as_deref()
                 && let Some(type_ref) = interner.and_then(|i| i.get(undeploys_into))
             {
-                push_exact_seed(&mut seeds, type_ref);
+                push_type_select_seed(
+                    &mut seeds,
+                    (type_ref, EntityCategory::Unit),
+                    rules,
+                    interner,
+                );
             }
         }
     }
@@ -711,8 +765,41 @@ pub(crate) fn compute_type_select_tap_with_playfield(
     }
 }
 
-fn push_exact_seed(seeds: &mut Vec<InternedId>, seed: InternedId) {
-    if !seeds.contains(&seed) {
+/// Ares GetSelectionGroupID1003DB30/1003DB50 and strcmpi10003990, used by
+/// IDMatches732C30 ->1004A490, click/band4ABD6C..4ABE58 ->10041760 and
+/// PlayerOwnedAliveAndNamed7327AA ->10041CD0. The rules owner provides the
+/// same key for all these callers; ownership, scope and admission stay here.
+type TypeSelectionSeed = (InternedId, EntityCategory);
+
+fn type_selection_matches(
+    left: TypeSelectionSeed,
+    right: TypeSelectionSeed,
+    rules: Option<&RuleSet>,
+    interner: Option<&crate::sim::intern::StringInterner>,
+) -> bool {
+    #[cfg(feature = "ares")]
+    if let (Some(rules), Some(interner)) = (rules, interner) {
+        return rules
+            .type_selection_key(left.1.into(), interner.resolve(left.0))
+            .eq_ignore_ascii_case(
+                rules.type_selection_key(right.1.into(), interner.resolve(right.0)),
+            );
+    }
+    #[cfg(not(feature = "ares"))]
+    let _ = (rules, interner);
+    left.0 == right.0
+}
+
+fn push_type_select_seed(
+    seeds: &mut Vec<TypeSelectionSeed>,
+    seed: TypeSelectionSeed,
+    rules: Option<&RuleSet>,
+    interner: Option<&crate::sim::intern::StringInterner>,
+) {
+    if !seeds
+        .iter()
+        .any(|&existing| type_selection_matches(existing, seed, rules, interner))
+    {
         seeds.push(seed);
     }
 }
@@ -720,7 +807,7 @@ fn push_exact_seed(seeds: &mut Vec<InternedId>, seed: InternedId) {
 fn type_select_candidates(
     entities: &EntityStore,
     source_order: &[u64],
-    seeds: &[InternedId],
+    seeds: &[TypeSelectionSeed],
     fog: Option<(&FogState, &crate::map::houses::HouseAllianceMap)>,
     local_owner: Option<&str>,
     rules: Option<&RuleSet>,
@@ -737,7 +824,14 @@ fn type_select_candidates(
             let type_id = interner.map_or("", |i| i.resolve(entity.type_ref()));
             if !entity.lifecycle.object_alive()
                 || local_owner.is_some_and(|local| !owner.eq_ignore_ascii_case(local))
-                || !seeds.contains(&entity.type_ref())
+                || !seeds.iter().any(|&seed| {
+                    type_selection_matches(
+                        seed,
+                        (entity.type_ref(), entity.category()),
+                        rules,
+                        interner,
+                    )
+                })
                 || (screen_only
                     && entity.category() != EntityCategory::Structure
                     && !is_drawn_for_local_owner(fog, local_owner, owner, entity, local_owner_id))
@@ -747,11 +841,12 @@ fn type_select_candidates(
             let dynamic = selection_dynamic_prefix(entity, entities, rules, interner)
                 && type_is_selectable(type_id, rules)
                 && (!require_playfield_membership || entity.in_playfield());
-            let undeploying_building_fallback = entity.category() == EntityCategory::Structure
-                && rules
-                    .and_then(|r| r.object(type_id))
-                    .is_some_and(|object| object.undeploys_into.is_some());
-            (dynamic || undeploying_building_fallback).then_some(*id)
+            // A structure answers false on the ordinary dynamic virtual; the ID
+            // match's building arm (`0x00732C61..0x00732C83`) admits it
+            // through `RuleSet::structure_type_selectable` instead.
+            let structure_admission = entity.category() == EntityCategory::Structure
+                && rules.is_some_and(|rules| rules.structure_type_selectable(type_id));
+            (dynamic || structure_admission).then_some(*id)
         })
         .collect()
 }
@@ -789,10 +884,10 @@ pub(crate) fn compute_type_select_click_mutation_with_playfield(
     let Some(clicked) = entities.get(clicked_id) else {
         return SelectionMutation::default();
     };
-    let clicked_type = clicked.type_ref();
+    let clicked_type = (clicked.type_ref(), clicked.category());
     if additive && current_selection.contains(&clicked_id) {
         return SelectionMutation {
-            deselect: exact_type_group(
+            deselect: matching_type_group(
                 entities,
                 scope_order,
                 clicked_type,
@@ -810,7 +905,7 @@ pub(crate) fn compute_type_select_click_mutation_with_playfield(
     }
     SelectionMutation {
         clear: !additive,
-        select: exact_type_group(
+        select: matching_type_group(
             entities,
             scope_order,
             clicked_type,
@@ -847,18 +942,26 @@ pub(crate) fn compute_type_select_box_mutation_with_playfield(
             continue;
         };
         let (sx, sy) = source.screen_position(entity);
-        if !entity.lifecycle.object_alive() || sx < min_x || sx > max_x || sy < min_y || sy > max_y
+        if !entity.lifecycle.object_alive()
+            || sx < min_x
+            || sx > max_x
+            || sy < min_y
+            || sy > max_y
+            || source.conceals(entity)
         {
             continue;
         }
-        if !represented_types.contains(&entity.type_ref()) {
-            represented_types.push(entity.type_ref());
-        }
+        push_type_select_seed(
+            &mut represented_types,
+            (entity.type_ref(), entity.category()),
+            rules,
+            interner,
+        );
     }
 
     let mut select = Vec::new();
     for type_ref in represented_types {
-        select.extend(exact_type_group(
+        select.extend(matching_type_group(
             entities,
             scope_order,
             type_ref,
@@ -877,10 +980,10 @@ pub(crate) fn compute_type_select_box_mutation_with_playfield(
     }
 }
 
-fn exact_type_group(
+fn matching_type_group(
     entities: &EntityStore,
     source_order: &[u64],
-    type_ref: InternedId,
+    type_ref: TypeSelectionSeed,
     local_owner: Option<&str>,
     rules: Option<&RuleSet>,
     interner: Option<&crate::sim::intern::StringInterner>,
@@ -895,7 +998,12 @@ fn exact_type_group(
             let type_id = interner.map_or("", |i| i.resolve(entity.type_ref()));
             if !entity.lifecycle.object_alive()
                 || entity.lifecycle.in_limbo()
-                || entity.type_ref() != type_ref
+                || !type_selection_matches(
+                    (entity.type_ref(), entity.category()),
+                    type_ref,
+                    rules,
+                    interner,
+                )
                 || local_owner.is_some_and(|local| !owner.eq_ignore_ascii_case(local))
                 || (selecting
                     && !static_selection_gate(entity, type_id, rules, require_playfield_membership))
@@ -1001,7 +1109,8 @@ pub(crate) fn selection_dynamic_prefix(
     interner: Option<&crate::sim::intern::StringInterner>,
 ) -> bool {
     // BuildingClass answers false on the ordinary dynamic selection virtual.
-    // TypeSelect owns the verified UndeploysInto fallback separately.
+    // TypeSelect owns the separate building admission
+    // (`RuleSet::structure_type_selectable`) instead.
     if entity.category() == EntityCategory::Structure {
         return false;
     }
@@ -1089,13 +1198,20 @@ pub(crate) fn pick_entity_at_point<'a>(
 /// `Tactical::PickObjectAtScreenPoint @ 0x006DA380`, with the cloak test
 /// ProcessClickCoords repeats on its result (`0x00692529..0x0069257F`).
 ///
-/// A shrouded clicked cell picks nothing. Otherwise the nearest admitted
+/// A shrouded clicked cell picks nothing (`DisplayClass::ProcessClickCoords @
+/// 0x00692300`, `0x00692480`). Neither does one whose first Building is
+/// frozen in FogOfWar (Building `+0x6E7`, `0x006924A4..0x006924FA`), so the
+/// live building and any unit on that cell stay out of reach. That arm's
+/// IsFogged for a cell without a Building is `0x005865E0`, which always
+/// answers false. Otherwise the nearest admitted
 /// registered object wins on `ftol(dx² + 0.5·dy²) < 200`, the first in
 /// `encounter_order` on a tie. With none, the pick is the head of the clicked
 /// cell's ground list (`CellClass+0xE4`, `0x006DA4B8..0x006DA4FB`): a
 /// building over its whole foundation, a unit standing beyond the ellipse, or
 /// a Terrain object. The bridge-deck list (`+0xE8`) is never read. An
-/// unadmitted head picks nothing; the pick never looks behind it.
+/// unadmitted head picks nothing; the pick never looks behind it. An object
+/// VERA's translucent fog leaves undrawn ([`PickSource::conceals`]) is not
+/// admitted either.
 ///
 /// Residual: the anchor pass scores only entities. Native also scores a
 /// registered Terrain object whose type has `IsVeinhole=` (`+0x2B4`);
@@ -1123,6 +1239,9 @@ pub(crate) fn pick_object_at_point<'a>(
             false,
             terrain,
         ) == crate::app::presentation::instances::CellVisibilityState::Shrouded
+            || source
+                .fog_of_war_cell_building(click_cell)
+                .is_some_and(|building| fog.is_object_fogged(player, building))
         {
             return None;
         }
@@ -1133,7 +1252,7 @@ pub(crate) fn pick_object_at_point<'a>(
         let Some(entity) = entities.get(stable_id) else {
             continue;
         };
-        if !pick_admits_object(entity, fog, player) {
+        if !pick_admits_object(entity, fog, player) || source.conceals(entity) {
             continue;
         }
         // Native6DA380 tests lifecycle/cloak after the clicked Cell gate;
@@ -1153,10 +1272,28 @@ pub(crate) fn pick_object_at_point<'a>(
     match source.first_ground_cell_object(click_cell)? {
         CellObjectMember::Entity(id) => entities
             .get(id)
-            .filter(|entity| pick_admits_object(entity, fog, player))
+            .filter(|entity| pick_admits_object(entity, fog, player) && !source.conceals(entity))
             .map(|_| CellObjectMember::Entity(id)),
         terrain => Some(terrain),
     }
+}
+
+/// With nothing selected, DetermineAction (`0x00692610`, its no-selection arm
+/// from `0x00692673`) refuses ACTION_SELECT for a picked Building frozen in
+/// FogOfWar (`+0x6E7`, `0x0069274C..0x00692760`) and for a Techno that
+/// retains `+0x3D4` (`0x00692762..0x00692778`). The click and the cursor
+/// share this leaf. A fogged building's own cell already picks nothing; this
+/// reaches the one picked through its anchor from a neighbouring cell.
+pub(crate) fn no_selection_refuses_select(
+    entity: &crate::sim::game_entity::GameEntity,
+    fog: Option<&FogState>,
+    player: Option<InternedId>,
+) -> bool {
+    (entity.category() == EntityCategory::Structure
+        && fog
+            .zip(player)
+            .is_some_and(|(fog, player)| fog.is_object_fogged(player, entity.stable_id())))
+        || entity.is_mission_only()
 }
 
 /// Final object admission shared by selection callers. Ownership and the
@@ -1202,6 +1339,14 @@ fn is_local_band_candidate(
 #[cfg(test)]
 #[path = "entity_pick_reveal_tests.rs"]
 mod reveal_tests;
+
+#[cfg(test)]
+#[path = "entity_pick_building_type_select_tests.rs"]
+mod building_type_select_tests;
+
+#[cfg(test)]
+#[path = "entity_pick_group_as_tests.rs"]
+mod group_as_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1380,6 +1525,240 @@ mod tests {
                     .map(|hover| hover.stable_id),
                 expected
             );
+        }
+    }
+
+    /// Under FogOfWar, ProcessClickCoords skips the pick on a cell whose
+    /// Building is frozen in fog (`0x006924A4..0x006924FA`); the fog flag
+    /// alone, without the Scenario FogOfWar bit, does not. From a neighbouring
+    /// cell the anchor ellipse still finds it, and with nothing selected
+    /// DetermineAction refuses to select it (`0x0069274C..0x00692760`). The
+    /// band preflight registers it whatever the fog mode (`0x006D9CE0`).
+    #[test]
+    fn a_building_frozen_in_fog_of_war_refuses_the_pick_on_its_cell() {
+        use crate::app::presentation::interpolation::RenderInterpolation;
+        use crate::sim::world::Simulation;
+
+        let mut sim = Simulation::new();
+        let viewer = sim.intern("viewer");
+        let other = sim.intern("other");
+        let typ = sim.intern("GAPOWR");
+        *sim.fog_mut_for_test() = FogState::new(32, 32);
+        // Explored, out of current sight: translucent fog conceals it.
+        for rx in 8..14 {
+            for ry in 8..14 {
+                sim.fog_mut_for_test()
+                    .set_ground_bits_for_test(viewer, rx, ry, 0x08);
+            }
+        }
+        let building = item83_entity(1, 10, 10, other, typ, EntityCategory::Structure, false);
+        let (x, y) = crate::render::locomotor_visual::screen_position(&building);
+        sim.entities_mut_for_test().insert(building);
+        sim.occupancy_mut().add(
+            10,
+            10,
+            1,
+            crate::sim::movement::locomotor::MovementLayer::Ground,
+            None,
+            crate::sim::occupancy::CellListInsertion::AppendBuilding,
+        );
+        sim.resubmit_entity_display_for_test(1);
+        let native = RenderInterpolation::new(false);
+        for (fog_of_war, fogged) in [(true, false), (true, true), (false, true)] {
+            sim.session_mut_for_test()
+                .game_options_mut_for_test()
+                .fog_of_war = fog_of_war;
+            sim.fog_mut_for_test()
+                .set_object_fogged_for_test(viewer, 1, fogged);
+            let case = format!("fog_of_war={fog_of_war} fogged={fogged}");
+            // On the anchor and beyond the ellipse on the same foundation.
+            for point_x in [x, x + 20.] {
+                assert_eq!(
+                    hover_target_at_point(&sim, point_x, y, "viewer", false)
+                        .map(|hover| hover.stable_id),
+                    (!(fog_of_war && fogged)).then_some(1),
+                    "{case} x={point_x}"
+                );
+            }
+            // Inside the ellipse, on the cell below the foundation.
+            let below = (x, y + 18.);
+            assert_eq!(
+                hover_target_at_point(&sim, below.0, below.1, "viewer", false)
+                    .map(|hover| hover.stable_id),
+                Some(1),
+                "{case}"
+            );
+            let click = compute_click_selection_snapshot_with_playfield(
+                &sim,
+                &[1],
+                &[],
+                Some(sim.fog()),
+                Some("viewer"),
+                below.0,
+                below.1,
+                false,
+                None,
+                Some(sim.interner()),
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                click.select,
+                if fogged { vec![] } else { vec![1] },
+                "{case}"
+            );
+            for translucent_viewer in [None, Some(viewer)] {
+                let source = PresentedWorld {
+                    sim: &sim,
+                    interpolation: &native,
+                    translucent_viewer,
+                };
+                let (bx, by) = source.screen_position(sim.entities().get(1).unwrap());
+                assert!(
+                    band_rect_contains_drawn_object(
+                        source,
+                        &[1],
+                        Some((sim.fog(), sim.house_alliances())),
+                        Some("viewer"),
+                        bx - 1.,
+                        by - 1.,
+                        bx + 1.,
+                        by + 1.,
+                        Some(sim.interner()),
+                    ),
+                    "{case} {translucent_viewer:?}"
+                );
+            }
+        }
+    }
+
+    /// Draw plan, screen selection and pickers share one visibility rule
+    /// (#617): own and allied units always show; an enemy shows in current
+    /// sight, and never under a hostile gap. On explored ground out of sight,
+    /// VERA's translucent fog with FogOfWar takes an enemy out of the draw
+    /// plan, so no point pick, band preflight or type-select box finds it;
+    /// the retail fog keeps it pickable, as native does
+    /// (`0x006924A4..0x006924FA`).
+    #[test]
+    fn translucent_fog_hides_from_the_pickers_what_it_hides_from_the_draw_plan() {
+        use crate::app::presentation::instances::{
+            TacticalEntityPurpose, tactical_entity_admission, translucent_fog_conceals,
+        };
+        use crate::app::presentation::interpolation::RenderInterpolation;
+        use crate::sim::world::Simulation;
+
+        let mut sim = Simulation::new();
+        let viewer = sim.intern("Americans");
+        let ally = sim.intern("British");
+        let enemy = sim.intern("Russians");
+        let typ = sim.intern("MTNK");
+        sim.session_mut_for_test()
+            .game_options_mut_for_test()
+            .fog_of_war = true;
+        sim.house_alliances_mut_for_test()
+            .insert("AMERICANS".into(), ["BRITISH".into()].into());
+        *sim.fog_mut_for_test() = FogState::new(40, 16);
+        // Explored, out of current sight, except the seen enemy's cell; a
+        // hostile gap then covers the last enemy.
+        for rx in 8..30 {
+            for ry in 8..12 {
+                sim.fog_mut_for_test()
+                    .set_ground_bits_for_test(viewer, rx, ry, 0x08);
+            }
+        }
+        sim.fog_mut_for_test()
+            .mark_visible_for_owner(viewer, 21, 10);
+        let (alliances, interner) = (sim.house_alliances().clone(), sim.interner().clone());
+        crate::sim::vision::apply_gap_generators(
+            sim.fog_mut_for_test(),
+            &alliances,
+            &[(enemy, 25, 10, 1)],
+            &interner,
+        );
+        // (id, cell x, owner, shown by retail fog, shown by translucent fog)
+        let cases = [
+            (1, 9, viewer, true, true),
+            (2, 13, ally, true, true),
+            (3, 17, enemy, true, false),
+            (4, 21, enemy, true, true),
+            (5, 25, enemy, false, false),
+        ];
+        for &(id, rx, owner, ..) in &cases {
+            sim.entities_mut_for_test().insert(item83_entity(
+                id,
+                rx,
+                10,
+                owner,
+                typ,
+                EntityCategory::Unit,
+                false,
+            ));
+            sim.resubmit_entity_display_for_test(id);
+        }
+        let all: Vec<u64> = cases.iter().map(|case| case.0).collect();
+        let native = RenderInterpolation::new(false);
+        for (id, _, owner, retail, translucent) in cases {
+            let entity = sim.entities().get(id).unwrap();
+            assert_eq!(!translucent_fog_conceals(&sim, viewer, entity), translucent);
+            let screen_selected = tactical_entity_admission(
+                TacticalEntityPurpose::ScreenSelection,
+                entity,
+                sim.interner().resolve(owner),
+                Some("Americans"),
+                Some(viewer),
+                sim.fog(),
+                sim.house_alliances(),
+                false,
+                0,
+                0,
+                Default::default(),
+            )
+            .is_some();
+            assert_eq!(screen_selected, retail, "{id}");
+            let screen_order: &[u64] = if screen_selected { &[id] } else { &[] };
+            for (translucent_viewer, shown) in [(None, retail), (Some(viewer), translucent)] {
+                let source = PresentedWorld {
+                    sim: &sim,
+                    interpolation: &native,
+                    translucent_viewer,
+                };
+                let case = format!("{id} {translucent_viewer:?}");
+                let (x, y) = source.screen_position(entity);
+                let picked = hover_target_at_point(source, x, y, "Americans", false)
+                    .map(|hover| hover.stable_id);
+                assert_eq!(picked, shown.then_some(id), "{case}");
+                let band = band_rect_contains_drawn_object(
+                    source,
+                    &[id],
+                    Some((sim.fog(), sim.house_alliances())),
+                    Some("Americans"),
+                    x - 1.,
+                    y - 1.,
+                    x + 1.,
+                    y + 1.,
+                    Some(sim.interner()),
+                );
+                assert_eq!(band, shown, "{case}");
+                // An MTNK in the box selects the viewer's own MTNKs.
+                let typed = compute_type_select_box_mutation_with_playfield(
+                    source,
+                    screen_order,
+                    &all,
+                    &[],
+                    None,
+                    Some("Americans"),
+                    x - 1.,
+                    y - 1.,
+                    x + 1.,
+                    y + 1.,
+                    false,
+                    None,
+                    Some(sim.interner()),
+                    false,
+                );
+                assert_eq!(typed.select, if shown { vec![1] } else { vec![] }, "{case}");
+            }
         }
     }
 

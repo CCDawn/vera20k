@@ -5,7 +5,9 @@
 
 use super::controls::{ControlPaint, paint_control};
 use super::text::rect_to_text_rect;
-use super::{SHELL_CONTROL_TEXT_DEPTH, SHELL_LABEL_TEXT_RGB};
+use super::{
+    SHELL_CONTROL_TEXT_DEPTH, SHELL_DISABLED_TEXT_RGB_FROM_PACKED_0000009F, SHELL_LABEL_TEXT_RGB,
+};
 use crate::app::AppState;
 use crate::render::batch::SpriteInstance;
 use crate::render::shell_text::{self, ShellAlign, ShellTextDraw};
@@ -35,11 +37,22 @@ fn text(
     align: ShellAlign,
     scale: ShellScale,
 ) -> ShellTextDraw {
+    colored_text(state, value, rect, align, scale, SHELL_LABEL_TEXT_RGB)
+}
+
+fn colored_text(
+    state: &AppState,
+    value: &str,
+    rect: RectPx,
+    align: ShellAlign,
+    scale: ShellScale,
+    rgb: [f32; 3],
+) -> ShellTextDraw {
     shell_text::draw_in_rect_scaled(
         &state.renderer.bit_font,
         value,
         rect_to_text_rect(rect),
-        SHELL_LABEL_TEXT_RGB,
+        rgb,
         align,
         [0.0; 2],
         SHELL_CONTROL_TEXT_DEPTH,
@@ -59,6 +72,9 @@ pub(crate) fn paint_wol_options_children(
     let scale = layout.page.scale;
     let chrome = atlas.control_chrome();
     for (index, (checkbox, rect)) in CHECKBOXES.iter().zip(layout.checkboxes).enumerate() {
+        let Some(rect) = rect else {
+            continue;
+        };
         paint_control(
             &mut paint.controls,
             &chrome,
@@ -106,6 +122,7 @@ pub(crate) fn paint_shell_sound_children(
                     scale,
                 ),
                 plaque: true,
+                disabled: !dialog.sliders_enabled,
             },
             scale,
         );
@@ -116,12 +133,18 @@ pub(crate) fn paint_shell_sound_children(
             ShellAlign::H_RIGHT,
             scale,
         ));
-        paint.texts.push(text(
+        // A disabled trackbar's value text takes [0xAC1CB4] (`0x0061E2B1`).
+        paint.texts.push(colored_text(
             state,
             &dialog.positions[index].to_string(),
             crate::ui::shell::trackbar::value_text_rect(rect, scale),
             ShellAlign::H_CENTER | ShellAlign::V_CENTER,
             scale,
+            if dialog.sliders_enabled {
+                SHELL_LABEL_TEXT_RGB
+            } else {
+                SHELL_DISABLED_TEXT_RGB_FROM_PACKED_0000009F
+            },
         ));
     }
     paint

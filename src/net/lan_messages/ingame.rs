@@ -9,9 +9,13 @@
 //! and beacons belong to their existing app owners. This module only encodes
 //! and reads the fields.
 
-use super::{LAN_MESSAGE_LEN, LanMessage, LanMessageError, LanMessageKind, game_name_hash};
+use super::{
+    LAN_MESSAGE_LEN, LanMessage, LanMessageError, LanMessageKind, SessionScope, game_name_hash,
+};
 
 pub const LOADING_PROGRESS_LEN: usize = 51;
+pub const SCOPED_LOADING_MAGIC: &[u8; 4] = b"VLP2";
+pub const SCOPED_LOADING_LEN: usize = 4 + SessionScope::LEN + LOADING_PROGRESS_LEN;
 const LOADING_KIND: u32 = 0x0f;
 const CHAT_KIND: u32 = 0x0c;
 const TAUNT_KIND: u32 = 0x1d;
@@ -29,6 +33,8 @@ pub enum InGameMessageError {
     WrongLoadingLength { actual: usize },
     #[error("loading progress has message kind{actual:#x}, expected0x0f")]
     WrongLoadingKind { actual: u32 },
+    #[error("loading progress belongs to a different LAN admission")]
+    WrongLoadingScope,
     #[error("chat is {actual} UTF-16 units, maximum{maximum}")]
     ChatTooLong { actual: usize, maximum: usize },
     #[error("beacon record has {actual} bytes, expected61")]
@@ -155,6 +161,26 @@ impl LoadingProgressMessage {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.message.as_bytes()[..LOADING_PROGRESS_LEN]
+    }
+
+    /// VERA binds the native loading record to the exact final host options.
+    /// Delayed progress100 from a previous match cannot satisfy a new barrier.
+    pub fn scoped_bytes(&self, scope: SessionScope) -> [u8; SCOPED_LOADING_LEN] {
+        let mut bytes = [0; SCOPED_LOADING_LEN];
+        bytes[..4].copy_from_slice(SCOPED_LOADING_MAGIC);
+        bytes[4..4 + SessionScope::LEN].copy_from_slice(&scope.encode());
+        bytes[4 + SessionScope::LEN..].copy_from_slice(self.as_bytes());
+        bytes
+    }
+
+    pub fn decode_scoped(bytes: &[u8], expected: SessionScope) -> Result<Self, InGameMessageError> {
+        if bytes.len() != SCOPED_LOADING_LEN
+            || &bytes[..4] != SCOPED_LOADING_MAGIC
+            || SessionScope::decode(&bytes[4..4 + SessionScope::LEN]) != Some(expected)
+        {
+            return Err(InGameMessageError::WrongLoadingScope);
+        }
+        Self::decode(&bytes[4 + SessionScope::LEN..])
     }
 
     pub fn name_bytes(&self) -> &[u8] {

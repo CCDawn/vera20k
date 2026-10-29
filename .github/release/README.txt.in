@@ -36,8 +36,8 @@ REQUIREMENTS
     scroll down, click Open Anyway, enter your password and confirm. The
     button stays for about an hour after the block; if it is gone, open
     VERA20k again. Each new version asks once.
-  Linux: needs ALSA (libasound2) and a Vulkan driver. The AppImage mounts
-    itself with FUSE (fusermount, from the fuse3 or fuse package), which most
+  Linux: needs ALSA (libasound2), a Vulkan driver, and libxkbcommon-x11-0
+    for X11 keyboard support. The AppImage mounts itself with FUSE (fusermount, from the fuse3 or fuse package), which most
     desktops have; without it, start it with --appimage-extract-and-run.
 
 This is early software: expect missing features and differences from the
@@ -47,8 +47,13 @@ Official downloads come only from
 https://github.com/YuriPlanet/vera20k/releases. To check that an installer was
 built there, run: gh attestation verify <installer> --repo YuriPlanet/vera20k
 
+Copyright 2026 Halvor Nikolai Rusten and VERA20k contributors.
 VERA20k is licensed under the GNU General Public License version 3
-(LICENSE-GPL). Source code: https://github.com/YuriPlanet/vera20k
+(LICENSE-GPL). The source of this build is at
+https://github.com/YuriPlanet/vera20k/tree/@COMMIT@
+Its Bink video decoder is ported from FFmpeg, copyright 2007-2011 Peter Ross,
+2009 Daniel Verkamp and 2009 Konstantin Shishkov, and licensed under the GNU
+Lesser General Public License version 2.1 or later (LGPL-2.1-or-later.txt).
 THIRD_PARTY_LICENSES.html lists the open-source libraries it includes and
 their licenses.
 

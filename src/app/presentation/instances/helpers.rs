@@ -158,14 +158,15 @@ pub(crate) fn tactical_entity_admission(
         || entity.lifecycle.in_limbo()
         || entity.passenger_role.is_inside_transport()
         || (requires_revealed_anchor
-            && !is_entity_visible_for_local_owner(
+            && !ignore_visibility
+            && !object_shown_to_local_owner(
                 local_owner,
+                local_owner_id,
                 fog,
                 alliances,
                 &entity.position,
                 owner,
-                ignore_visibility,
-                local_owner_id,
+                false,
             ))
     {
         return None;
@@ -438,33 +439,175 @@ pub(crate) fn interpolated_screen_position_entity(
     crate::render::locomotor_visual::screen_position(entity)
 }
 
-/// Check whether an entity is visible to the local player based on shroud.
+/// Is `owner`'s object at `pos` shown to the local player? The one rule
+/// tactical presentation (screen selection, VERA's translucent fog) and input
+/// picking (band preflight, TypeSelect's screen stage, translucent pick
+/// concealment) share; callers keep their own full-visibility switch.
 ///
-/// In standard YR (FogOfWar=false), once a cell is explored it stays fully
-/// visible forever. Entities of the local player's allies, as its house
-/// counts them, are always visible (VERA's policy, with no native ally test).
-/// Others are visible if the cell they occupy has been explored (revealed).
-pub(crate) fn is_entity_visible_for_local_owner(
+/// Without a known local player everything is shown. The local player's
+/// allies, as its house counts them, always are (VERA's policy, with no native
+/// ally test). Anyone else's object needs an explored anchor cell no hostile
+/// gap covers; `current_sight_only` (translucent fog under FogOfWar) also
+/// needs the viewer's current sight there.
+pub(crate) fn object_shown_to_local_owner(
     local_owner: Option<&str>,
+    local_owner_id: Option<InternedId>,
     fog: &FogState,
     alliances: &crate::map::houses::HouseAllianceMap,
     pos: &Position,
     owner: &str,
-    ignore_visibility: bool,
-    local_owner_id: Option<InternedId>,
+    current_sight_only: bool,
 ) -> bool {
-    if ignore_visibility {
-        return true;
-    }
     let Some(local_owner) = local_owner else {
         return true;
     };
-    if crate::map::houses::is_allied_with(alliances, local_owner, owner) {
-        return true;
+    crate::map::houses::is_allied_with(alliances, local_owner, owner)
+        || cell_shows_objects(
+            local_owner_id.unwrap_or_default(),
+            fog,
+            pos.rx(),
+            pos.ry(),
+            current_sight_only,
+        )
+}
+
+/// Does `viewer` see another house's objects on this cell? Explored (with
+/// `current_sight_only`, currently seen) and not covered by a hostile gap.
+fn cell_shows_objects(
+    viewer: InternedId,
+    fog: &FogState,
+    rx: u16,
+    ry: u16,
+    current_sight_only: bool,
+) -> bool {
+    let lit = if current_sight_only {
+        fog.is_cell_visible(viewer, rx, ry)
+    } else {
+        // Standard YR has no fog-of-war layer: explored ground stays visible.
+        fog.is_cell_revealed(viewer, rx, ry)
+    };
+    lit && !fog.is_cell_gap_covered(viewer, rx, ry)
+}
+
+/// VERA's translucent fog removes the A buffer's native concealment, so what
+/// it used to black out must leave the draw plan instead. Terrain stays
+/// visible, but an enemy cell shows no object until the viewer actually sees
+/// it; friendly and allied objects always draw.
+pub(crate) fn translucent_fog_conceals_cell(
+    viewer: Option<InternedId>,
+    fog: Option<&FogState>,
+    rx: u16,
+    ry: u16,
+    fog_of_war: bool,
+) -> bool {
+    let (Some(viewer), Some(fog)) = (viewer, fog) else {
+        return false;
+    };
+    !cell_shows_objects(viewer, fog, rx, ry, fog_of_war)
+}
+
+/// The local house VERA's translucent fog conceals other houses' unseen
+/// objects from, or `None` under the retail fog or full visibility. The draw
+/// plan and the tactical pickers ([`crate::app::input::entity_pick::presented`])
+/// both read it, so whatever the fog takes out of the plan no pick finds.
+pub(crate) fn translucent_fog_viewer(
+    state: &AppState,
+    sim: &crate::sim::world::Simulation,
+) -> Option<InternedId> {
+    if !state.translucent_fog_enabled() || state.match_state.sandbox_full_visibility {
+        return None;
     }
-    let owner_id = local_owner_id.unwrap_or_default();
-    fog.is_cell_revealed(owner_id, pos.rx(), pos.ry())
-        && !fog.is_cell_gap_covered(owner_id, pos.rx(), pos.ry())
+    let name = crate::app::input::commands::preferred_local_owner_name(state)?;
+    sim.interner().get(&name)
+}
+
+/// [`object_shown_to_local_owner`] as VERA's translucent fog applies it to
+/// one live object: everyone but the viewer's allies follows the viewer's
+/// sight at the anchor cell, current sight under FogOfWar.
+///
+/// Native draws such an object and lets the A buffer darken it: the IsFogged
+/// gates of `Tactical_ObjectRenderingLoop @ 0x006D8DB0` (`0x006D8FDA`,
+/// `0x006D920E`, `0x006D929F`, `0x006D965D`) call `MapClass::IsFogged @
+/// 0x005865E0`, which is `xor al, al; ret 4`. Its click stays pickable too:
+/// `DisplayClass::ProcessClickCoords @ 0x00692300` refuses the pick under
+/// FogOfWar (`0x006924A4..0x006924FA`) only for a fogged Building (`+0x6E7`)
+/// on the clicked cell, and otherwise asks that same stub.
+pub(crate) fn translucent_fog_conceals(
+    sim: &crate::sim::world::Simulation,
+    viewer: InternedId,
+    entity: &GameEntity,
+) -> bool {
+    let interner = sim.interner();
+    !object_shown_to_local_owner(
+        Some(interner.resolve(viewer)),
+        Some(viewer),
+        sim.fog(),
+        sim.house_alliances(),
+        &entity.position,
+        interner.resolve(entity.owner()),
+        sim.session().game_options().fog_of_war,
+    )
+}
+
+/// Enemy weapon projectiles and their trails are hidden under the same rule.
+/// A bullet without a live source object is treated as hostile, so a stray
+/// tracer cannot outline an unseen firing position.
+pub(crate) fn translucent_fog_conceals_bullet(
+    sim: &crate::sim::world::Simulation,
+    bullet: &crate::sim::projectile::Projectile,
+    coord: [i32; 3],
+    local_owner: Option<&str>,
+    viewer: Option<InternedId>,
+    fog_of_war: bool,
+) -> bool {
+    let source_owner = sim
+        .entities()
+        .get(bullet.source_id())
+        .map(|entity| sim.interner().resolve(entity.owner()));
+    let allied = source_owner.is_some_and(|owner| {
+        local_owner.is_some_and(|local| {
+            crate::map::houses::is_allied_with(sim.house_alliances(), local, owner)
+        })
+    });
+    if allied {
+        return false;
+    }
+    let cell = lepton_cell(coord[0], coord[1]);
+    translucent_fog_conceals_cell(viewer, Some(sim.fog()), cell.0, cell.1, fog_of_war)
+}
+
+/// World-lepton coordinates to their map cell, clamped to the addressable
+/// cell range.
+pub(crate) fn lepton_cell(x: i32, y: i32) -> (u16, u16) {
+    (
+        (x / 256).clamp(0, i32::from(u16::MAX)) as u16,
+        (y / 256).clamp(0, i32::from(u16::MAX)) as u16,
+    )
+}
+
+/// `[General]` superweapon effect animations keep drawing over unseen cells:
+/// these are the cinematic effects the fog must not swallow.
+pub(crate) fn is_superweapon_effect_anim(
+    name: &str,
+    general: &crate::rules::ruleset::GeneralRules,
+) -> bool {
+    name.eq_ignore_ascii_case("NUKEBALL")
+        || name.eq_ignore_ascii_case(&general.chrono_placement_anim)
+        || name.eq_ignore_ascii_case(&general.chrono_blast_anim)
+        || name.eq_ignore_ascii_case(&general.chrono_blast_dest_anim)
+        || name.eq_ignore_ascii_case(&general.dominator_first_anim)
+        || name.eq_ignore_ascii_case(&general.dominator_second_anim)
+        || name.eq_ignore_ascii_case(&general.iron_curtain_invoke_anim)
+        || name.eq_ignore_ascii_case(&general.force_shield_invoke_anim)
+        || name.eq_ignore_ascii_case(&general.weather_con_bolt_explosion)
+        || general
+            .weather_con_clouds
+            .iter()
+            .any(|anim| name.eq_ignore_ascii_case(anim))
+        || general
+            .weather_con_bolts
+            .iter()
+            .any(|anim| name.eq_ignore_ascii_case(anim))
 }
 
 pub(crate) fn cell_visibility_for_local_owner(
@@ -1045,6 +1188,89 @@ mod tests {
 
         let (_, drawn_y) = screen_position(gi);
         assert_eq!(ground_sort_row(gi, drawn_y) - drawn_y, 216.0);
+    }
+
+    /// VERA's translucent fog removes the A buffer's concealment, so the draw
+    /// plan relies on this gate: terrain stays visible but enemy objects are
+    /// withheld over unexplored ground; under FogOfWar they also need current
+    /// sight. Allies always draw. Standard YR keeps explored enemies visible.
+    #[test]
+    fn translucent_fog_withholds_only_unseen_enemies() {
+        use crate::sim::combat::Health;
+
+        let viewer_name = "Americans";
+        let viewer = crate::sim::intern::test_intern(viewer_name);
+        let enemy = crate::sim::intern::test_intern("Soviet");
+        let entity = |owner: InternedId| {
+            GameEntity::new_at_frame_zero_for_test(
+                1,
+                3,
+                3,
+                0,
+                0,
+                owner,
+                Health::new(100),
+                crate::sim::intern::test_intern("E1"),
+                EntityCategory::Unit,
+                0,
+                5,
+                true,
+            )
+        };
+        let enemy_entity = entity(enemy);
+        let own_entity = entity(viewer);
+        let conceal = |fog: &FogState, entity: &GameEntity, owner: &str, fog_of_war: bool| {
+            !object_shown_to_local_owner(
+                Some(viewer_name),
+                Some(viewer),
+                fog,
+                &Default::default(),
+                &entity.position,
+                owner,
+                fog_of_war,
+            )
+        };
+
+        // Never explored: hidden in both modes; the wall path agrees.
+        let mut fog = FogState::new(16, 16);
+        assert!(conceal(&fog, &enemy_entity, "Soviet", false));
+        assert!(conceal(&fog, &enemy_entity, "Soviet", true));
+        assert!(!conceal(&fog, &own_entity, viewer_name, false));
+        assert!(translucent_fog_conceals_cell(
+            Some(viewer),
+            Some(&fog),
+            3,
+            3,
+            false
+        ));
+
+        // Explored in standard YR: enemies stay visible even without current
+        // sight; this is the regression that made them vanish from lit ground.
+        let mut explored = FogState::new(16, 16);
+        explored.set_ground_bits_for_test(viewer, 3, 3, 0x08);
+        assert!(explored.is_cell_revealed(viewer, 3, 3));
+        assert!(!explored.is_cell_visible(viewer, 3, 3));
+        assert!(!conceal(&explored, &enemy_entity, "Soviet", false));
+        assert!(conceal(&explored, &enemy_entity, "Soviet", true));
+        assert!(!translucent_fog_conceals_cell(
+            Some(viewer),
+            Some(&explored),
+            3,
+            3,
+            false
+        ));
+        assert!(translucent_fog_conceals_cell(
+            Some(viewer),
+            Some(&explored),
+            3,
+            3,
+            true
+        ));
+
+        // Current sight keeps the enemy object in both modes.
+        explored.mark_visible_for_owner(viewer, 3, 3);
+        assert!(!conceal(&explored, &enemy_entity, "Soviet", false));
+        assert!(!conceal(&explored, &enemy_entity, "Soviet", true));
     }
 }
 

@@ -946,7 +946,9 @@ impl Simulation {
         if entity.category() != EntityCategory::Structure {
             return;
         }
-        let Some(object) = interner.object_type(entity.type_ref(), rules) else {
+        let Some(object) =
+            interner.object_type_in_category(entity.type_ref(), entity.category().into(), rules)
+        else {
             return;
         };
         let entry = RegisteredBuilding::new(id, object);
@@ -1746,6 +1748,9 @@ mod tests {
         sim.restore_map_authority_after_snapshot_load(&rules, &overlays, None)
             .expect("publish fixture map authority");
         sim.scenario_rng = crate::sim::rng::SimRng::new(0);
+        // Player load clears planning tokens (6370B0 / 70BF79), including the
+        // empty tokens registered by these fixture buildings.
+        sim.reset_planning_after_player_load();
         let before = sim.state_hash();
         let bytes = crate::sim::snapshot::GameSnapshot::save(&sim, 0, 0, "house-base-geometry", 0);
         let mut restored = crate::sim::snapshot::GameSnapshot::load(&bytes)

@@ -5,6 +5,12 @@
 //! keeps the control identity, the CSF/tooltip keys, and the action/result-code
 //! tables that the controller's activated-control id maps through.
 
+use crate::ui::shell::controller::DialogController;
+use crate::ui::shell::descriptor::DialogId;
+
+/// The main-menu dialog resource.
+pub const MAIN_MENU_DIALOG: DialogId = DialogId(0x00E2);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainMenuControlId {
     SinglePlayer0x683,
@@ -56,17 +62,29 @@ pub enum MainMenuShellAction {
 
 #[derive(Debug, Clone, Default)]
 pub struct MainMenuShellState {
-    pub pressed_owner_draw_button: Option<MainMenuControlId>,
-    /// Control under the cursor right now, if any. Drives the bottom-left
-    /// tooltip status line. Dialog 0xE2 buttons have no hover frame change:
-    /// the focus-flash byte the paint path reads is only toggled by a timer
-    /// armed for a network-dialog control that does not exist on this dialog,
-    /// so hovering produces no visual change (default frame stays selected).
-    pub hovered_owner_draw_button: Option<MainMenuControlId>,
     /// Retained, paint-driven kind-1 state for title static 0x694.
     pub(crate) title_reveal: crate::ui::shell::static_reveal::Kind1StaticReveal,
     /// Process-wide like `0x00A8F7B8`: a new 0xE2 keeps the typed letters.
     pub(crate) typed_codes: super::MainMenuTypedCodes,
+}
+
+/// The 0xE2 button held down, read from the controller's live 0xE2 instance.
+/// `None` while no 0xE2 is live: after its destruction, and after a re-entry
+/// until the first pointer message creates the new instance.
+pub fn pressed_control(controller: &DialogController) -> Option<MainMenuControlId> {
+    controller
+        .pressed_in(MAIN_MENU_DIALOG)
+        .and_then(MainMenuControlId::from_resource_id)
+}
+
+/// The 0xE2 button under the cursor; it drives the bottom-left status line.
+/// 0xE2 buttons have no hover frame: the focus-flash byte the paint path reads
+/// is only toggled by a timer armed for a network-dialog control that does not
+/// exist on this dialog.
+pub fn hovered_control(controller: &DialogController) -> Option<MainMenuControlId> {
+    controller
+        .hovered_in(MAIN_MENU_DIALOG)
+        .and_then(MainMenuControlId::from_resource_id)
 }
 
 pub fn action_for_control(id: MainMenuControlId) -> MainMenuShellAction {
@@ -120,8 +138,6 @@ pub fn tooltip_csf_key_for_control(id: MainMenuControlId) -> &'static str {
 mod tests {
     use super::*;
     use crate::ui::main_menu_shell::compute_layout;
-    use crate::ui::shell::controller::DialogController;
-    use crate::ui::shell::descriptor::DialogId;
     use crate::ui::shell::layout::LaidOutControl;
 
     /// Adapt the laid-out main-menu buttons into the controller's button-only feed.
@@ -194,5 +210,28 @@ mod tests {
         assert_eq!(c.pressed(), None);
         c.on_pointer_down(700, 577, &feed);
         assert_eq!(c.pressed(), None);
+    }
+
+    #[test]
+    fn paint_state_follows_the_live_0xe2_instance_only() {
+        let feed = button_feed(&compute_layout(800, 600));
+        let single_player = Some(MainMenuControlId::SinglePlayer0x683);
+        let mut c = DialogController::default();
+        c.ensure_active(MAIN_MENU_DIALOG, false);
+        c.on_pointer_move(700, 210, &feed);
+        c.on_pointer_down(700, 210, &feed);
+        // A message box over 0xE2 leaves 0xE2's own press and hover painted.
+        c.push(DialogId(0x0120), true);
+        assert_eq!(pressed_control(&c), single_player);
+        assert_eq!(hovered_control(&c), single_player);
+        // Destroying 0xE2 under the box clears them for the next instance.
+        c.restart_instance(MAIN_MENU_DIALOG);
+        assert_eq!(pressed_control(&c), None);
+        assert_eq!(hovered_control(&c), None);
+        assert_eq!(c.top_id(), Some(DialogId(0x0120)));
+        // Back from Single Player: 0x100's hover is never read as 0xE2's.
+        c.reset_to(DialogId(0x0100), false);
+        c.on_pointer_move(700, 210, &feed);
+        assert_eq!(hovered_control(&c), None);
     }
 }

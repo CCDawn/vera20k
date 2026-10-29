@@ -358,7 +358,7 @@ pub fn install_status_capture_count(
 }
 
 /// One physical retail scene shared by the flight/rearm and presentation tests.
-/// The existing dock-cycle fixture loads Death.mmx, admits a real GAAIRC,
+/// The default scene loads Death.mmx and admits a real GAAIRC,
 /// two stock ORCAs and an enemy Rhino through the production placement/spawn
 /// owners. Callers issue their own commands and advance the bound runtime.
 pub struct RetailHarrierDockScene {
@@ -372,9 +372,17 @@ pub struct RetailHarrierDockScene {
 pub fn retail_harrier_dock_scene(
     retail: &std::path::Path,
 ) -> Result<RetailHarrierDockScene, String> {
+    retail_harrier_dock_scene_on_map(retail, "Death.mmx")
+}
+
+/// The same admitted scene on an explicitly selected physical retail map.
+pub fn retail_harrier_dock_scene_on_map(
+    retail: &std::path::Path,
+    map: &str,
+) -> Result<RetailHarrierDockScene, String> {
     use crate::sim::house_state::HouseState;
     use crate::sim::runtime::SimRuntime;
-    let mut scenario = crate::headless_scenario::load(retail, "Death.mmx", 0x5EED_0001)?;
+    let mut scenario = crate::headless_scenario::load(retail, map, 0x5EED_0001)?;
     let SimRuntime {
         simulation: sim,
         resources,

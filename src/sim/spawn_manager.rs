@@ -257,6 +257,13 @@ pub struct SpawnManagerState {
 }
 
 impl SpawnManagerState {
+    /// Ares capture10045D76..10045D8B resumes the manager's +50 AI gate
+    /// only from its -1 start sentinel, preserving the retained duration.
+    #[cfg(feature = "ares")]
+    pub(crate) fn resume_update_timer(&mut self, frame: i32) {
+        self.update_timer.resume(frame);
+    }
+
     /// The interned `Spawns=` child type.
     pub fn spawn_type(&self) -> InternedId {
         self.spawn_type
@@ -395,6 +402,13 @@ impl SpawnManagerState {
             .count()
     }
 
+    /// Phobos `SpawnManagerClass::CountLaunchingSpawns`: children that are
+    /// alive but not docked, i.e. the complement of
+    /// [`Self::count_docked_spawns`] inside [`Self::count_alive_spawns`].
+    pub fn count_launching_spawns(&self) -> usize {
+        self.count_alive_spawns() - self.count_docked_spawns()
+    }
+
     /// Native `0x006B7D80`, read by the Drive/Ship Process_Movement gate
     /// (0x4B272C / 0x6A1D49) before its no-queue path request: slots waiting
     /// out a kamikaze launch (state 1), plus in-flight children (state 2)
@@ -457,9 +471,12 @@ pub fn init_spawn_manager(
     if obj.spawns_number <= 0 {
         return None;
     }
-    // Native resolves `Spawns=` through the TechnoType registry; an unresolved
+    // TechnoType ReadINI714E9E resolves Spawns through AircraftType67BD30; an unresolved
     // name leaves the pointer null and no manager is created.
-    rules.object(spawn_type_name)?;
+    rules.object_in_category(
+        crate::rules::object_type::ObjectCategory::Aircraft,
+        spawn_type_name,
+    )?;
 
     let missile_family = rules.missile_spawn.family_of(spawn_type_name);
     let is_missile_spawn = missile_family.is_some();
@@ -1091,7 +1108,7 @@ pub(crate) fn clear_all_spawn_targets(
 /// - `TechnoClass::ImbueLocomotor` (`0x00710021`), the Magnetron lift —
 ///   WIRED, via `Simulation::imbue_locomotor`.
 /// - `TechnoClass::Stun` (`0x006FCD40`) — WIRED via
-///   `Simulation::techno_death_stun`, which a lifted Foot skips.
+///   `Simulation::stun`, which a lifted Foot skips.
 pub(crate) fn kill_all_spawns_with_context(
     sim: &mut Simulation,
     owner_id: u64,
@@ -1492,8 +1509,11 @@ impl SpawnHost for WorldSpawn<'_, '_> {
         let (rx, ry, z) = (owner.position.rx(), owner.position.ry(), owner.position.z());
         let facing = owner.body_facing_byte(self.sim.session.binary_frame());
         let type_name = self.sim.interner.resolve(spawn_type).to_string();
-        self.sim.construct_object_limbo_at_height(
-            &type_name,
+        self.sim.construct_resolved_object_limbo_at_height(
+            rules.object_in_category(
+                crate::rules::object_type::ObjectCategory::Aircraft,
+                &type_name,
+            )?,
             &house,
             rx,
             ry,

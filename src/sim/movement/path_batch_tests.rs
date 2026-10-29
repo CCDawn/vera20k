@@ -1252,14 +1252,7 @@ fn an_order_to_more_foots_than_a_pass_answers_routes_over_two_passes() {
     }
     sim.batch_path_searches();
     let pending = |sim: &Simulation| -> Vec<u64> {
-        let mut ids: Vec<u64> = sim
-            .path_batch
-            .as_ref()
-            .unwrap()
-            .pending
-            .iter()
-            .map(|&(id, _)| id)
-            .collect();
+        let mut ids: Vec<u64> = sim.pending_path_search_actor_ids().collect();
         ids.sort_unstable();
         ids.dedup();
         ids

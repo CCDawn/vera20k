@@ -173,12 +173,20 @@ fn game_speed_transition_applies_at_ingress_before_triggers_and_hash() {
     assert_eq!(control.session.game_options().game_speed, 1);
     assert_ne!(result.state_hash, control_result.state_hash);
     assert_eq!(result.state_hash, Some(sim.state_hash()));
-    assert!(sim.take_master_frame_test_trace().starts_with(&[
-        MasterFrameTestRung::SessionCommands,
-        MasterFrameTestRung::Triggers,
-        MasterFrameTestRung::TeamScript,
-        MasterFrameTestRung::LogicVector,
-    ]));
+    let order = [
+        FrameStep::SessionCommands,
+        FrameStep::Triggers,
+        FrameStep::TeamScript,
+        FrameStep::DiskLasers,
+        FrameStep::LightningStorm,
+        FrameStep::LogicVector,
+    ];
+    let trace = sim.take_frame_step_trace();
+    let visited: Vec<_> = trace
+        .into_iter()
+        .filter(|step| order.contains(step))
+        .collect();
+    assert!(visited.starts_with(&order));
 }
 
 #[test]
@@ -4047,8 +4055,8 @@ fn gate_test_rules() -> RuleSet {
 
 #[test]
 fn native_frame_committed_late_gate_captures_pre_increment_frame() {
-    // The native frame is committed LATE, so a Phase-1 consumer sees frame N
-    // during the whole advance. The host duration is deliberately one
+    // The native frame is committed LATE, so every step of the frame sees
+    // frame N during the whole advance. The host duration is deliberately one
     // millisecond: admission, not elapsed time, advances the frame.
 
     let mut sim = Simulation::new();
@@ -5397,6 +5405,7 @@ fn event33_select_command_raises_tags_once_in_payload_order_after_admission() {
     sim.initialize_trigger_definitions(
         &map,
         &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
+        None,
         None,
         None,
     );
@@ -6798,6 +6807,8 @@ fn sale_death_is_ignored_before_ordinary_tail_drain() {
     rules.set_buildup_control_for_test("GAPOWR", [0, 25, 2]);
 
     let mut sim = Simulation::new();
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Skirmish);
     sim.input_delay_ticks = 0;
     let grid = PathGrid::test_all_passable(64, 64);
 
@@ -6878,9 +6889,10 @@ fn sale_death_is_ignored_before_ordinary_tail_drain() {
     );
 }
 
-/// Combat-death counterpart: a structure killed in combat (Phase 5) lives in the
-/// Dying window through Phase 7 and is freed only by the single end-of-tick drain. Its
-/// repair took its step in the building's own visit, before its death, and none after.
+/// Combat-death counterpart: a structure killed in combat in the object pass
+/// lives in the Dying window through the factory sweep and is freed only by the
+/// single end-of-tick drain. Its repair took its step in the building's own
+/// visit, before its death, and none after.
 #[test]
 fn combat_death_after_its_repair_visit_is_freed_at_end_of_tick() {
     use crate::sim::combat::Health;
@@ -6909,7 +6921,8 @@ fn combat_death_after_its_repair_visit_is_freed_at_end_of_tick() {
     // test happens on the first tick instead of after a turn-to-fire.
     atk.body_facing.snap(0x4000, 0);
     atk.health = Health::new(300);
-    // Damaged, auto-repairing enemy building MTNK destroys this tick at Phase 5.
+    // Damaged, auto-repairing enemy building MTNK destroys this tick in the
+    // object pass.
     let mut bld =
         GameEntity::test_default_of_category(2, "TARGB", "Russia", 7, 5, EntityCategory::Structure);
     bld.type_facts
@@ -6942,8 +6955,8 @@ fn combat_death_after_its_repair_visit_is_freed_at_end_of_tick() {
         "end-of-tick drain emptied the queue"
     );
     // The repair step belongs to the building's own LogicVector visit
-    // (`BuildingClass::UpdateRepairAndPower`, `0x004401B6`), which VERA runs
-    // before this tick's Phase 5 combat: frame 0 takes one step (Cost 1000 over
+    // (`BuildingClass::UpdateRepairAndPower`, `0x004401B6`), which runs
+    // before the MTNK's shot kills it: frame 0 takes one step (Cost 1000 over
     // 150 steps at 25% costs 1) while the building lives, and none after.
     assert_eq!(
         sim.houses.get(&russia).map(|h| h.economy().credits()),

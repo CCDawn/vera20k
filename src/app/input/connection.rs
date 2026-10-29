@@ -56,6 +56,12 @@ pub(crate) fn mouse(state: &mut AppState, button: MouseButton, pressed: bool) {
         Some(ConnectionButton::Player(row)) => {
             crate::app::match_runtime::network_match::propose_kick(state, row)
         }
+        Some(button @ (ConnectionButton::PreviousPage | ConnectionButton::NextPage)) => {
+            if let Some(page) = state.match_state.network_wait.page_mut() {
+                page.change_page(button == ConnectionButton::NextPage);
+            }
+            state.platform.window.request_redraw();
+        }
         None => {}
     }
 }

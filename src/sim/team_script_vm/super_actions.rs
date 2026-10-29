@@ -255,7 +255,7 @@ impl Simulation {
             (x as u16, y as u16),
             registry,
             frame_effects,
-            false,
+            crate::sim::superweapon::SuperWeaponTargetSource::Manual,
             selection,
         );
     }

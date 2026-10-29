@@ -485,15 +485,17 @@ pub fn combo_arrow_rect(rect: RectPx, scale: ShellScale) -> RectPx {
     })
 }
 
-/// Clickable arrow area of OwnerDraw_ComboBox 00617250 (006184B4).
+/// Clickable arrow area of OwnerDraw_ComboBox 00617250: `x > right - 0x14`
+/// against its GetClientRect `right` (`0x006172E7`, `0x006184BF..0x006184D7`),
+/// which is exclusive, so the zone is the face's last 19 columns.
 /// The adjacent `combo_arrow_rect` is only a zero-size sprite anchor.
 pub fn combo_arrow_hit_rect(rect: RectPx, scale: ShellScale) -> RectPx {
     let face = combo_face_rect(rect, scale);
     scale.derive_rect(face, |face| {
         RectPx::new(
-            face.x + face.w - COMBO_ARROW_RESERVE_W,
+            face.x + face.w - COMBO_ARROW_RESERVE_W + 1,
             face.y,
-            COMBO_ARROW_RESERVE_W,
+            COMBO_ARROW_RESERVE_W - 1,
             face.h,
         )
     })

@@ -21,6 +21,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::asset_tools::report::{ErrorReport, SoundEntry, SoundReport};
+use crate::asset_tools::sanitise_name;
 use crate::assets::asset_manager::{
     AssetManager, AssetResolutionRef, AudioIndexSources, LoadedAudioIndex, load_audio_index_pair,
 };
@@ -503,7 +504,7 @@ fn write_wav(out: &Path, name: &str, audio: &BagAudio) -> Result<String, String>
             dir.display()
         )
     })?;
-    let path = dir.join(format!("{}.wav", sanitise_name(name)));
+    let path = dir.join(format!("{}.wav", sanitise_name(name, FALLBACK_FILE_NAME)));
     std::fs::write(&path, bytes).map_err(|err| {
         format!(
             "could not write {}: {err} — pass a writable `--out` root",
@@ -552,26 +553,6 @@ fn wav_bytes(samples: &[i16], channels: u16, sample_rate: u32) -> Option<Vec<u8>
 fn sound_dir(out: &Path) -> PathBuf {
     let root = std::path::absolute(out).unwrap_or_else(|_| out.to_path_buf());
     root.join(SOUND_SUBDIR)
-}
-
-/// Replace every character outside `[A-Za-z0-9._-]`, matching the render verb's
-/// rule so both verbs' outputs are safe filename components everywhere.
-fn sanitise_name(name: &str) -> String {
-    let sanitised: String = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitised.is_empty() {
-        FALLBACK_FILE_NAME.to_string()
-    } else {
-        sanitised
-    }
 }
 
 /// The leading characters of a missed name, offered back as `--prefix`.

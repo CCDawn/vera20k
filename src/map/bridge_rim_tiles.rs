@@ -11,21 +11,22 @@ pub struct HighBridgeRimTiles {
 }
 
 impl HighBridgeRimTiles {
-    /// Original ReadTheater545150 reads these ten signed keys independently.
-    /// Their values are BridgeSet-relative tile identities, not TileSet indices.
-    pub(crate) fn from_theater(theater: &super::theater::TheaterData) -> Self {
-        let base = theater
-            .bridge_set
-            .and_then(|set| theater.lookup.bounds().get(usize::from(set)))
-            .map_or(-1, |bounds| i32::from(bounds.start));
-        Self::from_ini(base, &theater.ini_data)
-    }
+    /// No active theater: every native global keeps its -1 reset.
+    pub const ABSENT: Self = Self {
+        base: -1,
+        top_left: [-1; 2],
+        bottom_right: [-1; 2],
+        top_right: [-1; 2],
+        bottom_left: [-1; 2],
+        middle: [-1; 2],
+    };
 
-    pub fn from_ini(base: i32, bytes: &[u8]) -> Self {
-        let ini = crate::rules::ini_parser::IniFile::from_bytes(bytes).ok();
-        let general = ini.as_ref().and_then(|ini| ini.section("General"));
-        // These native globals are signed ReadInteger results. The older
-        // presentation-facing Option<u16> fields lose negative/large keys.
+    /// Read_Theater_TileSets_INI (`0x00545150`) reads these ten `[General]`
+    /// keys with CCINIClass::ReadInt (`0x005276D0`; calls `0x00545B4D` through
+    /// `0x00545C2E`, default -1) straight into signed globals. Their values
+    /// are BridgeSet-relative tile identities, not TileSet indices; `base` is
+    /// the published BridgeSet tile base. `load_theater` is the one reader.
+    pub(crate) fn read(base: i32, general: Option<&crate::rules::ini_parser::IniSection>) -> Self {
         let value = |key| general.map_or(-1, |section| section.read_int(key, -1));
         Self {
             base,
@@ -35,6 +36,13 @@ impl HighBridgeRimTiles {
             bottom_left: [value("BridgeBottomLeft1"), value("BridgeBottomLeft2")],
             middle: [value("BridgeMiddle1"), value("BridgeMiddle2")],
         }
+    }
+
+    /// [`Self::read`] over theater INI bytes, for fixtures.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_ini(base: i32, bytes: &[u8]) -> Self {
+        let ini = crate::rules::ini_parser::IniFile::from_bytes(bytes).ok();
+        Self::read(base, ini.as_ref().and_then(|ini| ini.section("General")))
     }
 
     fn relative(self, tile: i32) -> i32 {

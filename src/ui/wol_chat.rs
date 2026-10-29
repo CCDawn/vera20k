@@ -12,6 +12,9 @@
 //! `g_MuteSWLaunches` label is wrong), and the connection nodes
 //! `[0xA8DA78]`; it refuses pages only from a match.
 
+use crate::ui::wol_options::WolPreferences;
+use crate::util::native_string::wcs_starts_with_ignore_case;
+
 /// The localized command words the parser compares against.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WolChatCommands {
@@ -41,23 +44,6 @@ pub(crate) enum WolChatLine {
 }
 
 const SPACE: u16 = b' ' as u16;
-
-fn ascii_lower(unit: u16) -> u16 {
-    if (0x41..0x5B).contains(&unit) {
-        unit + 0x20
-    } else {
-        unit
-    }
-}
-
-/// `007DDE80` in the C locale: ASCII-only case folding.
-fn starts_with_ignore_case(line: &[u16], prefix: &[u16]) -> bool {
-    line.len() >= prefix.len()
-        && line
-            .iter()
-            .zip(prefix)
-            .all(|(a, b)| ascii_lower(*a) == ascii_lower(*b))
-}
 
 fn skip_spaces(rest: &[u16]) -> &[u16] {
     let start = rest
@@ -131,7 +117,7 @@ pub(crate) fn parse_lobby(
         (&filters.buddy, WolChatFilter::Buddy),
         (&filters.clan, WolChatFilter::Clan),
     ] {
-        if !word.is_empty() && starts_with_ignore_case(line, word) {
+        if !word.is_empty() && wcs_starts_with_ignore_case(line, word) {
             return WolLobbyChatLine::Filter(filter);
         }
     }
@@ -154,7 +140,7 @@ fn parse_page_or_reply(
     commands: &WolChatCommands,
     last_pager_known: bool,
 ) -> Option<WolChatLine> {
-    if !commands.page.is_empty() && starts_with_ignore_case(line, &commands.page) {
+    if !commands.page.is_empty() && wcs_starts_with_ignore_case(line, &commands.page) {
         let rest = skip_spaces(&line[commands.page.len()..]);
         // 0078A78C..A7B6: at most 11 name units are copied; 0078A7E0 then
         // accepts at most 10 (`cmp ebp, 0xa; jle`).
@@ -173,7 +159,8 @@ fn parse_page_or_reply(
             }
         });
     }
-    let reply_long = !commands.reply.is_empty() && starts_with_ignore_case(line, &commands.reply);
+    let reply_long =
+        !commands.reply.is_empty() && wcs_starts_with_ignore_case(line, &commands.reply);
     let reply_short = !commands.reply_short.is_empty() && line.starts_with(&commands.reply_short);
     if reply_long || reply_short {
         // 0078A9B0: the long word's length is used only for an exact-case
@@ -223,6 +210,7 @@ pub(crate) fn trim_line_end(text: &[u16]) -> &[u16] {
 }
 
 /// Chat-log colors of the C2 echo lines (BGR-ordered native values).
+/// `SAY_COLOR` is `[0x7EEF44]`, also the LAN lobbies' and BC6's echo.
 pub(crate) const SAY_COLOR: u32 = 0x40FFFF;
 pub(crate) const PRIVATE_COLOR: u32 = 0xFF8080;
 pub(crate) const EMOTE_COLOR: u32 = 0x3050FF;
@@ -275,6 +263,21 @@ pub(crate) struct WolDisplayFilters {
     /// `DisplayBuddies` `[0xB76AF0]` and `DisplayClan` `[0xB73AD0]`.
     pub(crate) buddies: bool,
     pub(crate) clan: bool,
+}
+
+impl WolDisplayFilters {
+    /// The live preferences the sinks read. The modern pages hide the
+    /// language, buddy and clan boxes, so a filter saved earlier could hide
+    /// chat with no way to undo it: they read all four as showing every line.
+    /// The retail pages read them as saved.
+    pub(crate) fn new(preferences: &WolPreferences, modern: bool) -> Self {
+        Self {
+            latin: preferences.display_latin != 0 || modern,
+            asian: preferences.display_asian != 0 || modern,
+            buddies: preferences.display_buddies && !modern,
+            clan: preferences.display_clan && !modern,
+        }
+    }
 }
 
 /// The language gate inlined in every chat, action and page sink (its
@@ -455,6 +458,26 @@ mod tests {
         assert!(buddy_clan_gate(&tanya, Some(""), &[], both, true));
         assert!(buddy_clan_gate(&boris, Some("BLUE"), &friend, both, true));
         assert!(!buddy_clan_gate(&boris, Some("BLUE"), &[], both, true));
+    }
+
+    #[test]
+    fn saved_filters_hide_no_chat_on_the_modern_pages() {
+        let saved = WolPreferences {
+            display_asian: 0,
+            display_latin: 0,
+            display_buddies: true,
+            ..WolPreferences::default()
+        };
+        let tanya = sender("Tanya", "", false);
+        let passes = |modern, text: &str| {
+            let filters = WolDisplayFilters::new(&saved, modern);
+            language_gate(&tanya, false, &w(text), filters)
+                && buddy_clan_gate(&tanya, Some(""), &[], filters, true)
+        };
+        for text in ["hi", "\u{4f60}"] {
+            assert!(passes(true, text), "{text}");
+            assert!(!passes(false, text), "{text}");
+        }
     }
 
     #[test]

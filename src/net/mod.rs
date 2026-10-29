@@ -28,3 +28,6 @@ pub mod reliable;
 pub mod udp;
 
 pub mod lan_messages;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod fault_proxy;

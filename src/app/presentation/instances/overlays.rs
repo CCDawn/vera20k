@@ -288,12 +288,23 @@ pub(crate) fn build_display_effect_instances(
         input.render_size[1] as f32 / z2,
     );
     let projection_viewport = [input.tactical[2] as f32 / z2, input.tactical[3] as f32 / z2];
-    let parachute_type = input
-        .rules
-        .general
-        .parachute_shp
-        .as_deref()
-        .and_then(|name| sim.interner().get(name));
+    // NPSE Paradrop C2FA75/C2F939 attaches either retained canopy type; Ares
+    // `[Side] Parachute.Anim=` adds its own attached type.
+    let mut parachute_names = vec![
+        input.rules.general.parachute_shp.as_deref(),
+        if crate::rules::NPATCH_ENABLED {
+            input.rules.general.vehicle_parachute.as_deref()
+        } else {
+            None
+        },
+    ];
+    #[cfg(feature = "ares")]
+    parachute_names.extend(input.rules.side_parachute_animations().map(Some));
+    let parachute_types = parachute_names
+        .into_iter()
+        .flatten()
+        .filter_map(|name| sim.interner().get(name))
+        .collect::<Vec<_>>();
     let local_owner = input.local_owner;
     for &stable_id in sim.display_layers().ordered_ids() {
         if let Some(light) = sim.building_spotlight(stable_id, input.rules) {
@@ -337,8 +348,10 @@ pub(crate) fn build_display_effect_instances(
         };
         // Paradrop creates a retained Anim, whose GetCoords resolves its
         // owner-relative75-lepton lift. Draw it at its own Display encounter.
-        let is_parachute =
-            parachute_type.is_some_and(|ty| parachute_canopy_owner(anim, ty).is_some());
+        let is_parachute = parachute_types
+            .iter()
+            .copied()
+            .any(|ty| parachute_canopy_owner(anim, ty).is_some());
         let type_name: &str = sim.interner().resolve(anim.type_id());
         let config = input.rules.art().anim_runtime_config(type_name);
         if config
@@ -412,7 +425,8 @@ pub(crate) fn build_display_effect_instances(
                     // A Super's ChronoPlacement anim: the client's byte
                     // (`match_runtime::super_selection`).
                     false => {
-                        anim.draw_runtime().hidden || input.hidden_super_anims.contains(&stable_id)
+                        anim.hidden_for(local_owner)
+                            || input.hidden_super_anims.contains(&stable_id)
                     }
                 },
                 special_hidden: anim.draw_runtime().special_hidden,
@@ -451,11 +465,6 @@ pub(crate) fn build_display_effect_instances(
         let Ok(frame) = u16::try_from(anim.runtime().current_frame.wrapping_add(start)) else {
             continue;
         };
-        let tint = if is_parachute {
-            [1.0; 3]
-        } else {
-            input.lighting.anim_tint_at((rx, ry), config)
-        };
         let remap_color =
             crate::render::sprite_atlas::anim_remap_color(anim, sim.interner(), input.house_colors);
         let palette_light = crate::app::presentation::lighting::anim_palette_light(
@@ -484,6 +493,18 @@ pub(crate) fn build_display_effect_instances(
             house_color: remap_color.unwrap_or(HouseColorIndex(0)),
         };
         let entry = atlas.get(&key);
+        // DrawIt422CA0's D4 instance Convert carries its palette/FC into
+        // the ordinary native blitter. Sparse FC absence means ctor1000;
+        // it is not a reason to choose the compatibility material.
+        let instance_scheme = remap_color.is_some()
+            && !anim.use_cell_drawer()
+            && entry.is_some_and(|entry| entry.source_palette != 0)
+            && super::anim_draw::ordinary_anim_type(type_name, config);
+        let tint = if is_parachute || instance_scheme {
+            [1.0; 3]
+        } else {
+            input.lighting.anim_tint_at((rx, ry), config)
+        };
         let Some(flags) = anim_instance_flags(
             config,
             anim.draw_flags(),
@@ -500,7 +521,7 @@ pub(crate) fn build_display_effect_instances(
         // Ordinary DrawIt422CA0 -> 4AED70 carries Convert's selector into
         // the packed RGB565 blitter, rather than alpha-blending the source.
         // Original full draw controls: spatial_oracle/anim_translucency.
-        let (alpha, draw_state) = if remap_color.is_none()
+        let (alpha, draw_state) = if (remap_color.is_none() || instance_scheme)
             && super::anim_draw::ordinary_anim_type(type_name, config)
         {
             (
@@ -664,7 +685,7 @@ pub(super) fn presentation_anim_frame_count(
 }
 
 /// The object a canopy hangs on: an owner-attached anim of the
-/// `[General] Parachute=` type.
+/// retained `Parachute=` or NPSE `VehicleParachute=` type.
 fn parachute_canopy_owner(
     anim: &crate::sim::anim_class::AnimObject,
     parachute_type: crate::sim::intern::InternedId,
@@ -739,6 +760,11 @@ struct CellOverlayInputs<'a> {
     viewport: [f32; 2],
     origin_y: f32,
     world_height: f32,
+    /// Translucent fog: walls are objects, so they leave the draw plan when the
+    /// local viewer does not see their cell.
+    viewer: Option<crate::sim::intern::InternedId>,
+    fog: Option<&'a crate::sim::vision::FogState>,
+    fog_of_war: bool,
 }
 
 /// Cell_ContentRendering @ 0x006D6D10 -> DrawOverlay_Body @ 0x0047F6A0 for
@@ -776,6 +802,19 @@ fn build_cell_overlay_bodies(input: &CellOverlayInputs<'_>, bodies: &mut Vec<sup
         }
         let overlay_registry = input.registry;
         let overlay_flags = overlay_registry.and_then(|reg| reg.flags(live_overlay_id));
+        // Walls are owned objects, not scenery: translucent fog keeps terrain,
+        // ore and trees visible but must not expose unseen wall lines.
+        if overlay_flags.is_some_and(|flags| flags.wall)
+            && super::helpers::translucent_fog_conceals_cell(
+                input.viewer,
+                input.fog,
+                entry.rx,
+                entry.ry,
+                input.fog_of_war,
+            )
+        {
+            continue;
+        }
         let slope_type = input
             .terrain
             .and_then(|terrain| terrain.cell(entry.rx, entry.ry))
@@ -959,6 +998,25 @@ pub(crate) fn build_overlay_instances(
         .map(|g| (g.origin_y, g.world_height))
         .unwrap_or((0.0, 1.0));
 
+    let (viewer, fog, fog_of_war) =
+        state
+            .match_state
+            .sim_runtime
+            .as_ref()
+            .map_or((None, None, false), |runtime| {
+                let sim = &runtime.simulation;
+                let viewer = crate::app::input::commands::preferred_local_owner_name(state)
+                    .as_deref()
+                    .and_then(|name| sim.interner().get(name));
+                (
+                    viewer.filter(|_| {
+                        state.translucent_fog_enabled()
+                            && !state.match_state.sandbox_full_visibility
+                    }),
+                    Some(sim.fog()),
+                    sim.session().game_options().fog_of_war,
+                )
+            });
     build_cell_overlay_bodies(
         &CellOverlayInputs {
             entries: state.match_state.match_presentation.overlays.as_slice(),
@@ -987,6 +1045,9 @@ pub(crate) fn build_overlay_instances(
             viewport: [sw, sh],
             origin_y,
             world_height,
+            viewer,
+            fog,
+            fog_of_war,
         },
         bodies,
     );
@@ -1254,6 +1315,43 @@ mod terrain_render_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn interpolated_wave_polygon_preserves_native_spans_when_an_edge_folds_back() {
+        use crate::app::presentation::interpolation::RenderInterpolation;
+        use crate::render::wave_geometry::{WaveClipPath, WaveDraw, WavePolygon, polygon_spans};
+        use crate::sim::world::Simulation;
+
+        let old = WaveDraw {
+            polygon: WavePolygon::Magnetic([[0, 5], [3, 7], [4, 2], [-3, 0]]),
+            source_point: [0, 0],
+            source_z: 0,
+            phase: 3,
+            direction: 0,
+            clip_path: WaveClipPath::Fast,
+        };
+        let current = WaveDraw {
+            polygon: WavePolygon::Magnetic([[0, -5], [-3, 3], [-2, 6], [5, 10]]),
+            ..old
+        };
+        let mut sim = Simulation::new();
+        sim.session_mut_for_test().set_binary_frame_for_test(1);
+        let mut cache = RenderInterpolation::new(true);
+        cache.observe(&sim, 0, Some(32.), false);
+        super::sample_weapon_wave_draw(old, 7, &cache, 1, [0, 0]);
+        sim.session_mut_for_test().set_binary_frame_for_test(2);
+        cache.observe(&sim, 32, Some(32.), false);
+        super::sample_weapon_wave_draw(current, 7, &cache, 2, [0, 0]);
+        cache.observe(&sim, 48, Some(32.), false);
+        let sampled = super::sample_weapon_wave_draw(current, 7, &cache, 2, [0, 0]);
+        assert_eq!(sampled.polygon.points(), &[[0, 0], [0, 5], [1, 4], [1, 5]]);
+
+        // Native execution of FUN_0063F080 @ 0x0063F080 (gamemd.exe) yields
+        // four visible rows; its extra edge write is outside that visible span.
+        let spans = polygon_spans(sampled.polygon.points());
+        assert_eq!(spans.top, 1);
+        assert_eq!(spans.rows, [[0, 0]; 4]);
+    }
+
     #[test]
     fn render_interpolation_preserves_both_native_wave_shapes_and_camera_independence() {
         use crate::app::presentation::interpolation::RenderInterpolation;

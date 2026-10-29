@@ -235,6 +235,14 @@ pub fn anim_class_roots(rules: &RuleSet) -> Vec<String> {
             roots.insert(name.to_ascii_uppercase());
         }
     };
+    // Ares common Launch10033068..100330AA constructs SW.Animation through
+    // the same AnimClass owner as other effects, even when it is hidden.
+    #[cfg(feature = "ares")]
+    for sw in rules.super_weapons.values() {
+        if let Some(Some(animation)) = &sw.presentation.animation {
+            insert(animation);
+        }
+    }
     for warhead in rules.warheads_iter() {
         for name in &warhead.anim_list {
             insert(name);
@@ -264,6 +272,17 @@ pub fn anim_class_roots(rules: &RuleSet) -> Vec<String> {
     {
         for object in rules.all_objects() {
             if let Some(Some(name)) = object.emp_rules().and_then(|emp| emp.sparkles()) {
+                insert(name);
+            }
+            // Self effects reach the same Anim constructor as Warhead effects
+            // (Ares Update10058E00, self-attach10058FC5 -> Attach10058520
+            // -> CreateAnim100586E0). Their image
+            // bounds are gameplay inputs too: an attached anim may kill its
+            // parent through ordinary AnimAI damage and its death weapon.
+            if let Some(name) = object
+                .self_attach_effect()
+                .and_then(|effect| effect.animation())
+            {
                 insert(name);
             }
         }
@@ -343,6 +362,19 @@ pub fn anim_class_roots(rules: &RuleSet) -> Vec<String> {
     if let Some(name) = rules.general.parachute_shp.as_deref() {
         insert(name);
     }
+    // NPSE ObjectClass::Paradrop C2F939..C2F94D substitutes Rules+400
+    // for non-infantry. It needs the same physical bounds as Parachute.
+    if crate::rules::NPATCH_ENABLED
+        && let Some(name) = rules.general.vehicle_parachute.as_deref()
+    {
+        insert(name);
+    }
+    // Ares `[Side] Parachute.Anim=`: an attached canopy type needs the same
+    // physical animation bounds before the simulator creates it.
+    #[cfg(feature = "ares")]
+    for name in rules.side_parachute_animations() {
+        insert(name);
+    }
     // Techno70F1D0 attaches [General] Behind= to an obscured object. Its
     // AnimClass must have physical frame bounds before the AI can create it.
     if let Some(name) = rules.general.behind.as_deref() {
@@ -378,6 +410,13 @@ pub fn anim_class_roots(rules: &RuleSet) -> Vec<String> {
     // at once.
     insert(&rules.general.dominator_first_anim);
     insert(&rules.general.dominator_second_anim);
+    // TechnoClass::Install_Drain_Link70FD70 constructs Rules+31C's
+    // DrainAnimationType at70FDF5..70FE14 and attaches it to the drainer.
+    // Bind its physical frames before Fire_At6FDF8C can create the AnimClass;
+    // the same scheduler closure supplies the renderer's animation atlas.
+    if let Some(name) = rules.combat_damage.drain_animation_type.as_deref() {
+        insert(name);
+    }
     // `[CombatDamage] ControlledAnimationType=` and
     // `PermaControlledAnimationType=`: the rings a captured or Dominated
     // object wears (`sim::capture_manager`).
@@ -655,6 +694,60 @@ mod tests {
         assert_eq!(catalog.raw_frame_count("BROKEN"), None);
     }
 
+    /// The NPSE `[General] VehicleParachute=` canopy is bound through the same
+    /// anim asset root the stock `Parachute=` uses, so a mod's own canopy
+    /// carries physical frame bounds before `AnimClass::effective_bounds`
+    /// reads them.
+    #[test]
+    fn vehicle_parachute_canopy_binds_through_the_production_load() {
+        let root = TestRoot::new();
+        std::fs::write(
+            root.path().join("VEHCHUTE.SHP"),
+            shp_with_undecodable_pixels(6),
+        )
+        .expect("write canopy SHP");
+        let assets = AssetManager::from_loose_root_for_test(root.path());
+        let art = IniFile::from_str("[PARACH]\nLoopCount=-1\n[VEHCHUTE]\nLoopCount=-1\n");
+        // `[Animations]` slot 1 also feeds the fifth infantry death anim, so
+        // the canopy takes slot 0 and the stock canopy slot 1 to keep this
+        // fixture from rooting the wrong name there.
+        let processed = crate::rules::native_processing::RulesLayerStack::new(IniFile::from_str(
+            "[Animations]\n0=VEHCHUTE\n1=PARACH\n\
+             [General]\nParachute=PARACH\nVehicleParachute=vehchute\n",
+        ))
+        .process_with_fixed_art(&art)
+        .expect("production retained Rules read");
+        let mut rules =
+            RuleSet::from_processed_rules(&processed).expect("project the processed rules");
+        rules.install_art_data(ArtRegistry::from_ini(&art));
+
+        let capability = crate::rules::NPATCH_ENABLED;
+        assert_eq!(
+            rules.general.vehicle_parachute.as_deref(),
+            capability.then_some("VEHCHUTE"),
+            "only the extension reader publishes the pointer"
+        );
+        let roots = anim_class_roots(&rules);
+        assert_eq!(
+            roots.iter().any(|root| root == "VEHCHUTE"),
+            capability,
+            "the canopy's art root follows the extension pointer"
+        );
+        rules.bind_anim_class_assets(&roots, &assets, "TEM", "TEMPERATE");
+        assert_eq!(
+            rules
+                .art()
+                .anim_runtime_config("VEHCHUTE")
+                .and_then(|config| config.raw_shp_frame_count),
+            capability.then_some(6),
+            "the bound canopy carries the SHP's physical frame bounds"
+        );
+        assert_eq!(
+            rules.art().scheduler_anim_types().contains("VEHCHUTE"),
+            capability
+        );
+    }
+
     /// A root whose SHP is missing stays a real null-image Anim, and a bound root's
     /// `Next=` chain is bound with it. Retail art names building animations
     /// (`[CAARAY] ActiveAnim=CAARAY_A`) whose sprites never shipped.
@@ -816,6 +909,66 @@ mod tests {
                 "{name}: {spawned:?}"
             );
         }
+    }
+
+    #[test]
+    fn self_attached_damage_animation_binds_and_reaches_the_helpers_death_weapon() {
+        let root = TestRoot::new();
+        std::fs::write(
+            root.path().join("PULSE.SHP"),
+            shp_with_undecodable_pixels(6),
+        )
+        .unwrap();
+        let assets = AssetManager::from_loose_root_for_test(root.path());
+        // Keep PULSE out of the stock InfDeath registry slots, so its only
+        // producer is the unit's own AttachEffect rather than a Warhead.
+        let ini = crate::sim::arena_fixture::clear_ground_ini(
+            "[Countries]\n0=Americans\n1=Russians\n[VehicleTypes]\n0=HELPER\n1=VICTIM\n\
+             [HELPER]\nStrength=1\nArmor=target\nExplodes=yes\nDeathWeapon=BURST\n\
+             AttachEffect.Duration=-1\nAttachEffect.Animation=PULSE\n\
+             [VICTIM]\nStrength=1000\nArmor=heavy\n[ArmorTypes]\ntarget=0%\n\
+             [Animations]\n0=DUMMY\n1=ELECTRO\n2=PULSE\n\
+             [CombatDamage]\nFlameDamage2=FIRE\n[Warheads]\n0=FIRE\n1=BLAST\n\
+             [FIRE]\nCellSpread=.3\nVerses=0%,0%,0%,0%,0%,0%,0%,0%,0%,0%,0%\nVersus.target=100%\n\
+             [BLAST]\nCellSpread=1\nPercentAtMax=1\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n\
+             [WeaponTypes]\n0=BURST\n[BURST]\nDamage=100\nRange=1\nProjectile=INVISO\nWarhead=BLAST\n\
+             [Projectiles]\n0=INVISO\n[INVISO]\nInviso=yes\n",
+        );
+        let art = IniFile::from_str("[PULSE]\nRate=900\nLoopCount=-1\nDamage=10\n");
+        let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
+        rules.install_art_data(ArtRegistry::from_ini(&art));
+        let roots = anim_class_roots(&rules);
+        rules.bind_anim_class_assets(&roots, &assets, "TEM", "TEMPERATE");
+        assert_eq!(
+            rules
+                .art()
+                .anim_runtime_config("PULSE")
+                .unwrap()
+                .raw_shp_frame_count,
+            crate::rules::ARES_ENABLED.then_some(6),
+        );
+        let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 17);
+        sim.intern_rule_type_ids(&rules);
+        sim.resolve_type_handles(&rules);
+        let helper = sim
+            .spawn_object("HELPER", "Americans", 20, 20, 0, &rules)
+            .unwrap();
+        let victim = sim
+            .spawn_object("VICTIM", "Russians", 21, 20, 0, &rules)
+            .unwrap();
+        for _ in 0..8 {
+            sim.advance_tick(&[], Some(&rules), None, Some(rules.overlay_registry()), 22);
+        }
+        let alive = sim
+            .entities()
+            .get(helper)
+            .is_some_and(|entity| entity.is_object_alive());
+        assert_eq!(alive, !crate::rules::ARES_ENABLED);
+        assert_eq!(
+            sim.entities().get(victim).unwrap().health.current() < 1000,
+            crate::rules::ARES_ENABLED,
+            "the self animation must reach the real death-weapon receiver",
+        );
     }
 
     fn catalog_hash(catalog: &EffectAssetCatalog) -> u64 {

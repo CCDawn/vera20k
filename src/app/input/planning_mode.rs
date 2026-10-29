@@ -242,6 +242,7 @@ pub(crate) fn queue_orders(
     state: &mut AppState,
     selected: &[u64],
     orders: Vec<CommandEnvelope>,
+    clicked_cell: Option<(u16, u16)>,
 ) -> bool {
     let Some(rt) = state.match_state.sim_runtime.as_mut() else {
         return false;
@@ -249,7 +250,7 @@ pub(crate) fn queue_orders(
     let Some(owner) = rt.simulation.session().current_house() else {
         return false;
     };
-    match queue_orders_in_sim(&mut rt.simulation, owner, selected, orders) {
+    match queue_orders_in_sim(&mut rt.simulation, owner, selected, orders, clicked_cell) {
         Ok(_) => true,
         Err(refusal) => {
             refuse(state, refusal);
@@ -263,6 +264,7 @@ fn queue_orders_in_sim(
     owner: crate::sim::intern::InternedId,
     selected: &[u64],
     orders: Vec<CommandEnvelope>,
+    clicked_cell: Option<(u16, u16)>,
 ) -> Result<bool, PlanningRefusal> {
     //4ABF7F's selection-wide admission precedes4AE750 for primary clicks
     // and ordinary planned missions. It is not a receiver/encoding guard.
@@ -286,11 +288,16 @@ fn queue_orders_in_sim(
             // refused as DEPLOY9; a mobile self-click is Unload16.
             // ClickedAction_Cell builds the MoveFlash (`0x004D7EB5`) before
             // its Move reaches Player_Send_Command.
+            let Some(order) = super::commands::encode_ordinary_local_command(sim, order) else {
+                continue;
+            };
             sim.issue_local_command(order);
             added = true;
             continue;
         }
-        let Some(record) = sim.encode_planning_order_record(order.owner, &order.payload) else {
+        let Some(record) =
+            sim.encode_planning_order_record(order.owner, &order.payload, clicked_cell)
+        else {
             continue;
         };
         sim.issue_local_command(CommandEnvelope::synchronized(record, order.execute_tick));
@@ -453,6 +460,7 @@ mod tests {
                         target_rx: 5,
                         target_ry: 7,
                     },
+                    None,
                 )
                 .unwrap();
             let command = sim.decode_native_command_record(&record, 0).unwrap();
@@ -566,7 +574,8 @@ mod tests {
                     &mut sim,
                     local,
                     &[42],
-                    vec![CommandEnvelope::new(local, 0, payload)]
+                    vec![CommandEnvelope::new(local, 0, payload)],
+                    None,
                 )
                 .is_ok_and(|added| !added)
             );
@@ -615,7 +624,8 @@ mod tests {
                     &mut sim,
                     local,
                     &[42],
-                    vec![CommandEnvelope::new(local, 0, payload.clone())]
+                    vec![CommandEnvelope::new(local, 0, payload.clone())],
+                    None,
                 )
                 .is_ok_and(|added| added),
                 "lost {payload:?}"
@@ -648,7 +658,9 @@ mod tests {
             Command::MoveFlash { rx: 5, ry: 6 },
         ] {
             let envelope = CommandEnvelope::new(local, 0, payload);
-            assert!(queue_orders_in_sim(&mut sim, local, &[42], vec![envelope.clone()]).unwrap());
+            assert!(
+                queue_orders_in_sim(&mut sim, local, &[42], vec![envelope.clone()], None).unwrap()
+            );
             assert_eq!(sim.take_frame_commands_for_test(), vec![envelope]);
         }
         for payload in [
@@ -661,7 +673,8 @@ mod tests {
                     &mut sim,
                     local,
                     &[42],
-                    vec![CommandEnvelope::new(local, 0, payload)]
+                    vec![CommandEnvelope::new(local, 0, payload)],
+                    None,
                 )
                 .unwrap()
             );
@@ -741,7 +754,17 @@ mod tests {
             2,
             Command::TogglePrimaryFactory { entity_id: second },
         );
-        assert!(queue_orders_in_sim(&mut sim, owner, &[second], vec![order.clone()]).unwrap());
+        assert!(
+            queue_orders_in_sim(&mut sim, owner, &[second], vec![order.clone()], None).unwrap()
+        );
+        let (opcode, frame_stamp) = {
+            let queues = sim.network_command_queues();
+            let records = queues.local_records().unwrap();
+            assert_eq!(records.len(), 1);
+            (records[0].opcode(), records[0].frame_stamp())
+        };
+        assert_eq!(opcode, 0x11);
+        assert_eq!(frame_stamp, sim.session().binary_frame() as i32);
         assert_eq!(
             sim.pending_command_snapshot(),
             vec![order],
@@ -756,7 +779,9 @@ mod tests {
             simulation: sim,
             resources,
         };
-        for selected in [false, true] {
+        // The raw native stamp controls execution; the preserved diagnostic
+        // issue ordinal 2 above cannot postpone an event issued at frame0.
+        for selected in [true, true] {
             let due = runtime.simulation.take_due_commands();
             runtime
                 .advance_frame(&due, 67, TickLane::Ordinary, FrameEffects::default())
@@ -815,6 +840,7 @@ mod tests {
                             target_rx: 25,
                             target_ry: 25,
                         },
+                        None,
                     )
                     .unwrap();
                 let envelope = sim.decode_native_command_record(&record, 0).unwrap();
@@ -832,6 +858,7 @@ mod tests {
                     2,
                     Command::TogglePrimaryFactory { entity_id: second },
                 )],
+                None,
             );
             let native = &case["phases"][0];
             let admitted = native["admitted"].as_bool().unwrap();
@@ -892,7 +919,7 @@ mod tests {
                 )
             })
             .collect();
-        assert!(queue_orders_in_sim(&mut sim, local, &[43, 42], orders.clone()).unwrap());
+        assert!(queue_orders_in_sim(&mut sim, local, &[43, 42], orders.clone(), None).unwrap());
         let pending = sim.pending_command_snapshot();
         assert_eq!(pending.len(), 2);
         for (planned, ordinary) in pending.iter().zip(&orders) {
@@ -902,7 +929,7 @@ mod tests {
                 planned.payload,
                 Command::PlanningRecord {
                     record: sim
-                        .encode_planning_order_record(local, &ordinary.payload)
+                        .encode_planning_order_record(local, &ordinary.payload, None)
                         .unwrap()
                 }
             );

@@ -49,6 +49,7 @@ fn fly_and_jumpjet_planned_move_legs_progress_through_native_arrival() {
                         target_rx,
                         target_ry: 15,
                     },
+                    None,
                 )
                 .unwrap();
             let envelope = sim

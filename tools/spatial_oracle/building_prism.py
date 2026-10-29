@@ -175,6 +175,7 @@ from unicorn.x86_const import (UC_X86_REG_EAX, UC_X86_REG_EBP, UC_X86_REG_EBX, U
                                UC_X86_REG_EDI, UC_X86_REG_EDX, UC_X86_REG_EIP, UC_X86_REG_ESI,
                                UC_X86_REG_ESP, UC_X86_REG_FPCW)
 from tools.native_oracle import RET_MAGIC, finish_vectors, provenance, run_checked
+from tools.native_oracle import require
 from tools.spatial_oracle.engineer_bridge_cursor_caller import TEXT_BEGIN, TEXT_SIZE
 from tools.spatial_oracle import building_body_rules as body_rules
 from tools.spatial_oracle import building_construction as bc
@@ -1730,7 +1731,7 @@ def disk_lifecycle(case, priors):
     # The existing Scene allocator supplies storage; no host queue is written.
     for initializer, vector in ((0x4A6C70, DISKS), (0x725850, PENDING_DELETE)):
         s.invoke(initializer, 0)
-        assert s.invoke(s.read32(s.read32(vector) + 8), vector, 64, 0) & 255
+        require(s.invoke(s.read32(s.read32(vector) + 8), vector, 64, 0) & 255, f'vector 0x{vector:X} reserve refused')
         assert not registry(vector)
     s.invoke(DISK_RING_INIT, 0)
     u.mem_write(SHOT_WEAPON + 0xAC, dwords(WARHEAD))
@@ -1843,7 +1844,7 @@ def disk_lifecycle(case, priors):
             assert pointer
             disks[birth['name']] = pointer
             s.names[pointer] = birth['name']
-            assert s.invoke(DISK_CTOR, pointer) == pointer
+            require(s.invoke(DISK_CTOR, pointer) == pointer, 'disk laser constructor did not return its receiver')
             constructed = disk_state(pointer)
             boundary()
             phase = 'fire'

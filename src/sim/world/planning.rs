@@ -511,8 +511,34 @@ impl Simulation {
         &self,
         owner: InternedId,
         command: &Command,
+        clicked_cell: Option<(u16, u16)>,
     ) -> Option<CommandRecord> {
         let mut record = self.encode_megamission_record(owner, command)?;
+        // FootClass::ClickedAction_Cell 0x004D8095..0x004D8231 passes the
+        // original clicked Cell as NavComAux to Player_Send_Command 0x006FFC30.
+        // The Cell resolver 0x004D806F may already have changed destination;
+        // input supplies the original click separately. Semantic callers with
+        // no Cell click use their supplied destination.
+        // Preserve it before Execute_DoList's group spread rewrites only the
+        // destination (0x0064D734). Plan event GetCoords 0x00633BC0 prefers
+        // this auxiliary token, so the group retains one shared waypoint.
+        let mut mission = MegaMissionRecord::decode(&record)?;
+        if let MegaMissionOrder::Move { target_x, target_y }
+        | MegaMissionOrder::AttackMove {
+            destination:
+                MegaMissionTarget::Cell {
+                    x: target_x,
+                    y: target_y,
+                },
+            ..
+        } = mission.order
+        {
+            let (x, y) = clicked_cell
+                .map(|(x, y)| (x as i16, y as i16))
+                .unwrap_or((target_x, target_y));
+            mission.auxiliary = MegaMissionTarget::Cell { x, y };
+            mission.write_into(&mut record).ok()?;
+        }
         record.payload_mut()[22] = 1;
         Some(record)
     }
@@ -1779,6 +1805,24 @@ fn coord_cell(coord: DriveCoord) -> Option<(u16, u16)> {
         u16::try_from(coord.x / 256).ok()?,
         u16::try_from(coord.y / 256).ok()?,
     ))
+}
+
+/// The object a PlanMgr record attaches nodes to: 0x2A connect's target 0
+/// (639800) or the flag-1 MEGAMISSION append's source (638120). Commit
+/// 0x2B and delete 0x2C name none.
+pub(super) fn planning_record_actor(record: &CommandRecord) -> Option<u64> {
+    match record.opcode() {
+        0x2a => match read_target(record, 0)? {
+            MegaMissionTarget::Object { id } => u64::try_from(id).ok(),
+            _ => None,
+        },
+        4 if record.payload()[22] == 1 => {
+            let mut ordinary = record.clone();
+            ordinary.payload_mut()[22] = 0;
+            u64::try_from(MegaMissionRecord::decode(&ordinary)?.source_id).ok()
+        }
+        _ => None,
+    }
 }
 
 fn read_target(record: &CommandRecord, offset: usize) -> Option<MegaMissionTarget> {

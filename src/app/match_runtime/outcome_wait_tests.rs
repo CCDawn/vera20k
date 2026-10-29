@@ -157,7 +157,7 @@ fn action110_stops_elapsed_before_action67_cue_and_house_wait() {
     sim.session_mut_for_test()
         .set_current_house_for_test(Some(owner));
     let map = MapFile::from_bytes(b"[Map]\nTheater=TEMPERATE\nSize=0,0,2,1\nLocalSize=0,0,2,1\n[IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n[Basic]\nNewINIFormat=4\n[Triggers]\nT=Russians,<none>,Pause then Win,0,1,1,1,0\n[Events]\nT=1,13,0,0\n[Actions]\nT=2,110,0,30,0,0,0,0,A,67,0,0,0,0,0,0,A\n[Tags]\nTAG=0,Pause then Win,T\n").unwrap();
-    sim.initialize_trigger_definitions(&map, &Default::default(), None, None);
+    sim.initialize_trigger_definitions(&map, &Default::default(), None, None, None);
     sim.classify_map_triggers(&rules);
     sim.publish_scenario_started();
     let mut runtime = SimRuntime::from_simulation(sim);

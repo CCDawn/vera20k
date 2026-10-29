@@ -5150,20 +5150,24 @@ fn selected_death_sounds_for(
     owner_is_human: bool,
     main_rng: &mut SimRng,
 ) -> Vec<String> {
+    selected_campaign_death_sounds(rules, owner_is_human, owner_is_human, main_rng)
+}
+
+/// The Techno death block in the fixture's campaign session, for an owner
+/// with the given `IsHuman` (`+0x1EC`) and `PlayerControl` (`+0x1ED`) bytes.
+fn selected_campaign_death_sounds(
+    rules: &RuleSet,
+    is_human: bool,
+    player_control: bool,
+    main_rng: &mut SimRng,
+) -> Vec<String> {
     let mut entities = EntityStore::new();
     entities.insert(make_entity_owned(2, "E1", 8, 5, 1, "Americans"));
     let mut interner = test_interner();
     let owner = test_intern("Americans");
-    let mut houses = [HouseState::new(
-        owner,
-        0,
-        Some(owner),
-        owner_is_human,
-        5_000,
-        10,
-    )]
-    .into_iter()
-    .collect::<crate::sim::houses::Houses>();
+    let mut house = HouseState::new(owner, 0, Some(owner), is_human, 5_000, 10);
+    house.set_player_control_for_test(player_control);
+    let mut houses = [house].into_iter().collect::<crate::sim::houses::Houses>();
     let mut scenario_rng = SimRng::new(0);
     let mut handled_deaths = Vec::new();
     let handles = crate::sim::type_handle_table::ResolvedRuleHandles::resolve(rules, &mut interner);
@@ -5761,6 +5765,28 @@ fn fatal_sound_selection_uses_human_voice_then_die_sound_main_draws() {
     assert_eq!(ai_rng.state(), one_draw_reference.state());
 }
 
+/// `0x00702130..0x00702136` gates VoiceDie on `HouseClass::IsHumanPlayer @
+/// 0x0050B6F0`, whose campaign arm also admits `PlayerControl` (`+0x1ED`,
+/// `0x0050B703`) without `IsHuman`: retail ALL01UMD and ALL03UMD give
+/// Alliance, and SOV04DMD Germans, `PlayerControl=yes`.
+#[test]
+fn campaign_player_controlled_house_hears_voice_die() {
+    let rules = RuleSet::from_ini(&IniFile::from_str(
+        "\
+[InfantryTypes]\n0=E1\n\n\
+[VehicleTypes]\n\n\
+[AircraftTypes]\n\n\
+[BuildingTypes]\n\n\
+[E1]\nStrength=1\nArmor=none\nVoiceDie=OnlyVoice\nDieSound=OnlyDie\n",
+    ))
+    .expect("death-sound rules parse");
+    let mut rng = SimRng::new(1);
+    assert_eq!(
+        selected_campaign_death_sounds(&rules, false, true, &mut rng),
+        ["OnlyVoice", "OnlyDie"]
+    );
+}
+
 #[test]
 fn fatal_sound_empty_lists_skip_draws_but_single_choices_still_draw() {
     let empty_rules = RuleSet::from_ini(&IniFile::from_str(
@@ -6175,7 +6201,28 @@ fn garrison_fire_keeps_occupant_anim_and_sound_path() {
         ev.report_sound_id.map(|id| interner.resolve(id)),
         Some("GIAttack")
     );
-    assert!(sounds.is_empty());
+    let [
+        SimSoundEvent::VocAt {
+            sound_id,
+            audible_to,
+            rx,
+            ry,
+            sub_x,
+            sub_y,
+            world_z_leptons,
+        },
+    ] = sounds.as_slice()
+    else {
+        panic!("expected one garrison weapon report, got {sounds:?}");
+    };
+    let fire_coord = crate::sim::anim_class::AnimWorldCoord::from(ev.fire_coord);
+    let (fire_rx, fire_ry, fire_sub_x, fire_sub_y, _) = fire_coord.to_cell_sub_z();
+    assert_eq!(sound_id, "GIAttack");
+    assert_eq!(audible_to, &None);
+    assert_eq!(
+        (*rx, *ry, *sub_x, *sub_y, *world_z_leptons),
+        (fire_rx, fire_ry, fire_sub_x, fire_sub_y, fire_coord.z)
+    );
 }
 
 #[test]
@@ -10625,10 +10672,13 @@ fn gsi_08_12_a_base_defence_kill_pays_nobody() {
 /// X term down a lepton.
 #[test]
 fn gsi_08_04_projectile_spawns_at_the_muzzle_not_the_hull_centre() {
-    let mut rules = RuleSet::from_ini(&IniFile::from_str(
+    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(
+&IniFile::from_str(
         "[VehicleTypes]\n0=MTNK\n1=HTNK\n[MTNK]\nStrength=300\nArmor=heavy\nSpeed=6\nCost=700\nPrimary=105mm\nTurret=yes\n[HTNK]\nStrength=2000\nArmor=heavy\nSpeed=4\nCost=900\nPrimary=105mm\n[105mm]\nDamage=65\nROF=50\nRange=6\nSpeed=40\nProjectile=Cannon\nWarhead=AP\n[Cannon]\nArcing=true\n[AP]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
-    ))
-    .expect("fire-origin fixture parses");
+    ),
+
+        &IniFile::from_str("[MTNK]\nPrimaryFireFLH=190,25,120\n"),
+).unwrap();
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(
         &IniFile::from_str("[MTNK]\nPrimaryFireFLH=190,25,120\n"),
     ));
@@ -10669,10 +10719,13 @@ fn gsi_08_04_projectile_spawns_at_the_muzzle_not_the_hull_centre() {
 /// Same fixture as `gsi_08_04`, whose `Arcing=` shell keeps the muzzle.
 #[test]
 fn gsi_08_04_a_dropping_shell_leaves_the_hull_centre() {
-    let mut rules = RuleSet::from_ini(&IniFile::from_str(
+    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(
+&IniFile::from_str(
         "[VehicleTypes]\n0=MTNK\n1=HTNK\n[MTNK]\nStrength=300\nArmor=heavy\nSpeed=6\nCost=700\nPrimary=105mm\nTurret=yes\n[HTNK]\nStrength=2000\nArmor=heavy\nSpeed=4\nCost=900\nPrimary=105mm\n[105mm]\nDamage=65\nROF=50\nRange=6\nSpeed=40\nProjectile=Bomb\nWarhead=AP\n[Bomb]\nDropping=yes\n[AP]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
-    ))
-    .expect("dropping fixture parses");
+    ),
+
+        &IniFile::from_str("[MTNK]\nPrimaryFireFLH=190,25,120\n"),
+).unwrap();
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(
         &IniFile::from_str("[MTNK]\nPrimaryFireFLH=190,25,120\n"),
     ));

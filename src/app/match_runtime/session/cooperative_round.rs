@@ -4,9 +4,9 @@
 //! with the round's roster as one network phase.
 //!
 //! Bodies: the loop `CampaignScoreClass vt+4` (`0x0046FC00`) and
-//! `Dialog0xBC6__DlgProc` (`0x0046DFD0`). The transport is controlled:
-//! peers arrive as decoded [`CooperativeRoundEvent`]s, and every packet
-//! this side sends is a [`NetworkLoadingRequest`].
+//! `Dialog0xBC6__DlgProc` (`0x0046DFD0`). Peers arrive as decoded
+//! [`CooperativeRoundEvent`]s and every packet this side sends is a
+//! [`NetworkLoadingRequest`]; `lan_service::cooperative` moves both.
 
 use super::{MatchSession, NetworkLoadingRequest, NetworkPhase, NetworkSession};
 use crate::skirmish_launch::{
@@ -75,13 +75,6 @@ pub(crate) struct CooperativeRoundOptions {
 
 /// A decoded BC6 packet from participant `source`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the network transport, outside this change, delivers the guest-side packets"
-    )
-)]
 pub(crate) enum CooperativeRoundEvent {
     /// `0x26`.
     PeerReady { source: usize },
@@ -97,8 +90,13 @@ pub(crate) enum CooperativeRoundEvent {
     Ack { source: usize },
     /// `0x31`, the master's go.
     Go,
-    /// `0x0C`.
-    Chat { source: usize, text: String },
+    /// `0x0C` of this game (its `+0x114` hash matched), with the line
+    /// colour at `+0x110`.
+    Chat {
+        source: usize,
+        text: String,
+        color: u32,
+    },
     /// `0x0D`, the 20 s keepalive: only the loop's tail reads it.
     KeepAlive,
 }
@@ -121,10 +119,11 @@ pub(crate) enum CooperativeRoundStep {
     PeerLeft {
         source: usize,
     },
-    /// `0x0C`: post the line.
+    /// `0x0C`: post the line in the packet's colour.
     Chat {
         source: usize,
         text: String,
+        color: u32,
     },
     /// The loop left with `0x89E04C`.
     Exit(bool),
@@ -401,9 +400,15 @@ impl MatchSession {
                 round.outcome = Some(true);
                 Ok(CooperativeRoundStep::Exit(true))
             }
-            CooperativeRoundEvent::Chat { source, text } => {
-                Ok(CooperativeRoundStep::Chat { source, text })
-            }
+            CooperativeRoundEvent::Chat {
+                source,
+                text,
+                color,
+            } => Ok(CooperativeRoundStep::Chat {
+                source,
+                text,
+                color,
+            }),
             CooperativeRoundEvent::KeepAlive => Ok(tail(requests, host, round)),
         }
     }

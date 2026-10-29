@@ -267,11 +267,11 @@ impl MoviesCapture {
                         input::key_press(state, Some(KeyCode::Tab), None);
                         let dialog = state.frontend.network_options.as_ref().context("D7")?;
                         ensure!(
-                            dialog.combo_open && dialog.focused_control == SOCKET,
+                            dialog.popup.control.is_some() && dialog.focused_control == SOCKET,
                             "Tab must advance edit focus while keeping the adapter popup"
                         );
                         ensure!(
-                            dialog.card_hot_row == Some(2),
+                            dialog.popup.hot_row == Some(2),
                             "scrollbar hover lost adapter hot row"
                         );
                         Self::restore_neutral_pointer(state);
@@ -282,7 +282,8 @@ impl MoviesCapture {
                                 .network_options
                                 .as_ref()
                                 .unwrap()
-                                .card_hot_row
+                                .popup
+                                .hot_row
                                 == Some(2),
                             "outside hover lost adapter hot row"
                         );
@@ -549,7 +550,7 @@ impl MoviesCapture {
         );
         if target == NetworkOptionsTarget::Cards {
             ensure!(
-                dialog.cards.len() == 8 && dialog.combo_open,
+                dialog.cards.len() == 8 && dialog.popup.control.is_some(),
                 "eight-card popup closed before capture"
             );
         }
@@ -579,8 +580,8 @@ impl MoviesCapture {
             "profile": profile_state(state),
             "message": state.frontend.network_options.as_ref().and_then(|dialog| dialog.pending_message()).map(|message| message.csf_key()),
             "cards": state.frontend.network_options.as_ref().map(|dialog| &dialog.cards),
-            "popup_open": state.frontend.network_options.as_ref().map(|dialog| dialog.combo_open),
-            "hot_row": state.frontend.network_options.as_ref().and_then(|dialog| dialog.card_hot_row),
+            "popup_open": state.frontend.network_options.as_ref().map(|dialog| dialog.popup.control.is_some()),
+            "hot_row": state.frontend.network_options.as_ref().and_then(|dialog| dialog.popup.hot_row),
             "returned_to_options": matches!(target, NetworkOptionsTarget::Back | NetworkOptionsTarget::SaveReturn),
             "writes_settings": target == NetworkOptionsTarget::SaveReturn,
             "scope": "production pointer/key handlers and final renderer; explicit prior settings and card responses"});

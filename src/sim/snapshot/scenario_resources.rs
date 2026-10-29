@@ -295,6 +295,7 @@ mod tests {
         resources.rules = rules;
         resources.terrain_template = Some(crate::map::resolved_terrain::test_flat_ground_grid(3));
         let source = crate::map::source::LoadedMapSource::Loose {
+            cache_lease: Default::default(),
             path: "/nonexistent/saved-only-map.map".into(),
             payload_len: 27,
             source_sha256: "saved-source-identity".into(),

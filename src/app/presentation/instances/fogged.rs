@@ -16,8 +16,10 @@ use crate::render::sprite_atlas::{ShpPaletteContext, ShpSpriteEntry, ShpSpriteKe
 use crate::render::tactical_draw_plan::RenderZPolicy;
 use crate::rules::house_colors::{HouseColorIndex, NO_REMAP};
 use crate::rules::ruleset::RuleSet;
-use crate::sim::intern::StringInterner;
-use crate::sim::vision::{FoggedDrawKind, FrozenBuilding};
+use crate::sim::intern::{InternedId, StringInterner};
+use crate::sim::vision::{
+    FoggedDrawKind, FoggedObjectFootprintRecord, FoggedObjectId, FrozenBuilding,
+};
 
 pub(crate) fn build_fogged_instances(state: &AppState) -> ObjectLayerPass {
     let (Some(runtime), Some(atlas)) = (
@@ -46,12 +48,22 @@ pub(crate) fn build_fogged_instances(state: &AppState) -> ObjectLayerPass {
         building_zshape: presentation.building_zshape.is_some(),
         detail_level: presentation.in_game_options.detail_level as i32,
     };
-    // Constructor4D0EF0 writes this signed key; DrawAll4D18C6
-    // sorts it ascending with4D2ED0. This index is not a Display layer.
-    let mut snapshots: Vec<_> = sim
-        .fog()
-        .fogged_objects()
-        .values()
+    let snapshots = fogged_draw_order(sim.fog().fogged_objects().values(), viewer);
+    lower_fogged_object_pieces(
+        snapshots
+            .into_iter()
+            .map(|(id, draw)| (id, frozen_building_pieces(&input, draw))),
+    )
+}
+
+/// FoggedObjectClass::DrawAll @ 0x004D1890 gates each saved picture on its
+/// retained visible byte at4D18F7, not current sight or a live source object.
+/// Constructor4D0EF0 supplies the signed sort key;4D18C6 sorts with4D2ED0.
+fn fogged_draw_order<'a>(
+    records: impl Iterator<Item = &'a FoggedObjectFootprintRecord>,
+    viewer: InternedId,
+) -> Vec<(FoggedObjectId, &'a FrozenBuilding)> {
+    let mut snapshots: Vec<_> = records
         .filter(|record| record.viewer == viewer)
         .filter_map(|record| record.drawing.as_ref().map(|draw| (record.id, draw)))
         .filter(|(_, draw)| draw.visible)
@@ -62,11 +74,7 @@ pub(crate) fn build_fogged_instances(state: &AppState) -> ObjectLayerPass {
             .wrapping_sub(i32::from((draw.location.y / 256) as i16).wrapping_mul(0x93b6))
             .wrapping_sub(6)
     });
-    lower_fogged_object_pieces(
-        snapshots
-            .into_iter()
-            .map(|(id, draw)| (id, frozen_building_pieces(&input, draw))),
-    )
+    snapshots
 }
 
 struct FrozenDrawInputs<'a> {
@@ -398,7 +406,19 @@ mod tests {
             building_zshape: true,
             detail_level: 2,
         };
-        let pieces = frozen_building_pieces(&input, &frozen);
+        let record = FoggedObjectFootprintRecord {
+            id: 1,
+            viewer: owner,
+            source_entity_id: 9999,
+            occupied_cells: vec![(7, 8)],
+            drawing: Some(frozen),
+        };
+        // The production selector has only immutable records: current sight
+        // and the former live building cannot veto this remembered picture.
+        let selected = fogged_draw_order(std::iter::once(&record), owner);
+        assert_eq!(selected.len(), 1);
+        assert!(fogged_draw_order(std::iter::once(&record), building).is_empty());
+        let pieces = frozen_building_pieces(&input, selected[0].1);
         assert_eq!(
             pieces.iter().map(|piece| piece.target).collect::<Vec<_>>(),
             vec![

@@ -172,7 +172,7 @@ fn scene(case: &Value, corpus: &Value) -> (Simulation, RuleSet, u64) {
     });
     assert_eq!(json!(slot3), case["before"]["slot3"]);
     let map = definitions(case);
-    sim.initialize_trigger_definitions(&map, &Default::default(), None, None);
+    sim.initialize_trigger_definitions(&map, &Default::default(), None, None, None);
     sim.classify_map_triggers(&rules);
     if let Some(tag) = case["input"]["definitions"]["Tags"]
         .as_object()

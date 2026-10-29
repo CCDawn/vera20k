@@ -52,7 +52,9 @@ pub(crate) fn advance_sidebar_credits_after_frame(
     if !crate::app::sidebar_projection::credits_advance_for_frame(frame_committed, tick_lane) {
         return;
     }
-    let owner_name = preferred_local_owner_name(state).unwrap_or_else(|| "Americans".to_string());
+    let Some(owner_name) = preferred_local_owner_name(state) else {
+        return;
+    };
     let Some(sim) = state
         .match_state
         .sim_runtime
@@ -117,8 +119,16 @@ fn apply_cameo_transitions(
 /// transitions, never from a view consumer.
 pub(crate) fn refresh_sidebar_projection(state: &mut AppState) {
     refresh_radar_animation_source(state);
+    let theme = current_sidebar_theme(state);
+    #[cfg(feature = "phobos")]
+    let gdi_positions = state.rules().map_or(
+        theme == crate::render::sidebar_chrome::SidebarTheme::Allied,
+        |rules| rules.side_gdi_positions(current_sidebar_side(state)),
+    );
+    #[cfg(not(feature = "phobos"))]
+    let gdi_positions = theme == crate::render::sidebar_chrome::SidebarTheme::Allied;
     let mut spec =
-        crate::ui::sidebar::SidebarChromeLayoutSpec::for_theme(current_sidebar_theme(state));
+        crate::ui::sidebar::SidebarChromeLayoutSpec::for_theme_and_positions(theme, gdi_positions);
     if let Some(atlas) = current_sidebar_chrome(state) {
         spec.side2_height = atlas.side2.pixel_size[1];
         spec.side3_height = atlas.side3.pixel_size[1];
@@ -128,13 +138,18 @@ pub(crate) fn refresh_sidebar_projection(state: &mut AppState) {
     let (screen_w, screen_h) = state.sidebar_frame().layout_screen();
     let visible_rows =
         sidebar::compute_layout_with_spec(spec, screen_w, screen_h, 0).side2_tile_count;
-    let owner_name: String =
-        preferred_local_owner_name(state).unwrap_or_else(|| "Americans".to_string());
+    let Some(owner_name) = preferred_local_owner_name(state) else {
+        state
+            .match_state
+            .match_presentation
+            .sidebar_projection
+            .replace_view(None);
+        return;
+    };
     let Some((
         build_options,
         queue_items,
         ready_buildings,
-        producer_focus,
         credits,
         power_produced,
         power_drained,
@@ -148,19 +163,6 @@ pub(crate) fn refresh_sidebar_projection(state: &mut AppState) {
                 .map(|rt| &rt.simulation)?,
             state.rules()?,
         );
-        let producer_focus = [
-            production::ProductionCategory::Building,
-            production::ProductionCategory::Defense,
-            production::ProductionCategory::Infantry,
-            production::ProductionCategory::Vehicle,
-            production::ProductionCategory::Aircraft,
-            production::ProductionCategory::Ship,
-        ]
-        .into_iter()
-        .filter_map(|category| {
-            production::active_producer_for_owner_category(sim, rules, &owner_name, category)
-        })
-        .collect::<Vec<_>>();
         let owner_iid = sim.interner().get(&owner_name).unwrap_or_default();
         let sw_views = crate::sim::superweapon::superweapon_views_for_owner(sim, rules, &owner_iid);
         let (power_produced, power_drained) =
@@ -169,7 +171,6 @@ pub(crate) fn refresh_sidebar_projection(state: &mut AppState) {
             production::all_build_options_for_owner(sim, rules, &owner_name),
             production::queue_view_for_owner(sim, rules, &owner_name),
             production::ready_buildings_for_owner(sim, rules, &owner_name),
-            producer_focus,
             counter_credits(sim, &owner_name),
             power_produced,
             power_drained,
@@ -201,6 +202,25 @@ pub(crate) fn refresh_sidebar_projection(state: &mut AppState) {
             production::initial_construction_options(sim, state.rules().expect("sidebar rules"))
         })
         .unwrap_or_default();
+    // Phobos adds a superweapon to the left sidebar first and skips its right
+    // sidebar cameo (`SidebarClass_AddCameo` returns false once accepted).
+    #[cfg(feature = "phobos")]
+    let sw_plan = crate::app::presentation::sw_sidebar::plan(state, owner, &sw_views);
+    #[cfg(feature = "phobos")]
+    let right_sw_views: Vec<crate::sim::superweapon::SuperWeaponView> = {
+        let left: std::collections::HashSet<&str> = sw_plan
+            .1
+            .iter()
+            .map(|entry| entry.type_id.as_str())
+            .collect();
+        sw_views
+            .iter()
+            .filter(|view| !left.contains(sim.interner().resolve(view.type_id)))
+            .cloned()
+            .collect()
+    };
+    #[cfg(not(feature = "phobos"))]
+    let right_sw_views = sw_views.clone();
     let cameos = crate::app::sidebar_projection::cameo_candidates(
         sim,
         state.rules().expect("sidebar rules"),
@@ -208,7 +228,7 @@ pub(crate) fn refresh_sidebar_projection(state: &mut AppState) {
         owner,
         &build_options,
         &ready_buildings,
-        &sw_views,
+        &right_sw_views,
     );
     let reconciled = state
         .match_state
@@ -258,9 +278,8 @@ pub(crate) fn refresh_sidebar_projection(state: &mut AppState) {
         scroll_up_btn_size,
         top_btn_sizes,
     ) = {
-        let scale = state.match_state.match_presentation.ui_scale;
         let size = |entry: Option<&crate::render::sidebar_chrome::SidebarChromeEntry>| {
-            entry.map(|entry| [entry.pixel_size[0] * scale, entry.pixel_size[1] * scale])
+            entry.map(|entry| entry.pixel_size)
         };
         let atlas = current_sidebar_chrome(state);
         (
@@ -304,14 +323,13 @@ pub(crate) fn refresh_sidebar_projection(state: &mut AppState) {
         &build_options,
         &ready_buildings,
         armed_entry.as_ref(),
-        &producer_focus,
         state
             .match_state
             .sim_runtime
             .as_ref()
             .map(|rt| &rt.simulation)
             .map(|sim| sim.interner()),
-        &sw_views,
+        &right_sw_views,
         &state.match_state.match_presentation.sidebar_gadget_state,
         repair_btn_size,
         sell_btn_size,
@@ -398,6 +416,12 @@ pub(crate) fn refresh_sidebar_projection(state: &mut AppState) {
         .match_presentation
         .sidebar_projection
         .replace_view(Some(view));
+    #[cfg(feature = "phobos")]
+    {
+        let sw = &mut state.match_state.match_presentation.sw_sidebar;
+        sw.layout = sw_plan.0;
+        sw.entries = sw_plan.1;
+    }
 }
 
 /// The per-frame part of the projection: each retained object cameo's drawn
@@ -408,18 +432,9 @@ pub(crate) fn refresh_sidebar_projection(state: &mut AppState) {
 /// two House rechecks must reach the very next frame. Membership and the House
 /// pass stay with [`refresh_sidebar_projection`].
 pub(crate) fn refresh_sidebar_cameo_draw_state(state: &mut AppState) {
-    // Without a current House the projection's owner comes from the sandbox
-    // guess, whose resolution scans every entity and each candidate's build
-    // options. That debug path keeps the drawn state of its last rebuild.
-    if state
-        .match_state
-        .sim_runtime
-        .as_ref()
-        .is_none_or(|runtime| runtime.simulation.session().current_house().is_none())
-    {
+    let Some(owner_name) = preferred_local_owner_name(state) else {
         return;
-    }
-    let owner_name = preferred_local_owner_name(state).unwrap_or_else(|| "Americans".to_string());
+    };
     let AppState { match_state, .. } = state;
     let Some(runtime) = match_state.sim_runtime.as_ref() else {
         return;
@@ -837,6 +852,7 @@ pub(crate) fn begin_main_pass<'a>(
         }),
         timestamp_writes: None,
         occlusion_query_set: None,
+        multiview_mask: None,
     })
 }
 
@@ -868,6 +884,7 @@ pub(crate) fn begin_main_load_pass<'a>(
         }),
         timestamp_writes: None,
         occlusion_query_set: None,
+        multiview_mask: None,
     })
 }
 

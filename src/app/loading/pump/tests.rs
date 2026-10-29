@@ -7,6 +7,16 @@ use crate::skirmish_launch::{
     SkirmishLaunchMode, SkirmishLaunchOptions, SkirmishLocalSlot,
 };
 
+#[test]
+fn browser_peer_wait_starts_after_the_terminal_ack_drain() {
+    let mut wait = NetworkLoadWait::new(100, 0.5);
+    wait.start_pending = true;
+    assert_eq!(wait.poll(340, 0.75), NetworkLoadPoll::Pending);
+    assert_eq!(wait.poll(639, 0.75), NetworkLoadPoll::Pending);
+    assert_eq!(wait.poll(640, 0.75), NetworkLoadPoll::ReportProgress);
+    assert_eq!(wait.poll(3940, 0.75), NetworkLoadPoll::TimedOut);
+}
+
 pub(super) fn test_launch_session(country: LaunchCountry) -> SkirmishLaunchSession {
     SkirmishLaunchSession {
         mode: SkirmishLaunchMode {
@@ -50,6 +60,180 @@ pub(super) fn test_launch_session(country: LaunchCountry) -> SkirmishLaunchSessi
         pre_fill_house_roster: crate::skirmish_launch::PreFillHouseRoster::from_compact_skirmish(1),
         options: SkirmishLaunchOptions::default(),
     }
+}
+
+#[test]
+fn recorded_network_mode_stays_in_shell_until_the_world_is_installed() {
+    use crate::app::match_runtime::session::{MatchSession, SessionMode};
+    let startup = LoadingStartup::Replay {
+        session: test_launch_session(LaunchCountry::America),
+        seed: crate::app::match_bootstrap::MatchSeed {
+            value: 73,
+            source: crate::app::match_bootstrap::MatchSeedSource::SavedScenario,
+            seed_authority_certifying: false,
+        },
+        game_mode: SessionMode::Wol,
+        native_id_prefix: 0,
+    };
+    assert!(!crate::app::loading::init::should_read_tmcj4f(
+        startup.session_mode(),
+        true,
+    ));
+    let replay_with_mode = |game_mode| match &startup {
+        LoadingStartup::Replay {
+            session,
+            seed,
+            native_id_prefix,
+            ..
+        } => LoadingStartup::Replay {
+            session: session.clone(),
+            seed: *seed,
+            game_mode,
+            native_id_prefix: *native_id_prefix,
+        },
+        _ => unreachable!("test startup is a Replay"),
+    };
+    let lan_replay = replay_with_mode(SessionMode::Lan);
+    assert!(!crate::app::loading::init::should_read_tmcj4f(
+        lan_replay.session_mode(),
+        true,
+    ));
+    let skirmish_replay = replay_with_mode(SessionMode::Skirmish);
+    assert!(crate::app::loading::init::should_read_tmcj4f(
+        skirmish_replay.session_mode(),
+        true,
+    ));
+    assert!(!crate::app::loading::init::should_read_tmcj4f(
+        skirmish_replay.session_mode(),
+        false,
+    ));
+    let mut session = MatchSession::default();
+    prepare_session_for_loading(&mut session, &startup);
+    assert_eq!(session.shell_mode(), Some(SessionMode::Wol));
+    assert_eq!(session.local_player_name(), Some("Player"));
+    assert!(session.network_return_context().is_none());
+    assert!(session.network_setup().is_none());
+    session.hand_mode_to_world(SessionMode::Wol);
+    assert_eq!(session.shell_mode(), None);
+}
+
+#[test]
+#[ignore = "slow; retail warm/cold ordered online startup"]
+fn sequenced_wol_cold_and_warm_rules_share_world_and_agreement_identity() {
+    use crate::app::match_runtime::session::{MatchSession, NetworkReturnContext, SessionMode};
+    use crate::sim::native_identity::modern_online_native_id_prefix;
+    let root = PathBuf::from(std::env::var_os("RA2_DIR").expect("retail RA2_DIR"));
+    let mut launch = test_launch_session(LaunchCountry::America);
+    launch.selected_map_file = Some("XMP03T4.MAP".into());
+    launch.opponents.clear();
+    launch.ai_player_count = 0;
+    let mut remote = launch.humans[0].clone();
+    remote.name = "Remote".into();
+    remote.raw_slot_index = Some(1);
+    remote.slot.country = LaunchCountry::Russia;
+    remote.slot.color_index = 1;
+    remote.slot.start_position = LaunchStartPosition::Position(1);
+    launch.humans.push(remote);
+    launch.rebuild_house_roster();
+    let mut session = MatchSession::default();
+    session.enter_network(NetworkReturnContext::Wol);
+    session.accept_network_setup(launch, true, Some(7)).unwrap();
+    session.prepare_wol_timing([0], true).unwrap();
+    let startup = session.freeze_network_start(73).unwrap();
+    let LoadingStartup::Network(admitted) = &startup else {
+        unreachable!()
+    };
+    let checkpoint = startup.native_id_prefix();
+    assert_eq!(checkpoint, Some(0));
+    assert_eq!(modern_online_native_id_prefix(SessionMode::Lan, 2), None);
+    assert_eq!(modern_online_native_id_prefix(SessionMode::Wol, 1), None);
+
+    let assets = AssetManager::new(
+        &root,
+        crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+    )
+    .unwrap();
+    let audio = crate::rules::audio_sources::AudioDefinitions::select(&assets);
+    let (_, _, mut process_rules) = crate::rules::retail_sources::load_startup_rules(
+        &assets,
+        std::sync::Arc::clone(audio.sounds()),
+        std::sync::Arc::clone(audio.eva()),
+    )
+    .unwrap()
+    .into_parts();
+    let load = |rules: Option<&mut crate::rules::process_owner::NativeRulesProcessOwner>,
+                prefix| {
+        crate::headless_scenario::load_with_launch_and_ini(
+            &root,
+            "XMP03T4.MAP",
+            73,
+            crate::sim::scenario_bootstrap::MatchLaunchDescriptor::from_resolved(
+                admitted.launch_session().clone(),
+            )
+            .unwrap(),
+            &Default::default(),
+            SessionMode::Wol,
+            prefix,
+            rules,
+        )
+        .unwrap()
+    };
+    // A real completed prior map load warms this independent process owner.
+    drop(load(Some(&mut process_rules), None));
+    let mut warm = load(Some(&mut process_rules), checkpoint);
+    let mut cold = load(None, checkpoint);
+    let mut agreements = Vec::new();
+    for scene in [&mut warm, &mut cold] {
+        let bindings = admitted
+            .launch_session()
+            .humans
+            .iter()
+            .enumerate()
+            .map(|(source, human)| {
+                (
+                    human.raw_slot_index.unwrap(),
+                    i8::try_from(
+                        crate::app::match_runtime::network_match::source_house(
+                            &session,
+                            scene.sim(),
+                            source,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let sim = &mut scene.runtime.simulation;
+        crate::app::loading::init::install_startup_session_mode(sim, &startup);
+        sim.batch_path_searches();
+        sim.network_command_queues().install_timing(
+            bindings[0].1,
+            std::num::NonZeroU8::new(1).unwrap(),
+            bindings.iter().map(|&(_, house)| house),
+        );
+        sim.network_command_queues().configure_sequenced_clock(45);
+        agreements.push(
+            crate::net::live_commands::StartupAgreement::new(
+                bindings.iter().copied(),
+                bindings.iter().map(|&(row, _)| row),
+                73,
+                admitted.max_ahead_frames(),
+                45,
+                std::num::NonZeroU32::new(1).unwrap(),
+                sim.state_hash(),
+            )
+            .unwrap(),
+        );
+    }
+    assert_eq!(warm.sim().state_hash(), cold.sim().state_hash());
+    assert_eq!(warm.sim().native_identity_prefix_checkpoint(), Some(0));
+    assert_eq!(
+        warm.sim().native_identity_cursor(),
+        cold.sim().native_identity_cursor()
+    );
+    // The full value object includes every private sequencing-identity input.
+    assert_eq!(agreements[0], agreements[1]);
 }
 
 #[test]
@@ -148,6 +332,7 @@ fn admitted_network_start_preserves_canonical_humans_and_host_seed_in_fresh_load
     let initial = crate::app::loading::init::MapLoadInitial::from_test_map_source(
         prefix_test_map(&[(0, 20, 24), (1, 42, 46)]),
         crate::map::source::LoadedMapSource::Loose {
+            cache_lease: Default::default(),
             path: std::path::PathBuf::from("mp01t4.map"),
             payload_len: 23,
             source_sha256: crate::util::sha256::sha256_hex(b"synthetic network map"),
@@ -207,6 +392,7 @@ fn campaign_preparation_failure_retires_the_lease_with_shell_retry_policy() {
                 None,
                 slot.take().unwrap(),
                 true,
+                None,
                 None,
             )
             .err()
@@ -376,6 +562,25 @@ fn begin_loading_plays_loading_theme_and_polls_theme_through_the_lease() {
 }
 
 #[test]
+fn presentation_wait_retirement_returns_the_process_asset_lease() {
+    let mut assets = crate::app::process_assets::ProcessAssets::new(
+        crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+        false,
+    );
+    assets.return_from_loading(AssetManager::from_loose_root_for_test(&std::env::temp_dir()));
+    let mut session = LoadingSession::from_request(LoadingRequest::generic_map_load("pending"));
+    let mut result = super::super::transitions::fallback_map_load_result();
+    result.asset_manager = assets.lease_for_loading();
+    session.stage = LoadingStage::PreparingPresentation {
+        result: Box::new(result),
+    };
+    assert!(assets.is_leased() && !assets.is_available());
+    assert!(loading_asset_manager(&session).is_some());
+    session.retire(&mut assets);
+    assert!(assets.is_available() && !assets.is_leased());
+}
+
+#[test]
 fn loading_replacement_and_terminal_retirement_preserve_cache_and_admission_order() {
     let dir = std::env::temp_dir().join(format!("vera20k-loading-owner-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -435,6 +640,21 @@ fn loading_replacement_and_terminal_retirement_preserve_cache_and_admission_orde
         .load_file_from_mix("sentinel.bin")
         .unwrap();
     assert!(std::sync::Arc::ptr_eq(&original.bytes, &cached.bytes));
+    // A completed observer handoff retains that same result and cache after
+    // the real wait has finished. Cancel/replacement must return its lease too.
+    let pending = slot.as_mut().unwrap();
+    let LoadingStage::AwaitingPeers { result, .. } = std::mem::replace(
+        &mut pending.stage,
+        LoadingStage::Selected(LoadingRequest::generic_map_load("auto")),
+    ) else {
+        unreachable!()
+    };
+    pending.stage = LoadingStage::ReadyToInstall { result };
+    let cached = audio_service_asset_manager(&assets, slot.as_ref())
+        .unwrap()
+        .load_file_from_mix("sentinel.bin")
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&original.bytes, &cached.bytes));
     // The installer's resource-only cleanup must preserve the replacement
     // admission until its actual L0 observation commits.
     retire_loading_attempt(&mut slot, &mut assets);
@@ -468,6 +688,7 @@ fn loading_replacement_and_terminal_retirement_preserve_cache_and_admission_orde
                 None,
                 slot.take().unwrap(),
                 true,
+                None,
                 None,
             )
             .err()
@@ -602,6 +823,7 @@ fn loading_preparation_consumes_real_source_and_returns_lease_on_initial_and_adm
         session,
         true,
         Some(ra2_dir.clone()),
+        None,
     )
     .unwrap();
     assert_eq!(session.next_frame, NextLoadingFrame::Blank);
@@ -637,6 +859,7 @@ fn loading_preparation_consumes_real_source_and_returns_lease_on_initial_and_adm
             session,
             false,
             Some(ra2_dir.clone()),
+            None,
         )
         .err()
         .unwrap();
@@ -652,6 +875,30 @@ fn loading_preparation_consumes_real_source_and_returns_lease_on_initial_and_adm
                 .bytes
         ));
     }
+}
+
+#[cfg(feature = "ares")]
+#[test]
+fn loading_rows_draw_their_own_country_insignia_file() {
+    let rules =
+        crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
+            "[Countries]\n0=Americans\n1=Custom\n[Custom]\nFile.Flag=MyFlag.PCX\n",
+        ))
+        .expect("insignia country rules parse");
+    assert_eq!(
+        super::loading_row_insignia(Some(&rules), None, 1).as_deref(),
+        Some("myflag.pcx")
+    );
+    assert_eq!(
+        super::loading_row_insignia(Some(&rules), Some(LoadingArtVariant::Americans), 0).as_deref(),
+        Some("usai.pcx")
+    );
+    // An observer row carries no Country selection, so the stock `-3` chain
+    // (obsi.pcx) still decides.
+    assert_eq!(
+        super::loading_row_insignia(Some(&rules), Some(LoadingArtVariant::Observer), 0),
+        None
+    );
 }
 
 #[test]
@@ -923,6 +1170,7 @@ fn load_descriptor_source_family_format_matrix() {
     ];
     for source in [
         crate::map::source::LoadedMapSource::Loose {
+            cache_lease: Default::default(),
             path: std::path::PathBuf::from("mp01t4.map"),
             payload_len: 17,
             source_sha256: crate::util::sha256::sha256_hex(b"synthetic map fixture"),
@@ -1026,6 +1274,7 @@ fn accepted_and_resolved_legacy_share_one_stock_cursor_shape() {
 
     let starts = [(0, 20, 24), (1, 42, 46)];
     let source = crate::map::source::LoadedMapSource::Loose {
+        cache_lease: Default::default(),
         path: std::path::PathBuf::from("mp01t4.map"),
         payload_len: 23,
         source_sha256: crate::util::sha256::sha256_hex(b"synthetic map fixture"),
@@ -1123,6 +1372,7 @@ fn generic_manual_and_unresolved_legacy_reject_before_receipt_or_staging() {
     let authored = crate::app::loading::init::MapLoadInitial::from_test_map_source(
         prefix_test_map(&starts),
         crate::map::source::LoadedMapSource::Loose {
+            cache_lease: Default::default(),
             path: std::path::PathBuf::from("manual.map"),
             payload_len: 1,
             source_sha256: crate::util::sha256::sha256_hex(b"synthetic map fixture"),
@@ -1283,6 +1533,7 @@ fn authored_prefix_rejects_random_map_staging_for_loose_and_mix_sources() {
     let starts = [(0, 20, 24), (1, 42, 46)];
     let sources = [
         crate::map::source::LoadedMapSource::Loose {
+            cache_lease: Default::default(),
             path: std::path::PathBuf::from(selected),
             payload_len: 1,
             source_sha256: crate::util::sha256::sha256_hex(b"synthetic map fixture"),
@@ -1517,6 +1768,7 @@ fn loading_request_moves_exact_startup_authority_once() {
     let initial = MapLoadInitial::from_test_map_source(
         prefix_test_map(&[(0, 20, 24), (1, 42, 46)]),
         crate::map::source::LoadedMapSource::Loose {
+            cache_lease: Default::default(),
             path: PathBuf::from("mp01t4.map"),
             payload_len: 1,
             source_sha256: crate::util::sha256::sha256_hex(b"synthetic map fixture"),
@@ -1690,30 +1942,34 @@ fn selected_native_gate_preserves_metadata_and_raw_progress_cadence() {
             Some(LoadingArtVariant::Americans),
             0,
             HouseColorIndex(0),
-            LoadingProgressRowSnapshot::from_launch_session(&test_launch_session(
-                LaunchCountry::America,
-            )),
+            LoadingProgressRowSnapshot::from_launch_session(
+                &test_launch_session(LaunchCountry::America),
+                crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
+            ),
             cadence,
         );
         native.runtime_color_scheme_count = 16;
         {
-            let mut phase = LoadingPhaseProgress::select(Some(&mut native), true, |_| {
+            let mut phase = LoadingPhaseProgress::select(Some(&mut native), true, None, |_, _| {
                 panic!("no atlas must select the real gated sink")
             });
             assert!(matches!(&phase.sink, SelectedProgressSink::Gated(_)));
             assert!(phase.native_theater_cache_mismatch);
             assert_eq!(phase.runtime_color_scheme_count, 16);
             for raw in [8, 6, 8, 12, 12] {
-                phase.sink.milestone(raw);
+                phase.sink.milestone(raw).unwrap();
             }
         }
         assert_eq!(native.progress.current_percent(), expected);
         {
-            let mut phase = LoadingPhaseProgress::select(Some(&mut native), false, |_| {
+            let mut phase = LoadingPhaseProgress::select(Some(&mut native), false, None, |_, _| {
                 panic!("no atlas must select the real gated sink")
             });
             assert!(!phase.native_theater_cache_mismatch);
-            phase.sink.milestone(cadence.terminal_raw_percent());
+            phase
+                .sink
+                .milestone(cadence.terminal_raw_percent())
+                .unwrap();
         }
         assert_eq!(native.progress.current_percent(), 100.0);
     }
@@ -1733,9 +1989,10 @@ fn native_loading_state_keeps_the_full_player_progress_ramp() {
         Some(LoadingArtVariant::Americans),
         0,
         HouseColorIndex(1),
-        LoadingProgressRowSnapshot::from_launch_session(&test_launch_session(
-            LaunchCountry::America,
-        )),
+        LoadingProgressRowSnapshot::from_launch_session(
+            &test_launch_session(LaunchCountry::America),
+            crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
+        ),
         NativeLoadingProgressCadence::SelectedMap,
     );
     native.resolve_player_colors(
@@ -1859,7 +2116,7 @@ fn absent_and_lost_loading_managers_preserve_media_policy() {
 }
 
 #[test]
-fn network_loading_progress_and_completion_match_original_controls() {
+fn native_loading_percentage_controls_and_completion_match_original() {
     let corpus: serde_json::Value =
         crate::test_fixture::json("tools/storage_oracle/lan_lobby.json").clone();
     for row in corpus["loading_wait_progress"].as_array().unwrap() {
@@ -1873,7 +2130,10 @@ fn network_loading_progress_and_completion_match_original_controls() {
                 human
             })
             .collect();
-        let mut rows = LoadingProgressRowSnapshot::from_launch_session(&launch);
+        let mut rows = LoadingProgressRowSnapshot::from_launch_session(
+            &launch,
+            crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
+        );
         let mut local = LoadingProgressState::standard_skirmish();
         for update in row["updates"].as_array().unwrap() {
             let index = update[0].as_u64().unwrap() as usize;
@@ -1881,7 +2141,15 @@ fn network_loading_progress_and_completion_match_original_controls() {
             if index == 0 {
                 local.advance_progress(percent as u32);
             } else {
-                rows.update_remote_progress(index, percent);
+                // This corpus exercises native SetPercent643C94..643CC9 and
+                // the original average/wait controls, including signed values
+                // after100. The network row's VERA terminal latch is a separate
+                // transport policy, covered by the real-UDP loading test.
+                rows.participants[index]
+                    .remote_progress
+                    .as_mut()
+                    .unwrap()
+                    .set_percent(f64::from(percent));
             }
         }
         for (index, expected) in row["values"].as_array().unwrap().iter().enumerate() {
@@ -2016,5 +2284,170 @@ fn a_network_start_installs_its_mode_and_timing_into_the_scenario() {
     assert_eq!(
         sim.session().game_mode().command_queue_route(),
         crate::sim::world::CommandQueueRoute::Multiplayer
+    );
+}
+
+#[test]
+fn held_network_sink_sends_rmg_display_progress_and_services_the_same_source_rows() {
+    let (mut host, mut host_session, _, mut guest, mut guest_session, _) =
+        crate::app::lan_service::loading_test_pair();
+    let native = |session: &crate::app::match_runtime::session::MatchSession| {
+        NativeLoadingScreenState::standard_skirmish(
+            Some(LoadingArtVariant::Americans),
+            0,
+            HouseColorIndex(0),
+            LoadingProgressRowSnapshot::from_launch_session(
+                session.network_setup().unwrap(),
+                crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
+            ),
+            NativeLoadingProgressCadence::RandomMapHalved,
+        )
+    };
+    let mut host_native = native(&host_session);
+    let mut guest_native = native(&guest_session);
+    let mut wait = NetworkLoadWait::new(
+        0,
+        host_native
+            .progress_row
+            .total_fraction(&host_native.progress),
+    );
+    host_session.request_kick_proposal(1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        for (service, session, native, raw) in [
+            (&mut host, &mut host_session, &mut host_native, 60),
+            (&mut guest, &mut guest_session, &mut guest_native, 12),
+        ] {
+            let network = crate::app::lan_service::LoadingNetworkService::borrow(
+                session,
+                Some(service),
+                false,
+            )
+            .unwrap();
+            let mut phase = LoadingPhaseProgress::select(Some(native), false, network, |_, _| {
+                panic!("fixture deliberately uses the real gated network sink without GPU art")
+            });
+            phase.sink.milestone(raw).unwrap();
+        }
+        if host_native.progress_row.participants[1]
+            .remote_progress
+            .as_ref()
+            .unwrap()
+            .current_percent()
+            == 6.0
+            && guest_native.progress_row.participants[0]
+                .remote_progress
+                .as_ref()
+                .unwrap()
+                .current_percent()
+                == 30.0
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "held loader did not service real UDP progress"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        host_native.progress.current_percent(),
+        30.0,
+        "raw60 is halved only once"
+    );
+    assert_eq!(guest_native.progress.current_percent(), 6.0);
+    assert!(
+        host_native.progress_row.participants[0]
+            .remote_progress
+            .is_none()
+    );
+    assert_eq!(
+        host_session.take_network_loading_requests(),
+        vec![
+            crate::app::match_runtime::session::NetworkLoadingRequest::ProposeKick {
+                target_source: 1
+            },
+        ],
+        "the synchronous report drain cannot steal another owner's request"
+    );
+    let fraction = host_native
+        .progress_row
+        .total_fraction(&host_native.progress);
+    assert_eq!(wait.poll(3500, fraction), NetworkLoadPoll::ReportProgress);
+    assert_eq!(
+        wait.timeout.remaining(3500),
+        7200,
+        "actual peer progress refreshes the native wait"
+    );
+    assert_ne!(wait.poll(3601, fraction), NetworkLoadPoll::TimedOut);
+}
+
+#[test]
+fn cancelled_admission_cannot_release_a_ready_result_and_returns_the_same_asset_lease() {
+    let (_, mut session, accepted, _, _, _) = crate::app::lan_service::loading_test_pair();
+    let dir = crate::map::source::test_support::TestDirectory::new("loading-cancel-lease");
+    dir.write("sentinel.bin", b"same process cache");
+    let mut assets = crate::app::process_assets::ProcessAssets::new(
+        crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+        false,
+    );
+    assets.return_from_loading(AssetManager::from_loose_root_for_test(dir.path()));
+    let original = assets
+        .manager()
+        .unwrap()
+        .load_file_from_mix("sentinel.bin")
+        .unwrap();
+    let mut loading = LoadingSession::from_request(LoadingRequest::network(accepted.clone()));
+    let mut result = super::super::transitions::fallback_map_load_result();
+    result.scenario.startup = accepted;
+    result.asset_manager = assets.lease_for_loading();
+    loading.stage = LoadingStage::ReadyToInstall {
+        result: Box::new(result),
+    };
+    let mut slot = Some(loading);
+    let mut startup = crate::app::match_runtime::startup::MatchStartup::default();
+    let still_admitted = take_after_network_service(&mut slot, &session)
+        .unwrap()
+        .unwrap();
+    assert!(assets.is_leased() && !assets.is_available());
+    slot = Some(still_admitted);
+    //This is the SAME MatchSession retirement used by ordinary shell/HTTPS
+    //abort reducers. Local completion cannot authorize an obsolete result.
+    session.return_to_network_lobby();
+    assert!(take_after_network_service(&mut slot, &session).is_err());
+    assert!(
+        slot.is_some() && assets.is_leased(),
+        "the guard cannot consume the invalid result"
+    );
+    //fail_loading's exact retirement seam, without a window/GPU fixture.
+    assert_eq!(
+        retire_failed_loading_attempt(
+            &mut slot,
+            &mut startup,
+            &mut assets,
+            LoadingFailurePolicy::RetryNetworkShell
+        ),
+        LoadingFailurePolicy::RetryNetworkShell
+    );
+    assert!(slot.is_none() && assets.is_available() && !assets.is_leased());
+    let restored = assets
+        .manager()
+        .unwrap()
+        .load_file_from_mix("SENTINEL.BIN")
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&original.bytes, &restored.bytes));
+    assert!(
+        take_after_network_service(&mut slot, &session)
+            .unwrap()
+            .is_none()
+    );
+    let same = assets
+        .manager()
+        .unwrap()
+        .load_file_from_mix("sentinel.bin")
+        .unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&restored.bytes, &same.bytes),
+        "no second lease return"
     );
 }

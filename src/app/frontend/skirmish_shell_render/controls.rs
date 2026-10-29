@@ -6,6 +6,7 @@
 use crate::app::loading::init::MapMenuEntry;
 use crate::render::batch::SpriteInstance;
 use crate::render::bit_font::BitFont;
+use crate::render::shell_text::{self, ShellAlign, ShellTextDraw};
 use crate::render::skirmish_shell_chrome::{
     ControlChrome, SkirmishShellChromeAtlas, SkirmishShellChromeEntry,
 };
@@ -28,6 +29,7 @@ use super::chrome::{
     push_ownerdraw_two_pixel_bevel_frame, push_ownerdraw_two_pixel_bevel_frame_px, push_solid_rect,
     push_solid_rect_px, push_tinted_entry,
 };
+use super::text::rect_to_text_rect;
 use super::{
     OWNERDRAW_SELECTED_RGB_FROM_DAT_00AC4604_PACKED_000000FF, SHELL_CONTROL_DEPTH,
     SHELL_DROPDOWN_BG_RGB_PENDING_COMBODROPWIN_SOURCE_CAPTURE, SHELL_DROPDOWN_DEPTH,
@@ -73,37 +75,49 @@ pub(super) fn frame_segments(
     out
 }
 
-/// Original61E700's group window split: the frame starts half the drawn
-/// font cell below the window top, and the caption sits 10px in on that top
-/// line, one authored cell tall. Returns (frame, caption) for
-/// [`push_group_or_plain_frame`] and the caption text.
+/// Original61E700's group window split: the frame starts half a font cell
+/// below the window top, and the caption sits 10px in, one cell tall.
+/// Derive both rectangles in authored pixels before mapping them to the window,
+/// so the caption's clip and the frame grow together. `cell_height` is unscaled.
 pub(super) fn group_box_geometry(
     group: RectPx,
-    drawn_cell_height: i32,
     cell_height: i32,
+    scale: ShellScale,
 ) -> (RectPx, RectPx) {
-    let top = drawn_cell_height / 2;
+    let top = cell_height / 2;
     (
-        RectPx::new(group.x, group.y + top, group.w, group.h - top),
-        RectPx::new(group.x + 10, group.y, group.w - 10, cell_height),
+        scale.derive_rect(group, |group| {
+            RectPx::new(group.x, group.y + top, group.w, group.h - top)
+        }),
+        scale.derive_rect(group, |group| {
+            RectPx::new(group.x + 10, group.y, group.w - 10, cell_height)
+        }),
     )
 }
 
+/// Paint the shared61E700/6208F0 bevel from a window-space frame. Caption
+/// width is in authored pixels; map each ring and its gap to the window once.
 pub(super) fn push_group_or_plain_frame(
     out: &mut Vec<SpriteInstance>,
-    atlas: &SkirmishShellChromeAtlas,
+    white_pixel: Option<SkirmishShellChromeEntry>,
     rect: RectPx,
     caption_width: Option<i32>,
     outer_light: bool,
+    scale: ShellScale,
 ) {
+    let rect = if scale.is_retail() {
+        rect
+    } else {
+        scale.base_rect(rect)
+    };
     for (index, (rect, rgb)) in frame_segments(rect, caption_width, outer_light)
         .into_iter()
         .enumerate()
     {
-        push_solid_rect(
+        push_solid_rect_px(
             out,
-            atlas,
-            rect,
+            white_pixel,
+            scale.scale_rect(rect),
             rgb.map(|c| f32::from(c) / 255.0),
             SHELL_CONTROL_DEPTH - index as f32 * 0.0000001,
         );
@@ -143,6 +157,87 @@ pub(super) fn push_new_edit_instances(
             paint.caret_depth,
             scale,
         );
+    }
+}
+
+/// A NewEdit's frame, caret and text, as NewEdit__DrawTextAndCaret
+/// `0x00623880` paints them in BB, BC/BD, C2/C9 and `0x10F`: the text sits
+/// inside the frame from the first visible unit, and an open IME composition
+/// is spliced in at the caret in the composition colour (`app::input::ime`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn push_new_edit(
+    controls: &mut Vec<SpriteInstance>,
+    texts: &mut Vec<ShellTextDraw>,
+    atlas: &SkirmishShellChromeAtlas,
+    font: &BitFont,
+    edit: &crate::ui::skirmish_shell::SavedSeedDescriptionEdit,
+    composition: Option<(&[u16], usize)>,
+    rect: RectPx,
+    caret_visible: bool,
+    text_depth: f32,
+    scale: ShellScale,
+) {
+    let composed = composition.map(|(units, cursor)| {
+        edit.with_composition(
+            units,
+            cursor,
+            (scale.base_rect(rect).w - 3).max(0) as u32,
+            |text| font.text_width(text),
+        )
+    });
+    let (view, composed_units) = match &composed {
+        Some((view, units)) => (view, units.clone()),
+        None => (edit, 0..0),
+    };
+    push_new_edit_instances(
+        controls,
+        atlas,
+        font,
+        view,
+        NewEditPaint {
+            frame: scale.derive_rect(rect, |rect| {
+                RectPx::new(rect.x - 2, rect.y - 2, rect.w + 5, rect.h + 5)
+            }),
+            text: scale.derive_rect(rect, |rect| {
+                RectPx::new(rect.x + 2, rect.y, rect.w - 1, rect.h + 1)
+            }),
+            background: None,
+            frame_depth: SHELL_EDIT_FRAME_DEPTH,
+            caret_depth: SHELL_EDIT_CARET_DEPTH,
+            caret_visible,
+        },
+        scale,
+    );
+    let first = view.first_visible_unit.min(view.units.len());
+    let (start, end) = (
+        composed_units.start.max(first),
+        composed_units.end.max(first),
+    );
+    let composition_rgb = crate::app::input::ime::COMPOSITION_RGB.map(|c| f32::from(c) / 255.0);
+    let mut x = 0;
+    for (units, rgb) in [
+        (first..start, SHELL_LABEL_TEXT_RGB),
+        (start..end, composition_rgb),
+        (end..view.units.len(), SHELL_LABEL_TEXT_RGB),
+    ] {
+        if units.is_empty() {
+            continue;
+        }
+        let text = view.painted_range(units.start, units.end);
+        let field = scale.derive_rect(rect, |rect| {
+            RectPx::new(rect.x + 2 + x, rect.y, rect.w - 1 - x, rect.h + 1)
+        });
+        texts.push(shell_text::draw_in_rect_scaled(
+            font,
+            &text,
+            rect_to_text_rect(field),
+            rgb,
+            ShellAlign::V_CENTER,
+            [0.0; 2],
+            text_depth,
+            scale.factor(),
+        ));
+        x += font.text_width(&text) as i32;
     }
 }
 
@@ -459,10 +554,12 @@ pub(super) enum ControlPaint {
     /// A trackbar window with its thumb's window-relative left edge
     /// ([`crate::ui::shell::trackbar::thumb_left`]). `plaque` is off where
     /// the owner sends `0x4AC` with 0 (Options Detail/Difficulty/Scroll, BBB).
+    /// `disabled` is the window's `WS_DISABLED` style (`0x0061E0B0`).
     Trackbar {
         rect: RectPx,
         thumb_left: i32,
         plaque: bool,
+        disabled: bool,
     },
     Combo {
         rect: RectPx,
@@ -506,6 +603,7 @@ pub(super) fn paint_control(
             rect,
             thumb_left,
             plaque,
+            disabled,
         } => {
             // The paint blits the plaque and the thumb, then draws two
             // adjacent border-2 frames; the frame entry includes their
@@ -528,6 +626,12 @@ pub(super) fn paint_control(
                     scale.factor(),
                     SHELL_CONTROL_DEPTH - 0.00002,
                 );
+                // A disabled window darkens the thumb rect with the overlay
+                // alpha (`0x0061E0B0..0x0061E0D4`). RESIDUAL: native also
+                // darkens the backdrop under TRAKGRIP's transparent texels.
+                if disabled && let Some(sprite) = out.last_mut() {
+                    sprite.tint = [DISABLED_OVERLAY_KEEP; 3];
+                }
             }
             let base = scale.base_rect(rect);
             if let Some(frame) = chrome.trackbar_frame(plaque, base.w, base.h) {
@@ -694,6 +798,7 @@ pub(super) fn push_trackbar_instances(
                 rect,
                 thumb_left,
                 plaque: true,
+                disabled: false,
             },
             layout.scale,
         );
@@ -1120,6 +1225,7 @@ mod tests {
                     rect,
                     thumb_left,
                     plaque: true,
+                    disabled: false,
                 },
                 ShellScale::RETAIL,
             );
@@ -1154,6 +1260,7 @@ mod tests {
                 rect: RectPx::new(236, 98, 263, 21),
                 thumb_left: 1,
                 plaque: false,
+                disabled: false,
             },
             ShellScale::RETAIL,
         );
@@ -1169,10 +1276,38 @@ mod tests {
                 rect,
                 thumb_left: 1,
                 plaque: true,
+                disabled: false,
             },
             ShellScale::RETAIL,
         );
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn a_disabled_trackbar_darkens_only_its_thumb() {
+        let chrome = ControlChrome {
+            trackbar_plaque_mid_trofm: Some(entry(0.1, 114.0, 24.0)),
+            trackbar_thumb_trakgrip: Some(entry(0.4, 12.0, 22.0)),
+            ..Default::default()
+        };
+        let paint = |disabled| {
+            let mut out = Vec::new();
+            paint_control(
+                &mut out,
+                &chrome,
+                ControlPaint::Trackbar {
+                    rect: RectPx::new(404, 314, 129, 22),
+                    thumb_left: 34,
+                    plaque: true,
+                    disabled,
+                },
+                ShellScale::RETAIL,
+            );
+            out.iter().map(|sprite| sprite.tint).collect::<Vec<_>>()
+        };
+        assert_eq!(paint(false), [[1.0; 3]; 2]);
+        // 0x60 overlay: (255 - 0x60) / 256 of each channel.
+        assert_eq!(paint(true), [[1.0; 3], [159.0 / 256.0; 3]]);
     }
 
     #[test]
@@ -1194,6 +1329,7 @@ mod tests {
                     rect: RectPx::new(236, 98, width, height),
                     thumb_left: 1,
                     plaque: reserve > 0,
+                    disabled: false,
                 },
                 ShellScale::RETAIL,
             );
@@ -1714,11 +1850,15 @@ mod tests {
     }
 }
 
+/// A disabled owner-draw control's `AlphaBlendRect` colour 0 at the overlay
+/// alpha `[0xAC4898]` = 0x60 (`0x0060FAB9`) keeps `(255 - 0x60) / 256` of each
+/// channel. As a tint it skips the RGB565 truncation (at most one unit per
+/// channel).
+const DISABLED_OVERLAY_KEEP: f32 = (255 - 0x60) as f32 / 256.0;
+
 /// Owner-draw checkbox 0x006163A0's WM_PAINT: the face PCX for its check
 /// and dual-state flags at the control's origin, then for a disabled window
-/// `AlphaBlendRect` colour 0 at the overlay alpha 0x60 (`0x0060FAB9`), which
-/// keeps `(255 - 0x60) / 256` of each channel. The tint applies that factor
-/// to the face without the RGB565 truncation (at most one unit per channel).
+/// the overlay ([`DISABLED_OVERLAY_KEEP`]).
 fn paint_checkbox_face(
     out: &mut Vec<SpriteInstance>,
     chrome: &ControlChrome,
@@ -1739,8 +1879,13 @@ fn paint_checkbox_face(
     };
     let icon = checkbox_icon_rect(rect, scale);
     if disabled {
-        const DISABLED_KEEP: f32 = (255 - 0x60) as f32 / 256.0;
-        push_tinted_entry(out, entry, icon, [DISABLED_KEEP; 3], SHELL_CONTROL_DEPTH);
+        push_tinted_entry(
+            out,
+            entry,
+            icon,
+            [DISABLED_OVERLAY_KEEP; 3],
+            SHELL_CONTROL_DEPTH,
+        );
     } else {
         push_entry(out, entry, icon, SHELL_CONTROL_DEPTH);
     }

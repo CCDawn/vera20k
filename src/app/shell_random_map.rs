@@ -537,6 +537,27 @@ pub(super) struct PreparedRandomMapGeneration {
     pub(super) tech_types: Vec<crate::map::rmg::phases::tech_buildings::TechType>,
 }
 
+impl PreparedRandomMapGeneration {
+    /// These are the same resolved settings, theater, TMP geometry and neutral
+    /// structures passed to `generate_map`; preparation does not consume RNG.
+    pub(super) fn multiplayer_digest(&self) -> String {
+        let mut bytes = b"VERA20k RMG dependencies v1\0".to_vec();
+        bytes.extend_from_slice(self.settings.multiplayer_digest().as_bytes());
+        bytes.extend_from_slice(crate::util::sha256::sha256_hex(&self.theater.ini_data).as_bytes());
+        bytes.extend_from_slice(self.blocks.multiplayer_digest().as_bytes());
+        for technology in &self.tech_types {
+            bytes.extend_from_slice(&(technology.name.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(technology.name.as_bytes());
+            bytes.extend_from_slice(&(technology.footprint.len() as u64).to_le_bytes());
+            for (x, y) in &technology.footprint {
+                bytes.extend_from_slice(&x.to_le_bytes());
+                bytes.extend_from_slice(&y.to_le_bytes());
+            }
+        }
+        crate::util::sha256::sha256_hex(&bytes)
+    }
+}
+
 pub(super) fn prepare_random_map_generation(
     asset_manager: &mut crate::assets::asset_manager::AssetManager,
     options: &crate::map::rmg::RmgOptions,
@@ -581,6 +602,23 @@ pub(super) fn prepare_random_map_generation(
     })
 }
 
+#[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+pub(super) fn spawn_random_map_generation_worker(
+    _options: crate::map::rmg::RmgOptions,
+    _settings: crate::map::rmg::RmgSettings,
+    _resolved_inputs: crate::map::rmg::build::ResolvedTheaterInputs,
+    _blocks: crate::map::rmg::theater_blocks::TheaterTileBlocks,
+    _tech_types: Vec<crate::map::rmg::phases::tech_buildings::TechType>,
+    _shared_cell_dummy: crate::map::resolved_terrain::SharedCellDummy,
+    _map_storage_decision: RandomMapStorageDecision,
+) -> std::io::Result<std::sync::mpsc::Receiver<RandomMapUpdate>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Random map generation is unavailable in the single-threaded Web preview",
+    ))
+}
+
+#[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
 pub(super) fn spawn_random_map_generation_worker(
     options: crate::map::rmg::RmgOptions,
     settings: crate::map::rmg::RmgSettings,
@@ -702,7 +740,7 @@ fn write_random_map_preview_to_dir(
     match crate::assets::pcx_file::encode_direct_rgb(width, height, &rgb) {
         Ok(encoded) => {
             let path = ra2_dir.join(RANDMAP_PREVIEW_FILE);
-            if let Err(err) = std::fs::write(&path, encoded) {
+            if let Err(err) = crate::util::file_system::write(&path, encoded) {
                 log::warn!("random map: could not write {}: {err}", path.display());
             }
         }
@@ -1207,7 +1245,7 @@ impl App {
             .as_ref()
             .map(|config| config.paths.ra2_dir.clone())
             .ok_or_else(|| anyhow::anyhow!("no game config; cannot locate the RA2 directory"))?;
-        std::fs::write(ra2_dir.join(RANDMAP_SED_FILE), options.to_sed_bytes())?;
+        crate::util::file_system::write(ra2_dir.join(RANDMAP_SED_FILE), options.to_sed_bytes())?;
 
         let description_text = options.description.display_text();
         let display = if options.description.is_empty() {
@@ -1331,7 +1369,7 @@ impl App {
                 .skirmish_shell_state
                 .random_map_setup_modal
                 .as_mut()
-                && setup.statics.hover(&help, std::time::Instant::now())
+                && setup.statics.hover(&help, crate::util::time::Instant::now())
             {
                 state.platform.window.request_redraw();
             }
@@ -1505,6 +1543,62 @@ mod terrain_preview_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_generated_seed_keeps_a_complete_admissible_start_table() {
+        let Some((retail_dir, _)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        let mut assets = crate::assets::asset_manager::AssetManager::new(
+            &retail_dir,
+            crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+        )
+        .unwrap();
+        let audio = crate::rules::audio_sources::AudioDefinitions::select(&assets);
+        let (_, _, rules) = crate::rules::retail_sources::load_startup_rules(
+            &assets,
+            std::sync::Arc::clone(audio.sounds()),
+            std::sync::Arc::clone(audio.eva()),
+        )
+        .unwrap()
+        .into_parts();
+        let options = crate::map::rmg::RmgOptions {
+            seed: 26702,
+            num_players: 2,
+            region_size: 46,
+            ruggedness: 76,
+            accessibility: 84,
+            water_amount: 21,
+            tiberium: 20,
+            tiberium_layout: 90,
+            vegetation: 62,
+            urban_presence: 2,
+            ..Default::default()
+        };
+        let prepared =
+            prepare_random_map_generation(&mut assets, &options, Some(&rules), None).unwrap();
+        let generated = crate::map::rmg::build::generate_map(
+            &options,
+            &prepared.settings,
+            &prepared.resolved_inputs,
+            &prepared.blocks,
+            &prepared.tech_types,
+        );
+        let staging = crate::app::loading::composition::scenario_start_staging(
+            &generated.map_file,
+            &generated.start_waypoints,
+        );
+        assert!(
+            crate::app::shell_network_setup::maps::checked_staging(
+                &staging.to_w_text(),
+                options.num_players,
+            )
+            .is_ok(),
+            "{staging:?}; starts={:?}; unfilled={}",
+            generated.start_waypoints,
+            generated.unfilled_start_slots,
+        );
+    }
 
     #[test]
     fn generated_raised_clear_preview_matches_original_tmp_level_colors() {

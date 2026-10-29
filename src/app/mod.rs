@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::Instant;
+use crate::util::time::Instant;
 
 use anyhow::Result;
 use winit::application::ApplicationHandler;
@@ -11,7 +11,12 @@ use winit::dpi::PhysicalSize;
 use winit::event::{MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+#[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+#[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+mod web_keyboard;
+#[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+use web_keyboard::KeyEventExtModifierSupplement;
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::app::match_runtime::sim_tick;
@@ -38,6 +43,9 @@ pub(crate) mod campaign_defeat;
 pub(crate) mod campaign_victory;
 pub(crate) mod chrono_screen;
 mod cncnet;
+#[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+mod browser_lifecycle;
+pub(crate) use cncnet::SpawnAction;
 mod cooperative_round;
 #[cfg(feature = "debug-tools")]
 pub(crate) mod debug_tools;
@@ -59,6 +67,7 @@ pub mod match_bootstrap;
 pub(crate) mod match_diagnostics;
 pub(crate) mod match_runtime;
 pub(crate) mod movie_playback;
+pub(crate) mod movie_subtitles;
 pub(crate) mod persistence;
 /// The build description's native version metadata (`Phobos.version.h`).
 pub(crate) mod phobos_version;
@@ -86,6 +95,7 @@ mod shell_wol;
 pub(crate) mod sidebar_projection;
 #[cfg(test)]
 mod sidebar_projection_tests;
+pub(crate) mod spawn_probe;
 mod state;
 #[cfg(feature = "telemetry-dashboard")]
 pub mod telemetry;
@@ -125,17 +135,27 @@ pub(crate) use state::{AppState, PlatformState, reset_scenario_exit_runtime};
 /// Top-level application. Implements winit's ApplicationHandler.
 pub struct App {
     state: Option<AppState>,
+    pending_initialization: Option<initialize::InitializationJob>,
     shell_capture: Option<crate::app::diagnostics::shell_capture::ShellCaptureSession>,
     tactical_capture:
         Option<crate::app::diagnostics::tactical_capture::session::TacticalCaptureSession>,
+    /// Render admission for hidden captures; service events may wake earlier.
+    capture_render_not_before: Option<Instant>,
     /// Retained until `resumed()` so the profile's pre-window Video read can
     /// use the command-line screen fields as its current-value defaults.
     startup_options: crate::app::frontend::startup_options::RetailStartupOptions,
     spawn_request: Option<crate::app::frontend::cncnet_spawn::SpawnRequest>,
+    /// `-SPAWN`: where the launch result is written (docs/spawn.md).
+    spawn_result_path: Option<std::path::PathBuf>,
+    replay_request: Option<crate::app::frontend::launch::ReplayLaunchRequest>,
     startup_failure: Option<String>,
     /// Make sure config.toml names a game folder before the window opens
     /// ([`app_bundle`]).
     ask_for_game_folder: bool,
+    /// Set while `window_event` re-dispatches the mouse events a touch meant
+    /// (`input::touch`). A synthetic `CursorMoved` must not pass for the OS
+    /// pointer, which is what clears the touch-parked cursor.
+    dispatching_touch: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,12 +197,17 @@ impl App {
     ) -> Self {
         Self {
             state: None,
+            pending_initialization: None,
             shell_capture: None,
             tactical_capture: None,
+            capture_render_not_before: None,
             startup_options,
             spawn_request: None,
+            spawn_result_path: None,
+            replay_request: None,
             startup_failure: None,
             ask_for_game_folder: false,
+            dispatching_touch: false,
         }
     }
 
@@ -191,14 +216,19 @@ impl App {
     ) -> Self {
         Self {
             state: None,
+            pending_initialization: None,
             shell_capture: Some(
                 crate::app::diagnostics::shell_capture::ShellCaptureSession::new(request),
             ),
             tactical_capture: None,
+            capture_render_not_before: None,
             startup_options: crate::app::frontend::startup_options::RetailStartupOptions::default(),
             spawn_request: None,
+            spawn_result_path: None,
+            replay_request: None,
             startup_failure: None,
             ask_for_game_folder: false,
+            dispatching_touch: false,
         }
     }
 
@@ -207,16 +237,21 @@ impl App {
     ) -> Self {
         Self {
             state: None,
+            pending_initialization: None,
             shell_capture: None,
             tactical_capture: Some(
                 crate::app::diagnostics::tactical_capture::session::TacticalCaptureSession::new(
                     request,
                 ),
             ),
+            capture_render_not_before: None,
             startup_options: crate::app::frontend::startup_options::RetailStartupOptions::default(),
             spawn_request: None,
+            spawn_result_path: None,
+            replay_request: None,
             startup_failure: None,
             ask_for_game_folder: false,
+            dispatching_touch: false,
         }
     }
 
@@ -225,6 +260,12 @@ impl App {
     /// AppImage.
     pub fn ask_for_game_folder_first(&mut self) {
         self.ask_for_game_folder = true;
+    }
+
+    pub fn new_replay(request: crate::app::frontend::launch::ReplayLaunchRequest) -> Self {
+        let mut app = Self::default();
+        app.replay_request = Some(request);
+        app
     }
 
     pub fn finish_capture(&mut self) -> Result<()> {

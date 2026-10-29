@@ -47,6 +47,9 @@ mod reinforcements;
 mod super_actions;
 mod team_ai;
 
+#[cfg(test)]
+mod ground_strike_tests;
+
 /// One resolved ScriptType action record.
 ///
 /// This matches the `(action, argument)` pair read by `ScriptClass` instead of
@@ -506,9 +509,10 @@ pub struct TeamMember {
 
 /// An `AbstractClass*` a team keeps: its centre (`+0x34`), mission target
 /// (`+0x3C`) or move target (`+0x40`). A cell is the `CellClass` at those
-/// coordinates; natively an out-of-map lookup gives the shared dummy cell,
-/// whose coordinates a later miss restamps (not represented: no ported path
-/// takes a team off the map).
+/// coordinates. Invalid lookup tokens name the shared Dummy allocation;
+/// its live coordinate can change after another map miss. Native pointer
+/// comparisons use NavTargetRef::same_pointer; GetCoords uses the retained
+/// target-coordinate owner rather than coordinate equality or another lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TeamTarget {
     Cell { x: i16, y: i16 },
@@ -744,8 +748,6 @@ pub struct TeamScriptVm {
     task_force_order: Vec<InternedId>,
     team_types: BTreeMap<InternedId, TeamTypeDefinition>,
     #[serde(default)]
-    team_type_order: Vec<InternedId>,
-    #[serde(default)]
     team_type_ini: BTreeMap<InternedId, TeamTypeIniMetadata>,
     #[serde(default)]
     ai_triggers: BTreeMap<InternedId, TeamAiTriggerDefinition>,
@@ -793,9 +795,6 @@ impl TeamScriptVm {
     }
 
     pub fn register_team_type(&mut self, definition: TeamTypeDefinition) {
-        if !self.team_types.contains_key(&definition.id) {
-            self.team_type_order.push(definition.id);
-        }
         self.team_type_ini.entry(definition.id).or_default();
         self.team_types.insert(definition.id, definition);
     }
@@ -1198,14 +1197,8 @@ impl TeamScriptVm {
         //70D562/70D577 compare Cell pointers too: fixed-stride aliases and
         //different requests for the shared Dummy identify the same allocation.
         let matches = |held: TeamTarget| {
-            if let (TeamTarget::Cell { .. }, TeamTarget::Cell { .. }, Some(terrain)) =
-                (held, target, terrain)
-            {
-                held.target_kind().cell_identity(terrain)
-                    == target.target_kind().cell_identity(terrain)
-            } else {
-                held == target
-            }
+            crate::sim::components::NavTargetRef::from(held.target_kind())
+                .same_pointer(target.target_kind().into(), terrain)
         };
         for team in self.teams.values_mut().rev() {
             if team.mission_target.is_some_and(matches) {
@@ -1317,6 +1310,24 @@ impl TeamScriptState {
 }
 
 impl TeamScriptVm {
+    /// World-hash retention query. Team+34/+3C/+40 keep Abstract pointers;
+    /// later CalcCenter/CoordinateMove6EAEE0/6EBAD0 reads their live Cell+48.
+    /// Dummy bytes remain with their process/map owner, not in Team state.
+    pub(crate) fn retains_dummy_cell(
+        &self,
+        terrain: &crate::map::resolved_terrain::ResolvedTerrainGrid,
+    ) -> bool {
+        self.teams.values().any(|team| {
+            [team.zone, team.mission_target, team.focus]
+                .into_iter()
+                .flatten()
+                .any(|target| {
+                    target.target_kind().cell_identity(terrain)
+                        == Some(crate::map::cell_index::NativeCellIdentity::Dummy)
+                })
+        })
+    }
+
     /// Folds each team's creation frame and forming byte, the AI triggers
     /// whose track record left its registered state (tagged), and each team's
     /// recruitment state once it leaves its constructor values plus the
@@ -1600,11 +1611,15 @@ pub(crate) fn join_team_for_test(
 }
 
 #[cfg(test)]
+mod type_conversion_tests;
+#[cfg(test)]
 mod firesale_retail_tests;
 #[cfg(test)]
 mod group_recruitment_tests;
 #[cfg(test)]
 mod oracle_tests;
+#[cfg(test)]
+mod packed_cell_tests;
 #[cfg(test)]
 mod path_threat_input_tests;
 #[cfg(test)]
@@ -1886,9 +1901,8 @@ mod tests {
         assert!(diagnostics.is_empty());
         assert_eq!(vm.registry_counts(), (1, 1, 2, 1));
         assert_eq!(
-            vm.team_type_order()
-                .iter()
-                .map(|id| interner.resolve(*id))
+            crate::sim::trigger_runtime::RuntimeDefinitions::read_teams(&registry)
+                .team_type_ids()
                 .collect::<Vec<_>>(),
             ["TT1", "TT2"]
         );
@@ -1981,7 +1995,6 @@ mod tests {
         let encoded = serde_json::to_string(&vm).unwrap();
         let restored: TeamScriptVm = serde_json::from_str(&encoded).unwrap();
         assert_eq!(restored.registry_counts(), vm.registry_counts());
-        assert_eq!(restored.team_type_order(), vm.team_type_order());
         assert_eq!(restored.ai_trigger_order(), vm.ai_trigger_order());
         assert_eq!(
             restored.ai_trigger(interner.get("AT").unwrap()),
@@ -2480,7 +2493,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires extracted retail rulesmd.ini and aimd.ini"]
+    #[ignore = "requires VERA20K_RETAIL_AIMD and VERA20K_RETAIL_RULESMD naming extracted retail INIs"]
     fn gsi_04_05_retail_aimd_installs_all_resolved_definitions_without_teams() {
         use crate::rules::ini_parser::IniFile;
 
@@ -2522,8 +2535,8 @@ mod tests {
             12
         );
         let zone_rows = vm
-            .team_type_order()
-            .iter()
+            .team_types
+            .keys()
             .map(|id| {
                 let team_type = vm.team_type(*id).expect("ordered TeamType");
                 format!(

@@ -9,7 +9,7 @@ use crate::skirmish_launch::SkirmishHumanSlot;
 use crate::ui::lan_shell::*;
 use crate::ui::main_menu_dialogs::options::LauncherCue;
 use crate::ui::shell::descriptor::DialogId;
-use std::time::{Duration, Instant};
+use crate::util::time::{Duration, Instant};
 use winit::event::{KeyEvent, MouseButton};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
@@ -69,6 +69,9 @@ pub(crate) enum LanServiceEvent {
         game_id: u64,
         reason: u32,
     },
+    JoinCanceled {
+        game_id: u64,
+    },
     JoinAccepted(LanJoinAcceptance),
 }
 
@@ -77,6 +80,7 @@ struct PendingJoin {
     game_id: u64,
     observe: bool,
     expires: Instant,
+    canceling: bool,
 }
 
 pub(crate) struct LanShellRuntime {
@@ -251,6 +255,9 @@ fn denial_modal(reason: u32, observer: bool) -> Option<&'static str> {
         5 => Some("TXT_GAME_CANCELLED"),
         6 => Some("TXT_MISMATCH"),
         7 => Some("TXT_SERIAL_DUP"),
+        // VERA direct-client admission extends native version checks with the
+        // actual source build and enabled gameplay feature identity.
+        8 => Some("VERA20k build or enabled gameplay features differ."),
         _ => None,
     }
 }
@@ -385,6 +392,7 @@ pub(crate) fn dispatch(state: &mut AppState, action: LanLobbyAction) {
                     game_id,
                     observe,
                     expires: Instant::now() + JOIN_TIMEOUT,
+                    canceling: false,
                 });
                 runtime.lobby.selection_enabled = false;
                 runtime
@@ -484,7 +492,7 @@ pub(crate) fn service_event(state: &mut AppState, event: LanServiceEvent) {
             let Some(pending) = runtime
                 .pending_join
                 .as_ref()
-                .filter(|pending| pending.game_id == game_id)
+                .filter(|pending| pending.game_id == game_id && !pending.canceling)
             else {
                 return;
             };
@@ -496,7 +504,11 @@ pub(crate) fn service_event(state: &mut AppState, event: LanServiceEvent) {
             }
         }
         LanServiceEvent::JoinAccepted(accepted) => {
-            if runtime.pending_game() != Some(accepted.game_id) {
+            if !runtime
+                .pending_join
+                .as_ref()
+                .is_some_and(|pending| pending.game_id == accepted.game_id && !pending.canceling)
+            {
                 return;
             }
             runtime.pending_join = None;
@@ -504,6 +516,15 @@ pub(crate) fn service_event(state: &mut AppState, event: LanServiceEvent) {
                 state,
                 shell_transition::ShellExitThen::LanJoinAccepted(accepted),
             );
+        }
+        LanServiceEvent::JoinCanceled { game_id } => {
+            if runtime
+                .pending_join
+                .as_ref()
+                .is_some_and(|pending| pending.game_id == game_id && pending.canceling)
+            {
+                runtime.release_request();
+            }
         }
     }
     state.platform.window.request_redraw();
@@ -576,6 +597,26 @@ pub(crate) fn key(state: &mut AppState, event: &KeyEvent) {
         };
         key_press(state, code, event.text.as_deref());
     }
+}
+
+/// The chat NewEdit while it takes keys, for the input method
+/// (`app::input::ime`). The name edit takes byte text only, so it keeps
+/// plain key text.
+pub(crate) fn ime_chat_rect(state: &AppState) -> Option<crate::ui::shell::geom::RectPx> {
+    let routed = state.frontend.screen == crate::ui::game_screen::GameScreen::MainMenu
+        && state.frontend.shell_route.lan_lobby()
+        && !shell_transition::blocks_shell_input(state);
+    state
+        .frontend
+        .lan
+        .as_ref()
+        .filter(|runtime| {
+            routed
+                && runtime.modal.is_none()
+                && runtime.lobby.enabled
+                && runtime.lobby.focused_control == CHAT
+        })
+        .map(|_| layout(state).chat)
 }
 
 pub(crate) fn key_press(state: &mut AppState, code: Option<KeyCode>, text: Option<&str>) {
@@ -826,17 +867,28 @@ pub(crate) fn poll(state: &mut AppState) -> Option<Instant> {
     if runtime
         .pending_join
         .as_ref()
-        .is_some_and(|request| now >= request.expires)
+        .is_some_and(|request| !request.canceling && now >= request.expires)
     {
         let game_id = runtime.pending_game().unwrap();
         runtime
             .requests
             .push(LanServiceRequest::CancelJoin { game_id });
-        runtime.release_request();
+        // Native5DF410 bounds the request by600 wall buckets. VERA also
+        // retires a possibly committed UDP admission before enabling retry;
+        // an old reply may not enter setup after the timeout was reported.
+        runtime
+            .pending_join
+            .as_mut()
+            .expect("timed request")
+            .canceling = true;
         report_error(state, "TXT_REQUEST_DENIED");
     }
     let runtime = state.frontend.lan.as_mut()?;
-    let mut deadline = runtime.pending_join.as_ref().map(|request| request.expires);
+    let mut deadline = runtime
+        .pending_join
+        .as_ref()
+        .filter(|request| !request.canceling)
+        .map(|request| request.expires);
     let lobby = &mut runtime.lobby;
     if runtime.modal.is_none() && lobby.enabled {
         for (list, rect, count) in [
@@ -947,6 +999,7 @@ mod tests {
             game_id: 7,
             observe: false,
             expires: Instant::now() + JOIN_TIMEOUT,
+            canceling: false,
         });
         assert!(!runtime.lobby.enabled);
         assert_eq!(runtime.lobby.activate(CREATE), None);

@@ -44,6 +44,59 @@ fn channel(send_capacity: usize, receive_capacity: usize) -> GlobalChannel {
     )
 }
 
+#[test]
+fn online_ack_requires_its_sent_destination_and_exposes_one_actual_response_sample() {
+    let target = SocketAddrV4::new(Ipv4Addr::new(127, 77, 0, 30), 1234);
+    let wrong = SocketAddrV4::new(Ipv4Addr::new(127, 77, 0, 2), 1234);
+    let mut sender = channel(8, 8);
+    sender.require_authenticated_acknowledgments();
+    let sequence = sender.next_send_sequence();
+    assert!(sender.send(
+        &[],
+        GlobalDestination::direct(target),
+        Delivery::Reliable,
+        0
+    ));
+    let ack = sender.frame(2, sequence, &[]);
+    assert_eq!(
+        sender.receive(target, 0, &ack, 99, &mut |_, _| {}),
+        Err(GlobalReceiveError::UnmatchedAcknowledgment),
+        "unsent messages cannot measure RTT"
+    );
+    sender.service(100, &mut |_, _| {});
+    assert_eq!(
+        sender.receive(wrong, 0, &ack, 109, &mut |_, _| {}),
+        Err(GlobalReceiveError::UnmatchedAcknowledgment)
+    );
+    sender
+        .receive(target, 0, &ack, 109, &mut |_, _| {})
+        .unwrap();
+    sender.service(110, &mut |_, _| {});
+    assert_eq!(
+        sender.pop_response_time(),
+        Some(GlobalResponseTime {
+            destination: GlobalDestination::direct(target),
+            sequence,
+            elapsed: 10,
+        })
+    );
+    assert!(sender.pop_response_time().is_none());
+    assert_eq!(sender.queued_send_count(), 0);
+    sender.reset();
+    assert!(sender.send(
+        &[],
+        GlobalDestination::direct(target),
+        Delivery::Reliable,
+        0
+    ));
+    sender.service(120, &mut |_, _| {});
+    assert_eq!(
+        sender.receive(wrong, 0, &ack, 125, &mut |_, _| {}),
+        Err(GlobalReceiveError::UnmatchedAcknowledgment),
+        "reset retains online source policy"
+    );
+}
+
 fn assert_emitted(actual: &[(GlobalDestination, Vec<u8>)], expected: &Value) {
     let rows = expected.as_array().unwrap();
     assert_eq!(actual.len(), rows.len());

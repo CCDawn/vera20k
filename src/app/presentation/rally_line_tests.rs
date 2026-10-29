@@ -577,6 +577,7 @@ fn production_rally_gpu_matches_native_pixels_and_preserves_depth() {
                             ),
                             timestamp_writes: None,
                             occlusion_query_set: None,
+                            multiview_mask: None,
                         });
                         batch.draw_with_buffer_ui_passthrough(
                             &mut pass,
@@ -713,6 +714,7 @@ fn production_rally_workload_timing() {
                     end_of_pass_write_index: Some(1),
                 }),
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_scissor_rect(
                 clip[0] as u32,

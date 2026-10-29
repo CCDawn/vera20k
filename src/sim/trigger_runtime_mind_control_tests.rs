@@ -124,7 +124,13 @@ fn retail_all02_mind_control_attack_starts_the_authored_stallone_script() {
     assert!(sim.rebuild_dynamic_navigation(&rules));
     sim.session.install_waypoints(&map.waypoints);
     sim.install_team_ai_registry(&registry, &rules).unwrap();
-    sim.initialize_trigger_definitions(&map, &registry, Some(audio.eva()), Some(audio.sounds()));
+    sim.initialize_trigger_definitions(
+        &map,
+        &registry,
+        Some(audio.eva()),
+        Some(audio.sounds()),
+        None,
+    );
 
     let tank = map
         .entities

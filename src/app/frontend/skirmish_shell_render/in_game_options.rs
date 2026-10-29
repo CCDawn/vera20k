@@ -51,6 +51,7 @@ pub(crate) fn build_in_game_options_instances(
                         rect,
                         thumb_left: plain_trackbar_thumb_left(pos, rect),
                         plaque: false,
+                        disabled: false,
                     },
                     ShellScale::RETAIL,
                 );

@@ -358,7 +358,10 @@ fn superweapon_money_two_stage_begin_cancel_reselect_in_one_saved_command_batch(
     for command in &commands {
         sim.queue_command(CommandEnvelope::new(owner, 0, command.clone()));
     }
-    assert!(sim.projected_paid_super_weapon_selection(owner).is_none());
+    assert!(
+        sim.projected_paid_super_weapon_selection(owner, &rules)
+            .is_none()
+    );
     let mut loaded = restore(&sim, &rules);
     let commands = loaded.take_frame_commands_for_test();
     assert_eq!(commands.len(), 5);

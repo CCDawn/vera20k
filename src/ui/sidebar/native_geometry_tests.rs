@@ -69,7 +69,6 @@ fn view(screen: [i32; 2], side: usize, count: usize, scroll: usize) -> SidebarVi
         &options,
         &[],
         None,
-        &[],
         Some(&interner),
         &[],
         &gadget,
@@ -143,10 +142,6 @@ fn native_21_screen_and_theme_layouts_drive_actual_view() {
         let empty = view(c.screen, c.side, 0, usize::MAX);
         assert_eq!(empty.layout.side2_tile_count, l.side2_tile_count);
         assert_eq!(empty.scroll_rows, 0);
-        assert!(!empty.cycle_owner_button.rect.contains(
-            empty.cycle_owner_button.rect.x,
-            empty.cycle_owner_button.rect.y
-        ));
     }
 }
 #[test]
@@ -240,5 +235,33 @@ fn retail_allied_control_capture_anchors_connect_to_hit_rects() {
             w: 140.,
             h: 108.
         }
+    );
+}
+
+/// `RadarClass::Init_For_House` moves the radar gadget by the position table:
+/// the GDI arm adds `(0xB, 4)`, the NOD arm `(0xE, 5)`, and nothing else
+/// differs. The aperture size stays the radar source frame.
+#[test]
+fn radar_aperture_follows_the_gdi_and_nod_tables() {
+    let gdi = SidebarChromeLayoutSpec::for_theme_and_positions(SidebarTheme::Soviet, true);
+    let nod = SidebarChromeLayoutSpec::for_theme_and_positions(SidebarTheme::Soviet, false);
+    assert_eq!(
+        radar_minimap_rect_with_spec(800., gdi),
+        Rect {
+            x: 648.,
+            y: 49.,
+            w: 140.,
+            h: 108.
+        }
+    );
+    assert_eq!(
+        radar_minimap_rect_with_spec(800., nod),
+        Rect {
+            x: 651.,
+            y: 50.,
+            w: 140.,
+            h: 108.
+        },
+        "the NOD table is the native +3/+1 from the GDI arm"
     );
 }

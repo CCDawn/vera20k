@@ -387,7 +387,7 @@ fn build_type_retail_all07_placement_reaches_house_poll_and_eva_once() {
     )
     .unwrap();
     // Bind the original EVA operand through the ordinary definition reader.
-    sim.initialize_trigger_definitions(&excerpt, &Default::default(), Some(&eva), None);
+    sim.initialize_trigger_definitions(&excerpt, &Default::default(), Some(&eva), None, None);
     sim.classify_map_triggers(&rules);
     let tag_type = sim.trigger_runtime.definitions.tag_type(tag_id).unwrap();
     let tag = sim.shared_trigger_tag(tag_type);

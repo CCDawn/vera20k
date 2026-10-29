@@ -394,8 +394,7 @@ impl ResolvedTerrainGrid {
         self.tile_registry_len = theater.map(|td| td.lookup.len());
         self.dummy_accepts_smudge =
             theater.is_some_and(|td| current_tile_permissions(&td.lookup, 0xffff).0);
-        self.high_bridge_rim_tiles =
-            theater.map(super::super::bridge_rim_tiles::HighBridgeRimTiles::from_theater);
+        self.high_bridge_rim_tiles = theater.map(|td| td.high_bridge_rim_tiles);
         self.bridge_set_start = theater.and_then(|td| {
             td.bridge_set
                 .and_then(|set| td.lookup.bounds().get(usize::from(set)))

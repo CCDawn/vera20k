@@ -16,8 +16,12 @@
 //!   0x00887180 (required); `LANGRULE.INI` with a valid `[Digest]` gets a full
 //!   `RulesClass::Process` (retail ships none); `AIMD.INI` -> g_AIINI.
 //! - `ScenarioClass::Full_Init` 0x00686B20, in order:
-//!   1. campaign: a scenario-named `.INI` Process, if present, before the reset
-//!      (0x00686D35);
+//!   1. scenario basename: Full_Init caches `entry GameMode == 0` at
+//!      0x00686B3D, then checks current mode at 0x00686C8B; 0x00686C9D skips
+//!      the basename `.INI` Process at 0x00686D35 unless entry mode was nonzero
+//!      and current mode is Campaign (0). Normal campaign startup is 0 -> 0 and
+//!      skips this pass; the transition that could admit it is not established
+//!      by the bounded campaign-start corpus;
 //!   2. multiplayer: `[Countries]`, `[General]`, HouseType bodies from RULESMD;
 //!   3. reset 0x006686C0 (random maps call it too, 0x0059A0F0): destroy type
 //!      registries; Process RULESMD (0x00668A27), LANGRULE (0x00668B05); re-read
@@ -83,8 +87,18 @@
 //!   Typed readers fold passes via
 //!   `projected_values`, which cannot model per-pass clamps or literal defaults. Fields:
 //!   each type's `from_ini_section`; `art_data.rs`, `team_ai_ini.rs`, `sound_ini.rs`.
-//! - VERA-only: `sound.ini` under SOUNDMD, fatal missing mode INI (native: empty INI,
-//!   0x005D67B0); no scenario-named `.INI`, `TMCJ4F.INI` or `[Digest]` handling.
+//! - VERA-only residuals: `sound.ini` under SOUNDMD and fatal missing mode INI
+//!   (native: empty INI, 0x005D67B0). The process Rules owner handles the
+//!   gated campaign basename pre-reset pass, checks the selected LANGRULE
+//!   Digest, and Processes TMCJ4F after post-map AI reads only for GameMode 5
+//!   + THETEAM + available file. A rejected LANGRULE Digest fails startup
+//!   (0x0052D302); a malformed one is indeterminate and VERA fails closed.
+//!   Each reset re-checks the same snapshot. TMCJ4F, like the campaign
+//!   basename, is read without a Digest check and keeps its `[Digest]`
+//!   section. Every campaign reads the basename pass: with entry mode 0 on
+//!   Full_Init's second pass (0x00687599 reruns the body). Bounded TMCJ and
+//!   campaign-gate witnesses do not execute the complete Full_Init scenario
+//!   path.
 //!
 //! ### Retail INIs in tests
 //! - `cargo run --bin extract-ini` fills the gitignored `ini/` with selected
@@ -103,24 +117,65 @@
 //! - rules/ does NOT depend on (outside tests): sim/, render/, ui/, audio/, net/
 
 pub mod airstrike;
+pub mod digital_display;
+pub mod phobos_parallel_ai_queues;
+#[cfg(all(test, feature = "phobos"))]
+#[path = "phobos_infantry_deploy_tests.rs"]
+mod phobos_infantry_deploy_tests;
+#[cfg(all(test, feature = "phobos"))]
+#[path = "phobos_prone_speed_tests.rs"]
+mod phobos_prone_speed_tests;
+#[cfg(feature = "phobos")]
+pub mod phobos_fly_wobble;
+#[cfg(feature = "phobos")]
+pub mod phobos_pause_menu;
+#[cfg(feature = "phobos")]
+pub mod phobos_placement_preview;
+#[cfg(feature = "phobos")]
+pub mod phobos_power_plant_enhancer;
+#[cfg(feature = "phobos")]
+pub mod phobos_selection_flash;
+#[cfg(feature = "phobos")]
+pub mod phobos_sw_sidebar;
 pub mod phobos_radiation;
 pub mod phobos_shields;
 /// Whether this binary includes the supported Ares extensions. INIs cannot change it.
 pub const ARES_ENABLED: bool = cfg!(feature = "ares");
 /// Whether this binary includes the supported Phobos extensions. INIs cannot change it.
 pub const PHOBOS_ENABLED: bool = cfg!(feature = "phobos");
-/// Whether this binary includes NPatch-specific behavior. A placeholder: no
-/// chain reads it yet, and builds without the feature keep every stock path.
+/// Whether this binary includes supported NPatch behavior. INIs cannot change it.
 pub const NPATCH_ENABLED: bool = cfg!(feature = "npatch");
-pub mod alpha_image_assets;
-pub mod animation_sequence;
+/// Whether this binary includes VERA20K's own extension behaviors. INIs cannot
+/// change it; builds without the feature keep every stock path.
+pub const VERAX_ENABLED: bool = cfg!(feature = "verax");
+pub(crate) mod ares_prerequisites;
 pub(crate) mod ares_armor;
 pub(crate) mod ares_emp;
+pub(crate) mod ares_abilities;
+#[cfg(feature = "ares")]
+pub(crate) mod ares_country_paradrop;
+#[cfg(feature = "ares")]
+pub(crate) mod ares_country_presentation;
+#[cfg(feature = "ares")]
+pub(crate) mod ares_side_extension;
+pub(crate) mod ares_warhead;
+#[cfg(feature = "ares")]
+pub(crate) mod ares_spotlight;
+#[cfg(feature = "ares")]
+pub(crate) mod ares_driver;
+#[cfg(feature = "ares")]
+pub(crate) mod ares_crew;
+#[cfg(feature = "ares")]
+pub(crate) mod ares_bounty;
+pub mod armor;
+pub mod alpha_image_assets;
+pub mod country_loading;
 #[cfg(test)]
 mod ares_manual_control_tests;
-pub(crate) mod ares_prerequisites;
-pub(crate) mod ares_warhead;
-pub mod armor;
+#[cfg(test)]
+mod ares_type_selection_tests;
+pub mod compatibility;
+pub mod animation_sequence;
 pub mod art_data;
 pub mod bridge_warheads;
 pub mod building_extra_power;
@@ -135,13 +190,11 @@ pub mod campaigns;
 pub mod color_add;
 pub mod color_scheme;
 pub mod combat_damage;
-pub mod compatibility;
-pub mod country_loading;
+pub mod crate_rules;
 #[cfg(test)]
 mod country_parent_tests;
 #[cfg(test)]
 mod country_veterancy_tests;
-pub mod crate_rules;
 pub mod effect_asset_catalog;
 pub mod error;
 pub mod flh;
@@ -151,6 +204,7 @@ pub mod gunner_turrets;
 pub mod house_colors;
 pub mod infantry_sequence;
 pub mod ini_parser;
+pub(crate) mod weapon_offsets;
 // The readers are a child of the raw store, so only they see raw value text.
 pub use ini_parser::ini_value;
 pub mod audio_sources;
@@ -162,8 +216,8 @@ pub mod mission_data;
 pub mod movies;
 pub mod native_ini_hash;
 pub mod native_processing;
-pub mod object_image;
 pub mod object_type;
+pub mod object_image;
 pub mod overlay_types;
 pub mod particle_system_type;
 pub mod particle_type;
@@ -176,15 +230,20 @@ pub mod radar_event_config;
 #[cfg(test)]
 mod radial_indicator_tests;
 pub mod recoil;
+pub mod secret_lab;
 pub mod retail_sources;
 pub(crate) mod rules_type_references;
 pub mod ruleset;
-pub mod secret_lab;
 pub mod shp_vehicle_sequence;
+pub mod skirmish_colors;
 pub mod smudge_type;
 pub mod sound_ini;
+pub mod theme_ini;
+#[cfg(feature = "ares")]
+pub(crate) mod superweapon_influence;
 pub mod superweapon_targeting;
 pub mod superweapon_type;
+pub mod hunter_seeker;
 pub mod team_ai_ini;
 pub mod terrain_asset_catalog;
 pub mod terrain_object_type;

@@ -98,6 +98,7 @@ fn planning_flags_use_the_production_group_destination_distributor() {
         .register(crate::sim::house_state::HouseState::new(
             owner, 0, None, true, 0, 10,
         ));
+    sim.session.set_current_house_for_test(Some(owner));
     let actors: Vec<_> = [(15, 15), (16, 15), (15, 16)]
         .into_iter()
         .map(|(x, y)| {
@@ -162,7 +163,7 @@ fn planning_flags_use_the_production_group_destination_distributor() {
             .iter()
             .map(|command| {
                 let mut record = sim
-                    .encode_planning_order_record(owner, &command.payload)
+                    .encode_planning_order_record(owner, &command.payload, None)
                     .unwrap();
                 record.payload_mut()[22] = flag;
                 CommandEnvelope::new(owner, 1, Command::PlanningRecord { record })
@@ -193,5 +194,78 @@ fn planning_flags_use_the_production_group_destination_distributor() {
                 }
             );
         }
+    }
+
+    // A group click must retain one shared planning node even though the
+    // scheduled group distributor gives the actors different destinations.
+    let records: Vec<_> = commands
+        .iter()
+        .map(|command| {
+            CommandEnvelope::synchronized(
+                sim.encode_planning_order_record(owner, &command.payload, None)
+                    .unwrap(),
+                0,
+            )
+        })
+        .collect();
+    sim.apply_due_commands(
+        &records,
+        &rules,
+        0,
+        Some(&registry),
+        crate::sim::world::FrameEffects::empty(),
+    );
+    let graph = sim.planning_draw_graph(owner, &actors, None, None);
+    assert_eq!(graph.nodes.len(), 1, "one click is one shared waypoint");
+    assert_eq!(graph.nodes[0].members, actors);
+    assert_eq!(
+        graph.nodes[0].coord,
+        crate::sim::components::DriveCoord::cell(19, 17, 0)
+    );
+    for (x, y) in [(20, 15), (18, 14)] {
+        let batch: Vec<_> = actors
+            .iter()
+            .map(|&actor| {
+                CommandEnvelope::synchronized(
+                    sim.encode_planning_order_record(
+                        owner,
+                        &Command::Move {
+                            entity_id: actor,
+                            target_rx: x,
+                            target_ry: y,
+                        },
+                        None,
+                    )
+                    .unwrap(),
+                    0,
+                )
+            })
+            .collect();
+        sim.apply_due_commands(&batch, &rules, 0, Some(&registry), Default::default());
+    }
+    let graph = sim.planning_draw_graph(owner, &actors, None, None);
+    assert_eq!(graph.nodes.len(), 3);
+    assert_eq!(graph.nodes[1].incoming.len(), 1);
+    assert_eq!(graph.nodes[2].incoming.len(), 1);
+    assert!(
+        graph
+            .actors
+            .iter()
+            .all(|actor| actor.connection.as_ref().unwrap().target == graph.nodes[0].coord)
+    );
+
+    let commit = sim.encode_plan_commit_record(owner).unwrap();
+    let command = sim.decode_native_command_record(&commit, 0).unwrap();
+    assert!(sim.apply_command("Americans", &command.payload, Some(&rules)));
+    let due = sim.take_frame_commands_for_test();
+    sim.session.set_binary_frame_for_test(1);
+    sim.apply_due_commands(&due, &rules, 2, Some(&registry), Default::default());
+    for actor in actors {
+        let entity = sim.entities().get(actor).unwrap();
+        assert_eq!(
+            entity.navigation.nav_com_aux(),
+            Some(crate::sim::components::NavTargetRef::cell(19, 17))
+        );
+        assert!(entity.navigation.nav_com().is_some());
     }
 }

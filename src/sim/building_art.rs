@@ -415,6 +415,11 @@ impl Simulation {
         if first_opening {
             self.open_super_weapon_anims(id, damaged, garrisoned, rules);
         }
+        // 0x0044678B..0x004467C3: the sensor arm, last in the first-opening
+        // block before the ready latch.
+        if first_opening {
+            self.add_building_sensor_circles_at_opening(id, rules, registry);
+        }
         if first_opening && let Some(entity) = self.substrate.entities.get_mut(id) {
             entity.mission_leaf.set_building_ready_latch(1);
         }
@@ -429,21 +434,26 @@ impl Simulation {
         // (Location `+0x9C` / 256) on a capture too. The fog border redraw
         // around it (`0x00567DA0`, radius + 3) is presentation: the shroud
         // renderer rebuilds from the vision owner.
-        if object.reveal_to_all && !self.house_is_human_player(owner) {
-            if !captured {
+        if object.reveal_to_all {
+            if !captured
+                && (self.session.game_mode().is_network() || !self.house_is_human_player(owner))
+            {
                 self.reveal_sight_to_current_house(
                     id,
                     crate::sim::world::UninitContext::new(rules, registry).with_effects(effects),
+                    None,
                 );
             }
-            self.sound_events
-                .emit(crate::sim::world::SimSoundEvent::RadarEvent {
-                    radar: crate::sim::radar::RadarEventRequest::new(
-                        crate::sim::radar::RadarEventType::ConstructionComplete,
-                        cell.0,
-                        cell.1,
-                    ),
-                });
+            if !self.house_is_human_player(owner) {
+                self.sound_events
+                    .emit(crate::sim::world::SimSoundEvent::RadarEvent {
+                        radar: crate::sim::radar::RadarEventRequest::new(
+                            crate::sim::radar::RadarEventType::ConstructionComplete,
+                            cell.0,
+                            cell.1,
+                        ),
+                    });
+            }
         }
         //44699A..446A5B: default naval rally, before placement/power publication.
         self.initialize_naval_rally_point(id, rules);
@@ -457,7 +467,6 @@ impl Simulation {
         if let Some(entity) = self.substrate.entities.get_mut(id) {
             entity.building_art.actually_placed = true;
         }
-        self.add_building_sensor_array_if_powered(id, rules, registry);
         Self::announce_super_weapon_building_complete(
             &mut self.interner,
             &self.substrate,

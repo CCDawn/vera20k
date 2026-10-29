@@ -121,6 +121,7 @@ from unicorn.x86_const import (UC_X86_REG_EAX, UC_X86_REG_EBP, UC_X86_REG_EBX, U
                                UC_X86_REG_EDI, UC_X86_REG_ESI)
 from tools.native_oracle import (SCRATCH, RET_MAGIC, STACK_BASE, STACK_SIZE,
     finish_vectors, provenance, run_checked)
+from tools.native_oracle import require
 from tools.spatial_oracle.trigger_type_flags import FlagsFixture
 from tools.spatial_oracle.infantry_deploy_rules import HEAP, PTD
 from tools.spatial_oracle.building_body_rules import INI, TYPE, SP, RULES
@@ -308,7 +309,7 @@ class ActionFixture(FlagsFixture):
         fn = {'team':0x6F1920,'trigger':0x727AA0,'tag':0x6E6310}[kind]
         for name in REFERENCE_NAMES[kind]:
             self.u.mem_write(BUFFER,name.encode('ascii')+b'\0')
-            assert self.call(fn,[],ecx=BUFFER)
+            require(self.call(fn,[],ecx=BUFFER), f'{kind} {name}: native 0x{fn:X} refused')
         assert len(self.definitions(kind)) == len(REFERENCE_NAMES[kind])
 
     def ordered_ini(self, values):
@@ -4241,7 +4242,7 @@ def flash_team_generate():
         types = []
         for name in ('088C1A4C', 'OtherFlashTeam'):
             u.mem_write(BUFFER, name.encode('ascii') + b'\0')
-            assert fixture.call(0x6F1920, [], ecx=BUFFER)
+            require(fixture.call(0x6F1920, [], ecx=BUFFER), 'native 0x6F1920 returned an unexpected result')
             types.append(fixture.definitions('team')[-1])
         # Original ALL01 Enter_Tanya operand: param-type5 supplies token8
         # as signed +90; the reference itself lives at +30 independently.
@@ -7075,7 +7076,7 @@ def tech_level_lifecycle():
         u.mem_write(action+0x54,bytes(25))
         u.mem_write(action+0x54,name.encode()+b'\0')
         u.mem_write(action+0x90,dwords(value))
-        assert m.invoke(0x6DD8B0,action,(0,0,0,0))&255==1
+        require(m.invoke(0x6DD8B0,action,(0,0,0,0))&255==1, 'native 0x6DD8B0 returned an unexpected result')
     stages.append(state('actions'))
     passes=[dict(name='prefix_missing_key',sections={'ORCA':{'Name':'ORCA'},'BEAG':{'Name':'BEAG'}}),
         dict(name='prefix_present_key',sections={'ORCA':{'TechLevel':'7'},'BEAG':{'TechLevel':'8'}})]

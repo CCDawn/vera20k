@@ -90,8 +90,9 @@ const COMPUTER_ROSTER: [(LaunchCountry, AiDifficulty); COMPUTERS] = [
     (LaunchCountry::GreatBritain, AiDifficulty::Hard),
 ];
 
-/// The human houses' countries, in a fixed rotation over the ten.
-const HUMAN_COUNTRIES: [LaunchCountry; 10] = [
+/// The human houses' countries, in a fixed rotation over the ten; the march
+/// scenario's houses take them too.
+pub(crate) const HUMAN_COUNTRIES: [LaunchCountry; 10] = [
     LaunchCountry::America,
     LaunchCountry::Russia,
     LaunchCountry::Yuri,
@@ -131,8 +132,8 @@ struct Side {
 static ALLIED: Side = Side {
     base: &[
         "GACNST", "GAPOWR", "GAPOWR", "GAPILE", "GAREFN", "GAWEAP", "GAPOWR", "GAREFN", "GAAIRC",
-        "AMRADR", "GADEPT", "GATECH", "GAPOWR", "GAPILL", "GAPILL", "NASAM", "NASAM", "ATESLA",
-        "ATESLA", "GTGCAN",
+        "AMRADR", "GADEPT", "GATECH", "GAPOWR", "GAPOWR", "GAGAP", "GAPILL", "GAPILL", "NASAM",
+        "NASAM", "ATESLA", "ATESLA", "GTGCAN",
     ],
     refinery: "GAREFN",
     defenses: &["GAPILL", "NASAM", "ATESLA", "GTGCAN"],

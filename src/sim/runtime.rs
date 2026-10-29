@@ -921,7 +921,7 @@ where
             &map_data.ini,
             descriptor.game_mode_nonzero,
         );
-        sim.initialize_trigger_definitions(map_data, &teams, None, None);
+        sim.initialize_trigger_definitions(map_data, &teams, None, None, None);
     }
     // Active YR `ScenarioClass__Full_Init @ 0x00686B20` calls
     // `ScenarioClass__Create_Houses @ 0x00687F10` before
