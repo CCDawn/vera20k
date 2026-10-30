@@ -720,7 +720,8 @@ rung queues the yard once a cell stands latched, and the latched cell
 places the ready yard — no search at placement time. The hull line
 rides the vehicle queue after the miner line: the side's basic hull
 (Destroyer, Typhoon, Boomer) to a quota of three, the AA escort (Aegis,
-Squid) once its extra prerequisite honestly passes `can_build`. The
+Squid) once the radar stands and its extra prerequisite honestly passes
+`can_build`. The
 hulls join the idle and standing pools by name — the land rosters never
 listed them — so the idle perimeter's Attack answers coast raiders; the
 wave's zone gate keeps them out of ground marches on its own, and the
@@ -767,6 +768,27 @@ over without spending a slot until then. What stays out is out for a
 reason: the Cosmonaut needs a lobby past the standard tech ceiling, the
 Slave Miner's ore line is the refinery's own five slaves already, and
 Yuri's second hound is a twin of the one already fielded.
+
+## Prerequisites the AI house skips
+
+The engine grades `CanBuild` differently for a house no human controls:
+the `Prerequisite=` chain is skipped outright, while `RequiredHouses`/
+`ForbiddenHouses`, the `RequiresStolen*` bytes and the tech-level
+ceiling against the lobby cap all still bite. The gap is real — a row
+whose retail prerequisite rises above its production factory (a radar
+over a war factory or barracks, a battle lab over a naval yard) would
+field from a bare factory. The rule the tables follow: every such row
+carries the gate itself — the roster's `needs` names the building and
+the rotation drops the row until it stands, the naval pick checks the
+radar or the battle lab before the escort, the second hull or the
+Boomer claims a slot. This round closed the last thirteen roster rows
+(TNKD, JUMPJET, GHOST, SNIPE on `GAAIRC`; TTNK, V3, FLAKT, IVAN, DESO,
+TERROR on `NARADR`; TELE, VIRUS, YURI on `NAPSIS`) plus the naval
+candidates (Aegis and Sea Scorpion behind the radar, Dolphin and Squid
+behind the lab, and the Boomer's whole navy line resting until Yuri's
+Psychic Sensor stands). Country locks stay with the engine — `can_build`
+grades them for AI houses too — and the Allied jet commission already
+waited for the radar before this round; nothing there needed a change.
 
 ## The second superweapon
 

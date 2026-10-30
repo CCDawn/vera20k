@@ -985,10 +985,13 @@ const OPENINGS: [Opening; 3] = [
                 role: Role::AntiArmor,
                 needs: Some("GATECH"),
             },
+            // The Tank Destroyer: retail Prerequisite=GAWEAP,RADAR
+            // (@rulesmd.ini:7479) — above the war factory, so the `needs`
+            // radar carries what the AI house's `CanBuild` would skip.
             RosterEntry {
                 name: "TNKD",
                 role: Role::AntiArmor,
-                needs: None,
+                needs: Some("GAAIRC"),
             },
             RosterEntry {
                 name: "ROBO",
@@ -1022,20 +1025,24 @@ const OPENINGS: [Opening; 3] = [
                 role: Role::AntiArmor,
                 needs: None,
             },
+            // The Rocketeer, the Navy SEAL and the Sniper: retail puts all
+            // three above the barracks — Prerequisite=GAAIRC alone for the
+            // jet, GAPILE,GAAIRC for the SEAL and the Sniper — so the rows
+            // gate themselves on GAAIRC.
             RosterEntry {
                 name: "JUMPJET",
                 role: Role::AntiAir,
-                needs: None,
+                needs: Some("GAAIRC"),
             },
             RosterEntry {
                 name: "GHOST",
                 role: Role::AntiInfantry,
-                needs: None,
+                needs: Some("GAAIRC"),
             },
             RosterEntry {
                 name: "SNIPE",
                 role: Role::AntiInfantry,
-                needs: None,
+                needs: Some("GAAIRC"),
             },
             // The attack dog: retail's counter-infiltration hound
             // (`DetectDisguise=yes`, 200 credits, TechLevel 2) — the sentry
@@ -1161,15 +1168,19 @@ const OPENINGS: [Opening; 3] = [
                 role: Role::AntiArmor,
                 needs: None,
             },
+            // The Tesla Tank and the V3 Launcher: retail Prerequisite=
+            // NAWEAP,RADAR on both — above the war factory, so the rows
+            // gate themselves on NARADR (the Tesla's Russian lock stays
+            // with `can_build`).
             RosterEntry {
                 name: "TTNK",
                 role: Role::AntiInfantry,
-                needs: None,
+                needs: Some("NARADR"),
             },
             RosterEntry {
                 name: "V3",
                 role: Role::Siege,
-                needs: None,
+                needs: Some("NARADR"),
             },
             RosterEntry {
                 name: "SCHP",
@@ -1195,10 +1206,13 @@ const OPENINGS: [Opening; 3] = [
             },
         ],
         infantry: &[
+            // The Flak Trooper: retail Prerequisite=NAHAND,RADAR — above
+            // the barracks, so the row gates itself on NARADR (its lower
+            // tech level the engine's own ceiling already carries).
             RosterEntry {
                 name: "FLAKT",
                 role: Role::AntiAir,
-                needs: None,
+                needs: Some("NARADR"),
             },
             // The hero leads his role for the same tie-break reason as
             // Tanya's table position (retail Prerequisite=NAHAND,NATECH,
@@ -1213,15 +1227,19 @@ const OPENINGS: [Opening; 3] = [
                 role: Role::AntiArmor,
                 needs: None,
             },
+            // Crazy Ivan and the Desolator: retail Prerequisite=
+            // NAHAND,RADAR on both — above the barracks, so the rows gate
+            // themselves on NARADR (the Desolator's Iraqi lock stays with
+            // `can_build`).
             RosterEntry {
                 name: "IVAN",
                 role: Role::AntiInfantry,
-                needs: None,
+                needs: Some("NARADR"),
             },
             RosterEntry {
                 name: "DESO",
                 role: Role::AntiInfantry,
-                needs: None,
+                needs: Some("NARADR"),
             },
             // The attack dog: also this side's scout (the `scout` field
             // names it — the scouting chain keeps its own pair alive), so
@@ -1236,11 +1254,13 @@ const OPENINGS: [Opening; 3] = [
             // The Cuban Terrorist: a 200-credit suicide rush (TerrorBomb
             // on attack and on death) — cheap enough to ride the wave as
             // living ordnance. `RequiredHouses=Confederation` gates him
-            // to Cuba through `can_build` (retail TechLevel 5).
+            // to Cuba through `can_build` (retail TechLevel 5); the retail
+            // Prerequisite=NAHAND,RADAR rides above the barracks, so the
+            // `needs` radar carries what the AI house's `CanBuild` skips.
             RosterEntry {
                 name: "TERROR",
                 role: Role::AntiInfantry,
-                needs: None,
+                needs: Some("NARADR"),
             },
             // The stolen-tech trio — the Allied table's note applies word
             // for word: all three sections ride every side's roster, the
@@ -1334,10 +1354,12 @@ const OPENINGS: [Opening; 3] = [
                 role: Role::AntiAir,
                 needs: None,
             },
+            // The Magnetron: retail Prerequisite=YAWEAP,RADAR — above the
+            // war factory, so the row gates itself on NAPSIS.
             RosterEntry {
                 name: "TELE",
                 role: Role::AntiArmor,
-                needs: None,
+                needs: Some("NAPSIS"),
             },
             RosterEntry {
                 name: "CAOS",
@@ -1356,15 +1378,19 @@ const OPENINGS: [Opening; 3] = [
                 role: Role::AntiArmor,
                 needs: None,
             },
+            // The Virus and the Yuri Clone: retail Prerequisite=
+            // YABRCK,NAPSIS on both (the Clone's cost 800 cited in the
+            // table note above) — above the barracks, so the rows gate
+            // themselves on NAPSIS.
             RosterEntry {
                 name: "VIRUS",
                 role: Role::AntiInfantry,
-                needs: None,
+                needs: Some("NAPSIS"),
             },
             RosterEntry {
                 name: "YURI",
                 role: Role::AntiArmor,
-                needs: None,
+                needs: Some("NAPSIS"),
             },
             // The hero: long-range mind control picks the enemy's best
             // off, so he files under Siege (retail YABRCK,YATECH,
@@ -4377,13 +4403,19 @@ impl SuperAi {
                 // from every build list). The rung queues the center once
                 // the battle lab stands, gated on roster membership so a
                 // side whose tables name no such entry never queues one,
-                // and the count check keeps it a rebuild too.
+                // and the count check keeps it a rebuild too. The side's
+                // radar stays out of the search beside the lab: both are
+                // ladder rungs of their own, and the radar rows' gates
+                // (the retail radar prerequisites above every factory)
+                // would otherwise shadow the center — the first candidate
+                // wins, and a standing radar would sit in front of the
+                // control center forever.
                 let tech_center = opening
                     .vehicles
                     .iter()
                     .chain(opening.infantry.iter())
                     .filter_map(|entry| entry.needs)
-                    .find(|&name| name != opening.battle_lab);
+                    .find(|&name| name != opening.battle_lab && name != opening.radar);
                 if let Some(center) = tech_center
                     && self.count_structures_of_type(sim, center) == 0
                     && self.count_structures_of_type(sim, opening.battle_lab) >= 1
@@ -6763,12 +6795,18 @@ impl SuperAi {
     /// up to [`NAVAL_SHIP_QUOTA`], with the AA escort claiming one turn
     /// once its extra prerequisite honestly passes `can_build` (the
     /// country-lock lesson: the cameo's brightness knows nothing of
-    /// prerequisites). Past the quota the second hull rotates up to
+    /// prerequisites). The escort also waits for the radar and the second
+    /// hull for the battle lab — both retail prerequisites ride above the
+    /// naval yard, exactly the gates the AI house's `CanBuild` would
+    /// skip; a gated limb simply falls through to the next candidate or
+    /// rests. Past the quota the second hull rotates up to
     /// [`NAVAL_EXTRA_QUOTA`], and once the battle lab stands the capital
     /// ship fills [`NAVAL_CAPITAL_QUOTA`] — its retail lab prerequisite is
     /// exactly the gate the AI house's `CanBuild` would skip, so the lab
-    /// count carries it here. `None` rests the limb — no yard, every
-    /// quota met, or nothing honestly buildable yet.
+    /// count carries it here. The Boomer is the one basic hull whose
+    /// retail `Prerequisite` carries the radar, so with Yuri's Psychic
+    /// Sensor down the whole navy line rests. `None` rests the limb — no
+    /// yard, every quota met, or nothing honestly buildable yet.
     fn naval_pick(
         &self,
         sim: &crate::sim::world::Simulation,
@@ -6782,17 +6820,35 @@ impl SuperAi {
             })
         };
         let hulls = self.count_units_of_type(sim, opening.naval_ship);
+        // The escort's radar: the Aegis and the Sea Scorpion both stand
+        // behind their side's radar in retail (Prerequisite=GAYARD,RADAR /
+        // NAYARD,RADAR) — the gate the AI house's `CanBuild` would skip.
+        // A missing sensor drops the limb and the pick falls through to
+        // the hull line below, unchanged.
         if let Some(aa) = opening.naval_aa
             && hulls >= 1
+            && self.owns_structure_of_type(sim, opening.radar)
             && self.count_units_of_type(sim, aa) < 1
             && buildable(aa)
         {
             return Some(aa);
         }
-        if hulls < NAVAL_SHIP_QUOTA && buildable(opening.naval_ship) {
+        // The Boomer is the one basic hull behind the radar (retail
+        // Prerequisite=YAYARD,RADAR @rulesmd.ini:8940): with the Psychic
+        // Sensor down Yuri's whole navy line rests — the Allied destroyer
+        // and the Soviet submarine need no radar and keep their line.
+        if hulls < NAVAL_SHIP_QUOTA
+            && (opening.naval_ship != "BSUB"
+                || self.owns_structure_of_type(sim, opening.radar))
+            && buildable(opening.naval_ship)
+        {
             return Some(opening.naval_ship);
         }
+        // The second hull rides the battle lab the same way the capital
+        // does: the Dolphin and the Squid are retail Prerequisite=
+        // GAYARD,GATECH / NAYARD,NATECH, above the naval yard.
         if let Some(extra) = opening.naval_hull_extra
+            && self.owns_structure_of_type(sim, opening.battle_lab)
             && self.count_units_of_type(sim, extra) < NAVAL_EXTRA_QUOTA
             && buildable(extra)
         {
@@ -7850,7 +7906,7 @@ mod tests {
         assert!(soviet
             .infantry
             .iter()
-            .any(|entry| entry.name == "TERROR" && entry.needs.is_none()));
+            .any(|entry| entry.name == "TERROR" && entry.needs == Some("NARADR")));
         assert!(soviet
             .vehicles
             .iter()
@@ -7916,6 +7972,85 @@ mod tests {
                 assert_eq!(rows[0].role, role);
                 assert_eq!(rows[0].needs, None, "{name} waits for no prerequisite");
             }
+        }
+    }
+
+    /// The roster's retail radar gates: every row whose retail
+    /// `Prerequisite` rides above the side's production factory (the war
+    /// factory or the barracks) carries the gate itself in `needs` — the
+    /// engine skips the prerequisite chain for a house no human controls,
+    /// so without the self-gate the rotation would field the unit from a
+    /// bare factory. Thirteen rows: four Allied (the Airforce Command),
+    /// six Soviet (the Radar Spire), three Yuri (the Psychic Sensor).
+    #[test]
+    fn openings_gate_the_retail_radar_prerequisites_in_needs() {
+        let opening = |yard: &str| {
+            OPENINGS
+                .iter()
+                .find(|opening| opening.construction_yard == yard)
+                .expect("each side's opening")
+        };
+        let row_needs = |table: &'static [RosterEntry], name: &str| {
+            let rows: Vec<_> = table
+                .iter()
+                .filter(|entry| entry.name == name)
+                .map(|entry| entry.needs)
+                .collect();
+            assert_eq!(rows.len(), 1, "exactly one {name} row");
+            rows[0]
+        };
+
+        let allied = opening("GACNST");
+        assert_eq!(
+            row_needs(allied.vehicles, "TNKD"),
+            Some("GAAIRC"),
+            "the Tank Destroyer gates itself on the Airforce Command"
+        );
+        for (name, gate) in [
+            ("JUMPJET", Some("GAAIRC")),
+            ("GHOST", Some("GAAIRC")),
+            ("SNIPE", Some("GAAIRC")),
+        ] {
+            assert_eq!(
+                row_needs(allied.infantry, name),
+                gate,
+                "the Allied {name} gates itself on the Airforce Command"
+            );
+        }
+
+        let soviet = opening("NACNST");
+        for (name, gate) in [("TTNK", Some("NARADR")), ("V3", Some("NARADR"))] {
+            assert_eq!(
+                row_needs(soviet.vehicles, name),
+                gate,
+                "the Soviet {name} gates itself on the Radar Spire"
+            );
+        }
+        for (name, gate) in [
+            ("FLAKT", Some("NARADR")),
+            ("IVAN", Some("NARADR")),
+            ("DESO", Some("NARADR")),
+            ("TERROR", Some("NARADR")),
+        ] {
+            assert_eq!(
+                row_needs(soviet.infantry, name),
+                gate,
+                "the Soviet {name} gates itself on the Radar Spire"
+            );
+        }
+
+        let yuri = opening("YACNST");
+        assert_eq!(
+            row_needs(yuri.vehicles, "TELE"),
+            Some("NAPSIS"),
+            "the Magnetron gates itself on the Psychic Sensor"
+        );
+        for (name, gate) in [("VIRUS", Some("NAPSIS")), ("YURI", Some("NAPSIS"))] {
+            assert_eq!(
+                row_needs(yuri.infantry, name),
+                gate,
+                "the Yuri {name} gates itself on the Psychic Sensor"
+            );
         }
     }
 
