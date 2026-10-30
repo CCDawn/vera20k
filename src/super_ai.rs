@@ -1619,7 +1619,7 @@ pub struct SuperAi {
     /// The tick the next raid arming window may run at; see
     /// [`ENGINEER_CAPTURE_WINDOW_TICKS`]. Pinned state, never read from the
     /// runtime.
-    raid_due: u32,
+    raid_arm_due: u32,
     /// Blocker shoves spent per opening MCV, keyed by entity id, each
     /// budget keyed to the latched cell it was spent at; see
     /// [`SHOVE_ATTEMPTS`]. Pinned state, never read from the runtime.
@@ -1776,7 +1776,7 @@ impl SuperAi {
             raid_stage: None,
             raid_stage_since: 0,
             raid_cooldown_until: 0,
-            raid_due: 0,
+            raid_arm_due: 0,
             shove_attempts: std::collections::HashMap::new(),
             shove_origin: std::collections::HashMap::new(),
             mcv_stuck_since: std::collections::HashMap::new(),
@@ -5231,7 +5231,7 @@ impl SuperAi {
         // Hygiene: a consumed engineer (the capture succeeded — the engine
         // eats him on entry) or a lost one leaves the bound set, and so does
         // a target no longer held by a neutral house.
-        self.capture_bound.retain(|&engineer, &target| {
+        self.capture_bound.retain(|&engineer, target| {
             let engineer_busy = sim
                 .substrate
                 .entities
@@ -5377,10 +5377,10 @@ impl SuperAi {
         if let Some(stage) = self.raid_stage {
             return self.engineer_raid_stage(sim, stage, tick);
         }
-        if tick < self.raid_cooldown_until || tick < self.raid_due {
+        if tick < self.raid_cooldown_until || tick < self.raid_arm_due {
             return None;
         }
-        self.raid_due = tick + ENGINEER_CAPTURE_WINDOW_TICKS;
+        self.raid_arm_due = tick + ENGINEER_CAPTURE_WINDOW_TICKS;
         // The arming gate: a fat wallet, a known enemy to aim at, a ride
         // the war factory can actually build.
         if crate::sim::production::credits_for_owner(sim, sim.interner.resolve(self.house))
