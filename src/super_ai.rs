@@ -632,6 +632,14 @@ struct Opening {
     /// off and the engine revokes a standing grant.
     super_weapon_building: &'static str,
     super_weapon_type: &'static str,
+    /// The side's second superweapon structure and the special it grants
+    /// (retail `SuperWeapon=` on the building): the Nuclear Silo, the
+    /// Genetic Mutator and the Chronosphere — each side's other retail
+    /// super behind the lab. The same `DisableableFromShell=yes` lobby
+    /// toggle owns its chain too, and the ladder's rung for it opens only
+    /// once the first super has stood (the same once-per-game latch).
+    second_super_weapon_building: &'static str,
+    second_super_weapon_type: &'static str,
     /// Whether the special lands on friends rather than enemies: the
     /// Iron Curtain makes the vehicles under it invulnerable while
     /// organic infantry there take damage instead, so it aims at the
@@ -714,6 +722,8 @@ const OPENINGS: [Opening; 3] = [
         basic_infantry: "E1",
         super_weapon_building: "GAWEAT",
         super_weapon_type: "LightningStormSpecial",
+        second_super_weapon_building: "GACSPH",
+        second_super_weapon_type: "ChronoSphereSpecial",
         super_weapon_targets_self: false,
         // Anti-air picks cite the weapon's retail projectile `AA=yes`:
         // the IFV's HoverMissile fires AAHeatSeeker2, the Rocketeer's
@@ -812,6 +822,8 @@ const OPENINGS: [Opening; 3] = [
         basic_infantry: "E2",
         super_weapon_building: "NAIRON",
         super_weapon_type: "IronCurtainSpecial",
+        second_super_weapon_building: "NAMISL",
+        second_super_weapon_type: "NukeSpecial",
         super_weapon_targets_self: true,
         // Flak answers air on both lines: the Flak Track's
         // FlakTrackAAGun and the Flak Trooper's FlakGuyAAGun fire the
@@ -912,6 +924,8 @@ const OPENINGS: [Opening; 3] = [
         basic_infantry: "INIT",
         super_weapon_building: "YAPPET",
         super_weapon_type: "PsychicDominatorSpecial",
+        second_super_weapon_building: "YAGNTC",
+        second_super_weapon_type: "GeneticConverterSpecial",
         super_weapon_targets_self: false,
         // The Gattling Tank's AAGattling fires the AA-only Invisible4.
         // The Magnetron lifts armor, the Chaos Drone gas masses. The
@@ -1046,6 +1060,10 @@ pub struct SuperAi {
     /// game and starved the expansion and the guns behind it. Pinned state,
     /// never read from the runtime.
     sw_ever_stood: bool,
+    /// Whether the second superweapon has ever stood: the once-per-game
+    /// latch for the silo/mutator/chronosphere rung, set the same way
+    /// `sw_ever_stood` is. Pinned state, never read from the runtime.
+    sw2_ever_stood: bool,
     /// Whether the hero's commission has issued at least once; the
     /// reservation hands the hero the first specialist slot past the lab.
     /// Pinned state, never read from the runtime.
@@ -1155,6 +1173,17 @@ pub struct SuperAi {
     /// Earliest tick the repair limb's next survey may run; see
     /// [`REPAIR_SURVEY_TICKS`]. Pinned state, never read from the runtime.
     repair_due: u32,
+    /// The tick the current [`Self::orders`] pass runs for, latched at the
+    /// entry so the structure census knows when its counts are stale.
+    /// Pinned state, never read from the runtime.
+    now_tick: u32,
+    /// The tick the structure census was last rebuilt; `u32::MAX` forces
+    /// the first rebuild. Pinned state, never read from the runtime.
+    census_tick: u32,
+    /// The per-tick structure census — type id to standing count, rebuilt
+    /// at most once per orders pass instead of one full entity walk per
+    /// ladder read. Pinned state, never read from the runtime.
+    census_counts: std::collections::HashMap<InternedId, u32>,
     // ---- Layer 3: combat & unit management state ----
     /// The futility backoff, per entity: see [`FutilityState`]. The shared
     /// helper behind the repeated-order sites this layer owns (guard
@@ -1215,6 +1244,7 @@ impl SuperAi {
             next_airstrike_tick: 0,
             next_sw_fire_tick: 0,
             sw_ever_stood: false,
+            sw2_ever_stood: false,
             hero_issued: false,
             fortress_issued: false,
             aa_issued: false,
@@ -1243,6 +1273,9 @@ impl SuperAi {
             placement_intent: None,
             repairing_structure: None,
             repair_due: 0,
+            now_tick: 0,
+            census_tick: u32::MAX,
+            census_counts: std::collections::HashMap::new(),
             futility: std::collections::HashMap::new(),
             boarders: Vec::new(),
             board_attempts: std::collections::HashMap::new(),
@@ -1279,6 +1312,7 @@ impl SuperAi {
     /// the side's basic soldier. See the module docs for the determinism
     /// contract.
     pub fn orders(&mut self, runtime: &SimRuntime, tick: u32) -> Vec<CommandEnvelope> {
+        self.now_tick = tick;
         let sim = &runtime.simulation;
         let rules = &runtime.resources.rules;
         let at = sim.session().tick() + 1;
@@ -1522,11 +1556,15 @@ impl SuperAi {
         let Some(opening) = self.opening(sim) else {
             return Vec::new();
         };
-        // The ladder's superweapon rung is once-per-game: remember the
-        // first one standing, so a razed storm never rebuilds (see the
-        // walk below for the starvation that motivated the latch).
+        // The ladder's superweapon rungs are once-per-game each: remember
+        // the supers standing, so a razed storm never rebuilds (see the
+        // walk below for the starvation that motivated the latch) and the
+        // second super's rung opens on the first one having stood.
         if self.count_structures_of_type(sim, opening.super_weapon_building) >= 1 {
             self.sw_ever_stood = true;
+        }
+        if self.count_structures_of_type(sim, opening.second_super_weapon_building) >= 1 {
+            self.sw2_ever_stood = true;
         }
 
         // The expansion survey and its proof latch: pure observations,
@@ -1766,28 +1804,33 @@ impl SuperAi {
         // fire button's own admission; `LaunchSuperWeapon` can still be
         // refused (a storm already in flight, a dominator mid-pulse), so a
         // launch retries after [`SW_FIRE_RETRY_TICKS`] instead of
-        // monopolizing this tick's single command.
-        if tick >= self.next_sw_fire_tick
-            && let Some(sw_type) = sim.interner.get(opening.super_weapon_type)
-            && let Some(instance) = sim
-                .super_weapons()
-                .get(&self.house)
-                .and_then(|house_sws| house_sws.get(&sw_type))
-            && instance.charge_start_tick() != -1
-            && instance.is_active()
-            && instance.is_ready()
-            && let Some((rx, ry)) = self.superweapon_target(sim, opening)
-        {
-            self.next_sw_fire_tick = tick + SW_FIRE_RETRY_TICKS;
-            return vec![CommandEnvelope::new(
-                self.house,
-                at,
-                Command::LaunchSuperWeapon {
-                    sw_type_id: sw_type,
-                    target_rx: rx,
-                    target_ry: ry,
-                },
-            )];
+        // monopolizing this tick's single command. Both supers — the
+        // ladder's first and second — sit in the walk: whichever is
+        // charged first fires.
+        if tick >= self.next_sw_fire_tick {
+            for sw_type_name in [opening.super_weapon_type, opening.second_super_weapon_type] {
+                if let Some(sw_type) = sim.interner.get(sw_type_name)
+                    && let Some(instance) = sim
+                        .super_weapons()
+                        .get(&self.house)
+                        .and_then(|house_sws| house_sws.get(&sw_type))
+                    && instance.charge_start_tick() != -1
+                    && instance.is_active()
+                    && instance.is_ready()
+                    && let Some((rx, ry)) = self.superweapon_target(sim, opening, sw_type_name)
+                {
+                    self.next_sw_fire_tick = tick + SW_FIRE_RETRY_TICKS;
+                    return vec![CommandEnvelope::new(
+                        self.house,
+                        at,
+                        Command::LaunchSuperWeapon {
+                            sw_type_id: sw_type,
+                            target_rx: rx,
+                            target_ry: ry,
+                        },
+                    )];
+                }
+            }
         }
 
         // The broken-bridge limb. A breach the zone grid already knows about
@@ -2862,6 +2905,7 @@ impl SuperAi {
                 name == radar_name
                     || name == opening.battle_lab
                     || name == opening.super_weapon_building
+                    || name == opening.second_super_weapon_building
             }
         });
         // Any battle tank standing gates the perimeter guns and the
@@ -3063,6 +3107,12 @@ impl SuperAi {
                 // refuses the building) and the step falls through to the
                 // expansion without occupying a slot.
                 (opening.super_weapon_building, 1),
+                // The second superweapon step mirrors the first — the same
+                // toggle owns its cameo, and the walk's guard opens it only
+                // once the first super has stood (its own once-per-game
+                // latch below), so the two monuments never race for the one
+                // building slot.
+                (opening.second_super_weapon_building, 1),
                 // The service depot: every side's MCV is retail-gated
                 // behind it (`Prerequisite=` on AMCV/SMCV/PCV), so it is a
                 // ladder rung of its own — built with the late base and
@@ -3092,6 +3142,19 @@ impl SuperAi {
                 // of the game (observed) and starve the expansion and the
                 // guns behind it.
                 if *name == opening.super_weapon_building && self.sw_ever_stood {
+                    continue;
+                }
+                // The second super's rung mirrors the first's once-per-game
+                // latch and adds the sequencing gate: it queues only once
+                // the first super has stood — the latch or the building
+                // still on the field — so a razed second super never
+                // rebuilds either.
+                if *name == opening.second_super_weapon_building
+                    && (self.sw2_ever_stood
+                        || !(self.sw_ever_stood
+                            || self.count_structures_of_type(sim, opening.super_weapon_building)
+                                >= 1))
+                {
                     continue;
                 }
                 if self.count_structures_of_type(sim, name) >= *target {
@@ -4170,15 +4233,37 @@ impl SuperAi {
     /// How many of the house's structures are exactly this retail type name:
     /// the build ladder's expansion targets count (and re-count what the
     /// enemy destroys).
+    ///
+    /// The reads are the orders pass's hottest scans — every ladder rung,
+    /// growth limb and gate re-walks the whole entity set — so the counts
+    /// are cached per tick: the first read rebuilds the census in one pass
+    /// (the `own_structures` filter, keyed by type id instead of collected
+    /// into Strings) and the rest of the pass reads the map. `orders` only
+    /// reads the sim and issues commands — the commands apply after the
+    /// pass returns — so a census latched to the pass's own tick is exact
+    /// for every read inside it.
     fn count_structures_of_type(
-        &self,
+        &mut self,
         sim: &crate::sim::world::Simulation,
         type_name: &str,
     ) -> usize {
-        self.own_structures(sim)
-            .iter()
-            .filter(|(_, name)| name == type_name)
-            .count()
+        if self.census_tick != self.now_tick {
+            self.census_counts.clear();
+            for (_, entity) in sim.substrate.entities.iter_sorted() {
+                if entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Structure
+                {
+                    *self.census_counts.entry(entity.type_ref()).or_insert(0) += 1;
+                }
+            }
+            self.census_tick = self.now_tick;
+        }
+        // Read-only lookup: every retail type name is interned at rules
+        // load; a miss would only report zero standing.
+        let Some(type_id) = sim.interner.get(type_name) else {
+            return 0;
+        };
+        self.census_counts.get(&type_id).copied().unwrap_or(0) as usize
     }
 
     /// How many of the house's units are exactly this retail type name.
@@ -4433,16 +4518,45 @@ impl SuperAi {
     /// nearest the enemy mass center, skipping the MCVs, the miner fleet
     /// (and, pointless on infantry, the engineer) — the old substrate-first
     /// pick all too often curtained the expansion MCV standing at home.
-    /// The storm and the dominator strike the enemy where it hurts most:
-    /// their war factories if any stand, else any structure, else the
-    /// hostile ground-mass center (ground-only — a jet's flight path is
-    /// not an aim point).
+    /// The genetic mutator devolves infantry, so it wants the hostile
+    /// foot-mobile mass: the centroid of their infantry (the enemy-center
+    /// walk narrowed to the category), falling through to the generic aim
+    /// when none stands. Every other special — storm, dominator, the
+    /// silo's nuke, the chronosphere — strikes the enemy where it hurts
+    /// most: their war factories if any stand, else any structure, else
+    /// the hostile ground-mass center (ground-only — a jet's flight path
+    /// is not an aim point).
     fn superweapon_target(
         &self,
         sim: &crate::sim::world::Simulation,
         opening: &Opening,
+        sw_type_name: &str,
     ) -> Option<(u16, u16)> {
-        if opening.super_weapon_targets_self {
+        // The genetic mutator's mass aim (the enemy_center walk narrowed
+        // to the Infantry category — the engine files foot soldiers there,
+        // tanks under Unit).
+        if sw_type_name == "GeneticConverterSpecial" {
+            let mut sum_x = 0i64;
+            let mut sum_y = 0i64;
+            let mut count = 0u64;
+            for (_, entity) in sim.substrate.entities.iter_sorted() {
+                if entity.category() != crate::map::entities::EntityCategory::Infantry
+                    || entity.lifecycle.in_limbo()
+                    || !self.is_enemy(sim, entity.owner())
+                {
+                    continue;
+                }
+                sum_x += i64::from(entity.position.rx());
+                sum_y += i64::from(entity.position.ry());
+                count += 1;
+            }
+            if count > 0 {
+                return Some(((sum_x / count as i64) as u16, (sum_y / count as i64) as u16));
+            }
+            // No hostile infantry stands: the generic hostile aim below
+            // still beats holding a charged special.
+        }
+        if opening.super_weapon_targets_self && sw_type_name == opening.super_weapon_type {
             let anchor = self
                 .enemy_center(sim)
                 .map(|center| (center.0.max(0) as u16, center.1.max(0) as u16))
@@ -7116,6 +7230,11 @@ mod tests {
             0,
             "the superweapon building never stood"
         );
+        assert_eq!(
+            structures(&scenario, "GACSPH"),
+            0,
+            "the second superweapon building never stood either"
+        );
         // The engine constructs every super's entry for a house at scenario
         // start (`SuperClass` constructor, inactive); the toggle-off pass
         // merely never grants one (`Deactivate`: "the entry stays"). And a
@@ -7139,6 +7258,71 @@ mod tests {
         assert!(
             storm.is_none_or(|sw| !sw.is_active()),
             "the storm special is never granted while the toggle is off"
+        );
+        // The second super's chain is the toggle's too: the chronosphere
+        // (the Allied second super's `SuperWeapon=`) is likewise never
+        // granted while the lobby keeps the specials off.
+        let sphere = scenario
+            .sim()
+            .interner
+            .get("ChronoSphereSpecial")
+            .and_then(|sw_type| {
+                scenario
+                    .sim()
+                    .super_weapons()
+                    .get(&human)
+                    .and_then(|house_sws| house_sws.get(&sw_type))
+            });
+        assert!(
+            sphere.is_none_or(|sw| !sw.is_active()),
+            "the chronosphere special is never granted while the toggle is off"
+        );
+    }
+
+    /// The ladder's second superweapon rung: with the lobby toggle on, the
+    /// same climb that stands the weather controller goes on to stand the
+    /// side's second super (`GACSPH`, retail
+    /// `SuperWeapon=ChronoSphereSpecial`) — a rung the walk opens only
+    /// once the first super has stood (its once-per-game latch).
+    #[test]
+    #[ignore = "slow; retail; loads a match and drives thousands of frames"]
+    fn ladder_builds_the_second_superweapon_after_the_first_stood() {
+        let (mut scenario, human) =
+            retail_battle_as(crate::skirmish_launch::LaunchCountry::America, true);
+        let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
+
+        let structures = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == human
+                        && entity.category() == crate::map::entities::EntityCategory::Structure
+                        && scenario.sim().interner.resolve(entity.type_ref()) == name
+                })
+                .count()
+        };
+
+        // Leg one runs to the first super standing; leg two keeps the
+        // same climb running until the second super joins it (`drive_until`
+        // restarts its tick budget per call, so the leg budgets are each
+        // sized for the full climb — the wide Soviet-style budget covers
+        // the two 5000-credit monuments the wallet must bank in turn).
+        drive_until(&mut scenario, &mut ai, 34000, |scenario| {
+            structures(scenario, "GAWEAT") >= 1
+        });
+        assert!(
+            structures(&scenario, "GAWEAT") >= 1,
+            "the first superweapon stood"
+        );
+        drive_until(&mut scenario, &mut ai, 68000, |scenario| {
+            structures(scenario, "GACSPH") >= 1
+        });
+        assert!(
+            structures(&scenario, "GACSPH") >= 1,
+            "the second superweapon stood after the first"
         );
     }
 
