@@ -131,6 +131,16 @@ const ALARM_RADIUS: i16 = 24;
 /// escort when its extra prerequisite honestly passes `can_build`.
 const NAVAL_SHIP_QUOTA: usize = 3;
 
+/// The second hull line's quota (Layer 2.7): past the basic hull quota the
+/// extra hull (the Dolphin, the Giant Squid) rotates up to this many — its
+/// own line, not a squeeze on the basic one.
+const NAVAL_EXTRA_QUOTA: usize = 3;
+
+/// The capital ship's quota (Layer 2.7): one, behind the battle lab — the
+/// Aircraft Carrier and the Dreadnought are the lab's naval expression,
+/// and one strike-carrier turns the quota fleet into a siege arm.
+const NAVAL_CAPITAL_QUOTA: usize = 1;
+
 /// How far from a yard the naval survey scans for a legal shoreline cell:
 /// the naval yard's foundation needs a WaterSet tile inside the base's own
 /// build area, so the survey rides the same admission the placement runs.
@@ -218,8 +228,11 @@ const REPAIR_FRACTION_DENOMINATOR: i32 = 5;
 /// simply skips the limb.
 const BRIDGE_HUT_TYPE: &str = "CABHUT";
 
-/// The capture infantry that repairs a hut's bridge (retail ENGINEER).
-const BRIDGE_ENGINEER_TYPE: &str = "ENGINEER";
+// The bridge repair's capture infantry is the opening's own `engineer`
+// field, not a shared name: the three sides' engineers are three rules
+// sections split by `ForbiddenHouses` ([ENGINEER] Allies, [SENGINEER]
+// Soviets, [YENGINEER] Yuri), so a shared "ENGINEER" commissioned nobody
+// outside an Allied base.
 
 /// Blocker shoves one opening MCV gets while it stands on the same cell:
 /// past the cap the site counts as failed and the stuck window below owns
@@ -453,6 +466,21 @@ const RAIDER_RETRY_TICKS: u32 = 300;
 /// is cheap but pointless per tick, and the toggle is once-per-unit anyway.
 const DEPLOY_MECH_TICKS: u32 = 150;
 
+/// Ticks between amphibious-ferry windows (the transport's dock, sail and
+/// unload legs, [`Self::ferry_orders`]): the branch is a pacing problem —
+/// one leg per window, the order gate pacing each passenger's boarding
+/// walk — so a refused unload or a boarded walking candidate costs a
+/// window, never the chain below.
+const FERRY_WINDOW_TICKS: u32 = 300;
+
+/// Chebyshev distance from the home yard past which a loaded ferry
+/// unloads and an empty one turns back: near home it beaches and loads.
+const FERRY_DISCHARGE_DISTANCE: i16 = 28;
+
+/// How far from the beached transport an idle boarding candidate may
+/// stand: the Enter walk stays short and the loading quick.
+const FERRY_BOARD_RADIUS: i16 = 12;
+
 /// How many dark cells nearest the scout get the zone-connection check: the
 /// scan effort stays capped even on a map whose every near candidate is
 /// across a breach.
@@ -624,6 +652,13 @@ struct Opening {
     tier2_tank: &'static str,
     /// The side's basic soldier (GI, Conscript, Initiate).
     basic_infantry: &'static str,
+    /// The side's bridge-repair engineer. The three sides' engineers are
+    /// three rules sections split by `ForbiddenHouses` — [ENGINEER] refuses
+    /// the Soviet and Yuri countries, [SENGINEER] the Allies and Yuri,
+    /// [YENGINEER] the Allies and the Soviets — so every engineer pick
+    /// (the hut dispatch and the commission alike) reads this field; a
+    /// shared "ENGINEER" name commissioned nobody outside an Allied base.
+    engineer: &'static str,
     /// The side's superweapon structure and the special it grants
     /// (retail `SuperWeapon=` on the building): Weather Controller,
     /// Iron Curtain, Psychic Dominator. Every retail one is
@@ -668,8 +703,19 @@ struct Opening {
     /// Soviet Typhoon, Yuri's Boomer (the side's only combat hull).
     naval_ship: &'static str,
     /// The side's naval AA escort behind its extra prerequisite (the Aegis
-    /// Cruiser's radar, the Giant Squid's battle lab), when one exists.
+    /// Cruiser's and the Sea Scorpion's radar), when one exists.
     naval_aa: Option<&'static str>,
+    /// The side's second combat hull, rotating in past the basic hull's
+    /// [`NAVAL_SHIP_QUOTA`] up to [`NAVAL_EXTRA_QUOTA`]: the Dolphin behind
+    /// its lab, the Giant Squid behind its own. `None` where the basic hull
+    /// line is the whole navy.
+    naval_hull_extra: Option<&'static str>,
+    /// The side's capital ship: one, behind the battle lab — the Aircraft
+    /// Carrier and the Dreadnought, both retail `Spawns=` strike-craft
+    /// carriers whose lab prerequisite the AI house's `CanBuild` would
+    /// skip. `None` where the basic hull is already the capital piece (the
+    /// Boomer spawns its own cruise missiles aboard).
+    naval_capital: Option<&'static str>,
     /// Aircraft-tab types the air wing fields, preference order (Korea's
     /// Black Eagle `BEAG` first, the shared Intruder `ORCA` behind — the
     /// cameo's country gate skips the one this house may not take). Only
@@ -692,6 +738,14 @@ struct Opening {
     /// Guardian GI's deployed launcher is the classic loadout). The
     /// other sides keep `None` and the boarding branch sleeps.
     fortress: Option<&'static str>,
+    /// The side's amphibious transport (retail `Naval=yes` hover hull with
+    /// `Passengers=12`: the Landing Craft, the Armored Transport, the Hover
+    /// Transport) — the ferry branch's hull. All three are
+    /// `MovementZone=Amphibious`, so they beach beside the yard to take
+    /// infantry aboard and unload on the far shore; each builds at the
+    /// side's naval yard behind its TechLevel. `None` keeps the branch
+    /// asleep.
+    amphibious_transport: Option<&'static str>,
     /// Combat vehicles the army mixes in past its core tank, each with
     /// its role; the core keeps the remaining slots. Country-locked
     /// entries stay in the table — CanBuild's `RequiredHouses=` gate
@@ -720,6 +774,9 @@ const OPENINGS: [Opening; 3] = [
         main_tank: "MTNK",
         tier2_tank: "SREF",
         basic_infantry: "E1",
+        // The Allied section: ForbiddenHouses refuses the Soviet and Yuri
+        // countries ([SENGINEER]/[YENGINEER] are their sides' twins).
+        engineer: "ENGINEER",
         super_weapon_building: "GAWEAT",
         super_weapon_type: "LightningStormSpecial",
         second_super_weapon_building: "GACSPH",
@@ -795,6 +852,15 @@ const OPENINGS: [Opening; 3] = [
                 role: Role::AntiInfantry,
                 needs: None,
             },
+            // The Chrono Legionnaire: the NeutronRifle erases its target
+            // from the timeline — a slow, expensive vehicle answer, so it
+            // files under AntiArmor behind its tech center (retail
+            // Prerequisite=GAPILE,TECH, cost 1500, TechLevel 10).
+            RosterEntry {
+                name: "CLEG",
+                role: Role::AntiArmor,
+                needs: Some("GATECH"),
+            },
         ],
         defense_basic: "GAPILL",
         defense_aa: "NASAM",
@@ -802,9 +868,18 @@ const OPENINGS: [Opening; 3] = [
         naval_yard: "GAYARD",
         naval_ship: "DEST",
         naval_aa: Some("AEGIS"),
+        // The second hull rotates past the destroyer quota (the Dolphin,
+        // retail Prerequisite=GAYARD,GATECH); the carrier is the lab's
+        // capital piece (retail Prerequisite=GAYARD,TECH, Spawns=HORNET).
+        naval_hull_extra: Some("DLPH"),
+        naval_capital: Some("CARRIER"),
         aircraft: &["BEAG", "ORCA"],
         scout: "ADOG",
         fortress: Some("BFRT"),
+        // The Landing Craft: retail Prerequisite=GAYARD, TechLevel 4, a
+        // `Naval=yes` hover hull with `Passengers=12` and
+        // `MovementZone=Amphibious` — it beaches to load and unload.
+        amphibious_transport: Some("LCRF"),
     },
     Opening {
         construction_yard: "NACNST",
@@ -820,6 +895,9 @@ const OPENINGS: [Opening; 3] = [
         main_tank: "HTNK",
         tier2_tank: "APOC",
         basic_infantry: "E2",
+        // The Soviet section: ForbiddenHouses refuses the Allies and Yuri
+        // (retail [SENGINEER], image ENGINEER).
+        engineer: "SENGINEER",
         super_weapon_building: "NAIRON",
         super_weapon_type: "IronCurtainSpecial",
         second_super_weapon_building: "NAMISL",
@@ -864,6 +942,18 @@ const OPENINGS: [Opening; 3] = [
                 role: Role::Siege,
                 needs: Some("NATECH"),
             },
+            // The Libyan Demolition Truck: a bomb on wheels (`Demobomb`
+            // primary and death weapon, `Explodes=yes`) — AntiArmor, never
+            // Siege, since the wave's standoff post would keep a suicide
+            // truck out of its own blast. `RequiredHouses=Africans` gates
+            // it to Libya through `can_build`; the `needs` radar carries
+            // the retail NAWEAP,RADAR prerequisite the AI house's
+            // `CanBuild` would skip (cost 1500, TechLevel 10).
+            RosterEntry {
+                name: "DTRUCK",
+                role: Role::AntiArmor,
+                needs: Some("NARADR"),
+            },
         ],
         infantry: &[
             RosterEntry {
@@ -894,16 +984,35 @@ const OPENINGS: [Opening; 3] = [
                 role: Role::AntiInfantry,
                 needs: None,
             },
+            // The Cuban Terrorist: a 200-credit suicide rush (TerrorBomb
+            // on attack and on death) — cheap enough to ride the wave as
+            // living ordnance. `RequiredHouses=Confederation` gates him
+            // to Cuba through `can_build` (retail TechLevel 5).
+            RosterEntry {
+                name: "TERROR",
+                role: Role::AntiInfantry,
+                needs: None,
+            },
         ],
         defense_basic: "NALASR",
         defense_aa: "NAFLAK",
         defense_heavy: "TESLA",
         naval_yard: "NAYARD",
         naval_ship: "SUB",
-        naval_aa: Some("SQD"),
+        // The Sea Scorpion is the AA escort (its FlakWeapon fires AA; the
+        // old pick, the Giant Squid, is an anti-hull grappler, not AA).
+        // The Squid rotates in the hull line behind its own lab instead,
+        // and the Dreadnought is the lab's capital piece (retail
+        // Prerequisite=NAYARD,NATECH on both, Spawns=DMISL).
+        naval_aa: Some("HYD"),
+        naval_hull_extra: Some("SQD"),
+        naval_capital: Some("DRED"),
         aircraft: &[],
         scout: "DOG",
         fortress: None,
+        // The Armored Transport: retail Prerequisite=NAYARD, TechLevel 2,
+        // `Passengers=12`, `MovementZone=Amphibious`.
+        amphibious_transport: Some("SAPC"),
     },
     Opening {
         construction_yard: "YACNST",
@@ -922,6 +1031,9 @@ const OPENINGS: [Opening; 3] = [
         main_tank: "LTNK",
         tier2_tank: "MIND",
         basic_infantry: "INIT",
+        // The Yuri section: ForbiddenHouses refuses the Allies and the
+        // Soviets (retail [YENGINEER], image ENGINEER).
+        engineer: "YENGINEER",
         super_weapon_building: "YAPPET",
         super_weapon_type: "PsychicDominatorSpecial",
         second_super_weapon_building: "YAGNTC",
@@ -980,16 +1092,36 @@ const OPENINGS: [Opening; 3] = [
                 role: Role::Siege,
                 needs: Some("YATECH"),
             },
+            // The attack dog: Yuri's anti-infantry and anti-spy hound
+            // (`DetectDisguise=yes`, 200 credits, TechLevel 2). Retail
+            // ships two Yuri-country twins ([YADOG] and [YDOG], both
+            // `RequiredHouses=YuriCountry`, mirroring the sides' own dog
+            // sections); the table takes [YDOG]. Neither twin's
+            // `Prerequisite` (GAPILE/NAHAND) gates a house that owns its
+            // barracks.
+            RosterEntry {
+                name: "YDOG",
+                role: Role::AntiInfantry,
+                needs: None,
+            },
         ],
         defense_basic: "YAGGUN",
         defense_aa: "YAGGUN",
         defense_heavy: "YAPSYT",
         naval_yard: "YAYARD",
         naval_ship: "BSUB",
+        // The Boomer is both hull and capital (its own cruise missiles
+        // spawn aboard, retail Spawns=CMISL), so the second-hull and
+        // capital pair stays empty and the quota line is the whole navy.
         naval_aa: None,
+        naval_hull_extra: None,
+        naval_capital: None,
         aircraft: &[],
         scout: "INIT",
         fortress: None,
+        // The Hover Transport: retail Prerequisite=YAYARD, TechLevel 2,
+        // `Passengers=12`, `MovementZone=Amphibious`.
+        amphibious_transport: Some("YHVR"),
     },
 ];
 
@@ -1077,6 +1209,10 @@ pub struct SuperAi {
     /// so the side's mobile AA answer stands before hostile air arrives.
     /// Pinned state, never read from the runtime.
     aa_issued: bool,
+    /// Whether the amphibious ferry's one-off commission has issued: the
+    /// hover transport builds at the naval yard and the ferry branch owns
+    /// it for life. Pinned state, never read from the runtime.
+    transport_issued: bool,
     /// The remote ore-field cell latched for the expansion refinery once
     /// the home economy reaches its design steady state; kept after the
     /// refinery stands so the second survey can exclude its field.
@@ -1206,6 +1342,9 @@ pub struct SuperAi {
     /// The tick the next raider window may issue at; see
     /// [`RAIDER_RETRY_TICKS`]. Pinned state, never read from the runtime.
     raid_due: u32,
+    /// The tick the next amphibious-ferry window may run at; see
+    /// [`FERRY_WINDOW_TICKS`]. Pinned state, never read from the runtime.
+    ferry_due: u32,
     /// Units the deploy mechanic already toggled: the sim deploy is a
     /// toggle, so a re-issue would undeploy. Pinned state, never read from
     /// the runtime.
@@ -1248,6 +1387,7 @@ impl SuperAi {
             hero_issued: false,
             fortress_issued: false,
             aa_issued: false,
+            transport_issued: false,
             expansion_site: None,
             remote_refinery_stood: false,
             expansion_yard_issued: false,
@@ -1281,6 +1421,7 @@ impl SuperAi {
             board_attempts: std::collections::HashMap::new(),
             raiders: Vec::new(),
             raid_due: 0,
+            ferry_due: 0,
             deploy_issued: std::collections::HashSet::new(),
             deploy_due: 0,
             scout_blacklist: std::collections::HashSet::new(),
@@ -2816,6 +2957,26 @@ impl SuperAi {
             }
         }
 
+        // The amphibious ferry — Layer 3. The side's hover transport
+        // beaches beside its own yard, takes idle infantry aboard with the
+        // engine's own Enter click (the fortress boarding's mechanism — a
+        // transport is one of its Enter targets), rides its Amphibious
+        // zone toward the enemy's mass center and unloads with the Unload
+        // mission. Both legs speak commands a human client also sends
+        // (`MegaMission` Enter and [`Command::UnloadPassengers`]), so the
+        // branch is a pacing problem: one leg per [`FERRY_WINDOW_TICKS`]
+        // window, below every combat, scouting and raiding limb.
+        if tick >= self.ferry_due
+            && let Some(transport_name) = opening.amphibious_transport
+        {
+            self.ferry_due = tick + FERRY_WINDOW_TICKS;
+            if let Some(command) =
+                self.ferry_orders(sim, rules, opening, transport_name, home_center, tick)
+            {
+                return vec![CommandEnvelope::new(self.house, at, command)];
+            }
+        }
+
         // Walk the build ladder while the building queue idles: the opening's
         // fixed five, then the expansion — each further war factory (retail
         // MultipleFactory=0.8 per extra one) with a power plant ahead of it,
@@ -3672,6 +3833,24 @@ impl SuperAi {
             // progressively, so no banked-cost wait belongs here.
             // `can_build`, not the cameo — the country-lock lesson again.
             opening.fortress
+        } else if opening.amphibious_transport.is_some()
+            && !self.transport_issued
+            && self.owns_structure_of_type(sim, opening.naval_yard)
+            && opening
+                .amphibious_transport
+                .and_then(|name| rules.object(name))
+                .is_some_and(|ty| {
+                    crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                        == crate::sim::production::CanBuild::Yes
+                })
+        {
+            // The ferry's one-off commission, the fortress's treatment: a
+            // reserved slot starves under war, a dedicated turn does not.
+            // The hover hulls are naval-yard builds (retail
+            // Prerequisite=GAYARD/NAYARD/YAYARD), so the commission waits
+            // for the shoreline like the naval line behind it.
+            // `can_build`, not the cameo — the country-lock lesson again.
+            opening.amphibious_transport
         } else if !self.expansion_abandoned
             && self.expansion_site.is_some()
             && !self.expansion_yard_issued
@@ -3747,6 +3926,9 @@ impl SuperAi {
             }
             if opening.fortress == Some(name) {
                 self.fortress_issued = true;
+            }
+            if opening.amphibious_transport == Some(name) {
+                self.transport_issued = true;
             }
             if !self.expansion_yard_issued
                 && self.expansion_site.is_some()
@@ -4139,7 +4321,7 @@ impl SuperAi {
         if let Some((engineer, _)) = sim.substrate.entities.iter_sorted().find(|(id, entity)| {
             entity.owner() == self.house
                 && entity.category() == crate::map::entities::EntityCategory::Infantry
-                && sim.interner.resolve(entity.type_ref()) == BRIDGE_ENGINEER_TYPE
+                && sim.interner.resolve(entity.type_ref()) == opening.engineer
                 && entity.lifecycle.object_alive()
                 && self.order_gate.get(id).is_none_or(|&due| tick >= due)
                 && matches!(
@@ -4179,7 +4361,7 @@ impl SuperAi {
             || sim.substrate.entities.iter_sorted().any(|(_, entity)| {
                 entity.owner() == self.house
                     && entity.category() == crate::map::entities::EntityCategory::Infantry
-                    && sim.interner.resolve(entity.type_ref()) == BRIDGE_ENGINEER_TYPE
+                    && sim.interner.resolve(entity.type_ref()) == opening.engineer
                     && entity.lifecycle.object_alive()
             })
         {
@@ -4189,11 +4371,11 @@ impl SuperAi {
         let queue = crate::sim::production::queue_view_for_owner(sim, rules, owner);
         if queue
             .iter()
-            .any(|item| sim.interner.resolve(item.type_id) == BRIDGE_ENGINEER_TYPE)
+            .any(|item| sim.interner.resolve(item.type_id) == opening.engineer)
         {
             return None;
         }
-        let Some(engineer_ty) = rules.object(BRIDGE_ENGINEER_TYPE) else {
+        let Some(engineer_ty) = rules.object(opening.engineer) else {
             return None;
         };
         if crate::sim::production::can_build(sim, rules, self.house, engineer_ty, false, false)
@@ -4202,9 +4384,208 @@ impl SuperAi {
         {
             return None;
         }
-        let type_id = sim.interner.get(BRIDGE_ENGINEER_TYPE)?;
+        let type_id = sim.interner.get(opening.engineer)?;
         self.bridge_retry_due = tick + BRIDGE_RETRY_TICKS;
         Some(Command::QueueProduction { type_id })
+    }
+
+    /// The amphibious ferry's one order for this window, or `None` to fall
+    /// through to the branches below; see the call site in [`Self::orders`].
+    /// The legs, in order: a loaded transport at or past the enemy's side of
+    /// the map unloads; an empty-seat one beached on the home side takes the
+    /// nearest idle boarding candidate with the engine's Enter click; a
+    /// loaded one whose pool has drained sails at the enemy's mass center
+    /// (each candidate zone-gated in the hull's own Amphibious row); an
+    /// empty one walks home — far out to reload, near home onto the yard's
+    /// spread ring so the boarding happens on land. `self` is `&mut` for
+    /// the order gate only — every other read is observation.
+    fn ferry_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        transport_name: &'static str,
+        home_center: Option<(i16, i16)>,
+        tick: u32,
+    ) -> Option<Command> {
+        let home = home_center?;
+        let (transport, entity) = sim.substrate.entities.iter_sorted().find(|(id, entity)| {
+            entity.owner() == self.house
+                && entity.category() == crate::map::entities::EntityCategory::Unit
+                && sim.interner.resolve(entity.type_ref()) == transport_name
+                && !entity.lifecycle.in_limbo()
+                && self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                && matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                )
+        })?;
+        let has_cargo = entity
+            .passenger_role
+            .cargo()
+            .is_some_and(|cargo| cargo.count() > 0);
+        let has_seats = entity
+            .passenger_role
+            .cargo()
+            .is_some_and(|cargo| cargo.count() < cargo.capacity());
+        let at = (entity.position.rx() as i16, entity.position.ry() as i16);
+        let from = (at.0.max(0) as u16, at.1.max(0) as u16);
+        // i32 miles: the cell diffs are tiny, the thresholds below are i32.
+        let chebyshev = |a: (i16, i16), b: (i16, i16)| {
+            i32::from((a.0 - b.0).abs().max((a.1 - b.1).abs()))
+        };
+        let home_distance = chebyshev(at, home);
+        // "The enemy's side": closer to their ground-mass center than to
+        // home — a discharge test that also works on the close maps where
+        // the whole front sits inside [`FERRY_DISCHARGE_DISTANCE`] of the
+        // base.
+        let enemy_side = self
+            .enemy_center(sim)
+            .is_some_and(|aim| chebyshev(at, aim) < home_distance);
+
+        // Discharge: the beachhead. The Unload mission's own admission
+        // sorts the passengers onto legal ground; pacing keeps a refused
+        // unload from soaking the branch — one window per attempt.
+        if has_cargo && (home_distance >= i32::from(FERRY_DISCHARGE_DISTANCE) || enemy_side) {
+            self.gate_idle_order(transport, tick);
+            return Some(Command::UnloadPassengers {
+                transport_id: transport,
+            });
+        }
+
+        // Dock: beached on the home side with seats open — the nearest
+        // idle boarding candidate takes the Enter order before anything
+        // sails, so a loading transport waits for its pool instead of
+        // ferrying one soldier at a time. The pool is the barracks line
+        // (the core soldier plus the infantry roster): the hero never
+        // boards, the dedicated scout pair stays on its chain (Yuri's
+        // initiate both scouts and boards — the same soldier), and the
+        // fortress's reserved cargo and live raiders stay out.
+        let near_home =
+            home_distance < i32::from(FERRY_DISCHARGE_DISTANCE) && !enemy_side;
+        if has_seats && near_home {
+            let mut pool: Vec<&'static str> = opening.infantry.iter().map(|e| e.name).collect();
+            pool.push(opening.basic_infantry);
+            let scout_reserved = opening.scout != opening.basic_infantry;
+            let mut best: Option<(i32, u64)> = None;
+            for (id, candidate) in sim.substrate.entities.iter_sorted() {
+                let type_name = sim.interner.resolve(candidate.type_ref());
+                if !pool.contains(&type_name)
+                    || candidate.owner() != self.house
+                    || candidate.category() != crate::map::entities::EntityCategory::Infantry
+                    || candidate.lifecycle.in_limbo()
+                    || type_name == opening.hero
+                    || (scout_reserved && type_name == opening.scout)
+                    || self.boarders.contains(&id)
+                    || self.raiders.contains(&id)
+                    || self.order_gate.get(&id).is_some_and(|&due| tick < due)
+                    || !matches!(
+                        candidate.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    )
+                {
+                    continue;
+                }
+                let dx = candidate.position.rx() as i16 - at.0;
+                let dy = candidate.position.ry() as i16 - at.1;
+                let distance = i32::from(dx.abs().max(dy.abs()));
+                if distance > i32::from(FERRY_BOARD_RADIUS) {
+                    continue;
+                }
+                if best.is_none_or(|(kept, _)| distance < kept) {
+                    best = Some((distance, id));
+                }
+            }
+            if let Some((_, boarder)) = best {
+                self.gate_idle_order(boarder, tick);
+                return Some(Command::clicked_mission(
+                    boarder,
+                    crate::sim::mission::MissionType::Enter,
+                    crate::sim::combat::TargetKind::Entity(transport),
+                ));
+            }
+        }
+
+        // Sail: loaded, its pool drained (or its seats full, or the beach
+        // behind it already far). The aim is the wave's — the enemy's
+        // priority structures in the transport's rotation, else their mass
+        // center spread — each candidate zone-gated before any order rides
+        // out. Plain Move, not AttackMove: the cargo is the payload, and a
+        // fight on the way must not sink the delivery. No connected aim
+        // (the sea road is cut) costs only this window.
+        if has_cargo {
+            let movement_zone = rules
+                .object(transport_name)
+                .map(|ty| ty.movement_zone)
+                .unwrap_or_default();
+            let enemy_targets = self.enemy_priority_targets(sim);
+            let raw = if enemy_targets.is_empty() {
+                self.enemy_center(sim).and_then(|aim| {
+                    (0..SPREAD_OFFSETS.len())
+                        .map(|index| (transport as usize + index) % SPREAD_OFFSETS.len())
+                        .find_map(|index| {
+                            let spread = SPREAD_OFFSETS[index];
+                            let cell = on_map_cell(
+                                sim,
+                                (aim.0 + i16::from(spread.0), aim.1 + i16::from(spread.1)),
+                                aim,
+                            );
+                            zones_connected(sim, movement_zone, from, cell).then_some(cell)
+                        })
+                })
+            } else {
+                (0..enemy_targets.len())
+                    .map(|attempt| {
+                        enemy_targets[(transport as usize + attempt) % enemy_targets.len()]
+                    })
+                    .find_map(|(_, cell)| {
+                        let cell = (cell.0.max(0) as u16, cell.1.max(0) as u16);
+                        zones_connected(sim, movement_zone, from, cell).then_some(cell)
+                    })
+            };
+            let (rx, ry) = raw?;
+            self.gate_idle_order(transport, tick);
+            return Some(Command::Move {
+                entity_id: transport,
+                target_rx: rx,
+                target_ry: ry,
+            });
+        }
+
+        // Return: empty and far out, walk back to the yard's spread ring
+        // for the next load. No connected ring cell (the sea road home is
+        // cut) costs only this window.
+        if home_distance >= i32::from(FERRY_DISCHARGE_DISTANCE) {
+            let cell =
+                connected_ring_cell(sim, rules, home, from, transport, transport_name)?;
+            self.gate_idle_order(transport, tick);
+            return Some(Command::Move {
+                entity_id: transport,
+                target_rx: cell.0,
+                target_ry: cell.1,
+            });
+        }
+        // Beach: empty on the home side with nobody in reach — walk to the
+        // yard's spread ring so the next windows board on land (a hull
+        // spawned offshore boards nobody from the water; a beached one sits
+        // in the infantry's own neighborhood).
+        if let Some(cell) =
+            connected_ring_cell(sim, rules, home, from, transport, transport_name)
+        {
+            self.gate_idle_order(transport, tick);
+            return Some(Command::Move {
+                entity_id: transport,
+                target_rx: cell.0,
+                target_ry: cell.1,
+            });
+        }
+        None
     }
 
     /// The house's structures as `(entity id, type name)` pairs, in the
@@ -4858,47 +5239,66 @@ impl SuperAi {
     /// infantry have to reach it first.
     /// Whether the type is one of the side's naval hulls — the combat
     /// tables are land rosters, so the ships join the idle and standing
-    /// defense pools by name instead. The wave's zone gate keeps them out
-    /// of ground marches on its own (their water rows never connect to a
-    /// land aim), and the guard-post limb filters them back out: a ship
-    /// cannot hold a land ring.
+    /// defense pools by name instead: the basic hull, the AA escort, the
+    /// second hull and the capital ship. The wave's zone gate keeps them
+    /// out of ground marches on its own (their water rows never connect to
+    /// a land aim), and the guard-post limb filters them back out: a ship
+    /// cannot hold a land ring. The amphibious transport is the ferry
+    /// branch's own charge, not a defense pool member.
     fn is_naval_type(opening: &Opening, name: &str) -> bool {
-        name == opening.naval_ship || opening.naval_aa == Some(name)
+        name == opening.naval_ship
+            || opening.naval_aa == Some(name)
+            || opening.naval_hull_extra == Some(name)
+            || opening.naval_capital == Some(name)
     }
 
     /// The naval layer's production pick (Layer 2.7): the basic hull line
     /// up to [`NAVAL_SHIP_QUOTA`], with the AA escort claiming one turn
     /// once its extra prerequisite honestly passes `can_build` (the
     /// country-lock lesson: the cameo's brightness knows nothing of
-    /// prerequisites). `None` rests the limb — no yard, quota met, or
-    /// nothing honestly buildable yet.
+    /// prerequisites). Past the quota the second hull rotates up to
+    /// [`NAVAL_EXTRA_QUOTA`], and once the battle lab stands the capital
+    /// ship fills [`NAVAL_CAPITAL_QUOTA`] — its retail lab prerequisite is
+    /// exactly the gate the AI house's `CanBuild` would skip, so the lab
+    /// count carries it here. `None` rests the limb — no yard, every
+    /// quota met, or nothing honestly buildable yet.
     fn naval_pick(
         &self,
         sim: &crate::sim::world::Simulation,
         rules: &crate::rules::ruleset::RuleSet,
         opening: &Opening,
     ) -> Option<&'static str> {
+        let buildable = |name: &'static str| {
+            rules.object(name).is_some_and(|ty| {
+                crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                    == crate::sim::production::CanBuild::Yes
+            })
+        };
         let hulls = self.count_units_of_type(sim, opening.naval_ship);
-        if hulls >= NAVAL_SHIP_QUOTA {
-            return None;
-        }
         if let Some(aa) = opening.naval_aa
             && hulls >= 1
             && self.count_units_of_type(sim, aa) < 1
-            && rules.object(aa).is_some_and(|ty| {
-                crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
-                    == crate::sim::production::CanBuild::Yes
-            })
+            && buildable(aa)
         {
             return Some(aa);
         }
-        rules
-            .object(opening.naval_ship)
-            .filter(|ty| {
-                crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
-                    == crate::sim::production::CanBuild::Yes
-            })
-            .map(|_| opening.naval_ship)
+        if hulls < NAVAL_SHIP_QUOTA && buildable(opening.naval_ship) {
+            return Some(opening.naval_ship);
+        }
+        if let Some(extra) = opening.naval_hull_extra
+            && self.count_units_of_type(sim, extra) < NAVAL_EXTRA_QUOTA
+            && buildable(extra)
+        {
+            return Some(extra);
+        }
+        if let Some(capital) = opening.naval_capital
+            && self.owns_structure_of_type(sim, opening.battle_lab)
+            && self.count_units_of_type(sim, capital) < NAVAL_CAPITAL_QUOTA
+            && buildable(capital)
+        {
+            return Some(capital);
+        }
+        None
     }
 
     fn standing_combat_units(
@@ -5735,6 +6135,75 @@ mod tests {
         assert_eq!(ai.house(), house);
         assert_eq!(ai.difficulty(), SuperAiDifficulty::Super);
         assert!(ai.orders(&runtime, 0).is_empty());
+    }
+
+    /// The expanded tables (the engineer split, the naval layer's second
+    /// hull and capital, the roster additions and the ferry transports):
+    /// fast table reads, one row per side. The production logic itself is
+    /// exercised by the retail drives; what this pins is that each side's
+    /// table names the rules sections that side can actually field — the
+    /// Soviet AA escort is the Sea Scorpion, not the anti-hull Squid, the
+    /// Yuri navy keeps its empty pair (the Boomer is both hull and
+    /// capital), and the three engineers are three distinct sections.
+    #[test]
+    fn openings_name_the_expanded_naval_roster_and_ferry_entries() {
+        let opening = |yard: &str| {
+            OPENINGS
+                .iter()
+                .find(|opening| opening.construction_yard == yard)
+                .expect("each side's opening")
+        };
+        let allied = opening("GACNST");
+        assert_eq!(allied.engineer, "ENGINEER");
+        assert_eq!(allied.naval_aa, Some("AEGIS"));
+        assert_eq!(allied.naval_hull_extra, Some("DLPH"));
+        assert_eq!(allied.naval_capital, Some("CARRIER"));
+        assert_eq!(allied.amphibious_transport, Some("LCRF"));
+        assert!(allied
+            .infantry
+            .iter()
+            .any(|entry| entry.name == "CLEG" && entry.needs == Some("GATECH")));
+
+        let soviet = opening("NACNST");
+        assert_eq!(soviet.engineer, "SENGINEER");
+        assert_eq!(
+            soviet.naval_aa,
+            Some("HYD"),
+            "the Sea Scorpion, not the anti-hull Squid, is the AA escort"
+        );
+        assert_eq!(soviet.naval_hull_extra, Some("SQD"));
+        assert_eq!(soviet.naval_capital, Some("DRED"));
+        assert_eq!(soviet.amphibious_transport, Some("SAPC"));
+        assert!(soviet
+            .infantry
+            .iter()
+            .any(|entry| entry.name == "TERROR" && entry.needs.is_none()));
+        assert!(soviet
+            .vehicles
+            .iter()
+            .any(|entry| entry.name == "DTRUCK" && entry.needs == Some("NARADR")));
+
+        let yuri = opening("YACNST");
+        assert_eq!(yuri.engineer, "YENGINEER");
+        assert_eq!(yuri.naval_aa, None);
+        assert_eq!(
+            yuri.naval_hull_extra.and(yuri.naval_capital),
+            None,
+            "the Boomer is both hull and capital"
+        );
+        assert_eq!(yuri.amphibious_transport, Some("YHVR"));
+        assert!(yuri
+            .infantry
+            .iter()
+            .any(|entry| entry.name == "YDOG" && entry.needs.is_none()));
+
+        // The engineer bug's own shape: the three sides name three distinct
+        // rules sections — a shared "ENGINEER" is ForbiddenHouses-refused
+        // outside an Allied base.
+        let mut engineers: Vec<&str> = OPENINGS.iter().map(|opening| opening.engineer).collect();
+        engineers.sort_unstable();
+        engineers.dedup();
+        assert_eq!(engineers, vec!["ENGINEER", "SENGINEER", "YENGINEER"]);
     }
 
     /// A retail XMP03T4 Battle as the Super AI plays it in the bench: the
@@ -7368,6 +7837,38 @@ mod tests {
         (scenario, ai, enemy)
     }
 
+    /// [`pacific_bridge_battle`] with the local house's lobby country
+    /// chosen by the caller: the Soviet engineer's commission needs a
+    /// Soviet house, whose opening resolves through a standing NACNST.
+    fn pacific_bridge_battle_as(
+        country: crate::skirmish_launch::LaunchCountry,
+    ) -> (
+        crate::headless_scenario::HeadlessScenario,
+        InternedId,
+        InternedId,
+    ) {
+        use crate::skirmish_launch::LaunchCountry;
+
+        let ra2 = std::path::PathBuf::from(
+            std::env::var("RA2_DIR").expect("set RA2_DIR to the retail RA2/YR install directory"),
+        );
+        let map = "Pacific.mmx";
+        let mut session = crate::headless_scenario::battle_session(map, &[]);
+        session.local_slot_mut().country = country;
+        session.options.unit_count = 0;
+        let mut scenario =
+            crate::headless_scenario::load_session(&ra2, map, 0x0B21_D6E5, session).unwrap();
+        let ai = scenario
+            .sim()
+            .houses
+            .iter()
+            .find(|(_, house)| house.is_controlled_by_human(true))
+            .map(|(&id, _)| id)
+            .expect("the local house");
+        let enemy = scenario.add_human_house("WaveTargetHouse", LaunchCountry::Russia);
+        (scenario, ai, enemy)
+    }
+
     /// Spawn `type_name` for `owner` at the first legal cell scanning a
     /// small spiral outward from `at` (a spawn refuses occupied or illegal
     /// ground), so the tests do not hard-code Pacific's clear cells.
@@ -7830,6 +8331,50 @@ mod tests {
         assert_eq!(
             recaptures, 0,
             "a standing span must not re-arm the repair limb"
+        );
+    }
+
+    /// The Soviet engineer's commission (the bridge-limb's engineer fix):
+    /// the three sides' engineers are three rules sections, so a Soviet
+    /// house that latches the broken hut must queue [SENGINEER]. The old
+    /// shared "ENGINEER" name is `ForbiddenHouses`-refused in a Soviet
+    /// base — the commission passed `can_build`, answered No, and the
+    /// bridge stayed broken for the game.
+    #[test]
+    #[ignore = "slow; retail; loads a retail map"]
+    fn soviet_bridge_limb_commissions_the_soviet_engineer() {
+        let (mut scenario, ai_house, enemy_house) = pacific_bridge_battle_as(
+            crate::skirmish_launch::LaunchCountry::Russia,
+        );
+        let far = far_shore(&scenario);
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+        // A Soviet yard and barracks at the witnesses' home shore, the
+        // hostile structure beyond the breach, then the collapse.
+        spawn_near(&mut scenario, "NACNST", ai_house, (64, 92));
+        spawn_near(&mut scenario, "NAHAND", ai_house, (66, 92));
+        spawn_near(&mut scenario, "GAPOWR", enemy_house, far);
+        collapse_pacific_bridge(&mut scenario);
+
+        // The commission rides the first survey: within a few orders
+        // passes the infantry queue receives the Soviet engineer — and
+        // never the Allied section name.
+        let mut queued: Vec<String> = Vec::new();
+        for tick in 0..10u32 {
+            for order in ai.orders(&scenario.runtime, tick) {
+                if let crate::sim::command::Command::QueueProduction { type_id } = order.payload {
+                    queued.push(scenario.sim().interner.resolve(type_id).to_string());
+                }
+            }
+        }
+        assert!(
+            queued.iter().any(|name| name == "SENGINEER"),
+            "the Soviet house must commission SENGINEER for the hut: {queued:?}"
+        );
+        assert!(
+            queued.iter().all(|name| name != "ENGINEER"),
+            "the Allied section is ForbiddenHouses-refused in a Soviet base: {queued:?}"
         );
     }
 
