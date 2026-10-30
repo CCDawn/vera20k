@@ -487,6 +487,60 @@ const FERRY_DISCHARGE_DISTANCE: i16 = 28;
 /// stand: the Enter walk stays short and the loading quick.
 const FERRY_BOARD_RADIUS: i16 = 12;
 
+/// Ticks between engineer-capture windows (the neutral-tech scan, the idle
+/// dispatch and the topped-up commission, [`Self::engineer_capture_orders`]):
+/// the scan walks every structure and a refused capture costs a window, so
+/// the branch is paced like the ferry's, never per tick.
+const ENGINEER_CAPTURE_WINDOW_TICKS: u32 = 450;
+
+/// The capture chain's own preference order over [`TECH_BUILDING_TYPES`]:
+/// the oil derrick leads — its `ProduceCashStartup` pays the engineer back
+/// the moment he walks in, and its tick income compounds — then the stock
+/// list's order. Distance picks within a class, never across it.
+const CAPTURE_PRIORITY_TYPES: [&str; 6] =
+    ["CAOILD", "CAAIRP", "CATHOSP", "CAOUTP", "CAMACH", "CAPOWR"];
+
+/// Total engineers (standing plus queued) the capture chain commissions up
+/// to: the bridge repair keeps its own one-at-a-time rule and outranks this
+/// limb, so the capture chain only ever spends the surplus above it.
+const CAPTURE_ENGINEER_STOCK: usize = 2;
+
+/// Ticks a finished (or failed) engineer ride keeps the raid limb asleep:
+/// an engineer-and-vehicle pair spent every cooldown would strip the AA
+/// roster line the waves need, so the raid fires once per breach of the
+/// wallet bar, never continuously.
+const RAID_COOLDOWN_TICKS: u32 = 6000;
+
+/// The wallet above which one engineer-ride raid may arm: comfortably past
+/// the pair's combined cost, so the commission never starves the growth
+/// ladder or the defense line that pays for itself first.
+const RAID_WALLET_CREDITS: i32 = 3000;
+
+/// Hard per-stage budget for the raid state machine: a leg that has not
+/// landed in this long (a refused Enter, an unload the ground refuses, a
+/// capture the arrival rules void) tears the raid down and arms the
+/// cooldown, so a wedged leg cannot pin the state forever. Sized for the
+/// sail: a loaded ride crossing a 512-cell map at vehicle speed runs
+/// past a tight bound, and tearing that leg down mid-sea strands the
+/// engineer in the hold — the wedge this budget exists to break costs
+/// two idle units for forty seconds, the cheaper failure.
+const RAID_STAGE_TIMEOUT_TICKS: u32 = 1800;
+
+/// Chebyshev distance from the raid target within which the loaded ride
+/// unloads: close enough that the walk-in stays short, far enough to stay
+/// outside the target's own foundation.
+const RAID_ARRIVAL_DISTANCE: i32 = 6;
+
+/// Enemy superweapon structures the spy infiltrates first: the arrival
+/// resets the charging special's clock (the recon facts' infiltration
+/// table), so the piece that can level the base outranks the rest.
+const ENEMY_SUPERWEAPON_TYPES: [&str; 6] =
+    ["GAWEAT", "NAIRON", "YAPPET", "GACSPH", "NAMISL", "YAGNTC"];
+
+/// Enemy radar structures the spy infiltrates next: the arrival knocks the
+/// radar offline, blinding their response while the waves march.
+const ENEMY_RADAR_TYPES: [&str; 4] = ["GAAIRC", "AMRADR", "NARADR", "NAPSIS"];
+
 /// How many dark cells nearest the scout get the zone-connection check: the
 /// scan effort stays capped even on a map whose every near candidate is
 /// across a breach.
@@ -568,6 +622,47 @@ struct FutilityState {
     cell: (u16, u16),
     strikes: u32,
     suppress_until: u32,
+}
+
+/// The engineer-ride raid's one live cycle (the engineer-in-an-IFV/Flak-
+/// Track quick strike), its stage machine marched one leg per window in
+/// [`Self::engineer_raid_orders`]. Every variant names both actors it
+/// still needs — a leg whose actor died tears the raid down — and the
+/// owner pins the leg's start tick beside it for the hard stage timeout.
+#[derive(Clone, Copy, Debug)]
+enum EngineerRaid {
+    /// Both commissioned or found; the Enter walk is pending.
+    Boarding { engineer: u64, ride: u64 },
+    /// The engineer rides (in the hold, in limbo); the vehicle attack-moves
+    /// at the latched enemy target.
+    Sailing {
+        engineer: u64,
+        ride: u64,
+        target: u64,
+    },
+    /// Arrived at the target: the unload lands, and the engineer
+    /// re-appears on foot after the hold's own discharge delay.
+    Unloading {
+        engineer: u64,
+        ride: u64,
+        target: u64,
+    },
+    /// The engineer stands beside the target again; the capture click is
+    /// his to walk in and be consumed by.
+    Capturing { engineer: u64, target: u64 },
+}
+
+impl EngineerRaid {
+    /// Every entity id the current stage leans on, for the wave pool's
+    /// exclusion and the liveness checks.
+    fn actors(&self) -> Vec<u64> {
+        match *self {
+            EngineerRaid::Boarding { engineer, ride }
+            | EngineerRaid::Sailing { engineer, ride, .. }
+            | EngineerRaid::Unloading { engineer, ride, .. } => vec![engineer, ride],
+            EngineerRaid::Capturing { engineer, .. } => vec![engineer],
+        }
+    }
 }
 
 /// The ladder the Super AI plays at.
@@ -665,6 +760,15 @@ struct Opening {
     /// (the hut dispatch and the commission alike) reads this field; a
     /// shared "ENGINEER" name commissioned nobody outside an Allied base.
     engineer: &'static str,
+    /// The side's land transport an engineer rides into a raid (retail
+    /// `Passengers=` war-factory vehicles): the Allied IFV [FV] and the
+    /// Soviet Flak Track [HTK], both already on the roster's anti-air line
+    /// (what the vehicle turns into under an engineer's IFVMode is the
+    /// delivery's problem, not the table's). `None` where the side fields
+    /// no land transport — Yuri's only hulls are the amphibious Hover
+    /// Transport (the ferry's) and the sea Boomer — so the raid branch
+    /// sleeps.
+    engineer_ride: Option<&'static str>,
     /// The side's superweapon structure and the special it grants
     /// (retail `SuperWeapon=` on the building): Weather Controller,
     /// Iron Curtain, Psychic Dominator. Every retail one is
@@ -802,6 +906,9 @@ const OPENINGS: [Opening; 3] = [
         // The Allied section: ForbiddenHouses refuses the Soviet and Yuri
         // countries ([SENGINEER]/[YENGINEER] are their sides' twins).
         engineer: "ENGINEER",
+        // The IFV: the raid ride (an engineer aboard is a repair vehicle by
+        // IFVMode — irrelevant to the delivery) and the roster's own AA lead.
+        engineer_ride: Some("FV"),
         super_weapon_building: "GAWEAT",
         super_weapon_type: "LightningStormSpecial",
         second_super_weapon_building: "GACSPH",
@@ -926,6 +1033,8 @@ const OPENINGS: [Opening; 3] = [
         // The Soviet section: ForbiddenHouses refuses the Allies and Yuri
         // (retail [SENGINEER], image ENGINEER).
         engineer: "SENGINEER",
+        // The Flak Track: the raid ride and the roster's own AA lead.
+        engineer_ride: Some("HTK"),
         super_weapon_building: "NAIRON",
         super_weapon_type: "IronCurtainSpecial",
         second_super_weapon_building: "NAMISL",
@@ -1067,6 +1176,9 @@ const OPENINGS: [Opening; 3] = [
         // The Yuri section: ForbiddenHouses refuses the Allies and the
         // Soviets (retail [YENGINEER], image ENGINEER).
         engineer: "YENGINEER",
+        // No land transport: Yuri's only `Passengers=` hull is the amphibious
+        // Hover Transport the ferry owns — the raid branch stays asleep.
+        engineer_ride: None,
         super_weapon_building: "YAPPET",
         super_weapon_type: "PsychicDominatorSpecial",
         second_super_weapon_building: "YAGNTC",
@@ -1325,6 +1437,30 @@ pub struct SuperAi {
     /// The tick the repair limb's next dispatch or commission may issue;
     /// see [`BRIDGE_RETRY_TICKS`]. Pinned state, never read from the runtime.
     bridge_retry_due: u32,
+    /// Engineers already dispatched at a neutral tech building, by id, with
+    /// the building each walks at: consumed (success) or lost engineers and
+    /// no-longer-neutral targets drop out; a bound engineer is this chain's
+    /// own and draws no second order. Pinned state, never read from the
+    /// runtime.
+    capture_bound: std::collections::HashMap<u64, u64>,
+    /// The tick the next engineer-capture window may run at; see
+    /// [`ENGINEER_CAPTURE_WINDOW_TICKS`]. Pinned state, never read from the
+    /// runtime.
+    capture_due: u32,
+    /// The live engineer-ride raid cycle, one at a time; see
+    /// [`EngineerRaid`]. Pinned state, never read from the runtime.
+    raid_stage: Option<EngineerRaid>,
+    /// The tick the current raid stage started at, for the hard
+    /// [`RAID_STAGE_TIMEOUT_TICKS`] budget. Pinned state, never read from
+    /// the runtime.
+    raid_stage_since: u32,
+    /// The tick the next raid cycle may arm at; see [`RAID_COOLDOWN_TICKS`].
+    /// Pinned state, never read from the runtime.
+    raid_cooldown_until: u32,
+    /// The tick the next raid arming window may run at; see
+    /// [`ENGINEER_CAPTURE_WINDOW_TICKS`]. Pinned state, never read from the
+    /// runtime.
+    raid_due: u32,
     /// Blocker shoves spent per opening MCV, keyed by entity id, each
     /// budget keyed to the latched cell it was spent at; see
     /// [`SHOVE_ATTEMPTS`]. Pinned state, never read from the runtime.
@@ -1456,6 +1592,12 @@ impl SuperAi {
             bridge_hut: None,
             bridge_engineer: None,
             bridge_retry_due: 0,
+            capture_bound: std::collections::HashMap::new(),
+            capture_due: 0,
+            raid_stage: None,
+            raid_stage_since: 0,
+            raid_cooldown_until: 0,
+            raid_due: 0,
             shove_attempts: std::collections::HashMap::new(),
             shove_origin: std::collections::HashMap::new(),
             mcv_stuck_since: std::collections::HashMap::new(),
@@ -2193,13 +2335,16 @@ impl SuperAi {
                         };
                         // Layer 3: the hero never rides the generic wave (his
                         // own branch owns him), reserved boarders and raiders
-                        // are off the pool while their orders run, and the
-                        // fortress stays home while its seats are open and
-                        // boarding is in progress.
+                        // are off the pool while their orders run, the raid
+                        // cycle's engineer and ride likewise (their stage
+                        // machine owns them), and the fortress stays home
+                        // while its seats are open and boarding is in
+                        // progress.
                         let type_name = sim.interner.resolve(entity.type_ref());
                         if type_name == opening.hero
                             || self.boarders.contains(&unit)
                             || self.raiders.contains(&unit)
+                            || self.raid_involves(unit)
                         {
                             continue;
                         }
@@ -3007,9 +3152,13 @@ impl SuperAi {
         }
 
         // The spy's infiltration run — Layer 3. The one commissioned
-        // infiltrator walks at the nearest revealed neutral tech building
-        // with the engine's own capture click (the arrival sorts out what a
-        // spy does there); with nothing revealed to run at, it stays home
+        // infiltrator walks at the nearest revealed enemy structure the
+        // infiltration table pays on — the enemy's superweapon (the charge
+        // reset) first, then its radar, its power plants, any standing
+        // structure ([`spy_infiltration_rank`], nearest within a class) —
+        // and only where no enemy aim stands revealed does the old neutral
+        // tech tour run (the stock YR list's buildings the arrival mostly
+        // ignores). With nothing revealed to run at, the spy stays home
         // like any other garrison piece. The futility backoff bounds the
         // re-issue loop the same way the scout's march is bounded.
         if let Some((spy, spy_entity)) = sim.substrate.entities.iter_sorted().find(|(id, entity)| {
@@ -3029,7 +3178,10 @@ impl SuperAi {
                 )
         }) {
             let from = (spy_entity.position.rx() as i16, spy_entity.position.ry() as i16);
-            if let Some(target) = self.nearest_revealed_tech(sim, from)
+            let target = self
+                .nearest_enemy_infiltration_target(sim, from)
+                .or_else(|| self.nearest_revealed_tech(sim, from));
+            if let Some(target) = target
                 && !self.futile(
                     spy,
                     FutilityKind::Spy,
@@ -3067,6 +3219,28 @@ impl SuperAi {
             {
                 return vec![CommandEnvelope::new(self.house, at, command)];
             }
+        }
+
+        // The engineer's neutral-tech capture — Layer 3. A revealed tech
+        // building still held by a neutral house is free money (the oil
+        // derrick's startup cash first), and an engineer the side can spare
+        // walks in with the engine's own capture click; the window paces
+        // the scan, the dispatch and the capped commission alike. Below the
+        // bridge limb on purpose: that chain keeps its own engineer and its
+        // own dispatch, this one spends the surplus.
+        if let Some(command) =
+            self.engineer_capture_orders(sim, rules, opening, home_center, tick)
+        {
+            return vec![CommandEnvelope::new(self.house, at, command)];
+        }
+
+        // The engineer-ride raid — Layer 3. An engineer in the side's land
+        // transport rides the enemy priority structures and walks in where
+        // he lands: the pair commissions behind the raid's own wallet bar
+        // and cooldown, and the armed stage machine spends one command per
+        // tick. Yuri's side fields no land transport and the branch sleeps.
+        if let Some(command) = self.engineer_raid_orders(sim, rules, opening, tick) {
+            return vec![CommandEnvelope::new(self.house, at, command)];
         }
 
         // Walk the build ladder while the building queue idles: the opening's
@@ -4526,7 +4700,10 @@ impl SuperAi {
     /// buildable type and a comfortably fat wallet ([`BRIDGE_ENGINEER_
     /// CREDITS`]), so the commission never wedges the growth ladder the way
     /// a broke base's queue would (the air wing's top-up guard, in
-    /// miniature). The retry window paces it like any dispatch.
+    /// miniature). The retry window paces it like any dispatch. The
+    /// mechanical halves (stock count, buildability) are the capture
+    /// chain's too — see [`Self::engineer_stock`] and
+    /// [`Self::engineer_commission_type`].
     fn commission_repair_engineer(
         &mut self,
         sim: &crate::sim::world::Simulation,
@@ -4534,37 +4711,606 @@ impl SuperAi {
         opening: &Opening,
         tick: u32,
     ) -> Option<Command> {
-        if tick < self.bridge_retry_due
-            || self.count_structures_of_type(sim, opening.barracks) == 0
-            || sim.substrate.entities.iter_sorted().any(|(_, entity)| {
+        if tick < self.bridge_retry_due {
+            return None;
+        }
+        let (standing, queued) = self.engineer_stock(sim, rules, opening);
+        if standing + queued > 0 {
+            return None;
+        }
+        let type_id = self.engineer_commission_type(sim, rules, opening)?;
+        if crate::sim::production::credits_for_owner(sim, sim.interner.resolve(self.house))
+            < BRIDGE_ENGINEER_CREDITS
+        {
+            return None;
+        }
+        self.bridge_retry_due = tick + BRIDGE_RETRY_TICKS;
+        Some(Command::QueueProduction { type_id })
+    }
+
+    /// The side's live engineer stock: how many stand alive and how many
+    /// sit in the production queue. Both engineer chains' commission caps
+    /// read it — the bridge's one-at-a-time and the capture chain's
+    /// [`CAPTURE_ENGINEER_STOCK`] surplus.
+    fn engineer_stock(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+    ) -> (usize, usize) {
+        let standing = sim
+            .substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
                 entity.owner() == self.house
                     && entity.category() == crate::map::entities::EntityCategory::Infantry
                     && sim.interner.resolve(entity.type_ref()) == opening.engineer
                     && entity.lifecycle.object_alive()
             })
-        {
-            return None;
-        }
+            .count();
         let owner = sim.interner.resolve(self.house);
-        let queue = crate::sim::production::queue_view_for_owner(sim, rules, owner);
-        if queue
+        let queued = crate::sim::production::queue_view_for_owner(sim, rules, owner)
             .iter()
-            .any(|item| sim.interner.resolve(item.type_id) == opening.engineer)
-        {
+            .filter(|item| sim.interner.resolve(item.type_id) == opening.engineer)
+            .count();
+        (standing, queued)
+    }
+
+    /// The engineer commission's shared admission: a standing barracks, a
+    /// buildable type (`can_build` — the country-lock lesson), the interned
+    /// id. The stock caps and wallet bars stay with the callers: the bridge
+    /// chain keeps its stricter one-at-a-time, the capture chain spends
+    /// only its surplus.
+    fn engineer_commission_type(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+    ) -> Option<InternedId> {
+        if self.count_structures_of_type(sim, opening.barracks) == 0 {
             return None;
         }
-        let Some(engineer_ty) = rules.object(opening.engineer) else {
-            return None;
-        };
+        let engineer_ty = rules.object(opening.engineer)?;
         if crate::sim::production::can_build(sim, rules, self.house, engineer_ty, false, false)
             != crate::sim::production::CanBuild::Yes
-            || crate::sim::production::credits_for_owner(sim, owner) < BRIDGE_ENGINEER_CREDITS
         {
             return None;
         }
-        let type_id = sim.interner.get(opening.engineer)?;
-        self.bridge_retry_due = tick + BRIDGE_RETRY_TICKS;
+        sim.interner.get(opening.engineer)
+    }
+
+    /// The engineer-capture limb's one order for this window, or `None`;
+    /// see the call site in [`Self::orders`]. The survey half picks the
+    /// nearest revealed neutral-owned tech building — the oil derrick's
+    /// class first ([`capture_priority_rank`], its `ProduceCashStartup`
+    /// pays the engineer back on entry), nearest within a class — and the
+    /// dispatch half sends an idle engineer with the engine's own capture
+    /// click: the engine walks him in, runs the arrival checks and consumes
+    /// him, which the [`Self::capture_bound`] hygiene reads as success (a
+    /// target that no longer stands neutral drops out with him — the chain
+    /// does not retake lost ground). With no idle engineer the limb
+    /// commissions one through the shared commission core, capped at
+    /// [`CAPTURE_ENGINEER_STOCK`] total standing-plus-queued — the bridge
+    /// repair's one-at-a-time rule outranks this limb and keeps its own,
+    /// and the same never-wedge-the-ladder wallet bar stands in front of
+    /// the queue. The bridge limb's own walker, the reserved boarders and
+    /// raiders and the raid cycle's actors stay out.
+    fn engineer_capture_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        home_center: Option<(i16, i16)>,
+        tick: u32,
+    ) -> Option<Command> {
+        if tick < self.capture_due {
+            return None;
+        }
+        self.capture_due = tick + ENGINEER_CAPTURE_WINDOW_TICKS;
+        let home = home_center?;
+
+        // Hygiene: a consumed engineer (the capture succeeded — the engine
+        // eats him on entry) or a lost one leaves the bound set, and so does
+        // a target no longer held by a neutral house.
+        self.capture_bound.retain(|&engineer, &target| {
+            let engineer_busy = sim
+                .substrate
+                .entities
+                .get(engineer)
+                .is_some_and(|entity| {
+                    entity.owner() == self.house && entity.lifecycle.object_alive()
+                });
+            let target_neutral = sim.substrate.entities.get(target).is_some_and(|entity| {
+                entity.category() == crate::map::entities::EntityCategory::Structure
+                    && entity.lifecycle.object_alive()
+                    && sim
+                        .houses
+                        .get(&entity.owner())
+                        .is_some_and(|house| house.multiplay_passive())
+            });
+            engineer_busy && target_neutral
+        });
+
+        // The survey: the nearest revealed neutral tech building, oil
+        // derrick first. The neutral owner is a passive house (the same
+        // reading the spy's scan makes); anything a combatant holds is not
+        // this chain's errand.
+        let mut best: Option<(usize, i32, u64)> = None;
+        for (id, entity) in sim.substrate.entities.iter_sorted() {
+            if entity.category() != crate::map::entities::EntityCategory::Structure
+                || entity.lifecycle.in_limbo()
+                || !entity.lifecycle.object_alive()
+            {
+                continue;
+            }
+            let type_name = sim.interner.resolve(entity.type_ref());
+            let Some(rank) = capture_priority_rank(type_name) else {
+                continue;
+            };
+            let owner = entity.owner();
+            if owner == self.house
+                || sim
+                    .houses
+                    .get(&owner)
+                    .is_none_or(|house| !house.multiplay_passive())
+                || !sim.fog.is_cell_revealed(self.house, entity.position.rx(), entity.position.ry())
+            {
+                continue;
+            }
+            let dx = i32::from(entity.position.rx()) - i32::from(home.0);
+            let dy = i32::from(entity.position.ry()) - i32::from(home.1);
+            let distance = dx.abs().max(dy.abs());
+            if best.is_none_or(|(kept_rank, kept_distance, _)| {
+                (rank, distance) < (kept_rank, kept_distance)
+            }) {
+                best = Some((rank, distance, id));
+            }
+        }
+        let Some((_, _, target)) = best else {
+            return None;
+        };
+
+        // The dispatch: an idle engineer free of every other chain. A bound
+        // one whose order the command layer dropped stands mission-less here
+        // and is re-pointed at the same target — the bridge limb's re-issue
+        // rule, paced by this window instead of its retry clock.
+        if let Some((engineer, _)) = sim.substrate.entities.iter_sorted().find(|(id, entity)| {
+            entity.owner() == self.house
+                && entity.category() == crate::map::entities::EntityCategory::Infantry
+                && sim.interner.resolve(entity.type_ref()) == opening.engineer
+                && entity.lifecycle.object_alive()
+                && !entity.lifecycle.in_limbo()
+                && self.bridge_engineer != Some(*id)
+                && !self.boarders.contains(id)
+                && !self.raiders.contains(id)
+                && !self.raid_involves(*id)
+                && self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                && matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                )
+        }) {
+            self.capture_bound.insert(engineer, target);
+            self.gate_idle_order(engineer, tick);
+            return Some(Command::CaptureBuilding {
+                engineer_id: engineer,
+                target_building_id: target,
+            });
+        }
+
+        // No idle engineer: commission into the surplus only — total stock
+        // (standing plus queued) under the cap, behind the same wallet bar
+        // the bridge commission pays.
+        let (standing, queued) = self.engineer_stock(sim, rules, opening);
+        if standing + queued >= CAPTURE_ENGINEER_STOCK {
+            return None;
+        }
+        let type_id = self.engineer_commission_type(sim, rules, opening)?;
+        if crate::sim::production::credits_for_owner(sim, sim.interner.resolve(self.house))
+            < BRIDGE_ENGINEER_CREDITS
+        {
+            return None;
+        }
         Some(Command::QueueProduction { type_id })
+    }
+
+    /// Whether the live raid cycle leans on this entity: the wave pool and
+    /// the capture dispatch keep their hands off both actors while the
+    /// stage machine owns them.
+    fn raid_involves(&self, unit: u64) -> bool {
+        self.raid_stage
+            .is_some_and(|raid| raid.actors().contains(&unit))
+    }
+
+    /// Tear the live raid cycle down and arm the cooldown: the terminal of
+    /// every failure (a lost actor, a wedged leg) and of the success alike —
+    /// the consumed engineer clears the stage the same way a dead one does.
+    fn end_engineer_raid(&mut self, tick: u32) {
+        self.raid_stage = None;
+        self.raid_cooldown_until = tick + RAID_COOLDOWN_TICKS;
+    }
+
+    /// The engineer-ride raid's one order for this tick, or `None`; see the
+    /// call site in [`Self::orders`]. An armed cycle (see [`EngineerRaid`])
+    /// marches every tick — each leg is one command wide and the order gate
+    /// paces the re-issues — while arming a fresh cycle is the paced half:
+    /// once per window, behind the cooldown, the wallet bar
+    /// ([`RAID_WALLET_CREDITS`]) and a buildable ride, it secures the pair
+    /// (an idle engineer and an idle ride on hand, or one commissioned per
+    /// window, queue dedup included) and latches
+    /// [`EngineerRaid::Boarding`]. Every stage is bounded by
+    /// [`RAID_STAGE_TIMEOUT_TICKS`] and every lost actor tears the cycle
+    /// into the cooldown; Yuri's side keeps `None` in
+    /// `Opening::engineer_ride` and never gets here.
+    fn engineer_raid_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        tick: u32,
+    ) -> Option<Command> {
+        let ride_name = opening.engineer_ride?;
+        // The stage machine first — an armed cycle marches whatever the
+        // wallet does afterwards.
+        if let Some(stage) = self.raid_stage {
+            return self.engineer_raid_stage(sim, stage, tick);
+        }
+        if tick < self.raid_cooldown_until || tick < self.raid_due {
+            return None;
+        }
+        self.raid_due = tick + ENGINEER_CAPTURE_WINDOW_TICKS;
+        // The arming gate: a fat wallet, a known enemy to aim at, a ride
+        // the war factory can actually build.
+        if crate::sim::production::credits_for_owner(sim, sim.interner.resolve(self.house))
+            < RAID_WALLET_CREDITS
+            || self.enemy_center(sim).is_none()
+            || self.count_structures_of_type(sim, opening.war_factory) == 0
+        {
+            return None;
+        }
+        let Some(ride_ty) = rules.object(ride_name) else {
+            return None;
+        };
+        if crate::sim::production::can_build(sim, rules, self.house, ride_ty, false, false)
+            != crate::sim::production::CanBuild::Yes
+        {
+            return None;
+        }
+        // Secure the pair: idle units first — the same idle reading every
+        // dispatch makes, each actor free of the other chains — else one
+        // commission per window (the queue dedup is the pacing when both
+        // are missing). The engineer commission honors the side-wide stock
+        // cap: the capture chain and this one draw the same well.
+        let engineer = self.find_raid_engineer(sim, opening, tick);
+        let ride = self.find_raid_ride(sim, ride_name, tick);
+        match (engineer, ride) {
+            (Some(engineer), Some(ride)) => {
+                self.raid_stage = Some(EngineerRaid::Boarding { engineer, ride });
+                self.raid_stage_since = tick;
+                None
+            }
+            (None, _) => {
+                let (standing, queued) = self.engineer_stock(sim, rules, opening);
+                if queued > 0 || standing + queued >= CAPTURE_ENGINEER_STOCK {
+                    // One engineer already in the pipe serves whichever chain
+                    // pops him; the stock cap keeps the side at two total.
+                    return None;
+                }
+                self.engineer_commission_type(sim, rules, opening)
+                    .map(|type_id| Command::QueueProduction { type_id })
+            }
+            (_, None) => {
+                // The ride's queue dedup is this arm's pacing: a ride in the
+                // pipe is the raid's already; another would pile up every
+                // window the field's stay busy.
+                let owner = sim.interner.resolve(self.house);
+                let ride_queued = crate::sim::production::queue_view_for_owner(sim, rules, owner)
+                    .iter()
+                    .any(|item| sim.interner.resolve(item.type_id) == ride_name);
+                if ride_queued {
+                    return None;
+                }
+                let type_id = sim.interner.get(ride_name)?;
+                Some(Command::QueueProduction { type_id })
+            }
+        }
+    }
+
+    /// An idle engineer free of every other chain, for the raid's arming
+    /// half — the capture dispatch's reading minus the bound set (a bound
+    /// engineer is the neutral-tech chain's own).
+    fn find_raid_engineer(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+        tick: u32,
+    ) -> Option<u64> {
+        sim.substrate.entities.iter_sorted().find(|(id, entity)| {
+            entity.owner() == self.house
+                && entity.category() == crate::map::entities::EntityCategory::Infantry
+                && sim.interner.resolve(entity.type_ref()) == opening.engineer
+                && entity.lifecycle.object_alive()
+                && !entity.lifecycle.in_limbo()
+                && !self.capture_bound.contains_key(id)
+                && self.bridge_engineer != Some(*id)
+                && !self.boarders.contains(id)
+                && !self.raiders.contains(id)
+                && self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                && matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                )
+        }).map(|(id, _)| id)
+    }
+
+    /// An idle ride free of every other chain, for the raid's arming half.
+    fn find_raid_ride(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        ride_name: &str,
+        tick: u32,
+    ) -> Option<u64> {
+        sim.substrate.entities.iter_sorted().find(|(id, entity)| {
+            entity.owner() == self.house
+                && entity.category() == crate::map::entities::EntityCategory::Unit
+                && sim.interner.resolve(entity.type_ref()) == ride_name
+                && entity.lifecycle.object_alive()
+                && !entity.lifecycle.in_limbo()
+                && self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                && matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                )
+        }).map(|(id, _)| id)
+    }
+
+    /// The armed cycle's leg for this tick; see [`Self::engineer_raid_orders`].
+    /// Each leg advances or re-issues one command wide, bounded by the stage
+    /// clock and the actors' liveness.
+    fn engineer_raid_stage(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        stage: EngineerRaid,
+        tick: u32,
+    ) -> Option<Command> {
+        // The hard stage budget: a leg that has not landed in this long
+        // tears the raid down into the cooldown.
+        if tick.saturating_sub(self.raid_stage_since) >= RAID_STAGE_TIMEOUT_TICKS {
+            self.end_engineer_raid(tick);
+            return None;
+        }
+        // Liveness: any lost actor ends the cycle — the consumed engineer is
+        // the capture's success, the dead one its failure; the engine does
+        // not tell them apart and the cooldown does not care.
+        if stage
+            .actors()
+            .into_iter()
+            .any(|actor| {
+                sim.substrate.entities.get(actor).is_none_or(|entity| {
+                    entity.owner() != self.house || !entity.lifecycle.object_alive()
+                })
+            })
+        {
+            self.end_engineer_raid(tick);
+            return None;
+        }
+        match stage {
+            EngineerRaid::Boarding { engineer, ride } => {
+                let aboard = sim.substrate.entities.get(ride).is_some_and(|entity| {
+                    entity
+                        .passenger_role
+                        .cargo()
+                        .is_some_and(|cargo| cargo.passengers().contains(&engineer))
+                });
+                if aboard {
+                    // Latch the raid's aim now, zone-gated from the ride's
+                    // own cell: the first enemy priority structure the
+                    // ground rows still connect to. None reachable yet —
+                    // more scouting may open one — costs this tick only,
+                    // the stage clock bounds the wait.
+                    let Some(ride_entity) = sim.substrate.entities.get(ride) else {
+                        return None;
+                    };
+                    let from = (
+                        (ride_entity.position.rx() as i16).max(0) as u16,
+                        (ride_entity.position.ry() as i16).max(0) as u16,
+                    );
+                    let target = self.enemy_priority_targets(sim).into_iter().find(
+                        |(_, cell)| {
+                            zones_connected(
+                                sim,
+                                crate::rules::locomotor_type::MovementZone::Normal,
+                                from,
+                                (cell.0.max(0) as u16, cell.1.max(0) as u16),
+                            )
+                        },
+                    );
+                    if let Some((target, _)) = target {
+                        self.raid_stage = Some(EngineerRaid::Sailing {
+                            engineer,
+                            ride,
+                            target,
+                        });
+                        self.raid_stage_since = tick;
+                    }
+                    return None;
+                }
+                // The Enter walk: re-issued only when both stand idle again
+                // (a dropped order, a refused Enter), gate-paced.
+                let both_idle = sim
+                    .substrate
+                    .entities
+                    .get(engineer)
+                    .and_then(|engineer_entity| {
+                        sim.substrate.entities.get(ride).map(|ride_entity| {
+                            matches!(
+                                engineer_entity.passive_acquire_mission(),
+                                crate::sim::mission::MissionType::None
+                                    | crate::sim::mission::MissionType::Sleep
+                                    | crate::sim::mission::MissionType::Guard
+                                    | crate::sim::mission::MissionType::AreaGuard
+                            ) && matches!(
+                                ride_entity.passive_acquire_mission(),
+                                crate::sim::mission::MissionType::None
+                                    | crate::sim::mission::MissionType::Sleep
+                                    | crate::sim::mission::MissionType::Guard
+                                    | crate::sim::mission::MissionType::AreaGuard
+                            )
+                        })
+                    })
+                    .unwrap_or(false);
+                if both_idle
+                    && self
+                        .order_gate
+                        .get(&engineer)
+                        .is_none_or(|&due| tick >= due)
+                {
+                    self.gate_idle_order(engineer, tick);
+                    return Some(Command::clicked_mission(
+                        engineer,
+                        crate::sim::mission::MissionType::Enter,
+                        crate::sim::combat::TargetKind::Entity(ride),
+                    ));
+                }
+                None
+            }
+            EngineerRaid::Sailing {
+                engineer,
+                ride,
+                target,
+            } => {
+                let Some(target_entity) = sim.substrate.entities.get(target) else {
+                    // The enemy razed the aim mid-sail: no delivery left.
+                    self.end_engineer_raid(tick);
+                    return None;
+                };
+                let aim = (
+                    target_entity.position.rx() as i16,
+                    target_entity.position.ry() as i16,
+                );
+                let Some(ride_entity) = sim.substrate.entities.get(ride) else {
+                    return None;
+                };
+                let at = (
+                    ride_entity.position.rx() as i16,
+                    ride_entity.position.ry() as i16,
+                );
+                let distance = i32::from((at.0 - aim.0).abs().max(at.1 - aim.1).max(0));
+                if distance <= RAID_ARRIVAL_DISTANCE {
+                    self.raid_stage = Some(EngineerRaid::Unloading {
+                        engineer,
+                        ride,
+                        target,
+                    });
+                    self.raid_stage_since = tick;
+                    return None;
+                }
+                // Re-issue the march only when the ride stands idle again —
+                // interrupted, or the arrival it managed fell short — and
+                // the order gate lets it (a dropped order waits its gate,
+                // never a per-tick churn).
+                if matches!(
+                    ride_entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                ) && self.order_gate.get(&ride).is_none_or(|&due| tick >= due)
+                {
+                    self.gate_idle_order(ride, tick);
+                    return Some(Command::AttackMove {
+                        entity_id: ride,
+                        target: None,
+                        destination: Some(crate::sim::combat::TargetKind::Cell(
+                            aim.0.max(0) as u16,
+                            aim.1.max(0) as u16,
+                        )),
+                    });
+                }
+                None
+            }
+            EngineerRaid::Unloading {
+                engineer,
+                ride,
+                target,
+            } => {
+                // The hold's discharge delay: the engineer rides in limbo a
+                // beat after the unload before he stands on foot again —
+                // poll until then, the stage clock bounding the wait.
+                let on_foot = sim.substrate.entities.get(engineer).is_some_and(|entity| {
+                    entity.owner() == self.house
+                        && entity.lifecycle.object_alive()
+                        && !entity.lifecycle.in_limbo()
+                });
+                if on_foot {
+                    self.raid_stage = Some(EngineerRaid::Capturing { engineer, target });
+                    self.raid_stage_since = tick;
+                    return None;
+                }
+                // Still aboard: the unload goes out when the ride stands
+                // still (the arrival leg's own stop, or a refused attempt's
+                // idle again), gate-paced like every re-issue.
+                let ride_idle = sim.substrate.entities.get(ride).is_some_and(|entity| {
+                    matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    )
+                });
+                if ride_idle && self.order_gate.get(&ride).is_none_or(|&due| tick >= due) {
+                    self.gate_idle_order(ride, tick);
+                    return Some(Command::UnloadPassengers { transport_id: ride });
+                }
+                None
+            }
+            EngineerRaid::Capturing { engineer, target } => {
+                // The aim still standing is the point: razed mid-walk, the
+                // click is void and the engineer walks home.
+                let target_stands = sim
+                    .substrate
+                    .entities
+                    .get(target)
+                    .is_some_and(|entity| entity.lifecycle.object_alive());
+                if !target_stands {
+                    self.end_engineer_raid(tick);
+                    return None;
+                }
+                // The capture click: re-issued only when the engineer stands
+                // idle again (the dropped order), gate-paced like the rest.
+                if sim.substrate.entities.get(engineer).is_some_and(|entity| {
+                    matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    )
+                }) && self
+                    .order_gate
+                    .get(&engineer)
+                    .is_none_or(|&due| tick >= due)
+                {
+                    self.gate_idle_order(engineer, tick);
+                    return Some(Command::CaptureBuilding {
+                        engineer_id: engineer,
+                        target_building_id: target,
+                    });
+                }
+                None
+            }
+        }
     }
 
     /// The amphibious ferry's one order for this window, or `None` to fall
@@ -5449,6 +6195,50 @@ impl SuperAi {
             })
     }
 
+    /// The nearest revealed enemy structure the spy's arrival pays on,
+    /// priority class first ([`spy_infiltration_rank`]: the enemy's
+    /// superweapon, then its radar, its power plants, any standing
+    /// structure) and nearest within a class — with the ground rows still
+    /// connecting it to `from`, since a revealed aim across a breach is a
+    /// walk the sim nulls, not an infiltration.
+    fn nearest_enemy_infiltration_target(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        from: (i16, i16),
+    ) -> Option<u64> {
+        let from_cell = (from.0.max(0) as u16, from.1.max(0) as u16);
+        let mut best: Option<(u8, u32, u64)> = None;
+        for (id, entity) in sim.substrate.entities.iter_sorted() {
+            if entity.category() != crate::map::entities::EntityCategory::Structure
+                || entity.lifecycle.in_limbo()
+                || !self.is_enemy(sim, entity.owner())
+            {
+                continue;
+            }
+            let (rx, ry) = (entity.position.rx(), entity.position.ry());
+            if !sim.fog.is_cell_revealed(self.house, rx, ry)
+                || !zones_connected(
+                    sim,
+                    crate::rules::locomotor_type::MovementZone::Normal,
+                    from_cell,
+                    (rx, ry),
+                )
+            {
+                continue;
+            }
+            let rank = spy_infiltration_rank(sim.interner.resolve(entity.type_ref()));
+            let dx = i32::from(rx) - i32::from(from.0);
+            let dy = i32::from(ry) - i32::from(from.1);
+            let distance = (dx * dx + dy * dy) as u32;
+            if best.is_none_or(|(kept_rank, kept_distance, _)| {
+                (rank, distance) < (kept_rank, kept_distance)
+            }) {
+                best = Some((rank, distance, id));
+            }
+        }
+        best.map(|(_, _, id)| id)
+    }
+
     /// The nearest revealed neutral tech building the spy can run at, with
     /// the ground rows still connecting it to `from`: a revealed one across
     /// a breach is a walk the sim nulls, not an infiltration. Neutral means
@@ -6072,6 +6862,33 @@ impl SuperAi {
     }
 }
 
+/// The capture chain's priority class for a tech building type — the oil
+/// derrick's class first ([`CAPTURE_PRIORITY_TYPES`] order, its
+/// `ProduceCashStartup` pays the engineer back on entry) — and `None` for
+/// a name outside the neutral-tech table, which the survey skips.
+fn capture_priority_rank(type_name: &str) -> Option<usize> {
+    CAPTURE_PRIORITY_TYPES
+        .iter()
+        .position(|&name| name == type_name)
+}
+
+/// The spy's infiltration priority for an enemy structure type: the
+/// superweapon buildings first (the arrival resets the charging special's
+/// clock), then the radars (the blackout), the power plants (the dip) —
+/// and every other standing enemy structure last, the walk still worth the
+/// walk even when the arrival teaches nothing.
+fn spy_infiltration_rank(type_name: &str) -> u8 {
+    if ENEMY_SUPERWEAPON_TYPES.contains(&type_name) {
+        0
+    } else if ENEMY_RADAR_TYPES.contains(&type_name) {
+        1
+    } else if ENEMY_POWER_TYPES.contains(&type_name) {
+        2
+    } else {
+        3
+    }
+}
+
 /// Clamp an offset destination into the map. An offset target off the map
 /// would wrap through `as u16` to the far corner, and the command layer
 /// silently drops such orders — the unit never leaves its standing set and
@@ -6366,7 +7183,10 @@ fn find_site_beyond(
 
 #[cfg(test)]
 mod tests {
-    use super::{EXPANSION_MIN_DISTANCE, OPENINGS, SuperAi, SuperAiDifficulty};
+    use super::{
+        capture_priority_rank, spy_infiltration_rank, EXPANSION_MIN_DISTANCE, OPENINGS, SuperAi,
+        SuperAiDifficulty, TECH_BUILDING_TYPES,
+    };
     use crate::sim::intern::InternedId;
     use crate::sim::runtime::SimRuntime;
 
@@ -6536,6 +7356,80 @@ mod tests {
         );
         assert_eq!(yuri.gap_generator, None);
         assert_eq!(yuri.country_cannon, None);
+    }
+
+    /// The engineer chains' table rows and pure rankings. The raid ride per
+    /// side (the Allied IFV, the Soviet Flak Track — both already on their
+    /// roster's anti-air line — and Yuri none, his only `Passengers=` hull
+    /// being the ferry's amphibious transport), the capture priority's
+    /// class order covering the neutral-tech table exactly once with the
+    /// oil derrick leading, and the spy retarget's rank order: enemy
+    /// superweapon, radar, power, then any standing structure.
+    #[test]
+    fn openings_name_the_engineer_ride_and_the_capture_and_spy_ranks_hold() {
+        let opening = |yard: &str| {
+            OPENINGS
+                .iter()
+                .find(|opening| opening.construction_yard == yard)
+                .expect("each side's opening")
+        };
+        let allied = opening("GACNST");
+        assert_eq!(allied.engineer_ride, Some("FV"));
+        assert!(allied.vehicles.iter().any(|entry| entry.name == "FV"));
+
+        let soviet = opening("NACNST");
+        assert_eq!(soviet.engineer_ride, Some("HTK"));
+        assert!(soviet.vehicles.iter().any(|entry| entry.name == "HTK"));
+
+        let yuri = opening("YACNST");
+        assert_eq!(
+            yuri.engineer_ride,
+            None,
+            "Yuri fields no land transport; the ferry's hover hull is not a raid ride"
+        );
+
+        // The capture priority ranks every neutral-tech type exactly once,
+        // the oil derrick's class leading, and nothing outside the table.
+        let ranks: Vec<Option<usize>> = TECH_BUILDING_TYPES
+            .iter()
+            .map(|name| capture_priority_rank(name))
+            .collect();
+        assert!(
+            ranks.iter().all(|rank| rank.is_some()),
+            "every neutral-tech type ranks in the capture priority"
+        );
+        let mut ranks: Vec<usize> = ranks.into_iter().flatten().collect();
+        ranks.sort_unstable();
+        ranks.dedup();
+        assert_eq!(
+            ranks.len(),
+            TECH_BUILDING_TYPES.len(),
+            "every neutral-tech type ranks exactly once"
+        );
+        assert_eq!(ranks[0], 0, "the ranked classes start at the oil derrick");
+        assert_eq!(
+            capture_priority_rank("CAOILD"),
+            Some(0),
+            "the oil derrick's startup cash leads the capture order"
+        );
+        assert_eq!(
+            capture_priority_rank("GACNST"),
+            None,
+            "a non-tech structure ranks nowhere"
+        );
+
+        // The spy's retarget order: the enemy's superweapon first, then the
+        // radar, the power plants, and any standing structure last.
+        assert_eq!(spy_infiltration_rank("GAWEAT"), 0);
+        assert_eq!(spy_infiltration_rank("YAGNTC"), 0);
+        assert_eq!(spy_infiltration_rank("NARADR"), 1);
+        assert_eq!(spy_infiltration_rank("AMRADR"), 1);
+        assert_eq!(spy_infiltration_rank("YAPOWR"), 2);
+        assert_eq!(
+            spy_infiltration_rank("GAWEAP"),
+            3,
+            "any standing enemy structure still outranks the neutral tour"
+        );
     }
 
     /// The ring walk's geometry: a 1x1 foundation's ring is its eight
