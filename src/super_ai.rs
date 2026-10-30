@@ -358,11 +358,15 @@ const DEFENSE_PER_YARD_BASIC: usize = 2;
 const DEFENSE_PER_YARD_AA: usize = 2;
 const DEFENSE_PER_YARD_HEAVY: usize = 1;
 
-/// The wall ring's wallet floor: a wall segment is 100 credits, but the ring
-/// spends dozens of them one production cycle at a time, so the limb stays
-/// shut until the wallet is deep enough that the perimeter never competes
-/// with the army queues or a real gun for the same income.
-const WALL_CREDIT_FLOOR: i32 = 1500;
+/// The wall ring's wallet floor: a wall segment is 100 credits, and the
+/// ring spends dozens of them one production cycle at a time. The floor
+/// sits just under a tank's price, not above it: a war economy's unit
+/// queues pin the wallet below their next item's cost between ore dumps
+/// (the `gun_hold` observation), so a 1500 floor meant the ring never
+/// opened at all in exactly the games that wanted walls. At 600 each
+/// miner dump carries the wallet past the floor and the limb takes its
+/// one 100-credit segment per pass, leaving the army the rest.
+const WALL_CREDIT_FLOOR: i32 = 600;
 
 /// The late-game defense sink: past this wallet, with every economy cap
 /// met and the power grid in the black, each yard's heavy quota gains one
