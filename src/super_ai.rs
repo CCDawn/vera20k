@@ -472,6 +472,43 @@ const RAIDER_RETRY_TICKS: u32 = 300;
 /// is cheap but pointless per tick, and the toggle is once-per-unit anyway.
 const DEPLOY_MECH_TICKS: u32 = 150;
 
+/// The Soviet Desolator — the roster's rad-field piece (`DESO`,
+/// `Deployer=yes`, the anti-foot line's radiation answer). Its deploy is an
+/// engagement switch: the engine keeps a deployed soldier guarding in
+/// place while its weapon radiates the cell, so the AI's whole order is
+/// the toggle. The generic home-deploy of the deploy mechanic skips the
+/// type — an unconditional field at the base door would burn the house's
+/// own feet — and the engagement below arms it instead.
+const DESO_TYPE: &str = "DESO";
+
+/// Enemy infantry within this many cells of an idle Desolator that arm its
+/// radiation stance: the field is the anti-assault wall, not a posture.
+const DESO_DEPLOY_RADIUS: i16 = 5;
+
+/// The count inside [`DESO_DEPLOY_RADIUS`] that arms the stance: a lone
+/// scout does not buy a toggle; an assault does.
+const DESO_DEPLOY_INFANTRY: usize = 3;
+
+/// Ticks between naval-sortie windows: the episode (a latched target, one
+/// hull dispatched per tick until only the home guard remains) may arm at
+/// most this often, so a fleet that fought its last battle waits a minute
+/// of game time before the next one instead of re-reading the shore every
+/// tick.
+const NAVAL_SORTIE_WINDOW_TICKS: u32 = 600;
+
+/// Idle combat hulls the sortie needs before it sails: a single ship is a
+/// gift to the enemy's fleet and the wave's mass lesson applies at sea too,
+/// so the branch waits for a pair — and keeps one more home as the defense
+/// stock on top.
+const NAVAL_SORTIE_FLEET_MIN: usize = 2;
+
+/// Dogs per standing yard that hold the sentry ring (`Command::Guard`
+/// posts whose leash, chase and spy-bite are the engine's own): the hound
+/// is retail's counter-infiltration base guard, so this is a cap on the
+/// kennel, not a commission — the extras stay in the idle pools for the
+/// perimeter attack and the alarm recall.
+const SENTRY_DOGS_PER_YARD: usize = 2;
+
 /// Ticks between amphibious-ferry windows (the transport's dock, sail and
 /// unload legs, [`Self::ferry_orders`]): the branch is a pacing problem —
 /// one leg per window, the order gate pacing each passenger's boarding
@@ -984,6 +1021,16 @@ const OPENINGS: [Opening; 3] = [
                 role: Role::AntiInfantry,
                 needs: None,
             },
+            // The attack dog: retail's counter-infiltration hound
+            // (`DetectDisguise=yes`, 200 credits, TechLevel 2) — the sentry
+            // ring's guard: posted on a yard ring its own Guard mission
+            // bites the spy and the raiding infantry that step to the door,
+            // so the entry needs no prerequisite and no branch of its own.
+            RosterEntry {
+                name: "ADOG",
+                role: Role::AntiInfantry,
+                needs: None,
+            },
             // The Chrono Legionnaire: the NeutronRifle erases its target
             // from the timeline — a slow, expensive vehicle answer, so it
             // files under AntiArmor behind its tech center (retail
@@ -1118,6 +1165,16 @@ const OPENINGS: [Opening; 3] = [
             },
             RosterEntry {
                 name: "DESO",
+                role: Role::AntiInfantry,
+                needs: None,
+            },
+            // The attack dog: also this side's scout (the `scout` field
+            // names it — the scouting chain keeps its own pair alive), so
+            // the roster row fields hounds past that pair: the extras hold
+            // the sentry ring and bite the spy, `DetectDisguise=yes`,
+            // 200 credits, TechLevel 2, no prerequisite.
+            RosterEntry {
+                name: "DOG",
                 role: Role::AntiInfantry,
                 needs: None,
             },
@@ -1543,6 +1600,26 @@ pub struct SuperAi {
     /// Whether the spy's single commission has issued; the quota is one per
     /// game. Pinned state, never read from the runtime.
     spy_issued: bool,
+    /// Whether a naval-sortie episode is launching: the target latched, the
+    /// hulls dispatched one per tick until only the home guard remains —
+    /// the wave episode's shape, at sea. Pinned state, never read from the
+    /// runtime.
+    naval_sortie_launching: bool,
+    /// The sortie episode's latched target (an enemy hull, else an enemy
+    /// shore structure): every hull of the episode attacks the same one, so
+    /// the group arrives as a mass. Cleared when the episode closes or the
+    /// target dies. Pinned state, never read from the runtime.
+    naval_sortie_target: Option<u64>,
+    /// Hulls already dispatched in the current sortie episode. A dispatch
+    /// the command layer drops leaves its hull mission-idle; without this
+    /// list the episode would re-order the same hull every tick — the wave
+    /// branch's `launched` list, naval edition. Cleared with the episode.
+    /// Pinned state, never read from the runtime.
+    naval_sortie_launched: Vec<u64>,
+    /// Earliest tick the next naval-sortie episode may arm at; see
+    /// [`NAVAL_SORTIE_WINDOW_TICKS`]. Pinned state, never read from the
+    /// runtime.
+    naval_sortie_due: u32,
 }
 
 impl SuperAi {
@@ -1618,6 +1695,10 @@ impl SuperAi {
             deploy_due: 0,
             scout_blacklist: std::collections::HashSet::new(),
             spy_issued: false,
+            naval_sortie_launching: false,
+            naval_sortie_target: None,
+            naval_sortie_launched: Vec::new(),
+            naval_sortie_due: 0,
         }
     }
 
@@ -1636,7 +1717,10 @@ impl SuperAi {
     /// One command per tick, in a fixed priority: deploy the opening MCV,
     /// place a ready building, defend the base (attack the nearest intruder;
     /// else launch a gathered wave on the enemy's structures, one unit per
-    /// tick; else post idle units on an Area Guard), fly the air wing's
+    /// tick; else post idle units on an Area Guard), toggle a Desolator
+    /// into its radiation stance on an enemy foot assault, post the dogs'
+    /// sentry ring, sail the navy's sortie at the nearest enemy hull or
+    /// shore, fly the air wing's
     /// sortie, board the fortress's anti-armor cargo, walk the expansion
     /// MCV to the second ore field and deploy it, walk an idle scout
     /// toward the map's nearest dark cell, keep the building queue walking
@@ -2345,6 +2429,11 @@ impl SuperAi {
                             || self.boarders.contains(&unit)
                             || self.raiders.contains(&unit)
                             || self.raid_involves(unit)
+                            // Layer 3: the dogs stay home — the sentry ring
+                            // is their post and the spy their war; a hound
+                            // that marched with the tanks is a dead 200
+                            // credits at the first vehicle line.
+                            || Self::is_dog(type_name)
                         {
                             continue;
                         }
@@ -2628,6 +2717,11 @@ impl SuperAi {
                         && !self.boarders.contains(id)
                         && !self.raiders.contains(id)
                         && sim.interner.resolve(entity.type_ref()) != opening.hero
+                        // The Desolator sits out this generic pick: its rad
+                        // field burns every foot unit that crosses — own
+                        // posted infantry included — so the stance arms on
+                        // the engagement below, not on standing near home.
+                        && sim.interner.resolve(entity.type_ref()) != DESO_TYPE
                         && matches!(
                             entity.passive_acquire_mission(),
                             crate::sim::mission::MissionType::None
@@ -2675,6 +2769,122 @@ impl SuperAi {
                             Command::DeployMcv { entity_id: id }
                         },
                     )];
+                }
+                // Layer 3: the Desolator's radiation stance. Deployed, the
+                // soldier holds a Guard in place while the weapon radiates
+                // its cell — the engine keeps the stance up on its own and
+                // a later Move lifts it, so the AI's whole order is the
+                // toggle, issued once per Desolator (the id joins
+                // `deploy_issued`: the sim deploy is a toggle, a re-issue
+                // would undeploy). The engagement is three enemy foot
+                // units inside five cells — an assault buys the field, a
+                // scout does not. Undeploy is nobody's order: the field
+                // decays without one.
+                let deso = sim.substrate.entities.iter_sorted().find(|(id, entity)| {
+                    entity.owner() == self.house
+                        && entity.lifecycle.object_alive()
+                        && !entity.lifecycle.in_limbo()
+                        && entity.category() == crate::map::entities::EntityCategory::Infantry
+                        && sim.interner.resolve(entity.type_ref()) == DESO_TYPE
+                        && !self.deploy_issued.contains(id)
+                        && !self.boarders.contains(id)
+                        && !self.raiders.contains(id)
+                        && !entity.is_deployed()
+                        && matches!(
+                            entity.passive_acquire_mission(),
+                            crate::sim::mission::MissionType::None
+                                | crate::sim::mission::MissionType::Sleep
+                                | crate::sim::mission::MissionType::Guard
+                                | crate::sim::mission::MissionType::AreaGuard
+                        )
+                        && {
+                            let cell = (
+                                entity.position.rx() as i16,
+                                entity.position.ry() as i16,
+                            );
+                            self.hostile_infantry_near(sim, cell, DESO_DEPLOY_RADIUS)
+                                >= DESO_DEPLOY_INFANTRY
+                        }
+                });
+                if let Some((id, _)) = deso {
+                    self.deploy_issued.insert(id);
+                    return vec![CommandEnvelope::new(
+                        self.house,
+                        at,
+                        Command::ToggleInfantryDeploy { entity_id: id },
+                    )];
+                }
+            }
+
+            // Layer 3: the dogs' sentry ring. The roster's hounds are
+            // counter-infiltration base guards (retail `DetectDisguise=yes`
+            // on all three sides' sections): posted on a yard ring, the
+            // dog's own Guard mission bites the spy and the raiding
+            // infantry that step to the door, and the engine's leash walks
+            // it back after every chase — so the AI's whole job is handing
+            // out the posts. Two dogs per standing yard hold the ring; the
+            // "on post" count reads the live Guard missions, so a sentry
+            // the alarm recalled or the enemy killed frees its slot and a
+            // fresh one takes it. The others stay in the idle pools — the
+            // perimeter attack and the alarm recall reach them — and the
+            // wave dispatch skips the type outright. The order gate paces
+            // the post the way it paces the generic poster's, so a dropped
+            // order waits its window instead of re-issuing per tick.
+            {
+                let sentry_cap =
+                    SENTRY_DOGS_PER_YARD * self.own_yard_centers(sim, opening).len().max(1);
+                let dogs_on_post = sim
+                    .substrate
+                    .entities
+                    .iter_sorted()
+                    .filter(|(_, entity)| {
+                        entity.owner() == self.house
+                            && entity.category() == crate::map::entities::EntityCategory::Infantry
+                            && entity.lifecycle.object_alive()
+                            && !entity.lifecycle.in_limbo()
+                            && Self::is_dog(sim.interner.resolve(entity.type_ref()))
+                            && matches!(
+                                entity.passive_acquire_mission(),
+                                crate::sim::mission::MissionType::Guard
+                                    | crate::sim::mission::MissionType::AreaGuard
+                            )
+                    })
+                    .count();
+                if dogs_on_post < sentry_cap {
+                    let pick = sim.substrate.entities.iter_sorted().find(|(id, entity)| {
+                        self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                            && entity.owner() == self.house
+                            && entity.category() == crate::map::entities::EntityCategory::Infantry
+                            && entity.lifecycle.object_alive()
+                            && !entity.lifecycle.in_limbo()
+                            && Self::is_dog(sim.interner.resolve(entity.type_ref()))
+                            && !self.boarders.contains(id)
+                            && !self.raiders.contains(id)
+                            && !self.raid_involves(*id)
+                            && matches!(
+                                entity.passive_acquire_mission(),
+                                crate::sim::mission::MissionType::None
+                                    | crate::sim::mission::MissionType::Sleep
+                            )
+                    });
+                    if let Some((dog, entity)) = pick {
+                        let from = (entity.position.rx(), entity.position.ry());
+                        let type_name = sim.interner.resolve(entity.type_ref());
+                        if let Some((px, py)) =
+                            connected_ring_cell(sim, rules, center, from, dog, type_name)
+                            && !self.futile(dog, FutilityKind::GuardPost, from, tick)
+                        {
+                            self.gate_idle_order(dog, tick);
+                            return vec![CommandEnvelope::new(
+                                self.house,
+                                at,
+                                Command::Guard {
+                                    entity_id: dog,
+                                    target: Some(crate::sim::combat::TargetKind::Cell(px, py)),
+                                },
+                            )];
+                        }
+                    }
                 }
             }
 
@@ -2744,6 +2954,100 @@ impl SuperAi {
                         },
                     )];
                 }
+            }
+        }
+
+        // The navy's sortie — Layer 3. The idle and standing pools collect
+        // the combat hulls for home defense, but the wave's zone gate keeps
+        // every ship out of the ground marches and no branch ever ordered
+        // one forward: a fleet stood at its yard for life. The sortie arms
+        // like a wave episode — at least [`NAVAL_SORTIE_FLEET_MIN`] idle
+        // hulls, never while the base alarm holds the army home — and
+        // dispatches one hull per tick at the latched target until only the
+        // home guard remains (the fleet's first idle hull; the defense
+        // recall can still pull it). The target is the nearest enemy hull
+        // the water rows connect to the first sailer (the ships' own
+        // movement zone answers "is this a water fight" — no rules lookup),
+        // else the nearest enemy structure those rows still reach (the
+        // shore bombardment), else nothing arms and the fleet stays
+        // anchored. A dispatched hull leaves the idle classes and drops out
+        // of the episode on its own; a dropped dispatch sits in
+        // `naval_sortie_launched` until the episode closes, so the branch
+        // cannot spin on it.
+        {
+            let idle_fleet: Vec<u64> = sim
+                .substrate
+                .entities
+                .iter_sorted()
+                .filter(|(id, entity)| {
+                    entity.owner() == self.house
+                        && entity.lifecycle.object_alive()
+                        && !entity.lifecycle.in_limbo()
+                        && entity.category() == crate::map::entities::EntityCategory::Unit
+                        && Self::is_naval_type(opening, sim.interner.resolve(entity.type_ref()))
+                        && !self.defenders.contains(id)
+                        && !self.naval_sortie_launched.contains(id)
+                        && self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                        && matches!(
+                            entity.passive_acquire_mission(),
+                            crate::sim::mission::MissionType::None
+                                | crate::sim::mission::MissionType::Sleep
+                                | crate::sim::mission::MissionType::Guard
+                                | crate::sim::mission::MissionType::AreaGuard
+                        )
+                })
+                .map(|(id, _)| id)
+                .collect();
+            if !self.naval_sortie_launching
+                && tick >= self.naval_sortie_due
+                && !self.base_alarm_armed(sim, tick)
+                && idle_fleet.len() >= NAVAL_SORTIE_FLEET_MIN
+            {
+                // Arm the episode: the latch reads the sortie target from
+                // the first hull that will sail (the home guard is the
+                // fleet's first idle hull; everything behind it sails). No
+                // target — no episode; the fleet keeps the anchorage.
+                if let Some(target) = self.naval_sortie_target(sim, rules, &idle_fleet[1..]) {
+                    self.naval_sortie_launching = true;
+                    self.naval_sortie_launched.clear();
+                    self.naval_sortie_target = Some(target);
+                } else {
+                    self.naval_sortie_due = tick + NAVAL_SORTIE_WINDOW_TICKS;
+                }
+            }
+            if self.naval_sortie_launching {
+                // The first idle hull is the home guard; the second sails
+                // at the latch — while it still lives on the substrate.
+                let sail = self
+                    .naval_sortie_target
+                    .filter(|&target| {
+                        sim.substrate.entities.get(target).is_some_and(|entity| {
+                            entity.lifecycle.object_alive() && !entity.lifecycle.in_limbo()
+                        })
+                    })
+                    .filter(|_| idle_fleet.len() > 1)
+                    .map(|target| (target, idle_fleet[1]));
+                if let Some((target, sailor)) = sail {
+                    self.naval_sortie_launched.push(sailor);
+                    self.gate_idle_order(sailor, tick);
+                    return vec![CommandEnvelope::new(
+                        self.house,
+                        at,
+                        Command::Attack {
+                            attacker_id: sailor,
+                            target_id: target,
+                        },
+                    )];
+                }
+                // The episode is over: every sailer dispatched (dropped
+                // orders included), the fleet down to the home guard, or
+                // the target fell under way — the hulls already at sea
+                // fight their own Attacks out, production rebuilds the
+                // line, and the next window re-reads the water.
+                self.naval_sortie_launching = false;
+                self.naval_sortie_due = tick + NAVAL_SORTIE_WINDOW_TICKS;
+                self.naval_sortie_target = None;
+                self.naval_sortie_launched.clear();
             }
         }
 
@@ -6313,6 +6617,17 @@ impl SuperAi {
             || opening.naval_capital == Some(name)
     }
 
+    /// Whether the type is one of the three sides' dogs — the roster's
+    /// sentry hound (`ADOG` Allied, `DOG` Soviet, `YDOG` Yuri; all three
+    /// `DetectDisguise=yes`). The wave dispatch reads it to keep the
+    /// kennel home, the sentry ring to count and post it. Exact names:
+    /// the sections are side twins, and "DOG" is a substring of its own
+    /// siblings, so only `==` answers.
+    fn is_dog(type_name: &str) -> bool {
+        const DOG_TYPES: [&str; 3] = ["ADOG", "DOG", "YDOG"];
+        DOG_TYPES.contains(&type_name)
+    }
+
     /// The naval layer's production pick (Layer 2.7): the basic hull line
     /// up to [`NAVAL_SHIP_QUOTA`], with the AA escort claiming one turn
     /// once its extra prerequisite honestly passes `can_build` (the
@@ -6360,6 +6675,68 @@ impl SuperAi {
             return Some(capital);
         }
         None
+    }
+
+    /// The naval sortie's target, read from the sailing force's own water
+    /// rows: the nearest enemy hull — the fleet's war is the gun duel —
+    /// else the nearest enemy structure those rows still reach (the shore
+    /// bombardment), else `None` and the caller keeps the anchorage. The
+    /// reach test runs in the first sailer's own movement zone, so an
+    /// inland factory across a land bridge is simply not a naval target
+    /// and no rules lookup is needed to say which fights are water
+    /// fights.
+    fn naval_sortie_target(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        force: &[u64],
+    ) -> Option<u64> {
+        let sailor = sim.substrate.entities.get(*force.first()?)?;
+        let from = (
+            sailor.position.rx() as i16,
+            sailor.position.ry() as i16,
+        );
+        let zone = rules
+            .object(sim.interner.resolve(sailor.type_ref()))
+            .map(|ty| ty.movement_zone)
+            .unwrap_or_default();
+        let connected = |cell: (i16, i16)| {
+            zones_connected(
+                sim,
+                zone,
+                (from.0.max(0) as u16, from.1.max(0) as u16),
+                (cell.0.max(0) as u16, cell.1.max(0) as u16),
+            )
+        };
+        // The enemy hulls: mobile water fights first. Land vehicles share
+        // the Unit category, but the rows decide — a cell the sailer's zone
+        // never reaches is not a sortie target.
+        let hulls: Vec<(u64, (i16, i16))> = sim
+            .substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.category() == crate::map::entities::EntityCategory::Unit
+                    && !entity.lifecycle.in_limbo()
+                    && self.is_enemy(sim, entity.owner())
+            })
+            .map(|(id, entity)| {
+                (
+                    id,
+                    (
+                        entity.position.rx() as i16,
+                        entity.position.ry() as i16,
+                    ),
+                )
+            })
+            .collect();
+        if let Some(target) = nearest_connected_target(&hulls, from, &connected) {
+            return Some(target);
+        }
+        // No hull to duel: the shore line. The wave targets stand in for
+        // it — the same factory-first list the ground waves march on.
+        let shores = self.enemy_priority_targets(sim);
+        nearest_connected_target(&shores, from, &connected)
     }
 
     fn standing_combat_units(
@@ -6422,6 +6799,30 @@ impl SuperAi {
         let alliances = sim.house_alliances();
         !crate::map::houses::is_allied_with(alliances, me, them)
             && !crate::map::houses::is_allied_with(alliances, them, me)
+    }
+
+    /// Enemy infantry (the engine files foot soldiers under the Infantry
+    /// category; allies and passive houses are not enemies) standing within
+    /// Chebyshev `radius` cells of `cell` — the Desolator's engagement
+    /// count.
+    fn hostile_infantry_near(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        cell: (i16, i16),
+        radius: i16,
+    ) -> usize {
+        sim.substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                let dx = i32::from(entity.position.rx() as i16) - i32::from(cell.0);
+                let dy = i32::from(entity.position.ry() as i16) - i32::from(cell.1);
+                entity.category() == crate::map::entities::EntityCategory::Infantry
+                    && !entity.lifecycle.in_limbo()
+                    && self.is_enemy(sim, entity.owner())
+                    && dx.abs().max(dy.abs()) <= i32::from(radius)
+            })
+            .count()
     }
 
     /// The nearest hostile entity inside `radius` cells of `center`, ties
@@ -7007,6 +7408,31 @@ fn siege_standoff_cell(
     None
 }
 
+/// The naval sortie's target pick: the nearest candidate cell the
+/// connectivity predicate admits, reading `candidates` in their given
+/// (stable) order so a distance tie keeps it. `None` — nothing reachable;
+/// the caller keeps its force anchored. Pure over its arguments: the
+/// connectivity predicate is injected so a test can stub the zone rows.
+fn nearest_connected_target(
+    candidates: &[(u64, (i16, i16))],
+    from: (i16, i16),
+    connected: &dyn Fn((i16, i16)) -> bool,
+) -> Option<u64> {
+    let mut best: Option<(u32, u64)> = None;
+    for &(id, cell) in candidates {
+        if !connected(cell) {
+            continue;
+        }
+        let dx = i32::from(cell.0) - i32::from(from.0);
+        let dy = i32::from(cell.1) - i32::from(from.1);
+        let distance = (dx * dx + dy * dy) as u32;
+        if best.is_none_or(|(kept, _)| distance < kept) {
+            best = Some((distance, id));
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
 /// The perimeter ring one cell outside a foundation's cell bounds, walked
 /// clockwise from the top-left corner: the top edge left to right, the right
 /// edge top to bottom, the bottom edge right to left, the left edge bottom
@@ -7184,8 +7610,8 @@ fn find_site_beyond(
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_priority_rank, spy_infiltration_rank, EXPANSION_MIN_DISTANCE, OPENINGS, SuperAi,
-        SuperAiDifficulty, TECH_BUILDING_TYPES,
+        capture_priority_rank, nearest_connected_target, spy_infiltration_rank, Role,
+        EXPANSION_MIN_DISTANCE, OPENINGS, SuperAi, SuperAiDifficulty, TECH_BUILDING_TYPES,
     };
     use crate::sim::intern::InternedId;
     use crate::sim::runtime::SimRuntime;
@@ -7320,6 +7746,73 @@ mod tests {
         engineers.sort_unstable();
         engineers.dedup();
         assert_eq!(engineers, vec!["ENGINEER", "SENGINEER", "YENGINEER"]);
+    }
+
+    /// The dogs' roster rows: each side's infantry table carries exactly one
+    /// hound (`ADOG` Allied, `DOG` Soviet, `YDOG` Yuri) — filed as a plain
+    /// AntiInfantry entry with no prerequisite, so the rotation fields them
+    /// like any other specialist (and [`SuperAi::is_dog`] answers for
+    /// exactly those three sections: the hook the wave dispatch uses to
+    /// keep the kennel on its sentry ring instead of the ground marches,
+    /// and the sentry limb to count it by).
+    #[test]
+    fn openings_field_one_dog_per_side_and_is_dog_answers_for_them() {
+        let opening = |yard: &str| {
+            OPENINGS
+                .iter()
+                .find(|opening| opening.construction_yard == yard)
+                .expect("each side's opening")
+        };
+        for (yard, dog) in [("GACNST", "ADOG"), ("NACNST", "DOG"), ("YACNST", "YDOG")] {
+            let opening = opening(yard);
+            let hounds: Vec<_> = opening
+                .infantry
+                .iter()
+                .filter(|entry| SuperAi::is_dog(entry.name))
+                .collect();
+            assert_eq!(hounds.len(), 1, "{yard} fields exactly one hound");
+            let entry = hounds[0];
+            assert_eq!(entry.name, dog);
+            assert_eq!(entry.role, Role::AntiInfantry);
+            assert_eq!(entry.needs, None, "the hound waits for no prerequisite");
+        }
+        for not_a_dog in ["E1", "E2", "INIT", "GGI", "TANY", "BRUTE", "ADOGG", "DOGGE"] {
+            assert!(
+                !SuperAi::is_dog(not_a_dog),
+                "{not_a_dog} is not a hound section"
+            );
+        }
+    }
+
+    /// The sortie's target pick: the nearest reachable candidate wins, an
+    /// unreachable nearer one is passed over, nothing reachable anchors the
+    /// fleet, and a distance tie keeps the stable order.
+    #[test]
+    fn nearest_connected_target_prefers_the_nearest_reachable() {
+        let candidates = [
+            (1u64, (20i16, 20i16)),
+            (2u64, (14i16, 14i16)),
+            (3u64, (60i16, 60i16)),
+        ];
+        // Everything reachable: the nearest wins.
+        assert_eq!(
+            nearest_connected_target(&candidates, (15, 15), &|_| true),
+            Some(2)
+        );
+        // The nearer cells across the water line are skipped: the far
+        // reachable one takes the shot.
+        assert_eq!(
+            nearest_connected_target(&candidates, (15, 15), &|cell| cell == (60, 60)),
+            Some(3)
+        );
+        // Nothing reachable: no sortie.
+        assert_eq!(
+            nearest_connected_target(&candidates, (15, 15), &|_| false),
+            None
+        );
+        // A distance tie keeps the candidates' own (stable) order.
+        let tied = [(7u64, (0i16, 0i16)), (9u64, (2i16, 2i16))];
+        assert_eq!(nearest_connected_target(&tied, (1, 1), &|_| true), Some(7));
     }
 
     /// The defense extension's table rows: the wall ring's segment, the gap
