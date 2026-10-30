@@ -724,9 +724,111 @@ Squid) once its extra prerequisite honestly passes `can_build`. The
 hulls join the idle and standing pools by name — the land rosters never
 listed them — so the idle perimeter's Attack answers coast raiders; the
 wave's zone gate keeps them out of ground marches on its own, and the
-guard-post limb filters them back out, a ship holding no land ring.
-What remains is the offensive half: hunting enemy fleets, shore
-bombardment, and amphibious transport for the ground army across water.
+guard-post limb filters them back out, a ship holding no land ring. The
+offensive half arrived with the arsenal below: the sortie hunts fleets
+and shores, and the amphibious transports ferry the foot army.
+
+## The full arsenal
+
+The unit tables closed their gaps against the rules corpus wholesale.
+The engineer pick was a shared `ENGINEER` name, but the three sides'
+engineers are three rules sections split by `ForbiddenHouses` — the
+bridge and repair commissions silently produced nobody outside an
+Allied base until the `Opening` carried its own (`ENGINEER`,
+`SENGINEER`, `YENGINEER`). The roster additions ride `can_build`'s
+country gate as every country-locked entry already did: the Chrono
+Legionnaire behind the Allied lab, the Cuban Terrorist and the Libyan
+Demolition Truck on their countries' slots, a Yuri hound. The navy
+gained a second hull line (Dolphin, Giant Squid) past the basic quota
+and a lab-gated capital (Carrier, Dreadnought) — and the Soviet AA
+escort became the Sea Scorpion it always should have been: the Squid
+is an anti-hull grappler, not a flak platform, and now rotates in the
+hull line instead. The amphibious transports (Landing Craft, Armored
+Transport, Hover Transport) commission once behind the naval yard and
+run a ferry — beach at home, board idle infantry with the engine's
+own Enter click, plain-Move to the enemy's aim (the cargo is the
+payload; a fight on the way must not sink the delivery), unload with
+the Unload mission, one leg per window.
+
+## The second superweapon
+
+Each side's ladder carried exactly one super rung — the Soviet slot
+held the Iron Curtain, Yuri's the Dominator — so the Nuclear Silo and
+the Genetic Mutator never entered any queue (observed live: "where is
+the nuke"). The `Opening` now carries a second pair — the Silo, the
+Mutator, the Chronosphere — queued once the first super has stood
+(its own once-per-game latch, so the two monuments never race for the
+one building slot), and the fire walk launches whichever special
+charges first: the mutator aims at the hostile infantry centroid, the
+rest at the generic hostile aim.
+
+## The per-tick census
+
+The ladder's structure counts re-walked the whole entity set — with a
+`String` per own building — on every read, thirty-plus reads per
+orders pass per AI per tick: a fixed tax that scaled with the map's
+entity count and showed up as frame cost on the 512-cell fields. The
+first read of a pass now rebuilds one census keyed by type id; the
+rest of the pass reads the map. `orders` only reads the sim and
+issues commands, so a census latched to the pass's own tick is exact
+for every read inside it.
+
+## Walls and the defense extensions
+
+Each side's `Wall=yes` segment — the Allied and Soviet walls, and
+Yuri's Citadel Wall (`GAFWLL`, actively registered at BuildingTypes
+312 despite the old French-wall comment beside it) — queues one
+100-credit cycle at a time and places one cell per cycle around the
+first superweapon, then the second, then the yard; the engine's own
+auto-fill closes the spans toward standing segments for free. The
+walk skips cells the live overlay grid already holds a wall on,
+retires a spent ring once and for all (a fallen segment is never
+rebuilt), and cancels a stranded ready segment rather than wedging
+the one placement slot. The gap generator and the French Grand Cannon
+ride the gun limb's queue step behind the core lines — the generator
+behind the Allied battle lab (its shroud bubble is fully native), the
+cannon behind the radar and a live French-country check, because
+`RequiredHouses` would refuse every other Allied house forever and a
+refused item parked in the one building slot is the barracks lesson
+again. The blackout gate covers both for free: they stand offline
+below full power, same as a coil.
+
+## The engineer's war
+
+Past the bridge, the engineers earn their keep three ways. A neutral-
+owned tech building is free money — the derrick's entry bonus alone
+pays the engineer twice over — so a windowed limb walks the nearest
+revealed one (derricks first) with the engine's own capture click,
+topping the stock to two through the commission core the bridge chain
+shares. The ride raid: an engineer boards the side's land transport
+(the IFV, the Flak Track; Yuri fields none), attack-moves at a
+latched enemy priority structure, unloads beside it and walks the
+capture in — the stage machine marches one command a tick, each leg
+re-issued only when its actor stands idle again, every stage on a
+hard clock sized for a cross-map sail, every lost actor into the
+shared cooldown. The spy retargets enemy superweapons first (the
+charge reset), then radars, then power plants — the neutral tech
+tour only when no revealed enemy aim stands, since a spy's arrival
+on a neutral building pays nothing.
+
+## Sentries, sorties and stances
+
+Every unit keeps its own war. The dogs: the roster fields a hound per
+side (`DetectDisguise=yes` on all three) and the wave dispatch skips
+the type outright — a hound marching with the tanks is a dead 200
+credits at the first vehicle line — while a sentry limb posts two
+per standing yard on the ring; the Guard post's own leash, chase and
+spy-bite are the engine's, and a recalled or killed sentry frees its
+slot to a fresh one by mission state alone. The sortie: the idle
+pools held the hulls for life, so an episode arms like a wave — two
+idle hulls minimum, the first held home for the defense recall — and
+dispatches one hull per tick at the latched aim, the nearest enemy
+hull the sailer's own water rows reach, else the nearest shore
+structure. The Desolator: the generic home-deploy skips the type (an
+unconditional rad field at the base door burns the house's own
+feet); the engagement rule arms it instead — three enemy foot units
+inside five cells buy the one-time toggle, and the field decays on
+its own when the assault is gone.
 
 ## Command-driven production publication
 
