@@ -5239,7 +5239,7 @@ impl SuperAi {
                 .is_some_and(|entity| {
                     entity.owner() == self.house && entity.lifecycle.object_alive()
                 });
-            let target_neutral = sim.substrate.entities.get(target).is_some_and(|entity| {
+            let target_neutral = sim.substrate.entities.get(*target).is_some_and(|entity| {
                 entity.category() == crate::map::entities::EntityCategory::Structure
                     && entity.lifecycle.object_alive()
                     && sim
