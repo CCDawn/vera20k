@@ -645,6 +645,89 @@ the native base centroid follows all owned buildings. The fair-growth
 census carries the proof: a refinery stood at the expansion distance,
 and two yards stood at once.
 
+## Power management
+
+The growth tail alone owned power, and it ran last: the gun limb and the
+ladder claimed the empty building slot ahead of the deficit rule, so a
+defended base chained one Powered gun after another into a deepening
+brownout — guns that stand offline in low power defend nothing — and by
+the time the deficit rule finally ran, the blackout had already slowed
+every factory through the native power factor (observed live: blackouts
+mid-game with plants still owed behind the gun ring). The building
+block's entrance now hoists one grid reading and preempts: the margin
+prices the production queue's unlanded drain in (`pending_structure_drain`
+— drain bites at placement while a queued plant pays nothing back until
+it stands), and a projected deficit queues the plant before any gun,
+ladder rung or growth limb may spend the slot. The gun limb additionally
+holds while the grid is actually red, and `POWER_CAP` rose from eight to
+sixteen: a two-yard base's drain (robot control −100, repair bay −200,
+the lab-and-radar climb, the gun ring) runs past eight Allied plants'
+1600 output, and the old cap pinned late-game grids into a permanent
+brownout. Damaged plants never need their own rule — output is already
+health-scaled, so the deficit reacts to a wounded grid on its own, and
+the repair limb's economy ranking covers the healing.
+
+## The base alarm
+
+Retail answers a raid with `TechnoClass__RespondToBaseAttack`
+(`0x00708080`) — a per-victim call that recruits nearby idle units — but
+nothing ever recalled the garrison when the army was away: a base whose
+wave was out fighting waved the enemy through (observed live: razed
+yards, no reaction). The fork reads the native damage admission stamp
+the engine already maintains (`HouseStrategyEmergencyState`'s
+`last_building_attack_frame`, written by every building damage prelude,
+in session ticks) and arms a stance while the stamp is fresh: the focus
+latches on the intruder nearest any yard at a 24-cell alarm radius —
+stand-off fire sits outside the idle perimeter's 16 — or the
+worst-wounded structure when no intruder stands visible; a due idle unit
+attacks the intruder outright, and short of a four-defender commit floor
+the nearest posted unit leaves its guard post and attack-moves on the
+focus, fighting whatever it meets on the way. The stance holds 450 ticks
+past its last refresh for the mop-up, then the defenders return to the
+idle flow and the posts re-form. Only a fresh stamp holds the next wave
+home — the mop-up hold alone must not, or a raided base on a crowded big
+map never attacks again (observed live: a besieged base that stopped
+attacking for good).
+
+## Expansion production
+
+A sub-base fields its own army and miners: the house's queues are
+shared, but a unit exits the factory that builds it — without a barracks
+and a war factory in the expansion's ring, every soldier and every
+miner the expansion is owed rolls out of the home base and walks the
+whole map first (observed live: the expansion's miners crossing two
+bridges to reach its dock). The cluster rules owe each yard's ring one
+barracks and one war factory (the factory inside the house-wide cap),
+routed by the placement intent. The barracks rule carries the loop
+lesson: a cluster item whose expansion ring refuses every site falls
+back home at placement, the count near the expansion stays at zero, and
+a rule without a house-wide bound re-queues the same building forever
+(observed live: a Yuri base that did nothing but chain barracks, the
+loop starving the building slot the factory growth needed). Two stands
+is the bound — the ladder's home barracks plus one more wherever the
+item landed; a razed one rebuilds.
+
+## The navy
+
+The navy was the last absent domain. Three pieces: the naval survey
+latches the one legal shoreline cell for the side's yard
+(`GAYARD`/`NAYARD`/`YAYARD`, `Naval=yes` — a WaterSet tile inside the
+base's own build area) by scanning capped rings around every standing
+yard with the same admission placement runs, paced and budgeted so a
+landlocked base abandons the navy after three surveys instead of
+wedging a ready shipyard that can never land; the growth tail's lowest
+rung queues the yard once a cell stands latched, and the latched cell
+places the ready yard — no search at placement time. The hull line
+rides the vehicle queue after the miner line: the side's basic hull
+(Destroyer, Typhoon, Boomer) to a quota of three, the AA escort (Aegis,
+Squid) once its extra prerequisite honestly passes `can_build`. The
+hulls join the idle and standing pools by name — the land rosters never
+listed them — so the idle perimeter's Attack answers coast raiders; the
+wave's zone gate keeps them out of ground marches on its own, and the
+guard-post limb filters them back out, a ship holding no land ring.
+What remains is the offensive half: hunting enemy fleets, shore
+bombardment, and amphibious transport for the ground army across water.
+
 ## Command-driven production publication
 
 Upstream `44f14000a` routed automatic mobile delivery through the local
