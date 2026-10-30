@@ -733,7 +733,7 @@ pub enum SuperAiDifficulty {
 pub const UNLIMITED_WALLET_FLOOR: i32 = 1_000_000;
 
 /// The battlefield role a buildable combat type fills in the army mix.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Role {
     /// Shoots air — the answer to hostile aircraft.
     AntiAir,
@@ -906,12 +906,24 @@ struct Opening {
     fortress: Option<&'static str>,
     /// The side's amphibious transport (retail `Naval=yes` hover hull with
     /// `Passengers=12`: the Landing Craft, the Armored Transport, the Hover
-    /// Transport) — the ferry branch's hull. All three are
+    /// Transport) — the ferry branch's sea hull (its air fallback lives in
+    /// [`Opening::air_ferry`]). All three are
     /// `MovementZone=Amphibious`, so they beach beside the yard to take
     /// infantry aboard and unload on the far shore; each builds at the
     /// side's naval yard behind its TechLevel. `None` keeps the branch
     /// asleep.
     amphibious_transport: Option<&'static str>,
+    /// The side's air ferry — the same ferry line where no naval yard ever
+    /// stands (retail `Passengers=` hull with `MovementZone=Fly`): the
+    /// Allied Night Hawk [SHAD], a war-factory build
+    /// (`Prerequisite=GAWEAP`, filed under `[VehicleTypes]`, so the vehicle
+    /// queue produces it like the hover hulls). The fly rows treat the map
+    /// as one connected zone, which makes it the inland Allies' only
+    /// ferry; a map with a shoreline keeps the Landing Craft first (the
+    /// naval commission outranks the air one and the two share the single
+    /// transport latch). `None` where the side fields no aircraft hull —
+    /// the Soviet and Yuri hover transports keep their naval-yard road.
+    air_ferry: Option<&'static str>,
     /// Combat vehicles the army mixes in past its core tank, each with
     /// its role; the core keeps the remaining slots. Country-locked
     /// entries stay in the table — CanBuild's `RequiredHouses=` gate
@@ -1040,6 +1052,39 @@ const OPENINGS: [Opening; 3] = [
                 role: Role::AntiArmor,
                 needs: Some("GATECH"),
             },
+            // The stolen-tech trio — all three sides' rosters carry all
+            // three sections (retail Owner= names every country, so any
+            // house that steals the matching tech fields any of them).
+            // Each is `RequiresStolen*=yes` behind `Prerequisite=BARRACKS`
+            // alone: a spy's battle-lab infiltration flips the house's
+            // stolen-tech byte and can_build opens the cameo, so `needs`
+            // stays None — the gate is the theft itself, and until it
+            // lands army_pick's buildable filter passes these rows over
+            // without spending a slot. The rotation fields them like any
+            // specialist once the cameo lights. The Chrono Commando: the
+            // hero's raid shape — a teleporting MP5 with C4 — AntiInfantry
+            // like Tanya's row (retail TechLevel 9, cost 2000).
+            RosterEntry {
+                name: "CCOMAND",
+                role: Role::AntiInfantry,
+                needs: None,
+            },
+            // Chrono Ivan: the bomb planter cracks vehicles and
+            // structures, so his row files AntiArmor like Boris's (retail
+            // TechLevel 9, cost 1750).
+            RosterEntry {
+                name: "CIVAN",
+                role: Role::AntiArmor,
+                needs: None,
+            },
+            // Psi-Corp Trooper: mind control picks the enemy's best off,
+            // the Yuri Prime row's own rationale — Siege (retail
+            // TechLevel 9, cost 1000).
+            RosterEntry {
+                name: "PTROOP",
+                role: Role::Siege,
+                needs: None,
+            },
         ],
         defense_basic: "GAPILL",
         defense_aa: "NASAM",
@@ -1062,6 +1107,12 @@ const OPENINGS: [Opening; 3] = [
         // `Naval=yes` hover hull with `Passengers=12` and
         // `MovementZone=Amphibious` — it beaches to load and unload.
         amphibious_transport: Some("LCRF"),
+        // The Night Hawk: retail Prerequisite=GAWEAP, TechLevel 7, 1000
+        // credits, `Passengers=5` and `MovementZone=Fly` — the sea-free
+        // ferry. On a shoreline map the naval yard commissions the Landing
+        // Craft first; inland, where no GAYARD ever stands, this hull is
+        // the ferry line the fly rows carry anywhere.
+        air_ferry: Some("SHAD"),
     },
     Opening {
         construction_yard: "NACNST",
@@ -1187,6 +1238,28 @@ const OPENINGS: [Opening; 3] = [
                 role: Role::AntiInfantry,
                 needs: None,
             },
+            // The stolen-tech trio — the Allied table's note applies word
+            // for word: all three sections ride every side's roster, the
+            // spy's theft opens can_build, and until then the buildable
+            // filter passes them over. Chrono Ivan bombs armor
+            // (AntiArmor), the Psi-Corp Trooper's mind control sieges
+            // (the Yuri Prime row's rationale), the Chrono Commando raids
+            // infantry (Tanya's).
+            RosterEntry {
+                name: "CCOMAND",
+                role: Role::AntiInfantry,
+                needs: None,
+            },
+            RosterEntry {
+                name: "CIVAN",
+                role: Role::AntiArmor,
+                needs: None,
+            },
+            RosterEntry {
+                name: "PTROOP",
+                role: Role::Siege,
+                needs: None,
+            },
         ],
         defense_basic: "NALASR",
         defense_aa: "NAFLAK",
@@ -1212,6 +1285,9 @@ const OPENINGS: [Opening; 3] = [
         // The Armored Transport: retail Prerequisite=NAYARD, TechLevel 2,
         // `Passengers=12`, `MovementZone=Amphibious`.
         amphibious_transport: Some("SAPC"),
+        // No air hull: the Soviets field no passenger aircraft, so the
+        // ferry line stays on the naval yard's hover transport alone.
+        air_ferry: None,
     },
     Opening {
         construction_yard: "YACNST",
@@ -1306,6 +1382,28 @@ const OPENINGS: [Opening; 3] = [
                 role: Role::AntiInfantry,
                 needs: None,
             },
+            // The stolen-tech trio — the Allied table's note applies word
+            // for word: all three sections ride every side's roster, the
+            // spy's theft opens can_build, and until then the buildable
+            // filter passes them over. The Psi-Corp Trooper's mind
+            // control sieges beside the hero (the same rationale),
+            // Chrono Ivan bombs armor, the Chrono Commando raids
+            // infantry.
+            RosterEntry {
+                name: "CCOMAND",
+                role: Role::AntiInfantry,
+                needs: None,
+            },
+            RosterEntry {
+                name: "CIVAN",
+                role: Role::AntiArmor,
+                needs: None,
+            },
+            RosterEntry {
+                name: "PTROOP",
+                role: Role::Siege,
+                needs: None,
+            },
         ],
         defense_basic: "YAGGUN",
         defense_aa: "YAGGUN",
@@ -1330,6 +1428,9 @@ const OPENINGS: [Opening; 3] = [
         // The Hover Transport: retail Prerequisite=YAYARD, TechLevel 2,
         // `Passengers=12`, `MovementZone=Amphibious`.
         amphibious_transport: Some("YHVR"),
+        // No air hull: Yuri fields no passenger aircraft, so the ferry
+        // line stays on the naval yard's hover transport alone.
+        air_ferry: None,
     },
 ];
 
@@ -1417,9 +1518,10 @@ pub struct SuperAi {
     /// so the side's mobile AA answer stands before hostile air arrives.
     /// Pinned state, never read from the runtime.
     aa_issued: bool,
-    /// Whether the amphibious ferry's one-off commission has issued: the
-    /// hover transport builds at the naval yard and the ferry branch owns
-    /// it for life. Pinned state, never read from the runtime.
+    /// Whether the ferry's one-off commission has issued: the two ferry
+    /// hulls — the naval yard's hover transport and the war factory's air
+    /// hull — share this one latch, so a base commissions one ferry line,
+    /// never two. Pinned state, never read from the runtime.
     transport_issued: bool,
     /// The remote ore-field cell latched for the expansion refinery once
     /// the home economy reaches its design steady state; kept after the
@@ -3505,22 +3607,24 @@ impl SuperAi {
             }
         }
 
-        // The amphibious ferry — Layer 3. The side's hover transport
-        // beaches beside its own yard, takes idle infantry aboard with the
-        // engine's own Enter click (the fortress boarding's mechanism — a
-        // transport is one of its Enter targets), rides its Amphibious
-        // zone toward the enemy's mass center and unloads with the Unload
-        // mission. Both legs speak commands a human client also sends
-        // (`MegaMission` Enter and [`Command::UnloadPassengers`]), so the
-        // branch is a pacing problem: one leg per [`FERRY_WINDOW_TICKS`]
-        // window, below every combat, scouting and raiding limb.
+        // The ferry — Layer 3. The side's transport hull takes idle
+        // infantry aboard with the engine's own Enter click (the fortress
+        // boarding's mechanism — a transport is one of its Enter targets),
+        // rides its movement row toward the enemy's mass center and
+        // unloads with the Unload mission. The hull is whichever of the
+        // table's two ferries the base fielded: the hover transport
+        // beaches beside its naval yard on a shoreline map, the Night Hawk
+        // (`MovementZone=Fly`, so the whole map is one connected zone)
+        // works the inland Allies' line where no yard ever stood. Both
+        // legs speak commands a human client also sends (`MegaMission`
+        // Enter and [`Command::UnloadPassengers`]), so the branch is a
+        // pacing problem: one leg per [`FERRY_WINDOW_TICKS`] window, below
+        // every combat, scouting and raiding limb.
         if tick >= self.ferry_due
-            && let Some(transport_name) = opening.amphibious_transport
+            && (opening.amphibious_transport.is_some() || opening.air_ferry.is_some())
         {
             self.ferry_due = tick + FERRY_WINDOW_TICKS;
-            if let Some(command) =
-                self.ferry_orders(sim, rules, opening, transport_name, home_center, tick)
-            {
+            if let Some(command) = self.ferry_orders(sim, rules, opening, home_center, tick) {
                 return vec![CommandEnvelope::new(self.house, at, command)];
             }
         }
@@ -4489,24 +4593,34 @@ impl SuperAi {
             // progressively, so no banked-cost wait belongs here.
             // `can_build`, not the cameo — the country-lock lesson again.
             opening.fortress
-        } else if opening.amphibious_transport.is_some()
-            && !self.transport_issued
-            && self.owns_structure_of_type(sim, opening.naval_yard)
-            && opening
+        } else if !self.transport_issued
+            && let Some(ferry_name) = opening
                 .amphibious_transport
-                .and_then(|name| rules.object(name))
-                .is_some_and(|ty| {
-                    crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
-                        == crate::sim::production::CanBuild::Yes
+                .filter(|_| self.owns_structure_of_type(sim, opening.naval_yard))
+                .or_else(|| {
+                    opening
+                        .air_ferry
+                        .filter(|_| self.owns_structure_of_type(sim, opening.war_factory))
                 })
+            && rules.object(ferry_name).is_some_and(|ty| {
+                crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                    == crate::sim::production::CanBuild::Yes
+            })
         {
             // The ferry's one-off commission, the fortress's treatment: a
             // reserved slot starves under war, a dedicated turn does not.
-            // The hover hulls are naval-yard builds (retail
+            // Two hulls share the one latch — one ferry line, never two.
+            // The hover hull is a naval-yard build (retail
             // Prerequisite=GAYARD/NAYARD/YAYARD), so the commission waits
-            // for the shoreline like the naval line behind it.
-            // `can_build`, not the cameo — the country-lock lesson again.
-            opening.amphibious_transport
+            // for the shoreline like the naval line behind it; where no
+            // yard ever stands the side's air hull takes the line — the
+            // Night Hawk is a war-factory build (retail
+            // Prerequisite=GAWEAP, filed under `[VehicleTypes]`, so the
+            // vehicle queue produces it too) and its `MovementZone=Fly`
+            // rows connect the whole map, which is the inland Allies' only
+            // ferry. `can_build`, not the cameo — the country-lock lesson
+            // again.
+            Some(ferry_name)
         } else if !self.expansion_abandoned
             && self.expansion_site.is_some()
             && !self.expansion_yard_issued
@@ -4583,7 +4697,7 @@ impl SuperAi {
             if opening.fortress == Some(name) {
                 self.fortress_issued = true;
             }
-            if opening.amphibious_transport == Some(name) {
+            if opening.amphibious_transport == Some(name) || opening.air_ferry == Some(name) {
                 self.transport_issued = true;
             }
             if !self.expansion_yard_issued
@@ -5617,30 +5731,39 @@ impl SuperAi {
         }
     }
 
-    /// The amphibious ferry's one order for this window, or `None` to fall
-    /// through to the branches below; see the call site in [`Self::orders`].
-    /// The legs, in order: a loaded transport at or past the enemy's side of
-    /// the map unloads; an empty-seat one beached on the home side takes the
-    /// nearest idle boarding candidate with the engine's Enter click; a
-    /// loaded one whose pool has drained sails at the enemy's mass center
-    /// (each candidate zone-gated in the hull's own Amphibious row); an
-    /// empty one walks home — far out to reload, near home onto the yard's
-    /// spread ring so the boarding happens on land. `self` is `&mut` for
-    /// the order gate only — every other read is observation.
+    /// The ferry's one order for this window, or `None` to fall through to
+    /// the branches below; see the call site in [`Self::orders`]. The hull
+    /// is any idle unit of the side's ferry names — the amphibious hover
+    /// transport on a shoreline map, the fly-zone air hull where no naval
+    /// yard ever stood; whichever answers first works the line. The legs,
+    /// in order: a loaded transport at or past the enemy's side of the map
+    /// unloads; an empty-seat one beached (or hovering) on the home side
+    /// takes the nearest idle boarding candidate with the engine's Enter
+    /// click; a loaded one whose pool has drained sails at the enemy's
+    /// mass center (each candidate zone-gated in the hull's own
+    /// movement-zone row — the hover hull's Amphibious, the air hull's
+    /// Fly, whose rows connect the whole map); an empty one walks home —
+    /// far out to reload, near home onto the yard's spread ring so the
+    /// boarding happens on land (the fly hull merely repositions there:
+    /// any cell is its ground). `self` is `&mut` for the order gate only —
+    /// every other read is observation.
     fn ferry_orders(
         &mut self,
         sim: &crate::sim::world::Simulation,
         rules: &crate::rules::ruleset::RuleSet,
         opening: &Opening,
-        transport_name: &'static str,
         home_center: Option<(i16, i16)>,
         tick: u32,
     ) -> Option<Command> {
         let home = home_center?;
+        let hulls: Vec<&'static str> = [opening.amphibious_transport, opening.air_ferry]
+            .into_iter()
+            .flatten()
+            .collect();
         let (transport, entity) = sim.substrate.entities.iter_sorted().find(|(id, entity)| {
             entity.owner() == self.house
                 && entity.category() == crate::map::entities::EntityCategory::Unit
-                && sim.interner.resolve(entity.type_ref()) == transport_name
+                && hulls.contains(&sim.interner.resolve(entity.type_ref()))
                 && !entity.lifecycle.in_limbo()
                 && self.order_gate.get(id).is_none_or(|&due| tick >= due)
                 && matches!(
@@ -5651,6 +5774,7 @@ impl SuperAi {
                         | crate::sim::mission::MissionType::AreaGuard
                 )
         })?;
+        let transport_name = sim.interner.resolve(entity.type_ref());
         let has_cargo = entity
             .passenger_role
             .cargo()
@@ -5684,7 +5808,8 @@ impl SuperAi {
             });
         }
 
-        // Dock: beached on the home side with seats open — the nearest
+        // Dock: beached (or hovering) on the home side with seats open —
+        // the nearest
         // idle boarding candidate takes the Enter order before anything
         // sails, so a loading transport waits for its pool instead of
         // ferrying one soldier at a time. The pool is the barracks line
@@ -5746,7 +5871,8 @@ impl SuperAi {
         // center spread — each candidate zone-gated before any order rides
         // out. Plain Move, not AttackMove: the cargo is the payload, and a
         // fight on the way must not sink the delivery. No connected aim
-        // (the sea road is cut) costs only this window.
+        // (the hover hull's sea road is cut; the fly hull's rows never
+        // cut) costs only this window.
         if has_cargo {
             let movement_zone = rules
                 .object(transport_name)
@@ -5787,8 +5913,9 @@ impl SuperAi {
         }
 
         // Return: empty and far out, walk back to the yard's spread ring
-        // for the next load. No connected ring cell (the sea road home is
-        // cut) costs only this window.
+        // for the next load. No connected ring cell (the hover hull's sea
+        // road home is cut; the fly hull is never cut) costs only this
+        // window.
         if home_distance >= i32::from(FERRY_DISCHARGE_DISTANCE) {
             let cell =
                 connected_ring_cell(sim, rules, home, from, transport, transport_name)?;
@@ -5800,9 +5927,9 @@ impl SuperAi {
             });
         }
         // Beach: empty on the home side with nobody in reach — walk to the
-        // yard's spread ring so the next windows board on land (a hull
-        // spawned offshore boards nobody from the water; a beached one sits
-        // in the infantry's own neighborhood).
+        // yard's spread ring so the next windows board on land (a hover
+        // hull spawned offshore boards nobody from the water; a beached —
+        // or hovering — one sits in the infantry's own neighborhood).
         if let Some(cell) =
             connected_ring_cell(sim, rules, home, from, transport, transport_name)
         {
@@ -7746,6 +7873,46 @@ mod tests {
         engineers.sort_unstable();
         engineers.dedup();
         assert_eq!(engineers, vec!["ENGINEER", "SENGINEER", "YENGINEER"]);
+    }
+
+    /// The air ferry and the stolen-tech trio. Only the Allies field a
+    /// fly-zone transport — the Night Hawk, the inland ferry where no
+    /// naval yard ever stands; the Soviet and Yuri hover transports keep
+    /// their naval-yard road, so their `air_ferry` stays `None`. All three
+    /// sides carry all three stolen-tech sections (retail Owner= names
+    /// every country): each row needs no prerequisite because the gate is
+    /// the theft — `can_build` refuses until a spy's lab infiltration
+    /// flips the house's stolen-tech byte, so army_pick never spends a
+    /// slot on one early.
+    #[test]
+    fn openings_field_the_air_ferry_and_the_stolen_tech_trio() {
+        let opening = |yard: &str| {
+            OPENINGS
+                .iter()
+                .find(|opening| opening.construction_yard == yard)
+                .expect("each side's opening")
+        };
+        assert_eq!(opening("GACNST").air_ferry, Some("SHAD"));
+        assert_eq!(opening("NACNST").air_ferry, None);
+        assert_eq!(opening("YACNST").air_ferry, None);
+
+        for yard in ["GACNST", "NACNST", "YACNST"] {
+            let opening = opening(yard);
+            for (name, role) in [
+                ("CCOMAND", Role::AntiInfantry),
+                ("CIVAN", Role::AntiArmor),
+                ("PTROOP", Role::Siege),
+            ] {
+                let rows: Vec<_> = opening
+                    .infantry
+                    .iter()
+                    .filter(|entry| entry.name == name)
+                    .collect();
+                assert_eq!(rows.len(), 1, "{yard} fields exactly one {name} row");
+                assert_eq!(rows[0].role, role);
+                assert_eq!(rows[0].needs, None, "{name} waits for no prerequisite");
+            }
+        }
     }
 
     /// The dogs' roster rows: each side's infantry table carries exactly one
