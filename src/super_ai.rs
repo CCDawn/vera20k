@@ -358,6 +358,12 @@ const DEFENSE_PER_YARD_BASIC: usize = 2;
 const DEFENSE_PER_YARD_AA: usize = 2;
 const DEFENSE_PER_YARD_HEAVY: usize = 1;
 
+/// The wall ring's wallet floor: a wall segment is 100 credits, but the ring
+/// spends dozens of them one production cycle at a time, so the limb stays
+/// shut until the wallet is deep enough that the perimeter never competes
+/// with the army queues or a real gun for the same income.
+const WALL_CREDIT_FLOOR: i32 = 1500;
+
 /// The late-game defense sink: past this wallet, with every economy cap
 /// met and the power grid in the black, each yard's heavy quota gains one
 /// tier — wealth converts to defense depth, and to nothing else (no new
@@ -693,6 +699,25 @@ struct Opening {
     defense_basic: &'static str,
     defense_aa: &'static str,
     defense_heavy: &'static str,
+    /// The side's wall segment (retail `Wall=yes` BuildingType — the Defense
+    /// queue's perimeter ring, one cell per production cycle): the Allied
+    /// Concrete Wall behind its barracks, the Soviet Wall behind its Hand,
+    /// Yuri's Citadel Wall behind its pedestal ([GAFWLL] — its section
+    /// header reads `[GAFWLL];temp wall for yuri[YAWALL]`, so the `[YAWALL]`
+    /// half is commented out and GAFWLL is the live section).
+    wall: Option<&'static str>,
+    /// The side's gap generator: [GAGAP], the shroud bubble behind the battle
+    /// lab (retail `Prerequisite=GATECH,GACNST`, `Powered=yes`, -100 power).
+    /// Allied only — the side table keeps the Soviet and Yuri entries `None`
+    /// so no house without an Allied lab ever queues one.
+    gap_generator: Option<&'static str>,
+    /// The side's country-locked heavy turret: [GTGCAN], the French Grand
+    /// Cannon behind the radar (retail `RequiredHouses=French`, -100 power).
+    /// The lock lives in the field staying on the Allied table AND in the
+    /// defense limb's own country re-check before the queue step: CanBuild
+    /// refuses a `RequiredHouses` type forever, and a refused item parked in
+    /// the one building slot is the engineer-commission lesson again.
+    country_cannon: Option<&'static str>,
     /// The side's naval yard (`Naval=yes`, so it founds on a WaterSet tile):
     /// one stands when the naval survey finds a legal shoreline cell inside
     /// the base's build area. Prerequisites are the ladder's own conyard,
@@ -865,6 +890,9 @@ const OPENINGS: [Opening; 3] = [
         defense_basic: "GAPILL",
         defense_aa: "NASAM",
         defense_heavy: "ATESLA",
+        wall: Some("GAWALL"),
+        gap_generator: Some("GAGAP"),
+        country_cannon: Some("GTGCAN"),
         naval_yard: "GAYARD",
         naval_ship: "DEST",
         naval_aa: Some("AEGIS"),
@@ -997,6 +1025,11 @@ const OPENINGS: [Opening; 3] = [
         defense_basic: "NALASR",
         defense_aa: "NAFLAK",
         defense_heavy: "TESLA",
+        // The Soviet Wall; the gap generator and the Grand Cannon are
+        // Allied-only retail pieces, so their entries stay empty.
+        wall: Some("NAWALL"),
+        gap_generator: None,
+        country_cannon: None,
         naval_yard: "NAYARD",
         naval_ship: "SUB",
         // The Sea Scorpion is the AA escort (its FlakWeapon fires AA; the
@@ -1108,6 +1141,12 @@ const OPENINGS: [Opening; 3] = [
         defense_basic: "YAGGUN",
         defense_aa: "YAGGUN",
         defense_heavy: "YAPSYT",
+        // Yuri's wall is the Citadel Wall ([GAFWLL], retail `Wall=yes`
+        // behind YABRCK, TechLevel 2, 100 credits); the gap generator and
+        // the Grand Cannon are Allied pieces.
+        wall: Some("GAFWLL"),
+        gap_generator: None,
+        country_cannon: None,
         naval_yard: "YAYARD",
         naval_ship: "BSUB",
         // The Boomer is both hull and capital (its own cruise missiles
@@ -1260,6 +1299,15 @@ pub struct SuperAi {
     /// ready item is skipped so the orders chain runs past it. Pinned
     /// state, never read from the runtime.
     place_pause_until: std::collections::HashMap<InternedId, u32>,
+    /// The wall ring's finished targets, by entity id: a structure whose
+    /// perimeter was fully walked (segments placed, cells refused, or the
+    /// ring already wall-to-wall) is one and done — a fallen wall segment
+    /// is never rebuilt. Pinned state, never read from the runtime.
+    walled: std::collections::HashSet<u64>,
+    /// The cells the wall placement has already issued into — placed or
+    /// refused alike — so a refused cell is never knocked on twice ahead of
+    /// a fresher one. Pinned state, never read from the runtime.
+    wall_cells: std::collections::HashSet<(u16, u16)>,
     /// Combat production slots issued since deploy — vehicles and infantry
     /// each. Pinned state driving the specialist wheels; see
     /// [`SPECIALIST_EVERY_VEHICLE`].
@@ -1399,6 +1447,8 @@ impl SuperAi {
             expansion_abandoned: false,
             place_stuck: std::collections::HashMap::new(),
             place_pause_until: std::collections::HashMap::new(),
+            walled: std::collections::HashSet::new(),
+            wall_cells: std::collections::HashSet::new(),
             rally_gate: std::collections::HashMap::new(),
             vehicle_slots: 0,
             infantry_slots: 0,
@@ -1448,7 +1498,8 @@ impl SuperAi {
     /// sortie, board the fortress's anti-armor cargo, walk the expansion
     /// MCV to the second ore field and deploy it, walk an idle scout
     /// toward the map's nearest dark cell, keep the building queue walking
-    /// the ladder, hold the war factories' rallies around the yard, keep
+    /// the ladder, raise the wall ring once the core gun quotas hold, hold
+    /// the war factories' rallies around the yard, keep
     /// the vehicle queue on miners-then-tanks, keep the barracks queue on
     /// the side's basic soldier. See the module docs for the determinism
     /// contract.
@@ -1818,6 +1869,46 @@ impl SuperAi {
             // placement slot (the old fallback's discipline, kept).
             && let Some((rx, ry)) = {
                 let type_name = sim.interner.resolve(ready.type_id);
+                // The wall ring's placement (Layer 2.8): a ready segment
+                // goes to the ring cell [`Self::wall_next_cell`] picks —
+                // the first untried, wall-free cell on the current target's
+                // perimeter — and the cell is marked tried the moment the
+                // order issues, so a placement the engine refuses moves to
+                // the next cell next tick instead of knocking on the same
+                // one. The strike counter below still counts the refused
+                // attempts and pauses the type, so a fully blocked ring
+                // cannot soak the one-command budget. `None` after the
+                // escape pass means every ring is genuinely done (the
+                // auto-fill completed the last one under us): cancel the
+                // 100-credit segment rather than let the ready item hold
+                // the Defense factory forever.
+                if opening
+                    .wall
+                    .is_some_and(|wall| sim.interner.get(wall) == Some(ready.type_id))
+                {
+                    match self.wall_next_cell(
+                        sim,
+                        rules,
+                        opening,
+                        &runtime.resources.overlay_registry,
+                        true,
+                    ) {
+                        Some(cell) => {
+                            self.wall_cells.insert(cell);
+                            Some(cell)
+                        }
+                        None => {
+                            return vec![CommandEnvelope::new(
+                                self.house,
+                                at,
+                                Command::CancelProductionByType {
+                                    type_id: ready.type_id,
+                                    all: false,
+                                },
+                            )];
+                        }
+                    }
+                } else {
                 let far_site = if type_name == opening.refinery
                     && self.expansion_site.is_some()
                     && !self.remote_refinery_stood
@@ -1917,6 +2008,7 @@ impl SuperAi {
                         }),
                     }
                 })
+                }
             }
         {
             let stuck = self.place_stuck.entry(ready.type_id).or_insert(0);
@@ -3102,6 +3194,18 @@ impl SuperAi {
             && self.count_structures_of_type(sim, opening.war_factory) >= FACTORY_BUILDOUT
             && self.count_structures_of_type(sim, opening.refinery) >= REFINERY_CAP
             && bases.len() >= 2;
+        // The Grand Cannon's country gate (the entry below): GTGCAN is
+        // `RequiredHouses=French`, so every other Allied country (America,
+        // Britain, Germany, Korea) must be refused before the queue step
+        // ever fires. The engine's own CanBuild answers No forever for a
+        // house the `RequiredHouses` lock refuses, and a type the house can
+        // never own must not keep reaching for the one building slot — the
+        // engineer-commission lesson. The side table already keeps the
+        // Soviet and Yuri entries `None`.
+        let french_house = sim
+            .houses
+            .get(&self.house)
+            .is_some_and(|house| sim.interner.resolve(house.house_type_id()) == "French");
         let heavy_per_yard = DEFENSE_PER_YARD_HEAVY + usize::from(late_sink);
         let defenses = [
             (
@@ -3121,6 +3225,33 @@ impl SuperAi {
                 DEFENSE_PER_YARD_BASIC,
                 BASIC_DEFENSE_TARGET * 2,
                 true,
+            ),
+            // The defense extension (Layer 2.9): the gap generator and the
+            // Grand Cannon ride the same gun queue step as the three core
+            // lines, so the blackout gate above covers them for free — both
+            // are retail `Powered=yes` with `Power=-100` and only queue
+            // while the grid reads `output >= drain`, with the power
+            // preemption standing a plant first when the pending drain
+            // would run the grid red. Their entries sit after the core
+            // lines, so a base arms itself before it decorates. The sides
+            // without a piece hold the basic pillbox's name below — never
+            // read, because the gate's `&&` chain short-circuits on the
+            // `None` field and the gun filter reads the count only behind a
+            // true gate.
+            (
+                opening.gap_generator.unwrap_or(opening.defense_basic),
+                1,
+                2,
+                opening.gap_generator.is_some()
+                    && self.count_structures_of_type(sim, opening.battle_lab) >= 1,
+            ),
+            (
+                opening.country_cannon.unwrap_or(opening.defense_basic),
+                1,
+                2,
+                opening.country_cannon.is_some()
+                    && french_house
+                    && self.count_structures_of_type(sim, radar_name) >= 1,
             ),
         ];
         // The first gated type with a base under its quota claims the next
@@ -3219,6 +3350,10 @@ impl SuperAi {
             // behind a superweapon rebuild). Placement rides the same
             // yard-centered ring scan every other building uses; Yuri's
             // Gatling Cannon serves both the AA and the pillbox slots.
+            // The wall limb reads this after the gun loop: an empty list
+            // means every base's core gun lines sit at their quotas (or
+            // their gates are shut).
+            let guns_settled = gun_wants.is_empty();
             if any_tank && grid_black {
                 for (name, expansion) in gun_wants {
                     // Guns queue only from a wallet that can pay for them
@@ -3336,6 +3471,49 @@ impl SuperAi {
                         Command::QueueProduction { type_id },
                     )];
                 }
+            }
+
+            // The wall ring (Layer 2.8). A perimeter of the side's wall
+            // segments goes up one production cycle at a time around the
+            // first superweapon, then the second, then the construction
+            // yard — the pieces an early raider values most. The gates keep
+            // the ring out of the way: the core gun lines are at their
+            // quotas (guns_settled), the wallet clears
+            // [`WALL_CREDIT_FLOOR`], the building queues are idle (the
+            // block this sits in), no wall is queued or ready, and some
+            // target still has an untried ring cell. The walk
+            // ([`Self::wall_next_cell`]) also retires exhausted targets
+            // into `walled` as it goes, so a ring the auto-fill or a refusal
+            // closed can never queue another segment for. Yuri walls through
+            // the same limb: its Citadel Wall is a retail `Wall=yes`
+            // Defense-queue building like the others.
+            if guns_settled
+                && let Some(wall_name) = opening.wall
+                && let Some(wall_ty) = rules.object(wall_name)
+                && crate::sim::production::cameo_draw_state(sim, rules, self.house, wall_ty)
+                    .enabled
+                && crate::sim::production::credits_for_owner(sim, &owner) >= WALL_CREDIT_FLOOR
+                && let Some(wall_type_id) = sim.interner.get(wall_name)
+                && !queue.iter().any(|item| item.type_id == wall_type_id)
+                && !ready_stock.iter().any(|item| item.type_id == wall_type_id)
+                && self
+                    .wall_next_cell(
+                        sim,
+                        rules,
+                        opening,
+                        &runtime.resources.overlay_registry,
+                        false,
+                    )
+                    .is_some()
+            {
+                self.placement_intent = None;
+                return vec![CommandEnvelope::new(
+                    self.house,
+                    at,
+                    Command::QueueProduction {
+                        type_id: wall_type_id,
+                    },
+                )];
             }
 
             // The growth tail: the base keeps expanding past the fixed
@@ -4660,6 +4838,99 @@ impl SuperAi {
             .count()
     }
 
+    /// The next ring cell the wall placement should issue into, walking the
+    /// targets first superweapon, then second superweapon, then construction
+    /// yard — the pieces an early raider values most — and retiring every
+    /// target whose ring is spent (every cell holds a wall, or was tried and
+    /// refused) into [`Self::walled`]. A ring walk reads the live overlay
+    /// grid, so cells already carrying a wall segment are skipped without
+    /// spending a tried-cell mark or a placement strike on them. With
+    /// `escape` set — a ready segment needs a home now — a walk that finds
+    /// nothing gives the tried-cell book one clean second pass on the yard's
+    /// ring, the perpetual fallback, so the walk can move again next tick;
+    /// whatever still refuses re-fills the book and the strike counter paces
+    /// the type, and a ring the auto-fill completed in the meantime answers
+    /// `None`, which the caller answers by canceling the segment instead of
+    /// wedging the one placement slot.
+    fn wall_next_cell(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        overlays: &crate::rules::overlay_types::OverlayTypeRegistry,
+        escape: bool,
+    ) -> Option<(u16, u16)> {
+        let grid = sim.overlay_grid.as_ref();
+        let holds_wall = |(rx, ry): (u16, u16)| -> bool {
+            grid.and_then(|grid| grid.cell(rx, ry).overlay_id)
+                .and_then(|id| overlays.flags(id))
+                .is_some_and(|flags| flags.wall)
+        };
+        for name in [
+            opening.super_weapon_building,
+            opening.second_super_weapon_building,
+            opening.construction_yard,
+        ] {
+            let Some((id, rx, ry)) = sim
+                .substrate
+                .entities
+                .iter_sorted()
+                .find_map(|(eid, entity)| {
+                    (entity.owner() == self.house
+                        && entity.category() == crate::map::entities::EntityCategory::Structure
+                        && sim.interner.resolve(entity.type_ref()) == name)
+                        .then_some((eid, entity.position.rx(), entity.position.ry()))
+                })
+            else {
+                continue;
+            };
+            if self.walled.contains(&id) {
+                continue;
+            }
+            let Some(ty) = rules.object(name) else {
+                continue;
+            };
+            // The ring's relative cells go negative (a 0-based foundation's
+            // top and left ring edges sit at -1), so the map-side guard
+            // against a `u16` wrap belongs on the absolute cell, never on
+            // the offset — filtering the offset would clip those two edges
+            // off the ring entirely.
+            let cell = wall_ring_cells(ty.foundation.cell_bounds())
+                .into_iter()
+                .map(|(dx, dy)| (rx as i16 + dx, ry as i16 + dy))
+                .filter(|&(x, y)| x >= 0 && y >= 0)
+                .map(|(x, y)| (x as u16, y as u16))
+                .find(|&cell| !self.wall_cells.contains(&cell) && !holds_wall(cell));
+            match cell {
+                Some(cell) => return Some(cell),
+                // The ring is spent. One and done either way: a ring fully
+                // walked needs no more segments, and a fallen segment is
+                // never rebuilt.
+                None => {
+                    self.walled.insert(id);
+                }
+            }
+        }
+        if escape {
+            self.wall_cells.clear();
+            // The yard is the target the ring can always fall back to, so a
+            // spent yard comes out of `walled` with its book wiped — the
+            // walk rediscovers it next tick. A supers-first priority means
+            // the reset never revisits a superweapon ring (those stay
+            // retired in `walled`).
+            let yard = sim.substrate.entities.iter_sorted().find_map(|(eid, entity)| {
+                (entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Structure
+                    && sim.interner.resolve(entity.type_ref()) == opening.construction_yard)
+                    .then_some(eid)
+            });
+            if let Some(id) = yard {
+                self.walled.remove(&id);
+            }
+        }
+        None
+    }
+
     /// How many of the house's combat units — vehicle or infantry; the
     /// engine files foot soldiers and the Rocketeer under `Infantry`, tanks
     /// under `Unit` — are exactly this retail type name. The mix's fielded
@@ -5919,6 +6190,31 @@ fn siege_standoff_cell(
     None
 }
 
+/// The perimeter ring one cell outside a foundation's cell bounds, walked
+/// clockwise from the top-left corner: the top edge left to right, the right
+/// edge top to bottom, the bottom edge right to left, the left edge bottom
+/// to top. The order is the wall ring's placement order — fixed, so a cell
+/// the engine refused is never revisited ahead of a fresher one, and a ring
+/// fills edge to edge instead of dotting.
+fn wall_ring_cells(bounds: (i16, i16, i16, i16)) -> Vec<(i16, i16)> {
+    let (min_x, min_y, max_x, max_y) = bounds;
+    let (left, top, right, bottom) = (min_x - 1, min_y - 1, max_x + 1, max_y + 1);
+    let mut cells = Vec::new();
+    for x in left..=right {
+        cells.push((x, top));
+    }
+    for y in top + 1..=bottom {
+        cells.push((right, y));
+    }
+    for x in (left..right).rev() {
+        cells.push((x, bottom));
+    }
+    for y in (top + 1..bottom).rev() {
+        cells.push((left, y));
+    }
+    cells
+}
+
 /// The first legal placement origin for `ty`, scanning outward from `center`
 /// ring by ring in a fixed row-major order.
 fn find_site_around(
@@ -6204,6 +6500,71 @@ mod tests {
         engineers.sort_unstable();
         engineers.dedup();
         assert_eq!(engineers, vec!["ENGINEER", "SENGINEER", "YENGINEER"]);
+    }
+
+    /// The defense extension's table rows: the wall ring's segment, the gap
+    /// generator and the French Grand Cannon, one row per side. The limbs
+    /// queue and place whatever these fields name, so a typo here would
+    /// queue a rules section that does not exist — the asserts pin the
+    /// retail pieces: GAWALL/NAWALL/[GAFWLL] are the only `Wall=yes`
+    /// building sections, GAGAP's lab prerequisite is Allied-only, and
+    /// GTGCAN's `RequiredHouses=French` keeps the cannon behind the limb's
+    /// own country gate.
+    #[test]
+    fn openings_name_the_wall_gap_and_country_cannon_entries() {
+        let opening = |yard: &str| {
+            OPENINGS
+                .iter()
+                .find(|opening| opening.construction_yard == yard)
+                .expect("each side's opening")
+        };
+        let allied = opening("GACNST");
+        assert_eq!(allied.wall, Some("GAWALL"));
+        assert_eq!(allied.gap_generator, Some("GAGAP"));
+        assert_eq!(allied.country_cannon, Some("GTGCAN"));
+
+        let soviet = opening("NACNST");
+        assert_eq!(soviet.wall, Some("NAWALL"));
+        assert_eq!(soviet.gap_generator, None, "GAGAP is Allied retail");
+        assert_eq!(soviet.country_cannon, None, "GTGCAN is French-only");
+
+        let yuri = opening("YACNST");
+        assert_eq!(
+            yuri.wall,
+            Some("GAFWLL"),
+            "the Citadel Wall — the [YAWALL] half of the section header is commented out"
+        );
+        assert_eq!(yuri.gap_generator, None);
+        assert_eq!(yuri.country_cannon, None);
+    }
+
+    /// The ring walk's geometry: a 1x1 foundation's ring is its eight
+    /// neighbors in the fixed clockwise-from-top-left order, and a w x h
+    /// foundation's ring is the expanded rectangle's border (2(w+2 + h+2) -
+    /// 4 cells) — the order the wall placement walks, so a refused cell is
+    /// never revisited ahead of a fresher one.
+    #[test]
+    fn wall_ring_walks_the_perimeter_clockwise_from_the_top_left() {
+        assert_eq!(
+            wall_ring_cells((0, 0, 0, 0)),
+            vec![
+                (-1, -1),
+                (0, -1),
+                (1, -1),
+                (1, 0),
+                (1, 1),
+                (0, 1),
+                (-1, 1),
+                (-1, 0)
+            ]
+        );
+        // A 3x2 foundation (bounds x 0..=2, y 0..=1): the expanded 5x4
+        // rectangle's border is 14 cells, top-left corner first.
+        let ring = wall_ring_cells((0, 0, 2, 1));
+        assert_eq!(ring.len(), 14);
+        assert_eq!(ring[0], (-1, -1));
+        assert_eq!(ring[4], (3, -1));
+        assert_eq!(ring[13], (-1, 0));
     }
 
     /// A retail XMP03T4 Battle as the Super AI plays it in the bench: the
