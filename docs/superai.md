@@ -748,7 +748,25 @@ Transport, Hover Transport) commission once behind the naval yard and
 run a ferry — beach at home, board idle infantry with the engine's
 own Enter click, plain-Move to the enemy's aim (the cargo is the
 payload; a fight on the way must not sink the delivery), unload with
-the Unload mission, one leg per window.
+the Unload mission, one leg per window. The Allies carry a second
+ferry hull the shoreline does not gate: the Night Hawk
+(`[VehicleTypes]`, so the vehicle queue fields it) rides `Fly` rows
+where the whole map is one connected zone, so an inland Allied base —
+no naval yard, no Landing Craft — still runs the ferry line off its
+war factory; the two hulls share the single transport latch, and the
+naval commission outranks the air one, so a shoreline base keeps the
+twelve-seat craft.
+
+The last two gaps closed with it. The stolen-tech trio — Chrono
+Commando, Chrono Ivan, Psi-Corp Trooper — rides every side's infantry
+table with no prerequisite of its own: retail gates each behind
+`RequiresStolen*=yes`, `can_build` checks the house's stolen-tech byte,
+and the spy's battle-lab infiltration is what flips it, so the rows sit
+dark until a theft lands and army_pick's buildable filter passes them
+over without spending a slot until then. What stays out is out for a
+reason: the Cosmonaut needs a lobby past the standard tech ceiling, the
+Slave Miner's ore line is the refinery's own five slaves already, and
+Yuri's second hound is a twin of the one already fielded.
 
 ## The second superweapon
 
