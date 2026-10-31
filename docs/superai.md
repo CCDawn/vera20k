@@ -910,6 +910,36 @@ reachable even while its placement is paused, and an exhausted escape pass
 rests the whole target roster for `WALL_TARGET_COOLDOWN_TICKS` instead of
 re-queueing into the same refusals.
 
+## The wall guarantee window and the outpost production wheel
+
+Two starvations the two-pass read of a live game caught. (1) The wall
+walk sat at the building chain's tail behind the ladder and the gun
+rebuilds and drew ~3 turns per 10000 ticks against ~170 segments of
+ring theory, with `guns_settled` false through any live war closing
+the queue door outright — walls were silently off exactly when they
+mattered. The limb now sits ahead of the gun queue and the ladder, and
+a guarantee window paces it: at quota the old always-on right of way
+holds, otherwise `WALL_WINDOW_TICKS` (600, rearmed on the issued
+order) buys the ring one segment per window — a ~56-tick build per
+span, ~9% of the building slot, at most one build time off the
+ladder's own rung. (2) Layer 2.6 raised the expansion's own war
+factory, but the engine's one production line per category still rode
+a single carrier (`find_factory` prefers the flagged primary), so
+every rollout left home. The primary wheel (`TogglePrimaryFactory`,
+unused until now) alternates the carrier every
+`PRIMARY_TOGGLE_EVERY_VEHICLES` issued slots by reading the live
+primary flags — no direction bit; the first factory raised carries the
+lifecycle's flag, each toggle hands the line to the other factory and
+the flags carry the alternation on their own. The rally limb anchors
+each factory on the nearest standing yard instead of the first yard's
+ring (a pure `rally_anchor` picks per factory, Chebyshev), and the ore
+survey adds a one-point enemy-direction tie-break
+(`enemy_direction_bias`): a field within 5/4 of home's span to the
+enemy centroid gains the tie, a field behind home's back loses it —
+ore direction is not enemy direction, and an outpost that mines
+backward arms a base that never sees the war, but the bias only flips
+ties so the richness term keeps its voice.
+
 ## Upstream sync
 
 `superai/base` merges `origin/main` regularly; each pillar lands on its own

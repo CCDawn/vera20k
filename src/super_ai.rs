@@ -107,6 +107,15 @@ const EXPANSION_YARD_PROXIMITY: i16 = 8;
 /// latching the same ground.
 const ORE_FIELD_EXCLUSION_RADIUS: i16 = 10;
 
+/// The ore survey's enemy-direction bias, a pure tie-break: a candidate
+/// field within 5/4 of the home-to-enemy span gains this much score, a
+/// field behind home's back loses it. The bias is a tie nudge, never a
+/// filter — the survey's richness-per-distance term keeps its voice, and
+/// a backward field merely loses ties instead of disappearing (ore
+/// direction is not enemy direction, but an outpost that mines at all
+/// outranks one that never picked a field).
+const ORE_ENEMY_DIRECTION_BIAS: i32 = 1;
+
 /// How many of the fan-out offsets anchor idle defenders around the
 /// expansion yard: half the home set, enough posts for the sub-base's
 /// guard reserve without thinning the home perimeter's own spread.
@@ -404,6 +413,29 @@ const WALL_CREDIT_FLOOR: i32 = 600;
 /// One paced retry per cooldown; a ring that genuinely freed in the
 /// meantime still gets built when the walk runs again.
 const WALL_TARGET_COOLDOWN_TICKS: u32 = 1800;
+
+/// Ticks one wall segment's queue right rests before the ring may queue
+/// the next — the guarantee window. The wall walk used to sit at the
+/// building chain's tail behind the ladder and the gun rebuilds, and the
+/// two-pass read of a live game had it drawing ~3 turns per 10000 ticks
+/// against ~170 segments of ring theory, with `guns_settled` false the
+/// whole war shutting the door outright. The window is the floor, sized
+/// to the slot it borrows: a segment's ~56-tick build per 600-tick span
+/// holds the building slot ~9% of the time, so the ladder's own rung
+/// (the 3100-tick superweapon the longest) slips at most one build time
+/// (~56 ticks) per segment while the ring still crawls forward mid-war.
+/// Rearmed on the issued order; see the wall limb in [`Self::orders`].
+const WALL_WINDOW_TICKS: u32 = 600;
+
+/// Issued vehicle slots between primary-factory toggles. The engine keeps
+/// one production line per category riding a single carrier factory
+/// ([`crate::sim::production::find_factory`] prefers the flagged primary),
+/// so once the expansion fields its own war factory (Layer 2.6) the wheel
+/// hands the line to the other standing factory every four vehicles — the
+/// same slot odometer as [`SPECIALIST_EVERY_VEHICLE`] — and each rollout
+/// leaves the base it will fight from. See the toggle limb in
+/// [`Self::orders`].
+const PRIMARY_TOGGLE_EVERY_VEHICLES: u32 = 4;
 
 /// The late-game defense sink: past this wallet, with every economy cap
 /// met and the power grid in the black, each yard's heavy quota gains one
@@ -1652,10 +1684,24 @@ pub struct SuperAi {
     /// [`WALL_TARGET_COOLDOWN_TICKS`]. Pinned state, never read from the
     /// runtime.
     wall_target_cooldown_until: u32,
+    /// The tick the wall limb's guarantee window next opens: past it the
+    /// ring may queue a segment even while `guns_settled` is still false
+    /// (see [`WALL_WINDOW_TICKS`]). Rearmed the moment a segment's queue
+    /// order actually issues — a window that opened but queued nothing
+    /// (wallet low, book spent) stays open, so the next tick retries for
+    /// free. Pinned state, never read from the runtime.
+    wall_window_due: u32,
     /// Combat production slots issued since deploy — vehicles and infantry
     /// each. Pinned state driving the specialist wheels; see
     /// [`SPECIALIST_EVERY_VEHICLE`].
     vehicle_slots: u32,
+    /// The vehicle-slot count the primary-factory wheel last toggled at:
+    /// every [`PRIMARY_TOGGLE_EVERY_VEHICLES`] issued slots the wheel
+    /// hands the production line to the other standing war factory, so
+    /// the expansion's line carries its share of the rollout instead of
+    /// idling behind the home carrier. Pinned state, never read from the
+    /// runtime.
+    primary_toggle_mark: u32,
     infantry_slots: u32,
     /// The tick the next broken-bridge survey may run; see
     /// [`BRIDGE_SURVEY_TICKS`]. Pinned state, never read from the runtime.
@@ -1842,8 +1888,10 @@ impl SuperAi {
             walled: std::collections::HashSet::new(),
             wall_cells: std::collections::HashSet::new(),
             wall_target_cooldown_until: 0,
+            wall_window_due: 0,
             rally_gate: std::collections::HashMap::new(),
             vehicle_slots: 0,
+            primary_toggle_mark: 0,
             infantry_slots: 0,
             bridge_survey_due: 0,
             bridge_hut: None,
@@ -4072,10 +4120,91 @@ impl SuperAi {
             // behind a superweapon rebuild). Placement rides the same
             // yard-centered ring scan every other building uses; Yuri's
             // Gatling Cannon serves both the AA and the pillbox slots.
-            // The wall limb reads this after the gun loop: an empty list
-            // means every base's core gun lines sit at their quotas (or
-            // their gates are shut).
+            // An empty list means every base's core gun lines sit at
+            // their quotas (or their gates are shut); the wall limb
+            // below reads it before the gun loop, the gun loop itself
+            // reads it right after.
             let guns_settled = gun_wants.is_empty();
+
+            // The wall ring (Layer 2.8). A perimeter of the side's wall
+            // segments goes up one production cycle at a time around the
+            // first superweapon, then the second, then the construction
+            // yard — the pieces an early raider values most. The limb sits
+            // ahead of the gun queue and the ladder walk on purpose: at the
+            // chain's old tail it drew ~3 turns per 10000 ticks while the
+            // superweapon and the rebuilds held the slot, and `guns_settled`
+            // — false through any live war — shut the door exactly when
+            // walls mattered. The guarantee window
+            // ([`WALL_WINDOW_TICKS`], rearmed on the issued order below)
+            // buys the ring one turn per window even mid-gun-fill; at
+            // quota it keeps the old always-on right of way. The rest of
+            // the gates keep the ring out of the way: the wallet clears
+            // [`WALL_CREDIT_FLOOR`], the building queues are idle (the
+            // block this sits in), no wall is queued or ready, and some
+            // target still has an untried ring cell. The escape cooldown
+            // paces a fully refused book. The walk
+            // ([`Self::wall_next_cell`]) also retires exhausted targets
+            // into `walled` as it goes, so a ring the auto-fill or a refusal
+            // closed can never queue another segment for. Yuri walls through
+            // the same limb: its Citadel Wall is a retail `Wall=yes`
+            // Defense-queue building like the others.
+            //
+            // The first gate hoisted into a bool: a `let`-chain may only
+            // run down `&&`s, so the `||` admission cannot sit inside the
+            // chain below.
+            let wall_admitted = guns_settled
+                // The guarantee window: with the gun quotas still filling,
+                // the ring may still claim one segment per
+                // [`WALL_WINDOW_TICKS`] — the pace that keeps the wall
+                // alive through a war without starved rungs behind it.
+                || tick >= self.wall_window_due;
+            if wall_admitted
+                // The escape cooldown: after an escape pass every ring was
+                // tried and refused, so the freshly re-opened book waits
+                // out [`WALL_TARGET_COOLDOWN_TICKS`] before the walk runs
+                // again — the retry is paced, not a per-tick loop.
+                && tick >= self.wall_target_cooldown_until
+                && let Some(wall_name) = opening.wall
+                && let Some(wall_ty) = rules.object(wall_name)
+                && crate::sim::production::cameo_draw_state(sim, rules, self.house, wall_ty)
+                    .enabled
+                && crate::sim::production::credits_for_owner(sim, &owner) >= WALL_CREDIT_FLOOR
+                && let Some(wall_type_id) = sim.interner.get(wall_name)
+                && !queue.iter().any(|item| item.type_id == wall_type_id)
+                && !ready_stock.iter().any(|item| item.type_id == wall_type_id)
+                // A placement-paused wall stays unqueued too: a segment
+                // that goes ready while its placement is paused is a
+                // certain cancel — the credits would ride the queue only
+                // to come back as nothing.
+                && !self.place_pause_until.contains_key(&wall_type_id)
+                && self
+                    .wall_next_cell(
+                        sim,
+                        rules,
+                        opening,
+                        &runtime.resources.overlay_registry,
+                        false,
+                    )
+                    .is_some()
+            {
+                // Rearm the window on the issued order, not on the open
+                // gate: a window that opened but queued nothing (credits
+                // under the floor, book spent) must stay open — the next
+                // tick retries for free — while a queued segment's own
+                // `!queued` gate above holds the limb out for the build.
+                // The rearm therefore paces exactly the segments the ring
+                // actually buys.
+                self.wall_window_due = tick + WALL_WINDOW_TICKS;
+                self.placement_intent = None;
+                return vec![CommandEnvelope::new(
+                    self.house,
+                    at,
+                    Command::QueueProduction {
+                        type_id: wall_type_id,
+                    },
+                )];
+            }
+
             if any_tank && grid_black {
                 for (name, expansion) in gun_wants {
                     // Guns queue only from a wallet that can pay for them
@@ -4193,59 +4322,6 @@ impl SuperAi {
                         Command::QueueProduction { type_id },
                     )];
                 }
-            }
-
-            // The wall ring (Layer 2.8). A perimeter of the side's wall
-            // segments goes up one production cycle at a time around the
-            // first superweapon, then the second, then the construction
-            // yard — the pieces an early raider values most. The gates keep
-            // the ring out of the way: the core gun lines are at their
-            // quotas (guns_settled), the wallet clears
-            // [`WALL_CREDIT_FLOOR`], the building queues are idle (the
-            // block this sits in), no wall is queued or ready, and some
-            // target still has an untried ring cell. The walk
-            // ([`Self::wall_next_cell`]) also retires exhausted targets
-            // into `walled` as it goes, so a ring the auto-fill or a refusal
-            // closed can never queue another segment for. Yuri walls through
-            // the same limb: its Citadel Wall is a retail `Wall=yes`
-            // Defense-queue building like the others.
-            if guns_settled
-                // The escape cooldown: after an escape pass every ring was
-                // tried and refused, so the freshly re-opened book waits
-                // out [`WALL_TARGET_COOLDOWN_TICKS`] before the walk runs
-                // again — the retry is paced, not a per-tick loop.
-                && tick >= self.wall_target_cooldown_until
-                && let Some(wall_name) = opening.wall
-                && let Some(wall_ty) = rules.object(wall_name)
-                && crate::sim::production::cameo_draw_state(sim, rules, self.house, wall_ty)
-                    .enabled
-                && crate::sim::production::credits_for_owner(sim, &owner) >= WALL_CREDIT_FLOOR
-                && let Some(wall_type_id) = sim.interner.get(wall_name)
-                && !queue.iter().any(|item| item.type_id == wall_type_id)
-                && !ready_stock.iter().any(|item| item.type_id == wall_type_id)
-                // A placement-paused wall stays unqueued too: a segment
-                // that goes ready while its placement is paused is a
-                // certain cancel — the credits would ride the queue only
-                // to come back as nothing.
-                && !self.place_pause_until.contains_key(&wall_type_id)
-                && self
-                    .wall_next_cell(
-                        sim,
-                        rules,
-                        opening,
-                        &runtime.resources.overlay_registry,
-                        false,
-                    )
-                    .is_some()
-            {
-                self.placement_intent = None;
-                return vec![CommandEnvelope::new(
-                    self.house,
-                    at,
-                    Command::QueueProduction {
-                        type_id: wall_type_id,
-                    },
-                )];
             }
 
             // The growth tail: the base keeps expanding past the fixed
@@ -4554,20 +4630,35 @@ impl SuperAi {
             }
         }
 
-        // Keep every war factory's rally around the construction yard so its
-        // output gathers in the base instead of jamming the factory exit —
-        // each factory on its own offset cell (its index in the substrate's
-        // stable order), so three factories don't funnel every tank onto one
-        // point. The command archives the cell per factory (`SetRallyPoint
+        // Keep every war factory's rally around the yard nearest it so its
+        // output gathers at its own base instead of jamming the factory
+        // exit or crossing the map — the expansion's factory used to aim
+        // every tank at the first yard's ring, a march past its own front.
+        // Each factory keeps its own offset cell (its index in the
+        // substrate's stable order) around that nearest yard's center, so
+        // three factories don't funnel every tank onto one point. The
+        // command archives the cell per factory (`SetRallyPoint
         // 0x00443860`), so correcting whichever factory's archived cell
         // differs — one per tick — suffices for all of them.
-        if let Some(center) = self.structure_center(sim, opening.construction_yard)
-            && let Some((factory_id, desired)) = self
+        if !yard_centers.is_empty() {
+            let war_factories: Vec<(u64, (i16, i16))> = self
                 .own_structures(sim)
                 .into_iter()
                 .filter(|(_, name)| name == opening.war_factory)
+                .filter_map(|(id, _)| {
+                    sim.substrate.entities.get(id).map(|entity| {
+                        (
+                            id,
+                            (entity.position.rx() as i16, entity.position.ry() as i16),
+                        )
+                    })
+                })
+                .collect();
+            if let Some((factory_id, desired)) = war_factories
+                .iter()
                 .enumerate()
-                .map(|(index, (id, _))| {
+                .map(|(index, &(id, factory_cell))| {
+                    let center = rally_anchor(factory_cell, &yard_centers);
                     let spread = SPREAD_OFFSETS[index % SPREAD_OFFSETS.len()];
                     (
                         id,
@@ -4587,25 +4678,26 @@ impl SuperAi {
                             && self.rally_gate.get(&id).is_none_or(|&next| tick >= next)
                     })
                 })
-        {
-            // Fork: pace each factory's correction — a desired cell the
-            // base's own later buildings occupy (the crowded ring around
-            // the yard) gets its SetRally refused at apply time, and an
-            // unpaced re-issue looped here every tick and starved every
-            // branch below for the rest of the game (observed: the
-            // freeze began as the fourth factory and the guns filled the
-            // ring). One attempt per factory per window; the wedge then
-            // costs a tick per window instead of all of them.
-            self.rally_gate.insert(factory_id, tick + RALLY_RETRY_TICKS);
-            return vec![CommandEnvelope::new(
-                self.house,
-                at,
-                Command::SetRally {
-                    rx: desired.0,
-                    ry: desired.1,
-                    producer_ids: vec![factory_id],
-                },
-            )];
+            {
+                // Fork: pace each factory's correction — a desired cell the
+                // base's own later buildings occupy (the crowded ring around
+                // the yard) gets its SetRally refused at apply time, and an
+                // unpaced re-issue looped here every tick and starved every
+                // branch below for the rest of the game (observed: the
+                // freeze began as the fourth factory and the guns filled the
+                // ring). One attempt per factory per window; the wedge then
+                // costs a tick per window instead of all of them.
+                self.rally_gate.insert(factory_id, tick + RALLY_RETRY_TICKS);
+                return vec![CommandEnvelope::new(
+                    self.house,
+                    at,
+                    Command::SetRally {
+                        rx: desired.0,
+                        ry: desired.1,
+                        producer_ids: vec![factory_id],
+                    },
+                )];
+            }
         }
 
         // The wing's own commission, first jet and top-ups alike. The air
@@ -4660,6 +4752,88 @@ impl SuperAi {
                 self.house,
                 at,
                 Command::QueueProduction { type_id },
+            )];
+        }
+
+        // The primary-factory wheel (Layer 2.9). The engine keeps one
+        // production line per category on a single carrier factory
+        // (`find_factory` prefers the flagged primary, else the last
+        // eligible building), so once Layer 2.6 raised the expansion's
+        // own war factory its line stood idle while every rollout still
+        // left the home carrier — the forward base mustered nothing where
+        // it would fight. The wheel alternates the carrier: whoever holds
+        // the primary flag is the live carrier (`is_primary_factory` is
+        // the query), and toggling a nonprimary clears its peers and
+        // claims the flag (`toggle_factory_primary`), so each window
+        // flips the line to the other factory — no direction bit needed.
+        // Main vs outpost reads off the standing factories' distances:
+        // the main is the one nearest the home yard, the outpost the
+        // alive-and-online one nearest the expansion center inside its
+        // cluster ring. The slot odometer (`PRIMARY_TOGGLE_EVERY_VEHICLES`)
+        // keeps the limb sparse: a cheap check every tick, a command only
+        // every four vehicles.
+        let own_factories: Vec<(u64, (i16, i16))> = self
+            .own_structures(sim)
+            .into_iter()
+            .filter(|(_, name)| name == opening.war_factory)
+            .filter_map(|(id, _)| {
+                sim.substrate.entities.get(id).and_then(|entity| {
+                    (entity.lifecycle.object_alive() && entity.building_online()).then_some({
+                        (
+                            id,
+                            (entity.position.rx() as i16, entity.position.ry() as i16),
+                        )
+                    })
+                })
+            })
+            .collect();
+        let main_factory = home_center.and_then(|home| {
+            own_factories.iter().copied().min_by_key(|(_, pos)| {
+                (i32::from(pos.0) - i32::from(home.0))
+                    .abs()
+                    .max((i32::from(pos.1) - i32::from(home.1)).abs())
+            })
+        });
+        let outpost_factory = expansion_center.and_then(|center| {
+            own_factories
+                .iter()
+                .copied()
+                .filter(|&(id, _)| main_factory.is_none_or(|(main, _)| main != id))
+                .min_by_key(|(_, pos)| {
+                    (i32::from(pos.0) - i32::from(center.0))
+                        .abs()
+                        .max((i32::from(pos.1) - i32::from(center.1)).abs())
+                })
+                // The outpost line only exists once Layer 2.6's factory
+                // actually landed in the expansion's ring; two factories
+                // that both sit at home are no alternation.
+                .filter(|(_, pos)| {
+                    (i32::from(pos.0) - i32::from(center.0))
+                        .abs()
+                        .max((i32::from(pos.1) - i32::from(center.1)).abs())
+                        <= i32::from(BASE_CLUSTER_RADIUS)
+                })
+        });
+        if let (Some((main_id, _)), Some((outpost_id, _))) = (main_factory, outpost_factory)
+            && self
+                .vehicle_slots
+                .saturating_sub(self.primary_toggle_mark)
+                >= PRIMARY_TOGGLE_EVERY_VEHICLES
+        {
+            // The carrier reads off the live primary flags. Neither
+            // flagged (a fresh pair the engine has not picked from yet)
+            // hands the toggle to the outpost, starting the alternation
+            // the flags then carry forward on their own.
+            let target = if sim.production.is_primary_factory(outpost_id) {
+                main_id
+            } else {
+                outpost_id
+            };
+            self.primary_toggle_mark = self.vehicle_slots;
+            return vec![CommandEnvelope::new(
+                self.house,
+                at,
+                Command::TogglePrimaryFactory { entity_id: target },
             )];
         }
 
@@ -5051,6 +5225,10 @@ impl SuperAi {
         validate: Option<&'static str>,
     ) -> Option<(u16, u16)> {
         let grid = sim.overlay_grid.as_ref()?;
+        // The enemy-direction read, hoisted once per survey (the callers
+        // are the paced expansion surveys, so the whole-entity walk costs
+        // nothing per candidate).
+        let enemy_center = self.enemy_center(sim);
         let mut candidates: Vec<((u16, u16), i32)> = Vec::new();
         for ry in 0..grid.height() {
             for rx in 0..grid.width() {
@@ -5073,9 +5251,15 @@ impl SuperAi {
                     continue;
                 };
                 // Value per cell of distance, as fixed-point thousandths:
-                // a field twice as far must be twice as rich to win.
+                // a field twice as far must be twice as rich to win. The
+                // enemy-direction bias nudges ties toward the fields that
+                // face the enemy — a forward outpost fights from its mine;
+                // a field behind home's back arms a base that never sees
+                // the war (the bias only flips ties, see
+                // [`enemy_direction_bias`]).
                 let score = i32::from(view.nominal_value) * 1000
-                    / (1000 + i32::from(distance) * 1000 / i32::from(EXPANSION_MIN_DISTANCE));
+                    / (1000 + i32::from(distance) * 1000 / i32::from(EXPANSION_MIN_DISTANCE))
+                    + enemy_direction_bias(enemy_center, from, (cx, cy));
                 candidates.push(((rx, ry), score));
             }
         }
@@ -7751,6 +7935,57 @@ fn spy_infiltration_rank(type_name: &str) -> u8 {
     }
 }
 
+/// A war factory's rally anchor: the standing yard center nearest it
+/// (Chebyshev, first in the stable yard order on ties — the home yard
+/// when only one stands). The expansion's factory rallied on the first
+/// yard's ring like everyone else, so every tank it built crossed the
+/// map home past its own front; anchoring per factory keeps each line's
+/// output at the base it fights from. Pure so the survey stays unit
+/// testable.
+fn rally_anchor(factory_cell: (i16, i16), yards: &[(i16, i16)]) -> (i16, i16) {
+    yards
+        .iter()
+        .copied()
+        .min_by_key(|&(ax, ay)| {
+            (i32::from(factory_cell.0) - i32::from(ax))
+                .abs()
+                .max((i32::from(factory_cell.1) - i32::from(ay)).abs())
+        })
+        .unwrap_or(factory_cell)
+}
+
+/// The ore survey's enemy-direction term: a field whose span
+/// to the enemy centroid stays within 5/4 of home's own span sits "toward
+/// the enemy" and gains [`ORE_ENEMY_DIRECTION_BIAS`], a field behind
+/// home's back loses it, and no enemy reading at all leaves the score
+/// untouched. The bias is a tie nudge, never a filter — ore direction is
+/// not enemy direction (the forward field is often the poorer one), so
+/// the richness-per-distance term keeps its voice and only ties flip.
+/// Pure so the bias stays unit testable.
+fn enemy_direction_bias(
+    enemy_cell: Option<(i16, i16)>,
+    home: (i16, i16),
+    cell: (i16, i16),
+) -> i32 {
+    let Some((ex, ey)) = enemy_cell else {
+        return 0;
+    };
+    let chebyshev = |ax: i16, ay: i16, bx: i16, by: i16| {
+        (i32::from(ax) - i32::from(bx))
+            .abs()
+            .max((i32::from(ay) - i32::from(by)).abs())
+    };
+    let home_span = chebyshev(ex, ey, home.0, home.1);
+    let cell_span = chebyshev(ex, ey, cell.0, cell.1);
+    // The 5/4 test as integers: cell_span <= home_span * 5/4, without a
+    // fraction.
+    if cell_span * 4 <= home_span * 5 {
+        ORE_ENEMY_DIRECTION_BIAS
+    } else {
+        -ORE_ENEMY_DIRECTION_BIAS
+    }
+}
+
 /// Clamp an offset destination into the map. An offset target off the map
 /// would wrap through `as u16` to the far corner, and the command layer
 /// silently drops such orders — the unit never leaves its standing set and
@@ -8247,8 +8482,9 @@ fn find_site_beyond(
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_priority_rank, foundation_keeps_gap, nearest_connected_target,
-        spy_infiltration_rank, Role, EXPANSION_MIN_DISTANCE, OPENINGS, SuperAi,
+        capture_priority_rank, enemy_direction_bias, foundation_keeps_gap,
+        nearest_connected_target, rally_anchor, spy_infiltration_rank, Role,
+        EXPANSION_MIN_DISTANCE, ORE_ENEMY_DIRECTION_BIAS, OPENINGS, SuperAi,
         SuperAiDifficulty, TECH_BUILDING_TYPES,
     };
     use crate::sim::intern::InternedId;
@@ -11576,6 +11812,37 @@ mod tests {
         );
     }
 
+    /// The ore survey's enemy-direction term is a tie nudge with both
+    /// signs and no hard side: a field toward the enemy wins the ties a
+    /// backward field loses, no enemy reading at all leaves the score
+    /// untouched, and one point either way cannot zero a candidate
+    /// against the survey's thousandths-scale richness term (ore
+    /// direction is not enemy direction — the term only breaks ties, the
+    /// richer backward field still wins outright).
+    #[test]
+    fn ore_enemy_bias_nudges_ties_but_never_zeroes() {
+        let home = (0, 0);
+        let enemy = (50, 0);
+        // Toward the enemy: the field's span to the enemy (10) sits well
+        // inside home's own span (50) times 5/4.
+        assert_eq!(
+            enemy_direction_bias(Some(enemy), home, (40, 0)),
+            ORE_ENEMY_DIRECTION_BIAS
+        );
+        // Behind home's back: the span (70) leaves the 62-cell budget, so
+        // the field is penalized — but only by the one tie point.
+        assert_eq!(
+            enemy_direction_bias(Some(enemy), home, (0, 70)),
+            -ORE_ENEMY_DIRECTION_BIAS
+        );
+        // No enemy reading at all: the term stays neutral both ways.
+        assert_eq!(enemy_direction_bias(None, home, (40, 0)), 0);
+        assert_eq!(enemy_direction_bias(None, home, (0, 70)), 0);
+        // The nudge stays a tie-break: past one point it would start
+        // overriding the richness term it exists to complement.
+        assert_eq!(ORE_ENEMY_DIRECTION_BIAS.abs(), 1);
+    }
+
     // ---- Layer 3: combat & unit management ----
 
     /// The combat layer's fixtures and reads live in a nested module so the
@@ -11584,7 +11851,8 @@ mod tests {
         use super::*;
         use super::super::{
             ATTACK_WAVE_SIZE, BOARD_MAX_ATTEMPTS, FutilityKind, IDLE_REORDER_TICKS,
-            STUCK_SCAN_TICKS, STUCK_TIMEOUT, WAVE_RETRY_TICKS,
+            PRIMARY_TOGGLE_EVERY_VEHICLES, STUCK_SCAN_TICKS, STUCK_TIMEOUT, WAVE_RETRY_TICKS,
+            WALL_TARGET_COOLDOWN_TICKS, WALL_WINDOW_TICKS,
         };
 
         use std::collections::BTreeMap;
@@ -12178,6 +12446,152 @@ mod tests {
             assert!(
                 ai.wall_next_cell(scenario.sim(), rules, opening, overlays, false).is_some(),
                 "the re-opened ring answers again — the re-queue the cooldown rests"
+            );
+        }
+
+        /// The wall guarantee window's sizing arithmetic, pinned as the
+        /// constants it lives in. The gate itself (the
+        /// `guns_settled ||` admission, the rearm on the issued order)
+        /// sits inside the orders building block — guns, wallet, cameo,
+        /// the idle queue — the same block the escape test above declines
+        /// to drive, so what pins here is the derivation the two-pass
+        /// read produced: one segment's ~56-tick build per
+        /// [`WALL_WINDOW_TICKS`] span holds the building slot ~9% of the
+        /// time, the ladder's own rung slips at most one build time per
+        /// segment, and the window still fires between two escape-cooldown
+        /// rests instead of the cooldown becoming the binding pace.
+        #[test]
+        fn wall_window_sizes_the_ring_into_the_chain() {
+            assert_eq!(
+                WALL_WINDOW_TICKS, 600,
+                "the two-pass floor: ~3 turns per 10000 ticks starved the \
+                 ring, 600 keeps the slot share near 9%"
+            );
+            // Tighter than a segment's build time and the window spends
+            // the whole slot share re-queuing; past the escape cooldown
+            // and the paced retry, not the window, paces the ring.
+            assert!(WALL_WINDOW_TICKS > 56);
+            assert!(WALL_WINDOW_TICKS < WALL_TARGET_COOLDOWN_TICKS);
+        }
+
+        /// The rally anchor is per factory: each factory rallies on the
+        /// nearest standing yard (Chebyshev), ties landing on the stable
+        /// order's earlier yard — the home yard. The expansion's factory
+        /// used to rally on the first yard's ring like everyone else, so
+        /// its whole rollout marched home past its own front.
+        #[test]
+        fn rally_anchor_takes_the_nearest_yard() {
+            let yards = [(10, 10), (40, 12)];
+            assert_eq!(rally_anchor((38, 14), &yards), (40, 12));
+            assert_eq!(rally_anchor((12, 9), &yards), (10, 10));
+            // A tie lands on the stable order's first yard — home.
+            assert_eq!(rally_anchor((25, 11), &yards), (10, 10));
+            // No yard at all: the factory stands in as its own anchor so
+            // the limb's offset arithmetic still lands on-map.
+            assert_eq!(rally_anchor((7, 8), &[]), (7, 8));
+        }
+
+        /// The primary wheel alternates the engine's single production
+        /// line between the two standing war factories. The lifecycle's
+        /// own initialization (`initialize_factory_primary`) flags the
+        /// first factory raised — the home carrier — so the first window
+        /// hands the line to the unflagged outpost factory; with the
+        /// outpost flagged, the next window hands it back — and the
+        /// applied toggles leave the flags exactly so, the alternation
+        /// then carrying itself without any direction bit of ours.
+        #[test]
+        #[ignore = "slow; retail; loads a retail map"]
+        fn primary_wheel_alternates_home_and_outpost_carriers() {
+            use crate::sim::world::{FrameEffects, TickLane};
+
+            let (mut scenario, ai_house, _enemy) = pacific_bridge_battle();
+            let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+            scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+            spawn_near(&mut scenario, "GACNST", ai_house, (64, 92));
+            let outpost_yard =
+                spawn_near(&mut scenario, "GACNST", ai_house, far_shore(&scenario));
+            let outpost_yard_cell = scenario
+                .sim()
+                .substrate
+                .entities
+                .get(outpost_yard)
+                .map(|entity| (entity.position.rx(), entity.position.ry()))
+                .expect("the expansion yard");
+            // The expansion center reads off the pinned second site: the
+            // yard nearest it is the outpost base the wheel routes to.
+            ai.expansion2_site = Some(outpost_yard_cell);
+            let home_factory = spawn_near(&mut scenario, "GAWEAP", ai_house, (66, 92));
+            let outpost_factory =
+                spawn_near(&mut scenario, "GAWEAP", ai_house, outpost_yard_cell);
+
+            // Four issued vehicles past the last mark: the first window is
+            // open from the first driven tick.
+            ai.vehicle_slots = PRIMARY_TOGGLE_EVERY_VEHICLES;
+
+            // Drive until the wheel's toggle shows up, applying every
+            // frame's orders on the way — the applied toggle is what moves
+            // the primary flag, so the next window reads the flip.
+            fn drive_for_toggle(
+                scenario: &mut crate::headless_scenario::HeadlessScenario,
+                ai: &mut SuperAi,
+                budget: u32,
+            ) -> u64 {
+                for tick in 0..budget {
+                    let orders = ai.orders(&scenario.runtime, tick);
+                    let toggle = orders.iter().find_map(|envelope| {
+                        match envelope.payload {
+                            crate::sim::command::Command::TogglePrimaryFactory {
+                                entity_id,
+                            } => Some(entity_id),
+                            _ => None,
+                        }
+                    });
+                    scenario
+                        .runtime
+                        .advance_frame(
+                            &orders,
+                            crate::headless_scenario::SIM_TICK_MS,
+                            TickLane::Ordinary,
+                            FrameEffects::default(),
+                        )
+                        .expect("simulation frame failed");
+                    if let Some(entity_id) = toggle {
+                        return entity_id;
+                    }
+                }
+                panic!("no TogglePrimaryFactory within {budget} ticks");
+            }
+
+            let first = drive_for_toggle(&mut scenario, &mut ai, 900);
+            assert_eq!(
+                first, outpost_factory,
+                "the unflagged outpost takes the first window"
+            );
+            assert!(
+                scenario.sim().production.is_primary_factory(outpost_factory),
+                "the applied toggle moved the line to the outpost"
+            );
+            assert!(
+                !scenario.sim().production.is_primary_factory(home_factory),
+                "the toggle cleared the home carrier's flag"
+            );
+
+            // Four more vehicles past the mark: the second window hands
+            // the line back home.
+            ai.vehicle_slots += PRIMARY_TOGGLE_EVERY_VEHICLES;
+            let second = drive_for_toggle(&mut scenario, &mut ai, 900);
+            assert_eq!(
+                second, home_factory,
+                "the flagged outpost yields the next window to the home carrier"
+            );
+            assert!(
+                scenario.sim().production.is_primary_factory(home_factory),
+                "the applied toggle moved the line back home"
+            );
+            assert!(
+                !scenario.sim().production.is_primary_factory(outpost_factory),
+                "the toggle cleared the outpost's flag"
             );
         }
     }
