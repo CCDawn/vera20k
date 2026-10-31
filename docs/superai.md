@@ -886,6 +886,30 @@ pre-strip-scan unconditional publication — from Factory state, through the
 same raw PLACE record — scoped to houses whose `HouseState::command_driven`
 is set. Upstream houses keep the strip path untouched.
 
+## Base livability fixes: site spacing, the stuck rescue, the radar alias, the wall cooldown
+
+Four live-play wedges, one theme: an AI base that could quietly stop
+functioning. (1) The site scans (`find_site_around_capped`,
+`find_site_beyond` in `src/super_ai.rs`) now keep a one-cell Chebyshev gap
+between foundations and demand a two-cell clear ring around factories,
+barracks and naval yards — the old first-legal-cell pick packed bases so
+tight that factory exits sealed and finished units held their factories at
+Done, stalling the queue; a packed base where no spaced candidate exists
+degrades one pass to the original predicate, because a tight base beats a
+frozen build chain. (2) A combat unit whose pathing burns out stood idle
+forever; a paced scan (`stuck_since`, `STUCK_TIMEOUT`) re-issues one
+AttackMove per window for a unit still on its snapshot cell, skipping
+units other chains own. (3) The `needs` gates read the Allied radar pair
+through an alias — GAAIRC is retail-forbidden to the Americans country,
+whose buildable twin is AMRADR, so a literal-only read kept an American
+ally's TNKD/JUMPJET/GHOST/SNIPE and its naval AA escort shut for whole
+games; the locked `needs` table values are unchanged, only the read. (4)
+The wall ring's refusal loop (refuse, pause, re-open the same ring, burn
+another 100-credit segment) drains: the ready segment's cancel escape is
+reachable even while its placement is paused, and an exhausted escape pass
+rests the whole target roster for `WALL_TARGET_COOLDOWN_TICKS` instead of
+re-queueing into the same refusals.
+
 ## Upstream sync
 
 `superai/base` merges `origin/main` regularly; each pillar lands on its own

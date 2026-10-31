@@ -53,6 +53,21 @@ const DEPLOY_ATTEMPTS: u8 = 5;
 /// How far from the construction yard the site search scans, in cells.
 const SITE_SEARCH_RADIUS: i16 = 24;
 
+/// Structures whose foundation owes a clear approach ring: war factories,
+/// barracks and naval yards march finished units out of a foundation edge,
+/// and a neighbor flush against that edge seals the door — the finished
+/// unit wedges inside holding the factory at Done, the queue stops drawing
+/// and the whole build chain stalls behind it (observed: a base whose yard
+/// had buildings on every side). The site scans demand a two-cell
+/// Chebyshev clear ring around these foundations — the conservative form
+/// (no per-exit-direction read) — which also carries the one-cell gap
+/// every foundation keeps from its neighbors.
+const EXIT_CLEARANCE_TYPES: [&str; 9] = [
+    "GAWEAP", "NAWEAP", "YAWEAP", // war factories
+    "GAPILE", "NAPILE", "YAPILE", // barracks
+    "GAYARD", "NAYARD", "YAYARD", // naval yards
+];
+
 /// Minimum distance, in cells, from the home yard for an expansion site:
 /// anything closer sits inside the home ring-scan's reach, so only the far
 /// ore fields — past [`SITE_SEARCH_RADIUS`] — justify walking a base out
@@ -269,6 +284,19 @@ const REFINERY_TYPES: [&str; 3] = ["GAREFN", "NAREFN", "YAREFN"];
 /// froze the whole build ladder for a tank's entire build time).
 const IDLE_REORDER_TICKS: u32 = 150;
 
+/// Ticks between the stuck-combat-unit scans: the walk visits every own
+/// combat entity, so it runs on this window's pace instead of every tick,
+/// like the other unit-wide sweeps' windows.
+const STUCK_SCAN_TICKS: u32 = 150;
+
+/// Ticks a combat unit may stand on one cell before the scan re-issues its
+/// march: the engine's own pathing burns out to an idle mission when the
+/// route exhausts, and nothing above re-orders a mission-less unit whose
+/// reorder gate has expired — a wave unit wedged behind a wall stood there
+/// for the rest of the game (the [`MCV_STUCK_TICKS`] lesson, for the army
+/// instead of the opening MCV).
+const STUCK_TIMEOUT: u32 = 600;
+
 /// The army's core — its main tank, the side's basic soldier — fills
 /// every queue slot until it reaches this size; only then does the mix
 /// diversify. A diversified opening would field specialists before the
@@ -367,6 +395,15 @@ const DEFENSE_PER_YARD_HEAVY: usize = 1;
 /// miner dump carries the wallet past the floor and the limb takes its
 /// one 100-credit segment per pass, leaving the army the rest.
 const WALL_CREDIT_FLOOR: i32 = 600;
+
+/// Ticks the wall ring's whole target roster rests after an escape pass:
+/// the pass only fires once every ring was tried and refused, and it
+/// resets the tried-cell book and re-opens the yard on the way out — so
+/// without a cooldown the wall limb re-queued against the same refusing
+/// ring the next tick and burned another 100-credit segment per cycle.
+/// One paced retry per cooldown; a ring that genuinely freed in the
+/// meantime still gets built when the walk runs again.
+const WALL_TARGET_COOLDOWN_TICKS: u32 = 1800;
 
 /// The late-game defense sink: past this wallet, with every economy cap
 /// met and the power grid in the black, each yard's heavy quota gains one
@@ -1609,6 +1646,12 @@ pub struct SuperAi {
     /// refused alike — so a refused cell is never knocked on twice ahead of
     /// a fresher one. Pinned state, never read from the runtime.
     wall_cells: std::collections::HashSet<(u16, u16)>,
+    /// The tick the wall limb may queue again after an escape pass. One
+    /// timestamp covers the whole target roster because the pass only
+    /// fires once every ring was tried and refused; see
+    /// [`WALL_TARGET_COOLDOWN_TICKS`]. Pinned state, never read from the
+    /// runtime.
+    wall_target_cooldown_until: u32,
     /// Combat production slots issued since deploy — vehicles and infantry
     /// each. Pinned state driving the specialist wheels; see
     /// [`SPECIALIST_EVERY_VEHICLE`].
@@ -1729,6 +1772,10 @@ pub struct SuperAi {
     /// paced at repeatedly without them ever revealing. Pinned state, never
     /// read from the runtime.
     scout_blacklist: std::collections::HashSet<(u16, u16)>,
+    /// The cell and tick each own combat unit was last seen standing still
+    /// at; see [`STUCK_TIMEOUT`]. Pinned state, never read from the
+    /// runtime.
+    stuck_since: std::collections::HashMap<u64, ((u16, u16), u32)>,
     /// Whether the spy's single commission has issued; the quota is one per
     /// game. Pinned state, never read from the runtime.
     spy_issued: bool,
@@ -1794,6 +1841,7 @@ impl SuperAi {
             place_pause_until: std::collections::HashMap::new(),
             walled: std::collections::HashSet::new(),
             wall_cells: std::collections::HashSet::new(),
+            wall_target_cooldown_until: 0,
             rally_gate: std::collections::HashMap::new(),
             vehicle_slots: 0,
             infantry_slots: 0,
@@ -1826,6 +1874,7 @@ impl SuperAi {
             deploy_issued: std::collections::HashSet::new(),
             deploy_due: 0,
             scout_blacklist: std::collections::HashSet::new(),
+            stuck_since: std::collections::HashMap::new(),
             spy_issued: false,
             naval_sortie_launching: false,
             naval_sortie_target: None,
@@ -2211,7 +2260,22 @@ impl SuperAi {
         self.place_pause_until.retain(|_, until| tick < *until);
         if let Some(ready) = ready_stock
             .iter()
-            .filter(|item| !self.place_pause_until.contains_key(&item.type_id))
+            .filter(|item| {
+                !self.place_pause_until.contains_key(&item.type_id)
+                    // The wall type stays visible through its own placement
+                    // pause, because this branch is the cancel escape's only
+                    // entry: a ready segment the filter hid while paused kept
+                    // its Defense-queue item parked forever — `building_busy`
+                    // (the queue scan in the build block below) read true,
+                    // the whole gun/ladder/wall block stood down, and the
+                    // segment sat there past every pause lifting. The pause
+                    // still holds the placement — the wall arm below answers
+                    // a paused type with the cancel — so the wedge drains
+                    // instead of re-issuing refused placements.
+                    || opening
+                        .wall
+                        .is_some_and(|wall| sim.interner.get(wall) == Some(item.type_id))
+            })
             .last()
             && let Some(ty) = rules.object(sim.interner.resolve(ready.type_id))
             // Routing, in order: the first expansion's refinery may still
@@ -2244,6 +2308,21 @@ impl SuperAi {
                     .wall
                     .is_some_and(|wall| sim.interner.get(wall) == Some(ready.type_id))
                 {
+                    // A placement-paused wall is cancel-only (the ready
+                    // stock filter above let it through for exactly this):
+                    // the segment's credits are already sunk, and holding
+                    // the Defense queue wedges `building_busy` — the gun,
+                    // ladder and wall limbs all stand down behind it.
+                    if self.place_pause_until.contains_key(&ready.type_id) {
+                        return vec![CommandEnvelope::new(
+                            self.house,
+                            at,
+                            Command::CancelProductionByType {
+                                type_id: ready.type_id,
+                                all: false,
+                            },
+                        )];
+                    }
                     match self.wall_next_cell(
                         sim,
                         rules,
@@ -2256,6 +2335,17 @@ impl SuperAi {
                             Some(cell)
                         }
                         None => {
+                            // The escape pass fired: every target's ring was
+                            // tried and refused, and the pass reset the
+                            // tried-cell book and re-opened the yard on the
+                            // way out. Arm the cooldown before the cancel —
+                            // without it the wall limb re-queued against the
+                            // same refusing ring next tick and each cycle
+                            // bought another 100-credit refusal. One paced
+                            // retry per [`WALL_TARGET_COOLDOWN_TICKS`]; the
+                            // queue gate holds the limb out for the span.
+                            self.wall_target_cooldown_until =
+                                tick + WALL_TARGET_COOLDOWN_TICKS;
                             return vec![CommandEnvelope::new(
                                 self.house,
                                 at,
@@ -3681,6 +3771,26 @@ impl SuperAi {
             return vec![CommandEnvelope::new(self.house, at, command)];
         }
 
+        // The stuck-unit rescue (Layer 3). The engine's own pathing burns
+        // out to an idle mission when a march exhausts, and no branch above
+        // re-orders a mission-less unit once its reorder gate has expired —
+        // a wave unit wedged against a wall stood there for the rest of the
+        // game. The scan runs on [`STUCK_SCAN_TICKS`]'s pace: every own
+        // combat unit stands in a cell-vs-snapshot map ([`Self::stuck_since`],
+        // the [`MCV_STUCK_TICKS`] window's shape), a unit still on its
+        // snapshot cell past [`STUCK_TIMEOUT`] draws one fresh AttackMove
+        // per scan — the wave's own destination read, the futility backoff
+        // pacing repeats — and units the walk no longer sees drop out of
+        // the map. Units parked on purpose (the guard posts' Guard stance,
+        // the ferry, the raids, the scouts, the reorder-gate cooldown)
+        // reset their window instead: not moving is what they were told
+        // to do.
+        if tick % STUCK_SCAN_TICKS == 0
+            && let Some(command) = self.stuck_rescue_orders(sim, rules, opening, tick)
+        {
+            return vec![CommandEnvelope::new(self.house, at, command)];
+        }
+
         // Walk the build ladder while the building queue idles: the opening's
         // fixed five, then the expansion — each further war factory (retail
         // MultipleFactory=0.8 per extra one) with a power plant ahead of it,
@@ -4100,6 +4210,11 @@ impl SuperAi {
             // the same limb: its Citadel Wall is a retail `Wall=yes`
             // Defense-queue building like the others.
             if guns_settled
+                // The escape cooldown: after an escape pass every ring was
+                // tried and refused, so the freshly re-opened book waits
+                // out [`WALL_TARGET_COOLDOWN_TICKS`] before the walk runs
+                // again — the retry is paced, not a per-tick loop.
+                && tick >= self.wall_target_cooldown_until
                 && let Some(wall_name) = opening.wall
                 && let Some(wall_ty) = rules.object(wall_name)
                 && crate::sim::production::cameo_draw_state(sim, rules, self.house, wall_ty)
@@ -4108,6 +4223,11 @@ impl SuperAi {
                 && let Some(wall_type_id) = sim.interner.get(wall_name)
                 && !queue.iter().any(|item| item.type_id == wall_type_id)
                 && !ready_stock.iter().any(|item| item.type_id == wall_type_id)
+                // A placement-paused wall stays unqueued too: a segment
+                // that goes ready while its placement is paused is a
+                // certain cancel — the credits would ride the queue only
+                // to come back as nothing.
+                && !self.place_pause_until.contains_key(&wall_type_id)
                 && self
                     .wall_next_cell(
                         sim,
@@ -6002,6 +6122,37 @@ impl SuperAi {
             .any(|(_, name)| name == type_name)
     }
 
+    /// The retail twin section a `needs` gate accepts beside its literal:
+    /// the Allied radar pair. GAAIRC is the Allied default but retail bars
+    /// it for the Americans country (`ForbiddenHouses=Americans`), and the
+    /// build ladder's own radar step resolves the Americans-buildable
+    /// AMRADR instead (the `radar_name` candidate scan in
+    /// [`Self::orders`]) — so a literal-only read of a `needs=="GAAIRC"`
+    /// row kept an American ally's TNKD, JUMPJET, GHOST and SNIPE shut for
+    /// a whole game: no radar the house may build ever counted. The Soviet
+    /// NARADR and the Yuri NAPSIS have no twins.
+    fn needs_gate_alias(gate: &str) -> Option<&'static str> {
+        match gate {
+            "GAAIRC" => Some("AMRADR"),
+            _ => None,
+        }
+    }
+
+    /// Whether a `needs` gate's prerequisite stands, reading the alias
+    /// pair through [`Self::needs_gate_alias`] — the gate's meaning is
+    /// "an Allied radar stands", not "the literal section stands", so the
+    /// consumers ([`Self::army_pick`], [`Self::naval_pick`]) must accept
+    /// either twin or the locked rows above never open.
+    fn needs_structure_stands(&self, sim: &crate::sim::world::Simulation, gate: &str) -> bool {
+        if self.owns_structure_of_type(sim, gate) {
+            return true;
+        }
+        match Self::needs_gate_alias(gate) {
+            Some(alias) => self.owns_structure_of_type(sim, alias),
+            None => false,
+        }
+    }
+
     /// How many of the house's structures are exactly this retail type name:
     /// the build ladder's expansion targets count (and re-count what the
     /// enemy destroys).
@@ -6344,7 +6495,7 @@ impl SuperAi {
             let mut pick: Option<(&RosterEntry, usize)> = None;
             for entry in roster.iter().filter(|entry| entry.role == role) {
                 if let Some(gate) = entry.needs
-                    && !self.owns_structure_of_type(sim, gate)
+                    && !self.needs_structure_stands(sim, gate)
                 {
                     continue;
                 }
@@ -6538,6 +6689,126 @@ impl SuperAi {
     fn gate_idle_order(&mut self, unit: u64, tick: u32) {
         self.order_gate.insert(unit, tick + IDLE_REORDER_TICKS);
         self.order_gate.retain(|_, &mut at| at > tick);
+    }
+
+    /// The stuck-units limb's one order for this scan, or `None`; see the
+    /// call site in [`Self::orders`]. The walk refreshes every eligible
+    /// unit's [`Self::stuck_since`] snapshot, resets the window for units
+    /// parked on purpose, drops units no longer on the field (the
+    /// [`Self::capture_bound`] hygiene's retain), and answers with at most
+    /// one rescue: the first unit still standing on its snapshot cell past
+    /// [`STUCK_TIMEOUT`] takes a fresh AttackMove at the wave's own
+    /// destination — the first enemy structure the unit's ground rows
+    /// connect to, rotating by unit id, else the enemy mass center's
+    /// spread ring. No hostile aim at all: no rescue, and the cleared
+    /// snapshot re-arms the window for the next scan.
+    fn stuck_rescue_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        tick: u32,
+    ) -> Option<Command> {
+        let roster = Self::combat_roster(opening);
+        let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut stuck: Option<(u64, (u16, u16))> = None;
+        for (id, entity) in sim.substrate.entities.iter_sorted() {
+            if entity.owner() != self.house
+                || entity.lifecycle.in_limbo()
+                || !entity.lifecycle.object_alive()
+                || !matches!(
+                    entity.category(),
+                    crate::map::entities::EntityCategory::Unit
+                        | crate::map::entities::EntityCategory::Infantry
+                )
+            {
+                continue;
+            }
+            let type_name = sim.interner.resolve(entity.type_ref());
+            // The combat roster only: MCVs, the miner fleet and the rest of
+            // the economy are nobody this limb re-marches — the opening MCV
+            // has its own stuck window ([`MCV_STUCK_TICKS`]).
+            if !roster.contains(&type_name) && !Self::is_naval_type(opening, type_name) {
+                continue;
+            }
+            // Parked on purpose: the guard posts, the one-command gate, the
+            // boarding and raid chains and the scouts own these units.
+            // Their window restarts when they next become eligible, so a
+            // unit the wave just dispatched is not instantly "stuck" on its
+            // old snapshot.
+            let parked = self.boarders.contains(&id)
+                || self.raiders.contains(&id)
+                || self.raid_involves(id)
+                || type_name == opening.scout
+                || self.order_gate.get(&id).is_some_and(|&due| tick < due)
+                || matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::Sleep
+                );
+            let cell = (entity.position.rx(), entity.position.ry());
+            if parked {
+                self.stuck_since.remove(&id);
+                continue;
+            }
+            visited.insert(id);
+            let snapshot = self.stuck_since.entry(id).or_insert((cell, tick));
+            if snapshot.0 != cell {
+                *snapshot = (cell, tick);
+            } else if tick.saturating_sub(snapshot.1) >= STUCK_TIMEOUT && stuck.is_none() {
+                // The snapshot clears on the rescue: the re-issued march
+                // restarts the window either way — a still-stuck unit
+                // re-arms here on a later scan and takes its next turn.
+                self.stuck_since.remove(&id);
+                stuck = Some((id, cell));
+            }
+        }
+        self.stuck_since.retain(|id, _| visited.contains(id));
+        let (unit, from) = stuck?;
+        let enemy_targets = self.enemy_priority_targets(sim);
+        let entity = sim.substrate.entities.get(unit)?;
+        let movement_zone = rules
+            .object(sim.interner.resolve(entity.type_ref()))
+            .map(|ty| ty.movement_zone)
+            .unwrap_or_default();
+        let raw = if enemy_targets.is_empty() {
+            self.enemy_center(sim).and_then(|aim| {
+                (0..SPREAD_OFFSETS.len())
+                    .map(|index| (unit as usize + index) % SPREAD_OFFSETS.len())
+                    .find_map(|index| {
+                        let spread = SPREAD_OFFSETS[index];
+                        let cell = on_map_cell(
+                            sim,
+                            (aim.0 + i16::from(spread.0), aim.1 + i16::from(spread.1)),
+                            aim,
+                        );
+                        zones_connected(sim, movement_zone, from, cell).then_some(cell)
+                    })
+            })
+        } else {
+            (0..enemy_targets.len())
+                .map(|attempt| enemy_targets[(unit as usize + attempt) % enemy_targets.len()])
+                .find_map(|(_, cell)| {
+                    let cell = (cell.0.max(0) as u16, cell.1.max(0) as u16);
+                    zones_connected(sim, movement_zone, from, cell).then_some(cell)
+                })
+        };
+        let Some((rx, ry)) = raw else {
+            return None;
+        };
+        // The futility backoff paces the repeats: a rescue that keeps
+        // landing this same unit on this same standing cell backs off the
+        // way the wave dispatch's repeat does (shared kind, shared strike
+        // streak — the two limbs fight over the same march).
+        if self.futile(unit, FutilityKind::Wave, from, tick) {
+            return None;
+        }
+        self.gate_idle_order(unit, tick);
+        Some(Command::AttackMove {
+            entity_id: unit,
+            target: None,
+            destination: Some(crate::sim::combat::TargetKind::Cell(rx, ry)),
+        })
     }
 
     // ---- Layer 3: combat & unit management helpers ----
@@ -6823,11 +7094,14 @@ impl SuperAi {
         // The escort's radar: the Aegis and the Sea Scorpion both stand
         // behind their side's radar in retail (Prerequisite=GAYARD,RADAR /
         // NAYARD,RADAR) — the gate the AI house's `CanBuild` would skip.
-        // A missing sensor drops the limb and the pick falls through to
-        // the hull line below, unchanged.
+        // The read goes through the `needs` alias ([`Self::needs_gate_alias`]):
+        // an American ally stands an AMRADR, never the literal GAAIRC its
+        // gate names, and a literal-only read held the escort shut for
+        // life. A missing sensor drops the limb and the pick falls through
+        // to the hull line below, unchanged.
         if let Some(aa) = opening.naval_aa
             && hulls >= 1
-            && self.owns_structure_of_type(sim, opening.radar)
+            && self.needs_structure_stands(sim, opening.radar)
             && self.count_units_of_type(sim, aa) < 1
             && buildable(aa)
         {
@@ -6839,7 +7113,7 @@ impl SuperAi {
         // and the Soviet submarine need no radar and keep their line.
         if hulls < NAVAL_SHIP_QUOTA
             && (opening.naval_ship != "BSUB"
-                || self.owns_structure_of_type(sim, opening.radar))
+                || self.needs_structure_stands(sim, opening.radar))
             && buildable(opening.naval_ship)
         {
             return Some(opening.naval_ship);
@@ -7645,28 +7919,62 @@ fn wall_ring_cells(bounds: (i16, i16, i16, i16)) -> Vec<(i16, i16)> {
     cells
 }
 
-/// The first legal placement origin for `ty`, scanning outward from `center`
-/// ring by ring in a fixed row-major order.
-fn find_site_around(
+/// The house's standing structures as inclusive foundation rectangles
+/// `(left, top, right, bottom)` in map cells — one pass over the entity
+/// set, built once per scan and never per candidate cell (a ring walk
+/// touches hundreds of cells; no base fields more than a few dozen
+/// buildings).
+fn own_structure_rects(
     sim: &crate::sim::world::Simulation,
     rules: &crate::rules::ruleset::RuleSet,
-    registry: &crate::rules::overlay_types::OverlayTypeRegistry,
-    ty: &crate::rules::object_type::ObjectType,
-    center: (i16, i16),
     house: InternedId,
-) -> Option<(u16, u16)> {
-    find_site_around_capped(sim, rules, registry, ty, center, house, None, SITE_SEARCH_RADIUS)
+) -> Vec<(i32, i32, i32, i32)> {
+    sim.substrate
+        .entities
+        .iter_sorted()
+        .filter(|(_, entity)| {
+            entity.owner() == house
+                && entity.category() == crate::map::entities::EntityCategory::Structure
+        })
+        .filter_map(|(_, entity)| {
+            let ty = rules.object(sim.interner.resolve(entity.type_ref()))?;
+            let (min_x, min_y, max_x, max_y) = ty.foundation.cell_bounds();
+            let (rx, ry) = (entity.position.rx(), entity.position.ry());
+            Some((
+                i32::from(rx) + i32::from(min_x),
+                i32::from(ry) + i32::from(min_y),
+                i32::from(rx) + i32::from(max_x),
+                i32::from(ry) + i32::from(max_y),
+            ))
+        })
+        .collect()
 }
 
-/// [`find_site_around`] with a capped radius and, when `build_area_owner`
-/// names a house, the engine's own build-area predicate as an extra
-/// candidate filter — the same admission `PlaceReadyBuilding` runs at
-/// apply time, so a candidate that passes here cannot be refused for
-/// adjacency (`production_placement::is_within_build_area`, the
-/// `Adjacent+1` ring over friendly `BaseNormal` providers). The legacy
-/// home scans pass no filter: they center on a standing yard whose build
-/// area already covers the reach those scans ever win on.
-fn find_site_around_capped(
+/// Whether `candidate` keeps at least `gap` empty Chebyshev cells from
+/// every already-standing own foundation: the rectangle expanded by `gap`
+/// on every side must not touch the other foundation. Pure rectangle
+/// arithmetic, so [`scan_site_rings`] and [`find_site_beyond`] share one
+/// oracle and the unit tests pin it without a sim — a candidate flush
+/// against (or overlapping) a neighbor fails, one empty cell passes, and
+/// the factories' two-cell ring is the same test at `gap == 2`.
+fn foundation_keeps_gap(
+    candidate: (i32, i32, i32, i32),
+    own: &[(i32, i32, i32, i32)],
+    gap: i32,
+) -> bool {
+    let (cx0, cy0, cx1, cy1) = candidate;
+    own.iter().all(|&(ox0, oy0, ox1, oy1)| {
+        cx1 + gap < ox0 || ox1 + gap < cx0 || cy1 + gap < oy0 || oy1 + gap < cy0
+    })
+}
+
+/// The ring walk [`find_site_around_capped`] runs: the first legal
+/// placement origin for `ty` scanning outward from `center` ring by ring
+/// in a fixed row-major order. With `keep_gap` the candidate must also
+/// keep its spacing ([`EXIT_CLEARANCE_TYPES`] foundations two cells from
+/// every own building, the rest one); without it the original
+/// no-spacing predicate runs.
+fn scan_site_rings(
     sim: &crate::sim::world::Simulation,
     rules: &crate::rules::ruleset::RuleSet,
     registry: &crate::rules::overlay_types::OverlayTypeRegistry,
@@ -7675,7 +7983,21 @@ fn find_site_around_capped(
     house: InternedId,
     build_area_owner: Option<&str>,
     max_radius: i16,
+    keep_gap: bool,
 ) -> Option<(u16, u16)> {
+    // Once per scan, not once per candidate: the spacing predicate only
+    // needs the standing roster's rectangles.
+    let own_rects = if keep_gap {
+        own_structure_rects(sim, rules, house)
+    } else {
+        Vec::new()
+    };
+    let clearance = if EXIT_CLEARANCE_TYPES.contains(&ty.id.as_str()) {
+        2
+    } else {
+        1
+    };
+    let (fmin_x, fmin_y, fmax_x, fmax_y) = ty.foundation.cell_bounds();
     for radius in 1..=max_radius {
         for dy in -radius..=radius {
             for dx in -radius..=radius {
@@ -7684,6 +8006,20 @@ fn find_site_around_capped(
                 }
                 let origin = (center.0 + dx, center.1 + dy);
                 if origin.0 <= 0 || origin.1 <= 0 {
+                    continue;
+                }
+                if keep_gap
+                    && !foundation_keeps_gap(
+                        (
+                            i32::from(origin.0) + i32::from(fmin_x),
+                            i32::from(origin.1) + i32::from(fmin_y),
+                            i32::from(origin.0) + i32::from(fmax_x),
+                            i32::from(origin.1) + i32::from(fmax_y),
+                        ),
+                        &own_rects,
+                        clearance,
+                    )
+                {
                     continue;
                 }
                 if crate::sim::build_site::can_place_building_at(
@@ -7711,6 +8047,74 @@ fn find_site_around_capped(
         }
     }
     None
+}
+
+/// The first legal placement origin for `ty`, scanning outward from `center`
+/// ring by ring in a fixed row-major order.
+fn find_site_around(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    ty: &crate::rules::object_type::ObjectType,
+    center: (i16, i16),
+    house: InternedId,
+) -> Option<(u16, u16)> {
+    find_site_around_capped(sim, rules, registry, ty, center, house, None, SITE_SEARCH_RADIUS)
+}
+
+/// [`find_site_around`] with a capped radius and, when `build_area_owner`
+/// names a house, the engine's own build-area predicate as an extra
+/// candidate filter — the same admission `PlaceReadyBuilding` runs at
+/// apply time, so a candidate that passes here cannot be refused for
+/// adjacency (`production_placement::is_within_build_area`, the
+/// `Adjacent+1` ring over friendly `BaseNormal` providers). The legacy
+/// home scans pass no filter: they center on a standing yard whose build
+/// area already covers the reach those scans ever win on.
+///
+/// The scan keeps the spacing term first (every foundation a cell clear of
+/// its neighbors, [`EXIT_CLEARANCE_TYPES`] a two-cell ring): the old
+/// first-legal-cell pick packed bases so tight that factory exits sealed
+/// and finished units wedged their queues shut. If the whole radius holds
+/// no spaced candidate, the walk degrades to the original no-spacing
+/// predicate and runs once more: a packed base where no cell ever
+/// satisfies the gap would otherwise fail every placement, feed
+/// `PLACE_STRIKES` into a `PLACE_PAUSE`, and re-fail after every pause —
+/// a tight base beats a frozen build chain, so the strict pass gives up
+/// before the build does.
+fn find_site_around_capped(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    ty: &crate::rules::object_type::ObjectType,
+    center: (i16, i16),
+    house: InternedId,
+    build_area_owner: Option<&str>,
+    max_radius: i16,
+) -> Option<(u16, u16)> {
+    scan_site_rings(
+        sim,
+        rules,
+        registry,
+        ty,
+        center,
+        house,
+        build_area_owner,
+        max_radius,
+        true,
+    )
+    .or_else(|| {
+        scan_site_rings(
+            sim,
+            rules,
+            registry,
+            ty,
+            center,
+            house,
+            build_area_owner,
+            max_radius,
+            false,
+        )
+    })
 }
 
 /// The first guard-post cell around `base` that the ground rows connect the
@@ -7752,7 +8156,11 @@ fn pick_guard_post(
 /// [`SITE_SEARCH_RADIUS`] ring scan pulled toward home, the refinery
 /// lands inside the very distance the remote latch demands, and the
 /// whole second-base chain never arms (observed: the refinery stood 28
-/// cells out and the latch never fired).
+/// cells out and the latch never fired). The walk carries the same
+/// one-cell neighbor gap the ring scans keep (the [`EXIT_CLEARANCE_TYPES`]
+/// two-cell ring included, in case an expansion ever drops a factory
+/// here): the expansion bases pack tighter than the home yard's ring and
+/// sealed their own doors the same way.
 fn find_site_beyond(
     sim: &crate::sim::world::Simulation,
     rules: &crate::rules::ruleset::RuleSet,
@@ -7763,6 +8171,13 @@ fn find_site_beyond(
     from: (i16, i16),
     min_distance: i16,
 ) -> Option<(u16, u16)> {
+    let own_rects = own_structure_rects(sim, rules, house);
+    let clearance = if EXIT_CLEARANCE_TYPES.contains(&ty.id.as_str()) {
+        2
+    } else {
+        1
+    };
+    let (fmin_x, fmin_y, fmax_x, fmax_y) = ty.foundation.cell_bounds();
     for radius in 1..=SITE_SEARCH_RADIUS {
         for dy in -radius..=radius {
             for dx in -radius..=radius {
@@ -7774,6 +8189,18 @@ fn find_site_beyond(
                     continue;
                 }
                 if (origin.0 - from.0).abs().max((origin.1 - from.1).abs()) < min_distance {
+                    continue;
+                }
+                if !foundation_keeps_gap(
+                    (
+                        i32::from(origin.0) + i32::from(fmin_x),
+                        i32::from(origin.1) + i32::from(fmin_y),
+                        i32::from(origin.0) + i32::from(fmax_x),
+                        i32::from(origin.1) + i32::from(fmax_y),
+                    ),
+                    &own_rects,
+                    clearance,
+                ) {
                     continue;
                 }
                 if crate::sim::build_site::can_place_building_at(
@@ -7797,8 +8224,9 @@ fn find_site_beyond(
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_priority_rank, nearest_connected_target, spy_infiltration_rank, Role,
-        EXPANSION_MIN_DISTANCE, OPENINGS, SuperAi, SuperAiDifficulty, TECH_BUILDING_TYPES,
+        capture_priority_rank, foundation_keeps_gap, nearest_connected_target,
+        spy_infiltration_rank, Role, EXPANSION_MIN_DISTANCE, OPENINGS, SuperAi,
+        SuperAiDifficulty, TECH_BUILDING_TYPES,
     };
     use crate::sim::intern::InternedId;
     use crate::sim::runtime::SimRuntime;
@@ -8052,6 +8480,68 @@ mod tests {
                 "the Yuri {name} gates itself on the Psychic Sensor"
             );
         }
+    }
+
+    /// The Allied radar alias: a `needs=="GAAIRC"` row accepts the
+    /// Americans-buildable AMRADR twin standing alone (retail
+    /// `ForbiddenHouses=Americans` splits the pair, and the build ladder's
+    /// radar step resolves AMRADR for such a house), while the Soviet and
+    /// Yuri radar gates keep their single literal sections — no row's
+    /// table value changes, only the read. A structure-level drive needs a
+    /// loaded retail ruleset, so the standing-structure path is exercised
+    /// by the retail drives; what this pins is the alias map itself, the
+    /// empty-world negative, and the opening pointer that routes both
+    /// naval gates through it.
+    #[test]
+    fn allied_radar_needs_gate_accepts_the_amradr_twin() {
+        assert_eq!(SuperAi::needs_gate_alias("GAAIRC"), Some("AMRADR"));
+        for single in ["NARADR", "NAPSIS", "GATECH", "GAROBO"] {
+            assert_eq!(
+                SuperAi::needs_gate_alias(single),
+                None,
+                "{single} has no twin section"
+            );
+        }
+        let (runtime, house) = runtime();
+        let ai = SuperAi::new(house, SuperAiDifficulty::Fair);
+        for gate in ["GAAIRC", "AMRADR", "NARADR", "NAPSIS"] {
+            assert!(
+                !ai.needs_structure_stands(&runtime.simulation, gate),
+                "an empty world satisfies no radar gate, alias or not"
+            );
+        }
+        let allied = OPENINGS
+            .iter()
+            .find(|opening| opening.construction_yard == "GACNST")
+            .expect("the Allied opening");
+        assert_eq!(
+            allied.radar, "GAAIRC",
+            "the naval gates read the same literal the alias splits"
+        );
+    }
+
+    /// The site scans' spacing oracle: a candidate flush against a standing
+    /// foundation (zero empty cells, shared edge or diagonal) is refused,
+    /// one empty cell passes, the [`super::EXIT_CLEARANCE_TYPES`] two-cell
+    /// ring refuses what the one-cell gap accepts, and an empty roster
+    /// passes anything — the degraded fallback walk runs predicate-free,
+    /// so a packed base still places (tight beats frozen).
+    #[test]
+    fn site_spacing_keeps_a_gap_and_doubles_for_factories() {
+        let candidate = (10, 10, 11, 11);
+        // Flush: no empty cell between the foundations.
+        assert!(!foundation_keeps_gap(candidate, &[(12, 10, 13, 11)], 1));
+        // Diagonal adjacency is no gap either — Chebyshev, not Manhattan.
+        assert!(!foundation_keeps_gap(candidate, &[(12, 12, 13, 13)], 1));
+        // One empty cell (column 12) passes the generic gap...
+        assert!(foundation_keeps_gap(candidate, &[(13, 10, 14, 11)], 1));
+        // ...but the factory ring wants two and refuses it.
+        assert!(!foundation_keeps_gap(candidate, &[(13, 10, 14, 11)], 2));
+        // Overlap refuses at any gap.
+        assert!(!foundation_keeps_gap(candidate, &[(11, 10, 14, 11)], 1));
+        // The degraded pass runs predicate-free: an empty roster passes
+        // even the factory ring.
+        assert!(foundation_keeps_gap(candidate, &[], 2));
     }
 
     /// The dogs' roster rows: each side's infantry table carries exactly one
@@ -11069,7 +11559,10 @@ mod tests {
     /// bridge fixtures above stay shared without re-declaring them.
     mod combat_layer_tests {
         use super::*;
-        use super::super::{ATTACK_WAVE_SIZE, BOARD_MAX_ATTEMPTS, FutilityKind, IDLE_REORDER_TICKS, WAVE_RETRY_TICKS};
+        use super::super::{
+            ATTACK_WAVE_SIZE, BOARD_MAX_ATTEMPTS, FutilityKind, IDLE_REORDER_TICKS,
+            STUCK_SCAN_TICKS, STUCK_TIMEOUT, WAVE_RETRY_TICKS,
+        };
 
         use std::collections::BTreeMap;
 
@@ -11505,6 +11998,163 @@ mod tests {
             assert!(
                 guards.values().all(|&count| count <= 2),
                 "a standing unit stops at two identical Guard posts (futility): {guards:?}"
+            );
+        }
+
+        /// The stuck-unit rescue: a combat unit standing on its snapshot
+        /// cell past STUCK_TIMEOUT draws a fresh AttackMove at the first
+        /// scan past the timeout — the limb's answer to a pathing burn-out
+        /// the engine leaves idle for life. The snapshot is seeded by
+        /// hand: the limb's contract is the window arithmetic and the aim
+        /// pick, not the engine's pathing dice, and with no frames
+        /// advancing the unit provably cannot move on its own.
+        #[test]
+        #[ignore = "slow; retail; loads a retail map"]
+        fn stuck_rescue_reorders_the_wedged_unit() {
+            let (mut scenario, ai_house, enemy_house) = pacific_bridge_battle();
+            let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+            scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+            // One own tank, one hostile mobile near it (the rescue aim is
+            // the enemy mass center — no hostile structure exists, so this
+            // drives the enemy-center fallback half of the pick).
+            let tank = spawn_near(&mut scenario, "MTNK", ai_house, (68, 94));
+            spawn_near(&mut scenario, "E1", enemy_house, (68, 94));
+
+            let (rx, ry) = {
+                let sim = scenario.sim();
+                let entity = sim.substrate.entities.get(tank).expect("the tank");
+                (entity.position.rx(), entity.position.ry())
+            };
+            ai.stuck_since.insert(tank, ((rx, ry), 0));
+
+            // From the first scan tick past the timeout (600 + 150 is a
+            // multiple of the scan pace) across three windows: an earlier
+            // limb may eat a scan tick's one command, a later window
+            // answers.
+            let start = STUCK_TIMEOUT + STUCK_SCAN_TICKS;
+            let mut rescued = 0usize;
+            for tick in start..start + 3 * STUCK_SCAN_TICKS {
+                for order in ai.orders(&scenario.runtime, tick) {
+                    if let crate::sim::command::Command::AttackMove { entity_id, .. } =
+                        order.payload
+                    {
+                        if entity_id == tank {
+                            rescued += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                rescued, 1,
+                "the wedged tank draws exactly one rescue AttackMove"
+            );
+        }
+
+        /// The rescue's exclusions: a unit parked on purpose — here the
+        /// side's scout dog, whose own chain owns it — has its window
+        /// reset instead of aging, and the limb never re-marches it (the
+        /// scout chain's own orders are plain Moves; any AttackMove naming
+        /// the dog would be this limb overstepping).
+        #[test]
+        #[ignore = "slow; retail; loads a retail map"]
+        fn stuck_rescue_leaves_parked_units_alone() {
+            let (mut scenario, ai_house, _enemy) = pacific_bridge_battle();
+            let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+            scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+            let scout = spawn_near(&mut scenario, "ADOG", ai_house, (68, 94));
+            let (rx, ry) = {
+                let sim = scenario.sim();
+                let entity = sim.substrate.entities.get(scout).expect("the dog");
+                (entity.position.rx(), entity.position.ry())
+            };
+            ai.stuck_since.insert(scout, ((rx, ry), 0));
+
+            let start = STUCK_TIMEOUT + STUCK_SCAN_TICKS;
+            for tick in start..start + 3 * STUCK_SCAN_TICKS {
+                for order in ai.orders(&scenario.runtime, tick) {
+                    if let crate::sim::command::Command::AttackMove { entity_id, .. } =
+                        order.payload
+                    {
+                        assert_ne!(
+                            entity_id, scout,
+                            "the parked scout never draws a rescue AttackMove"
+                        );
+                    }
+                }
+            }
+            assert!(
+                !ai.stuck_since.contains_key(&scout),
+                "a parked unit's window resets instead of aging"
+            );
+        }
+
+        /// The wall ring's escape semantics — the trigger the target
+        /// cooldown arms on: a walk whose every untried cell is spent
+        /// retires the target into `walled`, and the escape pass (the
+        /// ready segment's `escape = true` walk) then wipes the tried-cell
+        /// book and re-opens the yard ring — which is exactly the re-queue
+        /// the target-cooldown rest now paces. The full
+        /// cancel-plus-cooldown arm inside `orders` needs the whole
+        /// building block (guns settled, wallet floor, wall cameo, a ready
+        /// segment), so the gate itself is not driven here; what this pins
+        /// is the book-and-retire cycle the cooldown exists to pace.
+        #[test]
+        #[ignore = "slow; retail; loads a retail map"]
+        fn wall_ring_escape_clears_the_book_and_reopens_the_yard() {
+            let (mut scenario, ai_house, _enemy) = pacific_bridge_battle();
+            let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+            scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+            spawn_near(&mut scenario, "GACNST", ai_house, (64, 92));
+            let opening = OPENINGS
+                .iter()
+                .find(|opening| opening.construction_yard == "GACNST")
+                .expect("the Allied opening");
+            let rules = &scenario.runtime.resources.rules;
+            let overlays = &scenario.runtime.resources.overlay_registry;
+
+            // Fill the tried-cell book the way the placement branch does —
+            // one mark per answered cell — until the walk finds nothing.
+            let mut marks = 0usize;
+            while let Some((rx, ry)) =
+                ai.wall_next_cell(scenario.sim(), rules, opening, overlays, false)
+            {
+                ai.wall_cells.insert((rx, ry));
+                marks += 1;
+                assert!(marks < 200, "the yard ring walk must terminate");
+            }
+            let yard_id = scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .find(|(_, entity)| {
+                    entity.owner() == ai_house
+                        && entity.category() == crate::map::entities::EntityCategory::Structure
+                        && scenario.sim().interner.resolve(entity.type_ref()) == "GACNST"
+                })
+                .map(|(id, _)| id)
+                .expect("the standing yard");
+            assert!(
+                ai.walled.contains(&yard_id),
+                "the spent ring retires its target"
+            );
+
+            // The escape pass answers None (nothing to place into) but
+            // wipes the book and re-opens the yard ring.
+            assert!(
+                ai.wall_next_cell(scenario.sim(), rules, opening, overlays, true).is_none()
+            );
+            assert!(ai.wall_cells.is_empty(), "the escape wipes the book");
+            assert!(
+                !ai.walled.contains(&yard_id),
+                "the escape re-opens the yard ring"
+            );
+            assert!(
+                ai.wall_next_cell(scenario.sim(), rules, opening, overlays, false).is_some(),
+                "the re-opened ring answers again — the re-queue the cooldown rests"
             );
         }
     }
