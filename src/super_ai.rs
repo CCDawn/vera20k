@@ -981,6 +981,13 @@ struct Opening {
     /// power (Kirov, Siege Chopper, Floating Disk) rides `VehicleTypes`
     /// and their war factory, so their tables stay empty here.
     aircraft: &'static [&'static str],
+    /// The side's war-factory siege flyer — a flying `Unit` the vehicle
+    /// queue builds like any tank (retail `[VehicleTypes]` rows with
+    /// `MovementZone=Fly`): the Kirov `ZEP` behind the Soviet lab and the
+    /// Floating Disk `DISK` behind Yuri's. The Allies field none — their
+    /// air power rides the aircraft tab — so the field stays `None` there
+    /// and the one-off commission sleeps.
+    siege_flyer: Option<&'static str>,
     /// The side's scout: a barracks-cheap fast eye the fork keeps
     /// [`SCOUT_TARGET`] of alive and walks into unrevealed territory.
     /// Retail's own dogs are counter-infiltration base guards — the
@@ -1199,6 +1206,9 @@ const OPENINGS: [Opening; 3] = [
         naval_hull_extra: Some("DLPH"),
         naval_capital: Some("CARRIER"),
         aircraft: &["BEAG", "ORCA"],
+        // No siege flyer: the Allies' war factory fields no flying unit —
+        // their heavy air is the aircraft tab the wing already owns.
+        siege_flyer: None,
         scout: "ADOG",
         fortress: Some("BFRT"),
         // The Landing Craft: retail Prerequisite=GAYARD, TechLevel 4, a
@@ -1391,6 +1401,10 @@ const OPENINGS: [Opening; 3] = [
         naval_hull_extra: Some("SQD"),
         naval_capital: Some("DRED"),
         aircraft: &[],
+        // The Kirov: the roster's `ZEP` row (retail Prerequisite=NATECH)
+        // as a dedicated commission piece — the war-factory flyer the lab
+        // fields once it stands.
+        siege_flyer: Some("ZEP"),
         scout: "DOG",
         fortress: None,
         // The Armored Transport: retail Prerequisite=NAYARD, TechLevel 2,
@@ -1540,6 +1554,10 @@ const OPENINGS: [Opening; 3] = [
         naval_hull_extra: None,
         naval_capital: None,
         aircraft: &[],
+        // The Floating Disk: the roster's `DISK` row (retail
+        // Prerequisite=YATECH) as a dedicated commission piece — the
+        // war-factory flyer the lab fields once it stands.
+        siege_flyer: Some("DISK"),
         scout: "INIT",
         fortress: None,
         // The Hover Transport: retail Prerequisite=YAYARD, TechLevel 2,
@@ -1640,6 +1658,12 @@ pub struct SuperAi {
     /// hull — share this one latch, so a base commissions one ferry line,
     /// never two. Pinned state, never read from the runtime.
     transport_issued: bool,
+    /// Whether the siege flyer's one-off commission has issued: the
+    /// specialist wheel's siege slot is one turn per
+    /// [`SPECIALIST_EVERY_VEHICLE`] and every Siege row competes for it, so
+    /// the Kirov/Disk owes its existence to this dedicated latch, not the
+    /// wheel. Pinned state, never read from the runtime.
+    siege_flyer_issued: bool,
     /// The remote ore-field cell latched for the expansion refinery once
     /// the home economy reaches its design steady state; kept after the
     /// refinery stands so the second survey can exclude its field.
@@ -1899,6 +1923,7 @@ impl SuperAi {
             fortress_issued: false,
             aa_issued: false,
             transport_issued: false,
+            siege_flyer_issued: false,
             expansion_site: None,
             remote_refinery_stood: false,
             expansion_yard_issued: false,
@@ -3188,13 +3213,16 @@ impl SuperAi {
             // unit whose identical post order keeps landing unmoved stops
             // spending its reorder windows on it for a while. Naval hulls
             // never post — their defense is the idle perimeter's Attack,
-            // not a land ring.
+            // not a land ring. The war-factory flyers stand out beside
+            // them: a Kirov posted on the yard ring wastes its siege
+            // sortie on sentry duty the guns already do.
             let poster = self
                 .due_idle_unit(&idle, tick)
                 .filter(|&unit| !self.futility_suppressed(unit, FutilityKind::GuardPost, tick))
                 .filter(|&unit| {
                     sim.substrate.entities.get(unit).is_none_or(|entity| {
-                        !Self::is_naval_type(opening, sim.interner.resolve(entity.type_ref()))
+                        let name = sim.interner.resolve(entity.type_ref());
+                        !Self::is_naval_type(opening, name) && !Self::is_fly_type(rules, name)
                     })
                 });
             if let Some(unit) = poster {
@@ -3359,6 +3387,10 @@ impl SuperAi {
         // by jet id instead of stacking every bomb on the substrate's
         // first. The wing commission's dock gate (the radar class standing)
         // already keeps replacements out of an AirportBound crash loop.
+        // The war-factory flyers ride the same 900-tick rhythm: the Kirov
+        // and the Floating Disk are Unit-category `[VehicleTypes]` rows the
+        // Aircraft class never contains, so the class-only filter never
+        // saw them — the roster reads the Fly movement zone beside it.
         if tick >= self.next_airstrike_tick {
             let targets: Vec<u64> = self
                 .enemy_priority_targets(sim)
@@ -3373,7 +3405,19 @@ impl SuperAi {
                     .iter_sorted()
                     .filter(|(_, entity)| {
                         entity.owner() == self.house
-                            && entity.category() == crate::map::entities::EntityCategory::Aircraft
+                            // The flight roster: the Aircraft class, plus the
+                            // war-factory flyers — Unit-category rows (the
+                            // Kirov, the Floating Disk, the Night Hawk) that
+                            // never enter the Aircraft class, so the class
+                            // check alone never saw them.
+                            && (entity.category()
+                                == crate::map::entities::EntityCategory::Aircraft
+                                || (entity.category()
+                                    == crate::map::entities::EntityCategory::Unit
+                                    && Self::is_fly_type(
+                                        rules,
+                                        sim.interner.resolve(entity.type_ref()),
+                                    )))
                             && matches!(
                                 entity.passive_acquire_mission(),
                                 crate::sim::mission::MissionType::None
@@ -5035,6 +5079,27 @@ impl SuperAi {
             // ferry. `can_build`, not the cameo — the country-lock lesson
             // again.
             Some(ferry_name)
+        } else if opening.siege_flyer.is_some()
+            && !self.siege_flyer_issued
+            && self.count_structures_of_type(sim, opening.battle_lab) >= 1
+            && !vehicle_busy
+            && opening
+                .siege_flyer
+                .and_then(|name| rules.object(name))
+                .is_some_and(|ty| {
+                    crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                        == crate::sim::production::CanBuild::Yes
+                })
+        {
+            // The siege flyer's one-off commission, the fortress's
+            // treatment: the wheel's siege slot is one turn per
+            // [`SPECIALIST_EVERY_VEHICLE`] and every Siege row competes for
+            // it, so a hot war fields launchers and choppers forever and
+            // the Kirov/Disk never lifts. One dedicated turn once the lab
+            // stands — the flyer the whole siege plan rests on — and the
+            // latch keeps it at one per game. `can_build`, not the cameo —
+            // the country-lock lesson again.
+            opening.siege_flyer
         } else if !self.expansion_abandoned
             && self.expansion_site.is_some()
             && !self.expansion_yard_issued
@@ -5121,6 +5186,9 @@ impl SuperAi {
             }
             if opening.amphibious_transport == Some(name) || opening.air_ferry == Some(name) {
                 self.transport_issued = true;
+            }
+            if opening.siege_flyer == Some(name) {
+                self.siege_flyer_issued = true;
             }
             if !self.expansion_yard_issued
                 && self.expansion_site.is_some()
@@ -7354,6 +7422,18 @@ impl SuperAi {
             || opening.naval_capital == Some(name)
     }
 
+    /// Whether the type flies its own hull — a rules `MovementZone=Fly`
+    /// row. The war-factory aircraft (the Kirov, the Floating Disk, the
+    /// Night Hawk) are `[VehicleTypes]` entries the `Aircraft` category
+    /// never contains, so the flight limbs read the zone beside the class:
+    /// the air wing's sortie fields them and the guard-post filter spares
+    /// them, both through this one answer.
+    fn is_fly_type(rules: &crate::rules::ruleset::RuleSet, name: &str) -> bool {
+        rules
+            .object(name)
+            .is_some_and(|ty| ty.movement_zone == crate::rules::locomotor_type::MovementZone::Fly)
+    }
+
     /// Whether the type is one of the three sides' dogs — the roster's
     /// sentry hound (`ADOG` Allied, `DOG` Soviet, `YDOG` Yuri; all three
     /// `DetectDisguise=yes`). The wave dispatch reads it to keep the
@@ -8846,6 +8926,27 @@ mod tests {
                 assert_eq!(rows[0].needs, None, "{name} waits for no prerequisite");
             }
         }
+    }
+
+    /// The siege flyer column: the Soviets' Kirov and Yuri's Floating
+    /// Disk are the war-factory flyers the one-off commission fields once
+    /// the lab stands, and the Allies keep `None` — their heavy air rides
+    /// the aircraft tab, so their commission must stay asleep.
+    #[test]
+    fn openings_field_the_siege_flyer_on_two_sides() {
+        let opening = |yard: &str| {
+            OPENINGS
+                .iter()
+                .find(|opening| opening.construction_yard == yard)
+                .expect("each side's opening")
+        };
+        assert_eq!(opening("NACNST").siege_flyer, Some("ZEP"));
+        assert_eq!(opening("YACNST").siege_flyer, Some("DISK"));
+        assert_eq!(
+            opening("GACNST").siege_flyer,
+            None,
+            "the Allies field no war-factory flyer"
+        );
     }
 
     /// The roster's retail radar gates: every row whose retail
@@ -11367,6 +11468,41 @@ mod tests {
         );
     }
 
+    /// The siege flyer's one-off commission: a Soviet yard, war factory
+    /// and battle lab standing with the vehicle queue empty — the first
+    /// vehicle turn buys the Kirov, and the latch keeps the buy at exactly
+    /// one even though every commission condition stays true for the whole
+    /// window (the drive never advances the sim, so the queue never
+    /// busy-blocks the branch and the conditions never lapse).
+    #[test]
+    #[ignore = "slow; retail; loads a retail map"]
+    fn soviet_lab_commissions_one_kirov_and_latches() {
+        let (mut scenario, ai_house, _enemy_house) =
+            pacific_bridge_battle_as(crate::skirmish_launch::LaunchCountry::Russia);
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+        spawn_near(&mut scenario, "NACNST", ai_house, (64, 92));
+        spawn_near(&mut scenario, "NAPOWR", ai_house, (65, 92));
+        spawn_near(&mut scenario, "NAWEAP", ai_house, (66, 92));
+        spawn_near(&mut scenario, "NATECH", ai_house, (66, 94));
+
+        let mut queued: Vec<String> = Vec::new();
+        for tick in 0..400u32 {
+            for order in ai.orders(&scenario.runtime, tick) {
+                if let crate::sim::command::Command::QueueProduction { type_id } = order.payload {
+                    queued.push(scenario.sim().interner.resolve(type_id).to_string());
+                }
+            }
+        }
+        let kirovs = queued.iter().filter(|name| *name == "ZEP").count();
+        assert_eq!(
+            kirovs, 1,
+            "the lab stands: exactly one Kirov commission, never a re-arm: {queued:?}"
+        );
+        assert!(ai.siege_flyer_issued, "the order itself marks the latch");
+    }
+
     /// The helper's two answers on the real map: an intact span connects
     /// the two shores under the ground rows, the collapse cuts them, and
     /// the home shore itself stays connected throughout.
@@ -12179,6 +12315,118 @@ mod tests {
                         .is_some_and(|parked| parked.is_some())
                 }),
                 "the restriked jet was observed parked between its sorties"
+            );
+        }
+
+        /// The zone read on the retail rows: the Kirov, the Floating Disk
+        /// and the Night Hawk parse `MovementZone=Fly` out of their
+        /// `[VehicleTypes]` sections — the property the flight limbs read,
+        /// because the Aircraft class never contains them — while the
+        /// ground hulls keep land zones.
+        #[test]
+        #[ignore = "slow; retail; parses the retail ruleset"]
+        fn fly_type_filter_answers_the_war_factory_aircraft() {
+            let retail_dir = std::path::PathBuf::from(
+                std::env::var("RA2_DIR")
+                    .expect("set RA2_DIR to the retail RA2/YR install directory"),
+            );
+            let mut assets = crate::assets::asset_manager::AssetManager::new(
+                &retail_dir,
+                crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+            )
+            .expect("open retail MIX archives");
+            crate::map::theater::load_theater(&mut assets, "TEMPERATE")
+                .expect("load retail theater");
+            let (rules, _, _, _) =
+                crate::app::loading::init_helpers::load_rules_with_merged_ini(&assets, None, None)
+                    .expect("load production rules");
+            for name in ["ZEP", "DISK", "SHAD"] {
+                assert!(
+                    SuperAi::is_fly_type(&rules, name),
+                    "{name} parses MovementZone=Fly"
+                );
+            }
+            for name in ["HTNK", "LTNK"] {
+                assert!(
+                    !SuperAi::is_fly_type(&rules, name),
+                    "{name} is a ground hull"
+                );
+            }
+        }
+
+        /// The sortie roster reads the movement zone beside the class: a
+        /// spawned Kirov (Unit-category, `MovementZone=Fly`) with no
+        /// aircraft in sight still flies the limb's strike at the enemy's
+        /// priority structure — the class-only filter never saw it.
+        #[test]
+        #[ignore = "slow; retail; loads a retail map with real terrain zones"]
+        fn air_wing_sorties_the_siege_flyer_at_the_enemy() {
+            let (mut scenario, ai_house, enemy_house) = pacific_bridge_battle();
+            let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+            scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+            spawn_near(&mut scenario, "NACNST", ai_house, (64, 92));
+            let kirov = spawn_near(&mut scenario, "ZEP", ai_house, (66, 90));
+            let far = far_shore(&scenario);
+            let target = spawn_near(&mut scenario, "GAPOWR", enemy_house, far);
+
+            let mut strikes = 0usize;
+            for tick in 0..600u32 {
+                for order in ai.orders(&scenario.runtime, tick) {
+                    if let crate::sim::command::Command::Attack {
+                        attacker_id,
+                        target_id,
+                    } = order.payload
+                    {
+                        if attacker_id == kirov {
+                            strikes += 1;
+                            assert_eq!(target_id, target, "the flyer aims at the priority target");
+                        }
+                    }
+                }
+            }
+            assert!(
+                strikes >= 1,
+                "the limb must sortie the Unit-category flyer at the enemy"
+            );
+        }
+
+        /// The poster filter reads the movement zone beside the naval
+        /// roster: an idle Kirov is never pinned on the yard's guard ring
+        /// (its war is the siege sortie), while a ground tank still takes
+        /// its post — the positive control.
+        #[test]
+        #[ignore = "slow; retail; loads a retail map with real terrain zones"]
+        fn guard_poster_spares_the_siege_flyer_and_posts_the_tank() {
+            let (mut scenario, ai_house, _enemy_house) = pacific_bridge_battle();
+            let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+            scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+            spawn_near(&mut scenario, "NACNST", ai_house, (64, 92));
+            let kirov = spawn_near(&mut scenario, "ZEP", ai_house, (66, 90));
+            let tank = spawn_near(&mut scenario, "HTNK", ai_house, (66, 94));
+
+            let mut kirov_posts = 0usize;
+            let mut tank_posts = 0usize;
+            for tick in 0..1200u32 {
+                for order in ai.orders(&scenario.runtime, tick) {
+                    if let crate::sim::command::Command::Guard { entity_id, .. } = order.payload {
+                        if entity_id == kirov {
+                            kirov_posts += 1;
+                        }
+                        if entity_id == tank {
+                            tank_posts += 1;
+                        }
+                    }
+                }
+            }
+            assert!(
+                tank_posts >= 1,
+                "positive control: the ground tank holds a post"
+            );
+            assert_eq!(
+                kirov_posts, 0,
+                "the siege flyer is never posted on the home ring"
             );
         }
 

@@ -953,6 +953,26 @@ unit output fell to 52% and three houses reached zero — so
 `tech_bank_short` queues the unit lines once six tenths of the item's
 cost sits in the bank.
 
+## The siege flyer
+
+The war-factory flyers never flew. The Kirov and the Floating Disk are
+`[VehicleTypes]` rows with `MovementZone=Fly` — the vehicle queue builds
+them like any tank, but the specialist wheel's siege slot is one turn per
+`SPECIALIST_EVERY_VEHICLE` shared with every other Siege row, so a hot war
+fielded launchers and choppers forever and the flyer never lifted. The
+opening tables now carry `siege_flyer` (the Soviets' `ZEP`, Yuri's `DISK`,
+the Allies keep `None` — their heavy air rides the aircraft tab), and the
+commission chain spends one dedicated turn on it once the battle lab
+stands, latched per game like the fortress and the ferry.
+
+Two flight limbs now read the movement zone beside the class: the air
+wing's sortie fields the flyer at the enemy's priority structure (the old
+filter read `EntityCategory::Aircraft` alone, and a Unit-category flyer is
+never in that class), and the guard-post limb spares it the yard ring — a
+Kirov holding a sentry post wastes its siege sortie on a job the guns
+already do. The shared `is_fly_type` answer parses `MovementZone=Fly` off
+the rules row, which also covers the Night Hawk.
+
 ## Upstream sync
 
 `superai/base` merges `origin/main` regularly; each pillar lands on its own
