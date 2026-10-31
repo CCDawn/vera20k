@@ -940,6 +940,19 @@ ore direction is not enemy direction, and an outpost that mines
 backward arms a base that never sees the war, but the bias only flips
 ties so the richness term keeps its voice.
 
+## The queue retry gate and the six-tenths bank
+
+Two dead-weight drains the replay census caught: the engine refuses a
+building `PRODUCE` against a busy yard without surfacing the refusal, so
+the building limbs re-filed the identical dead command every tick
+(~12 000 a game, 91-99% of ticks spinning) and every building queue site
+now paces its type through `BUILD_QUEUE_RETRY_TICKS` (150); and the
+tech-climb bank's full-price bar shared one wallet between the climb and
+the army — across an Allied superweapon's ~2000-tick savings window the
+unit output fell to 52% and three houses reached zero — so
+`tech_bank_short` queues the unit lines once six tenths of the item's
+cost sits in the bank.
+
 ## Upstream sync
 
 `superai/base` merges `origin/main` regularly; each pillar lands on its own

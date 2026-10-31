@@ -427,6 +427,24 @@ const WALL_TARGET_COOLDOWN_TICKS: u32 = 1800;
 /// Rearmed on the issued order; see the wall limb in [`Self::orders`].
 const WALL_WINDOW_TICKS: u32 = 600;
 
+/// Ticks a building type's queue retry rests after its command issues.
+/// The engine refuses a building `PRODUCE` against a busy factory — the
+/// slot held, or no factory available — without surfacing the refusal
+/// (`factory_lifecycle.rs:202`, `:214-224`), so the AI's queue view
+/// stays empty and reads idle while the limbs re-filed the identical
+/// rejected command the very next tick (observed live: one house filed
+/// ~12000 dead queue orders in a game, 91-99% of its ticks spinning on
+/// a slot parked by a zero-progress item). An accepted queue needs no
+/// retry at all — the queue view then shows the item and the
+/// `building_busy` gate holds the block — so the window only ever paces
+/// dead retries. 150 ticks sits far below every ladder rung's build
+/// time (the 3100-tick superweapon the longest), so it never delays a
+/// successor behind an accepted queue; the one sub-window build (a wall
+/// segment, ~56 ticks) is paced by its own [`WALL_WINDOW_TICKS`] window
+/// anyway, which dominates the gate. See
+/// [`Self::build_queue_retry_open`].
+const BUILD_QUEUE_RETRY_TICKS: u32 = 150;
+
 /// Issued vehicle slots between primary-factory toggles. The engine keeps
 /// one production line per category riding a single carrier factory
 /// ([`crate::sim::production::find_factory`] prefers the flagged primary),
@@ -1782,6 +1800,13 @@ pub struct SuperAi {
     /// at most once per orders pass instead of one full entity walk per
     /// ladder read. Pinned state, never read from the runtime.
     census_counts: std::collections::HashMap<InternedId, u32>,
+    /// The tick each building type may re-enter the queue at: the
+    /// engine's refusal of a building `PRODUCE` against a busy factory
+    /// never reaches the queue view, so every building emit site paces
+    /// its type through this gate; see [`BUILD_QUEUE_RETRY_TICKS`] and
+    /// [`Self::build_queue_retry_open`]. Pinned state, never read from
+    /// the runtime.
+    build_queue_retry_gate: std::collections::HashMap<InternedId, u32>,
     // ---- Layer 3: combat & unit management state ----
     /// The futility backoff, per entity: see [`FutilityState`]. The shared
     /// helper behind the repeated-order sites this layer owns (guard
@@ -1913,6 +1938,7 @@ impl SuperAi {
             now_tick: 0,
             census_tick: u32::MAX,
             census_counts: std::collections::HashMap::new(),
+            build_queue_retry_gate: std::collections::HashMap::new(),
             futility: std::collections::HashMap::new(),
             boarders: Vec::new(),
             board_attempts: std::collections::HashMap::new(),
@@ -4100,6 +4126,10 @@ impl SuperAi {
                 && crate::sim::production::credits_for_owner(sim, &owner) >= ty.cost
                 && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
                 && let Some(type_id) = sim.interner.get(opening.power)
+                // The plant's own retry gate: a PRODUCE the engine
+                // silently refused (factory busy) re-files at
+                // [`BUILD_QUEUE_RETRY_TICKS`] pace, not every tick.
+                && self.build_queue_retry_open(type_id, tick)
             {
                 self.placement_intent = None;
                 return vec![CommandEnvelope::new(
@@ -4186,6 +4216,16 @@ impl SuperAi {
                         false,
                     )
                     .is_some()
+                // The segment's own retry gate, beside the window: the
+                // two clocks pace different failures and stack
+                // multiplicatively — [`WALL_WINDOW_TICKS`] (600) spaces
+                // the queue rights of orders that *issued* (rearmed on
+                // the issue below), while this gate spaces the re-files
+                // of orders the engine *silently refused*
+                // ([`BUILD_QUEUE_RETRY_TICKS`], 150) — a refused segment
+                // burns neither the window nor the book, so without the
+                // gate the limb re-filed it every tick.
+                && self.build_queue_retry_open(wall_type_id, tick)
             {
                 // Rearm the window on the issued order, not on the open
                 // gate: a window that opened but queued nothing (credits
@@ -4221,6 +4261,11 @@ impl SuperAi {
                         && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
                             .enabled
                         && let Some(type_id) = sim.interner.get(name)
+                        // The gun's retry gate: a PRODUCE the engine
+                        // silently refused re-files at
+                        // [`BUILD_QUEUE_RETRY_TICKS`] pace; the next gun
+                        // candidate takes its turn meanwhile.
+                        && self.build_queue_retry_open(type_id, tick)
                     {
                         self.placement_intent = Some((type_id, expansion));
                         return vec![CommandEnvelope::new(
@@ -4312,6 +4357,14 @@ impl SuperAi {
                     // Read-only lookup: every retail type name is interned at
                     // rules load; a miss would only skip this candidate.
                     && let Some(type_id) = sim.interner.get(*name)
+                    // The rung's retry gate: the engine refuses a PRODUCE
+                    // against a busy factory silently
+                    // ([`BUILD_QUEUE_RETRY_TICKS`]) and the walk read the
+                    // idle queue as invitation — the refused rung re-filed
+                    // every tick and never fell through to the next one. A
+                    // cooled rung steps aside this pass; the walk returns
+                    // for it when the window lifts.
+                    && self.build_queue_retry_open(type_id, tick)
                 {
                     // The fixed ladder places at home — clear any expansion
                     // intent a previous plan item left behind.
@@ -4377,6 +4430,9 @@ impl SuperAi {
                         && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
                             .enabled
                         && let Some(type_id) = sim.interner.get(opening.power)
+                        // The plant's retry gate — see the power
+                        // preemption at the block's head.
+                        && self.build_queue_retry_open(type_id, tick)
                     {
                         self.placement_intent = Some((type_id, true));
                         return vec![CommandEnvelope::new(
@@ -4391,6 +4447,9 @@ impl SuperAi {
                         && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
                             .enabled
                         && let Some(type_id) = sim.interner.get(opening.refinery)
+                        // The dock's retry gate — see the power
+                        // preemption at the block's head.
+                        && self.build_queue_retry_open(type_id, tick)
                     {
                         self.placement_intent = Some((type_id, true));
                         return vec![CommandEnvelope::new(
@@ -4436,6 +4495,9 @@ impl SuperAi {
                         && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
                             .enabled
                         && let Some(type_id) = sim.interner.get(opening.barracks)
+                        // The barracks' retry gate — see the power
+                        // preemption at the block's head.
+                        && self.build_queue_retry_open(type_id, tick)
                     {
                         self.placement_intent = Some((type_id, true));
                         return vec![CommandEnvelope::new(
@@ -4450,6 +4512,13 @@ impl SuperAi {
                         && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
                             .enabled
                         && let Some(type_id) = sim.interner.get(opening.war_factory)
+                        // The factory's retry gate — the expansion's
+                        // own war factory lives behind this queue: a
+                        // PRODUCE refused by the busy yard re-files at
+                        // [`BUILD_QUEUE_RETRY_TICKS`] pace instead of
+                        // re-filing every tick, and the primary wheel
+                        // below gets its second carrier.
+                        && self.build_queue_retry_open(type_id, tick)
                     {
                         self.placement_intent = Some((type_id, true));
                         return vec![CommandEnvelope::new(
@@ -4578,6 +4647,11 @@ impl SuperAi {
                         && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
                             .enabled
                         && let Some(type_id) = sim.interner.get(name)
+                        // The entry's retry gate: a refused entry cools
+                        // and the walk reaches the next candidate the
+                        // same pass, instead of pinning every growth
+                        // slot on one re-filed command.
+                        && self.build_queue_retry_open(type_id, tick)
                     {
                         // House-wide growth places at home — the intent's
                         // expansion marks belong to the block above.
@@ -4619,6 +4693,9 @@ impl SuperAi {
                     && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
                         .enabled
                     && let Some(type_id) = sim.interner.get(center)
+                    // The center's retry gate — see the power preemption
+                    // at the block's head.
+                    && self.build_queue_retry_open(type_id, tick)
                 {
                     self.placement_intent = None;
                     return vec![CommandEnvelope::new(
@@ -4744,8 +4821,15 @@ impl SuperAi {
                 })
             })
             && let Some(ty) = rules.object(name)
+            // The same six-tenths bank as the ground queues
+            // ([`tech_bank_short`]): the jet waits only while the climb
+            // is genuinely short, not until the item's full price sits
+            // in the wallet.
             && !(tech_climb_busy
-                && crate::sim::production::credits_for_owner(sim, &owner) < ty.cost)
+                && tech_bank_short(
+                    crate::sim::production::credits_for_owner(sim, &owner),
+                    ty.cost,
+                ))
             && let Some(type_id) = sim.interner.get(name)
         {
             return vec![CommandEnvelope::new(
@@ -5003,17 +5087,25 @@ impl SuperAi {
             && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
             // While a tech-climb piece or a wanted gun claims the income
             // flow the unit queues spend only banked credits — an item
-            // waits until its own cost sits in the bank, so the incoming
-            // ore flow stays with the radar, lab or gun instead of
-            // splitting three ways and stretching the wait over a tank's
-            // build time each. Miners are the income source itself and
+            // queues once six tenths of its cost sits in the bank
+            // ([`tech_bank_short`]), so the incoming ore flow stays with
+            // the radar, lab or gun while the climb is genuinely short
+            // and the army resumes before the window closes: the old
+            // full-price bar held the vehicle line out of an Allied
+            // superweapon's ~2000-tick savings window whole (observed:
+            // output density at 52%, late game at zero), and the
+            // engine's own queue holds an unpaid item until its payment
+            // lands anyway. Miners are the income source itself and
             // queue unconditionally.
             // The floor's savings hold stops the skimming outright; the
             // banked-credits gate below it still orders the affordable.
             && !(gun_hold && !economy_first)
             && !((tech_climb_busy || guns_wanted)
                 && !economy_first
-                && crate::sim::production::credits_for_owner(sim, &owner) < ty.cost)
+                && tech_bank_short(
+                    crate::sim::production::credits_for_owner(sim, &owner),
+                    ty.cost,
+                ))
             && let Some(type_id) = sim.interner.get(name)
         {
             // The one-shot commissions mark on the order itself, whatever
@@ -5115,14 +5207,18 @@ impl SuperAi {
             && let Some(name) = infantry_want
             && let Some(ty) = rules.object(name)
             && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
-            // The same banked-credits gate: soldiers wait for their own
-            // cost while a tech-climb piece or a wanted gun claims the
-            // income flow — and the floor's savings hold stops the
-            // soldier's cheap ladder from skimming the pool the gun is
-            // banking.
+            // The same banked-credits gate: soldiers queue once six
+            // tenths of their cost sits in the bank
+            // ([`tech_bank_short`]) while a tech-climb piece or a wanted
+            // gun claims the income flow — and the floor's savings hold
+            // stops the soldier's cheap ladder from skimming the pool
+            // the gun is banking.
             && !gun_hold
             && !((tech_climb_busy || guns_wanted)
-                && crate::sim::production::credits_for_owner(sim, &owner) < ty.cost)
+                && tech_bank_short(
+                    crate::sim::production::credits_for_owner(sim, &owner),
+                    ty.cost,
+                ))
             && let Some(type_id) = sim.interner.get(name)
         {
             if name == opening.hero {
@@ -6875,6 +6971,29 @@ impl SuperAi {
         self.order_gate.retain(|_, &mut at| at > tick);
     }
 
+    /// Whether the building type may enter the queue this tick, arming
+    /// its next [`BUILD_QUEUE_RETRY_TICKS`] window when it may — call it
+    /// exactly where the command issues, so the arming rides the order
+    /// out. The engine refuses a building `PRODUCE` against a busy
+    /// factory without surfacing the refusal
+    /// (`factory_lifecycle.rs:202`, `:214-224`) and the queue view shows
+    /// no failure, so without this gate every building limb re-filed the
+    /// identical rejected order the next tick. The unit queues keep
+    /// their own working busy gates; this one paces the building and
+    /// defense queue only.
+    fn build_queue_retry_open(&mut self, type_id: InternedId, tick: u32) -> bool {
+        if self
+            .build_queue_retry_gate
+            .get(&type_id)
+            .is_some_and(|&due| tick < due)
+        {
+            return false;
+        }
+        self.build_queue_retry_gate
+            .insert(type_id, tick + BUILD_QUEUE_RETRY_TICKS);
+        true
+    }
+
     /// The stuck-units limb's one order for this scan, or `None`; see the
     /// call site in [`Self::orders`]. The walk refreshes every eligible
     /// unit's [`Self::stuck_since`] snapshot, resets the window for units
@@ -7908,6 +8027,23 @@ impl SuperAi {
     }
 }
 
+/// The tech-climb bank's affordability bar for the three unit queues
+/// (aircraft, vehicle, infantry), shared so the three read one number:
+/// the wallet at six tenths of the item's cost (`credits * 5 <
+/// cost * 3`). The old full-price bar (`credits < cost`) made the
+/// banking tech piece and the army share one wallet with no split:
+/// across a long climb window — an Allied superweapon queues around
+/// 2000 ticks of savings — the vehicle and infantry lines stood locked
+/// the whole window (observed live: unit output density at 52% during
+/// it, zero past late game on three of four houses). At six tenths the
+/// army queues again once the bank holds most of its money: the
+/// engine's own production queue holds an unpaid item until its
+/// payment lands, so whichever wallet fills first proceeds, and the
+/// climb only keeps the income flow while it is genuinely short.
+fn tech_bank_short(credits: i32, cost: i32) -> bool {
+    credits * 5 < cost * 3
+}
+
 /// The capture chain's priority class for a tech building type — the oil
 /// derrick's class first ([`CAPTURE_PRIORITY_TYPES`] order, its
 /// `ProduceCashStartup` pays the engineer back on entry) — and `None` for
@@ -8483,9 +8619,10 @@ fn find_site_beyond(
 mod tests {
     use super::{
         capture_priority_rank, enemy_direction_bias, foundation_keeps_gap,
-        nearest_connected_target, rally_anchor, spy_infiltration_rank, Role,
-        EXPANSION_MIN_DISTANCE, ORE_ENEMY_DIRECTION_BIAS, OPENINGS, SuperAi,
-        SuperAiDifficulty, TECH_BUILDING_TYPES,
+        nearest_connected_target, rally_anchor, spy_infiltration_rank, tech_bank_short,
+        Role, BUILD_QUEUE_RETRY_TICKS, EXPANSION_MIN_DISTANCE,
+        ORE_ENEMY_DIRECTION_BIAS, OPENINGS, SuperAi, SuperAiDifficulty,
+        TECH_BUILDING_TYPES,
     };
     use crate::sim::intern::InternedId;
     use crate::sim::runtime::SimRuntime;
@@ -8515,6 +8652,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn build_queue_retry_gate_paces_a_type_and_lifts_on_time() {
+        // The gate is plain pinned state keyed by type id, so the test
+        // needs no runtime: two interned ids stand in for two building
+        // types and the helper reads only the map.
+        let mut sim = crate::sim::world::Simulation::new();
+        let house = sim.intern("SuperAiTest");
+        let type_id = sim.intern("GAPOWR");
+        let other_id = sim.intern("GAREFN");
+        let mut ai = SuperAi::new(house, SuperAiDifficulty::Fair);
+        // The pass arms the type's next window on the issue.
+        assert!(ai.build_queue_retry_open(type_id, 1000));
+        assert_eq!(
+            ai.build_queue_retry_gate.get(&type_id),
+            Some(&(1000 + BUILD_QUEUE_RETRY_TICKS))
+        );
+        // The same type cools the window out, every tick of it.
+        assert!(!ai.build_queue_retry_open(type_id, 1001));
+        assert!(!ai.build_queue_retry_open(type_id, 1000 + BUILD_QUEUE_RETRY_TICKS - 1));
+        // A second type keeps its own gate and passes meanwhile — the
+        // pacing is per type, never per queue.
+        assert!(ai.build_queue_retry_open(other_id, 1001));
+        // The window lifts exactly at its due tick. The gate is plain
+        // pinned state, so a hand-set due (a stale entry, say) behaves
+        // like an armed one.
+        ai.build_queue_retry_gate.insert(type_id, 1500);
+        assert!(!ai.build_queue_retry_open(type_id, 1499));
+        assert!(ai.build_queue_retry_open(type_id, 1500));
+        assert_eq!(
+            ai.build_queue_retry_gate.get(&type_id),
+            Some(&(1500 + BUILD_QUEUE_RETRY_TICKS))
+        );
+    }
+
+    #[test]
+    fn tech_bank_short_bars_the_wallet_under_six_tenths() {
+        // The bar on a 1000-credit item sits at 600: flat broke queues
+        // nothing, 599 waits (a hair under the bar), 600 clears, a full
+        // wallet clears.
+        assert!(tech_bank_short(0, 1000));
+        assert!(tech_bank_short(599, 1000));
+        assert!(!tech_bank_short(600, 1000));
+        assert!(!tech_bank_short(1000, 1000));
+        // The integer multiply holds exact fifths for odd prices too:
+        // a 999-credit item bars below 599.4, so 599 waits and 600 goes.
+        assert!(tech_bank_short(599, 999));
+        assert!(!tech_bank_short(600, 999));
     }
 
     #[test]
