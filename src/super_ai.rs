@@ -8040,7 +8040,30 @@ fn scan_site_rings(
                         origin.0 as u16,
                         origin.1 as u16,
                     )
-                }) {
+                })
+                    // The spaced pass clears the engine's build-area ring on
+                    // its own: the home scans pass no owner (the legacy
+                    // first-legal-cell pick sat close enough that the ring
+                    // held by default), but the gap term pushes the first
+                    // passing candidate well past the BaseNormal ring and
+                    // the engine's placement validation refuses it for real
+                    // (observed: six AI houses re-placing one ready
+                    // building for thousands of ticks — two for a whole
+                    // game — because the spaced scan always answered
+                    // *some* candidate and the degraded pass never got its
+                    // turn). Reading the owner back from the interner keeps
+                    // every legacy signature; the degraded pass below keeps
+                    // the exact old predicate.
+                    && (!keep_gap
+                        || crate::sim::production::is_within_build_area(
+                            sim,
+                            rules,
+                            sim.interner.resolve(house),
+                            ty,
+                            origin.0 as u16,
+                            origin.1 as u16,
+                        ))
+                {
                     return Some((origin.0 as u16, origin.1 as u16));
                 }
             }
