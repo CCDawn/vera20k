@@ -1126,6 +1126,233 @@ existing machinery: the capture click (`Command::CaptureBuilding`), the
 bridge chain shares, capped at `CAPTURE_ENGINEER_STOCK` (2) standing plus
 queued behind the bridge chain's wallet bar.
 
+## Survival without a yard: the pinned opening
+
+The "green freeze": two owners in one replay went 100% silent from tick
+~15215 and ~15334 while their units and factories still stood. The cause
+was the chain's first gate — `orders()` resolved the side's `Opening`
+through a standing construction yard every tick and returned nothing
+without one, so a base whose last yard fell lost every limb at once. The
+resolution is now pinned on first sight (`pinned_opening`), and so is the
+home yard's cell (`pinned_home`) while a yard stands: after the last yard
+falls, every non-building limb — the wave machine, the rescue, the
+garrison, the sortie, the spy, the hero, the raiders, the guard poster —
+keeps speaking through the pinned table and the pinned center. The wave
+machine is decoupled from the yard the same way: the combat block's gate
+is the home center with the pin as its fallback, not the yard's own
+structure center. The building limbs need no gate of their own: the
+ladder's first read is the yard's structure center, the placement branch
+has nothing ready, the unit queues starve out on their own.
+
+## The wave launch: the alarm's grace, the validated gather, the two-thirds regroup
+
+Four reasons one replay logged 8275 ticks with zero launches while the
+army stood complete. (1) A fresh base alarm held a forming wave home with
+no timeout at all; under constant alarms it never launched. The alarm may
+now delay the launch, never cancel it: past `WAVE_FORM_TIMEOUT_TICKS`
+(1500) plus `WAVE_ALARM_GRACE_TICKS` (900) the thinner wave launches under
+the alarm with what stands. (2) The demand feed (`wave_shortage`) answered
+the first short type only, and when the house could not build it the
+whole feed parked for the form clock; the walk now covers every short type
+in turn and answers the first buildable one (`can_build`, the country-lock
+lesson), one command per tick as before. (3) The gather cell was pure
+arithmetic — the aim pulled back `WAVE_GATHER_DISTANCE` with no
+validation, so it latched water, cliffs and one-cell passes, and every
+member marched at that one cell. `valid_gather_cell` steps from the aim
+toward home until a cell both connects to home in the ground zone and
+passes the openness floor (`cell_openness`, `OPEN_NEIGHBOR_FLOOR` — at
+least three of the eight neighbors connected and free of structures and
+terrain objects, the choke-avoid test), and the march dispatch spreads the
+members over `SPREAD_OFFSETS` around it the way the hunt and the rescue
+already do. (4) The regroup required every ground member inside the
+arrival ring, so one zone-skipped straggler burned the full 1800-tick
+march clock on most episodes; `WAVE_REGROUP_NUMERATOR`/`DENOMINATOR` (2/3)
+of the ground members arrived turns the march, the clock still the bound.
+The rescue's exemption narrows to match: a marching member is parked only
+while he still holds a live destination (`navigation.nav_com()`,
+`motion_query::is_moving`) or stands inside the arrival ring; an idle
+member far from the gather leaves `wave_marched` so the dispatch loop
+re-sends him instead of standing exempt for the whole clock.
+
+## The traffic limb: congestion, the engine's regroup, the rescue rework
+
+The 100-unit pileup. Engine facts, verified read-only: every construction
+yard deploy moves the house's base centre and orders every ground unit —
+super AI houses included — to one regroup cell beside it
+(`world_spawn.rs` → `MoveGroundForcesToBase`); a core path failure walks
+the unit home; head-on blockers stop both streams; `Command::Scatter` is
+refused for a unit holding a destination and moves only parked units to
+the nearest free cell. The AI can read a unit's destination
+(`navigation.nav_com()`) and motion (`motion_query::is_moving`), unused
+until now.
+
+The congestion limb (`congestion_orders`, every `CONGESTION_SCAN_TICKS`,
+ahead of every dispatch in the combat block) snapshots every own ground
+unit's cell and detects a cluster: `CONGESTION_CLUSTER_MIN` (8) own ground
+units with no displacement over the window standing within
+`CONGESTION_CLUSTER_RADIUS` (5) of one of them. On a cluster the parked
+members (no live destination — posted units included) scatter, and the
+members still holding a destination step to the nearest open cell on
+their own side — strictly closer to home than where they stand, so the
+stream backs out of the corridor instead of pushing through it; all in
+one pass (multiple envelopes per tick, the sortie limb's precedent). The
+cluster's center latches into `congestion_center`, and while it stands
+detected the wave march dispatch, the rescue and the alarm recall hold
+their dispatch into it; a later scan showing it cleared releases them.
+The engine's regroup gets its counter: the newest yard pins as
+`engine_home` (the engine's own base centre), the guard poster biases its
+home ring to it so the AI's streams and the engine's agree instead of
+crossing (the other yard keeps the expansion ring), and a yard count that
+rose this pass — the regroup having fired — re-posts every unit still
+aiming at the regroup cell from past `ENGINE_REGROUP_FAR_CELLS` (10) on
+its own side (`engine_regroup_reposts`, capped at eight).
+
+The rescue reworked: self-rescheduling (`rescue_due`) instead of
+`tick % 150`; up to `RESCUE_BATCH` (3) rescues per scan in one pass; a
+candidate whose aim or futility check fails keeps its snapshot and the
+next candidate takes the turn — the old limb popped its pick before the
+checks and lost the window on the first failure. The exemptions grow by
+the garrison walkers (`garrison_inbound`, `bunker_bound`), the capture
+walkers (`capture_bound`) and the units on their own Guard post; the scout
+exemption narrows to the ids the scouting chain actually dispatched
+(`scout_chain`) — Yuri's scout is the Initiate, and the type test exempted
+every Initiate in the army. The `raiders` set was push-only; a raider idle
+again with his gate lapsed is released, as the doc always promised. Guard
+posts gain the openness test (`pick_guard_post` prefers an open connected
+cell, the anti-floater anchor prefers an open economy structure), a posted
+unit inside a detected cluster scatters with it, and the engineer's
+tech-capture survey and dispatch gain the zone-connectivity check (a
+derrick across a breach is no candidate) and a futility backoff on the
+re-send (`FutilityKind::Capture`).
+
+## Counting only what stands
+
+The replay's queue storms had one root: `own_structures` and the census
+behind `count_structures_of_type` counted buildings still in the factory —
+queued, building, or ready and unplaced, every one in limbo. An airfield
+queued at 4619 lit the jet commission 271 ticks before it landed and the
+wing re-queued 267 times; a fortress Enter clicked one tick after the
+fortress was queued; rally points went out 600 ticks before the first
+factory. Both reads now filter `in_limbo()`, and the audit of the callers:
+the jet gate's radar read, the rallies' factory list, the fortress and
+ferry commissions, the `expansion_owed` yard count, the ladder's every
+rung, the per-base gun quotas and `structure_center` (a limbo building sat
+at (0,0) and could anchor a placement scan there) all read placed
+buildings only — which is what each of them meant. The jet limb also gains
+the building-queue retry gate it lacked (`build_queue_retry_open`), so a
+refused airframe PRODUCE re-files at `BUILD_QUEUE_RETRY_TICKS` pace.
+
+Three more replay bugs: the expansion-center distance took the absolute
+value of the max instead of the y difference, so a yard north of its
+field was mis-judged and one owner's wheel toggled between two home
+factories (fixed, both sites); the Battle Fortress was boarded all game
+and never once unloaded — fifteen Enter clicks, zero `UnloadPassengers`
+anywhere — so the unload leg discharges a loaded fortress that reached the
+enemy's side of the map (the ferry's discharge test) or stood idle loaded
+past `FORTRESS_UNLOAD_IDLE_TICKS` (300); and one owner's expansion MCV
+walked ~100 cells into enemy ground and never deployed, so the ore survey
+is bounded by `EXPANSION_MAX_SITE_DISTANCE` (70) and a walking MCV that
+stands still past `MCV_STUCK_TICKS` with its aim still far drops its
+latched site for a paced, nearer re-survey.
+
+## The outpost's production line (P1–P7)
+
+前哨必须能出兵. Engine truth: only the primary-flagged factory produces,
+a nonprimary only when no flag exists. (P1) The outpost anchor is the
+expansion yard once two stand, else the remote refinery's own cell once
+it stands at the expansion distance — Layer 2.6 and the placement router
+feed from it, so the forward base raises its lines before a second yard
+ever lands. (P2) The reserved factory slot: the home growth array builds
+out to `FACTORY_BUILDOUT` and caps at `FACTORY_CAP`; Layer 2.6 holds
+`FACTORY_CAP + 1`, so home growth can never consume the outpost's factory
+first. (P3) No home fallback for outpost production buildings: an
+outpost-intent item whose ring refuses every site widens the ring once
+(`EXPANSION_SITE_RADIUS * 2`), and a still-refusing neighborhood counts a
+strike toward the pause; a paused outpost item is cancel-only through the
+wall's own escape, never a wedge and never a factory stood at home. (P4)
+The first-appearance latch: a changed main/outpost pair (`primary_pair`)
+hands the primary flag to the outpost that tick, not after four vehicles;
+afterwards the alternation runs on the slot odometer OR
+`PRIMARY_TOGGLE_EVERY_TICKS` (1500) since the last toggle, and the mark
+resets with the pair. (P5) The demand arm (`outpost_carrier_demand`): the
+carrier holds at the outpost while its own cluster ring stands under half
+the guard reserve or the live wave's gather cell sits nearer the outpost
+than home; the blind alternation stays the fallback. (P6) The rally anchor
+set gains the outpost anchor, and the rally cell is picked on the
+factory's exit side — the first rotated spread offset at least three
+cells off the anchor — so it never sits on the crowded yard ring the
+engine refuses and the 900-tick gate then parked. (P7) Layer 2.6 gates on
+the expansion standing, not `any_tank`: a forward base with every tank
+dead must still raise the lines that rebuild them.
+
+## The superweapon suite (S-A–S-F)
+
+超时空/铁幕 et al., each with a strategy. Engine facts: a special fires
+through `Command::LaunchSuperWeapon` only when its instance reads
+`charge_start_tick != -1 && is_active && is_ready` (an uncharged fire is
+silently dropped); every house owns dormant instances of every type (a
+captured building grants the live one); the Chronosphere is two clicks —
+`ChronoSphereSpecial` stores the source 3x3 and reads not-ready until the
+warp, `ChronoWarpSpecial` zips source to target offset-preserving,
+passengers ride safely, no return timer, `ChronoDelay=60` frames before
+the ride is controllable; the Iron Curtain is a 3x3 for 750 frames and
+kills organic foot in the block; the Force Shield is radius 4 for 500.
+
+The fork fired only the sphere's source click and never the warp, so the
+sphere parked `is_ready=false` and never recharged. `superweapon_orders`
+now walks the house's whole instance set behind the retry gate — the
+side's own two supers first, then the captured grants — and hands each
+charged one to its strategy: (S-A) the Iron Curtain column — the first own
+3x3 holding `IRON_CURTAIN_COLUMN_MIN` (5) of the side's heavy tanks and no
+own infantry is curtained, and the column attack-moves at the nearest
+enemy gun cluster (the war factory the fallback) for the curtain's life
+(`iron_column`, the follow-through limb); no such pad falls back to the
+old front-most tank. (S-B) The chrono engineer steal (`chrono_steal_orders`,
+the engineer raid's stage shape): a ride — the Battle Fortress first, the
+side's engineer ride behind it — loads up to three engineers one Enter per
+window, parks on its pad, and the tick the sphere stands ready the suite
+returns both clicks from the same pass: the sphere on the pad, the warp on
+a passable cell two to three cells beside the enemy conyard on home's side
+(`chrono_steal_dest`); `CHRONO_RIDE_DELAY_TICKS` later the ride unloads,
+the first engineer takes the conyard, the spares the next-ranked
+structures. The ride is never curtained before the warp.
+`enemy_priority_targets` gains the conyard-first entry every raid now
+reads. (S-C) The chrono prism drop: a 3x3 holding `CHRONO_PRISM_DROP_MIN`
+(3) idle Prism-class tanks is the pad, the enemy power cluster's passable
+3x3 (the engine's own `Find_Nearby_Passable_Cell`) the destination, and the
+warped tanks attack-move at the nearest power then the refinery line for
+one clock (`prism_drop`). (S-D) Nuke and storm: the enemy structure cell
+maximizing the summed retail value inside `SW_SCORE_RADIUS` — conyard, war
+factory, tech center 100, power 60, base defense 35, else 4, the `[General]
+AIIonCannon*` table — replaces the first-priority-target click. (S-E) The
+dominator takes the enemy 3x3 with the most vehicle cost clear of own
+units within `DOMINATOR_OWN_CLEARANCE` (7, retail `CellSpread`); the
+mutator the densest enemy foot mass. (S-F) The paradrop (the Americans'
+AMRADR grant, or anyone's after capturing CAAIRP — which now ranks first
+in the tech-capture survey) lands on the enemy's nearest refinery line;
+the force shield fires on the own conyard while the alarm is armed and a
+structure inside `FORCE_SHIELD_RADIUS` bleeds.
+
+## Tactic extensions
+
+The engineer transport raid loads up to three engineers (the ride's seats
+permitting) and, when the enemy conyard stands, the Soviet suicide
+payload in the seats left (`SUICIDE_RAIDER_TYPES`: Crazy Ivan, the Terror
+Drone, the demolition truck) — the raid aims conyard-first, the first
+engineer takes it, the spares the war factory and the lab, and the payload
+attacks it on foot (Ivan's Attack is the bomb attach). `EngineerRaid`
+carries `engineers` and `payload` vectors now; a lost ride or last
+engineer still tears the cycle down, a lost spare merely leaves the crew.
+The fortress's cargo is per-type quotas (`boarding_cargo`: two Guardian
+GIs, two GIs, one Ghost — the retail loadout) counted against what rides
+and what stands reserved; the basic soldier never once boarded before. The
+hero boards the ferry (`SHAD`/`LCRF`) when he carries `C4=` and a priority
+target is zone-cut from home — the ferry is his only road across, and his
+own limb plants the charge once he lands. The Desolator's ore denial: an
+idle Desolator walks at the enemy's nearest harvester cell through the
+raider window (`ore_denial`) and toggles his radiation stance within two
+cells of it — the field burns the ore run under the enemy's miners.
+
 ## Upstream sync
 
 `superai/base` merges `origin/main` regularly; each pillar lands on its own

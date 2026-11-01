@@ -220,6 +220,29 @@ const WAVE_GATHER_ARRIVAL: i16 = 3;
 /// its tanks home for the rest of the game.
 const WAVE_FORM_TIMEOUT_TICKS: u32 = 1500;
 
+/// The extra forming grace a fresh base alarm buys past
+/// [`WAVE_FORM_TIMEOUT_TICKS`]: an alarm may delay the launch, never
+/// cancel it. Under constant base alarms the old gate held the forming
+/// wave home with no timeout at all (observed: 8275 ticks with zero
+/// launches while the army stood complete), so past the form clock plus
+/// this grace the thinner wave launches regardless.
+const WAVE_ALARM_GRACE_TICKS: u32 = 900;
+
+/// The regroup fraction, as numerator over denominator: this share of the
+/// ground members standing inside the arrival ring turns the march. The
+/// old all-members rule let one zone-skipped straggler hold the whole
+/// wave at the regroup until the march clock ran out (observed: most
+/// episodes burned the full clock).
+const WAVE_REGROUP_NUMERATOR: usize = 2;
+const WAVE_REGROUP_DENOMINATOR: usize = 3;
+
+/// The openness floor a gather cell, a guard post or a congestion
+/// discharge cell must pass: at least this many of its eight neighbors
+/// still connect in the walker's own zone and hold no structure or
+/// terrain object — the choke-avoid test, so a mass never aims at a
+/// one-cell pass.
+const OPEN_NEIGHBOR_FLOOR: usize = 3;
+
 /// Ticks the march to the gather cell may run before the strike sequence
 /// starts regardless: a member engaged on the way, or wedged, must not
 /// hold the whole wave at the regroup.
@@ -342,6 +365,97 @@ const STUCK_SCAN_TICKS: u32 = 150;
 /// for the rest of the game (the [`MCV_STUCK_TICKS`] lesson, for the army
 /// instead of the opening MCV).
 const STUCK_TIMEOUT: u32 = 600;
+
+/// Units the stuck rescue re-marches per scan, in one pass: the old limb
+/// answered one per 150-tick window, so a jam of twenty wedged units took
+/// fifty windows to unpick (observed: the 100-unit pileup). Multiple
+/// envelopes per tick are the sortie limb's precedent.
+const RESCUE_BATCH: usize = 3;
+
+/// Ticks between the congestion scans: the walk snapshots every own
+/// ground unit's cell, so it runs on the stuck scan's cadence, never per
+/// tick.
+const CONGESTION_SCAN_TICKS: u32 = 150;
+
+/// A congestion cluster: at least this many own ground units standing
+/// within [`CONGESTION_CLUSTER_RADIUS`] (Chebyshev) of one of them with no
+/// displacement over the scan window. The engine's yard-deploy regroup
+/// marches every ground unit to one cell and a head-on blocker stops both
+/// streams, so a base's whole army piles up on one approach (observed:
+/// 100 units frozen on one corridor).
+const CONGESTION_CLUSTER_MIN: usize = 8;
+const CONGESTION_CLUSTER_RADIUS: i16 = 5;
+
+/// The far side of the engine's yard-deploy regroup: an own unit still
+/// aiming at the engine's regroup cell from further than this many cells
+/// is re-posted on the AI's own side of the map instead of walking the
+/// whole way back (engine `MoveGroundForcesToBase`: every ground unit, one
+/// cell, on every yard deploy).
+const ENGINE_REGROUP_FAR_CELLS: i32 = 10;
+
+/// Ticks a loaded Battle Fortress stands idle before it discharges where
+/// it is: the loading pair filled it all game and nothing ever unloaded
+/// it (observed: fifteen Enter clicks, zero unloads, the whole match).
+const FORTRESS_UNLOAD_IDLE_TICKS: u32 = 300;
+
+/// The farthest an expansion survey may latch a field from home: a site
+/// scan with no upper bound walked one owner's MCV ~100 cells into enemy
+/// territory and it never deployed (observed).
+const EXPANSION_MAX_SITE_DISTANCE: i16 = 70;
+
+/// The primary wheel's time arm (Layer 2.9 / outpost P4): past this many
+/// ticks since the last toggle the carrier alternates even while the slot
+/// odometer stands still, so a quiet factory never pins the flag.
+const PRIMARY_TOGGLE_EVERY_TICKS: u32 = 1500;
+
+/// The chrono ride's controllable delay (retail `ChronoDelay=60` frames):
+/// the unload after a warp waits this many ticks for the passengers to be
+/// ridable again.
+const CHRONO_RIDE_DELAY_TICKS: u32 = 60;
+
+/// The Iron Curtain's column: this many of the side's heavy tanks standing
+/// inside one 3x3 pad arm the curtain on the pad, and the curtained column
+/// then attack-moves at the nearest enemy gun cluster for the curtain's
+/// own life (retail 750 frames).
+const IRON_CURTAIN_COLUMN_MIN: usize = 5;
+const IRON_CURTAIN_LIFE_TICKS: u32 = 750;
+
+/// The chrono prism drop's stage: this many Prism Tanks (plus a Mirage if
+/// one stands) gathered on the pad warp onto the enemy power cluster.
+const CHRONO_PRISM_DROP_MIN: usize = 3;
+const CHRONO_PRISM_DROP_MAX: usize = 4;
+
+/// The retail `[General] AIIonCannon*` structure values the destructive
+/// supers score an aim cell by — the summed value of every enemy structure
+/// inside [`SW_SCORE_RADIUS`] of the cell, highest wins.
+const SW_VALUE_CONYARD: i32 = 100;
+const SW_VALUE_WAR_FACTORY: i32 = 100;
+const SW_VALUE_TECH_CENTER: i32 = 100;
+const SW_VALUE_POWER: i32 = 60;
+const SW_VALUE_BASE_DEFENSE: i32 = 35;
+const SW_VALUE_OTHER: i32 = 4;
+const SW_SCORE_RADIUS: i32 = 4;
+
+/// The Psychic Dominator's own-unit exclusion (retail `CellSpread=7`): a
+/// pad with any own unit inside this radius is no aim.
+const DOMINATOR_OWN_CLEARANCE: i32 = 7;
+
+/// The Force Shield's radius (retail 4): the shield fires on the own
+/// conyard when a structure inside this radius is under fire.
+const FORCE_SHIELD_RADIUS: i32 = 4;
+
+/// Every side's construction yard, the chrono-steal's prize and the first
+/// entry of the raid target ranking.
+const CONYARD_TYPES: [&str; 3] = ["GACNST", "NACNST", "YACNST"];
+
+/// Every side's battle lab, scored as a tech center by the destructive
+/// supers and the chrono-steal's spare-engineer errand.
+const TECH_CENTER_TYPES: [&str; 3] = ["GATECH", "NATECH", "YATECH"];
+
+/// The suicide payloads the Soviet raid ride carries beside its engineers
+/// when the enemy conyard stands: Crazy Ivan (his Attack is the bomb
+/// attach), the Terror Drone and the demolition truck.
+const SUICIDE_RAIDER_TYPES: [&str; 3] = ["IVAN", "TERROR", "DTRUCK"];
 
 /// The army's core — its main tank, the side's basic soldier — fills
 /// every queue slot until it reaches this size; only then does the mix
@@ -724,16 +838,18 @@ const FERRY_BOARD_RADIUS: i16 = 12;
 const ENGINEER_CAPTURE_WINDOW_TICKS: u32 = 450;
 
 /// The capture chain's own preference order over [`TECH_BUILDING_TYPES`]:
-/// the oil derrick leads — its `ProduceCashStartup` pays the engineer back
-/// the moment he walks in, and its tick income compounds — then the
-/// airport, the machine shop, the hospital, and the rest (retail aimd
-/// sends an engineer team at the derrick and the airport first, the
-/// shop and hospital after, weighted 70 to 40). Distance picks within a
-/// class, never across it, and each building draws one engineer: a second
-/// one walking at the same derrick is an engineer spent on a building the
+/// the airport leads — its capture grants the paradrop special (`CAAIRP`,
+/// the superweapon suite's S-F arm), a whole reinforcement line for one
+/// engineer — then the oil derrick (its `ProduceCashStartup` pays the
+/// engineer back the moment he walks in, and its tick income compounds),
+/// the machine shop, the hospital, and the rest (retail aimd sends an
+/// engineer team at the derrick and the airport first, the shop and
+/// hospital after, weighted 70 to 40). Distance picks within a class,
+/// never across it, and each building draws one engineer: a second one
+/// walking at the same derrick is an engineer spent on a building the
 /// first already takes.
 const CAPTURE_PRIORITY_TYPES: [&str; 6] =
-    ["CAOILD", "CAAIRP", "CAMACH", "CATHOSP", "CAOUTP", "CAPOWR"];
+    ["CAAIRP", "CAOILD", "CAMACH", "CATHOSP", "CAOUTP", "CAPOWR"];
 
 /// Total engineers (standing plus queued) the capture chain commissions up
 /// to: the bridge repair keeps its own one-at-a-time rule and outranks this
@@ -877,6 +993,8 @@ enum FutilityKind {
     HeroC4,
     /// The spy's infiltration run.
     Spy,
+    /// The engineer's neutral-tech capture walk (the survey's re-send).
+    Capture,
 }
 
 /// One entity's futility-backoff state: the last order kind and aim cell it
@@ -890,43 +1008,143 @@ struct FutilityState {
     suppress_until: u32,
 }
 
-/// The engineer-ride raid's one live cycle (the engineer-in-an-IFV/Flak-
+/// The engineer-ride raid's one live cycle (the engineers-in-an-IFV/Flak-
 /// Track quick strike), its stage machine marched one leg per window in
-/// [`Self::engineer_raid_orders`]. Every variant names both actors it
-/// still needs — a leg whose actor died tears the raid down — and the
-/// owner pins the leg's start tick beside it for the hard stage timeout.
-#[derive(Clone, Copy, Debug)]
+/// [`Self::engineer_raid_orders`]. Every variant names the actors it
+/// still needs — a leg whose ride or last engineer died tears the raid
+/// down — and the owner pins the leg's start tick beside it for the hard
+/// stage timeout. The ride carries up to its capacity: the engineers first
+/// (the conyard, then the spares' errands at the war factory and the lab),
+/// then the Soviet suicide payload ([`SUICIDE_RAIDER_TYPES`]) when the
+/// enemy conyard stands — they unload beside it and do their thing.
+#[derive(Clone, Debug)]
 enum EngineerRaid {
-    /// Both commissioned or found; the Enter walk is pending.
-    Boarding { engineer: u64, ride: u64 },
-    /// The engineer rides (in the hold, in limbo); the vehicle attack-moves
+    /// Both commissioned or found; the Enter walks are pending, one per
+    /// window until every actor rides.
+    Boarding {
+        engineers: Vec<u64>,
+        payload: Vec<u64>,
+        ride: u64,
+    },
+    /// The actors ride (in the hold, in limbo); the vehicle attack-moves
     /// at the latched enemy target.
     Sailing {
-        engineer: u64,
+        engineers: Vec<u64>,
+        payload: Vec<u64>,
         ride: u64,
         target: u64,
     },
-    /// Arrived at the target: the unload lands, and the engineer
-    /// re-appears on foot after the hold's own discharge delay.
+    /// Arrived at the target: the unload lands, and the actors re-appear
+    /// on foot after the hold's own discharge delay.
     Unloading {
-        engineer: u64,
+        engineers: Vec<u64>,
+        payload: Vec<u64>,
         ride: u64,
         target: u64,
     },
-    /// The engineer stands beside the target again; the capture click is
-    /// his to walk in and be consumed by.
-    Capturing { engineer: u64, target: u64 },
+    /// The actors stand beside the target again: the first engineer's
+    /// capture click is his to walk in and be consumed by, the spares take
+    /// the next-ranked structures, the payload attacks the target.
+    Capturing {
+        engineers: Vec<u64>,
+        payload: Vec<u64>,
+        target: u64,
+    },
 }
 
 impl EngineerRaid {
     /// Every entity id the current stage leans on, for the wave pool's
     /// exclusion and the liveness checks.
     fn actors(&self) -> Vec<u64> {
-        match *self {
-            EngineerRaid::Boarding { engineer, ride }
-            | EngineerRaid::Sailing { engineer, ride, .. }
-            | EngineerRaid::Unloading { engineer, ride, .. } => vec![engineer, ride],
-            EngineerRaid::Capturing { engineer, .. } => vec![engineer],
+        match self {
+            EngineerRaid::Boarding {
+                engineers,
+                payload,
+                ride,
+            }
+            | EngineerRaid::Sailing {
+                engineers,
+                payload,
+                ride,
+                ..
+            }
+            | EngineerRaid::Unloading {
+                engineers,
+                payload,
+                ride,
+                ..
+            } => {
+                let mut all = engineers.clone();
+                all.extend(payload.iter().copied());
+                all.push(*ride);
+                all
+            }
+            EngineerRaid::Capturing {
+                engineers, payload, ..
+            } => {
+                let mut all = engineers.clone();
+                all.extend(payload.iter().copied());
+                all
+            }
+        }
+    }
+
+    /// The ride the stage still rides, `None` once the actors stand on
+    /// foot again.
+    fn ride(&self) -> Option<u64> {
+        match self {
+            EngineerRaid::Boarding { ride, .. }
+            | EngineerRaid::Sailing { ride, .. }
+            | EngineerRaid::Unloading { ride, .. } => Some(*ride),
+            EngineerRaid::Capturing { .. } => None,
+        }
+    }
+}
+
+/// The chrono engineer steal's one live cycle (the superweapon suite's
+/// S-B arm): a ride loaded with engineers parks on the Chronosphere's pad,
+/// the two-click warp drops it beside the enemy conyard, and the engineers
+/// walk in. Modeled on [`EngineerRaid`]; one cycle at a time, every stage
+/// bounded by [`RAID_STAGE_TIMEOUT_TICKS`].
+#[derive(Clone, Debug)]
+enum ChronoSteal {
+    /// The engineers Enter the ride, one per window.
+    Loading { engineers: Vec<u64>, ride: u64 },
+    /// The loaded ride moves onto the pad and waits for the sphere's
+    /// charge; the warp fires both clicks the tick it stands ready there.
+    Staging {
+        engineers: Vec<u64>,
+        ride: u64,
+        pad: (u16, u16),
+        target: u64,
+    },
+    /// Warped: the ride unloads once the chrono delay has passed.
+    Warped {
+        engineers: Vec<u64>,
+        ride: u64,
+        target: u64,
+        since: u32,
+    },
+    /// On foot beside the conyard: the capture clicks, the spares' errands.
+    Capturing { engineers: Vec<u64>, target: u64 },
+}
+
+impl ChronoSteal {
+    /// Every entity id the current stage leans on.
+    fn actors(&self) -> Vec<u64> {
+        match self {
+            ChronoSteal::Loading { engineers, ride }
+            | ChronoSteal::Staging {
+                engineers, ride, ..
+            }
+            | ChronoSteal::Warped {
+                engineers, ride, ..
+            } => {
+                let mut all = engineers.clone();
+                all.push(*ride);
+                all
+            }
+            ChronoSteal::Capturing { engineers, .. } => engineers.clone(),
         }
     }
 }
@@ -2285,6 +2503,91 @@ pub struct SuperAi {
     /// [`NAVAL_SORTIE_WINDOW_TICKS`]. Pinned state, never read from the
     /// runtime.
     naval_sortie_due: u32,
+    // ---- Survival, traffic and the superweapon suite ----
+    /// The side's opening table, pinned the first tick a standing yard
+    /// resolved it. `opening()` reads through a standing yard, so a base
+    /// whose every yard fell went silent for the rest of the game while
+    /// its units and factories still stood (observed: two owners 100%
+    /// silent from tick ~15000, the "green freeze"); the pin keeps every
+    /// non-building limb speaking. Pinned state, never read from the
+    /// runtime.
+    pinned_opening: Option<&'static Opening>,
+    /// The home yard's cell, pinned while a yard stands: the wave machine,
+    /// the guard poster and the rescue keep a home center after the last
+    /// yard falls. Pinned state, never read from the runtime.
+    pinned_home: Option<(i16, i16)>,
+    /// The engine's own base centre — the newest standing yard, the cell
+    /// every yard deploy moves `HouseClass::base_center` to and regroups
+    /// every ground unit on. The recall and the guard poster bias home
+    /// toward it so the AI's streams and the engine's agree instead of
+    /// crossing. Pinned state, never read from the runtime.
+    engine_home: Option<(i16, i16)>,
+    /// The yard count at the last pass: an increase is the engine's
+    /// regroup firing, and the counter-limb re-posts the far units it
+    /// pulled. Pinned state, never read from the runtime.
+    last_yard_count: usize,
+    /// The tick the next congestion scan may run; see
+    /// [`CONGESTION_SCAN_TICKS`]. Pinned state, never read from the
+    /// runtime.
+    congestion_due: u32,
+    /// The cell and tick each own ground unit was last seen standing at,
+    /// the congestion scan's displacement window (the `stuck_since`
+    /// shape). Pinned state, never read from the runtime.
+    congestion_snapshot: std::collections::HashMap<u64, ((u16, u16), u32)>,
+    /// The live congestion cluster's center while one stands detected: the
+    /// wave march, the rescue and the alarm recall hold their dispatch into
+    /// that corridor until a scan shows it cleared. Pinned state, never
+    /// read from the runtime.
+    congestion_center: Option<(u16, u16)>,
+    /// The tick the next stuck-rescue scan may run, self-rescheduling from
+    /// each scan; see [`STUCK_SCAN_TICKS`]. Pinned state, never read from
+    /// the runtime.
+    rescue_due: u32,
+    /// The unit ids the scouting chain has dispatched: only these are the
+    /// rescue's exempt scouts (Yuri's scout is the Initiate — the type
+    /// test exempted every one). Pinned state, never read from the
+    /// runtime.
+    scout_chain: std::collections::HashSet<u64>,
+    /// The tick each loaded Battle Fortress was first seen idle with cargo,
+    /// for the unload leg's patience ([`FORTRESS_UNLOAD_IDLE_TICKS`]).
+    /// Pinned state, never read from the runtime.
+    fortress_loaded_since: std::collections::HashMap<u64, u32>,
+    /// The cell and tick the expansion MCV was last seen standing at on
+    /// its walk; a walk that stands still past [`MCV_STUCK_TICKS`] drops
+    /// its latched site for a nearer survey. Pinned state, never read
+    /// from the runtime.
+    expansion_walk_since: Option<((u16, u16), u32)>,
+    /// The main/outpost factory pair the primary wheel last saw: a changed
+    /// pair (the outpost line standing for the first time, a factory lost)
+    /// latches the primary onto the outpost at once. Pinned state, never
+    /// read from the runtime.
+    primary_pair: Option<(u64, u64)>,
+    /// The tick the primary wheel last toggled, the time arm beside the
+    /// slot odometer ([`PRIMARY_TOGGLE_EVERY_TICKS`]). Pinned state, never
+    /// read from the runtime.
+    primary_last_toggle: u32,
+    /// The live chrono engineer steal, one at a time; see [`ChronoSteal`].
+    /// Pinned state, never read from the runtime.
+    chrono_steal: Option<ChronoSteal>,
+    /// The tick the current chrono-steal stage started at. Pinned state,
+    /// never read from the runtime.
+    chrono_steal_since: u32,
+    /// The tick the next chrono-steal cycle may arm at. Pinned state,
+    /// never read from the runtime.
+    chrono_steal_cooldown_until: u32,
+    /// The Iron Curtain column's follow-through: the pad cell, the tick
+    /// the curtain fired, and the tanks under it — they attack-move at the
+    /// enemy guns for the curtain's life. Pinned state, never read from
+    /// the runtime.
+    iron_column: Option<((u16, u16), u32, Vec<u64>)>,
+    /// The chrono prism drop's warped Prism Tanks and the tick they
+    /// landed: they attack-move at the enemy power then the refineries for
+    /// one strike clock. Pinned state, never read from the runtime.
+    prism_drop: Option<(u32, Vec<u64>)>,
+    /// The Desolators on an ore-denial walk, each with the harvester cell
+    /// it marches at: arriving toggles the radiation stance. Pinned state,
+    /// never read from the runtime.
+    ore_denial: std::collections::HashMap<u64, (u16, u16)>,
 }
 
 impl SuperAi {
@@ -2383,6 +2686,25 @@ impl SuperAi {
             naval_sortie_target: None,
             naval_sortie_launched: Vec::new(),
             naval_sortie_due: 0,
+            pinned_opening: None,
+            pinned_home: None,
+            engine_home: None,
+            last_yard_count: 0,
+            congestion_due: 0,
+            congestion_snapshot: std::collections::HashMap::new(),
+            congestion_center: None,
+            rescue_due: 0,
+            scout_chain: std::collections::HashSet::new(),
+            fortress_loaded_since: std::collections::HashMap::new(),
+            expansion_walk_since: None,
+            primary_pair: None,
+            primary_last_toggle: 0,
+            chrono_steal: None,
+            chrono_steal_since: 0,
+            chrono_steal_cooldown_until: 0,
+            iron_column: None,
+            prism_drop: None,
+            ore_denial: std::collections::HashMap::new(),
         }
     }
 
@@ -2655,8 +2977,21 @@ impl SuperAi {
         }
         // Everything below the deploy speaks through the side's opening,
         // which resolves through the standing yard — the branch above is
-        // what stands it.
-        let Some(opening) = self.opening(sim) else {
+        // what stands it. The resolution is pinned on first sight: a base
+        // whose every yard later fell (razed, sold, captured) must keep
+        // speaking through the pinned table, because `opening()` answers
+        // `None` without a yard and the old early return silenced the
+        // whole house while its units and factories still stood (observed:
+        // two owners 100% silent from tick ~15000 — the "green freeze").
+        // The building limbs below no-op on their own without a yard: the
+        // ladder's first gate is the yard's own structure center, the
+        // placement branch has nothing ready, the queues starve out.
+        if self.pinned_opening.is_none()
+            && let Some(resolved) = self.opening(sim)
+        {
+            self.pinned_opening = Some(resolved);
+        }
+        let Some(opening) = self.pinned_opening else {
             return Vec::new();
         };
         // The ladder's superweapon rungs are once-per-game each: remember
@@ -2676,32 +3011,91 @@ impl SuperAi {
         // refinery that stood and fell while the growth block never ran
         // (observed: the census saw the refinery; the latch never did,
         // and the whole expansion froze behind it).
-        let home_center = self.structure_center(sim, opening.construction_yard);
+        //
         // The standing yards (Layer 2): the first in the substrate's stable
         // order is the home base every legacy ring scan centers on; once a
         // second yard stands, the one furthest from home — or nearest the
         // expansion MCV's latched field, when that walk is still armed — is
-        // the expansion base the growth limbs route to.
+        // the expansion base the growth limbs route to. The home cell pins
+        // while a yard stands (the survival path reads the pin after the
+        // last yard falls), and the engine's own base centre — the newest
+        // yard, the cell every yard deploy moves `base_center` to and
+        // regroups the whole army on — pins beside it so the recall and
+        // the poster bias home where the engine's streams already go.
         let yard_centers = self.own_yard_centers(sim, opening);
+        if let Some(&home) = yard_centers.first() {
+            self.pinned_home = Some(home);
+        }
+        if let Some(&newest) = yard_centers.last() {
+            self.engine_home = Some(newest);
+        }
+        let home_center = self
+            .structure_center(sim, opening.construction_yard)
+            .or(self.pinned_home);
         let expansion_center = if yard_centers.len() >= 2 {
             match self.expansion2_site {
+                // Chebyshev with both axes absolute: the old chain took the
+                // absolute value of the max instead of the y difference, so
+                // a yard north of its field was mis-judged and one owner's
+                // wheel toggled between two home factories (observed).
                 Some(site) => yard_centers.iter().copied().min_by_key(|cell| {
                     (cell.0 - site.0 as i16)
                         .abs()
-                        .max(cell.1 - site.1 as i16)
-                        .abs()
+                        .max((cell.1 - site.1 as i16).abs())
                 }),
                 None => {
                     let home = home_center.unwrap_or(yard_centers[0]);
                     yard_centers
                         .iter()
                         .copied()
-                        .max_by_key(|cell| (cell.0 - home.0).abs().max(cell.1 - home.1).abs())
+                        .max_by_key(|cell| (cell.0 - home.0).abs().max((cell.1 - home.1).abs()))
                 }
             }
         } else {
             None
         };
+        // The outpost anchor (P1): the expansion yard once two stand, else
+        // the remote refinery's own cell once it stands at the expansion
+        // distance — the forward base the outpost production limbs and the
+        // placement router feed before a second yard ever lands.
+        let outpost_anchor = expansion_center.or_else(|| {
+            home_center.and_then(|home| {
+                self.own_structures(sim).into_iter().find_map(|(id, name)| {
+                    (name == opening.refinery)
+                        .then(|| sim.substrate.entities.get(id))
+                        .flatten()
+                        .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))
+                        .filter(|cell| {
+                            (cell.0 - home.0).abs().max((cell.1 - home.1).abs())
+                                >= EXPANSION_MIN_DISTANCE
+                        })
+                })
+            })
+        });
+        // The engine's yard-deploy regroup counter (Layer 3 traffic): a
+        // yard count that rose this pass is the engine's
+        // `MoveGroundForcesToBase` having fired — every own ground unit
+        // was just pointed at one cell beside the new yard. The units far
+        // from it would walk the whole map back through every corridor the
+        // AI's own streams use; each one still aiming at that cell from
+        // past [`ENGINE_REGROUP_FAR_CELLS`] is re-posted on its own side
+        // instead, all in one pass (multiple envelopes per tick: the
+        // sortie limb's precedent).
+        let yard_count = yard_centers.len();
+        if yard_count > self.last_yard_count
+            && self.last_yard_count > 0
+            && let Some(engine_home) = self.engine_home
+        {
+            let reposts = self.engine_regroup_reposts(sim, rules, engine_home, tick);
+            self.last_yard_count = yard_count;
+            if !reposts.is_empty() {
+                return reposts
+                    .into_iter()
+                    .map(|command| CommandEnvelope::new(self.house, at, command))
+                    .collect();
+            }
+        }
+        self.last_yard_count = yard_count;
         if self.expansion_site.is_none()
             && !self.remote_refinery_stood
             && tick >= self.survey_due
@@ -2782,6 +3176,12 @@ impl SuperAi {
                     || opening
                         .wall
                         .is_some_and(|wall| sim.interner.get(wall) == Some(item.type_id))
+                    // An outpost-intent item (P3) takes the same cancel
+                    // escape: its ring never falls back home, so a paused
+                    // one is a certain cancel, never a wedge.
+                    || self
+                        .placement_intent
+                        .is_some_and(|(intent, expansion)| intent == item.type_id && expansion)
             })
             .last()
             && let Some(ty) = rules.object(sim.interner.resolve(ready.type_id))
@@ -2864,6 +3264,27 @@ impl SuperAi {
                         }
                     }
                 } else {
+                // The outpost's cancel escape (P3): an outpost-intent item
+                // whose widened ring refused every site three times is
+                // paused, and a paused one is cancel-only — the credits
+                // come back and the queue walks on, instead of the item
+                // falling back to the home rings and standing an outpost
+                // factory at home.
+                if self.place_pause_until.contains_key(&ready.type_id)
+                    && self
+                        .placement_intent
+                        .is_some_and(|(intent, expansion)| intent == ready.type_id && expansion)
+                {
+                    self.placement_intent = None;
+                    return vec![CommandEnvelope::new(
+                        self.house,
+                        at,
+                        Command::CancelProductionByType {
+                            type_id: ready.type_id,
+                            all: false,
+                        },
+                    )];
+                }
                 let far_site = if type_name == opening.refinery
                     && self.expansion_site.is_some()
                     && !self.remote_refinery_stood
@@ -2911,12 +3332,14 @@ impl SuperAi {
                     // The expansion routing: the first expansion's refinery
                     // (before its remote latch arms, with the second yard
                     // already standing) and anything the growth plan marked
-                    // for the expansion base. The remote foundation must
-                    // itself keep the expansion distance from home — the
-                    // ring scan starts at the field and can pull a
-                    // foundation toward home, and a refinery inside the
-                    // distance never arms the second-base chain behind it.
-                    let expansion_route = expansion_center.filter(|_| {
+                    // for the outpost. The remote foundation must itself
+                    // keep the expansion distance from home — the ring scan
+                    // starts at the field and can pull a foundation toward
+                    // home, and a refinery inside the distance never arms
+                    // the second-base chain behind it. The anchor is the
+                    // outpost's (P1): the expansion yard, else the remote
+                    // refinery's cell.
+                    let expansion_route = outpost_anchor.filter(|_| {
                         (type_name == opening.refinery
                             && self.expansion_site.is_some()
                             && !self.remote_refinery_stood)
@@ -2928,7 +3351,14 @@ impl SuperAi {
                     });
                     match expansion_route {
                         Some(center) => {
-                            find_site_around_capped(
+                            // No home fallback (P3): an outpost production
+                            // building that cannot land in its own ring
+                            // widens the ring once, and a still-refusing
+                            // neighborhood counts a strike toward the pause
+                            // and the cancel escape above — the old fallback
+                            // stood the outpost's factory at home and the
+                            // outpost never produced.
+                            let site = find_site_around_capped(
                                 sim,
                                 rules,
                                 &runtime.resources.overlay_registry,
@@ -2939,17 +3369,27 @@ impl SuperAi {
                                 EXPANSION_SITE_RADIUS,
                             )
                             .or_else(|| {
-                                home_center.and_then(|home| {
-                                    find_site_around(
-                                        sim,
-                                        rules,
-                                        &runtime.resources.overlay_registry,
-                                        ty,
-                                        home,
-                                        self.house,
-                                    )
-                                })
-                            })
+                                find_site_around_capped(
+                                    sim,
+                                    rules,
+                                    &runtime.resources.overlay_registry,
+                                    ty,
+                                    center,
+                                    self.house,
+                                    Some(owner.as_str()),
+                                    EXPANSION_SITE_RADIUS * 2,
+                                )
+                            });
+                            if site.is_none() {
+                                let stuck = self.place_stuck.entry(ready.type_id).or_insert(0);
+                                *stuck += 1;
+                                if *stuck >= PLACE_STRIKES {
+                                    self.place_stuck.remove(&ready.type_id);
+                                    self.place_pause_until
+                                        .insert(ready.type_id, tick + PLACE_PAUSE_TICKS);
+                                }
+                            }
+                            site
                         }
                         None => home_center.and_then(|home| {
                             find_site_around(
@@ -2984,7 +3424,7 @@ impl SuperAi {
             )];
         }
 
-        // A charged superweapon fires. The lobby toggle already gates the
+        // The superweapon suite (W6). The lobby toggle already gates the
         // whole chain upstream: with superweapons off, `can_build` refuses
         // the `DisableableFromShell=yes` building (and the engine revokes a
         // standing grant), so no instance is ever owned or charged. The
@@ -2992,33 +3432,19 @@ impl SuperAi {
         // fire button's own admission; `LaunchSuperWeapon` can still be
         // refused (a storm already in flight, a dominator mid-pulse), so a
         // launch retries after [`SW_FIRE_RETRY_TICKS`] instead of
-        // monopolizing this tick's single command. Both supers — the
-        // ladder's first and second — sit in the walk: whichever is
-        // charged first fires.
-        if tick >= self.next_sw_fire_tick {
-            for sw_type_name in [opening.super_weapon_type, opening.second_super_weapon_type] {
-                if let Some(sw_type) = sim.interner.get(sw_type_name)
-                    && let Some(instance) = sim
-                        .super_weapons()
-                        .get(&self.house)
-                        .and_then(|house_sws| house_sws.get(&sw_type))
-                    && instance.charge_start_tick() != -1
-                    && instance.is_active()
-                    && instance.is_ready()
-                    && let Some((rx, ry)) = self.superweapon_target(sim, opening, sw_type_name)
-                {
-                    self.next_sw_fire_tick = tick + SW_FIRE_RETRY_TICKS;
-                    return vec![CommandEnvelope::new(
-                        self.house,
-                        at,
-                        Command::LaunchSuperWeapon {
-                            sw_type_id: sw_type,
-                            target_rx: rx,
-                            target_ry: ry,
-                        },
-                    )];
-                }
-            }
+        // monopolizing this tick's single command. Every house owns a
+        // dormant instance of every special (a captured building grants
+        // the live one), so the walk reads the house's whole instance set
+        // and hands each ready one to its own strategy — the Iron Curtain
+        // column, the chrono steal and the prism drop (two clicks, source
+        // then warp, from the same pass), the scored nuke and storm, the
+        // dominator's armor pad and the mutator's foot mass, the paradrop
+        // and the force shield; see [`Self::superweapon_orders`].
+        if let Some(commands) = self.superweapon_orders(sim, rules, opening, home_center, tick) {
+            return commands
+                .into_iter()
+                .map(|command| CommandEnvelope::new(self.house, at, command))
+                .collect();
         }
 
         // The broken-bridge limb. A breach the zone grid already knows about
@@ -3065,7 +3491,9 @@ impl SuperAi {
         // sequence runs. Orders issue one unit per
         // tick; an engaged, marching or posted unit leaves the standing set,
         // so no spam follows, and a wave that dies lets the next one form.
-        if let Some(center) = self.structure_center(sim, opening.construction_yard) {
+        // The center is the home yard's, else the pinned one (W1): the
+        // whole combat layer keeps running after the last yard falls.
+        if let Some(center) = home_center {
             // The counter-trigger table (retail aimd's `Enemy owns >= N`
             // triggers), read on the stuck scan's cadence: the hostile air
             // count arms the AA defense team's demand bumps (the mobile-AA
@@ -3082,6 +3510,30 @@ impl SuperAi {
                     .map(|&name| self.count_enemy_units_of_type(sim, name))
                     .sum::<usize>()
                     >= FLOATER_COUNTER_THREATS;
+            }
+            // The congestion limb (W3), ahead of every dispatch into the
+            // field: on its scan a cluster of own ground units standing
+            // still together is unpicked — the parked ones scatter, the
+            // rest step to open ground on their own side — and while the
+            // cluster stands detected the wave march, the rescue and the
+            // alarm recall hold their dispatch into it; see
+            // [`Self::congestion_orders`].
+            if tick >= self.congestion_due {
+                self.congestion_due = tick + CONGESTION_SCAN_TICKS;
+                let commands = self.congestion_orders(sim, rules, opening, center, tick);
+                if !commands.is_empty() {
+                    return commands
+                        .into_iter()
+                        .map(|command| CommandEnvelope::new(self.house, at, command))
+                        .collect();
+                }
+            }
+            // The superweapon suite's follow-throughs (W6): the curtained
+            // column attack-moves at the enemy guns for the curtain's life,
+            // the warped prism drop at the enemy power; see
+            // [`Self::superweapon_followthrough_orders`].
+            if let Some(command) = self.superweapon_followthrough_orders(sim, rules, tick) {
+                return vec![CommandEnvelope::new(self.house, at, command)];
             }
             let idle = self.idle_combat_units(sim, opening);
             let alarm_armed = self.base_alarm_armed(sim, tick);
@@ -3217,7 +3669,57 @@ impl SuperAi {
             // cell), Crazy Ivan bombs a reachable enemy structure (his
             // Attack IS the bomb-attach), and the Floating Disk raids power
             // plants and refineries instead of marching with the tanks it
-            // outflies.
+            // outflies. The Desolator's ore denial rides the same window
+            // (W7): an idle Desolator walks at the enemy's nearest harvester
+            // cell and toggles his radiation stance on arrival — the field
+            // burns the ore run under the enemy's miners.
+            //
+            // Reservation hygiene first: the doc promises a raider leaves
+            // the set when his order completes, and the set was push-only
+            // (observed: every raider reserved for life, the pool shrinking
+            // raid by raid). A raider idle again with his gate lapsed, or
+            // gone, is released; the Desolator's walk latch goes with him.
+            self.raiders.retain(|&id| {
+                sim.substrate.entities.get(id).is_some_and(|entity| {
+                    entity.owner() == self.house
+                        && entity.lifecycle.object_alive()
+                        && !entity.lifecycle.in_limbo()
+                        && !(self.order_gate.get(&id).is_none_or(|&due| tick >= due)
+                            && matches!(
+                                entity.passive_acquire_mission(),
+                                crate::sim::mission::MissionType::None
+                                    | crate::sim::mission::MissionType::Sleep
+                                    | crate::sim::mission::MissionType::Guard
+                                    | crate::sim::mission::MissionType::AreaGuard
+                            ))
+                })
+            });
+            self.ore_denial.retain(|id, _| self.raiders.contains(id));
+            // The Desolator's arrival: standing within two cells of his
+            // latched harvester cell, the stance toggles once (the deploy
+            // is a toggle — `deploy_issued` keeps the re-issue off) and the
+            // walk latch clears.
+            let arrived = self.ore_denial.iter().find(|(deso, cell)| {
+                let (hx, hy) = **cell;
+                sim.substrate.entities.get(**deso).is_some_and(|entity| {
+                    !entity.is_deployed()
+                        && !self.deploy_issued.contains(*deso)
+                        && (i32::from(entity.position.rx()) - i32::from(hx))
+                            .abs()
+                            .max((i32::from(entity.position.ry()) - i32::from(hy)).abs())
+                            <= 2
+                })
+            });
+            if let Some((&deso, _)) = arrived {
+                self.ore_denial.remove(&deso);
+                self.raiders.retain(|&kept| kept != deso);
+                self.deploy_issued.insert(deso);
+                return vec![CommandEnvelope::new(
+                    self.house,
+                    at,
+                    Command::ToggleInfantryDeploy { entity_id: deso },
+                )];
+            }
             if tick >= self.raid_due {
                 let mut raid: Option<(u64, Command)> = None;
                 for (id, entity) in sim.substrate.entities.iter_sorted() {
@@ -3237,11 +3739,35 @@ impl SuperAi {
                         )
                         || self.order_gate.get(&id).is_some_and(|&due| tick < due)
                         || self.raiders.contains(&id)
+                        || self.raid_involves(id)
                     {
                         continue;
                     }
                     let type_name = sim.interner.resolve(entity.type_ref());
                     let from = (entity.position.rx(), entity.position.ry());
+                    if type_name == DESO_TYPE
+                        && !entity.is_deployed()
+                        && !self.deploy_issued.contains(&id)
+                        && let Some((cell, _)) = self.nearest_enemy_harvester(sim, from)
+                        && zones_connected(
+                            sim,
+                            crate::rules::locomotor_type::MovementZone::Normal,
+                            from,
+                            cell,
+                        )
+                        && !self.futile(id, FutilityKind::Raid, from, tick)
+                    {
+                        self.ore_denial.insert(id, cell);
+                        raid = Some((
+                            id,
+                            Command::Move {
+                                entity_id: id,
+                                target_rx: cell.0,
+                                target_ry: cell.1,
+                            },
+                        ));
+                        break;
+                    }
                     if type_name == RAIDER_DRONE
                         && let Some((cell, _)) = self.nearest_enemy_harvester(sim, from)
                         && zones_connected(
@@ -3568,19 +4094,28 @@ impl SuperAi {
                 // hostile Disks or Kirovs on the field, an AA vehicle's post
                 // anchors on the nearest own power plant or refinery
                 // instead — the floaters raid the economy, so the flak
-                // stands over it.
+                // stands over it. The home ring anchors on the engine's own
+                // base centre (the newest yard, W3): every yard deploy
+                // regroups the whole army there, so a poster biased to the
+                // first yard sent its streams head-on into the engine's;
+                // the other yard keeps the expansion ring so both stay
+                // covered.
                 let economy_anchor = self
                     .counter_floater_armed
-                    .then(|| self.aa_economy_anchor(sim, opening, unit))
+                    .then(|| self.aa_economy_anchor(sim, rules, opening, unit))
                     .flatten();
+                let post_home = self.engine_home.unwrap_or(center);
+                let post_expansion = expansion_center
+                    .filter(|&cell| cell != post_home)
+                    .or_else(|| yard_centers.iter().copied().find(|&cell| cell != post_home));
                 let home_post = pick_guard_post(
                     sim,
                     rules,
                     unit,
-                    economy_anchor.unwrap_or(center),
+                    economy_anchor.unwrap_or(post_home),
                     &SPREAD_OFFSETS,
                 );
-                let post = if let Some(expansion) = expansion_center
+                let post = if let Some(expansion) = post_expansion
                     && economy_anchor.is_none()
                 {
                     let expansion_post = pick_guard_post(
@@ -3836,9 +4371,83 @@ impl SuperAi {
                 self.boarders.retain(|&kept| kept != unit);
                 self.board_attempts.retain(|&(kept, _), _| kept != unit);
             }
-            let cargo_names = Self::boarding_cargo(opening);
+            let cargo_quotas = Self::boarding_cargo(opening);
+            // The unload leg (W4): a fortress boarded all game was never
+            // once unloaded — fifteen Enter clicks in one replay, zero
+            // UnloadPassengers anywhere. A loaded fortress that reached its
+            // context (the enemy's side of the map — the ferry's discharge
+            // test) or has stood idle loaded past
+            // [`FORTRESS_UNLOAD_IDLE_TICKS`] discharges where it stands; the
+            // cargo fights on foot and the loading pair refills it later.
+            self.fortress_loaded_since.retain(|&id, _| {
+                sim.substrate.entities.get(id).is_some_and(|entity| {
+                    entity.owner() == self.house
+                        && entity.lifecycle.object_alive()
+                        && entity
+                            .passenger_role
+                            .cargo()
+                            .is_some_and(|cargo| cargo.count() > 0)
+                })
+            });
             if let Some(fortress_name) = opening.fortress
-                && !cargo_names.is_empty()
+                && let Some(home) = home_center
+            {
+                let enemy_center = self.enemy_center(sim);
+                let loaded: Vec<(u64, (i16, i16), bool)> = sim
+                    .substrate
+                    .entities
+                    .iter_sorted()
+                    .filter(|(_, entity)| {
+                        entity.owner() == self.house
+                            && entity.category() == crate::map::entities::EntityCategory::Unit
+                            && sim.interner.resolve(entity.type_ref()) == fortress_name
+                            && !entity.lifecycle.in_limbo()
+                            && entity
+                                .passenger_role
+                                .cargo()
+                                .is_some_and(|cargo| cargo.count() > 0)
+                    })
+                    .map(|(id, entity)| {
+                        (
+                            id,
+                            (entity.position.rx() as i16, entity.position.ry() as i16),
+                            matches!(
+                                entity.passive_acquire_mission(),
+                                crate::sim::mission::MissionType::None
+                                    | crate::sim::mission::MissionType::Sleep
+                                    | crate::sim::mission::MissionType::Guard
+                                    | crate::sim::mission::MissionType::AreaGuard
+                            ),
+                        )
+                    })
+                    .collect();
+                for (fortress, cell, idle) in loaded {
+                    let since = *self.fortress_loaded_since.entry(fortress).or_insert(tick);
+                    let home_distance = (cell.0 - home.0).abs().max((cell.1 - home.1).abs());
+                    let enemy_side = enemy_center.is_some_and(|aim| {
+                        (cell.0 - aim.0).abs().max((cell.1 - aim.1).abs()) < home_distance
+                    });
+                    if idle
+                        && self
+                            .order_gate
+                            .get(&fortress)
+                            .is_none_or(|&due| tick >= due)
+                        && (enemy_side || tick.saturating_sub(since) >= FORTRESS_UNLOAD_IDLE_TICKS)
+                    {
+                        self.fortress_loaded_since.remove(&fortress);
+                        self.gate_idle_order(fortress, tick);
+                        return vec![CommandEnvelope::new(
+                            self.house,
+                            at,
+                            Command::UnloadPassengers {
+                                transport_id: fortress,
+                            },
+                        )];
+                    }
+                }
+            }
+            if let Some(fortress_name) = opening.fortress
+                && !cargo_quotas.is_empty()
                 && let Some((fortress_id, fortress_entity)) =
                     sim.substrate.entities.iter_sorted().find(|(_, entity)| {
                         entity.owner() == self.house
@@ -3854,15 +4463,48 @@ impl SuperAi {
                     fortress_entity.position.rx() as i16,
                     fortress_entity.position.ry() as i16,
                 );
-                // The next boarder: the cargo mix's best candidate — anti-
-                // armor outranks anti-infantry, then nearest wins — among
-                // the idle, ungated infantry on foot. The hero never boards,
+                // The per-type quota (W7, retail 2 GGI + 2 E1 + 1 GHOST):
+                // what already rides plus what stands reserved counts
+                // against each type's seats, so the mix lands instead of
+                // the first anti-armor type filling the hold (the basic
+                // soldier never once boarded before).
+                let aboard: Vec<&str> = fortress_entity
+                    .passenger_role
+                    .cargo()
+                    .map(|cargo| {
+                        cargo
+                            .passengers()
+                            .iter()
+                            .filter_map(|&rider| sim.substrate.entities.get(rider))
+                            .map(|rider| sim.interner.resolve(rider.type_ref()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let reserved: Vec<&str> = self
+                    .boarders
+                    .iter()
+                    .filter_map(|&unit| sim.substrate.entities.get(unit))
+                    .map(|rider| sim.interner.resolve(rider.type_ref()))
+                    .collect();
+                let open_seats: Vec<(usize, &'static str)> = cargo_quotas
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(rank, &(name, quota))| {
+                        let taken = aboard.iter().filter(|&&n| n == name).count()
+                            + reserved.iter().filter(|&&n| n == name).count();
+                        (taken < quota).then_some((rank, name))
+                    })
+                    .collect();
+                // The next boarder: the quota's best open type — anti-
+                // armor outranks the rest, then nearest wins — among the
+                // idle, ungated infantry on foot. The hero never boards,
                 // and a pair past its attempt budget waits for the pool-back
                 // pass above.
                 let mut boarding: Option<(usize, u32, u64)> = None;
                 for (id, entity) in sim.substrate.entities.iter_sorted() {
                     let type_name = sim.interner.resolve(entity.type_ref());
-                    let Some(rank) = cargo_names.iter().position(|name| *name == type_name) else {
+                    let Some(&(rank, _)) = open_seats.iter().find(|(_, name)| *name == type_name)
+                    else {
                         continue;
                     };
                     if entity.owner() != self.house
@@ -4037,6 +4679,7 @@ impl SuperAi {
                 // MCV at the first site whose foundation stands legal. A
                 // wider loiter spent every attempt on ore (observed).
                 if dx.abs().max(dy.abs()) <= 1 {
+                    self.expansion_walk_since = None;
                     if tick >= self.next_expansion_deploy_tick {
                         let attempts = self.expansion_deploy_attempts.entry(mcv).or_insert(0);
                         if *attempts < EXPANSION_DEPLOY_ATTEMPTS {
@@ -4054,6 +4697,25 @@ impl SuperAi {
                         self.expansion_abandoned = true;
                     }
                 } else {
+                    // The walk's stuck window (W4): an MCV idle on the same
+                    // cell past [`MCV_STUCK_TICKS`] with its aim still far
+                    // is walking a site it cannot reach (one owner's MCV
+                    // walked ~100 cells into enemy ground and never
+                    // deployed). The latched site drops for a paced
+                    // re-survey — bounded by
+                    // [`EXPANSION_MAX_SITE_DISTANCE`] now — so the next aim
+                    // sits nearer home.
+                    let here = (entity.position.rx(), entity.position.ry());
+                    let stuck = self.expansion_walk_since.get_or_insert((here, tick));
+                    if stuck.0 != here {
+                        *stuck = (here, tick);
+                    } else if tick >= stuck.1 + MCV_STUCK_TICKS {
+                        self.expansion_walk_since = None;
+                        self.expansion_deploy_target = None;
+                        self.expansion2_site = None;
+                        self.survey_due = tick + SURVEY_RETRY_TICKS;
+                        return Vec::new();
+                    }
                     self.gate_idle_order(mcv, tick);
                     return vec![CommandEnvelope::new(
                         self.house,
@@ -4120,6 +4782,11 @@ impl SuperAi {
                     if self.futile(scout, FutilityKind::Scout, cell, tick) {
                         self.scout_blacklist.insert(cell);
                     } else {
+                        // The chain's own mark (W3): only dispatched scouts
+                        // are the rescue's exempt walkers — Yuri's scout is
+                        // the Initiate, and the old type test exempted
+                        // every Initiate in the army from the rescue.
+                        self.scout_chain.insert(scout);
                         self.gate_idle_order(scout, tick);
                         return vec![CommandEnvelope::new(
                             self.house,
@@ -4233,24 +4900,51 @@ impl SuperAi {
             return vec![CommandEnvelope::new(self.house, at, command)];
         }
 
-        // The stuck-unit rescue (Layer 3). The engine's own pathing burns
-        // out to an idle mission when a march exhausts, and no branch above
-        // re-orders a mission-less unit once its reorder gate has expired —
-        // a wave unit wedged against a wall stood there for the rest of the
-        // game. The scan runs on [`STUCK_SCAN_TICKS`]'s pace: every own
-        // combat unit stands in a cell-vs-snapshot map ([`Self::stuck_since`],
-        // the [`MCV_STUCK_TICKS`] window's shape), a unit still on its
-        // snapshot cell past [`STUCK_TIMEOUT`] draws one fresh AttackMove
-        // per scan — the wave's own destination read, the futility backoff
-        // pacing repeats — and units the walk no longer sees drop out of
-        // the map. Units parked on purpose (the guard posts' Guard stance,
-        // the ferry, the raids, the scouts, the reorder-gate cooldown)
-        // reset their window instead: not moving is what they were told
-        // to do.
-        if tick % STUCK_SCAN_TICKS == 0
-            && let Some(command) = self.stuck_rescue_orders(sim, rules, opening, tick)
-        {
-            return vec![CommandEnvelope::new(self.house, at, command)];
+        // The chrono engineer steal — Layer 3, the superweapon suite's S-B
+        // arm. A house holding the Chronosphere special (the Allied second
+        // super, or anyone's captured GACSPH) loads a ride with engineers,
+        // parks it on the sphere's pad and warps it beside the enemy
+        // conyard the tick the charge stands ready; the engineers walk in.
+        // The stage machine is the engineer raid's shape; see
+        // [`Self::chrono_steal_orders`]. The warp itself — both clicks,
+        // source and destination — rides the superweapon suite above, which
+        // reads this machine's staged pad.
+        let chrono = self.chrono_steal_orders(sim, rules, opening, home_center, tick);
+        if !chrono.is_empty() {
+            return chrono
+                .into_iter()
+                .map(|command| CommandEnvelope::new(self.house, at, command))
+                .collect();
+        }
+
+        // The stuck-unit rescue (Layer 3, reworked W3). The engine's own
+        // pathing burns out to an idle mission when a march exhausts, and
+        // no branch above re-orders a mission-less unit once its reorder
+        // gate has expired — a wave unit wedged against a wall stood there
+        // for the rest of the game. The scan is self-rescheduling
+        // (`rescue_due`): every own combat unit stands in a cell-vs-
+        // snapshot map ([`Self::stuck_since`], the [`MCV_STUCK_TICKS`]
+        // window's shape), a unit still on its snapshot cell past
+        // [`STUCK_TIMEOUT`] draws a fresh AttackMove per scan — the wave's
+        // own destination read, the futility backoff pacing repeats — up
+        // to [`RESCUE_BATCH`] of them per scan, in one pass (the sortie
+        // limb's multiple envelopes). A candidate whose aim or futility
+        // check fails keeps its snapshot and the next one takes the
+        // turn — the old limb popped its pick before the checks and lost
+        // the window on the first failure. Units the walk no longer sees
+        // drop out of the map. Units parked on purpose (the guard posts'
+        // Guard stance, the ferry, the raids, the chain's own scouts, the
+        // reorder-gate cooldown) reset their window instead: not moving is
+        // what they were told to do.
+        if tick >= self.rescue_due {
+            self.rescue_due = tick + STUCK_SCAN_TICKS;
+            let commands = self.stuck_rescue_orders(sim, rules, opening, tick);
+            if !commands.is_empty() {
+                return commands
+                    .into_iter()
+                    .map(|command| CommandEnvelope::new(self.house, at, command))
+                    .collect();
+            }
         }
 
         // Walk the build ladder while the building queue idles: the opening's
@@ -4800,42 +5494,43 @@ impl SuperAi {
             // feed another dock (two miners each). Every candidate
             // still passes its own cameo, so a limb the house cannot build
             // falls through to the next instead of wedging the queue.
-            if any_tank {
-                // The grid readings are the block's hoisted ones — the
-                // preemption's `output`, `drain` and `pending` above — so
-                // the deficit and margin rules below price the queue's
-                // unlanded drain in too.
-                let refineries = self.count_structures_of_type(sim, opening.refinery);
-                let factories = self.count_structures_of_type(sim, opening.war_factory);
-                let miners = opening
-                    .harvester
-                    .map(|miner| self.count_units_of_type(sim, miner))
-                    .unwrap_or(usize::MAX);
-                // The expansion growth (Layer 2): a second yard is a
-                // sub-base, not a monument. Before the house-wide growth
-                // array, the cluster around the expansion yard claims what
-                // it lacks — one power plant while its ring browns, one
-                // refinery while its ring holds no dock and the house-wide
-                // economy is one past its own cap — each routed to the
-                // expansion yard's rings by the placement intent. A ring
-                // scan that finds no legal site falls back home in the
-                // placement branch, and the strike/pause machinery paces
-                // the retry, so a refusing neighborhood can wedge neither
-                // the queue nor the chain.
-                if let Some(expansion) = expansion_center {
-                    let cluster_power = self.count_structures_of_type_near(
-                        sim,
-                        opening.power,
-                        expansion,
-                        BASE_CLUSTER_RADIUS,
-                    );
-                    let cluster_refineries = self.count_structures_of_type_near(
-                        sim,
-                        opening.refinery,
-                        expansion,
-                        BASE_CLUSTER_RADIUS,
-                    );
-                    if cluster_power < 1
+            // The grid readings are the block's hoisted ones — the
+            // preemption's `output`, `drain` and `pending` above — so
+            // the deficit and margin rules below price the queue's
+            // unlanded drain in too.
+            let refineries = self.count_structures_of_type(sim, opening.refinery);
+            let factories = self.count_structures_of_type(sim, opening.war_factory);
+            let miners = opening
+                .harvester
+                .map(|miner| self.count_units_of_type(sim, miner))
+                .unwrap_or(usize::MAX);
+            // The expansion growth (Layer 2): a second yard is a
+            // sub-base, not a monument. Before the house-wide growth
+            // array, the cluster around the outpost anchor (P1: the
+            // expansion yard once two stand, else the remote refinery's
+            // cell) claims what it lacks — one power plant while its ring
+            // browns, one refinery while its ring holds no dock and the
+            // house-wide economy is one past its own cap — each routed to
+            // the outpost's rings by the placement intent. The outpost's
+            // production buildings never fall back home at placement (P3,
+            // the router below); the strike/pause machinery paces their
+            // retry on a widened ring. The gate is the expansion standing
+            // (P7), not `any_tank`: a forward base with every tank dead
+            // must still raise the lines that rebuild them.
+            if let Some(expansion) = outpost_anchor {
+                let cluster_power = self.count_structures_of_type_near(
+                    sim,
+                    opening.power,
+                    expansion,
+                    BASE_CLUSTER_RADIUS,
+                );
+                let cluster_refineries = self.count_structures_of_type_near(
+                    sim,
+                    opening.refinery,
+                    expansion,
+                    BASE_CLUSTER_RADIUS,
+                );
+                if cluster_power < 1
                         && self.count_structures_of_type(sim, opening.power) < POWER_CAP
                         && let Some(ty) = rules.object(opening.power)
                         && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
@@ -4844,15 +5539,15 @@ impl SuperAi {
                         // The plant's retry gate — see the power
                         // preemption at the block's head.
                         && self.build_queue_retry_open(type_id, tick)
-                    {
-                        self.placement_intent = Some((type_id, true));
-                        return vec![CommandEnvelope::new(
-                            self.house,
-                            at,
-                            Command::QueueProduction { type_id },
-                        )];
-                    }
-                    if cluster_refineries < 1
+                {
+                    self.placement_intent = Some((type_id, true));
+                    return vec![CommandEnvelope::new(
+                        self.house,
+                        at,
+                        Command::QueueProduction { type_id },
+                    )];
+                }
+                if cluster_refineries < 1
                         && refineries < REFINERY_CAP + 1
                         && let Some(ty) = rules.object(opening.refinery)
                         && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
@@ -4861,46 +5556,46 @@ impl SuperAi {
                         // The dock's retry gate — see the power
                         // preemption at the block's head.
                         && self.build_queue_retry_open(type_id, tick)
-                    {
-                        self.placement_intent = Some((type_id, true));
-                        return vec![CommandEnvelope::new(
-                            self.house,
-                            at,
-                            Command::QueueProduction { type_id },
-                        )];
-                    }
-                    // The expansion's own production lines (Layer 2.6): a
-                    // sub-base fields its own army and miners. The house's
-                    // queues are shared, but a unit exits the factory that
-                    // builds it — without a barracks and a war factory in
-                    // the expansion's ring, every soldier and every miner
-                    // it is owed rolls out of the home base and walks the
-                    // whole map first (observed live: the expansion's
-                    // miners crossing two bridges to reach its dock). The
-                    // extra lines also pay the native MultipleFactory
-                    // speedup house-wide. Each is one per cluster, the
-                    // factory still inside the house-wide cap.
-                    let cluster_barracks = self.count_structures_of_type_near(
-                        sim,
-                        opening.barracks,
-                        expansion,
-                        BASE_CLUSTER_RADIUS,
-                    );
-                    let cluster_factories = self.count_structures_of_type_near(
-                        sim,
-                        opening.war_factory,
-                        expansion,
-                        BASE_CLUSTER_RADIUS,
-                    );
-                    // The house-wide bound is the loop breaker: a cluster
-                    // item whose expansion ring refuses every site falls
-                    // back home at placement, the cluster count near the
-                    // expansion stays at zero, and without a cap the rule
-                    // re-queues the same building forever (observed live:
-                    // a Yuri base that did nothing but chain barracks).
-                    // Two stands: the ladder's home barracks plus one more
-                    // wherever this rule's item landed; a razed one rebuilds.
-                    if cluster_barracks < 1
+                {
+                    self.placement_intent = Some((type_id, true));
+                    return vec![CommandEnvelope::new(
+                        self.house,
+                        at,
+                        Command::QueueProduction { type_id },
+                    )];
+                }
+                // The expansion's own production lines (Layer 2.6): a
+                // sub-base fields its own army and miners. The house's
+                // queues are shared, but a unit exits the factory that
+                // builds it — without a barracks and a war factory in
+                // the expansion's ring, every soldier and every miner
+                // it is owed rolls out of the home base and walks the
+                // whole map first (observed live: the expansion's
+                // miners crossing two bridges to reach its dock). The
+                // extra lines also pay the native MultipleFactory
+                // speedup house-wide. Each is one per cluster, the
+                // factory still inside the house-wide cap.
+                let cluster_barracks = self.count_structures_of_type_near(
+                    sim,
+                    opening.barracks,
+                    expansion,
+                    BASE_CLUSTER_RADIUS,
+                );
+                let cluster_factories = self.count_structures_of_type_near(
+                    sim,
+                    opening.war_factory,
+                    expansion,
+                    BASE_CLUSTER_RADIUS,
+                );
+                // The house-wide bound is the loop breaker: a cluster
+                // item whose expansion ring refuses every site falls
+                // back home at placement, the cluster count near the
+                // expansion stays at zero, and without a cap the rule
+                // re-queues the same building forever (observed live:
+                // a Yuri base that did nothing but chain barracks).
+                // Two stands: the ladder's home barracks plus one more
+                // wherever this rule's item landed; a razed one rebuilds.
+                if cluster_barracks < 1
                         && self.count_structures_of_type(sim, opening.barracks) < 2
                         && let Some(ty) = rules.object(opening.barracks)
                         && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
@@ -4909,16 +5604,21 @@ impl SuperAi {
                         // The barracks' retry gate — see the power
                         // preemption at the block's head.
                         && self.build_queue_retry_open(type_id, tick)
-                    {
-                        self.placement_intent = Some((type_id, true));
-                        return vec![CommandEnvelope::new(
-                            self.house,
-                            at,
-                            Command::QueueProduction { type_id },
-                        )];
-                    }
-                    if cluster_factories < 1
-                        && factories < FACTORY_CAP
+                {
+                    self.placement_intent = Some((type_id, true));
+                    return vec![CommandEnvelope::new(
+                        self.house,
+                        at,
+                        Command::QueueProduction { type_id },
+                    )];
+                }
+                // The reserved factory slot (P2): the house-wide growth
+                // array builds out to [`FACTORY_BUILDOUT`] and caps at
+                // [`FACTORY_CAP`] behind a deep wallet, so the outpost's
+                // line holds one slot past the cap — home growth can
+                // never consume the outpost's factory first.
+                if cluster_factories < 1
+                        && factories < FACTORY_CAP + 1
                         && let Some(ty) = rules.object(opening.war_factory)
                         && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
                             .enabled
@@ -4930,15 +5630,16 @@ impl SuperAi {
                         // re-filing every tick, and the primary wheel
                         // below gets its second carrier.
                         && self.build_queue_retry_open(type_id, tick)
-                    {
-                        self.placement_intent = Some((type_id, true));
-                        return vec![CommandEnvelope::new(
-                            self.house,
-                            at,
-                            Command::QueueProduction { type_id },
-                        )];
-                    }
+                {
+                    self.placement_intent = Some((type_id, true));
+                    return vec![CommandEnvelope::new(
+                        self.house,
+                        at,
+                        Command::QueueProduction { type_id },
+                    )];
                 }
+            }
+            if any_tank {
                 // The naval survey (Layer 2.7): the naval yard founds on a
                 // WaterSet tile inside the base's own build area, so before
                 // its rung may queue one the survey must latch a legal
@@ -5120,17 +5821,24 @@ impl SuperAi {
             }
         }
 
-        // Keep every war factory's rally around the yard nearest it so its
+        // Keep every war factory's rally around the anchor nearest it so its
         // output gathers at its own base instead of jamming the factory
         // exit or crossing the map — the expansion's factory used to aim
         // every tank at the first yard's ring, a march past its own front.
-        // Each factory keeps its own offset cell (its index in the
-        // substrate's stable order) around that nearest yard's center, so
-        // three factories don't funnel every tank onto one point. The
-        // command archives the cell per factory (`SetRallyPoint
+        // The anchor set is the standing yards plus the outpost anchor
+        // (P6), so a refinery-anchored outpost's factory rallies at the
+        // outpost. Each factory keeps its own offset cell (its index in the
+        // substrate's stable order) around that anchor, picked on the
+        // factory's exit side — the first rotated offset that lands at
+        // least three cells off the anchor, so the rally never sits on the
+        // crowded yard ring the engine refuses (and the 900-tick gate then
+        // parked) — so three factories don't funnel every tank onto one
+        // point. The command archives the cell per factory (`SetRallyPoint
         // 0x00443860`), so correcting whichever factory's archived cell
         // differs — one per tick — suffices for all of them.
-        if !yard_centers.is_empty() {
+        let rally_anchors: Vec<(i16, i16)> =
+            yard_centers.iter().copied().chain(outpost_anchor).collect();
+        if !rally_anchors.is_empty() {
             let war_factories: Vec<(u64, (i16, i16))> = self
                 .own_structures(sim)
                 .into_iter()
@@ -5148,8 +5856,13 @@ impl SuperAi {
                 .iter()
                 .enumerate()
                 .map(|(index, &(id, factory_cell))| {
-                    let center = rally_anchor(factory_cell, &yard_centers);
-                    let spread = SPREAD_OFFSETS[index % SPREAD_OFFSETS.len()];
+                    let center = rally_anchor(factory_cell, &rally_anchors);
+                    let spread = (0..SPREAD_OFFSETS.len())
+                        .map(|attempt| SPREAD_OFFSETS[(index + attempt) % SPREAD_OFFSETS.len()])
+                        .find(|spread| {
+                            i16::from(spread.0).abs().max(i16::from(spread.1).abs()) >= 3
+                        })
+                        .unwrap_or(SPREAD_OFFSETS[index % SPREAD_OFFSETS.len()]);
                     (
                         id,
                         on_map_cell(
@@ -5244,6 +5957,12 @@ impl SuperAi {
                     ty.cost,
                 ))
             && let Some(type_id) = sim.interner.get(name)
+            // The wing's own retry gate (W4): an airframe PRODUCE the busy
+            // factory silently refused re-filed every tick — 267 ORCA
+            // re-queues behind one airfield in the old replay, before the
+            // placed-only radar count fixed the commission half. The
+            // window paces it like every other quota's.
+            && self.build_queue_retry_open(type_id, tick)
         {
             return vec![CommandEnvelope::new(
                 self.house,
@@ -5291,7 +6010,7 @@ impl SuperAi {
                     .max((i32::from(pos.1) - i32::from(home.1)).abs())
             })
         });
-        let outpost_factory = expansion_center.and_then(|center| {
+        let outpost_factory = outpost_anchor.and_then(|center| {
             own_factories
                 .iter()
                 .copied()
@@ -5302,7 +6021,7 @@ impl SuperAi {
                         .max((i32::from(pos.1) - i32::from(center.1)).abs())
                 })
                 // The outpost line only exists once Layer 2.6's factory
-                // actually landed in the expansion's ring; two factories
+                // actually landed in the outpost's ring; two factories
                 // that both sit at home are no alternation.
                 .filter(|(_, pos)| {
                     (i32::from(pos.0) - i32::from(center.0))
@@ -5311,25 +6030,46 @@ impl SuperAi {
                         <= i32::from(BASE_CLUSTER_RADIUS)
                 })
         });
-        if let (Some((main_id, _)), Some((outpost_id, _))) = (main_factory, outpost_factory)
-            && self.vehicle_slots.saturating_sub(self.primary_toggle_mark)
-                >= PRIMARY_TOGGLE_EVERY_VEHICLES
-        {
-            // The carrier reads off the live primary flags. Neither
-            // flagged (a fresh pair the engine has not picked from yet)
-            // hands the toggle to the outpost, starting the alternation
-            // the flags then carry forward on their own.
-            let target = if sim.production.is_primary_factory(outpost_id) {
-                main_id
-            } else {
-                outpost_id
-            };
-            self.primary_toggle_mark = self.vehicle_slots;
-            return vec![CommandEnvelope::new(
-                self.house,
-                at,
-                Command::TogglePrimaryFactory { entity_id: target },
-            )];
+        if let (Some((main_id, _)), Some((outpost_id, _))) = (main_factory, outpost_factory) {
+            // The first-appearance latch (P4): a changed pair — the outpost
+            // line standing for the first time, a factory lost and
+            // replaced — hands the flag to the outpost that tick, instead
+            // of waiting out the slot odometer. Afterwards the alternation
+            // runs on the odometer OR the time arm
+            // ([`PRIMARY_TOGGLE_EVERY_TICKS`]): a quiet line must not pin
+            // the flag between vehicles. The demand arm (P5) holds the
+            // carrier at the outpost while its own guard ring stands short
+            // or the live wave's gather cell sits nearer the outpost than
+            // home — that is where the rollout fights — and the blind
+            // alternation stays the fallback.
+            let pair_changed = self.primary_pair != Some((main_id, outpost_id));
+            let odometer_due = self.vehicle_slots.saturating_sub(self.primary_toggle_mark)
+                >= PRIMARY_TOGGLE_EVERY_VEHICLES;
+            let time_due =
+                tick.saturating_sub(self.primary_last_toggle) >= PRIMARY_TOGGLE_EVERY_TICKS;
+            if pair_changed || odometer_due || time_due {
+                let demand = pair_changed
+                    || self.outpost_carrier_demand(sim, rules, outpost_factory.map(|(_, c)| c));
+                let target = if demand {
+                    outpost_id
+                } else if sim.production.is_primary_factory(outpost_id) {
+                    main_id
+                } else {
+                    outpost_id
+                };
+                self.primary_pair = Some((main_id, outpost_id));
+                self.primary_toggle_mark = self.vehicle_slots;
+                self.primary_last_toggle = tick;
+                // Only a nonprimary takes the toggle: the engine's PRIMARY
+                // event on the flagged factory turns the flag off.
+                if !sim.production.is_primary_factory(target) {
+                    return vec![CommandEnvelope::new(
+                        self.house,
+                        at,
+                        Command::TogglePrimaryFactory { entity_id: target },
+                    )];
+                }
+            }
         }
 
         // The war factory stands: keep its queue busy — the economy first
@@ -5515,18 +6255,16 @@ impl SuperAi {
             // before the tank core resumes. The quota rests the limb on
             // its own; the banked-credits gate below prices the hulls.
             Some(name)
-        } else if let Some(member) = self.wave_shortage(sim, opening, true)
-            && rules.object(member).is_some_and(|ty| {
-                crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
-                    == crate::sim::production::CanBuild::Yes
-            })
-        {
+        } else if let Some(member) = self.wave_shortage(sim, rules, opening, true) {
             // The wave's demand feed: a forming wave short of a core
             // armor member jumps the wheels — the composition is what the
             // cadence will march, and a specialist slot spent elsewhere
-            // launches a thinner wave. `can_build`, not the cameo — the
-            // country-lock lesson. The issue gates below (the busy queue,
-            // the floor's hold, the six-tenths bank) still price it.
+            // launches a thinner wave. The feed walks every short type
+            // (W2): a first short type the house cannot build no longer
+            // parks the whole feed for the form clock. `can_build`, not
+            // the cameo — the country-lock lesson. The issue gates below
+            // (the busy queue, the floor's hold, the six-tenths bank)
+            // still price it.
             Some(member)
         } else if self.vehicle_slots < CORE_BEFORE_SPECIALISTS as u32 {
             Some(core_tank)
@@ -5645,14 +6383,10 @@ impl SuperAi {
             // occupier (the GI, the Conscript, the Initiate), so the
             // bunker and civilian deficits are its queue.
             Some(opening.basic_infantry)
-        } else if let Some(member) = self.wave_shortage(sim, opening, false)
-            && rules.object(member).is_some_and(|ty| {
-                crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
-                    == crate::sim::production::CanBuild::Yes
-            })
-        {
+        } else if let Some(member) = self.wave_shortage(sim, rules, opening, false) {
             // The wave's demand feed, the foot half: the composition the
-            // cadence will march queues ahead of the wheel.
+            // cadence will march queues ahead of the wheel, every short
+            // buildable type in turn (W2).
             Some(member)
         } else if self.infantry_slots < CORE_BEFORE_SPECIALISTS as u32 {
             Some(opening.basic_infantry)
@@ -5834,7 +6568,12 @@ impl SuperAi {
             for rx in 0..grid.width() {
                 let (cx, cy) = (rx as i16, ry as i16);
                 let distance = (cx - from.0).abs().max((cy - from.1).abs());
-                if distance < EXPANSION_MIN_DISTANCE {
+                // The site bound (W4): nearer than the expansion distance
+                // is home's own field, further than
+                // [`EXPANSION_MAX_SITE_DISTANCE`] is a death walk — one
+                // owner's MCV walked ~100 cells into enemy ground and
+                // never deployed.
+                if distance < EXPANSION_MIN_DISTANCE || distance > EXPANSION_MAX_SITE_DISTANCE {
                     continue;
                 }
                 if exclude.is_some_and(|(ex, ey)| {
@@ -6210,9 +6949,11 @@ impl SuperAi {
         // The re-point: a bound engineer whose click the command layer
         // dropped stands idle again, his building still latched to him —
         // he walks at it again, the bridge limb's re-issue rule paced by
-        // this window instead of its retry clock. Entity order, never the
+        // this window instead of its retry clock, and the futility backoff
+        // (W3) retires a re-send that keeps landing him on the same cell
+        // instead of spending every window on it. Entity order, never the
         // bound map's: the determinism contract.
-        if let Some((engineer, target)) =
+        if let Some((engineer, target, from)) =
             sim.substrate
                 .entities
                 .iter_sorted()
@@ -6222,6 +6963,7 @@ impl SuperAi {
                         && entity.lifecycle.object_alive()
                         && !entity.lifecycle.in_limbo()
                         && self.order_gate.get(&id).is_none_or(|&due| tick >= due)
+                        && !self.futility_suppressed(id, FutilityKind::Capture, tick)
                         && matches!(
                             entity.passive_acquire_mission(),
                             crate::sim::mission::MissionType::None
@@ -6229,8 +6971,13 @@ impl SuperAi {
                                 | crate::sim::mission::MissionType::Guard
                                 | crate::sim::mission::MissionType::AreaGuard
                         ))
-                    .then_some((id, target))
+                    .then_some((
+                        id,
+                        target,
+                        (entity.position.rx(), entity.position.ry()),
+                    ))
                 })
+            && !self.futile(engineer, FutilityKind::Capture, from, tick)
         {
             self.gate_idle_order(engineer, tick);
             return Some(Command::CaptureBuilding {
@@ -6239,12 +6986,19 @@ impl SuperAi {
             });
         }
 
-        // The survey: the nearest revealed neutral tech building, oil
-        // derrick first. The neutral owner is a passive house (the same
+        // The survey: the nearest revealed neutral tech building, the
+        // airport first. The neutral owner is a passive house (the same
         // reading the spy's scan makes); anything a combatant holds is not
         // this chain's errand. A building latched to a live walker, or
         // resting after one fell short of it, is not a candidate — one
-        // engineer per building.
+        // engineer per building — and nor is one the engineer's ground
+        // rows cannot connect to from home (W3): the old survey latched a
+        // derrick across a breach and the walker died pacing the shore.
+        let foot_zone = rules
+            .object(opening.engineer)
+            .map(|ty| ty.movement_zone)
+            .unwrap_or_default();
+        let home_cell = (home.0.max(0) as u16, home.1.max(0) as u16);
         let mut best: Option<(usize, i32, u64)> = None;
         for (id, entity) in sim.substrate.entities.iter_sorted() {
             if entity.category() != crate::map::entities::EntityCategory::Structure
@@ -6268,6 +7022,12 @@ impl SuperAi {
                     .is_cell_revealed(self.house, entity.position.rx(), entity.position.ry())
                 || self.capture_bound.values().any(|&latched| latched == id)
                 || self.capture_retry.contains_key(&id)
+                || !zones_connected(
+                    sim,
+                    foot_zone,
+                    home_cell,
+                    (entity.position.rx(), entity.position.ry()),
+                )
             {
                 continue;
             }
@@ -6283,29 +7043,48 @@ impl SuperAi {
         let Some((_, _, target)) = best else {
             return None;
         };
+        let target_cell = sim
+            .substrate
+            .entities
+            .get(target)
+            .map(|entity| (entity.position.rx(), entity.position.ry()))?;
 
         // The dispatch: an idle engineer free of every other chain — and of
-        // this one's own latches (a bound walker keeps his building).
-        if let Some((engineer, _)) = sim.substrate.entities.iter_sorted().find(|(id, entity)| {
-            entity.owner() == self.house
-                && entity.category() == crate::map::entities::EntityCategory::Infantry
-                && sim.interner.resolve(entity.type_ref()) == opening.engineer
-                && entity.lifecycle.object_alive()
-                && !entity.lifecycle.in_limbo()
-                && !self.capture_bound.contains_key(id)
-                && self.bridge_engineer != Some(*id)
-                && !self.boarders.contains(id)
-                && !self.raiders.contains(id)
-                && !self.raid_involves(*id)
-                && self.order_gate.get(id).is_none_or(|&due| tick >= due)
-                && matches!(
-                    entity.passive_acquire_mission(),
-                    crate::sim::mission::MissionType::None
-                        | crate::sim::mission::MissionType::Sleep
-                        | crate::sim::mission::MissionType::Guard
-                        | crate::sim::mission::MissionType::AreaGuard
-                )
-        }) {
+        // this one's own latches (a bound walker keeps his building) —
+        // whose own rows connect to the building (W3).
+        if let Some((engineer, from)) = sim
+            .substrate
+            .entities
+            .iter_sorted()
+            .find(|(id, entity)| {
+                entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Infantry
+                    && sim.interner.resolve(entity.type_ref()) == opening.engineer
+                    && entity.lifecycle.object_alive()
+                    && !entity.lifecycle.in_limbo()
+                    && !self.capture_bound.contains_key(id)
+                    && self.bridge_engineer != Some(*id)
+                    && !self.boarders.contains(id)
+                    && !self.raiders.contains(id)
+                    && !self.raid_involves(*id)
+                    && self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                    && matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    )
+                    && zones_connected(
+                        sim,
+                        foot_zone,
+                        (entity.position.rx(), entity.position.ry()),
+                        target_cell,
+                    )
+            })
+            .map(|(id, entity)| (id, (entity.position.rx(), entity.position.ry())))
+            && !self.futile(engineer, FutilityKind::Capture, from, tick)
+        {
             self.capture_bound.insert(engineer, target);
             self.gate_idle_order(engineer, tick);
             return Some(Command::CaptureBuilding {
@@ -6330,17 +7109,23 @@ impl SuperAi {
         Some(Command::QueueProduction { type_id })
     }
 
-    /// Whether the live raid cycle leans on this entity: the wave pool and
-    /// the capture dispatch keep their hands off both actors while the
-    /// stage machine owns them.
+    /// Whether a live raid cycle — the engineer ride's or the chrono
+    /// steal's — leans on this entity: the wave pool and the capture
+    /// dispatch keep their hands off the actors while a stage machine owns
+    /// them.
     fn raid_involves(&self, unit: u64) -> bool {
         self.raid_stage
+            .as_ref()
             .is_some_and(|raid| raid.actors().contains(&unit))
+            || self
+                .chrono_steal
+                .as_ref()
+                .is_some_and(|steal| steal.actors().contains(&unit))
     }
 
     /// Tear the live raid cycle down and arm the cooldown: the terminal of
-    /// every failure (a lost actor, a wedged leg) and of the success alike —
-    /// the consumed engineer clears the stage the same way a dead one does.
+    /// every failure (a lost ride, a wedged leg) and of the success alike —
+    /// the consumed engineers clear the stage the same way dead ones do.
     fn end_engineer_raid(&mut self, tick: u32) {
         self.raid_stage = None;
         self.raid_cooldown_until = tick + RAID_COOLDOWN_TICKS;
@@ -6351,12 +7136,14 @@ impl SuperAi {
     /// marches every tick — each leg is one command wide and the order gate
     /// paces the re-issues — while arming a fresh cycle is the paced half:
     /// once per window, behind the cooldown, the wallet bar
-    /// ([`RAID_WALLET_CREDITS`]) and a buildable ride, it secures the pair
-    /// (an idle engineer and an idle ride on hand, or one commissioned per
-    /// window, queue dedup included) and latches
+    /// ([`RAID_WALLET_CREDITS`]) and a buildable ride, it secures the crew
+    /// (the idle engineers on hand up to the ride's seats — three at most
+    /// (W7) — plus, when the enemy conyard stands, the Soviet suicide
+    /// payload in the seats left; one engineer commissioned per window
+    /// when none stands, queue dedup included) and latches
     /// [`EngineerRaid::Boarding`]. Every stage is bounded by
-    /// [`RAID_STAGE_TIMEOUT_TICKS`] and every lost actor tears the cycle
-    /// into the cooldown; Yuri's side keeps `None` in
+    /// [`RAID_STAGE_TIMEOUT_TICKS`] and a lost ride or last engineer tears
+    /// the cycle into the cooldown; Yuri's side keeps `None` in
     /// `Opening::engineer_ride` and never gets here.
     fn engineer_raid_orders(
         &mut self,
@@ -6368,7 +7155,7 @@ impl SuperAi {
         let ride_name = opening.engineer_ride?;
         // The stage machine first — an armed cycle marches whatever the
         // wallet does afterwards.
-        if let Some(stage) = self.raid_stage {
+        if let Some(stage) = self.raid_stage.clone() {
             return self.engineer_raid_stage(sim, stage, tick);
         }
         if tick < self.raid_cooldown_until || tick < self.raid_arm_due {
@@ -6392,20 +7179,42 @@ impl SuperAi {
         {
             return None;
         }
-        // Secure the pair: idle units first — the same idle reading every
+        // Secure the crew: idle units first — the same idle reading every
         // dispatch makes, each actor free of the other chains — else one
-        // commission per window (the queue dedup is the pacing when both
-        // are missing). The engineer commission honors the side-wide stock
-        // cap: the capture chain and this one draw the same well.
-        let engineer = self.find_raid_engineer(sim, opening, tick);
+        // engineer commission per window (the queue dedup is the pacing
+        // when both are missing). The engineer commission honors the
+        // side-wide stock cap: the capture chain and this one draw the same
+        // well.
         let ride = self.find_raid_ride(sim, ride_name, tick);
-        match (engineer, ride) {
-            (Some(engineer), Some(ride)) => {
-                self.raid_stage = Some(EngineerRaid::Boarding { engineer, ride });
+        let seats = ride
+            .and_then(|id| sim.substrate.entities.get(id))
+            .and_then(|entity| entity.passenger_role.cargo().map(|cargo| cargo.capacity()))
+            .unwrap_or(1)
+            .max(1);
+        let engineers = self.find_raid_engineers(sim, opening, tick, seats.min(3) as usize);
+        match (engineers.is_empty(), ride) {
+            (false, Some(ride)) => {
+                // The payload (W7): with the enemy conyard standing, the
+                // seats past the engineers take the suicide raiders — they
+                // unload beside it and do their thing.
+                let payload = if self.enemy_conyard_stands(sim) {
+                    self.find_raid_payload(
+                        sim,
+                        tick,
+                        (seats as usize).saturating_sub(engineers.len()),
+                    )
+                } else {
+                    Vec::new()
+                };
+                self.raid_stage = Some(EngineerRaid::Boarding {
+                    engineers,
+                    payload,
+                    ride,
+                });
                 self.raid_stage_since = tick;
                 None
             }
-            (None, _) => {
+            (true, _) => {
                 let (standing, queued) = self.engineer_stock(sim, rules, opening);
                 if queued > 0 || standing + queued >= CAPTURE_ENGINEER_STOCK {
                     // One engineer already in the pipe serves whichever chain
@@ -6415,7 +7224,7 @@ impl SuperAi {
                 self.engineer_commission_type(sim, rules, opening)
                     .map(|type_id| Command::QueueProduction { type_id })
             }
-            (_, None) => {
+            (false, None) => {
                 // The ride's queue dedup is this arm's pacing: a ride in the
                 // pipe is the raid's already; another would pile up every
                 // window the field's stay busy.
@@ -6432,19 +7241,56 @@ impl SuperAi {
         }
     }
 
-    /// An idle engineer free of every other chain, for the raid's arming
-    /// half — the capture dispatch's reading minus the bound set (a bound
-    /// engineer is the neutral-tech chain's own).
-    fn find_raid_engineer(
+    /// Whether any enemy construction yard stands revealed — the suicide
+    /// payload's and the chrono steal's arming condition.
+    fn enemy_conyard_stands(&self, sim: &crate::sim::world::Simulation) -> bool {
+        self.enemy_conyard(sim, None).is_some()
+    }
+
+    /// The enemy construction yard nearest `from` (any when `None`), with
+    /// its cell: the raids' prize.
+    fn enemy_conyard(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        from: Option<(i16, i16)>,
+    ) -> Option<(u64, (i16, i16))> {
+        let mut best: Option<(i32, u64, (i16, i16))> = None;
+        for (id, entity) in sim.substrate.entities.iter_sorted() {
+            if entity.category() != crate::map::entities::EntityCategory::Structure
+                || entity.lifecycle.in_limbo()
+                || !entity.lifecycle.object_alive()
+                || !self.is_enemy(sim, entity.owner())
+                || !CONYARD_TYPES.contains(&sim.interner.resolve(entity.type_ref()))
+            {
+                continue;
+            }
+            let cell = (entity.position.rx() as i16, entity.position.ry() as i16);
+            let distance = from.map_or(0, |at| {
+                (i32::from(cell.0) - i32::from(at.0))
+                    .abs()
+                    .max((i32::from(cell.1) - i32::from(at.1)).abs())
+            });
+            if best.is_none_or(|(kept, _, _)| distance < kept) {
+                best = Some((distance, id, cell));
+            }
+        }
+        best.map(|(_, id, cell)| (id, cell))
+    }
+
+    /// Up to `count` idle engineers free of every other chain, for the
+    /// raid's arming half — the capture dispatch's reading minus the bound
+    /// set (a bound engineer is the neutral-tech chain's own).
+    fn find_raid_engineers(
         &self,
         sim: &crate::sim::world::Simulation,
         opening: &Opening,
         tick: u32,
-    ) -> Option<u64> {
+        count: usize,
+    ) -> Vec<u64> {
         sim.substrate
             .entities
             .iter_sorted()
-            .find(|(id, entity)| {
+            .filter(|(id, entity)| {
                 entity.owner() == self.house
                     && entity.category() == crate::map::entities::EntityCategory::Infantry
                     && sim.interner.resolve(entity.type_ref()) == opening.engineer
@@ -6454,6 +7300,7 @@ impl SuperAi {
                     && self.bridge_engineer != Some(*id)
                     && !self.boarders.contains(id)
                     && !self.raiders.contains(id)
+                    && !self.raid_involves(*id)
                     && self.order_gate.get(id).is_none_or(|&due| tick >= due)
                     && matches!(
                         entity.passive_acquire_mission(),
@@ -6464,6 +7311,49 @@ impl SuperAi {
                     )
             })
             .map(|(id, _)| id)
+            .take(count)
+            .collect()
+    }
+
+    /// Up to `count` idle suicide raiders ([`SUICIDE_RAIDER_TYPES`]) free
+    /// of every other chain, for the ride's spare seats.
+    fn find_raid_payload(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        tick: u32,
+        count: usize,
+    ) -> Vec<u64> {
+        if count == 0 {
+            return Vec::new();
+        }
+        sim.substrate
+            .entities
+            .iter_sorted()
+            .filter(|(id, entity)| {
+                entity.owner() == self.house
+                    && matches!(
+                        entity.category(),
+                        crate::map::entities::EntityCategory::Unit
+                            | crate::map::entities::EntityCategory::Infantry
+                    )
+                    && SUICIDE_RAIDER_TYPES.contains(&sim.interner.resolve(entity.type_ref()))
+                    && entity.lifecycle.object_alive()
+                    && !entity.lifecycle.in_limbo()
+                    && !self.boarders.contains(id)
+                    && !self.raiders.contains(id)
+                    && !self.raid_involves(*id)
+                    && self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                    && matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    )
+            })
+            .map(|(id, _)| id)
+            .take(count)
+            .collect()
     }
 
     /// An idle ride free of every other chain, for the raid's arming half.
@@ -6509,31 +7399,64 @@ impl SuperAi {
             self.end_engineer_raid(tick);
             return None;
         }
-        // Liveness: any lost actor ends the cycle — the consumed engineer is
-        // the capture's success, the dead one its failure; the engine does
-        // not tell them apart and the cooldown does not care.
-        if stage.actors().into_iter().any(|actor| {
-            sim.substrate.entities.get(actor).is_none_or(|entity| {
-                entity.owner() != self.house || !entity.lifecycle.object_alive()
+        // Liveness: a lost ride, or the last engineer gone, ends the cycle
+        // — the consumed engineer is the capture's success, the dead one
+        // its failure; the engine does not tell them apart and the cooldown
+        // does not care. A lost payload piece or spare engineer merely
+        // leaves the crew.
+        let alive = |actor: u64| {
+            sim.substrate.entities.get(actor).is_some_and(|entity| {
+                entity.owner() == self.house && entity.lifecycle.object_alive()
             })
-        }) {
+        };
+        if stage.ride().is_some_and(|ride| !alive(ride)) {
             self.end_engineer_raid(tick);
             return None;
         }
+        let idle = |actor: u64| {
+            sim.substrate.entities.get(actor).is_some_and(|entity| {
+                matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                )
+            })
+        };
         match stage {
-            EngineerRaid::Boarding { engineer, ride } => {
-                let aboard = sim.substrate.entities.get(ride).is_some_and(|entity| {
-                    entity
-                        .passenger_role
-                        .cargo()
-                        .is_some_and(|cargo| cargo.passengers().contains(&engineer))
-                });
-                if aboard {
+            EngineerRaid::Boarding {
+                engineers,
+                payload,
+                ride,
+            } => {
+                let engineers: Vec<u64> = engineers.into_iter().filter(|&id| alive(id)).collect();
+                let payload: Vec<u64> = payload.into_iter().filter(|&id| alive(id)).collect();
+                if engineers.is_empty() {
+                    self.end_engineer_raid(tick);
+                    return None;
+                }
+                let aboard = |actor: u64| {
+                    sim.substrate.entities.get(ride).is_some_and(|entity| {
+                        entity
+                            .passenger_role
+                            .cargo()
+                            .is_some_and(|cargo| cargo.passengers().contains(&actor))
+                    })
+                };
+                let pending: Vec<u64> = engineers
+                    .iter()
+                    .chain(payload.iter())
+                    .copied()
+                    .filter(|&actor| !aboard(actor))
+                    .collect();
+                if pending.is_empty() {
                     // Latch the raid's aim now, zone-gated from the ride's
-                    // own cell: the first enemy priority structure the
-                    // ground rows still connect to. None reachable yet —
-                    // more scouting may open one — costs this tick only,
-                    // the stage clock bounds the wait.
+                    // own cell: the enemy conyard first (W6's ranking), then
+                    // the first enemy priority structure the ground rows
+                    // still connect to. None reachable yet — more scouting
+                    // may open one — costs this tick only, the stage clock
+                    // bounds the wait.
                     let Some(ride_entity) = sim.substrate.entities.get(ride) else {
                         return None;
                     };
@@ -6554,7 +7477,8 @@ impl SuperAi {
                         });
                     if let Some((target, _)) = target {
                         self.raid_stage = Some(EngineerRaid::Sailing {
-                            engineer,
+                            engineers,
+                            payload,
                             ride,
                             target,
                         });
@@ -6562,39 +7486,22 @@ impl SuperAi {
                     }
                     return None;
                 }
-                // The Enter walk: re-issued only when both stand idle again
-                // (a dropped order, a refused Enter), gate-paced.
-                let both_idle = sim
-                    .substrate
-                    .entities
-                    .get(engineer)
-                    .and_then(|engineer_entity| {
-                        sim.substrate.entities.get(ride).map(|ride_entity| {
-                            matches!(
-                                engineer_entity.passive_acquire_mission(),
-                                crate::sim::mission::MissionType::None
-                                    | crate::sim::mission::MissionType::Sleep
-                                    | crate::sim::mission::MissionType::Guard
-                                    | crate::sim::mission::MissionType::AreaGuard
-                            ) && matches!(
-                                ride_entity.passive_acquire_mission(),
-                                crate::sim::mission::MissionType::None
-                                    | crate::sim::mission::MissionType::Sleep
-                                    | crate::sim::mission::MissionType::Guard
-                                    | crate::sim::mission::MissionType::AreaGuard
-                            )
-                        })
+                self.raid_stage = Some(EngineerRaid::Boarding {
+                    engineers,
+                    payload,
+                    ride,
+                });
+                // The Enter walk: one actor per window, re-issued only when
+                // he and the ride stand idle again (a dropped order, a
+                // refused Enter), gate-paced.
+                if idle(ride)
+                    && let Some(actor) = pending.into_iter().find(|&actor| {
+                        idle(actor) && self.order_gate.get(&actor).is_none_or(|&due| tick >= due)
                     })
-                    .unwrap_or(false);
-                if both_idle
-                    && self
-                        .order_gate
-                        .get(&engineer)
-                        .is_none_or(|&due| tick >= due)
                 {
-                    self.gate_idle_order(engineer, tick);
+                    self.gate_idle_order(actor, tick);
                     return Some(Command::clicked_mission(
-                        engineer,
+                        actor,
                         crate::sim::mission::MissionType::Enter,
                         crate::sim::combat::TargetKind::Entity(ride),
                     ));
@@ -6602,7 +7509,8 @@ impl SuperAi {
                 None
             }
             EngineerRaid::Sailing {
-                engineer,
+                engineers,
+                payload,
                 ride,
                 target,
             } => {
@@ -6622,10 +7530,11 @@ impl SuperAi {
                     ride_entity.position.rx() as i16,
                     ride_entity.position.ry() as i16,
                 );
-                let distance = i32::from((at.0 - aim.0).abs().max(at.1 - aim.1).max(0));
+                let distance = i32::from((at.0 - aim.0).abs().max((at.1 - aim.1).abs()));
                 if distance <= RAID_ARRIVAL_DISTANCE {
                     self.raid_stage = Some(EngineerRaid::Unloading {
-                        engineer,
+                        engineers,
+                        payload,
                         ride,
                         target,
                     });
@@ -6636,14 +7545,7 @@ impl SuperAi {
                 // interrupted, or the arrival it managed fell short — and
                 // the order gate lets it (a dropped order waits its gate,
                 // never a per-tick churn).
-                if matches!(
-                    ride_entity.passive_acquire_mission(),
-                    crate::sim::mission::MissionType::None
-                        | crate::sim::mission::MissionType::Sleep
-                        | crate::sim::mission::MissionType::Guard
-                        | crate::sim::mission::MissionType::AreaGuard
-                ) && self.order_gate.get(&ride).is_none_or(|&due| tick >= due)
-                {
+                if idle(ride) && self.order_gate.get(&ride).is_none_or(|&due| tick >= due) {
                     self.gate_idle_order(ride, tick);
                     return Some(Command::AttackMove {
                         entity_id: ride,
@@ -6657,44 +7559,46 @@ impl SuperAi {
                 None
             }
             EngineerRaid::Unloading {
-                engineer,
+                engineers,
+                payload,
                 ride,
                 target,
             } => {
-                // The hold's discharge delay: the engineer rides in limbo a
-                // beat after the unload before he stands on foot again —
+                // The hold's discharge delay: the crew rides in limbo a
+                // beat after the unload before it stands on foot again —
                 // poll until then, the stage clock bounding the wait.
-                let on_foot = sim.substrate.entities.get(engineer).is_some_and(|entity| {
-                    entity.owner() == self.house
-                        && entity.lifecycle.object_alive()
-                        && !entity.lifecycle.in_limbo()
-                });
-                if on_foot {
-                    self.raid_stage = Some(EngineerRaid::Capturing { engineer, target });
+                let on_foot = |actor: u64| {
+                    sim.substrate.entities.get(actor).is_some_and(|entity| {
+                        entity.owner() == self.house
+                            && entity.lifecycle.object_alive()
+                            && !entity.lifecycle.in_limbo()
+                    })
+                };
+                if engineers.iter().any(|&actor| on_foot(actor)) {
+                    self.raid_stage = Some(EngineerRaid::Capturing {
+                        engineers,
+                        payload,
+                        target,
+                    });
                     self.raid_stage_since = tick;
                     return None;
                 }
                 // Still aboard: the unload goes out when the ride stands
                 // still (the arrival leg's own stop, or a refused attempt's
                 // idle again), gate-paced like every re-issue.
-                let ride_idle = sim.substrate.entities.get(ride).is_some_and(|entity| {
-                    matches!(
-                        entity.passive_acquire_mission(),
-                        crate::sim::mission::MissionType::None
-                            | crate::sim::mission::MissionType::Sleep
-                            | crate::sim::mission::MissionType::Guard
-                            | crate::sim::mission::MissionType::AreaGuard
-                    )
-                });
-                if ride_idle && self.order_gate.get(&ride).is_none_or(|&due| tick >= due) {
+                if idle(ride) && self.order_gate.get(&ride).is_none_or(|&due| tick >= due) {
                     self.gate_idle_order(ride, tick);
                     return Some(Command::UnloadPassengers { transport_id: ride });
                 }
                 None
             }
-            EngineerRaid::Capturing { engineer, target } => {
+            EngineerRaid::Capturing {
+                engineers,
+                payload,
+                target,
+            } => {
                 // The aim still standing is the point: razed mid-walk, the
-                // click is void and the engineer walks home.
+                // click is void and the crew walks home.
                 let target_stands = sim
                     .substrate
                     .entities
@@ -6704,25 +7608,61 @@ impl SuperAi {
                     self.end_engineer_raid(tick);
                     return None;
                 }
-                // The capture click: re-issued only when the engineer stands
-                // idle again (the dropped order), gate-paced like the rest.
-                if sim.substrate.entities.get(engineer).is_some_and(|entity| {
-                    matches!(
-                        entity.passive_acquire_mission(),
-                        crate::sim::mission::MissionType::None
-                            | crate::sim::mission::MissionType::Sleep
-                            | crate::sim::mission::MissionType::Guard
-                            | crate::sim::mission::MissionType::AreaGuard
-                    )
-                }) && self
-                    .order_gate
-                    .get(&engineer)
-                    .is_none_or(|&due| tick >= due)
-                {
+                let engineers: Vec<u64> = engineers.into_iter().filter(|&id| alive(id)).collect();
+                let payload: Vec<u64> = payload.into_iter().filter(|&id| alive(id)).collect();
+                if engineers.is_empty() && payload.is_empty() {
+                    self.end_engineer_raid(tick);
+                    return None;
+                }
+                self.raid_stage = Some(EngineerRaid::Capturing {
+                    engineers: engineers.clone(),
+                    payload: payload.clone(),
+                    target,
+                });
+                // The capture clicks: the first engineer takes the target,
+                // the spares the next-ranked structures (the war factory,
+                // the lab — the priority list's order from the target's
+                // own cell); each re-issued only when he stands idle again
+                // (the dropped order), gate-paced like the rest.
+                let spares: Vec<(u64, (i16, i16))> = self
+                    .enemy_priority_targets(sim)
+                    .into_iter()
+                    .filter(|&(id, _)| id != target)
+                    .collect();
+                for (index, &engineer) in engineers.iter().enumerate() {
+                    if !idle(engineer)
+                        || self
+                            .order_gate
+                            .get(&engineer)
+                            .is_some_and(|&due| tick < due)
+                    {
+                        continue;
+                    }
+                    let aim = if index == 0 {
+                        Some(target)
+                    } else {
+                        spares.get(index - 1).map(|&(id, _)| id)
+                    };
+                    let Some(aim) = aim else {
+                        continue;
+                    };
                     self.gate_idle_order(engineer, tick);
                     return Some(Command::CaptureBuilding {
                         engineer_id: engineer,
-                        target_building_id: target,
+                        target_building_id: aim,
+                    });
+                }
+                // The payload does its thing: an Attack on the target —
+                // Ivan's is the bomb attach, the drone's and the truck's the
+                // run in.
+                for &piece in &payload {
+                    if !idle(piece) || self.order_gate.get(&piece).is_some_and(|&due| tick < due) {
+                        continue;
+                    }
+                    self.gate_idle_order(piece, tick);
+                    return Some(Command::Attack {
+                        attacker_id: piece,
+                        target_id: target,
                     });
                 }
                 None
@@ -6811,15 +7751,31 @@ impl SuperAi {
         // idle boarding candidate takes the Enter order before anything
         // sails, so a loading transport waits for its pool instead of
         // ferrying one soldier at a time. The pool is the barracks line
-        // (the core soldier plus the infantry roster): the hero never
-        // boards, the dedicated scout pair stays on its chain (Yuri's
-        // initiate both scouts and boards — the same soldier), and the
-        // fortress's reserved cargo and live raiders stay out.
+        // (the core soldier plus the infantry roster): the dedicated scout
+        // pair stays on its chain (Yuri's initiate both scouts and boards —
+        // the same soldier), and the fortress's reserved cargo and live
+        // raiders stay out. The hero boards too (W7) — but only a `C4=`
+        // carrier whose priority targets are zone-cut from home: the ferry
+        // is his only road across, and his own limb plants the charge once
+        // he lands on the far shore.
         let near_home = home_distance < i32::from(FERRY_DISCHARGE_DISTANCE) && !enemy_side;
         if has_seats && near_home {
             let mut pool: Vec<&'static str> = opening.infantry.iter().map(|e| e.name).collect();
             pool.push(opening.basic_infantry);
             let scout_reserved = opening.scout != opening.basic_infantry;
+            let home_cell = (home.0.max(0) as u16, home.1.max(0) as u16);
+            let hero_rides = rules.object(opening.hero).is_some_and(|ty| ty.c4)
+                && self.enemy_priority_targets(sim).iter().any(|&(_, cell)| {
+                    !zones_connected(
+                        sim,
+                        crate::rules::locomotor_type::MovementZone::Normal,
+                        home_cell,
+                        (cell.0.max(0) as u16, cell.1.max(0) as u16),
+                    )
+                });
+            if hero_rides {
+                pool.push(opening.hero);
+            }
             let mut best: Option<(i32, u64)> = None;
             for (id, candidate) in sim.substrate.entities.iter_sorted() {
                 let type_name = sim.interner.resolve(candidate.type_ref());
@@ -6827,7 +7783,7 @@ impl SuperAi {
                     || candidate.owner() != self.house
                     || candidate.category() != crate::map::entities::EntityCategory::Infantry
                     || candidate.lifecycle.in_limbo()
-                    || type_name == opening.hero
+                    || (type_name == opening.hero && !hero_rides)
                     || (scout_reserved && type_name == opening.scout)
                     || self.boarders.contains(&id)
                     || self.raiders.contains(&id)
@@ -6937,8 +7893,14 @@ impl SuperAi {
         None
     }
 
-    /// The house's structures as `(entity id, type name)` pairs, in the
-    /// substrate's stable order.
+    /// The house's placed structures as `(entity id, type name)` pairs, in
+    /// the substrate's stable order. Placed only (W4): a building still in
+    /// the factory — queued, building, or ready and unplaced — sits in
+    /// limbo, and counting it stood the whole chain on buildings that did
+    /// not exist yet (observed: an airfield queued at 4619 lit the jet
+    /// commission 271 ticks before it landed and the wing re-queued 267
+    /// times; a fortress Enter clicked one tick after the fortress was
+    /// queued; rally points set 600 ticks before the first factory).
     fn own_structures(&self, sim: &crate::sim::world::Simulation) -> Vec<(u64, String)> {
         sim.substrate
             .entities
@@ -6946,6 +7908,7 @@ impl SuperAi {
             .filter(|(_, entity)| {
                 entity.owner() == self.house
                     && entity.category() == crate::map::entities::EntityCategory::Structure
+                    && !entity.lifecycle.in_limbo()
             })
             .filter_map(|(id, entity)| {
                 Some((id, sim.interner.resolve(entity.type_ref()).to_string()))
@@ -7011,8 +7974,11 @@ impl SuperAi {
         if self.census_tick != self.now_tick {
             self.census_counts.clear();
             for (_, entity) in sim.substrate.entities.iter_sorted() {
+                // Placed only (W4), the `own_structures` reading: a
+                // building still in the factory is no rung climbed.
                 if entity.owner() == self.house
                     && entity.category() == crate::map::entities::EntityCategory::Structure
+                    && !entity.lifecycle.in_limbo()
                 {
                     *self.census_counts.entry(entity.type_ref()).or_insert(0) += 1;
                 }
@@ -7367,94 +8333,603 @@ impl SuperAi {
         None
     }
 
-    /// Where a charged superweapon lands. The Iron Curtain is the one
-    /// friendly special — its invulnerability goes on this house's own
-    /// armor (organic infantry under the curtain take damage instead), so
-    /// Layer 3 centers the front-most own combat vehicle: the ground mobile
-    /// nearest the enemy mass center, skipping the MCVs, the miner fleet
-    /// (and, pointless on infantry, the engineer) — the old substrate-first
-    /// pick all too often curtained the expansion MCV standing at home.
-    /// The genetic mutator devolves infantry, so it wants the hostile
-    /// foot-mobile mass: the centroid of their infantry (the enemy-center
-    /// walk narrowed to the category), falling through to the generic aim
-    /// when none stands. Every other special — storm, dominator, the
-    /// silo's nuke, the chronosphere — strikes the enemy where it hurts
-    /// most: their war factories if any stand, else any structure, else
-    /// the hostile ground-mass center (ground-only — a jet's flight path
-    /// is not an aim point).
-    fn superweapon_target(
+    // ---- The superweapon suite (W6) ----
+
+    /// The suite's one batch for this tick, or `None`; see the call site in
+    /// [`Self::orders`]. Every house owns dormant instances of every
+    /// special (a captured building grants the live one), so the walk reads
+    /// the house's whole instance set behind the retry gate and hands each
+    /// charged one to its own strategy:
+    ///
+    /// * **Iron Curtain** — the S-A column: a 3x3 pad holding
+    ///   [`IRON_CURTAIN_COLUMN_MIN`] of the side's own heavy tanks (and no
+    ///   own infantry — the curtain kills organic foot) is curtained, and
+    ///   the column attack-moves at the nearest enemy gun cluster for the
+    ///   curtain's life; no such pad falls back to the front-most tank.
+    /// * **Chronosphere** — the two-click special: the source click stores
+    ///   the pad, the warp click (ChronoWarpSpecial) fires the ride. The
+    ///   old fork fired only the source click, so the sphere parked with
+    ///   `is_ready=false` and never recharged — both clicks now leave the
+    ///   same pass, the pad being the chrono steal's staged ride or the
+    ///   prism drop's staging cluster (S-C), the destination the passable
+    ///   3x3 at the enemy power cluster (drop) or beside the enemy
+    ///   conyard (steal).
+    /// * **Nuke and storm** — the S-D retail scoring: the enemy structure
+    ///   cell maximizing the summed value inside [`SW_SCORE_RADIUS`]
+    ///   (conyard / war factory / tech center 100, power 60, base defense
+    ///   35, else 4), the `[General] AIIonCannon*` table.
+    /// * **Dominator / mutator** — the S-E mass pads: the dominator the
+    ///   3x3 with the most enemy vehicle cost clear of own units
+    ///   ([`DOMINATOR_OWN_CLEARANCE`], retail `CellSpread=7`), the mutator
+    ///   the densest enemy foot mass.
+    /// * **Paradrop** — the outpost pad when one stands, else the enemy's
+    ///   nearest refinery line (S-F).
+    /// * **Force shield** — the own conyard while the alarm is armed and a
+    ///   structure inside [`FORCE_SHIELD_RADIUS`] bleeds (S-F).
+    ///
+    /// One special fires per pass; a refused launch retries after
+    /// [`SW_FIRE_RETRY_TICKS`]. The ChronoWarpSpecial instance never fires
+    /// alone — its sphere's pass carries it.
+    fn superweapon_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        home_center: Option<(i16, i16)>,
+        tick: u32,
+    ) -> Option<Vec<Command>> {
+        if tick < self.next_sw_fire_tick {
+            return None;
+        }
+        let chrono_staged = self.chrono_steal.as_ref().and_then(|steal| match steal {
+            ChronoSteal::Staging { pad, .. } => Some(*pad),
+            _ => None,
+        });
+        // The walk's order: the side's own two supers lead (deterministic
+        // priority — a Soviet with a charged curtain and a captured storm
+        // fires the curtain's column first), then every other charged
+        // instance in the registry's stable order (the captured grants).
+        let own: [&'static str; 2] = [opening.super_weapon_type, opening.second_super_weapon_type];
+        let mut charged: Vec<InternedId> = sim
+            .super_weapons()
+            .get(&self.house)
+            .into_iter()
+            .flat_map(|house_sws| house_sws.iter())
+            .filter(|(_, instance)| {
+                instance.charge_start_tick() != -1 && instance.is_active() && instance.is_ready()
+            })
+            .map(|(sw_type, _)| *sw_type)
+            .collect();
+        charged.sort_by_key(|sw_type| {
+            own.iter()
+                .position(|name| sim.interner.get(name).is_some_and(|id| id == *sw_type))
+                .unwrap_or(own.len())
+        });
+        for sw_type in charged {
+            let sw_type_name = sim.interner.resolve(sw_type);
+            if sw_type_name == "ChronoWarpSpecial" {
+                // The warp rides its sphere's pass — the two-click pair.
+                continue;
+            }
+            let batch = if sw_type_name == "ChronoSphereSpecial" {
+                self.chronosphere_pair(
+                    sim,
+                    rules,
+                    opening,
+                    home_center,
+                    chrono_staged,
+                    sw_type,
+                    tick,
+                )
+            } else {
+                self.superweapon_target_for(sim, rules, opening, sw_type_name, home_center, tick)
+                    .map(|(rx, ry)| {
+                        vec![Command::LaunchSuperWeapon {
+                            sw_type_id: sw_type,
+                            target_rx: rx,
+                            target_ry: ry,
+                        }]
+                    })
+            };
+            // One special fires per pass; the rest wait for the next
+            // window.
+            if let Some(batch) = batch {
+                self.next_sw_fire_tick = tick + SW_FIRE_RETRY_TICKS;
+                return Some(batch);
+            }
+        }
+        None
+    }
+
+    /// The two chrono clicks, source then warp (W6), or `None` when no pad
+    /// or no destination stands. The pad is the chrono steal's staged ride
+    /// when one waits on its pad; else the prism drop's staging cluster —
+    /// a 3x3 holding [`CHRONO_PRISM_DROP_MIN`] own Prism-class tanks. The
+    /// destination is the passable 3x3 nearest the enemy power cluster
+    /// (the drop), or 2-3 cells beside the enemy conyard (the steal); the
+    /// steal machine advances to its warped stage the same tick.
+    #[allow(clippy::too_many_arguments)]
+    fn chronosphere_pair(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        home_center: Option<(i16, i16)>,
+        chrono_staged: Option<(u16, u16)>,
+        sphere_type: InternedId,
+        tick: u32,
+    ) -> Option<Vec<Command>> {
+        let warp_type = sim.interner.get("ChronoWarpSpecial")?;
+        let staged = match (&self.chrono_steal, chrono_staged) {
+            (Some(ChronoSteal::Staging { ride, target, .. }), Some(_)) => Some((*ride, *target)),
+            _ => None,
+        };
+        let (pad, dest) = if let Some((ride, target)) = staged {
+            // The steal's ride stands on its pad: the drop point is 2-3
+            // cells beside the enemy conyard, passable and clear.
+            let conyard_cell = sim
+                .substrate
+                .entities
+                .get(target)
+                .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))?;
+            let home = home_center?;
+            let dest = chrono_steal_dest(sim, home, conyard_cell)?;
+            let pad = chrono_staged?;
+            // The steal machine rides along: the warp moved its ride. The
+            // actors minus the ride itself are the engineers.
+            let engineers: Vec<u64> = self
+                .chrono_steal
+                .as_ref()
+                .map(|steal| steal.actors())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|actor| *actor != ride)
+                .collect();
+            self.chrono_steal = Some(ChronoSteal::Warped {
+                engineers,
+                ride,
+                target,
+                since: tick,
+            });
+            self.chrono_steal_since = tick;
+            (pad, dest)
+        } else {
+            // The prism drop's pad (S-C): the densest own staging cluster.
+            let (pad, staged) = self.chrono_prism_pad(sim, rules, opening)?;
+            let dest = self.enemy_power_pad(sim)?;
+            // The warping units are the staged tanks themselves.
+            self.prism_drop = Some((tick, staged));
+            (pad, dest)
+        };
+        let _ = opening;
+        Some(vec![
+            Command::LaunchSuperWeapon {
+                sw_type_id: sphere_type,
+                target_rx: pad.0,
+                target_ry: pad.1,
+            },
+            Command::LaunchSuperWeapon {
+                sw_type_id: warp_type,
+                target_rx: dest.0,
+                target_ry: dest.1,
+            },
+        ])
+    }
+
+    /// The prism drop's staging pad (S-C): the first own 3x3 (in the
+    /// substrate's stable order) holding
+    /// [`CHRONO_PRISM_DROP_MIN`]..[`CHRONO_PRISM_DROP_MAX`] of the side's
+    /// tier tanks and siege tanks idle, with its member ids.
+    fn chrono_prism_pad(
         &self,
         sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+    ) -> Option<((u16, u16), Vec<u64>)> {
+        let pad_types = [opening.tier2_tank, opening.main_tank];
+        let candidates: Vec<(u64, (u16, u16))> = sim
+            .substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Unit
+                    && !entity.lifecycle.in_limbo()
+                    && !Self::is_fly_type(rules, sim.interner.resolve(entity.type_ref()))
+                    && pad_types.contains(&sim.interner.resolve(entity.type_ref()))
+                    && matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    )
+            })
+            .map(|(id, entity)| (id, (entity.position.rx(), entity.position.ry())))
+            .collect();
+        for (_center_id, cell) in &candidates {
+            let members: Vec<u64> = candidates
+                .iter()
+                .filter(|(_, other)| {
+                    (i32::from(other.0) - i32::from(cell.0)).abs() <= 1
+                        && (i32::from(other.1) - i32::from(cell.1)).abs() <= 1
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            if members.len() >= CHRONO_PRISM_DROP_MIN {
+                let mut members = members;
+                members.truncate(CHRONO_PRISM_DROP_MAX);
+                return Some((*cell, members));
+            }
+        }
+        None
+    }
+
+    /// The enemy power cluster's passable 3x3 (the prism drop's
+    /// destination): the enemy power plant whose neighborhood the engine's
+    /// own passable-cell search admits, nearest any own unit; else the
+    /// enemy conyard's cell.
+    fn enemy_power_pad(&self, sim: &crate::sim::world::Simulation) -> Option<(u16, u16)> {
+        use crate::sim::find_nearby_cell::{NearbyArgs, NearbyFootprint, PassabilityArgs};
+        let powers: Vec<(u16, u16)> = sim
+            .substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.category() == crate::map::entities::EntityCategory::Structure
+                    && !entity.lifecycle.in_limbo()
+                    && self.is_enemy(sim, entity.owner())
+                    && ENEMY_POWER_TYPES.contains(&sim.interner.resolve(entity.type_ref()))
+            })
+            .map(|(_, entity)| (entity.position.rx(), entity.position.ry()))
+            .collect();
+        let anchor = powers.first().copied()?;
+        let (width, height) = (
+            sim.resolved_terrain.as_ref()?.width() as i32,
+            sim.resolved_terrain.as_ref()?.height() as i32,
+        );
+        // The warp lands what stands in the source 3x3 offset-preserving,
+        // so the destination block only needs to be passable ground: the
+        // engine's Find_Nearby_Passable_Cell from the plant's own cell.
+        sim.nearby_passable_cell(
+            (i32::from(anchor.0), i32::from(anchor.1)),
+            NearbyArgs {
+                passability: PassabilityArgs {
+                    speed_type: crate::rules::locomotor_type::SpeedType::Foot,
+                    required_zone_id: None,
+                    movement_zone: crate::rules::locomotor_type::MovementZone::Normal,
+                    bridge_aware_zone: false,
+                },
+                footprint: NearbyFootprint::new(3, 3),
+                allow_bridge_cells: true,
+                check_height: false,
+                check_occupancy: false,
+                target_cell: None,
+                options: crate::sim::find_nearby_cell::NearbySearchOptions {
+                    reject_any_overlay: false,
+                },
+            },
+        )
+        .filter(|&(x, y)| i32::from(x) < width && i32::from(y) < height)
+        .or(Some(anchor))
+    }
+
+    /// A destructive or friendly special's aim (S-A, S-D, S-E, S-F); the
+    /// strategies in doc order. `None` — no honest aim, the special holds
+    /// its charge.
+    fn superweapon_target_for(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
         opening: &Opening,
         sw_type_name: &str,
+        _home_center: Option<(i16, i16)>,
+        tick: u32,
     ) -> Option<(u16, u16)> {
-        // The genetic mutator's mass aim (the enemy_center walk narrowed
-        // to the Infantry category — the engine files foot soldiers there,
-        // tanks under Unit).
-        if sw_type_name == "GeneticConverterSpecial" {
-            let mut sum_x = 0i64;
-            let mut sum_y = 0i64;
-            let mut count = 0u64;
-            for (_, entity) in sim.substrate.entities.iter_sorted() {
-                if entity.category() != crate::map::entities::EntityCategory::Infantry
-                    || entity.lifecycle.in_limbo()
-                    || !self.is_enemy(sim, entity.owner())
-                {
-                    continue;
-                }
-                sum_x += i64::from(entity.position.rx());
-                sum_y += i64::from(entity.position.ry());
-                count += 1;
-            }
-            if count > 0 {
-                return Some(((sum_x / count as i64) as u16, (sum_y / count as i64) as u16));
-            }
-            // No hostile infantry stands: the generic hostile aim below
-            // still beats holding a charged special.
+        match sw_type_name {
+            // S-A: the Iron Curtain column.
+            "IronCurtainSpecial" => self.iron_curtain_pad(sim, rules, opening, tick),
+            // S-E: the dominator's armor pad, own-clear.
+            "PsychicDominatorSpecial" => self.dominator_pad(sim, rules),
+            // S-E: the mutator's foot mass.
+            "GeneticConverterSpecial" => self.mutator_pad(sim),
+            // S-F: the paradrop's outpost pad, else the enemy's ore line.
+            "ParaDropSpecial" | "AmerParaDropSpecial" => self.paradrop_target(sim),
+            // S-F: the shield rides the alarm.
+            "ForceShieldSpecial" => self.force_shield_target(sim, rules),
+            // S-D: the scored destructive aim — nuke, storm, and every
+            // other enemy-striking special.
+            _ => self.scored_strike_cell(sim),
         }
-        if opening.super_weapon_targets_self && sw_type_name == opening.super_weapon_type {
-            let anchor = self
-                .enemy_center(sim)
-                .map(|center| (center.0.max(0) as u16, center.1.max(0) as u16))
-                .or_else(|| {
-                    self.structure_center(sim, opening.construction_yard)
-                        .map(|center| (center.0.max(0) as u16, center.1.max(0) as u16))
-                });
-            let mut best: Option<(i64, (u16, u16))> = None;
-            for (_, entity) in sim.substrate.entities.iter_sorted() {
-                if entity.owner() != self.house
-                    || entity.category() != crate::map::entities::EntityCategory::Unit
-                    || entity.lifecycle.in_limbo()
-                {
-                    continue;
+    }
+
+    /// The Iron Curtain's column pad (S-A): the first own 3x3 holding
+    /// [`IRON_CURTAIN_COLUMN_MIN`] of the side's heavy tanks with no own
+    /// infantry inside — the curtain kills organic foot — latching the
+    /// column's follow-through. No such pad: the front-most own combat
+    /// vehicle, the old front pick, with no column.
+    fn iron_curtain_pad(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        tick: u32,
+    ) -> Option<(u16, u16)> {
+        let heavies = [opening.main_tank, opening.tier2_tank];
+        let tanks: Vec<(u64, (u16, u16))> = sim
+            .substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Unit
+                    && !entity.lifecycle.in_limbo()
+                    && !Self::is_fly_type(rules, sim.interner.resolve(entity.type_ref()))
+                    && heavies.contains(&sim.interner.resolve(entity.type_ref()))
+            })
+            .map(|(id, entity)| (id, (entity.position.rx(), entity.position.ry())))
+            .collect();
+        for (_center_id, cell) in &tanks {
+            let in_block: Vec<u64> = tanks
+                .iter()
+                .filter(|(_, other)| {
+                    (i32::from(other.0) - i32::from(cell.0)).abs() <= 1
+                        && (i32::from(other.1) - i32::from(cell.1)).abs() <= 1
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            if in_block.len() < IRON_CURTAIN_COLUMN_MIN {
+                continue;
+            }
+            // No own infantry in the pad: organic foot dies under the
+            // curtain instead of riding it.
+            let infantry_inside = sim.substrate.entities.iter_sorted().any(|(_, entity)| {
+                entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Infantry
+                    && !entity.lifecycle.in_limbo()
+                    && (i32::from(entity.position.rx()) - i32::from(cell.0)).abs() <= 1
+                    && (i32::from(entity.position.ry()) - i32::from(cell.1)).abs() <= 1
+            });
+            if infantry_inside {
+                continue;
+            }
+            // The column is the side's own curtain play: a curtain captured
+            // off a non-self-targeting table fires the plain front pick
+            // below (the table's `super_weapon_targets_self` tells whose
+            // doctrine this is).
+            if !opening.super_weapon_targets_self {
+                break;
+            }
+            self.iron_column = Some((*cell, tick, in_block));
+            return Some(*cell);
+        }
+        // The old front-most pick as the fallback: the ground mobile nearest
+        // the enemy mass center, skipping the MCVs and the miner fleet.
+        let anchor = self
+            .enemy_center(sim)
+            .map(|center| (center.0.max(0) as u16, center.1.max(0) as u16));
+        let mut best: Option<(i64, (u16, u16))> = None;
+        for (_, entity) in sim.substrate.entities.iter_sorted() {
+            if entity.owner() != self.house
+                || entity.category() != crate::map::entities::EntityCategory::Unit
+                || entity.lifecycle.in_limbo()
+            {
+                continue;
+            }
+            let name = sim.interner.resolve(entity.type_ref());
+            if MCV_TYPES.contains(&name) || ENEMY_MINER_TYPES.contains(&name) {
+                continue;
+            }
+            let cell = (entity.position.rx(), entity.position.ry());
+            let distance = match anchor {
+                Some((ax, ay)) => {
+                    let dx = i32::from(cell.0) - i32::from(ax);
+                    let dy = i32::from(cell.1) - i32::from(ay);
+                    i64::from(dx * dx + dy * dy)
                 }
+                None => 0,
+            };
+            if best.is_none_or(|(kept, _)| distance < kept) {
+                best = Some((distance, cell));
+            }
+        }
+        best.map(|(_, cell)| cell)
+    }
+
+    /// The dominator's pad (S-E): the enemy 3x3 with the most vehicle cost
+    /// inside, with no own unit within [`DOMINATOR_OWN_CLEARANCE`] (retail
+    /// `CellSpread=7`).
+    fn dominator_pad(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+    ) -> Option<(u16, u16)> {
+        let vehicles: Vec<((u16, u16), i32)> = sim
+            .substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.category() == crate::map::entities::EntityCategory::Unit
+                    && !entity.lifecycle.in_limbo()
+                    && self.is_enemy(sim, entity.owner())
+            })
+            .map(|(_, entity)| {
+                let cost = rules
+                    .object(sim.interner.resolve(entity.type_ref()))
+                    .map(|ty| ty.cost)
+                    .unwrap_or(0);
+                ((entity.position.rx(), entity.position.ry()), cost)
+            })
+            .collect();
+        let owns: Vec<(u16, u16)> = sim
+            .substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.owner() == self.house
+                    && matches!(
+                        entity.category(),
+                        crate::map::entities::EntityCategory::Unit
+                            | crate::map::entities::EntityCategory::Infantry
+                    )
+                    && !entity.lifecycle.in_limbo()
+            })
+            .map(|(_, entity)| (entity.position.rx(), entity.position.ry()))
+            .collect();
+        let mut best: Option<(i32, (u16, u16))> = None;
+        for (cell, _) in &vehicles {
+            let value: i32 = vehicles
+                .iter()
+                .filter(|(other, _)| {
+                    (i32::from(other.0) - i32::from(cell.0)).abs() <= 1
+                        && (i32::from(other.1) - i32::from(cell.1)).abs() <= 1
+                })
+                .map(|(_, cost)| *cost)
+                .sum();
+            let own_inside = owns.iter().any(|own| {
+                (i32::from(own.0) - i32::from(cell.0)).abs() <= DOMINATOR_OWN_CLEARANCE
+                    && (i32::from(own.1) - i32::from(cell.1)).abs() <= DOMINATOR_OWN_CLEARANCE
+            });
+            if own_inside {
+                continue;
+            }
+            if best.is_none_or(|(kept, _)| value > kept) {
+                best = Some((value, *cell));
+            }
+        }
+        best.map(|(_, cell)| cell)
+    }
+
+    /// The mutator's pad (S-E): the densest enemy foot mass (the devolution
+    /// wants infantry, the slaves included), nearest on ties.
+    fn mutator_pad(&self, sim: &crate::sim::world::Simulation) -> Option<(u16, u16)> {
+        let feet: Vec<(u16, u16)> = sim
+            .substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.category() == crate::map::entities::EntityCategory::Infantry
+                    && !entity.lifecycle.in_limbo()
+                    && self.is_enemy(sim, entity.owner())
+            })
+            .map(|(_, entity)| (entity.position.rx(), entity.position.ry()))
+            .collect();
+        let mut best: Option<(usize, (u16, u16))> = None;
+        for cell in &feet {
+            let count = feet
+                .iter()
+                .filter(|other| {
+                    (i32::from(other.0) - i32::from(cell.0)).abs() <= 1
+                        && (i32::from(other.1) - i32::from(cell.1)).abs() <= 1
+                })
+                .count();
+            if best.is_none_or(|(kept, _)| count > kept) {
+                best = Some((count, *cell));
+            }
+        }
+        best.map(|(_, cell)| cell)
+    }
+
+    /// The paradrop's aim (S-F): the outpost pad when one stands — the
+    /// reinforcements land where they fight — else the enemy's nearest
+    /// refinery line (the ore field's docks).
+    /// The paradrop's aim (S-F): the enemy's nearest standing refinery
+    /// line (the ore field's docks — the reinforcements land where the
+    /// economy bleeds), else the hostile mass center.
+    fn paradrop_target(&self, sim: &crate::sim::world::Simulation) -> Option<(u16, u16)> {
+        sim.substrate
+            .entities
+            .iter_sorted()
+            .find(|(_, entity)| {
+                entity.category() == crate::map::entities::EntityCategory::Structure
+                    && !entity.lifecycle.in_limbo()
+                    && self.is_enemy(sim, entity.owner())
+                    && ENEMY_REFINERY_TYPES.contains(&sim.interner.resolve(entity.type_ref()))
+            })
+            .map(|(_, entity)| (entity.position.rx(), entity.position.ry()))
+            .or_else(|| {
+                self.enemy_center(sim)
+                    .map(|center| (center.0.max(0) as u16, center.1.max(0) as u16))
+            })
+    }
+
+    /// The force shield's aim (S-F): the own conyard while the base alarm
+    /// is armed and a standing structure inside [`FORCE_SHIELD_RADIUS`] of
+    /// it bleeds — the shield rides the raid, never a quiet base.
+    fn force_shield_target(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+    ) -> Option<(u16, u16)> {
+        if !self.base_alarm_armed(sim, self.now_tick) {
+            return None;
+        }
+        let opening = self.pinned_opening?;
+        let conyard = self.own_yard_centers(sim, opening).first().copied()?;
+        let under_fire = sim.substrate.entities.iter_sorted().any(|(_, entity)| {
+            entity.owner() == self.house
+                && entity.category() == crate::map::entities::EntityCategory::Structure
+                && !entity.lifecycle.in_limbo()
+                && entity.lifecycle.object_alive()
+                && {
+                    let dx = i32::from(entity.position.rx()) - i32::from(conyard.0);
+                    let dy = i32::from(entity.position.ry()) - i32::from(conyard.1);
+                    dx.abs() <= FORCE_SHIELD_RADIUS && dy.abs() <= FORCE_SHIELD_RADIUS
+                }
+                && rules
+                    .object(sim.interner.resolve(entity.type_ref()))
+                    .is_some_and(|ty| entity.health.current() < ty.strength)
+        });
+        under_fire.then(|| (conyard.0.max(0) as u16, conyard.1.max(0) as u16))
+    }
+
+    /// The S-D scored strike cell: the enemy structure cell maximizing the
+    /// summed retail value ([`SW_VALUE_*`]) of every enemy structure inside
+    /// [`SW_SCORE_RADIUS`], the `[General] AIIonCannon*` table — no more
+    /// first-priority-target clicks onto an empty refinery corner.
+    fn scored_strike_cell(&self, sim: &crate::sim::world::Simulation) -> Option<(u16, u16)> {
+        let structures: Vec<((u16, u16), i32)> = sim
+            .substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.category() == crate::map::entities::EntityCategory::Structure
+                    && !entity.lifecycle.in_limbo()
+                    && self.is_enemy(sim, entity.owner())
+            })
+            .map(|(_, entity)| {
                 let name = sim.interner.resolve(entity.type_ref());
-                if MCV_TYPES.contains(&name) || ENEMY_MINER_TYPES.contains(&name) {
-                    continue;
-                }
-                let cell = (entity.position.rx(), entity.position.ry());
-                let distance = match anchor {
-                    Some((ax, ay)) => {
-                        let dx = i32::from(cell.0) - i32::from(ax);
-                        let dy = i32::from(cell.1) - i32::from(ay);
-                        i64::from(dx * dx + dy * dy)
-                    }
-                    // No enemy ground mobiles to front against: the
-                    // substrate's stable first pick still beats nothing.
-                    None => 0,
+                let value = if CONYARD_TYPES.contains(&name) {
+                    SW_VALUE_CONYARD
+                } else if WAR_FACTORY_TYPES.contains(&name) {
+                    SW_VALUE_WAR_FACTORY
+                } else if TECH_CENTER_TYPES.contains(&name) {
+                    SW_VALUE_TECH_CENTER
+                } else if ENEMY_POWER_TYPES.contains(&name) {
+                    SW_VALUE_POWER
+                } else if WAVE_DEFENSE_TYPES.contains(&name) {
+                    SW_VALUE_BASE_DEFENSE
+                } else {
+                    SW_VALUE_OTHER
                 };
-                if best.is_none_or(|(kept, _)| distance < kept) {
-                    best = Some((distance, cell));
-                }
+                ((entity.position.rx(), entity.position.ry()), value)
+            })
+            .collect();
+        let mut best: Option<(i32, (u16, u16))> = None;
+        for (cell, _) in &structures {
+            let value: i32 = structures
+                .iter()
+                .filter(|(other, _)| {
+                    (i32::from(other.0) - i32::from(cell.0)).abs() <= SW_SCORE_RADIUS
+                        && (i32::from(other.1) - i32::from(cell.1)).abs() <= SW_SCORE_RADIUS
+                })
+                .map(|(_, v)| *v)
+                .sum();
+            if best.is_none_or(|(kept, _)| value > kept) {
+                best = Some((value, *cell));
             }
-            return best.map(|(_, cell)| cell);
         }
-        let cell = self
-            .enemy_priority_targets(sim)
-            .first()
-            .map(|&(_, cell)| cell)
-            .or_else(|| self.enemy_center(sim))?;
-        Some((cell.0 as u16, cell.1 as u16))
+        best.map(|(_, cell)| cell)
     }
 
     /// The house's idle combat units for the opening's army types, in the
@@ -7572,27 +9047,37 @@ impl SuperAi {
             .insert(type_id, tick + BUILD_QUEUE_RETRY_TICKS);
     }
 
-    /// The stuck-units limb's one order for this scan, or `None`; see the
-    /// call site in [`Self::orders`]. The walk refreshes every eligible
-    /// unit's [`Self::stuck_since`] snapshot, resets the window for units
-    /// parked on purpose, drops units no longer on the field (the
-    /// [`Self::capture_bound`] hygiene's retain), and answers with at most
-    /// one rescue: the first unit still standing on its snapshot cell past
+    /// The stuck-units limb's orders for this scan, up to
+    /// [`RESCUE_BATCH`] of them, or empty; see the call site in
+    /// [`Self::orders`]. The walk refreshes every eligible unit's
+    /// [`Self::stuck_since`] snapshot, resets the window for units parked
+    /// on purpose, drops units no longer on the field (the
+    /// [`Self::capture_bound`] hygiene's retain), and answers with the
+    /// rescues: each unit still standing on its snapshot cell past
     /// [`STUCK_TIMEOUT`] takes a fresh AttackMove at the wave's own
     /// destination — the first enemy structure the unit's ground rows
     /// connect to, rotating by unit id, else the enemy mass center's
-    /// spread ring. No hostile aim at all: no rescue, and the cleared
-    /// snapshot re-arms the window for the next scan.
+    /// spread ring. A candidate with no aim or under the futility backoff
+    /// keeps its snapshot (the next scan sees it again) and the next
+    /// candidate takes the turn. A detected congestion cluster holds the
+    /// whole dispatch — a rescue into the corridor feeds the jam.
     fn stuck_rescue_orders(
         &mut self,
         sim: &crate::sim::world::Simulation,
         rules: &crate::rules::ruleset::RuleSet,
         opening: &Opening,
         tick: u32,
-    ) -> Option<Command> {
+    ) -> Vec<Command> {
         let roster = Self::combat_roster(opening);
+        self.scout_chain.retain(|&id| {
+            sim.substrate.entities.get(id).is_some_and(|entity| {
+                entity.owner() == self.house && entity.lifecycle.object_alive()
+            })
+        });
+        let gather = self.wave_gather;
         let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        let mut stuck: Option<(u64, (u16, u16))> = None;
+        let mut stuck: Vec<(u64, (u16, u16))> = Vec::new();
+        let mut released: Vec<u64> = Vec::new();
         for (id, entity) in sim.substrate.entities.iter_sorted() {
             if entity.owner() != self.house
                 || Self::garrisoned(entity)
@@ -7614,26 +9099,64 @@ impl SuperAi {
             if !roster.contains(&type_name) && !Self::is_naval_type(opening, type_name) {
                 continue;
             }
+            let cell = (entity.position.rx(), entity.position.ry());
+            // A marching wave's member is parked only while he still holds
+            // a live destination or already stands in the arrival ring —
+            // the regroup the march exists for (W2). An idle member far
+            // from the gather is a dropped or exhausted march: he leaves
+            // `wave_marched` so the dispatch loop re-sends him, instead of
+            // standing exempt for the whole march clock (observed: most
+            // episodes burned the full 1800 ticks on such stragglers).
+            let holds_destination = entity.navigation.nav_com().is_some()
+                || crate::sim::movement::motion_query::is_moving(entity) == Some(true);
+            let wave_member =
+                self.wave_stage == WaveStage::Marching && self.wave_members.contains(&id);
+            let in_arrival_ring = gather.is_some_and(|(gx, gy)| {
+                (i32::from(cell.0) - i32::from(gx))
+                    .abs()
+                    .max((i32::from(cell.1) - i32::from(gy)).abs())
+                    <= i32::from(WAVE_GATHER_ARRIVAL)
+            });
+            let wave_parked = wave_member && (holds_destination || in_arrival_ring);
+            if wave_member
+                && !wave_parked
+                && self.order_gate.get(&id).is_none_or(|&due| tick >= due)
+                && matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                )
+            {
+                released.push(id);
+                self.stuck_since.remove(&id);
+                continue;
+            }
             // Parked on purpose: the guard posts, the one-command gate, the
-            // boarding and raid chains and the scouts own these units.
-            // Their window restarts when they next become eligible, so a
-            // unit the wave just dispatched is not instantly "stuck" on its
-            // old snapshot. A marching wave's members are parked too: one
-            // that reached the gather cell waits there for the rest — the
-            // regroup the march exists for — and a rescue would send it at
-            // the enemy alone; the march clock owns its stragglers.
+            // boarding, raid and garrison chains, the chain's own scouts
+            // (by id, W3 — Yuri's scout is the Initiate, and the type test
+            // exempted every Initiate in the army) and a unit standing on
+            // its own Guard post. Their window restarts when they next
+            // become eligible, so a unit the wave just dispatched is not
+            // instantly "stuck" on its old snapshot.
             let parked = self.boarders.contains(&id)
                 || self.raiders.contains(&id)
                 || self.raid_involves(id)
-                || type_name == opening.scout
-                || (self.wave_stage == WaveStage::Marching && self.wave_members.contains(&id))
+                || self.scout_chain.contains(&id)
+                || self.capture_bound.contains_key(&id)
+                || self
+                    .garrison_inbound
+                    .iter()
+                    .any(|&(_, walker)| walker == id)
+                || self.bunker_bound.values().any(|&rider| rider == id)
+                || wave_parked
                 || self.order_gate.get(&id).is_some_and(|&due| tick < due)
                 || matches!(
                     entity.passive_acquire_mission(),
                     crate::sim::mission::MissionType::Guard
                         | crate::sim::mission::MissionType::Sleep
                 );
-            let cell = (entity.position.rx(), entity.position.ry());
             if parked {
                 self.stuck_since.remove(&id);
                 continue;
@@ -7642,60 +9165,78 @@ impl SuperAi {
             let snapshot = self.stuck_since.entry(id).or_insert((cell, tick));
             if snapshot.0 != cell {
                 *snapshot = (cell, tick);
-            } else if tick.saturating_sub(snapshot.1) >= STUCK_TIMEOUT && stuck.is_none() {
-                // The snapshot clears on the rescue: the re-issued march
-                // restarts the window either way — a still-stuck unit
-                // re-arms here on a later scan and takes its next turn.
-                self.stuck_since.remove(&id);
-                stuck = Some((id, cell));
+            } else if tick.saturating_sub(snapshot.1) >= STUCK_TIMEOUT {
+                stuck.push((id, cell));
             }
         }
         self.stuck_since.retain(|id, _| visited.contains(id));
-        let (unit, from) = stuck?;
+        if !released.is_empty() {
+            self.wave_marched.retain(|unit| !released.contains(unit));
+        }
+        // The congestion hold: a cluster stands detected — no rescue into
+        // it this scan; the snapshots keep and the next scan re-reads.
+        if self.congestion_center.is_some() {
+            return Vec::new();
+        }
         let enemy_targets = self.enemy_priority_targets(sim);
-        let entity = sim.substrate.entities.get(unit)?;
-        let movement_zone = rules
-            .object(sim.interner.resolve(entity.type_ref()))
-            .map(|ty| ty.movement_zone)
-            .unwrap_or_default();
-        let raw = if enemy_targets.is_empty() {
-            self.enemy_center(sim).and_then(|aim| {
-                (0..SPREAD_OFFSETS.len())
-                    .map(|index| (unit as usize + index) % SPREAD_OFFSETS.len())
-                    .find_map(|index| {
-                        let spread = SPREAD_OFFSETS[index];
-                        let cell = on_map_cell(
-                            sim,
-                            (aim.0 + i16::from(spread.0), aim.1 + i16::from(spread.1)),
-                            aim,
-                        );
+        let enemy_center = self.enemy_center(sim);
+        let mut commands: Vec<Command> = Vec::new();
+        for (unit, from) in stuck {
+            if commands.len() >= RESCUE_BATCH {
+                break;
+            }
+            let Some(entity) = sim.substrate.entities.get(unit) else {
+                continue;
+            };
+            let movement_zone = rules
+                .object(sim.interner.resolve(entity.type_ref()))
+                .map(|ty| ty.movement_zone)
+                .unwrap_or_default();
+            let raw = if enemy_targets.is_empty() {
+                enemy_center.and_then(|aim| {
+                    (0..SPREAD_OFFSETS.len())
+                        .map(|index| (unit as usize + index) % SPREAD_OFFSETS.len())
+                        .find_map(|index| {
+                            let spread = SPREAD_OFFSETS[index];
+                            let cell = on_map_cell(
+                                sim,
+                                (aim.0 + i16::from(spread.0), aim.1 + i16::from(spread.1)),
+                                aim,
+                            );
+                            zones_connected(sim, movement_zone, from, cell).then_some(cell)
+                        })
+                })
+            } else {
+                (0..enemy_targets.len())
+                    .map(|attempt| enemy_targets[(unit as usize + attempt) % enemy_targets.len()])
+                    .find_map(|(_, cell)| {
+                        let cell = (cell.0.max(0) as u16, cell.1.max(0) as u16);
                         zones_connected(sim, movement_zone, from, cell).then_some(cell)
                     })
-            })
-        } else {
-            (0..enemy_targets.len())
-                .map(|attempt| enemy_targets[(unit as usize + attempt) % enemy_targets.len()])
-                .find_map(|(_, cell)| {
-                    let cell = (cell.0.max(0) as u16, cell.1.max(0) as u16);
-                    zones_connected(sim, movement_zone, from, cell).then_some(cell)
-                })
-        };
-        let Some((rx, ry)) = raw else {
-            return None;
-        };
-        // The futility backoff paces the repeats: a rescue that keeps
-        // landing this same unit on this same standing cell backs off the
-        // way the wave dispatch's repeat does (shared kind, shared strike
-        // streak — the two limbs fight over the same march).
-        if self.futile(unit, FutilityKind::Wave, from, tick) {
-            return None;
+            };
+            // No aim, or the futility backoff pacing the repeats (a rescue
+            // that keeps landing this same unit on this same standing
+            // cell backs off the way the wave dispatch's repeat does —
+            // shared kind, shared strike streak): the snapshot keeps and
+            // the next candidate takes the turn.
+            let Some((rx, ry)) = raw else {
+                continue;
+            };
+            if self.futile(unit, FutilityKind::Wave, from, tick) {
+                continue;
+            }
+            // The snapshot clears on the rescue: the re-issued march
+            // restarts the window — a still-stuck unit re-arms on a later
+            // scan and takes its next turn.
+            self.stuck_since.remove(&unit);
+            self.gate_idle_order(unit, tick);
+            commands.push(Command::AttackMove {
+                entity_id: unit,
+                target: None,
+                destination: Some(crate::sim::combat::TargetKind::Cell(rx, ry)),
+            });
         }
-        self.gate_idle_order(unit, tick);
-        Some(Command::AttackMove {
-            entity_id: unit,
-            target: None,
-            destination: Some(crate::sim::combat::TargetKind::Cell(rx, ry)),
-        })
+        commands
     }
 
     // ---- Layer 3: combat & unit management helpers ----
@@ -7749,22 +9290,37 @@ impl SuperAi {
         false
     }
 
-    /// The fortress's cargo mix in boarding preference order: the roster's
-    /// anti-armor infantry first (the Guardian GI's deployed launcher is
-    /// the classic loadout), then the anti-infantry entries. The hero never
-    /// boards — the pick filters him out by name.
-    fn boarding_cargo(opening: &Opening) -> Vec<&'static str> {
-        let mut names = Vec::new();
-        for role in [Role::AntiArmor, Role::AntiInfantry] {
-            names.extend(
-                opening
-                    .infantry
-                    .iter()
-                    .filter(|entry| entry.role == role)
-                    .map(|entry| entry.name),
-            );
+    /// The fortress's cargo mix as per-type seat quotas, in boarding
+    /// preference order — the retail loadout (W7): two of the roster's
+    /// first anti-armor soldier (the Guardian GI's deployed launcher), two
+    /// of the side's basic soldier, one of the first anti-infantry entry
+    /// (the Ghost). The old mix ranked whole roles, so the first anti-armor
+    /// type filled every seat and the basic soldier never once boarded.
+    /// The hero never boards — the pick filters him out by name.
+    fn boarding_cargo(opening: &Opening) -> Vec<(&'static str, usize)> {
+        let mut quotas: Vec<(&'static str, usize)> = Vec::new();
+        if let Some(anti_armor) = opening
+            .infantry
+            .iter()
+            .find(|entry| entry.role == Role::AntiArmor)
+        {
+            quotas.push((anti_armor.name, 2));
         }
-        names
+        if !quotas
+            .iter()
+            .any(|&(name, _)| name == opening.basic_infantry)
+        {
+            quotas.push((opening.basic_infantry, 2));
+        }
+        if let Some(anti_infantry) = opening
+            .infantry
+            .iter()
+            .find(|entry| entry.role == Role::AntiInfantry)
+            && !quotas.iter().any(|&(name, _)| name == anti_infantry.name)
+        {
+            quotas.push((anti_infantry.name, 1));
+        }
+        quotas
     }
 
     /// The nearest enemy economy unit (a harvester on the move between the
@@ -8308,8 +9864,16 @@ impl SuperAi {
             WaveStage::Forming => {
                 let (picks, missing) = self.wave_member_picks(sim, opening, standing);
                 self.wave_members = picks;
-                let form_expired =
-                    tick.saturating_sub(self.wave_stage_since) >= WAVE_FORM_TIMEOUT_TICKS;
+                let form_age = tick.saturating_sub(self.wave_stage_since);
+                let form_expired = form_age >= WAVE_FORM_TIMEOUT_TICKS;
+                // The alarm's grace (W2): a fresh alarm may delay the
+                // launch, never cancel it — past the form clock plus
+                // [`WAVE_ALARM_GRACE_TICKS`] the wave launches under the
+                // alarm with what stands. The old gate held a forming
+                // wave home with no timeout at all, and under constant
+                // base alarms it never launched (observed: 8275 ticks
+                // with zero launches).
+                let grace_expired = form_age >= WAVE_FORM_TIMEOUT_TICKS + WAVE_ALARM_GRACE_TICKS;
                 if self.wave_members.is_empty() {
                     // Nothing to march (a base that lost its factories
                     // mid-form, a pool still under the reserve): the
@@ -8321,14 +9885,20 @@ impl SuperAi {
                     return None;
                 }
                 // A complete team launches; the form clock launches a
-                // thinner one. A fresh alarm holds either home.
-                if alarm_armed || (!missing.is_empty() && !form_expired) {
+                // thinner one. A fresh alarm holds either home — until the
+                // grace runs out.
+                if (alarm_armed && !grace_expired) || (!missing.is_empty() && !form_expired) {
                     return None;
                 }
                 // The gather cell latches on the launch: the nearest enemy
                 // base (its war factory first — the priority list's head
                 // class) pulled back [`WAVE_GATHER_DISTANCE`] toward home,
-                // clamped onto the map. No enemy aim at all (a map with no
+                // validated (W2) — same-zone-reachable from home and open
+                // enough for a mass ([`OPEN_NEIGHBOR_FLOOR`]) — and
+                // re-picked by stepping toward home until a cell passes.
+                // The old pick was pure arithmetic: it latched water,
+                // cliffs and one-cell passes, and every member marched at
+                // that one cell. No enemy aim at all (a map with no
                 // hostile structure left) marches straight onto the strike.
                 let aim = enemy_targets
                     .iter()
@@ -8342,20 +9912,7 @@ impl SuperAi {
                     })
                     .map(|&(_, cell)| cell)
                     .or(enemy_center);
-                self.wave_gather = aim.map(|aim| {
-                    let dx = i32::from(center.0) - i32::from(aim.0);
-                    let dy = i32::from(center.1) - i32::from(aim.1);
-                    let len = dx.abs().max(dy.abs()).max(1);
-                    let step = len.min(i32::from(WAVE_GATHER_DISTANCE));
-                    on_map_cell(
-                        sim,
-                        (
-                            (i32::from(aim.0) + dx * step / len) as i16,
-                            (i32::from(aim.1) + dy * step / len) as i16,
-                        ),
-                        aim,
-                    )
-                });
+                self.wave_gather = aim.and_then(|aim| Self::valid_gather_cell(sim, center, aim));
                 self.wave_stage = WaveStage::Marching;
                 self.wave_stage_since = tick;
                 self.wave_marched.clear();
@@ -8375,6 +9932,12 @@ impl SuperAi {
                     self.arm_wave_strike(sim, tick);
                     return None;
                 }
+                // The congestion hold (W3): a cluster stands detected — the
+                // march dispatch waits for the corridor to clear; the march
+                // clock still bounds the wait.
+                if self.congestion_center.is_some() {
+                    return None;
+                }
                 self.wave_dispatch_march(sim, rules, gather, tick)
             }
             WaveStage::Striking => {
@@ -8383,10 +9946,12 @@ impl SuperAi {
         }
     }
 
-    /// Whether the marched wave stands regrouped at the gather cell: every
-    /// ground member inside [`WAVE_GATHER_ARRIVAL`] of it. The flyers ride
-    /// their own sorties and never walk the regroup, so they neither hold
-    /// it up nor count toward it.
+    /// Whether the marched wave stands regrouped at the gather cell: at
+    /// least [`WAVE_REGROUP_NUMERATOR`]/[`WAVE_REGROUP_DENOMINATOR`] of the
+    /// ground members inside [`WAVE_GATHER_ARRIVAL`] of it (W2 — the old
+    /// all-members rule let one zone-skipped straggler burn the whole
+    /// march clock). The flyers ride their own sorties and never walk the
+    /// regroup, so they neither hold it up nor count toward it.
     fn wave_regrouped(
         &self,
         sim: &crate::sim::world::Simulation,
@@ -8394,6 +9959,7 @@ impl SuperAi {
         gather: (u16, u16),
     ) -> bool {
         let mut ground = 0usize;
+        let mut arrived = 0usize;
         for &unit in &self.wave_members {
             let Some(entity) = sim.substrate.entities.get(unit) else {
                 continue;
@@ -8407,11 +9973,41 @@ impl SuperAi {
             let away = (i32::from(entity.position.rx()) - i32::from(gather.0))
                 .abs()
                 .max((i32::from(entity.position.ry()) - i32::from(gather.1)).abs());
-            if away > i32::from(WAVE_GATHER_ARRIVAL) {
-                return false;
+            if away <= i32::from(WAVE_GATHER_ARRIVAL) {
+                arrived += 1;
             }
         }
-        ground > 0
+        ground > 0 && arrived * WAVE_REGROUP_DENOMINATOR >= ground * WAVE_REGROUP_NUMERATOR
+    }
+
+    /// The validated gather cell (W2): starting from the aim pulled back
+    /// [`WAVE_GATHER_DISTANCE`] toward `home`, step toward home one cell
+    /// at a time until a cell both connects to home in the ground zone
+    /// and passes the openness floor ([`cell_openness`]); `None` when no
+    /// cell on the line does (the march then goes straight to the strike).
+    fn valid_gather_cell(
+        sim: &crate::sim::world::Simulation,
+        home: (i16, i16),
+        aim: (i16, i16),
+    ) -> Option<(u16, u16)> {
+        let dx = i32::from(home.0) - i32::from(aim.0);
+        let dy = i32::from(home.1) - i32::from(aim.1);
+        let len = dx.abs().max(dy.abs()).max(1);
+        let home_cell = (home.0.max(0) as u16, home.1.max(0) as u16);
+        let zone = crate::rules::locomotor_type::MovementZone::Normal;
+        (i32::from(WAVE_GATHER_DISTANCE).min(len)..=len).find_map(|step| {
+            let cell = on_map_cell(
+                sim,
+                (
+                    (i32::from(aim.0) + dx * step / len) as i16,
+                    (i32::from(aim.1) + dy * step / len) as i16,
+                ),
+                aim,
+            );
+            (zones_connected(sim, zone, home_cell, cell)
+                && cell_openness(sim, zone, cell) >= OPEN_NEIGHBOR_FLOOR)
+                .then_some(cell)
+        })
     }
 
     /// Latch the strike sequence and turn the stage.
@@ -8484,10 +10080,12 @@ impl SuperAi {
     }
 
     /// The march stage's one dispatch: the first un-marched member the
-    /// order gate and the zone grid still admit attack-moves at the
-    /// gather cell. Fly members stay out — the sortie limb owns the
-    /// wings. `None` — everyone marched, gated or futile — lets the
-    /// stage clocks turn.
+    /// order gate and the zone grid still admit attack-moves at its own
+    /// spread cell around the gather (W2, the hunt's and the rescue's
+    /// pattern — every member at the one cell was the pileup), falling
+    /// back to the gather itself. Fly members stay out — the sortie limb
+    /// owns the wings. `None` — everyone marched, gated or futile — lets
+    /// the stage clocks turn.
     fn wave_dispatch_march(
         &mut self,
         sim: &crate::sim::world::Simulation,
@@ -8528,6 +10126,24 @@ impl SuperAi {
             if !zones_connected(sim, movement_zone, from, gather) {
                 continue;
             }
+            let anchor = (gather.0 as i16, gather.1 as i16);
+            let destination = (0..SPREAD_OFFSETS.len())
+                .map(|index| (unit as usize + index) % SPREAD_OFFSETS.len())
+                .find_map(|index| {
+                    let spread = SPREAD_OFFSETS[index];
+                    let cell = on_map_cell(
+                        sim,
+                        (
+                            anchor.0 + i16::from(spread.0),
+                            anchor.1 + i16::from(spread.1),
+                        ),
+                        anchor,
+                    );
+                    (zones_connected(sim, movement_zone, from, cell)
+                        && cell_openness(sim, movement_zone, cell) >= OPEN_NEIGHBOR_FLOOR)
+                        .then_some(cell)
+                })
+                .unwrap_or(gather);
             if self.futile(unit, FutilityKind::Wave, from, tick) {
                 continue;
             }
@@ -8536,7 +10152,10 @@ impl SuperAi {
             return Some(Command::AttackMove {
                 entity_id: unit,
                 target: None,
-                destination: Some(crate::sim::combat::TargetKind::Cell(gather.0, gather.1)),
+                destination: Some(crate::sim::combat::TargetKind::Cell(
+                    destination.0,
+                    destination.1,
+                )),
             });
         }
         None
@@ -8832,14 +10451,18 @@ impl SuperAi {
 
     /// The forming wave's production demand: the first core entry of the
     /// latched team's armor (`armor`) or foot wave whose members sit under
-    /// its count, gated the way the picks gate (`needs`, the tier-2 lab,
-    /// the anti-floater AA exemption). The vehicle and infantry chains
-    /// queue it ahead of their wheels — a wave short of its Rhinos does
-    /// not spend the factory on specialists, nor one short of its
-    /// Conscripts the barracks.
+    /// its count AND the house can honestly build (`can_build`, the
+    /// country-lock lesson), gated the way the picks gate (`needs`, the
+    /// tier-2 lab, the anti-floater AA exemption). The walk covers every
+    /// short type in turn (W2): the old feed answered the first short type
+    /// only, and when the house could not build it the whole feed parked
+    /// for the form clock. The vehicle and infantry chains queue the answer
+    /// ahead of their wheels — a wave short of its Rhinos does not spend the
+    /// factory on specialists, nor one short of its Conscripts the barracks.
     fn wave_shortage(
         &mut self,
         sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
         opening: &Opening,
         armor: bool,
     ) -> Option<&'static str> {
@@ -8862,7 +10485,14 @@ impl SuperAi {
                         .is_some_and(|entity| sim.interner.resolve(entity.type_ref()) == wanted)
                 })
                 .count();
-            if standing < count {
+            if standing >= count {
+                continue;
+            }
+            let buildable = rules.object(wanted).is_some_and(|ty| {
+                crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                    == crate::sim::production::CanBuild::Yes
+            });
+            if buildable {
                 return Some(wanted);
             }
         }
@@ -8875,6 +10505,7 @@ impl SuperAi {
     fn aa_economy_anchor(
         &self,
         sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
         opening: &Opening,
         unit: u64,
     ) -> Option<(i16, i16)> {
@@ -8892,7 +10523,14 @@ impl SuperAi {
             return None;
         }
         let from = (entity.position.rx() as i16, entity.position.ry() as i16);
-        let mut best: Option<(u32, (i16, i16))> = None;
+        let movement_zone = rules
+            .object(name)
+            .map(|ty| ty.movement_zone)
+            .unwrap_or_default();
+        // Openness (W3): an anchor whose own ring is a choke posts the flak
+        // into the jam; the nearest open anchor wins, the nearest closed
+        // one only when none is open.
+        let mut best: Option<(bool, u32, (i16, i16))> = None;
         for (_, entity) in sim.substrate.entities.iter_sorted() {
             if entity.owner() != self.house
                 || entity.category() != crate::map::entities::EntityCategory::Structure
@@ -8909,11 +10547,16 @@ impl SuperAi {
             let dx = i32::from(cell.0) - i32::from(from.0);
             let dy = i32::from(cell.1) - i32::from(from.1);
             let distance = (dx * dx + dy * dy) as u32;
-            if best.is_none_or(|(kept, _)| distance < kept) {
-                best = Some((distance, cell));
+            let closed = cell_openness(
+                sim,
+                movement_zone,
+                (entity.position.rx(), entity.position.ry()),
+            ) < OPEN_NEIGHBOR_FLOOR;
+            if best.is_none_or(|(kept_closed, kept, _)| (closed, distance) < (kept_closed, kept)) {
+                best = Some((closed, distance, cell));
             }
         }
-        best.map(|(_, cell)| cell)
+        best.map(|(_, _, cell)| cell)
     }
 
     /// The garrison limb's one order for this tick, or `None`; see the
@@ -9644,8 +11287,10 @@ impl SuperAi {
         // meets on the way. The standing set holds the posted and idle
         // combat roster (hero, boarders and raiders already excluded), so
         // this is the recall: the base's own garrison turns toward the
-        // fight instead of holding its ring while the yards burn.
-        if self.defenders.len() < DEFENSE_COMMIT_MIN {
+        // fight instead of holding its ring while the yards burn. The
+        // congestion hold (W3) pauses the recall while a cluster stands
+        // detected — a recall into the corridor feeds the jam.
+        if self.defenders.len() < DEFENSE_COMMIT_MIN && self.congestion_center.is_none() {
             let standing = self.standing_combat_units(sim, opening);
             let mut best: Option<(i32, u64)> = None;
             for unit in standing {
@@ -9743,19 +11388,23 @@ impl SuperAi {
     }
 
     /// The hostile structures a wave marches on, in the substrate's stable
-    /// order with each one's cell: the enemy's war factories first — a wave
+    /// order with each one's cell: the enemy's construction yards first (a
+    /// raid that takes the yard takes the base — the chrono steal's and
+    /// the engineer raid's prize, W6), then its war factories — a wave
     /// that razes production starves the reinforcements and snowballs — or
-    /// any hostile structure when no factory stands. Allies and passive
-    /// houses never count as hostile. Wave dispatches cycle this list by unit
-    /// id, so the group fans out over the target base; each destination is a
-    /// live building's own cell, which is always reachable-adjacent. An
-    /// entity still held by its constructor sits in limbo at (0,0) by native
-    /// semantics (`telemetry.rs`), so an under-construction factory is not a
-    /// (0,0) target — the replay's other half of the bridgehead jam.
+    /// any hostile structure when neither stands. Allies and passive
+    /// houses never count as hostile. Wave dispatches cycle this list by
+    /// unit id, so the group fans out over the target base; each
+    /// destination is a live building's own cell, which is always
+    /// reachable-adjacent. An entity still held by its constructor sits in
+    /// limbo at (0,0) by native semantics (`telemetry.rs`), so an
+    /// under-construction factory is not a (0,0) target — the replay's
+    /// other half of the bridgehead jam.
     fn enemy_priority_targets(
         &self,
         sim: &crate::sim::world::Simulation,
     ) -> Vec<(u64, (i16, i16))> {
+        let mut yards = Vec::new();
         let mut factories = Vec::new();
         let mut structures = Vec::new();
         for (id, entity) in sim.substrate.entities.iter_sorted() {
@@ -9767,15 +11416,18 @@ impl SuperAi {
             }
             let cell = (entity.position.rx() as i16, entity.position.ry() as i16);
             let name = sim.interner.resolve(entity.type_ref());
-            if WAR_FACTORY_TYPES.contains(&name) {
+            if CONYARD_TYPES.contains(&name) {
+                yards.push((id, cell));
+            } else if WAR_FACTORY_TYPES.contains(&name) {
                 factories.push((id, cell));
             }
             structures.push((id, cell));
         }
-        if factories.is_empty() {
-            structures
+        if !yards.is_empty() || !factories.is_empty() {
+            yards.extend(factories);
+            yards
         } else {
-            factories
+            structures
         }
     }
 
@@ -9969,6 +11621,733 @@ impl SuperAi {
             return Some(Command::ToggleRepair { entity_id: id });
         }
         None
+    }
+
+    // ---- The traffic limb (W3): congestion, the engine regroup, the
+    // outpost carrier's demand ----
+
+    /// The congestion limb's batch for this scan, or empty; see the call
+    /// site in [`Self::orders`]. The scan snapshots every own ground unit's
+    /// cell (the `stuck_since` shape) and detects a cluster:
+    /// [`CONGESTION_CLUSTER_MIN`] own ground units with no displacement
+    /// over the window standing within [`CONGESTION_CLUSTER_RADIUS`] of one
+    /// of them. On a cluster the parked members (no live destination —
+    /// posted units included, the engine's Scatter moves only those)
+    /// scatter, and the members still holding a destination step to the
+    /// nearest open cell ([`cell_openness`]) on their own side — toward
+    /// home — of the jam; the cluster's center latches into
+    /// `congestion_center` and holds the wave march, the rescue and the
+    /// alarm recall until a later scan shows it cleared.
+    fn congestion_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        home: (i16, i16),
+        tick: u32,
+    ) -> Vec<Command> {
+        let roster = Self::combat_roster(opening);
+        // The displacement window: refresh every own ground unit's
+        // snapshot, prune the gone.
+        let mut stationary: Vec<(u64, (u16, u16))> = Vec::new();
+        for (id, entity) in sim.substrate.entities.iter_sorted() {
+            if entity.owner() != self.house
+                || entity.lifecycle.in_limbo()
+                || !entity.lifecycle.object_alive()
+                || entity.category() != crate::map::entities::EntityCategory::Unit
+                || Self::is_fly_type(rules, sim.interner.resolve(entity.type_ref()))
+                || Self::garrisoned(entity)
+            {
+                continue;
+            }
+            let type_name = sim.interner.resolve(entity.type_ref());
+            if !roster.contains(&type_name) && !Self::is_naval_type(opening, type_name) {
+                continue;
+            }
+            let cell = (entity.position.rx(), entity.position.ry());
+            let snapshot = self.congestion_snapshot.entry(id).or_insert((cell, tick));
+            if snapshot.0 != cell {
+                *snapshot = (cell, tick);
+            } else if snapshot.1 != tick {
+                // Unchanged since an earlier scan: no displacement over
+                // the window.
+                stationary.push((id, cell));
+            }
+        }
+        self.congestion_snapshot
+            .retain(|id, _| sim.substrate.entities.get(*id).is_some());
+        // The cluster: the first stationary unit (stable order) with the
+        // quota of stationary own ground units inside its radius.
+        let cluster = stationary
+            .iter()
+            .find(|(_, cell)| {
+                stationary
+                    .iter()
+                    .filter(|(_, other)| {
+                        (i32::from(other.0) - i32::from(cell.0)).abs()
+                            <= i32::from(CONGESTION_CLUSTER_RADIUS)
+                            && (i32::from(other.1) - i32::from(cell.1)).abs()
+                                <= i32::from(CONGESTION_CLUSTER_RADIUS)
+                    })
+                    .count()
+                    >= CONGESTION_CLUSTER_MIN
+            })
+            .map(|(_, cell)| *cell);
+        self.congestion_center = cluster;
+        let Some(center) = cluster else {
+            return Vec::new();
+        };
+        // The members: every own ground unit (moving or not — the movers
+        // are the ones the regroup is still dragging in) standing inside
+        // the radius, in stable order.
+        let members: Vec<(u64, (u16, u16))> = sim
+            .substrate
+            .entities
+            .iter_sorted()
+            .filter(|(id, entity)| {
+                entity.owner() == self.house
+                    && entity.lifecycle.object_alive()
+                    && !entity.lifecycle.in_limbo()
+                    && entity.category() == crate::map::entities::EntityCategory::Unit
+                    && !Self::is_fly_type(rules, sim.interner.resolve(entity.type_ref()))
+                    && !Self::garrisoned(entity)
+                    && (i32::from(entity.position.rx()) - i32::from(center.0)).abs()
+                        <= i32::from(CONGESTION_CLUSTER_RADIUS)
+                    && (i32::from(entity.position.ry()) - i32::from(center.1)).abs()
+                        <= i32::from(CONGESTION_CLUSTER_RADIUS)
+                    && self.order_gate.get(id).is_none_or(|&due| tick >= due)
+            })
+            .map(|(id, entity)| (id, (entity.position.rx(), entity.position.ry())))
+            .collect();
+        let mut commands: Vec<Command> = Vec::new();
+        for (unit, at) in members {
+            let Some(entity) = sim.substrate.entities.get(unit) else {
+                continue;
+            };
+            let holds_destination = entity.navigation.nav_com().is_some()
+                || crate::sim::movement::motion_query::is_moving(entity) == Some(true);
+            let movement_zone = rules
+                .object(sim.interner.resolve(entity.type_ref()))
+                .map(|ty| ty.movement_zone)
+                .unwrap_or_default();
+            if !holds_destination {
+                // The engine's Scatter answers only parked units — the
+                // posted ones included (a re-post by scatter: the cluster
+                // cleared, the poster takes them back).
+                self.gate_idle_order(unit, tick);
+                commands.push(Command::Scatter { entity_id: unit });
+                continue;
+            }
+            // The movers step to the nearest open cell on their own side —
+            // strictly closer to home than where they stand, so the stream
+            // backs out of the corridor instead of pushing through it.
+            let discharge = if self.futility_suppressed(unit, FutilityKind::Wave, tick) {
+                None
+            } else {
+                (1..=6).find_map(|_radius| {
+                    (0..SPREAD_OFFSETS.len())
+                        .map(|index| (unit as usize + index) % SPREAD_OFFSETS.len())
+                        .filter_map(|index| {
+                            let spread = SPREAD_OFFSETS[index];
+                            let cell = on_map_cell(
+                                sim,
+                                (
+                                    at.0 as i16 + i16::from(spread.0),
+                                    at.1 as i16 + i16::from(spread.1),
+                                ),
+                                (at.0 as i16, at.1 as i16),
+                            );
+                            let on_own_side = (i32::from(cell.0) - i32::from(home.0))
+                                .abs()
+                                .max((i32::from(cell.1) - i32::from(home.1)).abs())
+                                < (i32::from(at.0) - i32::from(home.0))
+                                    .abs()
+                                    .max((i32::from(at.1) - i32::from(home.1)).abs());
+                            (on_own_side
+                                && zones_connected(sim, movement_zone, at, cell)
+                                && cell_openness(sim, movement_zone, cell) >= OPEN_NEIGHBOR_FLOOR)
+                                .then_some(cell)
+                        })
+                        .min_by_key(|cell| {
+                            (
+                                (i32::from(cell.0) - i32::from(at.0))
+                                    .abs()
+                                    .max((i32::from(cell.1) - i32::from(at.1)).abs()),
+                                *cell,
+                            )
+                        })
+                })
+            };
+            let Some(cell) = discharge else {
+                continue;
+            };
+            self.gate_idle_order(unit, tick);
+            commands.push(Command::Move {
+                entity_id: unit,
+                target_rx: cell.0,
+                target_ry: cell.1,
+            });
+        }
+        commands
+    }
+
+    /// The engine's yard-deploy regroup counter-limb (W3): the units still
+    /// aiming at the engine's own regroup cell (the base centre's cell,
+    /// within the regroup search's own reach) from past
+    /// [`ENGINE_REGROUP_FAR_CELLS`] are re-posted on their own side —
+    /// a Guard on the first connected spread cell around where they stand —
+    /// instead of walking the whole way back through every corridor the
+    /// AI's own streams use. Capped so a huge regroup cannot own the pass.
+    fn engine_regroup_reposts(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        engine_home: (i16, i16),
+        tick: u32,
+    ) -> Vec<Command> {
+        const REPOST_CAP: usize = 8;
+        let mut commands: Vec<Command> = Vec::new();
+        for (id, entity) in sim.substrate.entities.iter_sorted() {
+            if commands.len() >= REPOST_CAP {
+                break;
+            }
+            if entity.owner() != self.house
+                || entity.lifecycle.in_limbo()
+                || !entity.lifecycle.object_alive()
+                || !matches!(
+                    entity.category(),
+                    crate::map::entities::EntityCategory::Unit
+                        | crate::map::entities::EntityCategory::Infantry
+                )
+                || self.order_gate.get(&id).is_some_and(|&due| tick < due)
+                || self.defenders.contains(&id)
+                || self.boarders.contains(&id)
+                || self.raiders.contains(&id)
+                || self.raid_involves(id)
+            {
+                continue;
+            }
+            // The regroup's own aim: a Cell destination inside the regroup
+            // search's reach of the engine base centre.
+            let Some(crate::sim::components::NavTargetRef::Cell {
+                rx: dest_x,
+                ry: dest_y,
+            }) = entity.navigation.nav_com()
+            else {
+                continue;
+            };
+            if (i32::from(dest_x) - i32::from(engine_home.0)).abs() > 3
+                || (i32::from(dest_y) - i32::from(engine_home.1)).abs() > 3
+            {
+                continue;
+            }
+            let at = (entity.position.rx() as i16, entity.position.ry() as i16);
+            let far = (i32::from(at.0) - i32::from(engine_home.0))
+                .abs()
+                .max((i32::from(at.1) - i32::from(engine_home.1)).abs())
+                > ENGINE_REGROUP_FAR_CELLS;
+            if !far {
+                continue;
+            }
+            let type_name = sim.interner.resolve(entity.type_ref());
+            let Some(cell) = connected_ring_cell(
+                sim,
+                rules,
+                at,
+                (at.0.max(0) as u16, at.1.max(0) as u16),
+                id,
+                type_name,
+            ) else {
+                continue;
+            };
+            self.gate_idle_order(id, tick);
+            commands.push(Command::Guard {
+                entity_id: id,
+                target: Some(crate::sim::combat::TargetKind::Cell(cell.0, cell.1)),
+            });
+        }
+        commands
+    }
+
+    /// The outpost carrier's demand arm (P5): the outpost's guard ring
+    /// stands short — under half the reserve's own combat units inside its
+    /// cluster ring — or the live wave's gather cell sits nearer the
+    /// outpost than home. That is where the rollout fights, so the primary
+    /// flag holds there.
+    fn outpost_carrier_demand(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        outpost: Option<(i16, i16)>,
+    ) -> bool {
+        let Some(outpost) = outpost else {
+            return false;
+        };
+        let Some(opening) = self.pinned_opening else {
+            return false;
+        };
+        let roster = Self::combat_roster(opening);
+        let guard = sim
+            .substrate
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.owner() == self.house
+                    && entity.lifecycle.object_alive()
+                    && !entity.lifecycle.in_limbo()
+                    && !Self::is_fly_type(rules, sim.interner.resolve(entity.type_ref()))
+                    && roster.contains(&sim.interner.resolve(entity.type_ref()))
+                    && (i32::from(entity.position.rx()) - i32::from(outpost.0)).abs()
+                        <= i32::from(BASE_CLUSTER_RADIUS)
+                    && (i32::from(entity.position.ry()) - i32::from(outpost.1)).abs()
+                        <= i32::from(BASE_CLUSTER_RADIUS)
+            })
+            .count();
+        if guard < GUARD_RESERVE / 2 {
+            return true;
+        }
+        if let Some((gx, gy)) = self.wave_gather {
+            let to_outpost = (i32::from(gx) - i32::from(outpost.0))
+                .abs()
+                .max((i32::from(gy) - i32::from(outpost.1)).abs());
+            return self.pinned_home.is_some_and(|home| {
+                to_outpost
+                    < (i32::from(gx) - i32::from(home.0))
+                        .abs()
+                        .max((i32::from(gy) - i32::from(home.1)).abs())
+            });
+        }
+        false
+    }
+
+    // ---- The superweapon suite's follow-throughs (W6) ----
+
+    /// The curtained column's and the warped prism drop's strike legs, one
+    /// attack-move per tick, each bounded by its special's own clock (the
+    /// curtain's life, the prism drop's one strike clock); see
+    /// [`Self::superweapon_orders`].
+    fn superweapon_followthrough_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        tick: u32,
+    ) -> Option<Command> {
+        let alive = |actor: u64| {
+            sim.substrate.entities.get(actor).is_some_and(|entity| {
+                entity.owner() == self.house && entity.lifecycle.object_alive()
+            })
+        };
+        // The Iron Curtain column: attack-moves at the nearest enemy
+        // base-defense cluster, the war factory the fallback.
+        if let Some((pad, fired, units)) = self.iron_column.clone() {
+            if tick.saturating_sub(fired) >= IRON_CURTAIN_LIFE_TICKS
+                || units.iter().all(|unit| !alive(*unit))
+            {
+                self.iron_column = None;
+            } else if let Some(unit) = units.iter().copied().find(|&unit| {
+                alive(unit)
+                    && self.order_gate.get(&unit).is_none_or(|&due| tick >= due)
+                    && sim.substrate.entities.get(unit).is_some_and(|entity| {
+                        matches!(
+                            entity.passive_acquire_mission(),
+                            crate::sim::mission::MissionType::None
+                                | crate::sim::mission::MissionType::Sleep
+                                | crate::sim::mission::MissionType::Guard
+                                | crate::sim::mission::MissionType::AreaGuard
+                        )
+                    })
+            }) {
+                let aim = self.nearest_enemy_gun_cell(sim, rules, pad);
+                if let Some(cell) = aim {
+                    self.gate_idle_order(unit, tick);
+                    return Some(Command::AttackMove {
+                        entity_id: unit,
+                        target: None,
+                        destination: Some(crate::sim::combat::TargetKind::Cell(cell.0, cell.1)),
+                    });
+                }
+            }
+        }
+        // The warped prism drop: attack-moves at the nearest enemy power,
+        // then the refinery line, for one strike clock.
+        if let Some((landed, units)) = self.prism_drop.clone() {
+            if tick.saturating_sub(landed) >= WAVE_MARCH_TIMEOUT_TICKS
+                || units.iter().all(|unit| !alive(*unit))
+            {
+                self.prism_drop = None;
+            } else if let Some(unit) = units.iter().copied().find(|&unit| {
+                alive(unit)
+                    && self.order_gate.get(&unit).is_none_or(|&due| tick >= due)
+                    && sim.substrate.entities.get(unit).is_some_and(|entity| {
+                        matches!(
+                            entity.passive_acquire_mission(),
+                            crate::sim::mission::MissionType::None
+                                | crate::sim::mission::MissionType::Sleep
+                                | crate::sim::mission::MissionType::Guard
+                                | crate::sim::mission::MissionType::AreaGuard
+                        )
+                    })
+            }) {
+                let from = sim
+                    .substrate
+                    .entities
+                    .get(unit)
+                    .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))
+                    .unwrap_or((0, 0));
+                let aim = self
+                    .nearest_enemy_type_cell(sim, &ENEMY_POWER_TYPES, from)
+                    .or_else(|| self.nearest_enemy_type_cell(sim, &ENEMY_REFINERY_TYPES, from));
+                if let Some(cell) = aim {
+                    self.gate_idle_order(unit, tick);
+                    return Some(Command::AttackMove {
+                        entity_id: unit,
+                        target: None,
+                        destination: Some(crate::sim::combat::TargetKind::Cell(cell.0, cell.1)),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// The nearest enemy base-defense structure's cell from `from`, the war
+    /// factory the fallback, any hostile structure the last — the curtained
+    /// column's aim.
+    fn nearest_enemy_gun_cell(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        _rules: &crate::rules::ruleset::RuleSet,
+        from: (u16, u16),
+    ) -> Option<(u16, u16)> {
+        let mut best: Option<(usize, i32, (u16, u16))> = None;
+        for (_, entity) in sim.substrate.entities.iter_sorted() {
+            if entity.category() != crate::map::entities::EntityCategory::Structure
+                || entity.lifecycle.in_limbo()
+                || !self.is_enemy(sim, entity.owner())
+            {
+                continue;
+            }
+            let name = sim.interner.resolve(entity.type_ref());
+            if !(WAVE_DEFENSE_TYPES.contains(&name)
+                || WAR_FACTORY_TYPES.contains(&name)
+                || CONYARD_TYPES.contains(&name))
+            {
+                continue;
+            }
+            let class = usize::from(!WAVE_DEFENSE_TYPES.contains(&name));
+            let cell = (entity.position.rx(), entity.position.ry());
+            let distance = (i32::from(cell.0) - i32::from(from.0))
+                .abs()
+                .max((i32::from(cell.1) - i32::from(from.1)).abs());
+            if best.is_none_or(|(kept_class, kept_distance, _)| {
+                (class, distance) < (kept_class, kept_distance)
+            }) {
+                best = Some((class, distance, cell));
+            }
+        }
+        best.map(|(_, _, cell)| cell)
+    }
+
+    /// The nearest standing enemy structure of one of `types`, from `from`.
+    fn nearest_enemy_type_cell(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        types: &[&str],
+        from: (i16, i16),
+    ) -> Option<(u16, u16)> {
+        let mut best: Option<(i32, (u16, u16))> = None;
+        for (_, entity) in sim.substrate.entities.iter_sorted() {
+            if entity.category() != crate::map::entities::EntityCategory::Structure
+                || entity.lifecycle.in_limbo()
+                || !self.is_enemy(sim, entity.owner())
+                || !types.contains(&sim.interner.resolve(entity.type_ref()))
+            {
+                continue;
+            }
+            let cell = (entity.position.rx(), entity.position.ry());
+            let distance = (i32::from(cell.0) - i32::from(from.0))
+                .abs()
+                .max((i32::from(cell.1) - i32::from(from.1)).abs());
+            if best.is_none_or(|(kept, _)| distance < kept) {
+                best = Some((distance, cell));
+            }
+        }
+        best.map(|(_, cell)| cell)
+    }
+
+    // ---- The chrono engineer steal (W6, S-B) ----
+
+    /// The chrono steal's one batch for this tick, or empty; see the call
+    /// site in [`Self::orders`]. An armed cycle (see [`ChronoSteal`])
+    /// marches every tick — the Enter walks one actor per window, the
+    /// staged ride holds its pad until the suite's two clicks warp it, the
+    /// unload waits out [`CHRONO_RIDE_DELAY_TICKS`], the capture clicks
+    /// walk the engineers in. Arming a fresh cycle is the paced half:
+    /// behind the cooldown, when the house owns the Chronosphere special
+    /// and the enemy conyard stands, it secures the crew — idle engineers
+    /// up to three (one commissioned per window through the shared stock
+    /// cap) and an idle ride (the Battle Fortress first, the side's own
+    /// engineer ride behind it; one commissioned when none stands).
+    fn chrono_steal_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        _home_center: Option<(i16, i16)>,
+        tick: u32,
+    ) -> Vec<Command> {
+        if let Some(stage) = self.chrono_steal.clone() {
+            // The hard stage budget: a leg that has not landed in this
+            // long tears the steal down into the cooldown.
+            if tick.saturating_sub(self.chrono_steal_since) >= RAID_STAGE_TIMEOUT_TICKS {
+                self.chrono_steal = None;
+                self.chrono_steal_cooldown_until = tick + RAID_COOLDOWN_TICKS;
+                return Vec::new();
+            }
+            // Liveness: any lost actor ends the cycle.
+            if stage.actors().into_iter().any(|actor| {
+                sim.substrate.entities.get(actor).is_none_or(|entity| {
+                    entity.owner() != self.house || !entity.lifecycle.object_alive()
+                })
+            }) {
+                self.chrono_steal = None;
+                self.chrono_steal_cooldown_until = tick + RAID_COOLDOWN_TICKS;
+                return Vec::new();
+            }
+            let idle = |actor: u64| {
+                sim.substrate.entities.get(actor).is_some_and(|entity| {
+                    matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    )
+                })
+            };
+            return match stage {
+                ChronoSteal::Loading { engineers, ride } => {
+                    let aboard = |actor: u64| {
+                        sim.substrate.entities.get(ride).is_some_and(|entity| {
+                            entity
+                                .passenger_role
+                                .cargo()
+                                .is_some_and(|cargo| cargo.passengers().contains(&actor))
+                        })
+                    };
+                    let pending: Vec<u64> = engineers
+                        .iter()
+                        .copied()
+                        .filter(|&actor| !aboard(actor))
+                        .collect();
+                    if pending.is_empty() {
+                        // Latch the pad (the ride's own cell) and the prize.
+                        let pad = sim
+                            .substrate
+                            .entities
+                            .get(ride)
+                            .map(|entity| (entity.position.rx(), entity.position.ry()));
+                        let target = self.enemy_conyard(sim, None);
+                        if let (Some(pad), Some((target, _))) = (pad, target) {
+                            self.chrono_steal = Some(ChronoSteal::Staging {
+                                engineers,
+                                ride,
+                                pad,
+                                target,
+                            });
+                            self.chrono_steal_since = tick;
+                        }
+                        return Vec::new();
+                    }
+                    self.chrono_steal = Some(ChronoSteal::Loading { engineers, ride });
+                    if let Some(actor) = pending.into_iter().find(|&actor| {
+                        idle(actor) && self.order_gate.get(&actor).is_none_or(|&due| tick >= due)
+                    }) {
+                        self.gate_idle_order(actor, tick);
+                        return vec![Command::clicked_mission(
+                            actor,
+                            crate::sim::mission::MissionType::Enter,
+                            crate::sim::combat::TargetKind::Entity(ride),
+                        )];
+                    }
+                    Vec::new()
+                }
+                ChronoSteal::Staging {
+                    engineers,
+                    ride,
+                    pad,
+                    target,
+                } => {
+                    // The ride holds the pad until the suite's two clicks
+                    // fire; a ride drifted off the pad walks back on.
+                    let at = sim
+                        .substrate
+                        .entities
+                        .get(ride)
+                        .map(|entity| (entity.position.rx(), entity.position.ry()));
+                    if at == Some(pad) {
+                        return Vec::new();
+                    }
+                    if idle(ride) && self.order_gate.get(&ride).is_none_or(|&due| tick >= due) {
+                        self.gate_idle_order(ride, tick);
+                        return vec![Command::Move {
+                            entity_id: ride,
+                            target_rx: pad.0,
+                            target_ry: pad.1,
+                        }];
+                    }
+                    let _ = (engineers, target);
+                    Vec::new()
+                }
+                ChronoSteal::Warped {
+                    engineers,
+                    ride,
+                    target,
+                    since,
+                } => {
+                    if tick.saturating_sub(since) < CHRONO_RIDE_DELAY_TICKS {
+                        return Vec::new();
+                    }
+                    let on_foot = engineers.iter().any(|&actor| {
+                        sim.substrate.entities.get(actor).is_some_and(|entity| {
+                            entity.owner() == self.house
+                                && entity.lifecycle.object_alive()
+                                && !entity.lifecycle.in_limbo()
+                        })
+                    });
+                    if on_foot {
+                        self.chrono_steal = Some(ChronoSteal::Capturing { engineers, target });
+                        self.chrono_steal_since = tick;
+                        return Vec::new();
+                    }
+                    if idle(ride) && self.order_gate.get(&ride).is_none_or(|&due| tick >= due) {
+                        self.gate_idle_order(ride, tick);
+                        return vec![Command::UnloadPassengers { transport_id: ride }];
+                    }
+                    Vec::new()
+                }
+                ChronoSteal::Capturing { engineers, target } => {
+                    let target_stands = sim
+                        .substrate
+                        .entities
+                        .get(target)
+                        .is_some_and(|entity| entity.lifecycle.object_alive());
+                    if !target_stands {
+                        self.chrono_steal = None;
+                        self.chrono_steal_cooldown_until = tick + RAID_COOLDOWN_TICKS;
+                        return Vec::new();
+                    }
+                    let spares: Vec<(u64, (i16, i16))> = self
+                        .enemy_priority_targets(sim)
+                        .into_iter()
+                        .filter(|&(id, _)| id != target)
+                        .collect();
+                    for (index, &engineer) in engineers.iter().enumerate() {
+                        if !idle(engineer)
+                            || self
+                                .order_gate
+                                .get(&engineer)
+                                .is_some_and(|&due| tick < due)
+                        {
+                            continue;
+                        }
+                        let Some(aim) = (if index == 0 {
+                            Some(target)
+                        } else {
+                            spares.get(index - 1).map(|&(id, _)| id)
+                        }) else {
+                            continue;
+                        };
+                        self.gate_idle_order(engineer, tick);
+                        return vec![Command::CaptureBuilding {
+                            engineer_id: engineer,
+                            target_building_id: aim,
+                        }];
+                    }
+                    // The crew is spent (consumed or dead): the cycle is
+                    // done, the cooldown paces the next.
+                    self.chrono_steal = None;
+                    self.chrono_steal_cooldown_until = tick + RAID_COOLDOWN_TICKS;
+                    Vec::new()
+                }
+            };
+        }
+        // The arming half. The house must own the special (a live grant —
+        // the Allied second super, or a captured GACSPH), the cooldown and
+        // the arm window must stand open.
+        if tick < self.chrono_steal_cooldown_until {
+            return Vec::new();
+        }
+        let Some(sphere_type) = sim.interner.get("ChronoSphereSpecial") else {
+            return Vec::new();
+        };
+        if !sim
+            .super_weapons()
+            .get(&self.house)
+            .is_some_and(|house_sws| house_sws.contains_key(&sphere_type))
+        {
+            return Vec::new();
+        }
+        if self.enemy_conyard(sim, None).is_none() {
+            return Vec::new();
+        }
+        // The ride: the Battle Fortress first (the seats), the side's own
+        // engineer ride behind it.
+        let ride_names: Vec<&'static str> = [Some("BFRT"), opening.engineer_ride]
+            .into_iter()
+            .flatten()
+            .collect();
+        let ride = ride_names
+            .iter()
+            .copied()
+            .find_map(|name| self.find_raid_ride(sim, name, tick));
+        let Some(ride) = ride else {
+            // Commission the first ride type the factory can honestly
+            // build, queue dedup as the pacing.
+            let owner = sim.interner.resolve(self.house);
+            for name in ride_names {
+                let Some(ty) = rules.object(name) else {
+                    continue;
+                };
+                if crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                    != crate::sim::production::CanBuild::Yes
+                {
+                    continue;
+                }
+                let queued = crate::sim::production::queue_view_for_owner(sim, rules, owner)
+                    .iter()
+                    .any(|item| sim.interner.resolve(item.type_id) == name);
+                if queued {
+                    return Vec::new();
+                }
+                let Some(type_id) = sim.interner.get(name) else {
+                    continue;
+                };
+                return vec![Command::QueueProduction { type_id }];
+            }
+            return Vec::new();
+        };
+        let seats = sim
+            .substrate
+            .entities
+            .get(ride)
+            .and_then(|entity| entity.passenger_role.cargo().map(|cargo| cargo.capacity()))
+            .unwrap_or(1)
+            .max(1);
+        let engineers = self.find_raid_engineers(sim, opening, tick, seats.min(3) as usize);
+        if engineers.is_empty() {
+            let (standing, queued) = self.engineer_stock(sim, rules, opening);
+            if queued > 0 || standing + queued >= CAPTURE_ENGINEER_STOCK {
+                return Vec::new();
+            }
+            return self
+                .engineer_commission_type(sim, rules, opening)
+                .map(|type_id| vec![Command::QueueProduction { type_id }])
+                .unwrap_or_default();
+        }
+        self.chrono_steal = Some(ChronoSteal::Loading { engineers, ride });
+        self.chrono_steal_since = tick;
+        Vec::new()
     }
 }
 
@@ -10516,10 +12895,13 @@ fn find_site_around_capped(
 }
 
 /// The first guard-post cell around `base` that the ground rows connect the
-/// unit to, rotating the fixed fan-out offsets by unit id so a group
-/// spreads over neighboring cells instead of stacking on one. `None` — no
-/// connected offset; the caller spends only the unit's idle window (the
-/// order gate paces the retry) instead of marching it into the water.
+/// unit to and that passes the openness floor (W3 — a post in a one-cell
+/// pass is the jam's seed), rotating the fixed fan-out offsets by unit id
+/// so a group spreads over neighboring cells instead of stacking on one.
+/// A connected but closed cell is the fallback when no open one exists.
+/// `None` — no connected offset; the caller spends only the unit's idle
+/// window (the order gate paces the retry) instead of marching it into
+/// the water.
 fn pick_guard_post(
     sim: &crate::sim::world::Simulation,
     rules: &crate::rules::ruleset::RuleSet,
@@ -10533,9 +12915,9 @@ fn pick_guard_post(
         .object(sim.interner.resolve(entity.type_ref()))
         .map(|ty| ty.movement_zone)
         .unwrap_or_default();
-    (0..offsets.len())
+    let connected = (0..offsets.len())
         .map(|index| (unit as usize + index) % offsets.len())
-        .find_map(|index| {
+        .filter_map(|index| {
             let spread = offsets[index];
             let cell = on_map_cell(
                 sim,
@@ -10544,6 +12926,96 @@ fn pick_guard_post(
             );
             zones_connected(sim, movement_zone, from, cell).then_some(cell)
         })
+        .collect::<Vec<_>>();
+    connected
+        .iter()
+        .copied()
+        .find(|&cell| cell_openness(sim, movement_zone, cell) >= OPEN_NEIGHBOR_FLOOR)
+        .or_else(|| connected.first().copied())
+}
+
+/// The openness of a cell: how many of its eight neighbors stand on the
+/// map, connect to it in `movement_zone`'s rows (the zone grid answers
+/// cliffs, water and walls) and hold no structure or terrain object. The
+/// choke-avoid test the gather cell, the guard posts and the congestion
+/// discharge share against [`OPEN_NEIGHBOR_FLOOR`]; units are transient
+/// and do not count against a neighbor.
+fn cell_openness(
+    sim: &crate::sim::world::Simulation,
+    movement_zone: crate::rules::locomotor_type::MovementZone,
+    cell: (u16, u16),
+) -> usize {
+    let Some(terrain) = sim.resolved_terrain.as_ref() else {
+        // A terrain-less simulation: every neighbor is open.
+        return 8;
+    };
+    let max_x = i32::from(terrain.width() as u16).saturating_sub(1);
+    let max_y = i32::from(terrain.height() as u16).saturating_sub(1);
+    let mut open = 0usize;
+    for dy in -1i32..=1 {
+        for dx in -1i32..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let nx = i32::from(cell.0) + dx;
+            let ny = i32::from(cell.1) + dy;
+            if nx < 0 || ny < 0 || nx > max_x || ny > max_y {
+                continue;
+            }
+            let neighbor = (nx as u16, ny as u16);
+            if !zones_connected(sim, movement_zone, cell, neighbor) {
+                continue;
+            }
+            let blocked = sim
+                .cell_objects(
+                    neighbor,
+                    crate::sim::movement::locomotor::MovementLayer::Ground,
+                )
+                .any(|member| match member {
+                    crate::sim::occupancy::CellObjectMember::Terrain(_) => true,
+                    crate::sim::occupancy::CellObjectMember::Entity(id) => {
+                        sim.substrate.entities.get(id).is_some_and(|entity| {
+                            entity.category() == crate::map::entities::EntityCategory::Structure
+                        })
+                    }
+                });
+            if !blocked {
+                open += 1;
+            }
+        }
+    }
+    open
+}
+
+/// The chrono steal's drop point (W6): a passable cell two to three cells
+/// from the enemy conyard on home's side — the warp lands the source 3x3
+/// offset-preserving, so the engineers step off onto live ground beside
+/// their prize, not inside the yard's own footpoint.
+fn chrono_steal_dest(
+    sim: &crate::sim::world::Simulation,
+    home: (i16, i16),
+    conyard: (i16, i16),
+) -> Option<(u16, u16)> {
+    let dx = i32::from(home.0) - i32::from(conyard.0);
+    let dy = i32::from(home.1) - i32::from(conyard.1);
+    let len = dx.abs().max(dy.abs()).max(1);
+    let zone = crate::rules::locomotor_type::MovementZone::Normal;
+    for step in [2, 3] {
+        let cell = on_map_cell(
+            sim,
+            (
+                (i32::from(conyard.0) + dx * step / len) as i16,
+                (i32::from(conyard.1) + dy * step / len) as i16,
+            ),
+            conyard,
+        );
+        if zones_connected(sim, zone, cell, cell)
+            && cell_openness(sim, zone, cell) >= OPEN_NEIGHBOR_FLOOR
+        {
+            return Some(cell);
+        }
+    }
+    None
 }
 
 /// The first legal foundation for `ty` around `center` that also keeps
@@ -11241,7 +13713,8 @@ mod tests {
         );
 
         // The capture priority ranks every neutral-tech type exactly once,
-        // the oil derrick's class leading, and nothing outside the table.
+        // the airfield first (its paradrop grant outranks cash), and
+        // nothing outside the table.
         let ranks: Vec<Option<usize>> = TECH_BUILDING_TYPES
             .iter()
             .map(|name| capture_priority_rank(name))
@@ -11258,11 +13731,16 @@ mod tests {
             TECH_BUILDING_TYPES.len(),
             "every neutral-tech type ranks exactly once"
         );
-        assert_eq!(ranks[0], 0, "the ranked classes start at the oil derrick");
+        assert_eq!(ranks[0], 0, "the ranked classes start at the airfield");
+        assert_eq!(
+            capture_priority_rank("CAAIRP"),
+            Some(0),
+            "the airfield's paradrop grant leads the capture order"
+        );
         assert_eq!(
             capture_priority_rank("CAOILD"),
-            Some(0),
-            "the oil derrick's startup cash leads the capture order"
+            Some(1),
+            "the oil derrick's startup cash follows the airfield"
         );
         assert_eq!(
             capture_priority_rank("GACNST"),
