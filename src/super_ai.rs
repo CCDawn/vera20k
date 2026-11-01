@@ -179,16 +179,11 @@ const NAVAL_PROBE_TICKS: u32 = 900;
 /// game (no legal shoreline near any yard).
 const NAVAL_PROBE_MAX: u8 = 3;
 
-/// How many combat units must stand gathered (idle or on the guard post)
-/// before a wave launches as one mass: production has to outpace attrition
-/// first. Sized for the three-factory expansion — the faster queue gathers
-/// the group quickly enough that holding it costs less than the bigger
-/// punch gains.
-const ATTACK_WAVE_SIZE: usize = 18;
-
 /// How many standing combat units stay home whatever the offensive does: a
 /// base emptied of defenders loses to the first counterattack that walks
-/// past the marching wave.
+/// past the marching wave. A wave forms only while the standing pool
+/// outnumbers this reserve, and its picks spend the pool only past it —
+/// retail's team scripts never stripped the garrison either.
 const GUARD_RESERVE: usize = 4;
 
 /// Power plants the expansion ladder tops out at: each extra war factory
@@ -200,11 +195,53 @@ const POWER_TARGET: usize = 3;
 /// enough docks to keep five miners turning ore into credits.
 const REFINERY_TARGET: usize = 2;
 
-/// Ticks between wave episodes. A full pulse drains the standing set to the
-/// guard reserve; this interval lets production refill it before the next
-/// departure and bounds a wave whose dispatches were dropped to one wasted
-/// order per unit per interval.
-const WAVE_RETRY_TICKS: u32 = 300;
+/// The assault wave's cadence (retail `TeamDelays=2000` frames): the next
+/// wave decision runs this long after the previous episode's launch, and
+/// never while that episode still lives — one assault team alive at a
+/// time (retail `Max=1`). The interval lets production refill the
+/// composition between departures; an episode that outlasts it hands
+/// over to the next decision the tick it ends, and a form that never
+/// launched re-arms the full interval from its own end.
+const WAVE_CADENCE_TICKS: u32 = 2000;
+
+/// The retail gather point (`AISafeDistance`): the cells short of the
+/// enemy base the wave regroups at before the strike sequence runs, so the
+/// members arrive as one mass instead of single file from the rally.
+const WAVE_GATHER_DISTANCE: i16 = 20;
+
+/// Chebyshev cells from the gather cell within which a marched member
+/// counts as arrived: every member inside it (or the march clock) turns
+/// the march into the strike.
+const WAVE_GATHER_ARRIVAL: i16 = 3;
+
+/// Ticks a forming wave waits for its missing members before it launches
+/// with what stands: the composition is a demand, not a precondition — a
+/// war-poor base still attacks, with a thinner team, instead of holding
+/// its tanks home for the rest of the game.
+const WAVE_FORM_TIMEOUT_TICKS: u32 = 1500;
+
+/// Ticks the march to the gather cell may run before the strike sequence
+/// starts regardless: a member engaged on the way, or wedged, must not
+/// hold the whole wave at the regroup.
+const WAVE_MARCH_TIMEOUT_TICKS: u32 = 1800;
+
+/// Ticks one strike target may hold the wave: past it the episode ends and
+/// the members keep whatever attack-move they carry (the engine fights it
+/// out), so a target the wave cannot reach never pins the cadence.
+const WAVE_STRIKE_TIMEOUT_TICKS: u32 = 3000;
+
+/// Every side's core defense sections — the retail wave script's second
+/// quarry (base defenses) after the factories and before the generic
+/// buildings: pillboxes, AA towers, heavy towers and the two bunkers.
+const WAVE_DEFENSE_TYPES: [&str; 10] = [
+    "GAPILL", "NASAM", "ATESLA", "NALASR", "NAFLAK", "TESLA", "YAGGUN", "YAPSYT", "NABNKR",
+    "NATBNK",
+];
+
+/// Enemy superweapon buildings a wave's strike sequence leads with once
+/// they stand revealed (the counter-trigger table's priority strike): the
+/// Nuclear Silo and the Weather Controller — the two retail counters name.
+const WAVE_LEAD_SUPERWEAPON_TYPES: [&str; 2] = ["NAMISL", "GAWEAT"];
 
 /// Ticks between ore-field re-surveys while the expansion MCV waits: a
 /// survey without a deployable winner scans every candidate's
@@ -312,12 +349,14 @@ const STUCK_TIMEOUT: u32 = 600;
 /// line that holds the base exists.
 const CORE_BEFORE_SPECIALISTS: usize = 6;
 
-/// Out of every ten queue slots past the core, one goes to each
+/// Out of every ten queue slots past the core, two go to each
 /// specialist role and the situation can raise the demanded role to
 /// three: anti-air steps up while hostile aircraft exist, and
-/// armor-crackers against a hostile armored mass. The core keeps every
+/// armor-crackers against a hostile armored mass. The base share of two
+/// keeps a standing AA pair in every mix — the mobile answer exists
+/// before the first hostile aircraft does — and the core keeps every
 /// remaining slot.
-const ROLE_SHARE_BASE: usize = 1;
+const ROLE_SHARE_BASE: usize = 2;
 const ROLE_SHARE_BOOST: usize = 3;
 
 /// Retail's air-capable combat types the mix reacts to — the engine
@@ -335,9 +374,10 @@ const SW_FIRE_RETRY_TICKS: u32 = 150;
 
 /// The Allied jet wing's target size (retail Intruders `ORCA` / Korea's
 /// Black Eagles `BEAG`, both `Factory=AircraftType` off the Airforce
-/// Command). Four keeps the wing a real strike force without starving
-/// the ground queues the same wallet feeds.
-const AIR_WING_TARGET: usize = 4;
+/// Command). Six keeps the wing a real strike force — two full strike
+/// elements, not a four-jet token — without starving the ground queues
+/// the same wallet feeds.
+const AIR_WING_TARGET: usize = 6;
 
 /// Ticks one airstrike sortie waits before the next. The jets return,
 /// land and rearm natively after a strike; re-ordering them mid-sortie
@@ -372,10 +412,20 @@ const SCOUT_TARGET: usize = 2;
 const SPECIALIST_EVERY_VEHICLE: u32 = 4;
 const SPECIALIST_EVERY_INFANTRY: u32 = 3;
 
-/// Defense caps: two pillboxes hold the perimeter once tanks roll, AA
-/// rises only against air that actually fields (the limb re-reads it
-/// every slot, so peace drops the queue), and two heavy towers stand
-/// behind the radar their prerequisite names.
+/// The mobile-AA quota the vehicle pipeline owes the army: two of the
+/// roster's AntiAir vehicles stand before hostile air exists — the
+/// insurance pair the one-off commission used to buy — and every two
+/// hostile aircraft lift the target one more, capped at five. Cheap
+/// hulls (300-600) whose answer must exist when the bombers arrive, not
+/// after the first raid taught the mix wheel about them.
+const AA_UNIT_FLOOR: usize = 2;
+const AA_UNIT_CAP: usize = 5;
+
+/// Defense caps: two pillboxes hold the perimeter once tanks roll, the
+/// AA ring stands from the first tank onward and tiers up with the air
+/// war (per-yard quotas below — peace keeps one tower per yard as the
+/// baseline, hostile air lifts two, a real air force three), and two
+/// heavy towers stand behind the radar their prerequisite names.
 const BASIC_DEFENSE_TARGET: usize = 2;
 const AA_DEFENSE_CAP: usize = 2;
 const HEAVY_DEFENSE_CAP: usize = 2;
@@ -386,14 +436,66 @@ const HEAVY_DEFENSE_CAP: usize = 2;
 const DEFENSE_FLOOR: usize = 2;
 
 /// Per-base defense quotas (Layer 2): the house-wide caps above split per
-/// standing yard — each base carries its own pillboxes and AA, the heavy
-/// tower one per yard — so the expansion yard is not a naked foundation
-/// while the home ring holds every gun. The house-wide bound stays at
-/// twice the old caps, so the split can only move guns around, never
-/// inflate the armament program as a whole.
+/// standing yard — each base carries its own pillboxes, AA and bunkers,
+/// the heavy tower two per yard — so the expansion yard is not a naked
+/// foundation while the home ring holds every gun. The house-wide bounds
+/// ride the cap constants' multipliers in the quota rows, so the split
+/// can only move guns around, never inflate the armament program as a
+/// whole beyond the tier the air war justifies.
 const DEFENSE_PER_YARD_BASIC: usize = 2;
-const DEFENSE_PER_YARD_AA: usize = 2;
-const DEFENSE_PER_YARD_HEAVY: usize = 1;
+/// The AA tower's per-yard ladder: one always (a base never stands
+/// without its AA answer — the bombers must meet a tower, not a tower
+/// the first raid taught the queue to buy), two once hostile air
+/// actually fields, three against a real air force. Every side's tower
+/// wants only the barracks and its yard (retail `NASAM`/`NAFLAK`/`YAGGUN`
+/// `Prerequisite=BARRACKS,<yard>`, 1000 credits each), the steps the
+/// guns limb already sits behind, so the row needs no gate of its own.
+const DEFENSE_PER_YARD_AA_BASE: usize = 1;
+const DEFENSE_PER_YARD_AA_WARTIME: usize = 2;
+const DEFENSE_PER_YARD_AA_HEAVY: usize = 3;
+/// Hostile aircraft standing that count as a real air force: the tier
+/// where every yard wants its third AA tower.
+const AA_HEAVY_AIR_THREATS: usize = 4;
+const DEFENSE_PER_YARD_HEAVY: usize = 2;
+/// The bunker's per-yard quota (one per base) and its house-wide bound:
+/// the cheap garrison hole stands beside the pillboxes, and three cap
+/// the whole program.
+const DEFENSE_PER_YARD_BUNKER: usize = 1;
+const BUNKER_DEFENSE_CAP: usize = 3;
+
+/// The counter-trigger table (retail aimd's `Enemy owns >= N` triggers),
+/// read on the stuck scan's cadence. The air counter: six hostile
+/// aircraft standing arm the AA defense team — the mobile-AA quota's
+/// floor lifts to four hulls and the AntiAir role's share to six, the
+/// retail "6 FLAKT / 3 YTNK" shape fielded through the roster's own
+/// AntiAir rows (the Flak Trooper and the Rocketeer on the barracks
+/// wheel, the Gattling Tank on the vehicle quota). The floater counter:
+/// two hostile Floating Disks or Kirovs guard-post the AA vehicles over
+/// the house's own power plants and refineries — the anti-floater guard —
+/// instead of marching them in the waves.
+const AA_COUNTER_AIR_THREATS: usize = 6;
+const AA_COUNTER_VEHICLE_FLOOR: usize = 4;
+const AA_COUNTER_ROLE_SHARE: usize = 6;
+const FLOATER_COUNTER_THREATS: usize = 2;
+/// The floaters the anti-floater guard counts: the war-factory flyers that
+/// raid economy structures.
+const FLOATER_TYPES: [&str; 2] = ["DISK", "ZEP"];
+
+/// The garrison limb (Layer 3): the house's occupier infantry fill the
+/// nearest revealed neutral occupiable buildings and the side's own
+/// bunkers to the type's full `MaxNumberOccupants`, read off the rules row
+/// at order time (civilians ten, the Battle Bunker five). The scan walks
+/// every structure, so it runs on this window's pace like the stuck scan;
+/// the dispatch spends one capture click per tick in between.
+const GARRISON_SCAN_TICKS: u32 = 150;
+/// Civilian buildings the limb fills at once, nearest the home yard first:
+/// two holds the approaches without pulling the whole barracks output
+/// into the city.
+const GARRISON_BUILDING_TARGET: usize = 2;
+/// Garrison-demand soldiers the infantry queue may hold in production at
+/// once: the deficit feeds the barracks, bounded so a ten-slot civilian
+/// never monopolizes the line.
+const GARRISON_DEMAND_IN_PRODUCTION: usize = 2;
 
 /// The wall ring's wallet floor: a wall segment is 100 credits, and the
 /// ring spends dozens of them one production cycle at a time. The floor
@@ -623,15 +725,28 @@ const ENGINEER_CAPTURE_WINDOW_TICKS: u32 = 450;
 
 /// The capture chain's own preference order over [`TECH_BUILDING_TYPES`]:
 /// the oil derrick leads — its `ProduceCashStartup` pays the engineer back
-/// the moment he walks in, and its tick income compounds — then the stock
-/// list's order. Distance picks within a class, never across it.
+/// the moment he walks in, and its tick income compounds — then the
+/// airport, the machine shop, the hospital, and the rest (retail aimd
+/// sends an engineer team at the derrick and the airport first, the
+/// shop and hospital after, weighted 70 to 40). Distance picks within a
+/// class, never across it, and each building draws one engineer: a second
+/// one walking at the same derrick is an engineer spent on a building the
+/// first already takes.
 const CAPTURE_PRIORITY_TYPES: [&str; 6] =
-    ["CAOILD", "CAAIRP", "CATHOSP", "CAOUTP", "CAMACH", "CAPOWR"];
+    ["CAOILD", "CAAIRP", "CAMACH", "CATHOSP", "CAOUTP", "CAPOWR"];
 
 /// Total engineers (standing plus queued) the capture chain commissions up
 /// to: the bridge repair keeps its own one-at-a-time rule and outranks this
 /// limb, so the capture chain only ever spends the surplus above it.
 const CAPTURE_ENGINEER_STOCK: usize = 2;
+
+/// Ticks a neutral tech building rests after its latched engineer fell
+/// short of it — lost on the walk while the building still stands
+/// neutral — before the capture chain sends the next one: a derrick
+/// whose approach a hostile gun covers must not eat the engineer stock
+/// one walker per window. Four capture windows; a building that changed
+/// hands in the meantime drops out of the survey on its own.
+const CAPTURE_RETRY_TICKS: u32 = 1800;
 
 /// Ticks a finished (or failed) engineer ride keeps the raid limb asleep:
 /// an engineer-and-vehicle pair spent every cooldown would strip the AA
@@ -700,9 +815,13 @@ const ENEMY_POWER_TYPES: [&str; 3] = ["GAPOWR", "NAPOWR", "YAPOWR"];
 /// Enemy refineries the Floating Disk raids when no plant stands.
 const ENEMY_REFINERY_TYPES: [&str; 3] = ["GAREFN", "NAREFN", "YAREFN"];
 
-/// Neutral tech buildings the spy runs at (the stock YR
-/// `NeutralTechBuildings` list: airfield, hospital, oil derrick, outpost,
-/// machine shop, service pad).
+/// Neutral tech buildings the spy runs at — the engine's `[AI]
+/// NeutralTechBuildings=` list (Rules+ADC through the list reader,
+/// `ProcessedRulesLayers::neutral_tech_buildings`), retail value
+/// `CAAIRP,CATHOSP,CAOILD,CAOUTP,CAMACH,CAPOWR`: airfield, hospital, oil
+/// derrick, outpost, machine shop, civilian power plant. The capture chain
+/// walks the same set in its own preference order
+/// ([`CAPTURE_PRIORITY_TYPES`]).
 const TECH_BUILDING_TYPES: [&str; 6] =
     ["CAAIRP", "CATHOSP", "CAOILD", "CAOUTP", "CAMACH", "CAPOWR"];
 
@@ -720,6 +839,25 @@ const MCV_TYPES: [&str; 3] = ["AMCV", "SMCV", "PCV"];
 const RAIDER_DRONE: &str = "DRON";
 const RAIDER_IVAN: &str = "IVAN";
 const RAIDER_DISK: &str = "DISK";
+
+/// The assault wave's lifecycle (the retail team script's shape): the
+/// plan latches and its members gather, the formed wave marches at the
+/// gather cell short of the enemy base, the arrived wave strikes the
+/// latched sequence — factories, defenses, buildings — and hunts what
+/// stands. Idle between episodes; the cadence re-arms it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WaveStage {
+    /// No live wave.
+    Idle,
+    /// The plan latched; its members gather at their posts while the
+    /// production feed fills the missing ones (or the form clock fires).
+    Forming,
+    /// Launched: the members dispatch one per tick at the gather cell.
+    Marching,
+    /// Arrived: the members strike the latched target sequence, then the
+    /// hunt.
+    Striking,
+}
 
 /// The order kinds the futility backoff tracks. One kind per entity at a
 /// time: a different kind (or a moved aim) restarts the streak.
@@ -852,6 +990,46 @@ struct RosterEntry {
     needs: Option<&'static str>,
 }
 
+/// One retail assault team of the side's wave phases (the aimd team
+/// scripts): the armor composition and the infantry wave that marches with
+/// it, plus the extras the team attaches. The core `armor`/`infantry`
+/// entries are the wave's demand — the production feed fills them before
+/// the wheels resume — while `secondary` members only join if they already
+/// stand (never demanded, never block the launch) and `escort` pairs air
+/// onto the hard tank phases the way retail scripts bolt the flight onto
+/// them.
+#[derive(Clone, Copy)]
+struct WavePlan {
+    /// `(type, count)` pairs, lead element first: the wave's armor core.
+    /// The lead names the team — a sibling whose lead the house cannot
+    /// field yet (the V3 behind its radar) yields its turn to the phase's
+    /// first team.
+    armor: &'static [(&'static str, usize)],
+    /// `(type, count)` pairs: the foot wave that marches beside it.
+    infantry: &'static [(&'static str, usize)],
+    /// The air escort's jet count, drawn at the strike from the side's own
+    /// wing ([`Opening::aircraft`] — the Intruders, Korea's Black Eagles):
+    /// retail hard waves pair jets onto the armor. The draw waits for a
+    /// wing standing at [`AIR_WING_TARGET`] — the wing's own queue is what
+    /// fills it toward the target — so the sortie limb never flies
+    /// short-handed for the escort. `0` where the phase pairs none or the
+    /// side fields no aircraft factory.
+    escort: usize,
+    /// Members that tag along if standing — the Apocalypse wave's drone
+    /// screen — never queued by the demand feed.
+    secondary: &'static [(&'static str, usize)],
+}
+
+impl WavePlan {
+    /// The core entries, armor then infantry, in demand order.
+    fn core(&self) -> impl Iterator<Item = (&'static str, usize)> {
+        self.armor
+            .iter()
+            .copied()
+            .chain(self.infantry.iter().copied())
+    }
+}
+
 /// One side's opening build, by retail type name. The construction yard each
 /// MCV deploys into names the side (`GACNST`/`NACNST`/`YACNST`).
 struct Opening {
@@ -931,6 +1109,16 @@ struct Opening {
     defense_basic: &'static str,
     defense_aa: &'static str,
     defense_heavy: &'static str,
+    /// The side's garrison bunker: the Soviet Battle Bunker `[NABNKR]`
+    /// (500 credits, `Prerequisite=NACNST` alone; `CanBeOccupied=yes`,
+    /// `MaxNumberOccupants=5` — five occupier soldiers fire from it) and
+    /// Yuri's Tank Bunker `[NATBNK]` (400, `Prerequisite=YACNST` alone;
+    /// `Bunker=yes` — a one-vehicle hole: one armed turret tank installs
+    /// through the engine's radio contact, never an infantry garrison).
+    /// The garrison limb reads the rules flags to tell the two apart. The
+    /// Allies field none at retail, so their entry stays `None` and the
+    /// quota row sleeps.
+    defense_bunker: Option<&'static str>,
     /// The side's wall segment (retail `Wall=yes` BuildingType — the Defense
     /// queue's perimeter ring, one cell per production cycle): the Allied
     /// Concrete Wall behind its barracks, the Soviet Wall behind its Hand,
@@ -986,8 +1174,29 @@ struct Opening {
     /// `MovementZone=Fly`): the Kirov `ZEP` behind the Soviet lab and the
     /// Floating Disk `DISK` behind Yuri's. The Allies field none — their
     /// air power rides the aircraft tab — so the field stays `None` there
-    /// and the one-off commission sleeps.
+    /// and the wing quota sleeps.
     siege_flyer: Option<&'static str>,
+    /// The flyer wing's target size: the commission tops the type up to
+    /// this many (live plus in-production) and replenishes a lost flyer
+    /// through the same count check, paced by the per-type retry gate.
+    siege_flyer_target: u8,
+    /// The side's second war-factory flyer and its quota: the Soviet
+    /// Siege Chopper `SCHP` rides the same lab as the Kirov and fields a
+    /// smaller strike element behind it. `None` — the target `0` with it —
+    /// where the side's flyer line is a single type.
+    siege_second: Option<&'static str>,
+    siege_second_target: u8,
+    /// The side's assault waves by phase (retail aimd compositions, the
+    /// Easy/Normal/Hard team rows): `[0]` before the battle lab stands,
+    /// `[1]` with the lab standing, `[2]` under the late-game sink. Each
+    /// phase lists its sibling teams — retail's equal-weight teams for the
+    /// same trigger conditions, the Rhino wave beside the V3 bombardment —
+    /// and successive episodes take them in turn. The wave limb latches
+    /// the phase's team when the cadence fires, the production feed fills
+    /// its missing members, and the march runs the retail script shape —
+    /// regroup, gather short of the enemy base, strike factories, defenses,
+    /// buildings, then hunt.
+    waves: [&'static [WavePlan]; 3],
     /// The side's scout: a barracks-cheap fast eye the fork keeps
     /// [`SCOUT_TARGET`] of alive and walks into unrevealed territory.
     /// Retail's own dogs are counter-infiltration base guards — the
@@ -1194,6 +1403,9 @@ const OPENINGS: [Opening; 3] = [
         defense_basic: "GAPILL",
         defense_aa: "NASAM",
         defense_heavy: "ATESLA",
+        // No bunker at retail: the Allies garrison nothing — their
+        // pillbox is the cheap perimeter hole.
+        defense_bunker: None,
         wall: Some("GAWALL"),
         gap_generator: Some("GAGAP"),
         country_cannon: Some("GTGCAN"),
@@ -1207,8 +1419,39 @@ const OPENINGS: [Opening; 3] = [
         naval_capital: Some("CARRIER"),
         aircraft: &["BEAG", "ORCA"],
         // No siege flyer: the Allies' war factory fields no flying unit —
-        // their heavy air is the aircraft tab the wing already owns.
+        // their heavy air is the aircraft tab the wing already owns. The
+        // quota row sleeps with its zero targets.
         siege_flyer: None,
+        siege_flyer_target: 0,
+        siege_second: None,
+        siege_second_target: 0,
+        // The Allied waves (retail aimd E/N/H): three Grizzlies with a
+        // GI/Guardian pair early; four Grizzlies, a Mirage and a Prism
+        // behind the lab with two jets paired on; the ultra wave of six
+        // Grizzlies, three Prisms and four IFVs under the late sink, two
+        // jets again. The infantry share rides 2/3/5 GI with the matching
+        // Guardians; the escort draws whichever jet the country fields
+        // (Korea's Black Eagle, everyone else's Intruder).
+        waves: [
+            &[WavePlan {
+                armor: &[("MTNK", 3)],
+                infantry: &[("E1", 2), ("GGI", 2)],
+                escort: 0,
+                secondary: &[],
+            }],
+            &[WavePlan {
+                armor: &[("MTNK", 4), ("MGTK", 1), ("SREF", 1)],
+                infantry: &[("E1", 3), ("GGI", 3)],
+                escort: 2,
+                secondary: &[],
+            }],
+            &[WavePlan {
+                armor: &[("MTNK", 6), ("SREF", 3), ("FV", 4)],
+                infantry: &[("E1", 5), ("GGI", 5)],
+                escort: 2,
+                secondary: &[],
+            }],
+        ],
         scout: "ADOG",
         fortress: Some("BFRT"),
         // The Landing Craft: retail Prerequisite=GAYARD, TechLevel 4, a
@@ -1385,6 +1628,9 @@ const OPENINGS: [Opening; 3] = [
         defense_basic: "NALASR",
         defense_aa: "NAFLAK",
         defense_heavy: "TESLA",
+        // The Battle Bunker: retail Prerequisite=NACNST alone, 500
+        // credits — the cheap garrison hole behind the sentry guns.
+        defense_bunker: Some("NABNKR"),
         // The Soviet Wall; the gap generator and the Grand Cannon are
         // Allied-only retail pieces, so their entries stay empty.
         wall: Some("NAWALL"),
@@ -1401,10 +1647,62 @@ const OPENINGS: [Opening; 3] = [
         naval_hull_extra: Some("SQD"),
         naval_capital: Some("DRED"),
         aircraft: &[],
-        // The Kirov: the roster's `ZEP` row (retail Prerequisite=NATECH)
-        // as a dedicated commission piece — the war-factory flyer the lab
-        // fields once it stands.
+        // The Kirov wing: the roster's `ZEP` row (retail
+        // Prerequisite=NATECH) as a three-flyer strike force the
+        // commission tops up and replenishes, with the Siege Chopper
+        // `SCHP` (the same lab) fielding a two-chopper element behind it.
         siege_flyer: Some("ZEP"),
+        siege_flyer_target: 3,
+        siege_second: Some("SCHP"),
+        siege_second_target: 2,
+        // The Soviet waves (retail aimd E/N/H): three Rhinos with a Flak
+        // Track pair early; behind the lab the five-Rhino wave and the V3
+        // bombardment pair take turns (retail fields both teams on the
+        // same conditions); four Apocalypses with the pair under the late
+        // sink, the drone screen trailing if it stands. The foot waves
+        // ride 8/10 Conscripts, then twenty — or the mixed retail squad of
+        // two Flak Troopers, ten Conscripts and three Tesla Troopers on
+        // the Apocalypse wave's alternate turn.
+        waves: [
+            &[WavePlan {
+                armor: &[("HTNK", 3), ("HTK", 2)],
+                infantry: &[("E2", 8)],
+                escort: 0,
+                secondary: &[],
+            }],
+            &[
+                WavePlan {
+                    armor: &[("HTNK", 5), ("HTK", 2)],
+                    infantry: &[("E2", 10)],
+                    escort: 0,
+                    secondary: &[],
+                },
+                WavePlan {
+                    // The V3 team: the launchers lead (their radar gate
+                    // on the roster row picks the turn), the Flak Track
+                    // pair guarding them; the siege standoff holds them
+                    // short of the aim at the strike.
+                    armor: &[("V3", 2), ("HTK", 2)],
+                    infantry: &[("E2", 10)],
+                    escort: 0,
+                    secondary: &[],
+                },
+            ],
+            &[
+                WavePlan {
+                    armor: &[("APOC", 4), ("HTK", 2)],
+                    infantry: &[("E2", 20)],
+                    escort: 0,
+                    secondary: &[("DRON", 4)],
+                },
+                WavePlan {
+                    armor: &[("APOC", 4), ("HTK", 2)],
+                    infantry: &[("FLAKT", 2), ("E2", 10), ("SHK", 3)],
+                    escort: 0,
+                    secondary: &[("DRON", 4)],
+                },
+            ],
+        ],
         scout: "DOG",
         fortress: None,
         // The Armored Transport: retail Prerequisite=NAYARD, TechLevel 2,
@@ -1539,6 +1837,10 @@ const OPENINGS: [Opening; 3] = [
         defense_basic: "YAGGUN",
         defense_aa: "YAGGUN",
         defense_heavy: "YAPSYT",
+        // The Tank Bunker: retail Prerequisite=YACNST alone, 400 credits
+        // — a `Bunker=yes` one-vehicle hole (retail's "Unit Hunter"
+        // scripts park a tank in one), never an infantry garrison.
+        defense_bunker: Some("NATBNK"),
         // Yuri's wall is the Citadel Wall ([GAFWLL], retail `Wall=yes`
         // behind YABRCK, TechLevel 2, 100 credits); the gap generator and
         // the Grand Cannon are Allied pieces.
@@ -1554,10 +1856,38 @@ const OPENINGS: [Opening; 3] = [
         naval_hull_extra: None,
         naval_capital: None,
         aircraft: &[],
-        // The Floating Disk: the roster's `DISK` row (retail
-        // Prerequisite=YATECH) as a dedicated commission piece — the
-        // war-factory flyer the lab fields once it stands.
+        // The Floating Disk wing: the roster's `DISK` row (retail
+        // Prerequisite=YATECH) as a three-disk strike force the
+        // commission tops up and replenishes. Yuri fields no second
+        // war-factory flyer, so the second row sleeps.
         siege_flyer: Some("DISK"),
+        siege_flyer_target: 3,
+        siege_second: None,
+        siege_second_target: 0,
+        // Yuri's waves (retail aimd E/N/H): three Lashers and a Gattling
+        // early; five and two behind the lab; six Lashers, three Gattlings
+        // and two Master Minds under the late sink. The foot waves ride
+        // 4/5/10 Initiates, a Yuri Clone joining the last.
+        waves: [
+            &[WavePlan {
+                armor: &[("LTNK", 3), ("YTNK", 1)],
+                infantry: &[("INIT", 4)],
+                escort: 0,
+                secondary: &[],
+            }],
+            &[WavePlan {
+                armor: &[("LTNK", 5), ("YTNK", 2)],
+                infantry: &[("INIT", 5)],
+                escort: 0,
+                secondary: &[],
+            }],
+            &[WavePlan {
+                armor: &[("LTNK", 6), ("YTNK", 3), ("MIND", 2)],
+                infantry: &[("INIT", 10), ("YURI", 1)],
+                escort: 0,
+                secondary: &[],
+            }],
+        ],
         scout: "INIT",
         fortress: None,
         // The Hover Transport: retail Prerequisite=YAYARD, TechLevel 2,
@@ -1583,22 +1913,87 @@ pub struct SuperAi {
     /// re-arms [`Self::deploy_attempts`] (the budget is per foundation,
     /// not per game).
     deploy_origin: Option<(u16, u16)>,
-    /// Whether a gathered wave is currently launching: one standing unit
-    /// leaves per tick until only the guard reserve remains home, so the
-    /// group departs together and arrives as a mass instead of trickling
-    /// single file into the enemy's defense. Pinned state, never read from
-    /// the runtime — the determinism contract allows exactly this.
-    wave_launching: bool,
-    /// Units already dispatched in the current wave episode. A dispatch the
-    /// command layer drops leaves its unit in the standing set; without this
-    /// list the wave branch would re-order the same unit every tick and
+    /// The assault wave's live stage — forming, marching at the gather
+    /// cell, striking the latched sequence — or idle between episodes;
+    /// see [`WaveStage`]. Pinned state, never read from the runtime — the
+    /// determinism contract allows exactly this.
+    wave_stage: WaveStage,
+    /// The current wave's members, the latched team's picks from the
+    /// standing pool past the guard reserve, re-picked every forming pass
+    /// and latched at the launch (the air escort joins at the strike).
+    /// Pruned of the fallen every pass; cleared with the episode. Pinned
+    /// state, never read from the runtime.
+    wave_members: Vec<u64>,
+    /// Members already dispatched in the current stage. A dispatch the
+    /// command layer drops leaves its unit in the standing set; without
+    /// this list the stage would re-order the same unit every tick and
     /// starve every branch below it (observed: two units whose offset
-    /// destination was impassable froze all production).
-    launched: Vec<u64>,
-    /// Earliest tick the next wave episode may trigger. Paces pulses apart
-    /// and bounds the damage a wave of entirely dropped dispatches can do to
-    /// one order per unit per interval.
+    /// destination was impassable froze all production). Cleared at every
+    /// stage change so the next aim re-dispatches the whole wave. Pinned
+    /// state, never read from the runtime.
+    wave_marched: Vec<u64>,
+    /// The episode's latched gather cell — [`WAVE_GATHER_DISTANCE`] short
+    /// of the enemy base toward home. Pinned state, never read from the
+    /// runtime.
+    wave_gather: Option<(u16, u16)>,
+    /// The strike sequence latched when the wave arrives: the revealed
+    /// enemy superweapons (the counter-trigger's lead), then the struck
+    /// house's factories, defenses and every other structure, nearest the
+    /// gather cell first within each class; the head drops as it falls or
+    /// changes hands, an emptied list re-latches against the next house,
+    /// and no hostile structure left is the hunt. Pinned state, never read
+    /// from the runtime.
+    wave_targets: Vec<(u64, (i16, i16))>,
+    /// The tick the current wave stage began, for the form, march and
+    /// strike clocks. Pinned state, never read from the runtime.
+    wave_stage_since: u32,
+    /// The live episode's team, `(phase, sibling)` into
+    /// [`Opening::waves`], latched when the cadence arms the episode so
+    /// the picks, the production feed and the escort all read one plan.
+    /// Pinned state, never read from the runtime.
+    wave_plan: (usize, usize),
+    /// Episodes armed so far: successive episodes take a phase's sibling
+    /// teams in turn. Pinned state, never read from the runtime.
+    wave_episodes: u32,
+    /// Earliest tick the next wave episode may form; see
+    /// [`WAVE_CADENCE_TICKS`]. Armed by the launch, so the interval runs
+    /// launch to launch; a form that never launched re-arms it from its
+    /// own end. Pinned state, never read from the runtime.
     next_wave_tick: u32,
+    /// The garrison limb's targets, nearest the home yard first: the
+    /// revealed neutral occupiable civilians (up to
+    /// [`GARRISON_BUILDING_TARGET`]) and the side's own occupiable
+    /// bunkers, re-read every scan. Pinned state, never read from the
+    /// runtime.
+    garrison_targets: Vec<u64>,
+    /// `(building, infantry)` pairs still walking in: an ordered soldier
+    /// counts against the building's capacity until he lands (passengers
+    /// ride in limbo, and the occupant count carries him from there),
+    /// dies, or the target drops out. Pinned state, never read from the
+    /// runtime.
+    garrison_inbound: std::collections::HashSet<(u64, u64)>,
+    /// `(bunker, vehicle)` the tank-bunker Enter was issued on: one ride
+    /// per bunker until it installs or either end is lost. Pinned state,
+    /// never read from the runtime.
+    bunker_bound: std::collections::HashMap<u64, u64>,
+    /// Unfilled occupant slots across the garrison targets, latched per
+    /// scan — the infantry wheel's demand signal. Pinned state, never read
+    /// from the runtime.
+    garrison_demand: usize,
+    /// The tick the next garrison scan may run; see
+    /// [`GARRISON_SCAN_TICKS`]. Pinned state, never read from the runtime.
+    garrison_due: u32,
+    /// The counter-trigger table's air flag: six hostile aircraft standing
+    /// at the last read ([`AA_COUNTER_AIR_THREATS`]). Pinned state, never
+    /// read from the runtime.
+    counter_air_armed: bool,
+    /// The counter-trigger table's floater flag: two hostile Floating Disks
+    /// or Kirovs at the last read ([`FLOATER_COUNTER_THREATS`]). Pinned
+    /// state, never read from the runtime.
+    counter_floater_armed: bool,
+    /// The tick the counter-trigger table next reads the field; the stuck
+    /// scan's cadence. Pinned state, never read from the runtime.
+    counter_due: u32,
     /// The base-alarm stance's focus cell and the tick it lifts; see
     /// [`Self::base_defense_orders`]. Pinned state, never read from the
     /// runtime.
@@ -1648,22 +2043,11 @@ pub struct SuperAi {
     /// pair boards cargo into a standing fortress, so the vehicle rotation
     /// owes the base exactly one. Pinned state, never read from the runtime.
     fortress_issued: bool,
-    /// Whether the anti-air insurance vehicle's commission has issued: the
-    /// rotation owes the base exactly one of the roster's AntiAir entries,
-    /// so the side's mobile AA answer stands before hostile air arrives.
-    /// Pinned state, never read from the runtime.
-    aa_issued: bool,
     /// Whether the ferry's one-off commission has issued: the two ferry
     /// hulls — the naval yard's hover transport and the war factory's air
     /// hull — share this one latch, so a base commissions one ferry line,
     /// never two. Pinned state, never read from the runtime.
     transport_issued: bool,
-    /// Whether the siege flyer's one-off commission has issued: the
-    /// specialist wheel's siege slot is one turn per
-    /// [`SPECIALIST_EVERY_VEHICLE`] and every Siege row competes for it, so
-    /// the Kirov/Disk owes its existence to this dedicated latch, not the
-    /// wheel. Pinned state, never read from the runtime.
-    siege_flyer_issued: bool,
     /// The remote ore-field cell latched for the expansion refinery once
     /// the home economy reaches its design steady state; kept after the
     /// refinery stands so the second survey can exclude its field.
@@ -1763,6 +2147,13 @@ pub struct SuperAi {
     /// own and draws no second order. Pinned state, never read from the
     /// runtime.
     capture_bound: std::collections::HashMap<u64, u64>,
+    /// The per-building capture latch's retry half: a neutral tech
+    /// building whose latched engineer was lost short of it rests until
+    /// this tick before the next engineer walks at it; see
+    /// [`CAPTURE_RETRY_TICKS`]. The latch half is [`Self::capture_bound`]
+    /// itself — a building some live bound engineer walks at draws no
+    /// second one. Pinned state, never read from the runtime.
+    capture_retry: std::collections::HashMap<u64, u32>,
     /// The tick the next engineer-capture window may run at; see
     /// [`ENGINEER_CAPTURE_WINDOW_TICKS`]. Pinned state, never read from the
     /// runtime.
@@ -1905,9 +2296,23 @@ impl SuperAi {
             next_deploy_tick: 0,
             deploy_attempts: 0,
             deploy_origin: None,
-            wave_launching: false,
-            launched: Vec::new(),
+            wave_stage: WaveStage::Idle,
+            wave_members: Vec::new(),
+            wave_marched: Vec::new(),
+            wave_gather: None,
+            wave_targets: Vec::new(),
+            wave_stage_since: 0,
+            wave_plan: (0, 0),
+            wave_episodes: 0,
             next_wave_tick: 0,
+            garrison_targets: Vec::new(),
+            garrison_inbound: std::collections::HashSet::new(),
+            bunker_bound: std::collections::HashMap::new(),
+            garrison_demand: 0,
+            garrison_due: 0,
+            counter_air_armed: false,
+            counter_floater_armed: false,
+            counter_due: 0,
             defense_focus: None,
             defenders: Vec::new(),
             naval_site: None,
@@ -1921,9 +2326,7 @@ impl SuperAi {
             sw2_ever_stood: false,
             hero_issued: false,
             fortress_issued: false,
-            aa_issued: false,
             transport_issued: false,
-            siege_flyer_issued: false,
             expansion_site: None,
             remote_refinery_stood: false,
             expansion_yard_issued: false,
@@ -1948,6 +2351,7 @@ impl SuperAi {
             bridge_engineer: None,
             bridge_retry_due: 0,
             capture_bound: std::collections::HashMap::new(),
+            capture_retry: std::collections::HashMap::new(),
             capture_due: 0,
             raid_stage: None,
             raid_stage_since: 0,
@@ -2063,32 +2467,36 @@ impl SuperAi {
             );
             let blocker = (!clear)
                 .then(|| {
-                    yard_ty.foundation.cell_offsets().iter().find_map(|&(dx, dy)| {
-                        sim.cell_objects(
-                            ((mx - 1 + dx) as u16, (my - 1 + dy) as u16),
-                            crate::sim::movement::locomotor::MovementLayer::Ground,
-                        )
-                        .find_map(|member| match member {
-                            crate::sim::occupancy::CellObjectMember::Entity(id) => sim
-                                .substrate
-                                .entities
-                                .get(id)
-                                .filter(|e| {
-                                    e.owner() == self.house
-                                        && e.category()
-                                            == crate::map::entities::EntityCategory::Unit
-                                        && matches!(
-                                            e.passive_acquire_mission(),
-                                            crate::sim::mission::MissionType::None
-                                                | crate::sim::mission::MissionType::Sleep
-                                                | crate::sim::mission::MissionType::Guard
-                                                | crate::sim::mission::MissionType::AreaGuard
-                                        )
-                                })
-                                .map(|_| id),
-                            _ => None,
+                    yard_ty
+                        .foundation
+                        .cell_offsets()
+                        .iter()
+                        .find_map(|&(dx, dy)| {
+                            sim.cell_objects(
+                                ((mx - 1 + dx) as u16, (my - 1 + dy) as u16),
+                                crate::sim::movement::locomotor::MovementLayer::Ground,
+                            )
+                            .find_map(|member| match member {
+                                crate::sim::occupancy::CellObjectMember::Entity(id) => sim
+                                    .substrate
+                                    .entities
+                                    .get(id)
+                                    .filter(|e| {
+                                        e.owner() == self.house
+                                            && e.category()
+                                                == crate::map::entities::EntityCategory::Unit
+                                            && matches!(
+                                                e.passive_acquire_mission(),
+                                                crate::sim::mission::MissionType::None
+                                                    | crate::sim::mission::MissionType::Sleep
+                                                    | crate::sim::mission::MissionType::Guard
+                                                    | crate::sim::mission::MissionType::AreaGuard
+                                            )
+                                    })
+                                    .map(|_| id),
+                                _ => None,
+                            })
                         })
-                    })
                 })
                 .flatten();
             if !clear
@@ -2154,10 +2562,7 @@ impl SuperAi {
                     )];
                 }
             }
-            if clear
-                && tick >= self.next_deploy_tick
-                && self.deploy_attempts < DEPLOY_ATTEMPTS
-            {
+            if clear && tick >= self.next_deploy_tick && self.deploy_attempts < DEPLOY_ATTEMPTS {
                 self.next_deploy_tick = tick + DEPLOY_RETRY_TICKS;
                 self.deploy_attempts += 1;
                 return vec![CommandEnvelope::new(
@@ -2281,7 +2686,10 @@ impl SuperAi {
         let expansion_center = if yard_centers.len() >= 2 {
             match self.expansion2_site {
                 Some(site) => yard_centers.iter().copied().min_by_key(|cell| {
-                    (cell.0 - site.0 as i16).abs().max(cell.1 - site.1 as i16).abs()
+                    (cell.0 - site.0 as i16)
+                        .abs()
+                        .max(cell.1 - site.1 as i16)
+                        .abs()
                 }),
                 None => {
                     let home = home_center.unwrap_or(yard_centers[0]);
@@ -2649,17 +3057,32 @@ impl SuperAi {
         // (observed live: razed yards, no reaction). While the stance
         // stands no new wave departs; the wave already marching stays
         // out. Otherwise idle combat units engage the nearest intruder
-        // inside any yard's perimeter. Otherwise the offense moves in
-        // waves: once `ATTACK_WAVE_SIZE` units stand gathered (idle or on
-        // their guard post), the wave launches — one standing unit per
-        // tick attack-moves on the enemy center, so the group departs
-        // together and arrives as a mass — until only the guard reserve
-        // remains home; production then rebuilds the next wave while the
-        // current one fights. While a wave is still gathering, newcomers
-        // hold an Area Guard post on the yard. Orders issue one unit per
+        // inside any yard's perimeter. Otherwise the offense moves in the
+        // retail waves: the cadence latches the phase's composition (the
+        // opening tables' mixed `waves`), the members gather while
+        // production fills the missing ones, and the formed wave marches
+        // at the gather cell short of the enemy base before the strike
+        // sequence runs. Orders issue one unit per
         // tick; an engaged, marching or posted unit leaves the standing set,
         // so no spam follows, and a wave that dies lets the next one form.
         if let Some(center) = self.structure_center(sim, opening.construction_yard) {
+            // The counter-trigger table (retail aimd's `Enemy owns >= N`
+            // triggers), read on the stuck scan's cadence: the hostile air
+            // count arms the AA defense team's demand bumps (the mobile-AA
+            // floor and the AntiAir share below), and the hostile floater
+            // count arms the anti-floater guard (the AA vehicles' economy
+            // posts, and their exemption from the waves). Cheap reads of
+            // counts the mix already takes, latched so the per-tick limbs
+            // read flags instead of walking the field.
+            if tick >= self.counter_due {
+                self.counter_due = tick + STUCK_SCAN_TICKS;
+                self.counter_air_armed = self.enemy_air_count(sim) >= AA_COUNTER_AIR_THREATS;
+                self.counter_floater_armed = FLOATER_TYPES
+                    .iter()
+                    .map(|&name| self.count_enemy_units_of_type(sim, name))
+                    .sum::<usize>()
+                    >= FLOATER_COUNTER_THREATS;
+            }
             let idle = self.idle_combat_units(sim, opening);
             let alarm_armed = self.base_alarm_armed(sim, tick);
             if alarm_armed || self.defense_focus.is_some() {
@@ -2692,164 +3115,32 @@ impl SuperAi {
             } else {
                 None
             };
-            // A fresh alarm (a building hit inside the window) holds the
-            // next wave home; the stance's mop-up hold alone must not — on
-            // a crowded big map the focus stays latched nearly forever and
-            // the offense never sailed again (observed live: a besieged
-            // Yuri base that stopped attacking for good). The defenders
-            // already committed keep fighting either way.
-            if !self.wave_launching
-                && !alarm_armed
-                && tick >= self.next_wave_tick
-                && standing.len() >= ATTACK_WAVE_SIZE
-                && (!enemy_targets.is_empty() || enemy_center.is_some())
-            {
-                self.wave_launching = true;
-                self.launched.clear();
-            }
-            if self.wave_launching {
-                // Dispatch one not-yet-launched standing unit per tick. The
-                // `launched` list bounds the episode: a dispatch the command
-                // layer drops (its unit stays standing) is never re-ordered
-                // within the episode, so the branch cannot spin on it and
-                // starve the branches below. A destination is also gated on
-                // the zone grid before any order rides out: from the unit's
-                // own cell the wave tries the enemy structures in the unit's
-                // rotation order (then, without structures, the fallback
-                // offsets in the same rotation) and takes the first the
-                // ground rows connect. A target across a collapsed bridge is
-                // passed over — the sim would null the walk at the breach,
-                // the unit would idle there, and the next episode would
-                // re-order the same unreachable cell every retry (observed:
-                // 582 dead Moves at one broken bridge) — and an episode
-                // whose every un-launched unit is cut off simply ends here
-                // instead of marching to the water's edge.
-                let mut dispatch: Option<(u64, (u16, u16))> = None;
-                if standing.len() > GUARD_RESERVE {
-                    // The candidates collect first: the `launched` filter's
-                    // borrow must end before the loop body's futility
-                    // records (pinned state mutation inside the loop).
-                    for unit in standing
-                        .iter()
-                        .copied()
-                        .filter(|unit| !self.launched.contains(unit))
-                        .collect::<Vec<_>>()
-                    {
-                        let Some(entity) = sim.substrate.entities.get(unit) else {
-                            continue;
-                        };
-                        // Layer 3: the hero never rides the generic wave (his
-                        // own branch owns him), reserved boarders and raiders
-                        // are off the pool while their orders run, the raid
-                        // cycle's engineer and ride likewise (their stage
-                        // machine owns them), and the fortress stays home
-                        // while its seats are open and boarding is in
-                        // progress.
-                        let type_name = sim.interner.resolve(entity.type_ref());
-                        if type_name == opening.hero
-                            || self.boarders.contains(&unit)
-                            || self.raiders.contains(&unit)
-                            || self.raid_involves(unit)
-                            // Layer 3: the dogs stay home — the sentry ring
-                            // is their post and the spy their war; a hound
-                            // that marched with the tanks is a dead 200
-                            // credits at the first vehicle line.
-                            || Self::is_dog(type_name)
-                        {
-                            continue;
-                        }
-                        if Some(type_name) == opening.fortress
-                            && !self.boarders.is_empty()
-                            && entity
-                                .passenger_role
-                                .cargo()
-                                .is_some_and(|cargo| cargo.count() < cargo.capacity())
-                        {
-                            continue;
-                        }
-                        let from = (entity.position.rx(), entity.position.ry());
-                        let movement_zone = rules
-                            .object(type_name)
-                            .map(|ty| ty.movement_zone)
-                            .unwrap_or_default();
-                        let raw = if enemy_targets.is_empty() {
-                            enemy_center.and_then(|aim| {
-                                (0..SPREAD_OFFSETS.len())
-                                    .map(|index| {
-                                        (unit as usize + index) % SPREAD_OFFSETS.len()
-                                    })
-                                    .find_map(|index| {
-                                        let spread = SPREAD_OFFSETS[index];
-                                        let cell = on_map_cell(
-                                            sim,
-                                            (
-                                                aim.0 + i16::from(spread.0),
-                                                aim.1 + i16::from(spread.1),
-                                            ),
-                                            aim,
-                                        );
-                                        zones_connected(sim, movement_zone, from, cell)
-                                            .then_some(cell)
-                                    })
-                            })
-                        } else {
-                            (0..enemy_targets.len())
-                                .map(|attempt| {
-                                    enemy_targets[(unit as usize + attempt) % enemy_targets.len()]
-                                })
-                                .find_map(|(_, cell)| {
-                                    let cell = (cell.0 as u16, cell.1 as u16);
-                                    zones_connected(sim, movement_zone, from, cell).then_some(cell)
-                                })
-                        };
-                        // Layer 3: siege-role units bombard from standoff —
-                        // the destination pulls back to a cell short of the
-                        // aim along the home line instead of the aim cell
-                        // itself (the old walk-in died one V3 at a time in
-                        // the target's defense ring).
-                        let siege = opening
-                            .vehicles
-                            .iter()
-                            .any(|entry| entry.role == Role::Siege && entry.name == type_name);
-                        let destination = match raw {
-                            Some(cell) if siege => {
-                                siege_standoff_cell(sim, center, cell, from, movement_zone)
-                            }
-                            other => other,
-                        };
-                        let Some(cell) = destination else {
-                            continue;
-                        };
-                        // Layer 3: the futility backoff — a unit whose wave
-                        // dispatch keeps landing on the same standing cell
-                        // (a dropped order, an aim the ground refuses) stops
-                        // spending the episode's order on it for a while.
-                        if self.futile(unit, FutilityKind::Wave, from, tick) {
-                            continue;
-                        }
-                        dispatch = Some((unit, cell));
-                        break;
-                    }
-                }
-                if let Some((unit, (rx, ry))) = dispatch {
-                    self.launched.push(unit);
-                    return vec![CommandEnvelope::new(
-                        self.house,
-                        at,
-                        Command::AttackMove {
-                            entity_id: unit,
-                            target: None,
-                            destination: Some(crate::sim::combat::TargetKind::Cell(rx, ry)),
-                        },
-                    )];
-                }
-                // The reserve is home, every standing unit was already
-                // dispatched (dropped orders), or no un-launched unit has a
-                // destination the zone grid still connects: end the episode
-                // and let production fill the next one — the units held back
-                // are not spent, so a repaired span re-opens them.
-                self.wave_launching = false;
-                self.next_wave_tick = tick + WAVE_RETRY_TICKS;
+            // The assault wave (Layer 3, the retail team-script shape): the
+            // cadence latches the phase's composition, the members gather
+            // while the production feed fills the missing ones, the formed
+            // wave marches at the gather cell short of the enemy base and
+            // strikes the latched sequence — the revealed superweapons the
+            // counter table leads with, the factories, the defenses, then
+            // every structure — before the hunt. One order per tick; see
+            // [`Self::wave_orders`]. A fresh alarm (a building hit inside
+            // the window) holds the next wave home; the stance's mop-up
+            // hold alone must not — on a crowded big map the focus stays
+            // latched nearly forever and the offense never sailed again
+            // (observed live: a besieged Yuri base that stopped attacking
+            // for good). The defenders already committed keep fighting
+            // either way, and a wave already marching stays out.
+            if let Some(command) = self.wave_orders(
+                sim,
+                rules,
+                opening,
+                center,
+                &standing,
+                &enemy_targets,
+                enemy_center,
+                alarm_armed,
+                tick,
+            ) {
+                return vec![CommandEnvelope::new(self.house, at, command)];
             }
             // Layer 3: the hero's own small branch — the wave dispatch no
             // longer takes him (filtered above), so what remains is his own
@@ -2901,7 +3192,8 @@ impl SuperAi {
                     }
                 } else if matches!(
                     hero_entity.passive_acquire_mission(),
-                    crate::sim::mission::MissionType::None | crate::sim::mission::MissionType::Sleep
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
                 ) && !self.futile(hero, FutilityKind::GuardPost, from, tick)
                     && let Some((px, py)) =
                         connected_ring_cell(sim, rules, center, from, hero, opening.hero)
@@ -2960,46 +3252,54 @@ impl SuperAi {
                         )
                         && !self.futile(id, FutilityKind::Raid, from, tick)
                     {
-                        raid = Some((id, Command::AttackMove {
-                            entity_id: id,
-                            target: None,
-                            destination: Some(crate::sim::combat::TargetKind::Cell(
-                                cell.0, cell.1,
-                            )),
-                        }));
+                        raid = Some((
+                            id,
+                            Command::AttackMove {
+                                entity_id: id,
+                                target: None,
+                                destination: Some(crate::sim::combat::TargetKind::Cell(
+                                    cell.0, cell.1,
+                                )),
+                            },
+                        ));
                         break;
                     }
                     if type_name == RAIDER_IVAN
-                        && let Some((target, _)) = enemy_targets.iter().copied().find(
-                            |&(_, cell)| {
+                        && let Some((target, _)) =
+                            enemy_targets.iter().copied().find(|&(_, cell)| {
                                 zones_connected(
                                     sim,
                                     crate::rules::locomotor_type::MovementZone::Normal,
                                     from,
                                     (cell.0.max(0) as u16, cell.1.max(0) as u16),
                                 )
-                            },
-                        )
+                            })
                         && !self.futile(id, FutilityKind::Raid, from, tick)
                     {
-                        raid = Some((id, Command::Attack {
-                            attacker_id: id,
-                            target_id: target,
-                        }));
+                        raid = Some((
+                            id,
+                            Command::Attack {
+                                attacker_id: id,
+                                target_id: target,
+                            },
+                        ));
                         break;
                     }
                     if type_name == RAIDER_DISK
                         && let Some((_, cell)) = self.disc_raid_target(sim)
                         && !self.futile(id, FutilityKind::Raid, from, tick)
                     {
-                        raid = Some((id, Command::AttackMove {
-                            entity_id: id,
-                            target: None,
-                            destination: Some(crate::sim::combat::TargetKind::Cell(
-                                cell.0.max(0) as u16,
-                                cell.1.max(0) as u16,
-                            )),
-                        }));
+                        raid = Some((
+                            id,
+                            Command::AttackMove {
+                                entity_id: id,
+                                target: None,
+                                destination: Some(crate::sim::combat::TargetKind::Cell(
+                                    cell.0.max(0) as u16,
+                                    cell.1.max(0) as u16,
+                                )),
+                            },
+                        ));
                         break;
                     }
                 }
@@ -3119,10 +3419,7 @@ impl SuperAi {
                                 | crate::sim::mission::MissionType::AreaGuard
                         )
                         && {
-                            let cell = (
-                                entity.position.rx() as i16,
-                                entity.position.ry() as i16,
-                            );
+                            let cell = (entity.position.rx() as i16, entity.position.ry() as i16);
                             self.hostile_infantry_near(sim, cell, DESO_DEPLOY_RADIUS)
                                 >= DESO_DEPLOY_INFANTRY
                         }
@@ -3209,15 +3506,42 @@ impl SuperAi {
                 }
             }
 
+            // The garrison limb — Layer 3. Retail's aimd parks a tank in a
+            // tank bunker in every Yuri armor script and the engine's own
+            // `CanBeOccupied` machinery stood unused: the house's occupier
+            // soldiers now fill the nearest revealed neutral occupiable
+            // buildings and the side's own Battle Bunkers to the type's
+            // full `MaxNumberOccupants` (占满 — read off the rules row, never
+            // hardcoded), one capture click per tick with the engine's own
+            // admission ([`crate::sim::passenger::can_enter_transport`])
+            // asked per pair, and an empty Tank Bunker takes the nearest
+            // idle armed turret vehicle with the same Enter click the
+            // fortress boarding uses. Above the guard poster on purpose: a
+            // soldier owed to a bunker must not be posted on the ring first
+            // and gated out for a window. See [`Self::garrison_orders`].
+            if let Some(command) = self.garrison_orders(sim, rules, opening, center, tick) {
+                return vec![CommandEnvelope::new(self.house, at, command)];
+            }
+
             // Layer-3 futility gate folded into the Layer-2 post split: a
             // unit whose identical post order keeps landing unmoved stops
             // spending its reorder windows on it for a while. Naval hulls
             // never post — their defense is the idle perimeter's Attack,
             // not a land ring. The war-factory flyers stand out beside
             // them: a Kirov posted on the yard ring wastes its siege
-            // sortie on sentry duty the guns already do.
+            // sortie on sentry duty the guns already do. A launched wave's
+            // members are no candidates at all: idle at the gather cell
+            // they are regrouping, not lost — posting them home would
+            // dissolve the wave the march just formed.
+            let wave_launched =
+                matches!(self.wave_stage, WaveStage::Marching | WaveStage::Striking);
+            let post_pool: Vec<u64> = idle
+                .iter()
+                .copied()
+                .filter(|unit| !(wave_launched && self.wave_members.contains(unit)))
+                .collect();
             let poster = self
-                .due_idle_unit(&idle, tick)
+                .due_idle_unit(&post_pool, tick)
                 .filter(|&unit| !self.futility_suppressed(unit, FutilityKind::GuardPost, tick))
                 .filter(|&unit| {
                     sim.substrate.entities.get(unit).is_none_or(|entity| {
@@ -3239,9 +3563,26 @@ impl SuperAi {
                 // instead — a sub-base with no posts leaves its guns
                 // uncovered — and a unit with no connected post on its
                 // assigned ring falls back to the other base's, so the
-                // order gate is spent on a held post either way.
-                let home_post = pick_guard_post(sim, rules, unit, center, &SPREAD_OFFSETS);
-                let post = if let Some(expansion) = expansion_center {
+                // order gate is spent on a held post either way. The
+                // anti-floater guard (the counter-trigger table): with two
+                // hostile Disks or Kirovs on the field, an AA vehicle's post
+                // anchors on the nearest own power plant or refinery
+                // instead — the floaters raid the economy, so the flak
+                // stands over it.
+                let economy_anchor = self
+                    .counter_floater_armed
+                    .then(|| self.aa_economy_anchor(sim, opening, unit))
+                    .flatten();
+                let home_post = pick_guard_post(
+                    sim,
+                    rules,
+                    unit,
+                    economy_anchor.unwrap_or(center),
+                    &SPREAD_OFFSETS,
+                );
+                let post = if let Some(expansion) = expansion_center
+                    && economy_anchor.is_none()
+                {
                     let expansion_post = pick_guard_post(
                         sim,
                         rules,
@@ -3403,8 +3744,11 @@ impl SuperAi {
                     .substrate
                     .entities
                     .iter_sorted()
-                    .filter(|(_, entity)| {
+                    .filter(|(id, entity)| {
                         entity.owner() == self.house
+                            // The wave's escort flies the wave's own Attack
+                            // orders while it rides a strike.
+                            && !self.wave_members.contains(id)
                             // The flight roster: the Aircraft class, plus the
                             // war-factory flyers — Unit-category rows (the
                             // Kirov, the Floating Disk, the Night Hawk) that
@@ -3490,8 +3834,7 @@ impl SuperAi {
             }
             for unit in pool_back {
                 self.boarders.retain(|&kept| kept != unit);
-                self.board_attempts
-                    .retain(|&(kept, _), _| kept != unit);
+                self.board_attempts.retain(|&(kept, _), _| kept != unit);
             }
             let cargo_names = Self::boarding_cargo(opening);
             if let Some(fortress_name) = opening.fortress
@@ -3519,8 +3862,7 @@ impl SuperAi {
                 let mut boarding: Option<(usize, u32, u64)> = None;
                 for (id, entity) in sim.substrate.entities.iter_sorted() {
                     let type_name = sim.interner.resolve(entity.type_ref());
-                    let Some(rank) = cargo_names.iter().position(|name| *name == type_name)
-                    else {
+                    let Some(rank) = cargo_names.iter().position(|name| *name == type_name) else {
                         continue;
                     };
                     if entity.owner() != self.house
@@ -3770,9 +4112,7 @@ impl SuperAi {
             });
             if let Some((scout, entity)) = idle_scouts.next() {
                 let from = (entity.position.rx() as i16, entity.position.ry() as i16);
-                if let Some(cell) =
-                    self.nearest_unrevealed_cell(sim, from, &self.scout_blacklist)
-                {
+                if let Some(cell) = self.nearest_unrevealed_cell(sim, from, &self.scout_blacklist) {
                     // The futility aim is the dark cell itself: one scout
                     // paced at the same unreachable cell three windows
                     // retires the cell from the rotation, and the next
@@ -3805,23 +4145,28 @@ impl SuperAi {
         // ignores). With nothing revealed to run at, the spy stays home
         // like any other garrison piece. The futility backoff bounds the
         // re-issue loop the same way the scout's march is bounded.
-        if let Some((spy, spy_entity)) = sim.substrate.entities.iter_sorted().find(|(id, entity)| {
-            self.order_gate.get(id).is_none_or(|&due| tick >= due)
-                && entity.owner() == self.house
-                && entity.category() == crate::map::entities::EntityCategory::Infantry
-                && sim.interner.resolve(entity.type_ref()) == SPY_TYPE
-                && !entity.lifecycle.in_limbo()
-                && !self.boarders.contains(id)
-                && !self.raiders.contains(id)
-                && matches!(
-                    entity.passive_acquire_mission(),
-                    crate::sim::mission::MissionType::None
-                        | crate::sim::mission::MissionType::Sleep
-                        | crate::sim::mission::MissionType::Guard
-                        | crate::sim::mission::MissionType::AreaGuard
-                )
-        }) {
-            let from = (spy_entity.position.rx() as i16, spy_entity.position.ry() as i16);
+        if let Some((spy, spy_entity)) =
+            sim.substrate.entities.iter_sorted().find(|(id, entity)| {
+                self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                    && entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Infantry
+                    && sim.interner.resolve(entity.type_ref()) == SPY_TYPE
+                    && !entity.lifecycle.in_limbo()
+                    && !self.boarders.contains(id)
+                    && !self.raiders.contains(id)
+                    && matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    )
+            })
+        {
+            let from = (
+                spy_entity.position.rx() as i16,
+                spy_entity.position.ry() as i16,
+            );
             let target = self
                 .nearest_enemy_infiltration_target(sim, from)
                 .or_else(|| self.nearest_revealed_tech(sim, from));
@@ -3874,8 +4219,7 @@ impl SuperAi {
         // the scan, the dispatch and the capped commission alike. Below the
         // bridge limb on purpose: that chain keeps its own engineer and its
         // own dispatch, this one spends the surplus.
-        if let Some(command) =
-            self.engineer_capture_orders(sim, rules, opening, home_center, tick)
+        if let Some(command) = self.engineer_capture_orders(sim, rules, opening, home_center, tick)
         {
             return vec![CommandEnvelope::new(self.house, at, command)];
         }
@@ -4011,18 +4355,21 @@ impl SuperAi {
         // A gun still below its quota while the yard stands and tanks roll.
         // The limb's own ordering, hoisted once: the savings hold and the
         // limb itself must claim the same gun or the hold banks the wallet
-        // for a queue that never fires. Anti-air answers air that actually
-        // fields, the heavy tower waits behind the radar its prerequisite
-        // names, and the pillbox quota holds the perimeter once tanks roll.
-        // Per-base quotas (Layer 2): the caps split across the standing
-        // yards, each base carrying its own guns — the expansion yard used
-        // to stand bare while the home ring held every one. A gun's base
-        // reads as the yard whose [`BASE_CLUSTER_RADIUS`] ring it stands
-        // in; with no yard at all the legacy single-base behavior holds
-        // (the structure center anchors a virtual base, as the old
-        // house-wide caps effectively did). The heavy quota gains one tier
-        // per yard only under the late-game sink: a rich, capped base
-        // converts wealth to defense depth, and to nothing else.
+        // for a queue that never fires. Anti-air stands from the first
+        // tank onward and tiers up with the air war (one tower per yard
+        // in peace, two against hostile air, three against a real air
+        // force — [`aa_per_yard_quota`]), the heavy tower waits behind the
+        // radar its prerequisite names, and the pillbox quota holds the
+        // perimeter once tanks roll. Per-base quotas (Layer 2): the caps
+        // split across the standing yards, each base carrying its own
+        // guns — the expansion yard used to stand bare while the home ring
+        // held every one. A gun's base reads as the yard whose
+        // [`BASE_CLUSTER_RADIUS`] ring it stands in; with no yard at all
+        // the legacy single-base behavior holds (the structure center
+        // anchors a virtual base, as the old house-wide caps effectively
+        // did). The heavy quota gains one tier per yard only under the
+        // late-game sink: a rich, capped base converts wealth to defense
+        // depth, and to nothing else.
         let bases: Vec<(i16, i16)> = if yard_centers.is_empty() {
             self.structure_center(sim, opening.construction_yard)
                 .into_iter()
@@ -4046,18 +4393,19 @@ impl SuperAi {
             .houses
             .get(&self.house)
             .is_some_and(|house| sim.interner.resolve(house.house_type_id()) == "French");
+        let enemy_air = self.enemy_air_count(sim);
         let heavy_per_yard = DEFENSE_PER_YARD_HEAVY + usize::from(late_sink);
         let defenses = [
             (
                 opening.defense_aa,
-                DEFENSE_PER_YARD_AA,
-                AA_DEFENSE_CAP * 2,
-                self.enemy_air_count(sim) > 0,
+                aa_per_yard_quota(enemy_air),
+                AA_DEFENSE_CAP * 3,
+                true,
             ),
             (
                 opening.defense_heavy,
                 heavy_per_yard,
-                HEAVY_DEFENSE_CAP * 2 + usize::from(late_sink) * bases.len(),
+                HEAVY_DEFENSE_CAP * 4 + usize::from(late_sink) * bases.len(),
                 self.count_structures_of_type(sim, radar_name) >= 1,
             ),
             (
@@ -4066,8 +4414,21 @@ impl SuperAi {
                 BASIC_DEFENSE_TARGET * 2,
                 true,
             ),
+            // The garrison bunker: one cheap hole per yard, three to a
+            // house — the Battle Bunker's roof for five soldiers, the Tank
+            // Bunker's hole for one tank, over the perimeter the pillboxes
+            // already hold (the garrison limb fills both). Its row sits
+            // behind the pillbox's so sentry density still wins a contested
+            // slot, and the sides without a bunker hold the pillbox's name
+            // below — never read, the `None` gate short-circuits first.
+            (
+                opening.defense_bunker.unwrap_or(opening.defense_basic),
+                DEFENSE_PER_YARD_BUNKER,
+                BUNKER_DEFENSE_CAP,
+                opening.defense_bunker.is_some(),
+            ),
             // The defense extension (Layer 2.9): the gap generator and the
-            // Grand Cannon ride the same gun queue step as the three core
+            // Grand Cannon ride the same gun queue step as the core
             // lines, so the blackout gate above covers them for free — both
             // are retail `Powered=yes` with `Power=-100` and only queue
             // while the grid reads `output >= drain`, with the power
@@ -4131,6 +4492,10 @@ impl SuperAi {
             && self.count_structures_of_type(sim, opening.defense_basic)
                 + self.count_structures_of_type(sim, opening.defense_aa)
                 + self.count_structures_of_type(sim, opening.defense_heavy)
+                + opening
+                    .defense_bunker
+                    .map(|name| self.count_structures_of_type(sim, name))
+                    .unwrap_or(0)
                 < DEFENSE_FLOOR
             && gun_wants
                 .iter()
@@ -4141,9 +4506,7 @@ impl SuperAi {
                             .then_some(ty.cost)
                     })
                 })
-                .is_some_and(|cost| {
-                    crate::sim::production::credits_for_owner(sim, &owner) < cost
-                });
+                .is_some_and(|cost| crate::sim::production::credits_for_owner(sim, &owner) < cost);
         if self
             .structure_center(sim, opening.construction_yard)
             .is_some()
@@ -4460,8 +4823,12 @@ impl SuperAi {
                 // the retry, so a refusing neighborhood can wedge neither
                 // the queue nor the chain.
                 if let Some(expansion) = expansion_center {
-                    let cluster_power =
-                        self.count_structures_of_type_near(sim, opening.power, expansion, BASE_CLUSTER_RADIUS);
+                    let cluster_power = self.count_structures_of_type_near(
+                        sim,
+                        opening.power,
+                        expansion,
+                        BASE_CLUSTER_RADIUS,
+                    );
                     let cluster_refineries = self.count_structures_of_type_near(
                         sim,
                         opening.refinery,
@@ -4596,18 +4963,20 @@ impl SuperAi {
                     }
                     if let Some(yard_ty) = rules.object(opening.naval_yard)
                         && let Some(site) =
-                            self.own_yard_centers(sim, opening).iter().find_map(|&yard| {
-                                find_site_around_capped(
-                                    sim,
-                                    rules,
-                                    &runtime.resources.overlay_registry,
-                                    yard_ty,
-                                    yard,
-                                    self.house,
-                                    Some(owner.as_str()),
-                                    NAVAL_SITE_RADIUS,
-                                )
-                            })
+                            self.own_yard_centers(sim, opening)
+                                .iter()
+                                .find_map(|&yard| {
+                                    find_site_around_capped(
+                                        sim,
+                                        rules,
+                                        &runtime.resources.overlay_registry,
+                                        yard_ty,
+                                        yard,
+                                        self.house,
+                                        Some(owner.as_str()),
+                                        NAVAL_SITE_RADIUS,
+                                    )
+                                })
                     {
                         self.naval_site = Some(site);
                         self.naval_probes = 0;
@@ -4943,9 +5312,7 @@ impl SuperAi {
                 })
         });
         if let (Some((main_id, _)), Some((outpost_id, _))) = (main_factory, outpost_factory)
-            && self
-                .vehicle_slots
-                .saturating_sub(self.primary_toggle_mark)
+            && self.vehicle_slots.saturating_sub(self.primary_toggle_mark)
                 >= PRIMARY_TOGGLE_EVERY_VEHICLES
         {
             // The carrier reads off the live primary flags. Neither
@@ -5002,32 +5369,50 @@ impl SuperAi {
         } else {
             opening.main_tank
         };
-        // The roster's anti-air entry, derived like the fortress's cargo —
-        // the side's mobile AA answer, whatever its name.
-        let aa_name = opening
+        // The roster's anti-air entries, derived like the fortress's cargo —
+        // the side's mobile AA answer, whatever its names.
+        let aa_types: Vec<&'static str> = opening
             .vehicles
             .iter()
-            .find(|entry| entry.role == Role::AntiAir)
-            .map(|entry| entry.name);
-        // The one-off existence commissions — AA insurance, fortress,
-        // expansion MCV — claim their turn before the miner line: a
-        // commission queued behind `economy_first` starves exactly when it
-        // matters (war-poor late game, every vehicle turn spent on a
-        // replacement miner), the same death the fortress's specialist-
-        // slot reservation died of. Each fires once per game, so the miner
-        // line loses one turn to each, never more.
+            .filter(|entry| entry.role == Role::AntiAir)
+            .map(|entry| entry.name)
+            .collect();
+        // The existence commissions — the AA quota, the fortress, the
+        // ferry, the flyer wing, the expansion MCV — claim their turn
+        // before the miner line: a commission queued behind
+        // `economy_first` starves exactly when it matters (war-poor late
+        // game, every vehicle turn spent on a replacement miner), the same
+        // death the fortress's specialist-slot reservation died of. The
+        // quotas pace themselves: a per-type retry gate closes the
+        // re-file for [`BUILD_QUEUE_RETRY_TICKS`] after every issued
+        // order, so the miner line loses one turn per pacing window, not
+        // a turn per commission candidate per tick.
         let vehicle_want = if self.vehicle_slots >= CORE_BEFORE_SPECIALISTS as u32
-            && !self.aa_issued
-            && aa_name.is_some_and(|name| {
+            && self.aa_unit_count(sim, opening, &queue)
+                < aa_vehicle_target(self.enemy_air_count(sim), self.counter_air_armed)
+            && let Some(aa_name) = aa_types.iter().copied().find(|&name| {
                 rules.object(name).is_some_and(|ty| {
                     crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
                         == crate::sim::production::CanBuild::Yes
+                        // Full price, not the six-tenths bank: these are
+                        // 300-600 credit hulls, cheap enough to buy
+                        // outright and too cheap to bank for.
+                        && crate::sim::production::credits_for_owner(sim, &owner) >= ty.cost
                 })
-            }) {
-            // The AA insurance: exactly one of the roster's AntiAir entries
-            // once the tank core stands, so the side's AA answer exists
-            // before hostile air arrives.
-            aa_name
+            })
+            && let Some(aa_type_id) = sim.interner.get(aa_name)
+            && self.build_queue_retry_ready(aa_type_id, tick)
+        {
+            // The mobile-AA quota: [`AA_UNIT_FLOOR`] of the roster's
+            // AntiAir vehicles once the tank core stands, one more per
+            // two hostile aircraft up to [`AA_UNIT_CAP`] — the side's AA
+            // answer exists before hostile air arrives and grows with
+            // it, and a lost hull is replaced on the retry gate's pace
+            // (read here, armed on the issued order below). The counter
+            // trigger's air team lifts the floor to
+            // [`AA_COUNTER_VEHICLE_FLOOR`] when six hostile aircraft
+            // stand.
+            Some(aa_name)
         } else if opening.fortress.is_some()
             && !self.fortress_issued
             && self.count_structures_of_type(sim, opening.battle_lab) >= 1
@@ -5041,14 +5426,13 @@ impl SuperAi {
         {
             // The fortress's one-off commission: the loading pair boards
             // cargo into a standing Battle Fortress, and a base that never
-            // builds one boards nothing. This and the AA insurance are
-            // dedicated existence commissions rather than specialist-slot
-            // reservations — a hot war keeps the wheel from reaching its
-            // next specialist slot while the barracks rotation drains the
-            // bank faster than a 2000-credit item can gather, so a
-            // reservation starves and commissions nothing. Once the
-            // QueueProduction order is out the factory charges
-            // progressively, so no banked-cost wait belongs here.
+            // builds one boards nothing. A dedicated existence commission
+            // rather than a specialist-slot reservation — a hot war keeps
+            // the wheel from reaching its next specialist slot while the
+            // barracks rotation drains the bank faster than a 2000-credit
+            // item can gather, so a reservation starves and commissions
+            // nothing. Once the QueueProduction order is out the factory
+            // charges progressively, so no banked-cost wait belongs here.
             // `can_build`, not the cameo — the country-lock lesson again.
             opening.fortress
         } else if !self.transport_issued
@@ -5079,27 +5463,27 @@ impl SuperAi {
             // ferry. `can_build`, not the cameo — the country-lock lesson
             // again.
             Some(ferry_name)
-        } else if opening.siege_flyer.is_some()
-            && !self.siege_flyer_issued
-            && self.count_structures_of_type(sim, opening.battle_lab) >= 1
-            && !vehicle_busy
-            && opening
-                .siege_flyer
-                .and_then(|name| rules.object(name))
-                .is_some_and(|ty| {
-                    crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
-                        == crate::sim::production::CanBuild::Yes
-                })
+        } else if !vehicle_busy
+            && let Some(flyer_name) = self.siege_flyer_want(
+                sim,
+                rules,
+                opening,
+                &queue,
+                crate::sim::production::credits_for_owner(sim, &owner),
+                tick,
+            )
         {
-            // The siege flyer's one-off commission, the fortress's
-            // treatment: the wheel's siege slot is one turn per
-            // [`SPECIALIST_EVERY_VEHICLE`] and every Siege row competes for
-            // it, so a hot war fields launchers and choppers forever and
-            // the Kirov/Disk never lifts. One dedicated turn once the lab
-            // stands — the flyer the whole siege plan rests on — and the
-            // latch keeps it at one per game. `can_build`, not the cameo —
-            // the country-lock lesson again.
-            opening.siege_flyer
+            // The siege flyer's wing, the one-off commission grown up:
+            // the wheel's siege slot is one turn per
+            // [`SPECIALIST_EVERY_VEHICLE`] and every Siege row competes
+            // for it, so a hot war fields launchers and choppers forever
+            // and the Kirov/Disk never lifted. The quota branch tops each
+            // side flyer up to its target once the lab stands — and a
+            // lost flyer's count drops under the target, so
+            // replenishment is the same check, paced by the per-type
+            // retry gate. `can_build`, not the cameo — the country-lock
+            // lesson again.
+            Some(flyer_name)
         } else if !self.expansion_abandoned
             && self.expansion_site.is_some()
             && !self.expansion_yard_issued
@@ -5131,6 +5515,19 @@ impl SuperAi {
             // before the tank core resumes. The quota rests the limb on
             // its own; the banked-credits gate below prices the hulls.
             Some(name)
+        } else if let Some(member) = self.wave_shortage(sim, opening, true)
+            && rules.object(member).is_some_and(|ty| {
+                crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                    == crate::sim::production::CanBuild::Yes
+            })
+        {
+            // The wave's demand feed: a forming wave short of a core
+            // armor member jumps the wheels — the composition is what the
+            // cadence will march, and a specialist slot spent elsewhere
+            // launches a thinner wave. `can_build`, not the cameo — the
+            // country-lock lesson. The issue gates below (the busy queue,
+            // the floor's hold, the six-tenths bank) still price it.
+            Some(member)
         } else if self.vehicle_slots < CORE_BEFORE_SPECIALISTS as u32 {
             Some(core_tank)
         } else if self.vehicle_slots % SPECIALIST_EVERY_VEHICLE == SPECIALIST_EVERY_VEHICLE - 1 {
@@ -5177,18 +5574,21 @@ impl SuperAi {
             // window it fired in: the marks used to live behind the
             // `!economy_first` arm, so a commission ordered while the
             // miner line ran re-armed every turn and ordered again
-            // (observed: three expansion MCVs, none ever escorted).
-            if Some(name) == aa_name {
-                self.aa_issued = true;
-            }
+            // (observed: three expansion MCVs, none ever escorted). The
+            // AA and flyer quotas need no mark — their count checks pace
+            // them — but their per-type retry window arms here, on the
+            // order that actually issued.
             if opening.fortress == Some(name) {
                 self.fortress_issued = true;
             }
             if opening.amphibious_transport == Some(name) || opening.air_ferry == Some(name) {
                 self.transport_issued = true;
             }
-            if opening.siege_flyer == Some(name) {
-                self.siege_flyer_issued = true;
+            if aa_types.contains(&name)
+                || opening.siege_flyer == Some(name)
+                || opening.siege_second == Some(name)
+            {
+                self.arm_build_queue_retry(type_id, tick);
             }
             if !self.expansion_yard_issued
                 && self.expansion_site.is_some()
@@ -5217,8 +5617,44 @@ impl SuperAi {
         });
         // The same wheel as the vehicles: core soldiers for the first
         // [`CORE_BEFORE_SPECIALISTS`] infantry slots, then every
-        // [`SPECIALIST_EVERY_INFANTRY`]th slot to the mix.
-        let infantry_want = if self.infantry_slots < CORE_BEFORE_SPECIALISTS as u32 {
+        // [`SPECIALIST_EVERY_INFANTRY`]th slot to the mix. Two demands
+        // jump the wheel ahead of it: the garrison deficit (unfilled
+        // occupant slots across the limb's targets, the demand the
+        // garrison scan latches — bounded so a ten-slot civilian never
+        // monopolizes the line) and the forming wave's missing foot
+        // members. The garrison demand queues at full price (cheap
+        // soldiers, and a bunker slot waits badly); both pass through the
+        // issue gates below like any other pick.
+        let garrison_demand_owed = self.garrison_demand > 0
+            && queue
+                .iter()
+                .filter(|item| {
+                    item.queue_category
+                        == crate::sim::production::ProductionCategory::Infantry
+                        && sim.interner.resolve(item.type_id) == opening.basic_infantry
+                })
+                .count()
+                < GARRISON_DEMAND_IN_PRODUCTION
+            // Full price: a broke base banks for the guns first, and the
+            // wheel below keeps its turn meanwhile.
+            && rules
+                .object(opening.basic_infantry)
+                .is_some_and(|ty| crate::sim::production::credits_for_owner(sim, &owner) >= ty.cost);
+        let infantry_want = if garrison_demand_owed {
+            // The garrison's demand: the basic soldier is the side's
+            // occupier (the GI, the Conscript, the Initiate), so the
+            // bunker and civilian deficits are its queue.
+            Some(opening.basic_infantry)
+        } else if let Some(member) = self.wave_shortage(sim, opening, false)
+            && rules.object(member).is_some_and(|ty| {
+                crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                    == crate::sim::production::CanBuild::Yes
+            })
+        {
+            // The wave's demand feed, the foot half: the composition the
+            // cadence will march queues ahead of the wheel.
+            Some(member)
+        } else if self.infantry_slots < CORE_BEFORE_SPECIALISTS as u32 {
             Some(opening.basic_infantry)
         } else if self.infantry_slots % SPECIALIST_EVERY_INFANTRY == SPECIALIST_EVERY_INFANTRY - 1 {
             // The scout reservation claims the first specialist slots the
@@ -5711,13 +6147,20 @@ impl SuperAi {
     /// click: the engine walks him in, runs the arrival checks and consumes
     /// him, which the [`Self::capture_bound`] hygiene reads as success (a
     /// target that no longer stands neutral drops out with him — the chain
-    /// does not retake lost ground). With no idle engineer the limb
-    /// commissions one through the shared commission core, capped at
-    /// [`CAPTURE_ENGINEER_STOCK`] total standing-plus-queued — the bridge
-    /// repair's one-at-a-time rule outranks this limb and keeps its own,
-    /// and the same never-wedge-the-ladder wallet bar stands in front of
-    /// the queue. The bridge limb's own walker, the reserved boarders and
-    /// raiders and the raid cycle's actors stay out.
+    /// does not retake lost ground). One engineer per building: the bound
+    /// pair is the building's latch, so a building some live engineer
+    /// already walks at never draws a second one, and a walker lost short
+    /// of a still-neutral building rests it for [`CAPTURE_RETRY_TICKS`]
+    /// ([`Self::capture_retry`]) before the next engineer tries. A bound
+    /// engineer whose click the command layer dropped stands idle again
+    /// and is re-pointed at his own latched building first. With no idle
+    /// engineer the limb commissions one through the shared commission
+    /// core, capped at [`CAPTURE_ENGINEER_STOCK`] total
+    /// standing-plus-queued — the bridge repair's one-at-a-time rule
+    /// outranks this limb and keeps its own, and the same
+    /// never-wedge-the-ladder wallet bar stands in front of the queue. The
+    /// bridge limb's own walker, the reserved boarders and raiders and the
+    /// raid cycle's actors stay out.
     fn engineer_capture_orders(
         &mut self,
         sim: &crate::sim::world::Simulation,
@@ -5734,15 +6177,15 @@ impl SuperAi {
 
         // Hygiene: a consumed engineer (the capture succeeded — the engine
         // eats him on entry) or a lost one leaves the bound set, and so does
-        // a target no longer held by a neutral house.
+        // a target no longer held by a neutral house. A walker lost while
+        // his building still stands neutral fell short of it: the
+        // building's retry gate rests it (the success case flips the owner,
+        // so a gate armed in the same breath as the flip is never read).
+        let mut fell_short: Vec<u64> = Vec::new();
         self.capture_bound.retain(|&engineer, target| {
-            let engineer_busy = sim
-                .substrate
-                .entities
-                .get(engineer)
-                .is_some_and(|entity| {
-                    entity.owner() == self.house && entity.lifecycle.object_alive()
-                });
+            let engineer_busy = sim.substrate.entities.get(engineer).is_some_and(|entity| {
+                entity.owner() == self.house && entity.lifecycle.object_alive()
+            });
             let target_neutral = sim.substrate.entities.get(*target).is_some_and(|entity| {
                 entity.category() == crate::map::entities::EntityCategory::Structure
                     && entity.lifecycle.object_alive()
@@ -5751,13 +6194,57 @@ impl SuperAi {
                         .get(&entity.owner())
                         .is_some_and(|house| house.multiplay_passive())
             });
+            if !engineer_busy && target_neutral {
+                fell_short.push(*target);
+            }
             engineer_busy && target_neutral
         });
+        for building in fell_short {
+            self.capture_retry
+                .insert(building, tick + CAPTURE_RETRY_TICKS);
+        }
+        // A lapsed gate rests nothing: drop it, so the book holds only the
+        // buildings still cooling.
+        self.capture_retry.retain(|_, &mut due| tick < due);
+
+        // The re-point: a bound engineer whose click the command layer
+        // dropped stands idle again, his building still latched to him —
+        // he walks at it again, the bridge limb's re-issue rule paced by
+        // this window instead of its retry clock. Entity order, never the
+        // bound map's: the determinism contract.
+        if let Some((engineer, target)) =
+            sim.substrate
+                .entities
+                .iter_sorted()
+                .find_map(|(id, entity)| {
+                    let &target = self.capture_bound.get(&id)?;
+                    (entity.owner() == self.house
+                        && entity.lifecycle.object_alive()
+                        && !entity.lifecycle.in_limbo()
+                        && self.order_gate.get(&id).is_none_or(|&due| tick >= due)
+                        && matches!(
+                            entity.passive_acquire_mission(),
+                            crate::sim::mission::MissionType::None
+                                | crate::sim::mission::MissionType::Sleep
+                                | crate::sim::mission::MissionType::Guard
+                                | crate::sim::mission::MissionType::AreaGuard
+                        ))
+                    .then_some((id, target))
+                })
+        {
+            self.gate_idle_order(engineer, tick);
+            return Some(Command::CaptureBuilding {
+                engineer_id: engineer,
+                target_building_id: target,
+            });
+        }
 
         // The survey: the nearest revealed neutral tech building, oil
         // derrick first. The neutral owner is a passive house (the same
         // reading the spy's scan makes); anything a combatant holds is not
-        // this chain's errand.
+        // this chain's errand. A building latched to a live walker, or
+        // resting after one fell short of it, is not a candidate — one
+        // engineer per building.
         let mut best: Option<(usize, i32, u64)> = None;
         for (id, entity) in sim.substrate.entities.iter_sorted() {
             if entity.category() != crate::map::entities::EntityCategory::Structure
@@ -5776,7 +6263,11 @@ impl SuperAi {
                     .houses
                     .get(&owner)
                     .is_none_or(|house| !house.multiplay_passive())
-                || !sim.fog.is_cell_revealed(self.house, entity.position.rx(), entity.position.ry())
+                || !sim
+                    .fog
+                    .is_cell_revealed(self.house, entity.position.rx(), entity.position.ry())
+                || self.capture_bound.values().any(|&latched| latched == id)
+                || self.capture_retry.contains_key(&id)
             {
                 continue;
             }
@@ -5793,16 +6284,15 @@ impl SuperAi {
             return None;
         };
 
-        // The dispatch: an idle engineer free of every other chain. A bound
-        // one whose order the command layer dropped stands mission-less here
-        // and is re-pointed at the same target — the bridge limb's re-issue
-        // rule, paced by this window instead of its retry clock.
+        // The dispatch: an idle engineer free of every other chain — and of
+        // this one's own latches (a bound walker keeps his building).
         if let Some((engineer, _)) = sim.substrate.entities.iter_sorted().find(|(id, entity)| {
             entity.owner() == self.house
                 && entity.category() == crate::map::entities::EntityCategory::Infantry
                 && sim.interner.resolve(entity.type_ref()) == opening.engineer
                 && entity.lifecycle.object_alive()
                 && !entity.lifecycle.in_limbo()
+                && !self.capture_bound.contains_key(id)
                 && self.bridge_engineer != Some(*id)
                 && !self.boarders.contains(id)
                 && !self.raiders.contains(id)
@@ -5951,25 +6441,29 @@ impl SuperAi {
         opening: &Opening,
         tick: u32,
     ) -> Option<u64> {
-        sim.substrate.entities.iter_sorted().find(|(id, entity)| {
-            entity.owner() == self.house
-                && entity.category() == crate::map::entities::EntityCategory::Infantry
-                && sim.interner.resolve(entity.type_ref()) == opening.engineer
-                && entity.lifecycle.object_alive()
-                && !entity.lifecycle.in_limbo()
-                && !self.capture_bound.contains_key(id)
-                && self.bridge_engineer != Some(*id)
-                && !self.boarders.contains(id)
-                && !self.raiders.contains(id)
-                && self.order_gate.get(id).is_none_or(|&due| tick >= due)
-                && matches!(
-                    entity.passive_acquire_mission(),
-                    crate::sim::mission::MissionType::None
-                        | crate::sim::mission::MissionType::Sleep
-                        | crate::sim::mission::MissionType::Guard
-                        | crate::sim::mission::MissionType::AreaGuard
-                )
-        }).map(|(id, _)| id)
+        sim.substrate
+            .entities
+            .iter_sorted()
+            .find(|(id, entity)| {
+                entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Infantry
+                    && sim.interner.resolve(entity.type_ref()) == opening.engineer
+                    && entity.lifecycle.object_alive()
+                    && !entity.lifecycle.in_limbo()
+                    && !self.capture_bound.contains_key(id)
+                    && self.bridge_engineer != Some(*id)
+                    && !self.boarders.contains(id)
+                    && !self.raiders.contains(id)
+                    && self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                    && matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    )
+            })
+            .map(|(id, _)| id)
     }
 
     /// An idle ride free of every other chain, for the raid's arming half.
@@ -5979,21 +6473,25 @@ impl SuperAi {
         ride_name: &str,
         tick: u32,
     ) -> Option<u64> {
-        sim.substrate.entities.iter_sorted().find(|(id, entity)| {
-            entity.owner() == self.house
-                && entity.category() == crate::map::entities::EntityCategory::Unit
-                && sim.interner.resolve(entity.type_ref()) == ride_name
-                && entity.lifecycle.object_alive()
-                && !entity.lifecycle.in_limbo()
-                && self.order_gate.get(id).is_none_or(|&due| tick >= due)
-                && matches!(
-                    entity.passive_acquire_mission(),
-                    crate::sim::mission::MissionType::None
-                        | crate::sim::mission::MissionType::Sleep
-                        | crate::sim::mission::MissionType::Guard
-                        | crate::sim::mission::MissionType::AreaGuard
-                )
-        }).map(|(id, _)| id)
+        sim.substrate
+            .entities
+            .iter_sorted()
+            .find(|(id, entity)| {
+                entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Unit
+                    && sim.interner.resolve(entity.type_ref()) == ride_name
+                    && entity.lifecycle.object_alive()
+                    && !entity.lifecycle.in_limbo()
+                    && self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                    && matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    )
+            })
+            .map(|(id, _)| id)
     }
 
     /// The armed cycle's leg for this tick; see [`Self::engineer_raid_orders`].
@@ -6014,15 +6512,11 @@ impl SuperAi {
         // Liveness: any lost actor ends the cycle — the consumed engineer is
         // the capture's success, the dead one its failure; the engine does
         // not tell them apart and the cooldown does not care.
-        if stage
-            .actors()
-            .into_iter()
-            .any(|actor| {
-                sim.substrate.entities.get(actor).is_none_or(|entity| {
-                    entity.owner() != self.house || !entity.lifecycle.object_alive()
-                })
+        if stage.actors().into_iter().any(|actor| {
+            sim.substrate.entities.get(actor).is_none_or(|entity| {
+                entity.owner() != self.house || !entity.lifecycle.object_alive()
             })
-        {
+        }) {
             self.end_engineer_raid(tick);
             return None;
         }
@@ -6047,16 +6541,17 @@ impl SuperAi {
                         (ride_entity.position.rx() as i16).max(0) as u16,
                         (ride_entity.position.ry() as i16).max(0) as u16,
                     );
-                    let target = self.enemy_priority_targets(sim).into_iter().find(
-                        |(_, cell)| {
+                    let target = self
+                        .enemy_priority_targets(sim)
+                        .into_iter()
+                        .find(|(_, cell)| {
                             zones_connected(
                                 sim,
                                 crate::rules::locomotor_type::MovementZone::Normal,
                                 from,
                                 (cell.0.max(0) as u16, cell.1.max(0) as u16),
                             )
-                        },
-                    );
+                        });
                     if let Some((target, _)) = target {
                         self.raid_stage = Some(EngineerRaid::Sailing {
                             engineer,
@@ -6290,9 +6785,8 @@ impl SuperAi {
         let at = (entity.position.rx() as i16, entity.position.ry() as i16);
         let from = (at.0.max(0) as u16, at.1.max(0) as u16);
         // i32 miles: the cell diffs are tiny, the thresholds below are i32.
-        let chebyshev = |a: (i16, i16), b: (i16, i16)| {
-            i32::from((a.0 - b.0).abs().max((a.1 - b.1).abs()))
-        };
+        let chebyshev =
+            |a: (i16, i16), b: (i16, i16)| i32::from((a.0 - b.0).abs().max((a.1 - b.1).abs()));
         let home_distance = chebyshev(at, home);
         // "The enemy's side": closer to their ground-mass center than to
         // home — a discharge test that also works on the close maps where
@@ -6321,8 +6815,7 @@ impl SuperAi {
         // boards, the dedicated scout pair stays on its chain (Yuri's
         // initiate both scouts and boards — the same soldier), and the
         // fortress's reserved cargo and live raiders stay out.
-        let near_home =
-            home_distance < i32::from(FERRY_DISCHARGE_DISTANCE) && !enemy_side;
+        let near_home = home_distance < i32::from(FERRY_DISCHARGE_DISTANCE) && !enemy_side;
         if has_seats && near_home {
             let mut pool: Vec<&'static str> = opening.infantry.iter().map(|e| e.name).collect();
             pool.push(opening.basic_infantry);
@@ -6421,8 +6914,7 @@ impl SuperAi {
         // road home is cut; the fly hull is never cut) costs only this
         // window.
         if home_distance >= i32::from(FERRY_DISCHARGE_DISTANCE) {
-            let cell =
-                connected_ring_cell(sim, rules, home, from, transport, transport_name)?;
+            let cell = connected_ring_cell(sim, rules, home, from, transport, transport_name)?;
             self.gate_idle_order(transport, tick);
             return Some(Command::Move {
                 entity_id: transport,
@@ -6434,9 +6926,7 @@ impl SuperAi {
         // yard's spread ring so the next windows board on land (a hover
         // hull spawned offshore boards nobody from the water; a beached —
         // or hovering — one sits in the infantry's own neighborhood).
-        if let Some(cell) =
-            connected_ring_cell(sim, rules, home, from, transport, transport_name)
-        {
+        if let Some(cell) = connected_ring_cell(sim, rules, home, from, transport, transport_name) {
             self.gate_idle_order(transport, tick);
             return Some(Command::Move {
                 entity_id: transport,
@@ -6583,16 +7073,16 @@ impl SuperAi {
             opening.second_super_weapon_building,
             opening.construction_yard,
         ] {
-            let Some((id, rx, ry)) = sim
-                .substrate
-                .entities
-                .iter_sorted()
-                .find_map(|(eid, entity)| {
-                    (entity.owner() == self.house
-                        && entity.category() == crate::map::entities::EntityCategory::Structure
-                        && sim.interner.resolve(entity.type_ref()) == name)
-                        .then_some((eid, entity.position.rx(), entity.position.ry()))
-                })
+            let Some((id, rx, ry)) =
+                sim.substrate
+                    .entities
+                    .iter_sorted()
+                    .find_map(|(eid, entity)| {
+                        (entity.owner() == self.house
+                            && entity.category() == crate::map::entities::EntityCategory::Structure
+                            && sim.interner.resolve(entity.type_ref()) == name)
+                            .then_some((eid, entity.position.rx(), entity.position.ry()))
+                    })
             else {
                 continue;
             };
@@ -6630,12 +7120,16 @@ impl SuperAi {
             // walk rediscovers it next tick. A supers-first priority means
             // the reset never revisits a superweapon ring (those stay
             // retired in `walled`).
-            let yard = sim.substrate.entities.iter_sorted().find_map(|(eid, entity)| {
-                (entity.owner() == self.house
-                    && entity.category() == crate::map::entities::EntityCategory::Structure
-                    && sim.interner.resolve(entity.type_ref()) == opening.construction_yard)
-                    .then_some(eid)
-            });
+            let yard = sim
+                .substrate
+                .entities
+                .iter_sorted()
+                .find_map(|(eid, entity)| {
+                    (entity.owner() == self.house
+                        && entity.category() == crate::map::entities::EntityCategory::Structure
+                        && sim.interner.resolve(entity.type_ref()) == opening.construction_yard)
+                        .then_some(eid)
+                });
             if let Some(id) = yard {
                 self.walled.remove(&id);
             }
@@ -6793,7 +7287,9 @@ impl SuperAi {
     /// [`CORE_BEFORE_SPECIALISTS`] slots: the roster role furthest behind
     /// its demanded share. Hostile aircraft lift anti-air's demand to
     /// [`ROLE_SHARE_BOOST`] — the mix fields answer guns instead of
-    /// losing the base to air it cannot touch — and an enemy that
+    /// losing the base to air it cannot touch — and the counter-trigger
+    /// table's air team lifts it to [`AA_COUNTER_ROLE_SHARE`] (the retail
+    /// six-Flak-Trooper answer to six hostile aircraft); an enemy that
     /// out-tanks this house lifts armor-crackers the same way. A role
     /// whose entries this house cannot field (country-locked types such
     /// as the Germans' Tank Destroyer, a hero past its `BuildLimit`)
@@ -6807,11 +7303,7 @@ impl SuperAi {
         roster: &[RosterEntry],
     ) -> Option<&'static str> {
         let enemy_air = self.enemy_air_count(sim);
-        let anti_air_demand = if enemy_air > 0 {
-            ROLE_SHARE_BOOST
-        } else {
-            ROLE_SHARE_BASE
-        };
+        let anti_air_demand = anti_air_demand(enemy_air, self.counter_air_armed);
         let anti_armor_demand = if self.count_enemy_vehicles(sim) > self.count_own_vehicles(sim) {
             ROLE_SHARE_BOOST
         } else {
@@ -7009,6 +7501,7 @@ impl SuperAi {
                         crate::map::entities::EntityCategory::Unit
                             | crate::map::entities::EntityCategory::Infantry
                     )
+                    && !Self::garrisoned(entity)
                     && {
                         let name = sim.interner.resolve(entity.type_ref());
                         roster.contains(&name) || Self::is_naval_type(opening, name)
@@ -7047,19 +7540,36 @@ impl SuperAi {
     /// (`factory_lifecycle.rs:202`, `:214-224`) and the queue view shows
     /// no failure, so without this gate every building limb re-filed the
     /// identical rejected order the next tick. The unit queues keep
-    /// their own working busy gates; this one paces the building and
-    /// defense queue only.
+    /// their own working busy gates; their per-type quotas (the mobile
+    /// AA, the flyer wings) read the window with
+    /// [`Self::build_queue_retry_ready`] and arm it on the issued order.
     fn build_queue_retry_open(&mut self, type_id: InternedId, tick: u32) -> bool {
-        if self
-            .build_queue_retry_gate
-            .get(&type_id)
-            .is_some_and(|&due| tick < due)
-        {
+        if !self.build_queue_retry_ready(type_id, tick) {
             return false;
         }
+        self.arm_build_queue_retry(type_id, tick);
+        true
+    }
+
+    /// The retry gate's read half: whether `type_id`'s window is open,
+    /// without arming it. A unit-queue quota picks its type inside the
+    /// vehicle chain, ahead of the chain's own issue gates (the busy
+    /// factory, the floor's savings hold, the six-tenths bank), so it
+    /// reads the window here and the issue arms it
+    /// ([`Self::arm_build_queue_retry`]) — a pick the issue gates refuse
+    /// must not spend the window, or the quota only ever re-files on the
+    /// rare tick its window and an idle factory coincide.
+    fn build_queue_retry_ready(&self, type_id: InternedId, tick: u32) -> bool {
+        self.build_queue_retry_gate
+            .get(&type_id)
+            .is_none_or(|&due| tick >= due)
+    }
+
+    /// The retry gate's write half: close `type_id`'s window for the next
+    /// [`BUILD_QUEUE_RETRY_TICKS`].
+    fn arm_build_queue_retry(&mut self, type_id: InternedId, tick: u32) {
         self.build_queue_retry_gate
             .insert(type_id, tick + BUILD_QUEUE_RETRY_TICKS);
-        true
     }
 
     /// The stuck-units limb's one order for this scan, or `None`; see the
@@ -7085,7 +7595,7 @@ impl SuperAi {
         let mut stuck: Option<(u64, (u16, u16))> = None;
         for (id, entity) in sim.substrate.entities.iter_sorted() {
             if entity.owner() != self.house
-                || entity.lifecycle.in_limbo()
+                || Self::garrisoned(entity)
                 || !entity.lifecycle.object_alive()
                 || !matches!(
                     entity.category(),
@@ -7098,7 +7608,9 @@ impl SuperAi {
             let type_name = sim.interner.resolve(entity.type_ref());
             // The combat roster only: MCVs, the miner fleet and the rest of
             // the economy are nobody this limb re-marches — the opening MCV
-            // has its own stuck window ([`MCV_STUCK_TICKS`]).
+            // has its own stuck window ([`MCV_STUCK_TICKS`]). A garrisoned
+            // piece (a roof's occupant, a tank bunker's driver) stands
+            // still on purpose and is skipped above.
             if !roster.contains(&type_name) && !Self::is_naval_type(opening, type_name) {
                 continue;
             }
@@ -7106,11 +7618,15 @@ impl SuperAi {
             // boarding and raid chains and the scouts own these units.
             // Their window restarts when they next become eligible, so a
             // unit the wave just dispatched is not instantly "stuck" on its
-            // old snapshot.
+            // old snapshot. A marching wave's members are parked too: one
+            // that reached the gather cell waits there for the rest — the
+            // regroup the march exists for — and a rescue would send it at
+            // the enemy alone; the march clock owns its stragglers.
             let parked = self.boarders.contains(&id)
                 || self.raiders.contains(&id)
                 || self.raid_involves(id)
                 || type_name == opening.scout
+                || (self.wave_stage == WaveStage::Marching && self.wave_members.contains(&id))
                 || self.order_gate.get(&id).is_some_and(|&due| tick < due)
                 || matches!(
                     entity.passive_acquire_mission(),
@@ -7282,10 +7798,7 @@ impl SuperAi {
     /// The Floating Disk's raid target: the enemy's first standing power
     /// plant (the blinding cut), else its first refinery. A live
     /// structure's own cell, limbo construction excluded.
-    fn disc_raid_target(
-        &self,
-        sim: &crate::sim::world::Simulation,
-    ) -> Option<(u64, (i16, i16))> {
+    fn disc_raid_target(&self, sim: &crate::sim::world::Simulation) -> Option<(u64, (i16, i16))> {
         sim.substrate
             .entities
             .iter_sorted()
@@ -7445,6 +7958,1366 @@ impl SuperAi {
         DOG_TYPES.contains(&type_name)
     }
 
+    /// Whether the entity stands inside a garrison hole: a building's
+    /// occupant or any carrier's passenger (riding in limbo — the civilian
+    /// roofs, the Battle Bunker) or a tank bunker's installed driver. Both
+    /// are parked pieces the idle, standing and stuck pools must not
+    /// re-order — a hull pulled out of its bunker by the poster or the
+    /// rescue is an empty hole the garrison limb refills with the next
+    /// tank, and the churn never ends.
+    fn garrisoned(entity: &crate::sim::game_entity::GameEntity) -> bool {
+        entity.lifecycle.in_limbo()
+            || entity.passenger_role.is_inside_transport()
+            || entity.bunker.link().installed_in().is_some()
+    }
+
+    /// The mobile-AA quota's standing count: the roster's AntiAir
+    /// vehicles alive plus the same types still sitting in the vehicle
+    /// queue, so a commission the factory is still working through never
+    /// re-arms the branch. The infantry AA answers (the Rocketeer, the
+    /// Flak Trooper) are the barracks wheel's own share, not this
+    /// quota's count.
+    fn aa_unit_count(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+        queue: &[crate::sim::production::QueueItemView],
+    ) -> usize {
+        let aa_types: Vec<&'static str> = opening
+            .vehicles
+            .iter()
+            .filter(|entry| entry.role == Role::AntiAir)
+            .map(|entry| entry.name)
+            .collect();
+        let live = aa_types
+            .iter()
+            .map(|&name| self.count_units_of_type(sim, name))
+            .sum::<usize>();
+        let in_production = queue
+            .iter()
+            .filter(|item| {
+                item.queue_category == crate::sim::production::ProductionCategory::Vehicle
+                    && aa_types
+                        .iter()
+                        .any(|&name| sim.interner.resolve(item.type_id) == name)
+            })
+            .count();
+        live + in_production
+    }
+
+    /// The siege wing's next commission piece, the primary flyer's line
+    /// first: the first side flyer type whose wing — live plus
+    /// in-production — sits under its quota while the battle lab stands
+    /// and the wallet holds the six-tenths bank the one-off commission
+    /// already flew behind ([`tech_bank_short`]). The per-type retry
+    /// gate paces the re-file ([`BUILD_QUEUE_RETRY_TICKS`], read here and
+    /// armed by the issued order): a lost Kirov is replaced within the
+    /// window, not the tick after its death, and a quota met to the last
+    /// flyer rests the line. `None` — every wing at quota, no lab,
+    /// nothing honestly buildable, or every gate still cooling — hands
+    /// the vehicle turn on.
+    fn siege_flyer_want(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        queue: &[crate::sim::production::QueueItemView],
+        owner_credits: i32,
+        tick: u32,
+    ) -> Option<&'static str> {
+        if self.count_structures_of_type(sim, opening.battle_lab) < 1 {
+            return None;
+        }
+        let lines = [
+            (opening.siege_flyer, usize::from(opening.siege_flyer_target)),
+            (
+                opening.siege_second,
+                usize::from(opening.siege_second_target),
+            ),
+        ];
+        for (name, target) in lines {
+            let Some(name) = name else { continue };
+            if target == 0 {
+                continue;
+            }
+            let wing = self.count_units_of_type(sim, name)
+                + queue
+                    .iter()
+                    .filter(|item| {
+                        item.queue_category == crate::sim::production::ProductionCategory::Vehicle
+                            && sim.interner.resolve(item.type_id) == name
+                    })
+                    .count();
+            if wing >= target {
+                continue;
+            }
+            let Some(ty) = rules.object(name) else {
+                continue;
+            };
+            // `can_build`, not the cameo — the country-lock lesson — and
+            // the six-tenths bank: the flyer waits while the tech climb
+            // is genuinely short, exactly as the one-off commission did.
+            if crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                != crate::sim::production::CanBuild::Yes
+                || tech_bank_short(owner_credits, ty.cost)
+            {
+                continue;
+            }
+            let Some(type_id) = sim.interner.get(name) else {
+                continue;
+            };
+            // Read, not armed: the vehicle chain's issue arms the window
+            // on the order that actually goes out.
+            if !self.build_queue_retry_ready(type_id, tick) {
+                continue;
+            }
+            return Some(name);
+        }
+        None
+    }
+
+    /// The phase a wave reads: `[0]` before the battle lab stands, `[1]`
+    /// with the lab standing, `[2]` under the late-game sink — the same
+    /// rich, capped, two-base condition the defense limb's heavy quota
+    /// reads. The lab gate follows the tier-2 tank's own switch: the
+    /// phase-two compositions name it, so a base without the lab marches
+    /// the phase-one plan.
+    fn wave_phase_index(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+        owner_credits: i32,
+    ) -> usize {
+        if self.count_structures_of_type(sim, opening.battle_lab) == 0 {
+            return 0;
+        }
+        let late_sink = owner_credits > LATE_SINK_CREDITS
+            && self.count_structures_of_type(sim, opening.war_factory) >= FACTORY_BUILDOUT
+            && self.count_structures_of_type(sim, opening.refinery) >= REFINERY_CAP
+            && self.own_yard_centers(sim, opening).len() >= 2;
+        if late_sink { 2 } else { 1 }
+    }
+
+    /// Latch the arming episode's team ([`Self::wave_plan`]): the phase's
+    /// sibling teams take successive episodes in turn, and a sibling whose
+    /// lead the house cannot field yet (the V3 team before its radar)
+    /// yields the turn to the phase's first team.
+    fn latch_wave_plan(&mut self, sim: &crate::sim::world::Simulation, opening: &Opening) {
+        let credits =
+            crate::sim::production::credits_for_owner(sim, sim.interner.resolve(self.house));
+        let phase = self.wave_phase_index(sim, opening, credits);
+        let siblings: &'static [WavePlan] = opening.waves[phase];
+        let turn = self.wave_episodes as usize % siblings.len().max(1);
+        let lead_ready = siblings
+            .get(turn)
+            .and_then(|plan| plan.armor.first())
+            .is_none_or(|&(lead, _)| self.wave_entry_admits(sim, opening, lead));
+        self.wave_plan = (phase, if lead_ready { turn } else { 0 });
+        self.wave_episodes = self.wave_episodes.wrapping_add(1);
+    }
+
+    /// The live episode's latched team; `None` only for a table without
+    /// teams (every side's phases hold at least one).
+    fn current_wave_plan(&self, opening: &Opening) -> Option<&'static WavePlan> {
+        let (phase, sibling) = self.wave_plan;
+        let siblings: &'static [WavePlan] = *opening.waves.get(phase)?;
+        siblings.get(sibling).or_else(|| siblings.first())
+    }
+
+    /// The latched team's members, picked from the standing pool in the
+    /// plan's own order: each composition entry takes its count from the
+    /// standing units of that type, armor first, then the foot wave, then
+    /// the secondary extras that tag along if they already stand (never
+    /// demanded). The picks spend the pool only past [`GUARD_RESERVE`] —
+    /// the reserve stays home whatever the composition asks — and pass
+    /// the engineer raid's actors by (their stage machine owns them; the
+    /// raid rides are the Flak Track and the IFV, both wave types). Types
+    /// the roster gates (`needs`, the tier-2 tank's lab) only pick while
+    /// their gate holds, and the anti-floater guard keeps the AA vehicles
+    /// home — the floaters raid the economy, so the flak guards it
+    /// instead of marching. The second half of the answer is the core
+    /// shortfall per type.
+    fn wave_member_picks(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+        standing: &[u64],
+    ) -> (Vec<u64>, Vec<(&'static str, usize)>) {
+        let Some(plan) = self.current_wave_plan(opening) else {
+            return (Vec::new(), Vec::new());
+        };
+        let pool: Vec<(u64, &str)> = standing
+            .iter()
+            .copied()
+            .filter(|&unit| !self.raid_involves(unit))
+            .filter_map(|unit| {
+                sim.substrate
+                    .entities
+                    .get(unit)
+                    .map(|entity| (unit, sim.interner.resolve(entity.type_ref())))
+            })
+            .collect();
+        let mut budget = standing.len().saturating_sub(GUARD_RESERVE);
+        let mut members: Vec<u64> = Vec::new();
+        let mut missing: Vec<(&'static str, usize)> = Vec::new();
+        for (wanted, count) in plan.core() {
+            if !self.wave_entry_admits(sim, opening, wanted) {
+                continue;
+            }
+            let mut need = count;
+            for &(unit, name) in &pool {
+                if need == 0 || budget == 0 {
+                    break;
+                }
+                if name == wanted && !members.contains(&unit) {
+                    members.push(unit);
+                    need -= 1;
+                    budget -= 1;
+                }
+            }
+            if need > 0 {
+                missing.push((wanted, need));
+            }
+        }
+        for &(wanted, count) in plan.secondary {
+            let mut extras = 0usize;
+            for &(unit, name) in &pool {
+                if extras >= count || budget == 0 {
+                    break;
+                }
+                if name == wanted && !members.contains(&unit) {
+                    members.push(unit);
+                    extras += 1;
+                    budget -= 1;
+                }
+            }
+        }
+        (members, missing)
+    }
+
+    /// Whether a wave composition entry may field right now: the tier-2
+    /// tank waits for its battle lab (the AI house's `CanBuild` skips the
+    /// prerequisite, so the count carries it), a roster entry waits for
+    /// its `needs` gate, and the anti-floater guard pulls the AA-role
+    /// vehicles out of the wave entirely. The core tank and the basic
+    /// soldier carry no gate of their own.
+    fn wave_entry_admits(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+        wanted: &str,
+    ) -> bool {
+        if wanted == opening.tier2_tank {
+            return self.count_structures_of_type(sim, opening.battle_lab) >= 1;
+        }
+        if let Some(entry) = opening.vehicles.iter().find(|entry| entry.name == wanted) {
+            if self.counter_floater_armed && entry.role == Role::AntiAir {
+                return false;
+            }
+            return entry
+                .needs
+                .is_none_or(|gate| self.needs_structure_stands(sim, gate));
+        }
+        opening
+            .infantry
+            .iter()
+            .find(|entry| entry.name == wanted)
+            .and_then(|entry| entry.needs)
+            .is_none_or(|gate| self.needs_structure_stands(sim, gate))
+    }
+
+    /// The wave limb's one order for this tick, or `None`; see the call
+    /// site in [`Self::orders`]. The retail team-script lifecycle rides
+    /// the pinned stage machine:
+    ///
+    /// * **Forming** — the cadence armed the episode (one wave alive at a
+    ///   time, retail `Max=1`) and latched the phase's team; the members
+    ///   re-pick every pass from the standing pool past the guard reserve
+    ///   and gather at their posts while the production feed queues the
+    ///   missing core types (`wave_shortage` below). A complete team
+    ///   launches the march; the form clock launches a thinner one, and a
+    ///   form with nothing to march re-arms the cadence instead.
+    /// * **Marching** — the members dispatch one per tick at the gather
+    ///   cell ([`WAVE_GATHER_DISTANCE`] short of the nearest enemy base
+    ///   toward home, the retail regroup), zone-gated like every march;
+    ///   the regrouped wave — every ground member inside the arrival ring
+    ///   — or the march clock turns the stage.
+    /// * **Striking** — the latched sequence (`wave_strike_sequence`)
+    ///   leads with the revealed enemy superweapons, then strikes the
+    ///   nearest house's factories, its defenses, then every other
+    ///   structure it holds (`WAVE_DEFENSE_TYPES`, the retail script's
+    ///   quarry order). The head that falls or changes hands advances the
+    ///   sequence, an emptied sequence re-latches against the next house,
+    ///   and no hostile structure left is the hunt — attack-moves at the
+    ///   hostile mass center's spread ring. The strike clock ends the
+    ///   episode when it runs out, the way the old dispatch bounds bounded
+    ///   a dropped order, and the members keep whatever they carry (the
+    ///   engine fights it out).
+    ///
+    /// A fresh alarm holds a forming wave home; one already marching or
+    /// striking stays out, and a wave whose members all fell ends at once
+    /// so the cadence can form the next. The flyer wings never join the
+    /// ground march — the sortie limb owns them — save the escort the
+    /// team pairs on, which joins at the strike with the Attack click.
+    #[allow(clippy::too_many_arguments)]
+    fn wave_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        center: (i16, i16),
+        standing: &[u64],
+        enemy_targets: &[(u64, (i16, i16))],
+        enemy_center: Option<(i16, i16)>,
+        alarm_armed: bool,
+        tick: u32,
+    ) -> Option<Command> {
+        // The members' hygiene runs every pass: the fallen drop out.
+        self.wave_members.retain(|&unit| {
+            sim.substrate.entities.get(unit).is_some_and(|entity| {
+                entity.owner() == self.house
+                    && entity.lifecycle.object_alive()
+                    && !entity.lifecycle.in_limbo()
+            })
+        });
+        if matches!(self.wave_stage, WaveStage::Marching | WaveStage::Striking)
+            && self.wave_members.is_empty()
+        {
+            // The whole wave fell: the episode is over, and the cadence
+            // its launch armed paces the next one.
+            self.end_wave_episode(tick);
+            return None;
+        }
+        match self.wave_stage {
+            WaveStage::Idle => {
+                if !alarm_armed
+                    && tick >= self.next_wave_tick
+                    && standing.len() > GUARD_RESERVE
+                    && (!enemy_targets.is_empty() || enemy_center.is_some())
+                {
+                    self.wave_stage = WaveStage::Forming;
+                    self.wave_stage_since = tick;
+                    self.wave_members.clear();
+                    self.wave_marched.clear();
+                    self.wave_gather = None;
+                    self.wave_targets.clear();
+                    self.latch_wave_plan(sim, opening);
+                }
+                None
+            }
+            WaveStage::Forming => {
+                let (picks, missing) = self.wave_member_picks(sim, opening, standing);
+                self.wave_members = picks;
+                let form_expired =
+                    tick.saturating_sub(self.wave_stage_since) >= WAVE_FORM_TIMEOUT_TICKS;
+                if self.wave_members.is_empty() {
+                    // Nothing to march (a base that lost its factories
+                    // mid-form, a pool still under the reserve): the
+                    // expired form hands the budget back to the cadence
+                    // instead of pinning the stage forever.
+                    if form_expired {
+                        self.end_wave_episode(tick);
+                    }
+                    return None;
+                }
+                // A complete team launches; the form clock launches a
+                // thinner one. A fresh alarm holds either home.
+                if alarm_armed || (!missing.is_empty() && !form_expired) {
+                    return None;
+                }
+                // The gather cell latches on the launch: the nearest enemy
+                // base (its war factory first — the priority list's head
+                // class) pulled back [`WAVE_GATHER_DISTANCE`] toward home,
+                // clamped onto the map. No enemy aim at all (a map with no
+                // hostile structure left) marches straight onto the strike.
+                let aim = enemy_targets
+                    .iter()
+                    .min_by_key(|&&(id, cell)| {
+                        (
+                            (i32::from(cell.0) - i32::from(center.0))
+                                .abs()
+                                .max((i32::from(cell.1) - i32::from(center.1)).abs()),
+                            id,
+                        )
+                    })
+                    .map(|&(_, cell)| cell)
+                    .or(enemy_center);
+                self.wave_gather = aim.map(|aim| {
+                    let dx = i32::from(center.0) - i32::from(aim.0);
+                    let dy = i32::from(center.1) - i32::from(aim.1);
+                    let len = dx.abs().max(dy.abs()).max(1);
+                    let step = len.min(i32::from(WAVE_GATHER_DISTANCE));
+                    on_map_cell(
+                        sim,
+                        (
+                            (i32::from(aim.0) + dx * step / len) as i16,
+                            (i32::from(aim.1) + dy * step / len) as i16,
+                        ),
+                        aim,
+                    )
+                });
+                self.wave_stage = WaveStage::Marching;
+                self.wave_stage_since = tick;
+                self.wave_marched.clear();
+                // The cadence runs launch to launch (retail TeamDelays).
+                self.next_wave_tick = tick + WAVE_CADENCE_TICKS;
+                None
+            }
+            WaveStage::Marching => {
+                let Some(gather) = self.wave_gather else {
+                    // No gather cell to march at: straight to the strike.
+                    self.arm_wave_strike(sim, tick);
+                    return None;
+                };
+                if tick.saturating_sub(self.wave_stage_since) >= WAVE_MARCH_TIMEOUT_TICKS
+                    || self.wave_regrouped(sim, rules, gather)
+                {
+                    self.arm_wave_strike(sim, tick);
+                    return None;
+                }
+                self.wave_dispatch_march(sim, rules, gather, tick)
+            }
+            WaveStage::Striking => {
+                self.wave_dispatch_strike(sim, rules, opening, center, enemy_center, tick)
+            }
+        }
+    }
+
+    /// Whether the marched wave stands regrouped at the gather cell: every
+    /// ground member inside [`WAVE_GATHER_ARRIVAL`] of it. The flyers ride
+    /// their own sorties and never walk the regroup, so they neither hold
+    /// it up nor count toward it.
+    fn wave_regrouped(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        gather: (u16, u16),
+    ) -> bool {
+        let mut ground = 0usize;
+        for &unit in &self.wave_members {
+            let Some(entity) = sim.substrate.entities.get(unit) else {
+                continue;
+            };
+            if entity.category() == crate::map::entities::EntityCategory::Aircraft
+                || Self::is_fly_type(rules, sim.interner.resolve(entity.type_ref()))
+            {
+                continue;
+            }
+            ground += 1;
+            let away = (i32::from(entity.position.rx()) - i32::from(gather.0))
+                .abs()
+                .max((i32::from(entity.position.ry()) - i32::from(gather.1)).abs());
+            if away > i32::from(WAVE_GATHER_ARRIVAL) {
+                return false;
+            }
+        }
+        ground > 0
+    }
+
+    /// Latch the strike sequence and turn the stage.
+    fn arm_wave_strike(&mut self, sim: &crate::sim::world::Simulation, tick: u32) {
+        self.wave_targets = self.wave_strike_sequence(sim);
+        self.wave_stage = WaveStage::Striking;
+        self.wave_stage_since = tick;
+        self.wave_marched.clear();
+    }
+
+    /// The strike sequence: the revealed enemy superweapons first (the
+    /// counter table's priority strike, whoever holds them), then the
+    /// house whose structure stands nearest the gather cell — its
+    /// factories, its defenses, then every other structure it holds, the
+    /// retail script's quarry order — nearest the gather cell first within
+    /// each class, so the wave works one base through instead of
+    /// zigzagging between houses. Empty when no hostile structure stands.
+    fn wave_strike_sequence(&self, sim: &crate::sim::world::Simulation) -> Vec<(u64, (i16, i16))> {
+        let anchor = self.wave_gather.map(|(rx, ry)| (rx as i16, ry as i16));
+        let distance = |cell: (i16, i16)| {
+            anchor.map_or(0, |at: (i16, i16)| {
+                (i32::from(cell.0) - i32::from(at.0))
+                    .abs()
+                    .max((i32::from(cell.1) - i32::from(at.1)).abs())
+            })
+        };
+        let mut leads: Vec<(i32, u64, (i16, i16))> = Vec::new();
+        let mut hostile: Vec<(usize, i32, u64, (i16, i16), InternedId)> = Vec::new();
+        for (id, entity) in sim.substrate.entities.iter_sorted() {
+            if entity.category() != crate::map::entities::EntityCategory::Structure
+                || entity.lifecycle.in_limbo()
+                || !entity.lifecycle.object_alive()
+                || !self.is_enemy(sim, entity.owner())
+            {
+                continue;
+            }
+            let cell = (entity.position.rx() as i16, entity.position.ry() as i16);
+            let name = sim.interner.resolve(entity.type_ref());
+            // The counter-trigger's priority strike: a revealed enemy
+            // Nuclear Silo or Weather Controller leads the wave.
+            if WAVE_LEAD_SUPERWEAPON_TYPES.contains(&name)
+                && sim
+                    .fog
+                    .is_cell_revealed(self.house, entity.position.rx(), entity.position.ry())
+            {
+                leads.push((distance(cell), id, cell));
+                continue;
+            }
+            let class = if WAR_FACTORY_TYPES.contains(&name) {
+                0
+            } else if WAVE_DEFENSE_TYPES.contains(&name) {
+                1
+            } else {
+                2
+            };
+            hostile.push((class, distance(cell), id, cell, entity.owner()));
+        }
+        let struck = hostile
+            .iter()
+            .min_by_key(|&&(_, away, id, _, _)| (away, id))
+            .map(|&(_, _, _, _, owner)| owner);
+        hostile.retain(|&(_, _, _, _, owner)| Some(owner) == struck);
+        leads.sort_unstable_by_key(|&(away, id, _)| (away, id));
+        hostile.sort_unstable_by_key(|&(class, away, id, _, _)| (class, away, id));
+        leads
+            .into_iter()
+            .map(|(_, id, cell)| (id, cell))
+            .chain(hostile.into_iter().map(|(_, _, id, cell, _)| (id, cell)))
+            .collect()
+    }
+
+    /// The march stage's one dispatch: the first un-marched member the
+    /// order gate and the zone grid still admit attack-moves at the
+    /// gather cell. Fly members stay out — the sortie limb owns the
+    /// wings. `None` — everyone marched, gated or futile — lets the
+    /// stage clocks turn.
+    fn wave_dispatch_march(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        gather: (u16, u16),
+        tick: u32,
+    ) -> Option<Command> {
+        for unit in self
+            .wave_members
+            .iter()
+            .copied()
+            .filter(|unit| !self.wave_marched.contains(unit))
+            .collect::<Vec<_>>()
+        {
+            let Some(entity) = sim.substrate.entities.get(unit) else {
+                continue;
+            };
+            if Self::is_fly_type(rules, sim.interner.resolve(entity.type_ref())) {
+                // The wing flies its own sortie; the march passes it.
+                self.wave_marched.push(unit);
+                continue;
+            }
+            if !matches!(
+                entity.passive_acquire_mission(),
+                crate::sim::mission::MissionType::None
+                    | crate::sim::mission::MissionType::Sleep
+                    | crate::sim::mission::MissionType::Guard
+                    | crate::sim::mission::MissionType::AreaGuard
+            ) || self.order_gate.get(&unit).is_some_and(|&due| tick < due)
+            {
+                continue;
+            }
+            let from = (entity.position.rx(), entity.position.ry());
+            let movement_zone = rules
+                .object(sim.interner.resolve(entity.type_ref()))
+                .map(|ty| ty.movement_zone)
+                .unwrap_or_default();
+            if !zones_connected(sim, movement_zone, from, gather) {
+                continue;
+            }
+            if self.futile(unit, FutilityKind::Wave, from, tick) {
+                continue;
+            }
+            self.gate_idle_order(unit, tick);
+            self.wave_marched.push(unit);
+            return Some(Command::AttackMove {
+                entity_id: unit,
+                target: None,
+                destination: Some(crate::sim::combat::TargetKind::Cell(gather.0, gather.1)),
+            });
+        }
+        None
+    }
+
+    /// The escort joins at the strike: the latched team's jets, drawn from
+    /// the side's own wing ([`Opening::aircraft`] — the Intruders, Korea's
+    /// Black Eagles) while it stands at [`AIR_WING_TARGET`] — the wing's
+    /// own queue is what fills it toward the target — and holding
+    /// ordnance, ride the wave's Attack orders; the sortie limb passes
+    /// them while they do.
+    fn join_wave_escort(&mut self, sim: &crate::sim::world::Simulation, opening: &Opening) {
+        let Some(plan) = self.current_wave_plan(opening) else {
+            return;
+        };
+        if plan.escort == 0 {
+            return;
+        }
+        let mut on_board = self
+            .wave_members
+            .iter()
+            .filter(|&&unit| {
+                sim.substrate.entities.get(unit).is_some_and(|entity| {
+                    entity.category() == crate::map::entities::EntityCategory::Aircraft
+                        && opening
+                            .aircraft
+                            .contains(&sim.interner.resolve(entity.type_ref()))
+                })
+            })
+            .count();
+        if on_board >= plan.escort {
+            return;
+        }
+        let wing: usize = opening
+            .aircraft
+            .iter()
+            .map(|&jet| self.count_aircraft_of_type(sim, jet))
+            .sum();
+        if wing < AIR_WING_TARGET {
+            return;
+        }
+        let mut joiners: Vec<u64> = Vec::new();
+        for (id, entity) in sim.substrate.entities.iter_sorted() {
+            if on_board >= plan.escort {
+                break;
+            }
+            if entity.owner() != self.house
+                || entity.category() != crate::map::entities::EntityCategory::Aircraft
+                || !entity.lifecycle.object_alive()
+                || entity.lifecycle.in_limbo()
+                || !opening
+                    .aircraft
+                    .contains(&sim.interner.resolve(entity.type_ref()))
+                || entity.ammo().is_none_or(|ammo| ammo.current() == 0)
+                || self.wave_members.contains(&id)
+            {
+                continue;
+            }
+            joiners.push(id);
+            on_board += 1;
+        }
+        self.wave_members.extend(joiners);
+    }
+
+    /// The strike stage's one dispatch: the sequence head that still
+    /// stands hostile draws the wave's next member — an AttackMove at its
+    /// cell, or the Attack click for the escorting jets — and a head that
+    /// fell or changed hands advances the sequence (an emptied one
+    /// re-latches against the next house). No hostile structure left is
+    /// the hunt: attack-moves at the hostile mass center's spread ring, one
+    /// member per tick, and a dispatched-out hunt (or the strike clock)
+    /// ends the episode.
+    fn wave_dispatch_strike(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        center: (i16, i16),
+        enemy_center: Option<(i16, i16)>,
+        tick: u32,
+    ) -> Option<Command> {
+        self.join_wave_escort(sim, opening);
+        // The fallen or captured head advances and restarts the strike
+        // clock; the clock bounds a head the wave cannot reach (a wedged
+        // march, an unreachable cell).
+        while let Some(&(head, _)) = self.wave_targets.first() {
+            if sim.substrate.entities.get(head).is_some_and(|entity| {
+                entity.lifecycle.object_alive()
+                    && !entity.lifecycle.in_limbo()
+                    && self.is_enemy(sim, entity.owner())
+            }) {
+                break;
+            }
+            self.wave_targets.remove(0);
+            self.wave_marched.clear();
+            self.wave_stage_since = tick;
+            if self.wave_targets.is_empty() {
+                // The struck house is razed: the next house's base, if
+                // any stands.
+                self.wave_targets = self.wave_strike_sequence(sim);
+            }
+        }
+        let strike_expired =
+            tick.saturating_sub(self.wave_stage_since) >= WAVE_STRIKE_TIMEOUT_TICKS;
+        let Some(&(head, head_cell)) = self.wave_targets.first() else {
+            // The hunt: no hostile structure left — the members attack-move
+            // at the hostile mass center's spread ring, one per tick, and a
+            // dispatched-out wave (or the clock) ends the episode.
+            let Some(aim) = enemy_center.or_else(|| self.enemy_center(sim)) else {
+                self.end_wave_episode(tick);
+                return None;
+            };
+            let Some((unit, cell)) = self.wave_hunt_dispatch(sim, rules, aim, tick) else {
+                if strike_expired || self.wave_marched.len() >= self.wave_members.len() {
+                    self.end_wave_episode(tick);
+                }
+                return None;
+            };
+            self.wave_marched.push(unit);
+            self.gate_idle_order(unit, tick);
+            return Some(Command::AttackMove {
+                entity_id: unit,
+                target: None,
+                destination: Some(crate::sim::combat::TargetKind::Cell(cell.0, cell.1)),
+            });
+        };
+        for unit in self
+            .wave_members
+            .iter()
+            .copied()
+            .filter(|unit| !self.wave_marched.contains(unit))
+            .collect::<Vec<_>>()
+        {
+            let Some(entity) = sim.substrate.entities.get(unit) else {
+                continue;
+            };
+            let type_name = sim.interner.resolve(entity.type_ref());
+            let fly = entity.category() == crate::map::entities::EntityCategory::Aircraft
+                || Self::is_fly_type(rules, type_name);
+            if !fly
+                && !matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                )
+            {
+                continue;
+            }
+            if fly && entity.ammo().is_none_or(|ammo| ammo.current() == 0) {
+                continue;
+            }
+            if self.order_gate.get(&unit).is_some_and(|&due| tick < due) {
+                continue;
+            }
+            let from = (entity.position.rx(), entity.position.ry());
+            if fly {
+                // The escort's Attack rides the strike head (the walk
+                // above guarantees it stands); a fallen head drops the
+                // order with the stage.
+                self.gate_idle_order(unit, tick);
+                self.wave_marched.push(unit);
+                return Some(Command::Attack {
+                    attacker_id: unit,
+                    target_id: head,
+                });
+            }
+            let movement_zone = rules
+                .object(type_name)
+                .map(|ty| ty.movement_zone)
+                .unwrap_or_default();
+            let cell = (head_cell.0.max(0) as u16, head_cell.1.max(0) as u16);
+            if !zones_connected(sim, movement_zone, from, cell) {
+                continue;
+            }
+            // Layer 3: siege-role units bombard from standoff — the
+            // destination pulls back short of the aim along the home
+            // line (the walk-in died one V3 at a time in the target's
+            // defense ring).
+            let siege = opening
+                .vehicles
+                .iter()
+                .any(|entry| entry.role == Role::Siege && entry.name == type_name);
+            let destination = if siege {
+                siege_standoff_cell(sim, center, cell, from, movement_zone)
+            } else {
+                Some(cell)
+            };
+            let Some(cell) = destination else {
+                continue;
+            };
+            if self.futile(unit, FutilityKind::Wave, from, tick) {
+                continue;
+            }
+            self.gate_idle_order(unit, tick);
+            self.wave_marched.push(unit);
+            return Some(Command::AttackMove {
+                entity_id: unit,
+                target: None,
+                destination: Some(crate::sim::combat::TargetKind::Cell(cell.0, cell.1)),
+            });
+        }
+        // Nobody left to dispatch at a head that still stands: the clock
+        // moves the wave on — the members already dispatched fight their
+        // orders out, and the cadence forms the next wave.
+        if strike_expired {
+            self.end_wave_episode(tick);
+        }
+        None
+    }
+
+    /// The hunt's one dispatch: the first member the ground rows connect
+    /// from, aimed at the hostile mass center's spread ring. Fly members
+    /// pass — the sortie limb owns them — and count as marched so the
+    /// episode can end.
+    fn wave_hunt_dispatch(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        aim: (i16, i16),
+        tick: u32,
+    ) -> Option<(u64, (u16, u16))> {
+        for unit in self
+            .wave_members
+            .iter()
+            .copied()
+            .filter(|unit| !self.wave_marched.contains(unit))
+            .collect::<Vec<_>>()
+        {
+            let Some(entity) = sim.substrate.entities.get(unit) else {
+                continue;
+            };
+            let type_name = sim.interner.resolve(entity.type_ref());
+            if entity.category() == crate::map::entities::EntityCategory::Aircraft
+                || Self::is_fly_type(rules, type_name)
+            {
+                self.wave_marched.push(unit);
+                continue;
+            }
+            if !matches!(
+                entity.passive_acquire_mission(),
+                crate::sim::mission::MissionType::None
+                    | crate::sim::mission::MissionType::Sleep
+                    | crate::sim::mission::MissionType::Guard
+                    | crate::sim::mission::MissionType::AreaGuard
+            ) || self.order_gate.get(&unit).is_some_and(|&due| tick < due)
+            {
+                continue;
+            }
+            let from = (entity.position.rx(), entity.position.ry());
+            let movement_zone = rules
+                .object(type_name)
+                .map(|ty| ty.movement_zone)
+                .unwrap_or_default();
+            let cell = (0..SPREAD_OFFSETS.len())
+                .map(|index| (unit as usize + index) % SPREAD_OFFSETS.len())
+                .find_map(|index| {
+                    let spread = SPREAD_OFFSETS[index];
+                    let cell = on_map_cell(
+                        sim,
+                        (aim.0 + i16::from(spread.0), aim.1 + i16::from(spread.1)),
+                        aim,
+                    );
+                    zones_connected(sim, movement_zone, from, cell).then_some(cell)
+                });
+            let Some(cell) = cell else {
+                continue;
+            };
+            if self.futile(unit, FutilityKind::Wave, from, tick) {
+                continue;
+            }
+            return Some((unit, cell));
+        }
+        None
+    }
+
+    /// End the wave episode. A launched episode keeps the cadence its
+    /// launch armed — the next decision [`WAVE_CADENCE_TICKS`] after the
+    /// launch, never while this one lived — and a form that never
+    /// launched re-arms the full interval from now, the retail interval
+    /// that lets production refill the composition.
+    fn end_wave_episode(&mut self, tick: u32) {
+        if self.wave_stage == WaveStage::Forming {
+            self.next_wave_tick = tick + WAVE_CADENCE_TICKS;
+        }
+        self.wave_stage = WaveStage::Idle;
+        self.wave_members.clear();
+        self.wave_marched.clear();
+        self.wave_gather = None;
+        self.wave_targets.clear();
+    }
+
+    /// The forming wave's production demand: the first core entry of the
+    /// latched team's armor (`armor`) or foot wave whose members sit under
+    /// its count, gated the way the picks gate (`needs`, the tier-2 lab,
+    /// the anti-floater AA exemption). The vehicle and infantry chains
+    /// queue it ahead of their wheels — a wave short of its Rhinos does
+    /// not spend the factory on specialists, nor one short of its
+    /// Conscripts the barracks.
+    fn wave_shortage(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+        armor: bool,
+    ) -> Option<&'static str> {
+        if self.wave_stage != WaveStage::Forming {
+            return None;
+        }
+        let plan = self.current_wave_plan(opening)?;
+        let entries = if armor { plan.armor } else { plan.infantry };
+        for &(wanted, count) in entries {
+            if !self.wave_entry_admits(sim, opening, wanted) {
+                continue;
+            }
+            let standing = self
+                .wave_members
+                .iter()
+                .filter(|&&unit| {
+                    sim.substrate
+                        .entities
+                        .get(unit)
+                        .is_some_and(|entity| sim.interner.resolve(entity.type_ref()) == wanted)
+                })
+                .count();
+            if standing < count {
+                return Some(wanted);
+            }
+        }
+        None
+    }
+
+    /// The anti-floater guard's post anchor: the nearest own power plant
+    /// or refinery, the structures the hostile Disks and Kirovs raid —
+    /// `None` keeps the caller's own anchor.
+    fn aa_economy_anchor(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+        unit: u64,
+    ) -> Option<(i16, i16)> {
+        let Some(entity) = sim.substrate.entities.get(unit) else {
+            return None;
+        };
+        // Only the AA vehicles take the economy post; every other unit
+        // keeps the yard ring.
+        let name = sim.interner.resolve(entity.type_ref());
+        if !opening
+            .vehicles
+            .iter()
+            .any(|entry| entry.role == Role::AntiAir && entry.name == name)
+        {
+            return None;
+        }
+        let from = (entity.position.rx() as i16, entity.position.ry() as i16);
+        let mut best: Option<(u32, (i16, i16))> = None;
+        for (_, entity) in sim.substrate.entities.iter_sorted() {
+            if entity.owner() != self.house
+                || entity.category() != crate::map::entities::EntityCategory::Structure
+                || entity.lifecycle.in_limbo()
+                || !entity.lifecycle.object_alive()
+            {
+                continue;
+            }
+            let name = sim.interner.resolve(entity.type_ref());
+            if name != opening.power && name != opening.refinery {
+                continue;
+            }
+            let cell = (entity.position.rx() as i16, entity.position.ry() as i16);
+            let dx = i32::from(cell.0) - i32::from(from.0);
+            let dy = i32::from(cell.1) - i32::from(from.1);
+            let distance = (dx * dx + dy * dy) as u32;
+            if best.is_none_or(|(kept, _)| distance < kept) {
+                best = Some((distance, cell));
+            }
+        }
+        best.map(|(_, cell)| cell)
+    }
+
+    /// The garrison limb's one order for this tick, or `None`; see the
+    /// call site in [`Self::orders`]. The scan half (paced by
+    /// [`GARRISON_SCAN_TICKS`]) re-reads the targets — the nearest
+    /// revealed neutral occupiable civilians, then the side's own
+    /// occupiable bunkers — and latches the unfilled-slot deficit the
+    /// infantry wheel reads as demand. The dispatch half spends one order
+    /// per tick: the first target still short of its type's
+    /// `MaxNumberOccupants` (occupants plus the soldiers already walking
+    /// in) draws the nearest idle occupier soldier the engine's own
+    /// admission ([`crate::sim::passenger::can_enter_transport`]) accepts,
+    /// with the capture click — the same order a player's garrison click
+    /// sends. The `(building, soldier)` pair pins until he lands (he then
+    /// rides in limbo and the occupant count carries him), dies, or the
+    /// target drops out, so a building is never over-ordered and a lost
+    /// walker frees his slot. An empty Tank Bunker (`Bunker=yes`, one
+    /// vehicle) takes the nearest idle armed turret vehicle with the
+    /// fortress boarding's Enter click, one ride per bunker.
+    fn garrison_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        center: (i16, i16),
+        tick: u32,
+    ) -> Option<Command> {
+        // Hygiene every pass: a soldier who landed (limbo), fell or walked
+        // off the house, and a target that fell or changed hands, free
+        // their pair; a bunker ride that installed or was lost frees its
+        // bunker. So does a walker standing idle once his order gate has
+        // lapsed: the click was dropped or refused (the walk itself runs
+        // the Capture or Enter mission, never an idle one), and a pair
+        // pinned on him would hold the slot shut for the rest of the game.
+        let dropped = |unit: u64, entity: &crate::sim::game_entity::GameEntity| {
+            self.order_gate.get(&unit).is_none_or(|&due| tick >= due)
+                && matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                )
+        };
+        let house = self.house;
+        self.garrison_inbound.retain(|&(building, infantry)| {
+            let walking = sim.substrate.entities.get(infantry).is_some_and(|entity| {
+                entity.owner() == house
+                    && entity.lifecycle.object_alive()
+                    && !entity.lifecycle.in_limbo()
+                    && !dropped(infantry, entity)
+            });
+            let target_stands = sim.substrate.entities.get(building).is_some_and(|entity| {
+                entity.category() == crate::map::entities::EntityCategory::Structure
+                    && entity.lifecycle.object_alive()
+            });
+            walking && target_stands
+        });
+        self.bunker_bound.retain(|&bunker, &mut vehicle| {
+            let bunker_open = sim.substrate.entities.get(bunker).is_some_and(|entity| {
+                entity.owner() == house
+                    && entity.lifecycle.object_alive()
+                    && entity.bunker.occupant().is_none()
+            });
+            let riding = sim.substrate.entities.get(vehicle).is_some_and(|entity| {
+                entity.owner() == house
+                    && entity.lifecycle.object_alive()
+                    && entity.bunker.link().installed_in().is_none()
+                    && !dropped(vehicle, entity)
+            });
+            bunker_open && riding
+        });
+        if tick >= self.garrison_due {
+            self.garrison_due = tick + GARRISON_SCAN_TICKS;
+            self.garrison_scan(sim, rules, opening, center);
+        }
+
+        // The infantry dispatch: the first target short of its capacity.
+        for building in self.garrison_targets.clone() {
+            let Some(entity) = sim.substrate.entities.get(building) else {
+                continue;
+            };
+            if !entity.lifecycle.object_alive() || entity.lifecycle.in_limbo() {
+                continue;
+            }
+            let Some(ty) = rules.object(sim.interner.resolve(entity.type_ref())) else {
+                continue;
+            };
+            if !ty.can_be_occupied {
+                continue;
+            }
+            let occupants = entity.passenger_role.occupants().count().max(0) as usize;
+            let inbound = self
+                .garrison_inbound
+                .iter()
+                .filter(|&&(target, _)| target == building)
+                .count();
+            if occupants + inbound >= ty.max_number_occupants as usize {
+                continue;
+            }
+            let target_cell = (entity.position.rx() as i16, entity.position.ry() as i16);
+            if let Some(infantry) =
+                self.nearest_garrison_infantry(sim, rules, target_cell, building, tick)
+            {
+                self.garrison_inbound.insert((building, infantry));
+                self.gate_idle_order(infantry, tick);
+                return Some(Command::CaptureBuilding {
+                    engineer_id: infantry,
+                    target_building_id: building,
+                });
+            }
+        }
+
+        // The tank bunker: an empty `Bunker=yes` hole of the side's own
+        // takes one armed turret vehicle (the engine installs exactly one
+        // through its radio contact; the bound pair keeps the limb from
+        // sending a second ride before the first lands).
+        let bunker_name = opening.defense_bunker?;
+        if !rules.object(bunker_name).is_some_and(|ty| ty.bunker) {
+            return None;
+        }
+        let bunkers: Vec<(u64, (i16, i16))> = self
+            .own_structures(sim)
+            .into_iter()
+            .filter(|(_, name)| name == bunker_name)
+            .filter_map(|(id, _)| {
+                sim.substrate.entities.get(id).and_then(|entity| {
+                    (entity.lifecycle.object_alive()
+                        && !entity.lifecycle.in_limbo()
+                        && entity.bunker.occupant().is_none()
+                        && !self.bunker_bound.contains_key(&id))
+                    .then_some((
+                        id,
+                        (entity.position.rx() as i16, entity.position.ry() as i16),
+                    ))
+                })
+            })
+            .collect();
+        for (bunker, cell) in bunkers {
+            if let Some(vehicle) = self.nearest_bunker_vehicle(sim, rules, opening, cell, tick) {
+                self.bunker_bound.insert(bunker, vehicle);
+                self.gate_idle_order(vehicle, tick);
+                return Some(Command::clicked_mission(
+                    vehicle,
+                    crate::sim::mission::MissionType::Enter,
+                    crate::sim::combat::TargetKind::Entity(bunker),
+                ));
+            }
+        }
+        None
+    }
+
+    /// The garrison scan: re-read the targets and latch the deficit. The
+    /// civilians are the revealed, neutral-owned (a passive house — the
+    /// same reading the tech-capture and spy scans make), `CanBeOccupied`
+    /// structures above red health whose cell the side's soldier can walk
+    /// to from the yard (a city across a breach would latch a demand no
+    /// walker ever fills), nearest the home yard first, up to
+    /// [`GARRISON_BUILDING_TARGET`]; the side's own occupiable bunkers
+    /// follow, nearest first. The deficit sums every target's open slots
+    /// — capacity read off the rules row, less the occupants and the
+    /// soldiers already walking in — for the infantry wheel's demand.
+    fn garrison_scan(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        center: (i16, i16),
+    ) {
+        let distance_to = |rx: u16, ry: u16| -> i32 {
+            (i32::from(rx) - i32::from(center.0))
+                .abs()
+                .max((i32::from(ry) - i32::from(center.1)).abs())
+        };
+        let home = (center.0.max(0) as u16, center.1.max(0) as u16);
+        let foot_zone = rules
+            .object(opening.basic_infantry)
+            .map(|ty| ty.movement_zone)
+            .unwrap_or_default();
+        let mut civilians: Vec<(i32, u64)> = Vec::new();
+        let mut bunkers: Vec<(i32, u64)> = Vec::new();
+        for (id, entity) in sim.substrate.entities.iter_sorted() {
+            if entity.category() != crate::map::entities::EntityCategory::Structure
+                || entity.lifecycle.in_limbo()
+                || !entity.lifecycle.object_alive()
+            {
+                continue;
+            }
+            let name = sim.interner.resolve(entity.type_ref());
+            let Some(ty) = rules.object(name) else {
+                continue;
+            };
+            if !ty.can_be_occupied {
+                continue;
+            }
+            let (rx, ry) = (entity.position.rx(), entity.position.ry());
+            let owner = entity.owner();
+            if owner == self.house {
+                if opening.defense_bunker == Some(name) {
+                    bunkers.push((distance_to(rx, ry), id));
+                }
+                continue;
+            }
+            // Neutral: a passive house, never a combatant's.
+            if sim
+                .houses
+                .get(&owner)
+                .is_none_or(|house| !house.multiplay_passive())
+                || !sim.fog.is_cell_revealed(self.house, rx, ry)
+                || !zones_connected(sim, foot_zone, home, (rx, ry))
+            {
+                continue;
+            }
+            // Above red health: the engine refuses a garrison at or below
+            // `ConditionRed`, so a wreck is not a target.
+            if crate::sim::combat::health_category(
+                entity.health.current(),
+                ty.strength,
+                rules.general.condition_red,
+                rules.general.condition_yellow,
+            ) == 0
+            {
+                continue;
+            }
+            civilians.push((distance_to(rx, ry), id));
+        }
+        civilians.sort_by_key(|&(distance, id)| (distance, id));
+        bunkers.sort_by_key(|&(distance, id)| (distance, id));
+        self.garrison_targets = civilians
+            .into_iter()
+            .take(GARRISON_BUILDING_TARGET)
+            .chain(bunkers)
+            .map(|(_, id)| id)
+            .collect();
+        self.garrison_demand = self
+            .garrison_targets
+            .iter()
+            .map(|&building| {
+                let Some(entity) = sim.substrate.entities.get(building) else {
+                    return 0;
+                };
+                let Some(ty) = rules.object(sim.interner.resolve(entity.type_ref())) else {
+                    return 0;
+                };
+                let occupants = entity.passenger_role.occupants().count().max(0) as usize;
+                let inbound = self
+                    .garrison_inbound
+                    .iter()
+                    .filter(|&&(target, _)| target == building)
+                    .count();
+                (ty.max_number_occupants as usize).saturating_sub(occupants + inbound)
+            })
+            .sum();
+    }
+
+    /// The nearest idle occupier soldier free of every other chain whom
+    /// the engine admits into `building`: a rules row with `Occupier=yes`
+    /// (retail's GI, Conscript and Initiate — each side's basic soldier;
+    /// the engineers, the spy, the heroes and the hounds never carry it),
+    /// idle-class mission, order gate open, not a reserved boarder,
+    /// raider, raid actor, bound engineer, bridge walker or wave member,
+    /// not already walking into a garrison, on ground the building's cell
+    /// connects to (a walk across a breach never lands); the pair's
+    /// admission (`can_enter_transport`: occupier flag, owner passive or
+    /// own, capacity, red health, mind control, inside a transport) asked
+    /// nearest first.
+    fn nearest_garrison_infantry(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        target_cell: (i16, i16),
+        building: u64,
+        tick: u32,
+    ) -> Option<u64> {
+        let to = (target_cell.0.max(0) as u16, target_cell.1.max(0) as u16);
+        let mut candidates: Vec<(u32, u64)> = Vec::new();
+        for (id, entity) in sim.substrate.entities.iter_sorted() {
+            if entity.owner() != self.house
+                || entity.category() != crate::map::entities::EntityCategory::Infantry
+                || !entity.lifecycle.object_alive()
+                || entity.lifecycle.in_limbo()
+                || !matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                )
+                || self.order_gate.get(&id).is_some_and(|&due| tick < due)
+                || self.boarders.contains(&id)
+                || self.raiders.contains(&id)
+                || self.raid_involves(id)
+                || self.capture_bound.contains_key(&id)
+                || self.bridge_engineer == Some(id)
+                || self.wave_members.contains(&id)
+                || self
+                    .garrison_inbound
+                    .iter()
+                    .any(|&(_, walker)| walker == id)
+            {
+                continue;
+            }
+            let Some(ty) = rules.object(sim.interner.resolve(entity.type_ref())) else {
+                continue;
+            };
+            if !ty.occupier
+                || !zones_connected(
+                    sim,
+                    ty.movement_zone,
+                    (entity.position.rx(), entity.position.ry()),
+                    to,
+                )
+            {
+                continue;
+            }
+            let dx = i32::from(entity.position.rx()) - i32::from(target_cell.0);
+            let dy = i32::from(entity.position.ry()) - i32::from(target_cell.1);
+            candidates.push(((dx * dx + dy * dy) as u32, id));
+        }
+        candidates.sort_by_key(|&(distance, id)| (distance, id));
+        candidates
+            .into_iter()
+            .map(|(_, id)| id)
+            .find(|&id| crate::sim::passenger::can_enter_transport(sim, rules, id, building))
+    }
+
+    /// The nearest idle vehicle a Tank Bunker takes: the engine's own
+    /// admission ([`crate::sim::docking::bunker_link::can_auto_deploy_here`],
+    /// the native `0x0070FB50` — `Bunkerable=`, a turret, an armed current
+    /// weapon, a SpeedType other than Hover, no parasite aboard) answers
+    /// whether the hull fits at all; the AI's own policy then keeps the
+    /// economy (the miners, the MCVs), the ferry hulls, the fortress, the
+    /// naval line, the flyers and the roster's AA vehicles (the mobile-AA
+    /// quota's answer belongs on the ring, not in a hole) out, along with
+    /// a hull already linked to a bunker or bound to one, or held by
+    /// another chain.
+    fn nearest_bunker_vehicle(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        bunker_cell: (i16, i16),
+        tick: u32,
+    ) -> Option<u64> {
+        let mut best: Option<(u32, u64)> = None;
+        for (id, entity) in sim.substrate.entities.iter_sorted() {
+            if entity.owner() != self.house
+                || entity.category() != crate::map::entities::EntityCategory::Unit
+                || !entity.lifecycle.object_alive()
+                || entity.lifecycle.in_limbo()
+                || !matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                )
+                || self.order_gate.get(&id).is_some_and(|&due| tick < due)
+                || self.boarders.contains(&id)
+                || self.raiders.contains(&id)
+                || self.raid_involves(id)
+                || self.wave_members.contains(&id)
+                || entity.bunker.link().installed_in().is_some()
+                || self.bunker_bound.values().any(|&ride| ride == id)
+            {
+                continue;
+            }
+            let name = sim.interner.resolve(entity.type_ref());
+            if !crate::sim::docking::bunker_link::can_auto_deploy_here(sim, id, rules)
+                || Self::is_fly_type(rules, name)
+                || Self::is_naval_type(opening, name)
+                || opening.harvester == Some(name)
+                || MCV_TYPES.contains(&name)
+                || opening.fortress == Some(name)
+                || opening.amphibious_transport == Some(name)
+                || opening.air_ferry == Some(name)
+                || opening
+                    .vehicles
+                    .iter()
+                    .any(|entry| entry.role == Role::AntiAir && entry.name == name)
+                // A drive across a breach never lands: the bunker's cell must
+                // share the hull's own ground rows.
+                || !zones_connected(
+                    sim,
+                    rules
+                        .object(name)
+                        .map(|ty| ty.movement_zone)
+                        .unwrap_or_default(),
+                    (entity.position.rx(), entity.position.ry()),
+                    (bunker_cell.0.max(0) as u16, bunker_cell.1.max(0) as u16),
+                )
+            {
+                continue;
+            }
+            let dx = i32::from(entity.position.rx()) - i32::from(bunker_cell.0);
+            let dy = i32::from(entity.position.ry()) - i32::from(bunker_cell.1);
+            let distance = (dx * dx + dy * dy) as u32;
+            if best.is_none_or(|(kept, _)| distance < kept) {
+                best = Some((distance, id));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
     /// The naval layer's production pick (Layer 2.7): the basic hull line
     /// up to [`NAVAL_SHIP_QUOTA`], with the AA escort claiming one turn
     /// once its extra prerequisite honestly passes `can_build` (the
@@ -7495,8 +9368,7 @@ impl SuperAi {
         // Sensor down Yuri's whole navy line rests — the Allied destroyer
         // and the Soviet submarine need no radar and keep their line.
         if hulls < NAVAL_SHIP_QUOTA
-            && (opening.naval_ship != "BSUB"
-                || self.needs_structure_stands(sim, opening.radar))
+            && (opening.naval_ship != "BSUB" || self.needs_structure_stands(sim, opening.radar))
             && buildable(opening.naval_ship)
         {
             return Some(opening.naval_ship);
@@ -7536,10 +9408,7 @@ impl SuperAi {
         force: &[u64],
     ) -> Option<u64> {
         let sailor = sim.substrate.entities.get(*force.first()?)?;
-        let from = (
-            sailor.position.rx() as i16,
-            sailor.position.ry() as i16,
-        );
+        let from = (sailor.position.rx() as i16, sailor.position.ry() as i16);
         let zone = rules
             .object(sim.interner.resolve(sailor.type_ref()))
             .map(|ty| ty.movement_zone)
@@ -7567,10 +9436,7 @@ impl SuperAi {
             .map(|(id, entity)| {
                 (
                     id,
-                    (
-                        entity.position.rx() as i16,
-                        entity.position.ry() as i16,
-                    ),
+                    (entity.position.rx() as i16, entity.position.ry() as i16),
                 )
             })
             .collect();
@@ -7599,6 +9465,7 @@ impl SuperAi {
                         crate::map::entities::EntityCategory::Unit
                             | crate::map::entities::EntityCategory::Infantry
                     )
+                    && !Self::garrisoned(entity)
                     && {
                         let name = sim.interner.resolve(entity.type_ref());
                         (roster.contains(&name) || Self::is_naval_type(opening, name))
@@ -7839,11 +9706,7 @@ impl SuperAi {
             // wounds compare fairly without floats.
             let fraction = health * 1000 / strength;
             if best.is_none_or(|(kept, _, _)| fraction < kept) {
-                best = Some((
-                    fraction,
-                    entity.position.rx(),
-                    entity.position.ry(),
-                ));
+                best = Some((fraction, entity.position.rx(), entity.position.ry()));
             }
         }
         best.map(|(_, rx, ry)| (rx, ry))
@@ -8023,7 +9886,9 @@ impl SuperAi {
             return false;
         };
         self.own_yard_centers(sim, opening).iter().any(|cell| {
-            (i32::from(cell.0) - i32::from(sx)).abs().max((i32::from(cell.1) - i32::from(sy)).abs())
+            (i32::from(cell.0) - i32::from(sx))
+                .abs()
+                .max((i32::from(cell.1) - i32::from(sy)).abs())
                 <= i32::from(radius)
         })
     }
@@ -8107,6 +9972,61 @@ impl SuperAi {
     }
 }
 
+/// The AA tower's per-yard quota against the hostile air count — the
+/// defense limb's tiered AA answer: one tower per yard always (a base
+/// never stands without its AA answer), two once hostile air actually
+/// fields, three against a real air force
+/// ([`AA_HEAVY_AIR_THREATS`]). The limb re-reads the count every slot,
+/// so a peace treaty drops the tier back and the queue rests at the
+/// baseline ring.
+fn aa_per_yard_quota(enemy_air: usize) -> usize {
+    if enemy_air >= AA_HEAVY_AIR_THREATS {
+        DEFENSE_PER_YARD_AA_HEAVY
+    } else if enemy_air > 0 {
+        DEFENSE_PER_YARD_AA_WARTIME
+    } else {
+        DEFENSE_PER_YARD_AA_BASE
+    }
+}
+
+/// The mobile-AA quota the vehicle pipeline owes the army: the
+/// [`AA_UNIT_FLOOR`] pair stands before hostile air exists, and every
+/// two hostile aircraft lift the target one more, capped at
+/// [`AA_UNIT_CAP`].
+fn aa_unit_target(enemy_air: usize) -> usize {
+    (AA_UNIT_FLOOR + enemy_air / 2).min(AA_UNIT_CAP)
+}
+
+/// The mobile-AA quota with the counter-trigger table's air team folded
+/// in: the armed trigger ([`AA_COUNTER_AIR_THREATS`] hostile aircraft at
+/// the last read) lifts the floor to [`AA_COUNTER_VEHICLE_FLOOR`] — never
+/// past the cap the quota already holds, so a trigger that reads while
+/// the air count still climbs buys the hulls the count alone would have
+/// bought a window later.
+fn aa_vehicle_target(enemy_air: usize, counter_armed: bool) -> usize {
+    let target = aa_unit_target(enemy_air);
+    if counter_armed {
+        target.max(AA_COUNTER_VEHICLE_FLOOR).min(AA_UNIT_CAP)
+    } else {
+        target
+    }
+}
+
+/// The AntiAir role's demanded share for the specialist wheels: the base
+/// share in peace, [`ROLE_SHARE_BOOST`] once hostile air fields, and the
+/// counter-trigger table's [`AA_COUNTER_ROLE_SHARE`] once the air team
+/// arms — the retail six-Flak-Trooper shape, fielded through whichever
+/// roster rows the side's AntiAir role names.
+fn anti_air_demand(enemy_air: usize, counter_armed: bool) -> usize {
+    if counter_armed {
+        AA_COUNTER_ROLE_SHARE
+    } else if enemy_air > 0 {
+        ROLE_SHARE_BOOST
+    } else {
+        ROLE_SHARE_BASE
+    }
+}
+
 /// The tech-climb bank's affordability bar for the three unit queues
 /// (aircraft, vehicle, infantry), shared so the three read one number:
 /// the wallet at six tenths of the item's cost (`credits * 5 <
@@ -8178,11 +10098,7 @@ fn rally_anchor(factory_cell: (i16, i16), yards: &[(i16, i16)]) -> (i16, i16) {
 /// not enemy direction (the forward field is often the poorer one), so
 /// the richness-per-distance term keeps its voice and only ties flip.
 /// Pure so the bias stays unit testable.
-fn enemy_direction_bias(
-    enemy_cell: Option<(i16, i16)>,
-    home: (i16, i16),
-    cell: (i16, i16),
-) -> i32 {
+fn enemy_direction_bias(enemy_cell: Option<(i16, i16)>, home: (i16, i16), cell: (i16, i16)) -> i32 {
     let Some((ex, ey)) = enemy_cell else {
         return 0;
     };
@@ -8310,8 +10226,7 @@ fn siege_standoff_cell(
         let sy = ty - (dy * step) / distance;
         let cell = on_map_cell(sim, (sx as i16, sy as i16), home);
         // A pull-back clamped all the way onto the home cell is not a post.
-        if (cell.0 as i16, cell.1 as i16) != home
-            && zones_connected(sim, movement_zone, from, cell)
+        if (cell.0 as i16, cell.1 as i16) != home && zones_connected(sim, movement_zone, from, cell)
         {
             return Some(cell);
         }
@@ -8533,7 +10448,16 @@ fn find_site_around(
     center: (i16, i16),
     house: InternedId,
 ) -> Option<(u16, u16)> {
-    find_site_around_capped(sim, rules, registry, ty, center, house, None, SITE_SEARCH_RADIUS)
+    find_site_around_capped(
+        sim,
+        rules,
+        registry,
+        ty,
+        center,
+        house,
+        None,
+        SITE_SEARCH_RADIUS,
+    )
 }
 
 /// [`find_site_around`] with a capped radius and, when `build_area_owner`
@@ -8698,11 +10622,15 @@ fn find_site_beyond(
 #[cfg(test)]
 mod tests {
     use super::{
+        AA_COUNTER_AIR_THREATS, AA_COUNTER_ROLE_SHARE, AA_COUNTER_VEHICLE_FLOOR, AA_UNIT_CAP,
+        AA_UNIT_FLOOR, AIR_WING_TARGET, BUILD_QUEUE_RETRY_TICKS, DEFENSE_PER_YARD_AA_BASE,
+        DEFENSE_PER_YARD_AA_HEAVY, DEFENSE_PER_YARD_AA_WARTIME, EXPANSION_MIN_DISTANCE,
+        FLOATER_COUNTER_THREATS, FLOATER_TYPES, OPENINGS, ORE_ENEMY_DIRECTION_BIAS,
+        ROLE_SHARE_BASE, ROLE_SHARE_BOOST, Role, RosterEntry, SuperAi, SuperAiDifficulty,
+        TECH_BUILDING_TYPES, aa_per_yard_quota, aa_unit_target, aa_vehicle_target, anti_air_demand,
         capture_priority_rank, enemy_direction_bias, foundation_keeps_gap,
         nearest_connected_target, rally_anchor, spy_infiltration_rank, tech_bank_short,
-        Role, BUILD_QUEUE_RETRY_TICKS, EXPANSION_MIN_DISTANCE,
-        ORE_ENEMY_DIRECTION_BIAS, OPENINGS, SuperAi, SuperAiDifficulty,
-        TECH_BUILDING_TYPES,
+        wall_ring_cells,
     };
     use crate::sim::intern::InternedId;
     use crate::sim::runtime::SimRuntime;
@@ -8783,6 +10711,46 @@ mod tests {
         assert!(!tech_bank_short(600, 999));
     }
 
+    /// The mobile-AA quota's arithmetic: the floor pair stands with no
+    /// hostile air at all, every two hostile aircraft add one hull, and
+    /// the cap holds at five however large the air war grows.
+    #[test]
+    fn aa_unit_target_scales_with_enemy_air_and_caps() {
+        assert_eq!(aa_unit_target(0), AA_UNIT_FLOOR);
+        assert_eq!(
+            aa_unit_target(1),
+            AA_UNIT_FLOOR,
+            "one jet is not yet a pair"
+        );
+        assert_eq!(aa_unit_target(2), 3);
+        assert_eq!(aa_unit_target(3), 3);
+        assert_eq!(aa_unit_target(4), 4);
+        assert_eq!(aa_unit_target(6), AA_UNIT_CAP);
+        assert_eq!(aa_unit_target(50), AA_UNIT_CAP, "the cap holds");
+        assert_eq!(AA_UNIT_FLOOR, 2);
+        assert_eq!(AA_UNIT_CAP, 5);
+    }
+
+    /// The AA tower's per-yard ladder: the baseline ring in peace, the
+    /// wartime tier the moment hostile air fields, the heavy tier against
+    /// a real air force — and the tiers read 1/2/3.
+    #[test]
+    fn aa_tower_quota_tiers_with_the_air_war() {
+        assert_eq!(aa_per_yard_quota(0), DEFENSE_PER_YARD_AA_BASE);
+        assert_eq!(aa_per_yard_quota(1), DEFENSE_PER_YARD_AA_WARTIME);
+        assert_eq!(aa_per_yard_quota(3), DEFENSE_PER_YARD_AA_WARTIME);
+        assert_eq!(aa_per_yard_quota(4), DEFENSE_PER_YARD_AA_HEAVY);
+        assert_eq!(aa_per_yard_quota(12), DEFENSE_PER_YARD_AA_HEAVY);
+        assert_eq!(
+            (
+                DEFENSE_PER_YARD_AA_BASE,
+                DEFENSE_PER_YARD_AA_WARTIME,
+                DEFENSE_PER_YARD_AA_HEAVY
+            ),
+            (1, 2, 3)
+        );
+    }
+
     #[test]
     fn same_view_and_tick_produce_the_identical_sequence() {
         let (runtime, house) = runtime();
@@ -8841,10 +10809,12 @@ mod tests {
         assert_eq!(allied.naval_hull_extra, Some("DLPH"));
         assert_eq!(allied.naval_capital, Some("CARRIER"));
         assert_eq!(allied.amphibious_transport, Some("LCRF"));
-        assert!(allied
-            .infantry
-            .iter()
-            .any(|entry| entry.name == "CLEG" && entry.needs == Some("GATECH")));
+        assert!(
+            allied
+                .infantry
+                .iter()
+                .any(|entry| entry.name == "CLEG" && entry.needs == Some("GATECH"))
+        );
 
         let soviet = opening("NACNST");
         assert_eq!(soviet.engineer, "SENGINEER");
@@ -8856,14 +10826,18 @@ mod tests {
         assert_eq!(soviet.naval_hull_extra, Some("SQD"));
         assert_eq!(soviet.naval_capital, Some("DRED"));
         assert_eq!(soviet.amphibious_transport, Some("SAPC"));
-        assert!(soviet
-            .infantry
-            .iter()
-            .any(|entry| entry.name == "TERROR" && entry.needs == Some("NARADR")));
-        assert!(soviet
-            .vehicles
-            .iter()
-            .any(|entry| entry.name == "DTRUCK" && entry.needs == Some("NARADR")));
+        assert!(
+            soviet
+                .infantry
+                .iter()
+                .any(|entry| entry.name == "TERROR" && entry.needs == Some("NARADR"))
+        );
+        assert!(
+            soviet
+                .vehicles
+                .iter()
+                .any(|entry| entry.name == "DTRUCK" && entry.needs == Some("NARADR"))
+        );
 
         let yuri = opening("YACNST");
         assert_eq!(yuri.engineer, "YENGINEER");
@@ -8874,10 +10848,11 @@ mod tests {
             "the Boomer is both hull and capital"
         );
         assert_eq!(yuri.amphibious_transport, Some("YHVR"));
-        assert!(yuri
-            .infantry
-            .iter()
-            .any(|entry| entry.name == "YDOG" && entry.needs.is_none()));
+        assert!(
+            yuri.infantry
+                .iter()
+                .any(|entry| entry.name == "YDOG" && entry.needs.is_none())
+        );
 
         // The engineer bug's own shape: the three sides name three distinct
         // rules sections — a shared "ENGINEER" is ForbiddenHouses-refused
@@ -8929,7 +10904,7 @@ mod tests {
     }
 
     /// The siege flyer column: the Soviets' Kirov and Yuri's Floating
-    /// Disk are the war-factory flyers the one-off commission fields once
+    /// Disk are the war-factory flyers the wing commission fields once
     /// the lab stands, and the Allies keep `None` — their heavy air rides
     /// the aircraft tab, so their commission must stay asleep.
     #[test]
@@ -8947,6 +10922,49 @@ mod tests {
             None,
             "the Allies field no war-factory flyer"
         );
+    }
+
+    /// The flyer wing quotas and the garrison bunkers: the Soviets fly
+    /// three Kirovs with a two-chopper Siege element behind them, Yuri
+    /// three Floating Disks with no second line, the Allies none — their
+    /// aircraft-tab wing grew to six jets to carry the same weight. The
+    /// bunker row: the Soviet Battle Bunker and Yuri's Tank Bunker stand
+    /// beside the pillboxes, the Allies garrison nothing.
+    #[test]
+    fn openings_field_the_flyer_quotas_and_the_bunkers() {
+        let opening = |yard: &str| {
+            OPENINGS
+                .iter()
+                .find(|opening| opening.construction_yard == yard)
+                .expect("each side's opening")
+        };
+
+        let soviet = opening("NACNST");
+        assert_eq!(soviet.siege_flyer, Some("ZEP"));
+        assert_eq!(soviet.siege_flyer_target, 3);
+        assert_eq!(soviet.siege_second, Some("SCHP"));
+        assert_eq!(soviet.siege_second_target, 2);
+        assert_eq!(soviet.defense_bunker, Some("NABNKR"));
+
+        let yuri = opening("YACNST");
+        assert_eq!(yuri.siege_flyer, Some("DISK"));
+        assert_eq!(yuri.siege_flyer_target, 3);
+        assert_eq!(yuri.siege_second, None, "Yuri fields one flyer line");
+        assert_eq!(yuri.siege_second_target, 0);
+        assert_eq!(yuri.defense_bunker, Some("NATBNK"));
+
+        let allied = opening("GACNST");
+        assert_eq!(allied.siege_flyer, None);
+        assert_eq!(allied.siege_flyer_target, 0);
+        assert_eq!(allied.siege_second, None);
+        assert_eq!(allied.siege_second_target, 0);
+        assert_eq!(
+            allied.defense_bunker, None,
+            "the Allies garrison no bunker at retail"
+        );
+        // The aircraft-tab wing the same wallet feeds grew with the
+        // war-factory flyer wings.
+        assert_eq!(AIR_WING_TARGET, 6);
     }
 
     /// The roster's retail radar gates: every row whose retail
@@ -9218,8 +11236,7 @@ mod tests {
 
         let yuri = opening("YACNST");
         assert_eq!(
-            yuri.engineer_ride,
-            None,
+            yuri.engineer_ride, None,
             "Yuri fields no land transport; the ferry's hover hull is not a raid ride"
         );
 
@@ -9888,7 +11905,10 @@ mod tests {
                 state.command_driven() && !state.multiplay_passive() && !state.is_human()
             })
             .map(|(&house, state)| {
-                SuperAi::new(house, state.super_tier().unwrap_or(SuperAiDifficulty::Brutal))
+                SuperAi::new(
+                    house,
+                    state.super_tier().unwrap_or(SuperAiDifficulty::Brutal),
+                )
             })
             .collect();
         assert!(
@@ -9955,14 +11975,14 @@ mod tests {
                         if !entity.on_bridge() {
                             let cells =
                                 crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
-                            let [x, y] =
-                                crate::sim::movement::ground_pose::position_world_xy(
-                                    &entity.position,
-                                );
+                            let [x, y] = crate::sim::movement::ground_pose::position_world_xy(
+                                &entity.position,
+                            );
                             let slope_blocked = cells.ground_fields(cells.lookup_world(x, y)).1
                                 == 0
                                 && crate::sim::movement::ground_pose::terrain_projection_differs(
-                                    &cells, [x, y],
+                                    &cells,
+                                    [x, y],
                                 );
                             gates.push_str(&format!("slope_blocked={slope_blocked} "));
                         } else {
@@ -9970,7 +11990,10 @@ mod tests {
                         }
                         gates.push_str(&format!(
                             "tube={:?} ",
-                            terrain.is_tube_deploy_neighborhood((mcv_cell.0 as i16, mcv_cell.1 as i16))
+                            terrain.is_tube_deploy_neighborhood((
+                                mcv_cell.0 as i16,
+                                mcv_cell.1 as i16
+                            ))
                         ));
                     }
                     let weapons_factory = sim
@@ -10100,7 +12123,10 @@ mod tests {
                 state.command_driven() && !state.multiplay_passive() && !state.is_human()
             })
             .map(|(&house, state)| {
-                SuperAi::new(house, state.super_tier().unwrap_or(SuperAiDifficulty::Brutal))
+                SuperAi::new(
+                    house,
+                    state.super_tier().unwrap_or(SuperAiDifficulty::Brutal),
+                )
             })
             .collect();
 
@@ -10117,8 +12143,10 @@ mod tests {
                     .and_then(|ty| ty.undeploys_into.clone())
             })
             .collect();
-        let mut produced: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u32>> =
-            Default::default();
+        let mut produced: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, u32>,
+        > = Default::default();
         let mut moved_mcv: std::collections::BTreeMap<String, (u64, u16, u16)> = Default::default();
         for tick in 0..20_000u32 {
             let mut orders = Vec::new();
@@ -10129,19 +12157,19 @@ mod tests {
                 match &envelope.payload {
                     crate::sim::command::Command::QueueProduction { type_id } => {
                         let owner = scenario.sim().interner.resolve(envelope.owner).to_string();
-                        let name = scenario
-                            .sim()
-                            .interner
-                            .resolve(*type_id)
-                            .to_string();
+                        let name = scenario.sim().interner.resolve(*type_id).to_string();
                         *produced.entry(owner).or_default().entry(name).or_insert(0) += 1;
                     }
-                    crate::sim::command::Command::Move { entity_id, target_rx, target_ry } => {
+                    crate::sim::command::Command::Move {
+                        entity_id,
+                        target_rx,
+                        target_ry,
+                    } => {
                         if let Some(entity) = scenario.sim().substrate.entities.get(*entity_id)
                             && entity.category() == EntityCategory::Unit
-                            && mcv_names.iter().any(|m| {
-                                m == scenario.sim().interner.resolve(entity.type_ref())
-                            })
+                            && mcv_names
+                                .iter()
+                                .any(|m| m == scenario.sim().interner.resolve(entity.type_ref()))
                         {
                             let owner = scenario.sim().interner.resolve(envelope.owner).to_string();
                             moved_mcv.insert(owner, (*entity_id, *target_rx, *target_ry));
@@ -10183,7 +12211,8 @@ mod tests {
             let tanks: usize = OPENINGS
                 .iter()
                 .map(|o| {
-                    ai.count_units_of_type(sim, o.main_tank) + ai.count_units_of_type(sim, o.tier2_tank)
+                    ai.count_units_of_type(sim, o.main_tank)
+                        + ai.count_units_of_type(sim, o.tier2_tank)
                 })
                 .sum();
             let units = sim
@@ -10194,12 +12223,12 @@ mod tests {
                 .count();
             let mcv_walks = moved_mcv.get(&name);
             let mut mcv_line = String::from("mcv_walks=no-orders ");
-            if let Some(entity) = mcv_walks
-                .and_then(|(id, _, _)| sim.substrate.entities.get(*id))
-            {
+            if let Some(entity) = mcv_walks.and_then(|(id, _, _)| sim.substrate.entities.get(*id)) {
                 if let Some((hx, hy)) = home {
-                    let dist = (entity.position.rx() as i16 - hx).abs()
-                        .max(entity.position.ry() as i16 - hy).abs();
+                    let dist = (entity.position.rx() as i16 - hx)
+                        .abs()
+                        .max(entity.position.ry() as i16 - hy)
+                        .abs();
                     mcv_line = format!(
                         "live_mcv_pos=({},{}) dist_from_home={} ",
                         entity.position.rx(),
@@ -10231,9 +12260,12 @@ mod tests {
         // still fails the run.
         println!("== AI-vs-AI late-game census ==\n{census}");
         let any_units = drivers.iter().any(|ai| {
-            scenario.sim().substrate.entities.iter_sorted().any(|(_, e)| {
-                e.owner() == ai.house && e.category() == EntityCategory::Unit
-            })
+            scenario
+                .sim()
+                .substrate
+                .entities
+                .iter_sorted()
+                .any(|(_, e)| e.owner() == ai.house && e.category() == EntityCategory::Unit)
         });
         assert!(any_units, "some house still fields units\n{census}");
     }
@@ -11000,9 +13032,7 @@ mod tests {
     /// Collapse the scene's high bridge the way the sim's own bridge
     /// witnesses do: ordinary HE damage past the bridge strength at the
     /// deck receiver until the structural facts clear.
-    fn collapse_pacific_bridge(
-        scenario: &mut crate::headless_scenario::HeadlessScenario,
-    ) {
+    fn collapse_pacific_bridge(scenario: &mut crate::headless_scenario::HeadlessScenario) {
         use crate::sim::bridge_state::BridgeDamageEvent;
 
         let runtime = &mut scenario.runtime;
@@ -11057,10 +13087,7 @@ mod tests {
     /// The engine's own Normal-row zone id for `cell` — the oracle the
     /// gating assertions read (the helper under test wraps exactly this
     /// query, so the oracle stays the sim's, not the wrapper's).
-    fn ground_zone(
-        scenario: &crate::headless_scenario::HeadlessScenario,
-        cell: (u16, u16),
-    ) -> u32 {
+    fn ground_zone(scenario: &crate::headless_scenario::HeadlessScenario, cell: (u16, u16)) -> u32 {
         let sim = scenario.sim();
         sim.zone_grid
             .as_ref()
@@ -11076,9 +13103,7 @@ mod tests {
 
     /// The map CABHUT entity nearest the evidence's hut coordinate, with
     /// its cell.
-    fn pacific_hut(
-        scenario: &crate::headless_scenario::HeadlessScenario,
-    ) -> (u64, (u16, u16)) {
+    fn pacific_hut(scenario: &crate::headless_scenario::HeadlessScenario) -> (u64, (u16, u16)) {
         scenario
             .sim()
             .substrate
@@ -11087,12 +13112,7 @@ mod tests {
             .find(|(_, entity)| {
                 scenario.sim().interner.resolve(entity.type_ref()) == super::BRIDGE_HUT_TYPE
             })
-            .map(|(id, entity)| {
-                (
-                    id,
-                    (entity.position.rx(), entity.position.ry()),
-                )
-            })
+            .map(|(id, entity)| (id, (entity.position.rx(), entity.position.ry())))
             .expect("the retail map's bridge repair hut")
     }
 
@@ -11166,15 +13186,22 @@ mod tests {
                 )
                 .expect("the under-construction factory");
         }
-        for _ in 0..super::ATTACK_WAVE_SIZE + 1 {
+        // A full phase-one wave's worth of Grizzlies and more: the plan
+        // takes three, the rest hold the guard reserve and the posts.
+        for _ in 0..12 {
             spawn_near(&mut scenario, "MTNK", ai_house, (64, 94));
         }
         let far_target = far_target_cell(&scenario);
 
-        // Intact span: the wave launches across it. Every destination is
-        // the far structure's own cell — never the limbo factory's (0,0).
+        // Intact span: the wave forms on the cadence, launches on the form
+        // clock (the plan's GIs never arrive — no barracks stands), and
+        // its march and strike dispatches ride out. No destination is
+        // ever the limbo factory's (0,0), and the strike aims the far
+        // structure's own cell once the gather stage turns.
+        let intact_window = super::WAVE_FORM_TIMEOUT_TICKS + super::WAVE_MARCH_TIMEOUT_TICKS + 64;
+        let mut intact_moves = 0;
         let mut intact_far_moves = 0;
-        for tick in 0..24u32 {
+        for tick in 0..intact_window {
             for order in ai.orders(&scenario.runtime, tick) {
                 if let crate::sim::command::Command::AttackMove {
                     destination: Some(crate::sim::combat::TargetKind::Cell(rx, ry)),
@@ -11186,22 +13213,25 @@ mod tests {
                         (0, 0),
                         "a constructor-held factory is not a target (tick {tick})"
                     );
-                    assert_eq!(
-                        (rx, ry),
-                        far_target,
-                        "an intact span sends the wave at the far structure"
-                    );
-                    intact_far_moves += 1;
+                    intact_moves += 1;
+                    if (rx, ry) == far_target {
+                        intact_far_moves += 1;
+                    }
                 }
             }
         }
         assert!(
-            intact_far_moves > 0,
+            intact_moves > 0,
             "the wave must launch across the intact span (positive control)"
         );
         assert!(
-            !ai.launched.is_empty(),
-            "the intact-span episode dispatched its units"
+            intact_far_moves > 0,
+            "the strike stage sends the wave at the far structure's cell"
+        );
+        assert!(
+            !ai.wave_marched.is_empty() || ai.wave_stage == super::WaveStage::Idle,
+            "the intact-span episode dispatched its members (stage {:?})",
+            ai.wave_stage
         );
 
         collapse_pacific_bridge(&mut scenario);
@@ -11212,17 +13242,22 @@ mod tests {
             "the breach must split the zone rows (setup oracle)"
         );
 
-        // Broken span: several wave-retry windows' worth of ticks — long
-        // enough for the marched tanks to idle out at the breach and rejoin
-        // the standing set. No order of any kind may land in the cut-off
-        // zone, and an armed episode must end with nothing launched: the
-        // pinned `launched` list entered a call non-empty (the intact-span
-        // dispatches), the arm clears it, and no unreachable destination
-        // refills it — that one-tick transition is observable from outside.
+        // Broken span: several wave cadences' worth of ticks — long enough
+        // for the live episode to run its clocks out and the next ones to
+        // form, march and strike behind the breach. No order of any kind
+        // may land in the cut-off zone, and a strike stage running behind
+        // the breach must end with nothing dispatched: the pinned stage
+        // enters a call striking and leaves it idle, and the marched list
+        // never grew while it struck — observable from outside. (The
+        // march may still dispatch at a gather cell on the home shore;
+        // only the strike aims across the water.)
         let mut guard_posts = 0;
         let mut armed_and_blocked = false;
-        for tick in 24..8 * super::WAVE_RETRY_TICKS {
-            let launched_before = !ai.launched.is_empty();
+        let mut post_breach_strike_dispatches = 0;
+        let breach_tick = intact_window;
+        for tick in breach_tick..breach_tick + 8 * super::WAVE_CADENCE_TICKS {
+            let stage_before = ai.wave_stage;
+            let marched_before = ai.wave_marched.len();
             for order in ai.orders(&scenario.runtime, tick) {
                 let destination = match &order.payload {
                     crate::sim::command::Command::AttackMove { destination, .. }
@@ -11255,17 +13290,23 @@ mod tests {
                     }
                 }
             }
-            if launched_before && !ai.wave_launching && ai.launched.is_empty() {
+            if stage_before == super::WaveStage::Striking && ai.wave_marched.len() > marched_before
+            {
+                post_breach_strike_dispatches += 1;
+            }
+            if stage_before == super::WaveStage::Striking
+                && ai.wave_stage == super::WaveStage::Idle
+                && post_breach_strike_dispatches == 0
+            {
                 armed_and_blocked = true;
             }
         }
         assert!(
             armed_and_blocked,
-            "the wave must re-arm after the breach and end with no dispatch"
+            "a strike behind the breach must end with no dispatch"
         );
         assert_eq!(
-            ai.launched,
-            Vec::<u64>::new(),
+            post_breach_strike_dispatches, 0,
             "no unit may launch into the cut-off zone after the breach"
         );
         assert!(
@@ -11275,9 +13316,7 @@ mod tests {
     }
 
     /// The far-shore structure's cell (the wave's one target).
-    fn far_target_cell(
-        scenario: &crate::headless_scenario::HeadlessScenario,
-    ) -> (u16, u16) {
+    fn far_target_cell(scenario: &crate::headless_scenario::HeadlessScenario) -> (u16, u16) {
         scenario
             .sim()
             .substrate
@@ -11308,17 +13347,14 @@ mod tests {
 
         spawn_near(&mut scenario, "GACNST", ai_house, (64, 92));
         spawn_near(&mut scenario, "GAPOWR", enemy_house, far);
-        for _ in 0..super::ATTACK_WAVE_SIZE + 1 {
+        for _ in 0..12 {
             spawn_near(&mut scenario, "MTNK", ai_house, (64, 94));
         }
         collapse_pacific_bridge(&mut scenario);
         let engineer = spawn_near(&mut scenario, "ENGINEER", ai_house, PACIFIC_SHORE);
         let (hut_id, hut_cell) = pacific_hut(&scenario);
         assert!(
-            crate::sim::world::bridge_orchestrator::bridge_hut_can_repair(
-                scenario.sim(),
-                hut_cell
-            ),
+            crate::sim::world::bridge_orchestrator::bridge_hut_can_repair(scenario.sim(), hut_cell),
             "setup: the collapsed span wants repair"
         );
 
@@ -11386,13 +13422,16 @@ mod tests {
             "the engine consumes the engineer on hut entry"
         );
 
-        // With the span back the held wave crosses: the next episode sends
-        // attack-moves at the far structure, and the repair limb stays
-        // quiet — no re-issued capture, the tracker cleared with the
-        // consumed engineer.
+        // With the span back the held wave crosses: within a few cadences
+        // an episode's march or strike sends an attack-move into the far
+        // zone (the gather cell may sit on the home shore — only the
+        // far-zone landing counts), and the repair limb stays quiet — no
+        // re-issued capture, the tracker cleared with the consumed
+        // engineer.
         let mut far_moves = 0;
         let mut recaptures = 0;
-        for tick in 4001..4001 + 3 * super::WAVE_RETRY_TICKS {
+        let far_zone = ground_zone(&scenario, far_target_cell(&scenario));
+        for tick in 4001..4001 + 8 * super::WAVE_CADENCE_TICKS {
             for order in ai.orders(&scenario.runtime, tick) {
                 match order.payload {
                     crate::sim::command::Command::CaptureBuilding { .. } => recaptures += 1,
@@ -11400,12 +13439,9 @@ mod tests {
                         destination: Some(crate::sim::combat::TargetKind::Cell(rx, ry)),
                         ..
                     } => {
-                        assert_eq!(
-                            ground_zone(&scenario, (rx, ry)),
-                            ground_zone(&scenario, far_target_cell(&scenario)),
-                            "the resumed wave crosses to the far zone"
-                        );
-                        far_moves += 1;
+                        if ground_zone(&scenario, (rx, ry)) == far_zone {
+                            far_moves += 1;
+                        }
                     }
                     _ => {}
                 }
@@ -11433,9 +13469,8 @@ mod tests {
     #[test]
     #[ignore = "slow; retail; loads a retail map"]
     fn soviet_bridge_limb_commissions_the_soviet_engineer() {
-        let (mut scenario, ai_house, enemy_house) = pacific_bridge_battle_as(
-            crate::skirmish_launch::LaunchCountry::Russia,
-        );
+        let (mut scenario, ai_house, enemy_house) =
+            pacific_bridge_battle_as(crate::skirmish_launch::LaunchCountry::Russia);
         let far = far_shore(&scenario);
         let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
         scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
@@ -11468,15 +13503,18 @@ mod tests {
         );
     }
 
-    /// The siege flyer's one-off commission: a Soviet yard, war factory
-    /// and battle lab standing with the vehicle queue empty — the first
-    /// vehicle turn buys the Kirov, and the latch keeps the buy at exactly
-    /// one even though every commission condition stays true for the whole
-    /// window (the drive never advances the sim, so the queue never
-    /// busy-blocks the branch and the conditions never lapse).
+    /// The siege flyer's wing quota: a Soviet yard, war factory and
+    /// battle lab standing with the AA pair fielded and the full wing on
+    /// the map — three Kirovs plus the two-chopper Siege element — the
+    /// vehicle line never touches the flyers (the drive never advances
+    /// the sim, so the queue never busy-blocks the branch and the counts
+    /// never drift). A lost Kirov re-opens the count check: the
+    /// commission fires on the first pass after the fall, then the
+    /// per-type retry gate paces every further top-up one
+    /// [`BUILD_QUEUE_RETRY_TICKS`] window at a time.
     #[test]
     #[ignore = "slow; retail; loads a retail map"]
-    fn soviet_lab_commissions_one_kirov_and_latches() {
+    fn soviet_lab_flies_the_kirov_wing_and_replenishes_a_loss() {
         let (mut scenario, ai_house, _enemy_house) =
             pacific_bridge_battle_as(crate::skirmish_launch::LaunchCountry::Russia);
         let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
@@ -11486,21 +13524,434 @@ mod tests {
         spawn_near(&mut scenario, "NAPOWR", ai_house, (65, 92));
         spawn_near(&mut scenario, "NAWEAP", ai_house, (66, 92));
         spawn_near(&mut scenario, "NATECH", ai_house, (66, 94));
+        // The mobile-AA quota met (two Flak Tracks) so the flyer lines own
+        // the commission chain, then the full wing: three Kirovs and the
+        // two Siege Choppers.
+        spawn_near(&mut scenario, "HTK", ai_house, (66, 96));
+        spawn_near(&mut scenario, "HTK", ai_house, (66, 98));
+        let wing: Vec<u64> = [(66, 90), (67, 90), (68, 90)]
+            .iter()
+            .map(|&(x, y)| spawn_near(&mut scenario, "ZEP", ai_house, (x, y)))
+            .collect();
+        spawn_near(&mut scenario, "SCHP", ai_house, (67, 92));
+        spawn_near(&mut scenario, "SCHP", ai_house, (68, 92));
 
-        let mut queued: Vec<String> = Vec::new();
-        for tick in 0..400u32 {
+        let mut queued: Vec<(u32, String)> = Vec::new();
+        for tick in 0..160u32 {
             for order in ai.orders(&scenario.runtime, tick) {
                 if let crate::sim::command::Command::QueueProduction { type_id } = order.payload {
-                    queued.push(scenario.sim().interner.resolve(type_id).to_string());
+                    queued.push((tick, scenario.sim().interner.resolve(type_id).to_string()));
                 }
             }
         }
-        let kirovs = queued.iter().filter(|name| *name == "ZEP").count();
-        assert_eq!(
-            kirovs, 1,
-            "the lab stands: exactly one Kirov commission, never a re-arm: {queued:?}"
+        assert!(
+            queued
+                .iter()
+                .all(|(_, name)| name != "ZEP" && name != "SCHP"),
+            "the full wing holds both flyer lines: {queued:?}"
         );
-        assert!(ai.siege_flyer_issued, "the order itself marks the latch");
+
+        // A Kirov falls. The next pass sees the wing under its quota and
+        // re-commissions on the spot; the retry gate then spaces every
+        // further top-up a full window.
+        scenario
+            .runtime
+            .simulation
+            .substrate
+            .entities
+            .remove(wing[0]);
+        let replenish_start = 160u32;
+        for tick in replenish_start..replenish_start + 2 * BUILD_QUEUE_RETRY_TICKS {
+            for order in ai.orders(&scenario.runtime, tick) {
+                if let crate::sim::command::Command::QueueProduction { type_id } = order.payload {
+                    queued.push((tick, scenario.sim().interner.resolve(type_id).to_string()));
+                }
+            }
+        }
+        let kirov_ticks: Vec<u32> = queued
+            .iter()
+            .filter(|(_, name)| name == "ZEP")
+            .map(|&(tick, _)| tick)
+            .collect();
+        assert_eq!(
+            kirov_ticks.first(),
+            Some(&replenish_start),
+            "the lost flyer is re-commissioned on the first pass after it falls: {queued:?}"
+        );
+        assert_eq!(
+            kirov_ticks.len(),
+            2,
+            "one replenish per retry window in the driven span: {kirov_ticks:?}"
+        );
+        for pair in kirov_ticks.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= BUILD_QUEUE_RETRY_TICKS,
+                "the per-type retry gate paces the re-commissions: {kirov_ticks:?}"
+            );
+        }
+        assert!(
+            queued.iter().all(|(_, name)| name != "SCHP"),
+            "the chopper line stays at its quota while the Kirovs replenish: {queued:?}"
+        );
+    }
+
+    /// The mobile-AA quota: with four hostile jets standing the target
+    /// reads 2 + 4/2 = 4 Flak Tracks, and the vehicle line fills them one
+    /// retry window at a time — the quota's per-type gate pacing the
+    /// re-file exactly like every building queue's.
+    #[test]
+    #[ignore = "slow; retail; loads a retail map"]
+    fn soviet_vehicle_line_fills_the_mobile_aa_quota_against_air() {
+        let (mut scenario, ai_house, enemy_house) =
+            pacific_bridge_battle_as(crate::skirmish_launch::LaunchCountry::Russia);
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+        spawn_near(&mut scenario, "NACNST", ai_house, (64, 92));
+        spawn_near(&mut scenario, "NAPOWR", ai_house, (65, 92));
+        spawn_near(&mut scenario, "NAWEAP", ai_house, (66, 92));
+        spawn_near(&mut scenario, "NATECH", ai_house, (66, 94));
+        // The air war: four Rocketeers across the map lift the AA target
+        // from the floor pair to four hulls.
+        let far = far_shore(&scenario);
+        for offset in [(0, 0), (2, 0), (0, 2), (2, 2)] {
+            spawn_near(
+                &mut scenario,
+                "JUMPJET",
+                enemy_house,
+                (far.0 + offset.0, far.1 + offset.1),
+            );
+        }
+
+        let mut queued: Vec<(u32, String)> = Vec::new();
+        for tick in 0..4 * BUILD_QUEUE_RETRY_TICKS {
+            for order in ai.orders(&scenario.runtime, tick) {
+                if let crate::sim::command::Command::QueueProduction { type_id } = order.payload {
+                    queued.push((tick, scenario.sim().interner.resolve(type_id).to_string()));
+                }
+            }
+        }
+        let flak_ticks: Vec<u32> = queued
+            .iter()
+            .filter(|(_, name)| name == "HTK")
+            .map(|&(tick, _)| tick)
+            .collect();
+        assert_eq!(
+            flak_ticks.len(),
+            4,
+            "the air war lifts the quota to four Flak Tracks: {queued:?}"
+        );
+        assert_eq!(
+            flak_ticks.first(),
+            Some(&0),
+            "the first AA hull queues on the first pass"
+        );
+        for pair in flak_ticks.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= BUILD_QUEUE_RETRY_TICKS,
+                "the per-type retry gate paces the quota fill: {flak_ticks:?}"
+            );
+        }
+    }
+
+    /// The counter-trigger table's AA bumps over the mobile-AA quota: in
+    /// peace the floor pair and the base share; hostile air lifts the
+    /// quota on its count and the share to the boost; the armed trigger
+    /// (six hostile aircraft at the last read) lifts the floor to four
+    /// hulls — never past the quota's cap — and the AntiAir share to six,
+    /// the retail six-Flak-Trooper team.
+    #[test]
+    fn aa_counter_bumps_lift_the_mobile_answer() {
+        assert_eq!(AA_COUNTER_AIR_THREATS, 6);
+        assert_eq!(AA_COUNTER_VEHICLE_FLOOR, 4);
+        assert_eq!(AA_COUNTER_ROLE_SHARE, 6);
+        // Peace.
+        assert_eq!(aa_vehicle_target(0, false), AA_UNIT_FLOOR);
+        assert_eq!(anti_air_demand(0, false), ROLE_SHARE_BASE);
+        // Hostile air, trigger not yet read.
+        assert_eq!(aa_vehicle_target(4, false), 4);
+        assert_eq!(anti_air_demand(2, false), ROLE_SHARE_BOOST);
+        // The trigger armed: the floor and the share jump, the cap holds.
+        assert_eq!(aa_vehicle_target(0, true), AA_COUNTER_VEHICLE_FLOOR);
+        assert_eq!(aa_vehicle_target(2, true), AA_COUNTER_VEHICLE_FLOOR);
+        assert_eq!(aa_vehicle_target(6, true), AA_UNIT_CAP, "the cap holds");
+        assert_eq!(aa_vehicle_target(40, true), AA_UNIT_CAP);
+        assert_eq!(anti_air_demand(6, true), AA_COUNTER_ROLE_SHARE);
+        assert_eq!(anti_air_demand(0, true), AA_COUNTER_ROLE_SHARE);
+        // The floater trigger counts the war-factory raiders alone.
+        assert_eq!(FLOATER_TYPES, ["DISK", "ZEP"]);
+        assert_eq!(FLOATER_COUNTER_THREATS, 2);
+    }
+
+    /// The garrison limb fills a Battle Bunker to its capacity and rests
+    /// (占满): a Soviet yard and bunker with seven Conscripts beside it —
+    /// the limb sends exactly `MaxNumberOccupants` capture clicks, one
+    /// soldier each (the inbound pairs count against the capacity, so the
+    /// sixth and seventh never march), the walk lands them, and no order
+    /// follows once the bunker is full. The capacity is read off the rules
+    /// row at order time, never hardcoded.
+    #[test]
+    #[ignore = "slow; retail; loads a retail map and drives a real garrison walk"]
+    fn soviet_bunker_fills_to_capacity_then_rests() {
+        let (mut scenario, ai_house, _enemy_house) =
+            pacific_bridge_battle_as(crate::skirmish_launch::LaunchCountry::Russia);
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+        spawn_near(&mut scenario, "NACNST", ai_house, (64, 92));
+        let bunker = spawn_near(&mut scenario, "NABNKR", ai_house, (66, 96));
+        let capacity = scenario
+            .runtime
+            .resources
+            .rules
+            .object("NABNKR")
+            .expect("the Battle Bunker row")
+            .max_number_occupants as usize;
+        assert_eq!(capacity, 5, "retail MaxNumberOccupants=5 (setup oracle)");
+        for offset in [(0, 3), (1, 3), (2, 3), (0, 4), (1, 4), (2, 4), (3, 4)] {
+            spawn_near(
+                &mut scenario,
+                "E2",
+                ai_house,
+                (66 + offset.0, 96 + offset.1),
+            );
+        }
+
+        let mut garrison_orders: Vec<(u32, u64)> = Vec::new();
+        for tick in 0..1500u32 {
+            let orders = ai.orders(&scenario.runtime, tick);
+            for order in &orders {
+                if let crate::sim::command::Command::CaptureBuilding {
+                    engineer_id,
+                    target_building_id,
+                } = &order.payload
+                    && *target_building_id == bunker
+                {
+                    garrison_orders.push((tick, *engineer_id));
+                }
+            }
+            scenario
+                .runtime
+                .advance_frame(
+                    &orders,
+                    crate::headless_scenario::SIM_TICK_MS,
+                    crate::sim::world::TickLane::Ordinary,
+                    crate::sim::world::FrameEffects::default(),
+                )
+                .expect("simulation frame failed");
+        }
+        assert_eq!(
+            garrison_orders.len(),
+            capacity,
+            "exactly one capture click per occupant slot: {garrison_orders:?}"
+        );
+        let soldiers: std::collections::HashSet<u64> = garrison_orders
+            .iter()
+            .map(|&(_, soldier)| soldier)
+            .collect();
+        assert_eq!(
+            soldiers.len(),
+            capacity,
+            "every click names a different soldier: {garrison_orders:?}"
+        );
+        let occupants = scenario
+            .sim()
+            .substrate
+            .entities
+            .get(bunker)
+            .map(|entity| entity.passenger_role.occupants().count().max(0) as usize)
+            .expect("the bunker stands");
+        assert_eq!(
+            occupants + ai.garrison_inbound.len(),
+            capacity,
+            "the bunker is full or filling to the last slot (occupants {occupants}, \
+             inbound {})",
+            ai.garrison_inbound.len()
+        );
+        assert!(
+            occupants >= 1,
+            "the engine's garrison walk lands at least the nearest soldier"
+        );
+        assert_eq!(
+            ai.garrison_demand, 0,
+            "a full bunker leaves the infantry line no garrison demand"
+        );
+    }
+
+    /// The tank bunker's one ride: a Yuri yard, an empty Tank Bunker and
+    /// two Lashers beside it — the limb sends exactly one Enter click at
+    /// the bunker (the fortress boarding's own order form), never a second
+    /// while the bound ride stands, and the engine installs the tank.
+    #[test]
+    #[ignore = "slow; retail; loads a retail map and drives a real bunker entry"]
+    fn yuri_tank_bunker_takes_one_armed_tank() {
+        use crate::sim::mission::MissionType;
+
+        let (mut scenario, ai_house, _enemy_house) =
+            pacific_bridge_battle_as(crate::skirmish_launch::LaunchCountry::Yuri);
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+        spawn_near(&mut scenario, "YACNST", ai_house, (64, 92));
+        let bunker = spawn_near(&mut scenario, "NATBNK", ai_house, (66, 96));
+        assert!(
+            scenario
+                .runtime
+                .resources
+                .rules
+                .object("NATBNK")
+                .is_some_and(|ty| ty.bunker && !ty.can_be_occupied),
+            "retail NATBNK is a Bunker=yes vehicle hole, no infantry garrison (setup oracle)"
+        );
+        let tanks: Vec<u64> = [(66, 99), (68, 99)]
+            .iter()
+            .map(|&cell| spawn_near(&mut scenario, "LTNK", ai_house, cell))
+            .collect();
+
+        let mut enters: Vec<(u32, u64)> = Vec::new();
+        for tick in 0..900u32 {
+            let orders = ai.orders(&scenario.runtime, tick);
+            for order in &orders {
+                if let crate::sim::command::Command::MegaMission {
+                    entity_id,
+                    mission: MissionType::Enter,
+                    destination: Some(crate::sim::combat::TargetKind::Entity(target)),
+                    ..
+                } = &order.payload
+                    && *target == bunker
+                {
+                    enters.push((tick, *entity_id));
+                }
+            }
+            scenario
+                .runtime
+                .advance_frame(
+                    &orders,
+                    crate::headless_scenario::SIM_TICK_MS,
+                    crate::sim::world::TickLane::Ordinary,
+                    crate::sim::world::FrameEffects::default(),
+                )
+                .expect("simulation frame failed");
+        }
+        assert_eq!(
+            enters.len(),
+            1,
+            "one ride per bunker, never a second while the first is bound: {enters:?}"
+        );
+        assert!(
+            tanks.contains(&enters[0].1),
+            "the ride is one of the Lashers: {enters:?}"
+        );
+        let occupant = scenario
+            .sim()
+            .substrate
+            .entities
+            .get(bunker)
+            .and_then(|entity| entity.bunker.occupant());
+        assert_eq!(
+            occupant,
+            Some(enters[0].1),
+            "the engine installs the ordered tank in the bunker"
+        );
+    }
+
+    /// The tech capture sends exactly one engineer per neutral building: a
+    /// revealed neutral oil derrick beside an Allied yard with two idle
+    /// engineers standing — one capture click names one engineer, the
+    /// walk consumes him and flips the derrick, and the second engineer
+    /// never draws an order for a building that is no longer neutral.
+    #[test]
+    #[ignore = "slow; retail; loads a retail map and drives a real capture walk"]
+    fn tech_capture_sends_exactly_one_engineer_per_neutral_building() {
+        let (mut scenario, ai_house, _enemy_house) = pacific_bridge_battle();
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+        spawn_near(&mut scenario, "GACNST", ai_house, (64, 92));
+        // The scenario's neutral owner: a passive house (the same reading
+        // the capture scan makes).
+        let neutral = scenario
+            .sim()
+            .houses
+            .iter()
+            .find(|(_, house)| house.multiplay_passive())
+            .map(|(&id, _)| id)
+            .expect("the map's passive neutral house");
+        let derrick = spawn_near(&mut scenario, "CAOILD", neutral, (66, 97));
+        let engineers: Vec<u64> = [(64, 95), (65, 95)]
+            .iter()
+            .map(|&cell| spawn_near(&mut scenario, "ENGINEER", ai_house, cell))
+            .collect();
+
+        let mut captures: Vec<(u32, u64)> = Vec::new();
+        let mut captured_tick = None;
+        for tick in 0..4000u32 {
+            let orders = ai.orders(&scenario.runtime, tick);
+            for order in &orders {
+                if let crate::sim::command::Command::CaptureBuilding {
+                    engineer_id,
+                    target_building_id,
+                } = &order.payload
+                    && *target_building_id == derrick
+                {
+                    captures.push((tick, *engineer_id));
+                }
+            }
+            scenario
+                .runtime
+                .advance_frame(
+                    &orders,
+                    crate::headless_scenario::SIM_TICK_MS,
+                    crate::sim::world::TickLane::Ordinary,
+                    crate::sim::world::FrameEffects::default(),
+                )
+                .expect("simulation frame failed");
+            if scenario
+                .sim()
+                .substrate
+                .entities
+                .get(derrick)
+                .is_some_and(|entity| entity.owner() == ai_house)
+            {
+                captured_tick = Some(tick);
+                break;
+            }
+        }
+        assert!(
+            captured_tick.is_some(),
+            "the engineer's walk flips the derrick within the budget: {captures:?}"
+        );
+        let walkers: std::collections::HashSet<u64> =
+            captures.iter().map(|&(_, engineer)| engineer).collect();
+        assert_eq!(
+            walkers.len(),
+            1,
+            "exactly one engineer walks at the one neutral building: {captures:?}"
+        );
+        assert!(
+            engineers.contains(walkers.iter().next().expect("one walker")),
+            "the walker is one of the spawned engineers"
+        );
+        // The second engineer stands, unspent: the building is ours now
+        // and the scan has nothing neutral left to send him at.
+        let standing: Vec<u64> = engineers
+            .iter()
+            .copied()
+            .filter(|&id| {
+                scenario
+                    .sim()
+                    .substrate
+                    .entities
+                    .get(id)
+                    .is_some_and(|entity| entity.lifecycle.object_alive())
+            })
+            .collect();
+        assert_eq!(standing.len(), 1, "one engineer consumed, one spared");
+        assert!(
+            ai.capture_bound.is_empty(),
+            "the consumed walker clears the bound set: {:?}",
+            ai.capture_bound
+        );
     }
 
     /// The helper's two answers on the real map: an intact span connects
@@ -11569,16 +14020,12 @@ mod tests {
             for y in [70u16, 95, 120] {
                 let mut row = String::new();
                 for x in (60..126).step_by(4) {
-                    let zone = sim
-                        .zone_grid
-                        .as_ref()
-                        .unwrap()
-                        .get_zone_id_native(
-                            sim.resolved_terrain.as_ref().unwrap(),
-                            (x, y),
-                            crate::rules::locomotor_type::MovementZone::Normal,
-                            false,
-                        );
+                    let zone = sim.zone_grid.as_ref().unwrap().get_zone_id_native(
+                        sim.resolved_terrain.as_ref().unwrap(),
+                        (x, y),
+                        crate::rules::locomotor_type::MovementZone::Normal,
+                        false,
+                    );
                     row.push_str(&format!("{x}:{:?} ", zone));
                 }
                 eprintln!("PROBE y={y} {row}");
@@ -11606,7 +14053,8 @@ mod tests {
 
     /// Chebyshev distance between two cells, for the test's endpoint pick.
     fn chebyshev(a: (u16, u16), b: (u16, u16)) -> u32 {
-        i32::from(a.0).abs_diff(i32::from(b.0))
+        i32::from(a.0)
+            .abs_diff(i32::from(b.0))
             .max(i32::from(a.1).abs_diff(i32::from(b.1))) as u32
     }
 
@@ -11632,7 +14080,7 @@ mod tests {
         let mut shoves = 0;
         let mut mcv_moves = 0;
         let mut shoves_after_cap = 0;
-        for tick in 0..8 * super::WAVE_RETRY_TICKS {
+        for tick in 0..16 * super::STUCK_SCAN_TICKS {
             for order in ai.orders(&scenario.runtime, tick) {
                 match order.payload {
                     crate::sim::command::Command::Move {
@@ -11727,13 +14175,16 @@ mod tests {
                 let damage = rules.bridge_rules.strength + 1;
                 let mut collapsed = false;
                 'span: for _ in 0..10 {
-                    for (dx, dy) in
-                        [(0i32, 0i32), (1, 0), (0, 1), (-1, 0), (0, -1), (2, 0), (0, 2)]
-                    {
-                        let (rx, ry) = (
-                            i32::from(mid.0) + dx,
-                            i32::from(mid.1) + dy,
-                        );
+                    for (dx, dy) in [
+                        (0i32, 0i32),
+                        (1, 0),
+                        (0, 1),
+                        (-1, 0),
+                        (0, -1),
+                        (2, 0),
+                        (0, 2),
+                    ] {
+                        let (rx, ry) = (i32::from(mid.0) + dx, i32::from(mid.1) + dy);
                         if rx < 0 || ry < 0 {
                             continue;
                         }
@@ -11877,17 +14328,8 @@ mod tests {
                 .count()
         };
         let non_yard = cluster(&[
-            "GAPOWR",
-            "GAREFN",
-            "GAPILE",
-            "GAWEAP",
-            "GAAIRC",
-            "AMRADR",
-            "GATECH",
-            "GADEPT",
-            "GAPILL",
-            "NASAM",
-            "ATESLA",
+            "GAPOWR", "GAREFN", "GAPILE", "GAWEAP", "GAAIRC", "AMRADR", "GATECH", "GADEPT",
+            "GAPILL", "NASAM", "ATESLA",
         ]);
         let defenses_near = cluster(&["GAPILL", "NASAM", "ATESLA"]);
         assert!(
@@ -12170,12 +14612,12 @@ mod tests {
     /// The combat layer's fixtures and reads live in a nested module so the
     /// bridge fixtures above stay shared without re-declaring them.
     mod combat_layer_tests {
-        use super::*;
         use super::super::{
-            ATTACK_WAVE_SIZE, BOARD_MAX_ATTEMPTS, FutilityKind, IDLE_REORDER_TICKS,
-            PRIMARY_TOGGLE_EVERY_VEHICLES, STUCK_SCAN_TICKS, STUCK_TIMEOUT, WAVE_RETRY_TICKS,
-            WALL_TARGET_COOLDOWN_TICKS, WALL_WINDOW_TICKS,
+            BOARD_MAX_ATTEMPTS, FutilityKind, IDLE_REORDER_TICKS, PRIMARY_TOGGLE_EVERY_VEHICLES,
+            RAIDER_RETRY_TICKS, STUCK_SCAN_TICKS, STUCK_TIMEOUT, WALL_TARGET_COOLDOWN_TICKS,
+            WALL_WINDOW_TICKS, WAVE_FORM_TIMEOUT_TICKS, WAVE_MARCH_TIMEOUT_TICKS,
         };
+        use super::*;
 
         use std::collections::BTreeMap;
 
@@ -12255,10 +14697,7 @@ mod tests {
                             && entity.category() == EntityCategory::Aircraft
                         {
                             let dry = entity.ammo().is_some_and(|ammo| ammo.current() == 0);
-                            assert!(
-                                !dry,
-                                "only armed jets fly (tick {tick}, jet {attacker_id})"
-                            );
+                            assert!(!dry, "only armed jets fly (tick {tick}, jet {attacker_id})");
                             if parked_since
                                 .get(&attacker_id)
                                 .is_some_and(|parked| parked.is_some())
@@ -12326,29 +14765,20 @@ mod tests {
         #[test]
         #[ignore = "slow; retail; parses the retail ruleset"]
         fn fly_type_filter_answers_the_war_factory_aircraft() {
-            let retail_dir = std::path::PathBuf::from(
-                std::env::var("RA2_DIR")
-                    .expect("set RA2_DIR to the retail RA2/YR install directory"),
-            );
-            let mut assets = crate::assets::asset_manager::AssetManager::new(
-                &retail_dir,
-                crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
-            )
-            .expect("open retail MIX archives");
-            crate::map::theater::load_theater(&mut assets, "TEMPERATE")
-                .expect("load retail theater");
-            let (rules, _, _, _) =
-                crate::app::loading::init_helpers::load_rules_with_merged_ini(&assets, None, None)
-                    .expect("load production rules");
+            // The retail ruleset through the bridge fixture's own load —
+            // the same path every drive test takes (this module compiles
+            // in the core crate, where no client loading helpers exist).
+            let (mut scenario, _ai_house, _enemy_house) = pacific_bridge_battle();
+            let rules = &scenario.runtime.resources.rules;
             for name in ["ZEP", "DISK", "SHAD"] {
                 assert!(
-                    SuperAi::is_fly_type(&rules, name),
+                    SuperAi::is_fly_type(rules, name),
                     "{name} parses MovementZone=Fly"
                 );
             }
             for name in ["HTNK", "LTNK"] {
                 assert!(
-                    !SuperAi::is_fly_type(&rules, name),
+                    !SuperAi::is_fly_type(rules, name),
                     "{name} is a ground hull"
                 );
             }
@@ -12445,7 +14875,9 @@ mod tests {
             let far = far_shore(&scenario);
             spawn_near(&mut scenario, "GAPOWR", enemy_house, far);
             let tany = spawn_near(&mut scenario, "TANY", ai_house, (66, 90));
-            for _ in 0..ATTACK_WAVE_SIZE {
+            // The phase-one plan takes three Grizzlies; a dozen stand so
+            // the picks never run short and the rest hold the reserve.
+            for _ in 0..12 {
                 spawn_near(&mut scenario, "MTNK", ai_house, (64, 94));
             }
             let enemy_structure = scenario
@@ -12464,7 +14896,9 @@ mod tests {
             let mut hero_wave_moves = 0usize;
             let mut wave_moves = 0usize;
             let mut plant: Option<(u64, u64)> = None;
-            for tick in 0..3 * WAVE_RETRY_TICKS + 600 {
+            // The wave launches on the form clock (no barracks stands for
+            // the plan's GIs), then marches and strikes within the clocks.
+            for tick in 0..WAVE_FORM_TIMEOUT_TICKS + WAVE_MARCH_TIMEOUT_TICKS + 600 {
                 for order in ai.orders(&scenario.runtime, tick) {
                     match order.payload {
                         crate::sim::command::Command::AttackMove { entity_id, .. } => {
@@ -12490,10 +14924,7 @@ mod tests {
                 wave_moves > 0,
                 "positive control: the gathered wave marched"
             );
-            assert_eq!(
-                hero_wave_moves, 0,
-                "the hero never rides the generic wave"
-            );
+            assert_eq!(hero_wave_moves, 0, "the hero never rides the generic wave");
             assert_eq!(
                 plant,
                 Some((tany, enemy_structure)),
@@ -12577,18 +15008,28 @@ mod tests {
             let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
             scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
 
+            // The phase-two Soviet wave carries the V3s, so the siege
+            // standoff leg runs through the strike stage: the lab and the
+            // radar stand (the phase and the V3's own `needs` gate), two
+            // launchers and eight Rhinos stand for the picks.
             spawn_near(&mut scenario, "NACNST", ai_house, (64, 92));
+            spawn_near(&mut scenario, "NARADR", ai_house, (63, 92));
+            spawn_near(&mut scenario, "NATECH", ai_house, (66, 94));
             let far = far_shore(&scenario);
             spawn_near(&mut scenario, "GAPOWR", enemy_house, far);
             let v3 = spawn_near(&mut scenario, "V3", ai_house, (66, 92));
-            for _ in 0..ATTACK_WAVE_SIZE {
+            spawn_near(&mut scenario, "V3", ai_house, (67, 92));
+            for _ in 0..8 {
                 spawn_near(&mut scenario, "HTNK", ai_house, (64, 94));
             }
             let target_cell = far_target_cell(&scenario);
 
             let mut v3_destinations: Vec<(u16, u16)> = Vec::new();
             let mut tank_destinations: Vec<(u16, u16)> = Vec::new();
-            for tick in 0..3 * WAVE_RETRY_TICKS {
+            // The form clock launches with the Conscripts missing (no
+            // barracks stands), the march clock turns the gather, and the
+            // strike dispatches within its own clock.
+            for tick in 0..WAVE_FORM_TIMEOUT_TICKS + WAVE_MARCH_TIMEOUT_TICKS + 600 {
                 for order in ai.orders(&scenario.runtime, tick) {
                     if let crate::sim::command::Command::AttackMove {
                         entity_id,
@@ -12609,9 +15050,7 @@ mod tests {
                 "positive control: the wave marched on the target"
             );
             assert!(
-                tank_destinations
-                    .iter()
-                    .any(|&cell| cell == target_cell),
+                tank_destinations.iter().any(|&cell| cell == target_cell),
                 "the line units walk all the way in: {tank_destinations:?}"
             );
             assert!(
@@ -12622,10 +15061,16 @@ mod tests {
                 let distance = chebyshev(cell, target_cell);
                 assert_ne!(cell, target_cell, "the V3 never aims the target cell");
                 assert!(
-                    (9..=12).contains(&distance),
-                    "the V3 holds 10-12 cells short of the target (saw {distance} at {cell:?})"
+                    distance <= 20,
+                    "the V3 never walks past the standoff line (saw {distance} at {cell:?})"
                 );
             }
+            assert!(
+                v3_destinations
+                    .iter()
+                    .any(|&cell| (9..=12).contains(&chebyshev(cell, target_cell))),
+                "the strike holds the V3 10-12 cells short of the target: {v3_destinations:?}"
+            );
         }
 
         /// The Terror Drone hunts the enemy's economy: with a harvester on
@@ -12655,7 +15100,7 @@ mod tests {
             };
 
             let mut drone_moves: Vec<(u16, u16)> = Vec::new();
-            for tick in 0..2 * WAVE_RETRY_TICKS {
+            for tick in 0..2 * RAIDER_RETRY_TICKS {
                 for order in ai.orders(&scenario.runtime, tick) {
                     if let crate::sim::command::Command::AttackMove {
                         entity_id,
@@ -12668,10 +15113,7 @@ mod tests {
                     }
                 }
             }
-            assert!(
-                !drone_moves.is_empty(),
-                "the drone took its hunt order"
-            );
+            assert!(!drone_moves.is_empty(), "the drone took its hunt order");
             assert!(
                 drone_moves.iter().any(|&cell| cell == harv_cell),
                 "the drone marches at the harvester's cell: {drone_moves:?} vs {harv_cell:?}"
@@ -12684,7 +15126,8 @@ mod tests {
                 .opening(scenario.sim())
                 .expect("the Soviet opening resolves through the standing yard");
             assert!(
-                !ai.standing_combat_units(scenario.sim(), opening).contains(&drone),
+                !ai.standing_combat_units(scenario.sim(), opening)
+                    .contains(&drone),
                 "a live raid keeps the drone out of the wave pool"
             );
         }
@@ -12870,7 +15313,8 @@ mod tests {
             // The escape pass answers None (nothing to place into) but
             // wipes the book and re-opens the yard ring.
             assert!(
-                ai.wall_next_cell(scenario.sim(), rules, opening, overlays, true).is_none()
+                ai.wall_next_cell(scenario.sim(), rules, opening, overlays, true)
+                    .is_none()
             );
             assert!(ai.wall_cells.is_empty(), "the escape wipes the book");
             assert!(
@@ -12878,7 +15322,8 @@ mod tests {
                 "the escape re-opens the yard ring"
             );
             assert!(
-                ai.wall_next_cell(scenario.sim(), rules, opening, overlays, false).is_some(),
+                ai.wall_next_cell(scenario.sim(), rules, opening, overlays, false)
+                    .is_some(),
                 "the re-opened ring answers again — the re-queue the cooldown rests"
             );
         }
@@ -12943,8 +15388,8 @@ mod tests {
             scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
 
             spawn_near(&mut scenario, "GACNST", ai_house, (64, 92));
-            let outpost_yard =
-                spawn_near(&mut scenario, "GACNST", ai_house, far_shore(&scenario));
+            let far = far_shore(&scenario);
+            let outpost_yard = spawn_near(&mut scenario, "GACNST", ai_house, far);
             let outpost_yard_cell = scenario
                 .sim()
                 .substrate
@@ -12956,8 +15401,7 @@ mod tests {
             // yard nearest it is the outpost base the wheel routes to.
             ai.expansion2_site = Some(outpost_yard_cell);
             let home_factory = spawn_near(&mut scenario, "GAWEAP", ai_house, (66, 92));
-            let outpost_factory =
-                spawn_near(&mut scenario, "GAWEAP", ai_house, outpost_yard_cell);
+            let outpost_factory = spawn_near(&mut scenario, "GAWEAP", ai_house, outpost_yard_cell);
 
             // Four issued vehicles past the last mark: the first window is
             // open from the first driven tick.
@@ -12973,13 +15417,11 @@ mod tests {
             ) -> u64 {
                 for tick in 0..budget {
                     let orders = ai.orders(&scenario.runtime, tick);
-                    let toggle = orders.iter().find_map(|envelope| {
-                        match envelope.payload {
-                            crate::sim::command::Command::TogglePrimaryFactory {
-                                entity_id,
-                            } => Some(entity_id),
-                            _ => None,
+                    let toggle = orders.iter().find_map(|envelope| match envelope.payload {
+                        crate::sim::command::Command::TogglePrimaryFactory { entity_id } => {
+                            Some(entity_id)
                         }
+                        _ => None,
                     });
                     scenario
                         .runtime
@@ -13003,7 +15445,10 @@ mod tests {
                 "the unflagged outpost takes the first window"
             );
             assert!(
-                scenario.sim().production.is_primary_factory(outpost_factory),
+                scenario
+                    .sim()
+                    .production
+                    .is_primary_factory(outpost_factory),
                 "the applied toggle moved the line to the outpost"
             );
             assert!(
@@ -13024,7 +15469,10 @@ mod tests {
                 "the applied toggle moved the line back home"
             );
             assert!(
-                !scenario.sim().production.is_primary_factory(outpost_factory),
+                !scenario
+                    .sim()
+                    .production
+                    .is_primary_factory(outpost_factory),
                 "the toggle cleared the outpost's flag"
             );
         }

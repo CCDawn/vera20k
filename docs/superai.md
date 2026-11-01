@@ -578,10 +578,8 @@ barracks rotation drains the bank faster than a 2000-credit item can
 gather — so the fortress takes the first free vehicle turn once the
 battle lab stands (`can_build`-gated, the country-lock lesson again),
 and once the QueueProduction order is out the factory charges
-progressively; no banked-cost wait belongs in the branch. The same
-treatment fields the AA insurance: one of the roster's AntiAir entries
-once the tank core stands, so the side's mobile AA answer exists before
-hostile air arrives. The boarding branch —
+progressively; no banked-cost wait belongs in the branch. The boarding
+branch —
 below the combat branches, above the scouts — sends the roster's
 anti-armor infantry (the Guardian GI's deployed launcher, the classic
 loadout; derived from the roster, not hardcoded) into the first
@@ -838,8 +836,9 @@ below full power, same as a coil.
 Past the bridge, the engineers earn their keep three ways. A neutral-
 owned tech building is free money — the derrick's entry bonus alone
 pays the engineer twice over — so a windowed limb walks the nearest
-revealed one (derricks first) with the engine's own capture click,
-topping the stock to two through the commission core the bridge chain
+revealed one (derricks first) with the engine's own capture click, one
+engineer per building (see "Neutral tech capture" below), topping the
+stock to two through the commission core the bridge chain
 shares. The ride raid: an engineer boards the side's land transport
 (the IFV, the Flak Track; Yuri fields none), attack-moves at a
 latched enemy priority structure, unloads beside it and walks the
@@ -953,25 +952,179 @@ unit output fell to 52% and three houses reached zero — so
 `tech_bank_short` queues the unit lines once six tenths of the item's
 cost sits in the bank.
 
-## The siege flyer
+## The siege flyer wings
 
 The war-factory flyers never flew. The Kirov and the Floating Disk are
 `[VehicleTypes]` rows with `MovementZone=Fly` — the vehicle queue builds
 them like any tank, but the specialist wheel's siege slot is one turn per
 `SPECIALIST_EVERY_VEHICLE` shared with every other Siege row, so a hot war
 fielded launchers and choppers forever and the flyer never lifted. The
-opening tables now carry `siege_flyer` (the Soviets' `ZEP`, Yuri's `DISK`,
-the Allies keep `None` — their heavy air rides the aircraft tab), and the
-commission chain spends one dedicated turn on it once the battle lab
-stands, latched per game like the fortress and the ferry.
+opening tables now carry the flyer wings: `siege_flyer` with a quota —
+three Kirovs (`ZEP`) for the Soviets, three Floating Disks (`DISK`) for
+Yuri, the Allies `None` (their heavy air rides the aircraft tab, whose
+wing grew to six jets to carry the same weight) — and a second line
+beside the primary: the Siege Chopper (`SCHP`) fields two behind the
+Kirovs. The commission tops each line up to its target once the battle
+lab stands — live plus in-production counted, the six-tenths bank the
+one-off commission flew behind, the per-type retry gate pacing the
+re-file — and replenishment is the same check: a lost Kirov's count drops
+under the quota and the next window buys the replacement, a wing the
+whole siege plan rests on that never rests at one per game.
 
-Two flight limbs now read the movement zone beside the class: the air
-wing's sortie fields the flyer at the enemy's priority structure (the old
-filter read `EntityCategory::Aircraft` alone, and a Unit-category flyer is
-never in that class), and the guard-post limb spares it the yard ring — a
-Kirov holding a sentry post wastes its siege sortie on a job the guns
-already do. The shared `is_fly_type` answer parses `MovementZone=Fly` off
-the rules row, which also covers the Night Hawk.
+Two flight limbs read the movement zone beside the class: the air wing's
+sortie fields the flyer at the enemy's priority structure (the old filter
+read `EntityCategory::Aircraft` alone, and a Unit-category flyer is never
+in that class), and the guard-post limb spares it the yard ring — a Kirov
+holding a sentry post wastes its siege sortie on a job the guns already
+do. The shared `is_fly_type` answer parses `MovementZone=Fly` off the
+rules row, which also covers the Night Hawk — and keeps the whole wing
+out of the ground waves, where the sortie limb owns it.
+
+## The AA answer: mobile quota, tiered towers, bunkers
+
+Three answers to the air war, all count-driven and read every pass. The
+mobile quota fields the roster's AntiAir vehicles to `AA_UNIT_FLOOR` (2)
+once the tank core stands — the pair exists before the first hostile
+aircraft does — one more per two hostile aircraft to `AA_UNIT_CAP` (5):
+live hulls plus in-production counted, per-type retry gate pacing the
+re-file, full price (300-600 credit hulls are too cheap to bank for).
+The specialist wheel's base share rose with it (`ROLE_SHARE_BASE` 1→2),
+so a standing AA pair rides every mix. The tower ring tiers with the air
+war per standing yard — `aa_per_yard_quota` reads 1 in peace, 2 once
+hostile air fields, 3 against a real air force (`AA_HEAVY_AIR_THREATS`)
+— with the house-wide bound at three times `AA_DEFENSE_CAP`; the old
+`enemy_air_count > 0` gate is gone (peace keeps its baseline ring). The
+heavy tower doubles per yard (`DEFENSE_PER_YARD_HEAVY` 2), its house-wide
+bound four times the cap plus the late-sink tier. And each side's bunker
+joins the gun ring: one per yard, `BUNKER_DEFENSE_CAP` (3) to a house —
+the Soviet Battle Bunker (`NABNKR`, five soldiers behind `CanBeOccupied`)
+and Yuri's Tank Bunker (`NATBNK`, one vehicle behind `Bunker=yes`; the
+Allies field none). The `defense_bunker` table entry carries the retail
+prerequisites' evidence in the section comments; the quota row sleeps
+where the entry is `None`.
+
+## The garrison limb: fill to capacity
+
+The engine's `CanBeOccupied` machinery stood unused by the AI. The
+garrison limb (Layer 3, above the guard poster) fills the nearest
+revealed neutral occupiable civilians — two at a time, health above
+`ConditionRed`, passive-owner checked like every neutral scan — and the
+side's own occupiable bunkers to the type's full `MaxNumberOccupants`,
+read off the rules row at order time (civilians 10, the Battle Bunker 5):
+占满, never a token pair. The infantry are the retail `Occupier=yes` rows
+(GI, Conscript, Initiate — the engineers, the spy, the hero and the
+hounds never qualify), idle-class, free of the boarding, raid, capture
+and wave chains; the nearest soldier takes the nearest open slot through
+the engine's own admission (`can_enter_transport`, the garrison click's
+pair check) and the capture click — the same order a player's garrison
+click sends. The `(building, soldier)` inbound pairs count against the
+capacity until he lands (passengers ride in limbo and the occupant count
+carries him), dies or the target changes hands, so a building is never
+over-ordered and a full one rests. The deficit feeds production: unfilled
+slots across the targets latch a demand the infantry wheel queues ahead
+of its mix — the side's basic soldier (the same three rows), at most
+`GARRISON_DEMAND_IN_PRODUCTION` (2) in the pipe, full price. Yuri's Tank
+Bunker takes its one ride the same way: an empty `Bunker=yes` hole draws
+the nearest idle armed turret vehicle on a ground locomotor (never the
+miners, the MCVs, the ferry hulls, the fortress, the naval line, the
+flyers or the AA roster), boarded with the fortress Enter click, one ride
+per bunker through the pinned bound pair.
+
+Three guards keep the limb from wedging itself. A walker whose click was
+dropped or refused stands idle once his order gate lapses — the walk runs
+the Capture or Enter mission, never an idle one — and the pair frees his
+slot instead of holding the building shut for the rest of the game. Every
+pick is zone-gated (a soldier or a tank across a breach never lands), and
+a civilian roof the side's soldier cannot walk to from the yard never
+becomes a target, so it latches no demand the barracks could never fill.
+And the garrisoned pieces stay parked: a roof's occupant or any carrier's
+passenger (riding in limbo) and a tank bunker's installed driver are out
+of the idle and standing pools and the stuck rescue, so neither the guard
+poster, the perimeter attack, the alarm, the waves nor the rescue pulls
+them back out — a bunker emptied by the poster would draw the next tank
+and churn forever.
+
+## The wave system: retail compositions
+
+The offense marches the aimd team scripts now. The `Opening` carries each
+side's waves in three phases — before the battle lab, with the lab, under
+the late sink — and each phase lists its sibling teams (retail's
+equal-weight teams for the same trigger), taken in turn by successive
+episodes; a sibling whose lead the house cannot field yet (the V3 before
+its radar) yields its turn to the phase's first team. Soviets: 3 Rhinos +
+2 Flak Tracks with 8 Conscripts; behind the lab 5 Rhinos + 2 Flak Tracks
+or the V3 bombardment (2 V3s + 2 Flak Tracks), either with 10; under the
+sink 4 Apocalypses + 2 Flak Tracks with 20 Conscripts or the mixed squad
+of 2 Flak Troopers, 10 Conscripts and 3 Tesla Troopers, a four-drone
+screen trailing if it stands. Allies: 3 Grizzlies with a 2 GI + 2
+Guardian pair, then 4 Grizzlies + Mirage + Prism with 3 + 3 and two jets
+paired on, then the ultra 6 Grizzlies + 3 Prisms + 4 IFVs with 5 + 5 and
+two jets again (whichever jet the country fields — Korea's Black Eagle,
+everyone else's Intruder — drawn only from a wing standing at
+`AIR_WING_TARGET`). Yuri: 3 Lashers + 1 Gattling with 4 Initiates, then
+5 + 2 with 5, then 6 + 3 + 2 Master Minds with 10 and a Clone. One wave is
+alive at a time (retail `Max=1`), the next decision
+`WAVE_CADENCE_TICKS` (2000 — retail TeamDelays) after the last launch:
+the plan latches, the members gather at their posts while the production
+feed queues the missing core types ahead of the wheels (a wave short of
+its Rhinos does not spend the factory on specialists), the form clock
+launches a thinner wave when the queues cannot fill it, and the launch
+marches the members one per tick at the gather cell —
+`WAVE_GATHER_DISTANCE` (20, retail AISafeDistance) short of the enemy
+base toward home, the retail regroup. Arrival turns the stage to the
+strike: the latched sequence runs the script's quarry order — factories,
+then defenses (`WAVE_DEFENSE_TYPES`), then every other structure, siege
+units bombarding from standoff — and the empty sequence is the hunt,
+attack-moves at the hostile mass center's spread ring. The stage clocks
+(form 1500, march 1800, strike 3000 per head) bound every wedge the way
+the old dispatch bounds bounded a dropped order; the alarm still holds a
+forming wave home, and the flyer wings stay out of the ground march — the
+escort the plan pairs on joins at the strike with the Attack click. The
+expansion MCV, the miner line and the naval line keep their turns ahead
+of the wave feed in the vehicle chain; the primary wheel, the rallies and
+the stuck rescue are untouched (the rescue parks a marching wave's
+members — the regroup is the march's own wait).
+
+## Counter triggers
+
+The aimd counter triggers, read on the stuck scan's cadence and latched
+into two flags the limbs consult. Six hostile aircraft arm the AA defense
+team: the mobile-AA quota's floor lifts to four hulls
+(`AA_COUNTER_VEHICLE_FLOOR`, the cap still holding) and the AntiAir
+role's share to six (`AA_COUNTER_ROLE_SHARE`) — the retail
+six-Flak-Trooper answer, fielded through whichever rows the side's roster
+names (Flak Trooper and Flak Track for the Soviets, Gattling Tank for
+Yuri, Rocketeer and IFV for the Allies). Two hostile Floating Disks or
+Kirovs arm the anti-floater guard: the AA vehicles post over the nearest
+own power plant or refinery instead of the yard ring (the floaters raid
+the economy, so the flak stands over it) and sit the waves out. And a
+revealed enemy Nuclear Silo or Weather Controller leads the next wave's
+strike sequence — the priority strike the retail counter table orders.
+
+## Neutral tech capture: one engineer per building
+
+The tech chain walks the engine's `[AI] NeutralTechBuildings=` set
+(`TECH_BUILDING_TYPES`, retail `CAAIRP,CATHOSP,CAOILD,CAOUTP,CAMACH,CAPOWR`)
+in its own preference order (`CAPTURE_PRIORITY_TYPES`): the oil derrick
+first — its `ProduceCashStartup` pays the engineer back on entry — then
+the airport, the machine shop, the hospital and the rest, nearest the home
+yard within a class. Candidates are revealed, alive and held by a passive
+(`MultiplayPassive`) house, never already ours. Each building draws one
+engineer: the `capture_bound` pair (engineer to building) is the
+building's latch, so a building some live walker already heads for is not
+a candidate for the next one — the old survey re-picked the nearest
+derrick every window and sent the second engineer after the first. A
+walker lost short of a building that still stands neutral rests it for
+`CAPTURE_RETRY_TICKS` (1800, four capture windows) before the next
+engineer tries, so a derrick under a hostile gun cannot eat the stock one
+walker per window; a success flips the owner and the building leaves the
+survey on its own. A bound engineer whose click the command layer dropped
+stands idle again and is re-pointed at his own building first (entity
+order, never the bound map's — the determinism contract). The rest is the
+existing machinery: the capture click (`Command::CaptureBuilding`), the
+`ENGINEER_CAPTURE_WINDOW_TICKS` (450) pacing, the commission core the
+bridge chain shares, capped at `CAPTURE_ENGINEER_STOCK` (2) standing plus
+queued behind the bridge chain's wallet bar.
 
 ## Upstream sync
 
