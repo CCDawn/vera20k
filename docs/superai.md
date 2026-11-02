@@ -952,6 +952,19 @@ unit output fell to 52% and three houses reached zero — so
 `tech_bank_short` queues the unit lines once six tenths of the item's
 cost sits in the bank.
 
+Every `QueueProduction` the AI emits — building, gun, wall, jet, vehicle,
+soldier, engineer and raid ride — now files through one choke point,
+`file_production`, which arms the same per-type window and records the
+file with the engine's delivered count of the type (`produced_count`). A
+later pass that sees the count moved reads the file as landed and lifts the
+window at once, so a line's build-time cadence never waits; nothing
+delivered inside the 150 ticks reads as refused and the window holds — one
+file per window per type, whatever dropped it. A file merely queued does not
+lift it (a naval hull rides `Ship`, which `vehicle_busy` never reads). The unit lines had only a busy read of the queue
+view, and in build12 four houses re-filed their core tank ~every tick for
+thousands of ticks while their factories still delivered, starving every
+limb behind the line. The chrono steal keeps the plain armed-every-file gate.
+
 ## The siege flyer wings
 
 The war-factory flyers never flew. The Kirov and the Floating Disk are
@@ -1177,35 +1190,51 @@ re-sends him instead of standing exempt for the whole clock.
 ## The traffic limb: congestion, the engine's regroup, the rescue rework
 
 The 100-unit pileup. Engine facts, verified read-only: every construction
-yard deploy moves the house's base centre and orders every ground unit —
-super AI houses included — to one regroup cell beside it
-(`world_spawn.rs` → `MoveGroundForcesToBase`); a core path failure walks
-the unit home; head-on blockers stop both streams; `Command::Scatter` is
-refused for a unit holding a destination and moves only parked units to
-the nearest free cell. The AI can read a unit's destination
-(`navigation.nav_com()`) and motion (`motion_query::is_moving`), unused
-until now.
+yard deploy moves the house's base centre and orders every ground unit to
+one regroup cell beside it (`world_spawn.rs` → `MoveGroundForcesToBase`;
+a command-driven house is now exempt, see Engine hooks); a core path
+failure walks the unit home; head-on blockers stop both streams;
+`Command::Scatter` is refused for a unit holding a destination and moves
+only parked units to the nearest free cell. The AI can read a unit's
+destination (`navigation.nav_com()`) and motion
+(`motion_query::is_moving`), unused until now.
 
 The congestion limb (`congestion_orders`, every `CONGESTION_SCAN_TICKS`,
-ahead of every dispatch in the combat block) snapshots every own ground
-unit's cell and detects a cluster: `CONGESTION_CLUSTER_MIN` (8) own ground
-units with no displacement over the window standing within
-`CONGESTION_CLUSTER_RADIUS` (5) of one of them. On a cluster the parked
-members (no live destination — posted units included) scatter, and the
-members still holding a destination step to the nearest open cell on
-their own side — strictly closer to home than where they stand, so the
-stream backs out of the corridor instead of pushing through it; all in
-one pass (multiple envelopes per tick, the sortie limb's precedent). The
-cluster's center latches into `congestion_center`, and while it stands
-detected the wave march dispatch, the rescue and the alarm recall hold
-their dispatch into it; a later scan showing it cleared releases them.
-The engine's regroup gets its counter: the newest yard pins as
-`engine_home` (the engine's own base centre), the guard poster biases its
-home ring to it so the AI's streams and the engine's agree instead of
-crossing (the other yard keeps the expansion ring), and a yard count that
-rose this pass — the regroup having fired — re-posts every unit still
-aiming at the regroup cell from past `ENGINE_REGROUP_FAR_CELLS` (10) on
-its own side (`engine_regroup_reposts`, capped at eight).
+ahead of every dispatch in the combat block) snapshots the ground units —
+vehicles and infantry — of the house and its allies (a one-cell drift is
+jitter) and detects a cluster: `CONGESTION_CLUSTER_MIN` (8) stationary
+units within `CONGESTION_CLUSTER_RADIUS` (5) of an own one, at least
+`CONGESTION_OWN_MIN` (3) own, with a jam's evidence — a stationary unit
+still holding a destination, or a rally or the gather inside the box (a
+garrison on its posts is no jam). The scan stops the members holding a
+destination (`Command::Stop`); the next pass scatters a fresh jam's parked
+vehicles and walks the infantry and the stopped movers to open discharge
+cells clear of the box (`discharge_cell`, off the traffic axis). The
+centre latches into `congestion_center`: the wave march and the alarm
+recall hold only a walk that crosses it (`jam_on_corridor`), the rescue
+only its enemy leg. The engine's regroup gets its counter (defense in
+depth since the engine hook): the newest yard pins as `engine_home`, the
+guard poster biases its home ring to it, and a yard count that rose arms
+`engine_regroup_reposts` for `REGROUP_REPOST_WINDOW_TICKS` — every combat
+unit still walking a Move within `REGROUP_REPOST_TOLERANCE` (6) of the
+regroup cell is re-posted on an open cell beside it, eight per pass,
+until none is left.
+
+The traffic law (build12: four of six houses looped for good on clumps
+their own orders fed; `Stop` never emitted). A jam the next scan finds at
+the same centre moves its attractor instead of re-scattering: a rally
+within 4 cells re-sets 8 away (`rally_avoid`), a marching wave's gather is
+struck out (`gather_blacklist`) and re-picked, and the smaller house of a
+jam shared with an ally steps sideways (`yield_cell`; ties: the higher
+house id yields). Parking cells (guard, hero, dog, rally, repost) need the
+openness floor and keep `AXIS_CLEARANCE` (3) off the home→nearest-enemy
+line (`traffic_axis`); a gather needs `GATHER_OPEN_FLOOR` (5), and the
+march clock launches the arrived share if it is half the wave, else
+disbands and strikes the gather out. A rescue's first leg walks to open
+ground nearby, only a second marches at the enemy; units past a marching
+wave's gather are not walked home through it; an air target hit three
+sorties without falling rests 6000 ticks; an allied engineer's capture
+target is skipped, a live race ceded by the higher house id.
 
 The rescue reworked: self-rescheduling (`rescue_due`) instead of
 `tick % 150`; up to `RESCUE_BATCH` (3) rescues per scan in one pass; a
@@ -1218,7 +1247,7 @@ exemption narrows to the ids the scouting chain actually dispatched
 (`scout_chain`) — Yuri's scout is the Initiate, and the type test exempted
 every Initiate in the army. The `raiders` set was push-only; a raider idle
 again with his gate lapsed is released, as the doc always promised. Guard
-posts gain the openness test (`pick_guard_post` prefers an open connected
+posts gain the openness test (`pick_guard_post` requires an open connected
 cell, the anti-floater anchor prefers an open economy structure), a posted
 unit inside a detected cluster scatters with it, and the engineer's
 tech-capture survey and dispatch gain the zone-connectivity check (a
@@ -1271,17 +1300,29 @@ outpost-intent item whose ring refuses every site widens the ring once
 strike toward the pause; a paused outpost item is cancel-only through the
 wall's own escape, never a wedge and never a factory stood at home. (P4)
 The first-appearance latch: a changed main/outpost pair (`primary_pair`)
-hands the primary flag to the outpost that tick, not after four vehicles;
+owes the outpost the flag until it carries once, not after four vehicles;
 afterwards the alternation runs on the slot odometer OR
-`PRIMARY_TOGGLE_EVERY_TICKS` (1500) since the last toggle, and the mark
-resets with the pair. (P5) The demand arm (`outpost_carrier_demand`): the
+`PRIMARY_TOGGLE_EVERY_TICKS` (1500) since the last toggle. The flag is
+sticky: the rules only name the carrier they want, and it moves when one
+want has held `PRIMARY_PREFERENCE_PASSES` (30) consecutive passes, or when
+neither factory has carried it for `PRIMARY_LOST_TICKS` (150) — and never
+twice inside `PRIMARY_TOGGLE_EVERY_TICKS`, a hard floor per house
+(`primary_toggle_due`). The old wheel flipped on every trigger, and its
+odometer counted refused files: build12 toggled one house 731 times at an
+~11-tick cadence. (P5) The demand arm (`outpost_carrier_demand`): the
 carrier holds at the outpost while its own cluster ring stands under half
 the guard reserve or the live wave's gather cell sits nearer the outpost
 than home; the blind alternation stays the fallback. (P6) The rally anchor
-set gains the outpost anchor, and the rally cell is picked on the
-factory's exit side — the first rotated spread offset at least three
-cells off the anchor — so it never sits on the crowded yard ring the
-engine refuses and the 900-tick gate then parked. (P7) Layer 2.6 gates on
+set gains the outpost anchor and the pinned home, and the rally cell is
+the factory's rotated spread offset at least three cells off the anchor —
+never on the crowded yard ring the engine refuses — inside the factory's
+bound (`war_factory_rally`): a home factory within `HOME_RALLY_MAX` (8) of
+its yard and never at the outpost, the outpost factory within
+`OUTPOST_RALLY_MAX` (6) of the outpost, both open and off the traffic
+axis. The site survey (`best_ore_field`) skips a site whose home→site walk
+passes within `ALLIED_BASE_CORRIDOR` (12) of an allied base or that sits
+nearer an ally than home (build12: one outpost 85 cells out, past two
+allied bases). (P7) Layer 2.6 gates on
 the expansion standing, not `any_tank`: a forward base with every tank
 dead must still raise the lines that rebuild them.
 
@@ -1373,3 +1414,11 @@ cells of it — the field burns the ore run under the enemy's miners.
 `superai/<pillar>` branch off `base`. Anything generally useful (bench
 harness parts, command-layer hooks) is a candidate to PR back upstream;
 difficulty knobs and strategies stay fork-only.
+
+## Engine hooks
+
+Fork conditions in the engine that stand down for a command-driven house
+(`HouseState::command_driven`). The yard-deploy regroup (`world_spawn.rs`
+→ `MoveGroundForcesToBase`) skips such a house: it overwrote every own
+ground unit's NavCom (harvesters and engineers included), seen by the
+command layer only a tick later. Base centre and base-plan recalc stay.
