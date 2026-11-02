@@ -64,7 +64,7 @@ const SITE_SEARCH_RADIUS: i16 = 24;
 /// every foundation keeps from its neighbors.
 const EXIT_CLEARANCE_TYPES: [&str; 9] = [
     "GAWEAP", "NAWEAP", "YAWEAP", // war factories
-    "GAPILE", "NAPILE", "YAPILE", // barracks
+    "GAPILE", "NAHAND", "YABRCK", // barracks
     "GAYARD", "NAYARD", "YAYARD", // naval yards
 ];
 
@@ -198,6 +198,12 @@ const HOME_INFANTRY_QUOTA: usize = 6;
 /// drains, and negative power would slow every build through the native
 /// power factor in `time_to_build`.
 const POWER_TARGET: usize = 3;
+
+/// Standing power plants past which the power limb's next build is a
+/// fifth-plus plant — the Soviet Nuclear Reactor override's trigger: with
+/// this many Tesla Reactors up and the battle lab standing, the next power
+/// want builds one [NANRCT] instead (`Opening::nuclear_reactor`).
+const NUCLEAR_OVERRIDE_PLANTS: usize = 4;
 
 /// Refineries the ladder builds before it switches purely to factories:
 /// enough docks to keep five miners turning ore into credits.
@@ -559,7 +565,8 @@ const TECH_CENTER_TYPES: [&str; 3] = ["GATECH", "NATECH", "YATECH"];
 
 /// The suicide payloads the Soviet raid ride carries beside its engineers
 /// when the enemy conyard stands: Crazy Ivan (his Attack is the bomb
-/// attach), the Terror Drone and the demolition truck.
+/// attach), the Cuban Terrorist and the demolition truck (`DRON`, the
+/// Terror Drone, is the roster's own AntiArmor row, never a payload).
 const SUICIDE_RAIDER_TYPES: [&str; 3] = ["IVAN", "TERROR", "DTRUCK"];
 
 /// The army's core — its main tank, the side's basic soldier — fills
@@ -1396,6 +1403,23 @@ struct Opening {
     radar: &'static str,
     /// The side's battle lab, the tech gate for the tier-2 tank.
     battle_lab: &'static str,
+    /// The side's one-of-each economy/tech annexes behind the battle lab,
+    /// each a ladder rung of its own right ahead of the superweapon rungs
+    /// (cheaper, and they compound where a super is a one-shot spend): the
+    /// Ore Purifier and the Spy Satellite Uplink for the Allies, the
+    /// Industrial Plant for the Soviets, the Cloning Vats for Yuri. Each
+    /// pairs the building with the structure besides the lab its retail
+    /// `Prerequisite=` names — the PROC refinery class beside NAINDP's and
+    /// GAOREP's lab, nothing beside NACLON's and GASPYSAT's (the yard every
+    /// one names already stands under the walk) — because the AI house's
+    /// `CanBuild` skips the chain and the rung must not file into a refusal.
+    econ_upgrades: &'static [(&'static str, Option<&'static str>)],
+    /// The side's late-power override: the Soviet Nuclear Reactor [NANRCT]
+    /// (retail `Prerequisite=NATECH,NACNST`, cost 1000, `Power=2000`),
+    /// built once per match in place of the fifth-plus Tesla Reactor while
+    /// the battle lab stands (see [`NUCLEAR_OVERRIDE_PLANTS`]); the plant
+    /// line resumes behind it. `None` keeps the other sides on plants alone.
+    nuclear_reactor: Option<&'static str>,
     /// The side's miner, if the war factory can build it (Yuri's slave miner
     /// is not a plain vehicle and stays out of the opening).
     harvester: Option<&'static str>,
@@ -1419,14 +1443,17 @@ struct Opening {
     /// (the hut dispatch and the commission alike) reads this field; a
     /// shared "ENGINEER" name commissioned nobody outside an Allied base.
     engineer: &'static str,
-    /// The side's land transport an engineer rides into a raid (retail
-    /// `Passengers=` war-factory vehicles): the Allied IFV [FV] and the
-    /// Soviet Flak Track [HTK], both already on the roster's anti-air line
+    /// The side's transport an engineer rides into a raid (retail
+    /// `Passengers=` hulls): the Allied IFV [FV] and the Soviet Flak Track
+    /// [HTK], both war-factory builds already on the roster's anti-air line
     /// (what the vehicle turns into under an engineer's IFVMode is the
-    /// delivery's problem, not the table's). `None` where the side fields
-    /// no land transport — Yuri's only hulls are the amphibious Hover
-    /// Transport (the ferry's) and the sea Boomer — so the raid branch
-    /// sleeps.
+    /// delivery's problem, not the table's), and Yuri's Hover Transport
+    /// [YHVR] — his only land-capable `Passengers=` hull, a `Naval=yes`
+    /// naval-yard build (retail `Prerequisite=YAYARD`), so its commission
+    /// waits for a standing yard and the raid sleeps on a land-locked map.
+    /// The ferry works the same hull type; the two limbs never drive one
+    /// instance at once (the ferry skips a raid's actors, the raid takes
+    /// only an empty hold). `None` keeps the raid branch asleep.
     engineer_ride: Option<&'static str>,
     /// The side's superweapon structure and the special it grants
     /// (retail `SuperWeapon=` on the building): Weather Controller,
@@ -1606,6 +1633,13 @@ const OPENINGS: [Opening; 3] = [
         war_factory: "GAWEAP",
         radar: "GAAIRC",
         battle_lab: "GATECH",
+        // The Ore Purifier (retail Prerequisite=GATECH,PROC,GACNST, cost
+        // 2500, TechLevel 10, `OrePurifier=yes`) and the Spy Satellite
+        // Uplink (retail Prerequisite=GATECH,GACNST, cost 1500, TechLevel 9,
+        // `SpySat=yes` — the engine latches its full-map reveal in
+        // `Simulation::assess_house_spy_sat`), income before intel.
+        econ_upgrades: &[("GAOREP", Some("GAREFN")), ("GASPYSAT", None)],
+        nuclear_reactor: None,
         hero: "TANY",
         harvester: Some("CMIN"),
         service_depot: "GADEPT",
@@ -1826,6 +1860,10 @@ const OPENINGS: [Opening; 3] = [
         war_factory: "NAWEAP",
         radar: "NARADR",
         battle_lab: "NATECH",
+        // The Industrial Plant (retail Prerequisite=NATECH,PROC,NACNST, cost
+        // 2500, TechLevel 10, `FactoryPlant=yes` with `UnitsCostBonus=0.75`).
+        econ_upgrades: &[("NAINDP", Some("NAREFN"))],
+        nuclear_reactor: Some("NANRCT"),
         hero: "BORIS",
         harvester: Some("HARV"),
         service_depot: "NADEPT",
@@ -2076,6 +2114,11 @@ const OPENINGS: [Opening; 3] = [
         // satisfies no prerequisite.
         radar: "NAPSIS",
         battle_lab: "YATECH",
+        // The Cloning Vats (retail Prerequisite=YATECH,YACNST — no refinery
+        // — cost 2500, TechLevel 9, `Cloning=yes`: every barracks graduate
+        // walks out with a free twin).
+        econ_upgrades: &[("NACLON", None)],
+        nuclear_reactor: None,
         hero: "YURIPR",
         harvester: None,
         service_depot: "YAGRND",
@@ -2085,9 +2128,12 @@ const OPENINGS: [Opening; 3] = [
         // The Yuri section: ForbiddenHouses refuses the Allies and the
         // Soviets (retail [YENGINEER], image ENGINEER).
         engineer: "YENGINEER",
-        // No land transport: Yuri's only `Passengers=` hull is the amphibious
-        // Hover Transport the ferry owns — the raid branch stays asleep.
-        engineer_ride: None,
+        // The Hover Transport: the raid ride from the naval yard (retail
+        // Prerequisite=YAYARD, `Naval=yes`, `Passengers=12`,
+        // `MovementZone=Amphibious`) — the ferry's hull type too; the raid
+        // commissions it only behind a standing yard and takes only an
+        // empty hold, so a land-locked map keeps the branch asleep.
+        engineer_ride: Some("YHVR"),
         super_weapon_building: "YAPPET",
         super_weapon_type: "PsychicDominatorSpecial",
         second_super_weapon_building: "YAGNTC",
@@ -2388,6 +2434,12 @@ pub struct SuperAi {
     /// latch for the silo/mutator/chronosphere rung, set the same way
     /// `sw_ever_stood` is. Pinned state, never read from the runtime.
     sw2_ever_stood: bool,
+    /// Whether the side's Nuclear Reactor (`Opening::nuclear_reactor`) has
+    /// ever stood: the late-power override builds one per match, so a razed
+    /// reactor never re-arms it and the Tesla Reactors answer every later
+    /// power want. Set from observation the same way `sw_ever_stood` is.
+    /// Pinned state, never read from the runtime.
+    nuclear_ever_stood: bool,
     /// Whether the hero's commission has issued at least once; the
     /// reservation hands the hero the first specialist slot past the lab.
     /// Pinned state, never read from the runtime.
@@ -2847,6 +2899,7 @@ impl SuperAi {
             next_sw_fire_tick: 0,
             sw_ever_stood: false,
             sw2_ever_stood: false,
+            nuclear_ever_stood: false,
             hero_issued: false,
             fortress_issued: false,
             transport_issued: false,
@@ -3240,6 +3293,13 @@ impl SuperAi {
         }
         if self.count_structures_of_type(sim, opening.second_super_weapon_building) >= 1 {
             self.sw2_ever_stood = true;
+        }
+        // The late-power override is once-per-match the same way: a reactor
+        // that stood once never re-arms it.
+        if let Some(reactor) = opening.nuclear_reactor
+            && self.count_structures_of_type(sim, reactor) >= 1
+        {
+            self.nuclear_ever_stood = true;
         }
 
         // The expansion survey and its proof latch: pure observations,
@@ -5152,11 +5212,12 @@ impl SuperAi {
             return vec![CommandEnvelope::new(self.house, at, command)];
         }
 
-        // The engineer-ride raid — Layer 3. An engineer in the side's land
+        // The engineer-ride raid — Layer 3. An engineer in the side's
         // transport rides the enemy priority structures and walks in where
         // he lands: the pair commissions behind the raid's own wallet bar
         // and cooldown, and the armed stage machine spends one command per
-        // tick. Yuri's side fields no land transport and the branch sleeps.
+        // tick. Yuri's ride is the naval yard's Hover Transport, so his
+        // branch sleeps wherever no yard stands.
         if let Some(command) = self.engineer_raid_orders(sim, rules, opening, tick) {
             return vec![CommandEnvelope::new(self.house, at, command)];
         }
@@ -5282,11 +5343,12 @@ impl SuperAi {
                 })
             })
             .unwrap_or(opening.radar);
-        // Whether a tech-climb piece (the radar, the battle lab or the
-        // superweapon) is the building under construction. Those carry the
-        // tier the whole strategy climbs for, so they alone may claim the
-        // income flow; a routine expansion building must not throttle the
-        // army that defends the base while it builds.
+        // Whether a tech-climb piece (the radar, the battle lab, an
+        // economy/tech annex or the superweapon) is the building under
+        // construction. Those carry the tier the whole strategy climbs for,
+        // so they alone may claim the income flow; a routine expansion
+        // building must not throttle the army that defends the base while
+        // it builds.
         let tech_climb_busy = queue.iter().any(|item| {
             matches!(
                 item.queue_category,
@@ -5298,6 +5360,10 @@ impl SuperAi {
                     || name == opening.battle_lab
                     || name == opening.super_weapon_building
                     || name == opening.second_super_weapon_building
+                    || opening
+                        .econ_upgrades
+                        .iter()
+                        .any(|&(upgrade, _)| upgrade == name)
             }
         });
         // Any battle tank standing gates the perimeter guns and the
@@ -5482,6 +5548,36 @@ impl SuperAi {
             let (output, drain) =
                 crate::sim::production::power_balance_for_owner(sim, rules, &owner);
             let pending = self.pending_structure_drain(sim, rules, &owner);
+            // The late-power override (W2): when the power limb would
+            // build a fifth-plus plant — [`NUCLEAR_OVERRIDE_PLANTS`]
+            // standing and the limb's own want, the preemption's deficit
+            // below or the growth margin's thin headroom while the standard
+            // factory build-out is short — and the battle lab stands (the
+            // reactor's retail `Prerequisite=NATECH,NACNST`, which the AI
+            // house's `CanBuild` skips), the Soviet side builds one Nuclear
+            // Reactor instead, once per match (`nuclear_ever_stood`). The
+            // limb itself keeps its logic: the override only claims this one
+            // slot ahead of it, behind the preemption's own wallet bar, and
+            // the plants resume the moment the reactor stood.
+            if let Some(reactor) = opening.nuclear_reactor
+                && !self.nuclear_ever_stood
+                && self.count_structures_of_type(sim, opening.power) >= NUCLEAR_OVERRIDE_PLANTS
+                && self.count_structures_of_type(sim, opening.power) < POWER_CAP
+                && self.count_structures_of_type(sim, opening.battle_lab) >= 1
+                && (output - drain - pending < 0
+                    || (any_tank
+                        && output - drain - pending < POWER_HEADROOM_TARGET
+                        && self.count_structures_of_type(sim, opening.war_factory)
+                            < FACTORY_BUILDOUT))
+                && let Some(ty) = rules.object(reactor)
+                && crate::sim::production::credits_for_owner(sim, &owner) >= ty.cost
+                && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
+                && let Some(type_id) = sim.interner.get(reactor)
+                && let Some(command) = self.file_production(sim, rules, type_id, tick)
+            {
+                self.placement_intent = None;
+                return vec![CommandEnvelope::new(self.house, at, command)];
+            }
             if output - drain - pending < 0
                 && self.count_structures_of_type(sim, opening.power) < POWER_CAP
                 && let Some(ty) = rules.object(opening.power)
@@ -5625,7 +5721,7 @@ impl SuperAi {
                 }
             }
 
-            let ladder = [
+            let mut ladder = vec![
                 (opening.power, 1),
                 (opening.refinery, 1),
                 (opening.barracks, 1),
@@ -5641,6 +5737,15 @@ impl SuperAi {
                 // once the tier is secure.
                 (radar_name, 1),
                 (opening.battle_lab, 1),
+            ];
+            // The annex rungs (`Opening::econ_upgrades`) splice in between
+            // the battle lab and the superweapon steps: cheaper than either
+            // super and compounding (income, cost, vision), so the lab's
+            // tech pays out before the monuments claim the slot.
+            for &(annex, _) in opening.econ_upgrades {
+                ladder.push((annex, 1));
+            }
+            ladder.extend([
                 // The superweapon step follows the lobby toggle for free:
                 // every retail one is `DisableableFromShell=yes`, so its
                 // cameo stays dark while superweapons are off (CanBuild
@@ -5665,7 +5770,7 @@ impl SuperAi {
                 (opening.service_depot, 1),
                 (opening.power, POWER_TARGET),
                 (opening.war_factory, FACTORY_BUILDOUT),
-            ];
+            ]);
             // The first five steps are the opening; the expansion beyond
             // them waits for a battle tank to leave the factory —
             // expanding production must not starve the pipeline it expands.
@@ -5694,6 +5799,24 @@ impl SuperAi {
                         || !(self.sw_ever_stood
                             || self.count_structures_of_type(sim, opening.super_weapon_building)
                                 >= 1))
+                {
+                    continue;
+                }
+                // An annex rung queues only once its named prerequisites
+                // stand — the battle lab, plus the refinery where retail
+                // names the PROC class beside it: the AI house's `CanBuild`
+                // skips the `Prerequisite=` chain, and a PRODUCE filed
+                // behind a missing prerequisite is the silent refusal the
+                // chrono-steal ride's factory gate exists for. One stands per
+                // match (retail `BuildLimit=1`, home placement); the count
+                // check below rebuilds a razed one, the lab's own treatment.
+                if let Some(&(_, extra)) = opening
+                    .econ_upgrades
+                    .iter()
+                    .find(|&&(annex, _)| annex == *name)
+                    && (self.count_structures_of_type(sim, opening.battle_lab) == 0
+                        || extra
+                            .is_some_and(|extra| self.count_structures_of_type(sim, extra) == 0))
                 {
                     continue;
                 }
@@ -7461,8 +7584,9 @@ impl SuperAi {
     /// when none stands, queue dedup included) and latches
     /// [`EngineerRaid::Boarding`]. Every stage is bounded by
     /// [`RAID_STAGE_TIMEOUT_TICKS`] and a lost ride or last engineer tears
-    /// the cycle into the cooldown; Yuri's side keeps `None` in
-    /// `Opening::engineer_ride` and never gets here.
+    /// the cycle into the cooldown; a side whose `Opening::engineer_ride` is
+    /// `None` never gets here, and Yuri's naval ride sleeps until a naval
+    /// yard stands ([`raid_ride_producer`]).
     fn engineer_raid_orders(
         &mut self,
         sim: &crate::sim::world::Simulation,
@@ -7481,11 +7605,17 @@ impl SuperAi {
         }
         self.raid_arm_due = tick + ENGINEER_CAPTURE_WINDOW_TICKS;
         // The arming gate: a fat wallet, a known enemy to aim at, a ride
-        // the war factory can actually build.
+        // its own yard can actually build — the war factory for a land
+        // transport, the naval yard for a `Naval=yes` hull (Yuri's Hover
+        // Transport rides the Ship queue): a PRODUCE with no standing
+        // producer is refused silently and the queue view never shows it,
+        // the chrono-steal ride's factory-gate lesson. A land-locked base
+        // with no yard keeps the naval ride's raid asleep.
+        let ride_producer = raid_ride_producer(rules, opening, ride_name);
         if crate::sim::production::credits_for_owner(sim, sim.interner.resolve(self.house))
             < RAID_WALLET_CREDITS
             || self.enemy_center(sim).is_none()
-            || self.count_structures_of_type(sim, opening.war_factory) == 0
+            || self.count_structures_of_type(sim, ride_producer) == 0
         {
             return None;
         }
@@ -7674,7 +7804,12 @@ impl SuperAi {
             .collect()
     }
 
-    /// An idle ride free of every other chain, for the raid's arming half.
+    /// An idle ride free of every other chain, for the raid's arming half —
+    /// the engineer raid's and the chrono steal's alike. The hold must be
+    /// empty: a hull with passengers aboard is another limb's working
+    /// instance (Yuri's Hover Transport is also the ferry's hull type, and
+    /// a loaded ferry idles between its windows), and an engineer could
+    /// take no seat in a full hold anyway.
     fn find_raid_ride(
         &self,
         sim: &crate::sim::world::Simulation,
@@ -7690,6 +7825,10 @@ impl SuperAi {
                     && sim.interner.resolve(entity.type_ref()) == ride_name
                     && entity.lifecycle.object_alive()
                     && !entity.lifecycle.in_limbo()
+                    && entity
+                        .passenger_role
+                        .cargo()
+                        .is_none_or(|cargo| cargo.count() == 0)
                     && self.order_gate.get(id).is_none_or(|&due| tick >= due)
                     && matches!(
                         entity.passive_acquire_mission(),
@@ -8022,6 +8161,12 @@ impl SuperAi {
                 && entity.category() == crate::map::entities::EntityCategory::Unit
                 && hulls.contains(&sim.interner.resolve(entity.type_ref()))
                 && !entity.lifecycle.in_limbo()
+                // A live raid's ride is the raid's own: Yuri's Hover
+                // Transport is both hull types, and ferry orders sailing the
+                // engineers' ride out from under their stage machine would
+                // tear the raid down at its stage clock. The ferry picks the
+                // hull back up when the raid's cycle ends.
+                && !self.raid_involves(*id)
                 && self.order_gate.get(id).is_none_or(|&due| tick >= due)
                 && matches!(
                     entity.passive_acquire_mission(),
@@ -8105,6 +8250,9 @@ impl SuperAi {
                     || (scout_reserved && type_name == opening.scout)
                     || self.boarders.contains(&id)
                     || self.raiders.contains(&id)
+                    // A live raid's engineers walk their own Enter orders;
+                    // the pool never poaches them mid-walk.
+                    || self.raid_involves(id)
                     || self.order_gate.get(&id).is_some_and(|&due| tick < due)
                     || !matches!(
                         candidate.passive_acquire_mission(),
@@ -13669,19 +13817,22 @@ impl SuperAi {
             .copied()
             .find_map(|name| self.find_raid_ride(sim, name, tick));
         let Some(ride) = ride else {
-            // Commission the first ride type the factory can honestly
-            // build: behind a standing war factory (the raid's gate — a
-            // vehicle PRODUCE with no factory is refused silently and the
-            // queue view never shows it), the queue dedup, and the
-            // per-type retry gate that paces a refused re-file.
-            if self.count_structures_of_type(sim, opening.war_factory) == 0 {
-                return Vec::new();
-            }
+            // Commission the first ride type its yard can honestly build:
+            // behind that yard standing (the raid's gate — the war factory
+            // for a land ride, the naval yard for Yuri's hover hull; a
+            // PRODUCE with no standing producer is refused silently and the
+            // queue view never shows it, [`raid_ride_producer`]), the queue
+            // dedup, and the per-type retry gate that paces a refused
+            // re-file.
             let owner = sim.interner.resolve(self.house);
             for name in ride_names {
                 let Some(ty) = rules.object(name) else {
                     continue;
                 };
+                if self.count_structures_of_type(sim, raid_ride_producer(rules, opening, name)) == 0
+                {
+                    continue;
+                }
                 if crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
                     != crate::sim::production::CanBuild::Yes
                 {
@@ -13896,6 +14047,24 @@ fn on_map_cell(
     let max_x = (terrain.width() as i16).saturating_sub(1);
     let max_y = (terrain.height() as i16).saturating_sub(1);
     (cell.0.clamp(0, max_x) as u16, cell.1.clamp(0, max_y) as u16)
+}
+
+/// The yard that builds a raid ride: a `Naval=yes` hull (Yuri's Hover
+/// Transport) queues in the Ship category at the side's naval yard, every
+/// land transport at the war factory. The ride commissions read it as
+/// their producer gate — a PRODUCE with no standing yard of its own
+/// category is refused silently and the queue view never shows it (the
+/// chrono-steal's factory gate, widened to the naval hull).
+fn raid_ride_producer(
+    rules: &crate::rules::ruleset::RuleSet,
+    opening: &Opening,
+    ride_name: &str,
+) -> &'static str {
+    if rules.object(ride_name).is_some_and(|ty| ty.naval) {
+        opening.naval_yard
+    } else {
+        opening.war_factory
+    }
 }
 
 /// Whether ground movement connects `from` to `to`: the native zone rows
@@ -15129,11 +15298,11 @@ mod tests {
 
     /// The engineer chains' table rows and pure rankings. The raid ride per
     /// side (the Allied IFV, the Soviet Flak Track — both already on their
-    /// roster's anti-air line — and Yuri none, his only `Passengers=` hull
-    /// being the ferry's amphibious transport), the capture priority's
-    /// class order covering the neutral-tech table exactly once with the
-    /// oil derrick leading, and the spy retarget's rank order: enemy
-    /// superweapon, radar, power, then any standing structure.
+    /// roster's anti-air line — and Yuri's Hover Transport, the ferry's
+    /// amphibious hull type, built behind his naval yard), the capture
+    /// priority's class order covering the neutral-tech table exactly once
+    /// with the oil derrick leading, and the spy retarget's rank order:
+    /// enemy superweapon, radar, power, then any standing structure.
     #[test]
     fn openings_name_the_engineer_ride_and_the_capture_and_spy_ranks_hold() {
         let opening = |yard: &str| {
@@ -15152,8 +15321,9 @@ mod tests {
 
         let yuri = opening("YACNST");
         assert_eq!(
-            yuri.engineer_ride, None,
-            "Yuri fields no land transport; the ferry's hover hull is not a raid ride"
+            yuri.engineer_ride,
+            Some("YHVR"),
+            "Yuri's raid rides the naval yard's Hover Transport"
         );
 
         // The capture priority ranks every neutral-tech type exactly once,

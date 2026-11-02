@@ -839,8 +839,9 @@ pays the engineer twice over — so a windowed limb walks the nearest
 revealed one (derricks first) with the engine's own capture click, one
 engineer per building (see "Neutral tech capture" below), topping the
 stock to two through the commission core the bridge chain
-shares. The ride raid: an engineer boards the side's land transport
-(the IFV, the Flak Track; Yuri fields none), attack-moves at a
+shares. The ride raid: an engineer boards the side's transport
+(the IFV, the Flak Track, Yuri's Hover Transport behind a standing
+naval yard), attack-moves at a
 latched enemy priority structure, unloads beside it and walks the
 capture in — the stage machine marches one command a tick, each leg
 re-issued only when its actor stands idle again, every stage on a
@@ -1414,8 +1415,8 @@ structure inside `FORCE_SHIELD_RADIUS` bleeds.
 
 The engineer transport raid loads up to three engineers (the ride's seats
 permitting) and, when the enemy conyard stands, the Soviet suicide
-payload in the seats left (`SUICIDE_RAIDER_TYPES`: Crazy Ivan, the Terror
-Drone, the demolition truck) — the raid aims conyard-first, the first
+payload in the seats left (`SUICIDE_RAIDER_TYPES`: Crazy Ivan, the Cuban
+Terrorist, the demolition truck) — the raid aims conyard-first, the first
 engineer takes it, the spares the war factory and the lab, and the payload
 attacks it on foot (Ivan's Attack is the bomb attach). `EngineerRaid`
 carries `engineers` and `payload` vectors now; a lost ride or last
@@ -1429,6 +1430,23 @@ own limb plants the charge once he lands. The Desolator's ore denial: an
 idle Desolator walks at the enemy's nearest harvester cell through the
 raider window (`ore_denial`) and toggles his radiation stance within two
 cells of it — the field burns the ore run under the enemy's miners.
+
+## One-of-each annexes, the reactor and Yuri's ride
+
+Past the battle lab the ladder now queues the side's economy/tech annexes
+(`Opening::econ_upgrades`) before the superweapon rungs — the Ore Purifier
+and Spy Satellite Uplink for the Allies, the Industrial Plant for the
+Soviets, the Cloning Vats for Yuri, each one per base, retail
+`BuildLimit=1`, gated on the lab (plus the refinery where retail names the
+`PROC` class, `PrerequisiteProc`) so the order never files into a refusal.
+The Soviet power limb builds one Nuclear Reactor instead of a fifth-plus
+Tesla Reactor once the lab stands (`nuclear_ever_stood` latches it, the
+plants resume). Yuri's engineer raid rides the naval yard's Hover
+Transport (`raid_ride_producer` picks the yard by the hull's `Naval=yes`),
+the ferry never drives a raid's actors (`raid_involves` on both pools) and
+the raid takes only an empty hold. The exit-clearance table names the real
+barracks now (`NAHAND`/`YABRCK` — `NAPILE`/`YAPILE` never existed, so the
+Soviet and Yuri barracks had only a one-cell exit ring).
 
 ## Upstream sync
 
