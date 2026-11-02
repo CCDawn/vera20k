@@ -1308,14 +1308,28 @@ own infantry is curtained, and the column attack-moves at the nearest
 enemy gun cluster (the war factory the fallback) for the curtain's life
 (`iron_column`, the follow-through limb); no such pad falls back to the
 old front-most tank. (S-B) The chrono engineer steal (`chrono_steal_orders`,
-the engineer raid's stage shape): a ride — the Battle Fortress first, the
-side's engineer ride behind it — loads up to three engineers one Enter per
+the engineer raid's stage shape). The cycle arms only while the house holds
+a live Chronosphere grant (`SuperWeaponInstance::is_active`, the sphere
+standing — never the registry slot, which every house carries for every
+special from the first tick) and an enemy conyard stands revealed, and the
+arming half runs once per `ENGINEER_CAPTURE_WINDOW_TICKS` (`chrono_arm_due`,
+the raid's `raid_arm_due` shape), never per tick. A ride — the side's own
+fortress first, its engineer ride behind it, by the side table's names;
+commissioned only behind a standing war factory, the queue dedup and the
+per-type retry gate — loads up to three engineers (one commissioned per
+window through the shared stock cap and the same retry gate) one Enter per
 window, parks on its pad, and the tick the sphere stands ready the suite
 returns both clicks from the same pass: the sphere on the pad, the warp on
 a passable cell two to three cells beside the enemy conyard on home's side
 (`chrono_steal_dest`); `CHRONO_RIDE_DELAY_TICKS` later the ride unloads,
 the first engineer takes the conyard, the spares the next-ranked
-structures. The ride is never curtained before the warp.
+structures. The ride is never curtained before the warp. (The build11
+regression: the arming gate read the registry slot, so it passed for every
+AI house the tick an enemy yard deployed, and the unpaced, factory-less
+ride commission — a literal Battle Fortress, which the native CanBuild
+admits without side or prerequisite for a house no human controls — filed
+one QueueProduction every tick ahead of the build ladder; the one-command
+budget never reached the ladder and the AIs built nothing.)
 `enemy_priority_targets` gains the conyard-first entry every raid now
 reads. (S-C) The chrono prism drop: a 3x3 holding `CHRONO_PRISM_DROP_MIN`
 (3) idle Prism-class tanks is the pad, the enemy power cluster's passable

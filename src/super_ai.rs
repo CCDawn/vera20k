@@ -2575,6 +2575,11 @@ pub struct SuperAi {
     /// The tick the next chrono-steal cycle may arm at. Pinned state,
     /// never read from the runtime.
     chrono_steal_cooldown_until: u32,
+    /// The tick the chrono steal's arming half next runs at — its scan and
+    /// its ride/engineer commissions re-run once per
+    /// [`ENGINEER_CAPTURE_WINDOW_TICKS`], the raid's `raid_arm_due` shape.
+    /// Pinned state, never read from the runtime.
+    chrono_arm_due: u32,
     /// The Iron Curtain column's follow-through: the pad cell, the tick
     /// the curtain fired, and the tanks under it — they attack-move at the
     /// enemy guns for the curtain's life. Pinned state, never read from
@@ -2702,6 +2707,7 @@ impl SuperAi {
             chrono_steal: None,
             chrono_steal_since: 0,
             chrono_steal_cooldown_until: 0,
+            chrono_arm_due: 0,
             iron_column: None,
             prism_drop: None,
             ore_denial: std::collections::HashMap::new(),
@@ -12272,28 +12278,43 @@ impl SuperAi {
                 }
             };
         }
-        // The arming half. The house must own the special (a live grant —
-        // the Allied second super, or a captured GACSPH), the cooldown and
-        // the arm window must stand open.
-        if tick < self.chrono_steal_cooldown_until {
+        // The arming half. The house must own the special — a live grant
+        // (`is_active`, the sphere standing: the Allied second super or a
+        // captured GACSPH), not the registry's slot, which every house
+        // holds for every special from the first tick — and the cooldown
+        // and the arm window must stand open. The window paces the whole
+        // half like the raid's `raid_arm_due`: the scan, the ride and the
+        // engineer commissions re-run once per
+        // [`ENGINEER_CAPTURE_WINDOW_TICKS`], never per tick. (Observed
+        // live, build11: the slot gate read true for every AI house from
+        // the deploy tick on, and the ride commission below — no factory
+        // gate, no pacing — re-filed a Battle Fortress every tick for the
+        // whole game; the one-command budget never reached the build
+        // ladder behind it and the AIs built nothing.)
+        if tick < self.chrono_steal_cooldown_until || tick < self.chrono_arm_due {
             return Vec::new();
         }
+        self.chrono_arm_due = tick + ENGINEER_CAPTURE_WINDOW_TICKS;
         let Some(sphere_type) = sim.interner.get("ChronoSphereSpecial") else {
             return Vec::new();
         };
         if !sim
             .super_weapons()
             .get(&self.house)
-            .is_some_and(|house_sws| house_sws.contains_key(&sphere_type))
+            .and_then(|house_sws| house_sws.get(&sphere_type))
+            .is_some_and(|instance| instance.is_active())
         {
             return Vec::new();
         }
         if self.enemy_conyard(sim, None).is_none() {
             return Vec::new();
         }
-        // The ride: the Battle Fortress first (the seats), the side's own
-        // engineer ride behind it.
-        let ride_names: Vec<&'static str> = [Some("BFRT"), opening.engineer_ride]
+        // The ride: the side's own fortress first (the seats), its engineer
+        // ride behind it — the side table's names, never a literal hull: the
+        // native CanBuild answers Yes without prerequisites or side locks
+        // for a house no human controls, so `can_build` alone would let a
+        // Soviet house commission an Allied Battle Fortress forever.
+        let ride_names: Vec<&'static str> = [opening.fortress, opening.engineer_ride]
             .into_iter()
             .flatten()
             .collect();
@@ -12303,7 +12324,13 @@ impl SuperAi {
             .find_map(|name| self.find_raid_ride(sim, name, tick));
         let Some(ride) = ride else {
             // Commission the first ride type the factory can honestly
-            // build, queue dedup as the pacing.
+            // build: behind a standing war factory (the raid's gate — a
+            // vehicle PRODUCE with no factory is refused silently and the
+            // queue view never shows it), the queue dedup, and the
+            // per-type retry gate that paces a refused re-file.
+            if self.count_structures_of_type(sim, opening.war_factory) == 0 {
+                return Vec::new();
+            }
             let owner = sim.interner.resolve(self.house);
             for name in ride_names {
                 let Some(ty) = rules.object(name) else {
@@ -12323,6 +12350,9 @@ impl SuperAi {
                 let Some(type_id) = sim.interner.get(name) else {
                     continue;
                 };
+                if !self.build_queue_retry_open(type_id, tick) {
+                    continue;
+                }
                 return vec![Command::QueueProduction { type_id }];
             }
             return Vec::new();
@@ -12340,10 +12370,16 @@ impl SuperAi {
             if queued > 0 || standing + queued >= CAPTURE_ENGINEER_STOCK {
                 return Vec::new();
             }
-            return self
-                .engineer_commission_type(sim, rules, opening)
-                .map(|type_id| vec![Command::QueueProduction { type_id }])
-                .unwrap_or_default();
+            // The commission's own admission (a standing barracks, a
+            // buildable type) sits in the shared core; the per-type retry
+            // gate paces a refused re-file beside the arm window.
+            let Some(type_id) = self.engineer_commission_type(sim, rules, opening) else {
+                return Vec::new();
+            };
+            if !self.build_queue_retry_open(type_id, tick) {
+                return Vec::new();
+            }
+            return vec![Command::QueueProduction { type_id }];
         }
         self.chrono_steal = Some(ChronoSteal::Loading { engineers, ride });
         self.chrono_steal_since = tick;
