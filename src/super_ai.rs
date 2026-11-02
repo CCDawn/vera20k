@@ -186,6 +186,14 @@ const NAVAL_PROBE_MAX: u8 = 3;
 /// retail's team scripts never stripped the garrison either.
 const GUARD_RESERVE: usize = 4;
 
+/// The infantry that stay home whatever the surplus (W4), on top of
+/// [`GUARD_RESERVE`]: the engine parks every fresh infantryman in
+/// AreaGuard beside the rally and nothing else ever marched them, so a
+/// quota of zero would strip the base's close defense every time a wave
+/// forms. Standing combat infantry past reserve plus this quota join the
+/// wave as extras instead of hoarding at home.
+const HOME_INFANTRY_QUOTA: usize = 6;
+
 /// Power plants the expansion ladder tops out at: each extra war factory
 /// drains, and negative power would slow every build through the native
 /// power factor in `time_to_build`.
@@ -211,8 +219,18 @@ const WAVE_GATHER_DISTANCE: i16 = 20;
 
 /// Chebyshev cells from the gather cell within which a marched member
 /// counts as arrived: every member inside it (or the march clock) turns
-/// the march into the strike.
-const WAVE_GATHER_ARRIVAL: i16 = 3;
+/// the march into the strike. One past the march spread's outer reach
+/// ([`WAVE_MARCH_SPREAD`] dispatches on the 4-cell ring), so a member the
+/// dispatch sent is always a member the arrival read counts.
+const WAVE_GATHER_ARRIVAL: i16 = 5;
+
+/// The march dispatch's spread fan (W1): the inner ring of
+/// [`SPREAD_OFFSETS`] — the centre and the eight 4-cell offsets. The full
+/// table's outer ring marched members 8 cells out, past the arrival read,
+/// and the gather clock then disbanded the wave for stragglers it had
+/// dispatched there itself (observed: ~1/16 of every wave never counted
+/// as arrived, and the clock disbanded most episodes for it).
+const WAVE_MARCH_SPREAD: usize = 9;
 
 /// Ticks a forming wave waits for its missing members before it launches
 /// with what stands: the composition is a demand, not a precondition — a
@@ -400,8 +418,27 @@ const CONGESTION_SAME_CENTER: i32 = 3;
 
 /// The persistent jam's attractor reach (T2): a war-factory rally or the
 /// wave's gather cell within this many cells of a jam that outlived one
-/// scan is what keeps feeding it.
-const CONGESTION_ATTRACTOR_REACH: i32 = 4;
+/// scan is what keeps feeding it. Held at the cluster box's own radius,
+/// so every jam an attractor proves is also a jam this reach escalates —
+/// the old 4 proved jams the 5-wide escalation then never saw.
+const CONGESTION_ATTRACTOR_REACH: i32 = CONGESTION_CLUSTER_RADIUS as i32;
+
+/// The home ring the traffic limb does not police (W3): within this many
+/// cells of the engine home or an own construction yard a dense standing
+/// ring is the base's normal state — the engine parks every new
+/// infantryman in AreaGuard beside the rally and the rally itself sits on
+/// the offset grid there — so inside it only a wedged unit proves a jam,
+/// a jam there holds no march (`jam_on_corridor` measures to the walk's
+/// start) and the rescue skips no home-ring unit.
+const HOME_JAM_RADIUS: i32 = 12;
+
+/// Ticks a unit the traffic limb moved stays out of its member picks
+/// (W3): without it the scan re-fired on the faces it had just parked
+/// back into the box — Stop dropped each marcher's AttackMove, the
+/// rescue never saw it, and the batches looped every 150 ticks at home
+/// (observed: 1846 Stops, 170+ units shuffled five times or more).
+/// Pinned map, pruned each scan.
+const CONGESTION_MEMBER_COOLDOWN_TICKS: u32 = 600;
 
 /// The yielding house's sidestep (T2): in a jam shared with an ally the
 /// smaller house's members walk at least this many cells off the home→jam
@@ -2674,6 +2711,13 @@ pub struct SuperAi {
     /// with whether it was stopped mid-move, the jam centre and the scan's
     /// streak and tick. Pinned state, never read from the runtime.
     congestion_discharge: Vec<(u64, bool, (u16, u16), u32, u32)>,
+    /// Per unit, the tick its traffic-limb cooldown lifts (W3): a unit the
+    /// limb Stopped, scattered or discharged is not a member again before
+    /// it — the scan re-firing on the faces it had itself just moved was
+    /// the every-150-ticks home loop. See
+    /// [`CONGESTION_MEMBER_COOLDOWN_TICKS`]. Pinned state, never read from
+    /// the runtime.
+    congestion_cooldown: std::collections::HashMap<u64, u32>,
     /// The home→nearest-enemy-base axis (home, aim), refreshed on the
     /// congestion scan's cadence (T4): every wave walks it, so parking cells
     /// keep [`AXIS_CLEARANCE`] off it. Pinned state, never read from the
@@ -2876,6 +2920,7 @@ impl SuperAi {
             congestion_center: None,
             congestion_streak: None,
             congestion_discharge: Vec::new(),
+            congestion_cooldown: std::collections::HashMap::new(),
             traffic_axis: None,
             gather_blacklist: Vec::new(),
             rally_avoid: std::collections::HashMap::new(),
@@ -9422,19 +9467,24 @@ impl SuperAi {
     /// [`Self::capture_bound`] hygiene's retain), and answers with the
     /// rescues: each unit still standing on its snapshot cell past
     /// [`STUCK_TIMEOUT`] — or one scan window, when the engine latched its
-    /// path blocked (T6) — takes a fresh AttackMove. The first rescue walks
-    /// it to the nearest open ground off the traffic axis
-    /// ([`Self::rescue_open_cell`], T6 — the old rescue marched every
-    /// wedged unit at the enemy, straight back into the corridor that
-    /// wedged it); only a unit wedged again near its first rescue
-    /// ([`Self::rescue_marks`]) marches at the wave's own destination — the
-    /// first enemy structure the unit's ground rows connect to, rotating by
-    /// unit id, else the enemy mass center's spread ring. A candidate with
+    /// path blocked (T6) — takes a fresh AttackMove. A wedged unit —
+    /// holding a destination or latched path-blocked — takes the
+    /// open-ground first leg ([`Self::rescue_open_cell`], T6 — the old
+    /// rescue marched every wedged unit at the enemy, straight back into
+    /// the corridor that wedged it); a merely idle unit — the AreaGuard
+    /// garrison the engine parks home — and one wedged again near its
+    /// first rescue ([`Self::rescue_marks`]) march at the enemy directly
+    /// (W3: the idle leg is the idle infantry's only outlet) — the first
+    /// enemy structure the unit's ground rows connect to, rotating by
+    /// unit id, else the enemy mass center's spread ring, each candidate
+    /// passed by when its walk would cross a standing jam off home
+    /// ([`Self::jam_on_corridor`]). A candidate with
     /// no aim or under the futility backoff keeps its snapshot (the next
     /// scan sees it again) and the next candidate takes the turn. A standing
     /// congestion jam keeps its own members (the congestion limb unpicks
-    /// them) and holds the enemy leg — a march into the corridor feeds the
-    /// jam.
+    /// them) — unless they stand inside the home ring
+    /// ([`Self::in_home_jam_box`], W3), where the rescue is the only
+    /// outlet.
     fn stuck_rescue_orders(
         &mut self,
         sim: &crate::sim::world::Simulation,
@@ -9575,7 +9625,13 @@ impl SuperAi {
             if commands.len() >= RESCUE_BATCH {
                 break;
             }
-            if jam.is_some_and(|jam| cell_distance(jam, from) <= i32::from(CONGESTION_CLUSTER_RADIUS)) {
+            // The congestion hold: the limb's own members stay its business
+            // — unless they stand inside the home ring (W3), where the
+            // standing density is the base's normal state and the rescue is
+            // the idle infantry's only outlet.
+            if jam.is_some_and(|jam| cell_distance(jam, from) <= i32::from(CONGESTION_CLUSTER_RADIUS))
+                && !self.in_home_jam_box(sim, from)
+            {
                 continue;
             }
             let Some(entity) = sim.substrate.entities.get(unit) else {
@@ -9590,30 +9646,53 @@ impl SuperAi {
             let second = self.rescue_marks.get(&unit).is_some_and(|&(first, _)| {
                 cell_distance(first, from) <= RESCUE_OPEN_RADIUS + 2
             });
-            let raw = if !second {
+            // Wedged means holding a destination or latched path-blocked
+            // (W3): those take the open-ground first leg. A unit merely
+            // idle past [`STUCK_TIMEOUT`] — the AreaGuard garrison the
+            // engine parks home, the poster's blind spot — is not wedged
+            // and marches at the enemy directly: that leg was the previous
+            // build's outlet, and without it the idle infantry stood home
+            // for the whole game.
+            let wedged = entity.navigation.nav_com().is_some()
+                || entity.navigation.path_runtime().path_blocked();
+            let raw = if !second && wedged {
                 self.rescue_open_cell(sim, movement_zone, unit, from)
-            } else if jam.is_some() {
-                None
-            } else if enemy_targets.is_empty() {
-                enemy_center.and_then(|aim| {
-                    (0..SPREAD_OFFSETS.len())
-                        .map(|index| (unit as usize + index) % SPREAD_OFFSETS.len())
-                        .find_map(|index| {
-                            let spread = SPREAD_OFFSETS[index];
-                            let cell = on_map_cell(
-                                sim,
-                                (aim.0 + i16::from(spread.0), aim.1 + i16::from(spread.1)),
-                                aim,
-                            );
+            } else {
+                // The enemy leg, per candidate now (W3): a candidate whose
+                // walk crosses a standing jam off home is passed by, not
+                // the whole leg — the old any-jam-blocks-everything read
+                // shut the outlet whenever one jam stood anywhere.
+                let aims: Vec<(u16, u16)> = if enemy_targets.is_empty() {
+                    enemy_center
+                        .map(|aim| {
+                            (0..SPREAD_OFFSETS.len())
+                                .map(|index| (unit as usize + index) % SPREAD_OFFSETS.len())
+                                .filter_map(|index| {
+                                    let spread = SPREAD_OFFSETS[index];
+                                    let cell = on_map_cell(
+                                        sim,
+                                        (aim.0 + i16::from(spread.0), aim.1 + i16::from(spread.1)),
+                                        aim,
+                                    );
+                                    zones_connected(sim, movement_zone, from, cell).then_some(cell)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    (0..enemy_targets.len())
+                        .map(|attempt| {
+                            enemy_targets[(unit as usize + attempt) % enemy_targets.len()]
+                        })
+                        .filter_map(|(_, cell)| {
+                            let cell = (cell.0.max(0) as u16, cell.1.max(0) as u16);
                             zones_connected(sim, movement_zone, from, cell).then_some(cell)
                         })
-                })
-            } else {
-                (0..enemy_targets.len())
-                    .map(|attempt| enemy_targets[(unit as usize + attempt) % enemy_targets.len()])
-                    .find_map(|(_, cell)| {
-                        let cell = (cell.0.max(0) as u16, cell.1.max(0) as u16);
-                        zones_connected(sim, movement_zone, from, cell).then_some(cell)
+                        .collect()
+                };
+                aims.into_iter()
+                    .find(|&cell| {
+                        !self.jam_on_corridor((from.0 as i16, from.1 as i16), cell)
                     })
             };
             // No aim, or the futility backoff pacing the repeats (a rescue
@@ -10126,7 +10205,9 @@ impl SuperAi {
     /// plan's own order: each composition entry takes its count from the
     /// standing units of that type, armor first, then the foot wave, then
     /// the secondary extras that tag along if they already stand (never
-    /// demanded). The picks spend the pool only past [`GUARD_RESERVE`] —
+    /// demanded); past the plan's counts the wave takes every standing
+    /// combat infantry beyond the home quota as its own extras (W4, the
+    /// surplus outlet). The picks spend the pool only past [`GUARD_RESERVE`] —
     /// the reserve stays home whatever the composition asks — and pass
     /// the engineer raid's actors by (their stage machine owns them; the
     /// raid rides are the Flak Track and the IFV, both wave types). Types
@@ -10188,6 +10269,36 @@ impl SuperAi {
                     extras += 1;
                     budget -= 1;
                 }
+            }
+        }
+        // The surplus outlet (W4): past the plan's counts the wave takes
+        // every standing combat infantry beyond the home quota — the guard
+        // reserve plus [`HOME_INFANTRY_QUOTA`] stay behind, the rest
+        // marches. The engine parks each fresh infantryman in AreaGuard
+        // beside the rally, the poster never reaches an AreaGuard unit and
+        // the old picks stopped at the plan's counts, so the surplus stood
+        // home for the whole game (observed: the infantry hoard, production
+        // answering a base that never spent its men). The budget still
+        // binds: the reserve's own doctrine holds whatever the surplus.
+        let infantry_types: Vec<&'static str> = opening
+            .infantry
+            .iter()
+            .map(|entry| entry.name)
+            .chain(std::iter::once(opening.basic_infantry))
+            .collect();
+        let infantry_standing = pool
+            .iter()
+            .filter(|(_, name)| infantry_types.contains(name))
+            .count();
+        let mut surplus = infantry_standing.saturating_sub(GUARD_RESERVE + HOME_INFANTRY_QUOTA);
+        for &(unit, name) in &pool {
+            if surplus == 0 || budget == 0 {
+                break;
+            }
+            if infantry_types.contains(&name) && !members.contains(&unit) {
+                members.push(unit);
+                surplus -= 1;
+                budget -= 1;
             }
         }
         (members, missing)
@@ -10354,8 +10465,7 @@ impl SuperAi {
                     })
                     .map(|&(_, cell)| cell)
                     .or(enemy_center);
-                self.wave_gather =
-                    aim.and_then(|aim| self.valid_gather_cell(sim, center, aim, tick));
+                self.wave_gather = aim.and_then(|aim| self.valid_gather_cell(sim, center, aim, 0, tick));
                 self.wave_stage = WaveStage::Marching;
                 self.wave_stage_since = tick;
                 self.wave_marched.clear();
@@ -10381,11 +10491,11 @@ impl SuperAi {
                     self.arm_wave_strike(sim, tick);
                     return None;
                 }
-                // The gather clock (T3): a wave the clock caught short of
-                // its regroup launches with the arrived share when that is
-                // half the wave, else disbands and strikes the gather out —
-                // the old clock armed the strike regardless and the stuck
-                // members were re-fed into the next gather at the same cell.
+                // The gather clock (T3): the clock caught short of the
+                // regroup launches the strike with the whole wave regardless
+                // (W1 — the old release disbanded the episode for members
+                // the dispatch had itself sent past the arrival ring); a
+                // true stall only adds the gather to the blacklist.
                 if tick.saturating_sub(self.wave_stage_since) >= WAVE_MARCH_TIMEOUT_TICKS {
                     self.release_stalled_gather(sim, rules, gather, tick);
                     return None;
@@ -10446,13 +10556,18 @@ impl SuperAi {
     /// the gather's own openness floor ([`GATHER_OPEN_FLOOR`], T3 — a mass
     /// regroups on the cell's ring, and a two-wide canyon passed the
     /// general floor while it jammed whole waves) and stands clear of every
-    /// struck-out gather ([`Self::gather_blacklisted`]); `None` when no cell
-    /// on the line does (the march then goes straight to the strike).
+    /// struck-out gather ([`Self::gather_blacklisted`]). `min_home_span`
+    /// floors the pick's distance from home (W1): the re-pick after a
+    /// blacklist walks this same line toward home, and without the floor
+    /// the first valid cell could sit one ring from the base — the
+    /// disbanded-wave walk-home. `None` when no cell on the line does (the
+    /// march then goes straight to the strike).
     fn valid_gather_cell(
         &self,
         sim: &crate::sim::world::Simulation,
         home: (i16, i16),
         aim: (i16, i16),
+        min_home_span: i32,
         tick: u32,
     ) -> Option<(u16, u16)> {
         let dx = i32::from(home.0) - i32::from(aim.0);
@@ -10460,7 +10575,13 @@ impl SuperAi {
         let len = dx.abs().max(dy.abs()).max(1);
         let home_cell = (home.0.max(0) as u16, home.1.max(0) as u16);
         let zone = crate::rules::locomotor_type::MovementZone::Normal;
-        (i32::from(WAVE_GATHER_DISTANCE).min(len)..=len).find_map(|step| {
+        let floor = i32::from(WAVE_GATHER_DISTANCE).min(len);
+        // step runs aim → home, so a cell's distance from home is
+        // `len - step`: the floor caps the step from above, and a span the
+        // line cannot honor empties the range — the march then goes
+        // straight to the strike rather than pull the regroup deeper in.
+        let ceil = len - min_home_span;
+        (floor..=ceil).find_map(|step| {
             let cell = on_map_cell(
                 sim,
                 (
@@ -10489,8 +10610,10 @@ impl SuperAi {
     /// it. The cell rests for [`TRAFFIC_BLACKLIST_TICKS`], every member
     /// leaves `wave_marched` so the dispatch re-sends the wave, and the
     /// gather re-picks along the traffic axis past the blacklist — never
-    /// the cell that jammed it. No other cell on the line passes: the wave
-    /// goes straight to the strike.
+    /// the cell that jammed it, and never one ring closer to home than the
+    /// gather it replaces (W1: the blacklist's own step-toward-home walk
+    /// pulled every re-pick deep into the base ring). No cell at that
+    /// distance or beyond passes: the wave goes straight to the strike.
     fn abort_wave_gather(
         &mut self,
         sim: &crate::sim::world::Simulation,
@@ -10500,9 +10623,13 @@ impl SuperAi {
         self.gather_blacklist
             .push((gather, tick + TRAFFIC_BLACKLIST_TICKS));
         self.wave_marched.clear();
-        let repick = self
-            .traffic_axis
-            .and_then(|(home, aim)| self.valid_gather_cell(sim, home, aim, tick));
+        let repick = self.traffic_axis.and_then(|(home, aim)| {
+            let span = cell_distance(
+                (home.0.max(0) as u16, home.1.max(0) as u16),
+                gather,
+            );
+            self.valid_gather_cell(sim, home, aim, span, tick)
+        });
         match repick {
             Some(cell) => self.wave_gather = Some(cell),
             None => self.arm_wave_strike(sim, tick),
@@ -10510,13 +10637,15 @@ impl SuperAi {
     }
 
     /// The gather clock's release (T3): the march clock ran out short of
-    /// the regroup. With at least half the ground members inside the
-    /// arrival ring the arrived share launches the strike — the stragglers
-    /// leave the wave for the pool, the escort wings stay — and a thinner
-    /// arrival disbands the episode (the members return to the pool and
-    /// the guard poster spreads them over its posts) and strikes the gather
-    /// out for [`TRAFFIC_BLACKLIST_TICKS`], so the next wave's gather never
-    /// lands on the cell that held this one.
+    /// the regroup, and the strike launches anyway — every ground member
+    /// marches on, the escort wings ride along (W1: the old release
+    /// disbanded the episode when under half the wave stood in the arrival
+    /// ring, but the dispatch's own outer offsets had put a member there
+    /// by construction, so most episodes ended with the army walked home
+    /// and the gather blacklisted closer to base). Only a true stall —
+    /// fewer than a third of the ground members inside the arrival ring —
+    /// also strikes the gather out for [`TRAFFIC_BLACKLIST_TICKS`], so the
+    /// next wave's pick never lands on the cell that held this one.
     fn release_stalled_gather(
         &mut self,
         sim: &crate::sim::world::Simulation,
@@ -10526,7 +10655,6 @@ impl SuperAi {
     ) {
         let mut ground = 0usize;
         let mut arrived = 0usize;
-        let mut kept: Vec<u64> = Vec::new();
         for &unit in &self.wave_members {
             let Some(entity) = sim.substrate.entities.get(unit) else {
                 continue;
@@ -10534,7 +10662,6 @@ impl SuperAi {
             if entity.category() == crate::map::entities::EntityCategory::Aircraft
                 || Self::is_fly_type(rules, sim.interner.resolve(entity.type_ref()))
             {
-                kept.push(unit);
                 continue;
             }
             ground += 1;
@@ -10542,17 +10669,13 @@ impl SuperAi {
                 <= i32::from(WAVE_GATHER_ARRIVAL)
             {
                 arrived += 1;
-                kept.push(unit);
             }
         }
-        if ground == 0 || arrived * 2 >= ground {
-            self.wave_members.retain(|unit| kept.contains(unit));
-            self.arm_wave_strike(sim, tick);
-            return;
+        if ground > 0 && arrived * 3 < ground {
+            self.gather_blacklist
+                .push((gather, tick + TRAFFIC_BLACKLIST_TICKS));
         }
-        self.gather_blacklist
-            .push((gather, tick + TRAFFIC_BLACKLIST_TICKS));
-        self.end_wave_episode(tick);
+        self.arm_wave_strike(sim, tick);
     }
 
     /// Latch the strike sequence and turn the stage. The inbound hold (T8)
@@ -10674,8 +10797,11 @@ impl SuperAi {
                 continue;
             }
             let anchor = (gather.0 as i16, gather.1 as i16);
-            let destination = (0..SPREAD_OFFSETS.len())
-                .map(|index| (unit as usize + index) % SPREAD_OFFSETS.len())
+            // The spread fan is the inner ring only (W1): every cell a
+            // member is dispatched to stands inside the arrival ring, so
+            // the arrival read never rules a dispatched member out.
+            let destination = (0..WAVE_MARCH_SPREAD)
+                .map(|index| (unit as usize + index) % WAVE_MARCH_SPREAD)
                 .find_map(|index| {
                     let spread = SPREAD_OFFSETS[index];
                     let cell = on_map_cell(
@@ -12215,6 +12341,15 @@ impl SuperAi {
     /// The centre latches into `congestion_center` and holds the wave
     /// march, the rescue's enemy leg and the alarm recall through it until
     /// a scan shows it cleared.
+    ///
+    /// Three reads bound what a jam even is (W3, the build13 infantry
+    /// hoard): a wave marching or striking owns its members — they sit the
+    /// snapshot and the picks both out, and the gather is no attractor; the
+    /// home ring ([`HOME_JAM_RADIUS`] around the engine home or an own
+    /// yard) is normal density, provable only by a wedged unit; and a
+    /// member the limb moved rests
+    /// [`CONGESTION_MEMBER_COOLDOWN_TICKS`] before it can be picked
+    /// again — only stationary units are members at all.
     fn congestion_orders(
         &mut self,
         sim: &crate::sim::world::Simulation,
@@ -12258,6 +12393,17 @@ impl SuperAi {
             {
                 continue;
             }
+            // Wave immunity (W3): a wave marching or striking owns its
+            // members' orders — the gather is the regroup the march exists
+            // for, and the limb reading the regroup as a jam Stopped the
+            // members into walking home and the episode into disbanding at
+            // its own clock. Its members sit the snapshot and the member
+            // picks both out until the episode ends.
+            if matches!(self.wave_stage, WaveStage::Marching | WaveStage::Striking)
+                && self.wave_members.contains(&id)
+            {
+                continue;
+            }
             let owner = entity.owner();
             let type_name = sim.interner.resolve(entity.type_ref());
             if Self::is_fly_type(rules, type_name) {
@@ -12298,20 +12444,19 @@ impl SuperAi {
             }
         }
         self.congestion_snapshot.retain(|id, _| seen.contains(id));
-        // The attractors (T2): the house's war-factory rallies and the
-        // marching wave's gather — the cells its own orders keep streaming
-        // units at.
-        let mut attractors: Vec<(u16, u16)> = self
+        self.congestion_cooldown
+            .retain(|_, until| tick < *until);
+        // The attractors (T2): the house's war-factory rallies — the cells
+        // its own orders keep streaming units at. The marching wave's
+        // gather is no attractor (W3): the regroup is the march's own
+        // business, and reading it as jam-feed pushed every arriving wave
+        // back toward home.
+        let attractors: Vec<(u16, u16)> = self
             .own_structures(sim)
             .into_iter()
             .filter(|(_, name)| name == opening.war_factory)
             .filter_map(|(id, _)| sim.substrate.entities.get(id)?.rally_cell())
             .collect();
-        if self.wave_stage == WaveStage::Marching
-            && let Some(gather) = self.wave_gather
-        {
-            attractors.push(gather);
-        }
         // The cluster: the first stationary own unit (stable order) whose
         // box holds the quota of stationary ground units, enough of them
         // the house's own — and a jam's evidence: a wedged unit in it, or
@@ -12321,6 +12466,20 @@ impl SuperAi {
         // guard ring.
         let in_box =
             |a: (u16, u16), b: (u16, u16)| cell_distance(a, b) <= i32::from(CONGESTION_CLUSTER_RADIUS);
+        // The attractor proof's reach is the escalation's own (W3): a jam
+        // an attractor within [`CONGESTION_ATTRACTOR_REACH`] proves is a
+        // jam the same reach then escalates — the proof and the cure read
+        // one constant.
+        let in_reach =
+            |a: (u16, u16), b: (u16, u16)| cell_distance(a, b) <= CONGESTION_ATTRACTOR_REACH;
+        // The home exemption (W3): inside [`HOME_JAM_RADIUS`] of the
+        // engine home or an own yard a dense standing ring is the base's
+        // normal state — the engine parks every fresh infantryman in
+        // AreaGuard there and the rally sits beside the yard on the offset
+        // grid — so only a wedged unit proves a jam inside it. The old
+        // attractor proof read the yard rally as jam-feed and stopped the
+        // home garrison every scan.
+        let home_ring = |cell: (u16, u16)| self.in_home_jam_box(sim, cell);
         let cluster = stationary
             .iter()
             .filter(|&&(_, _, owner, _)| owner == self.house)
@@ -12340,7 +12499,9 @@ impl SuperAi {
                     );
                 total >= CONGESTION_CLUSTER_MIN
                     && own >= CONGESTION_OWN_MIN
-                    && (wedged || attractors.iter().any(|&attractor| in_box(cell, attractor)))
+                    && (wedged
+                        || (!home_ring(cell)
+                            && attractors.iter().any(|&attractor| in_reach(cell, attractor))))
             })
             .map(|&(_, cell, _, _)| cell);
         self.congestion_center = cluster;
@@ -12380,50 +12541,47 @@ impl SuperAi {
             .max_by_key(|&&(house, count)| (count, std::cmp::Reverse(house)))
             .map(|&(house, _)| house);
         let yields = streak >= 2 && holder != Some(self.house);
-        // The members: every own combat unit in the box (moving or not —
-        // the movers are the stream still feeding it), free of the chains
-        // that own their units and of a fresh order's window.
-        let members: Vec<(u64, (u16, u16), bool, crate::rules::locomotor_type::MovementZone)> = sim
-            .substrate
-            .entities
-            .iter_sorted()
-            .filter(|(id, entity)| {
-                entity.owner() == self.house
-                    && entity.lifecycle.object_alive()
-                    && !entity.lifecycle.in_limbo()
-                    && matches!(
-                        entity.category(),
-                        crate::map::entities::EntityCategory::Unit
-                            | crate::map::entities::EntityCategory::Infantry
-                    )
-                    && !Self::garrisoned(entity)
-                    && {
-                        let name = sim.interner.resolve(entity.type_ref());
-                        (roster.contains(&name) || Self::is_naval_type(opening, name))
-                            && !Self::is_fly_type(rules, name)
-                    }
-                    && in_box(center, (entity.position.rx(), entity.position.ry()))
+        // The members: every own combat unit standing stationary in the box
+        // (W3 — a unit displaced across the scan window is a walker, not a
+        // member; the stream this box still feeds is nobody the Stop
+        // unpicks), never one the limb itself moved inside
+        // [`CONGESTION_MEMBER_COOLDOWN_TICKS`], and free of the chains
+        // that own their units and of a fresh order's window. A unit still
+        // holding a destination without walking is the wedged case the
+        // Stop exists for.
+        let members: Vec<(u64, (u16, u16), bool, crate::rules::locomotor_type::MovementZone)> =
+            stationary
+                .iter()
+                .filter(|&&(_, cell, owner, _)| owner == self.house && in_box(center, cell))
+                .filter(|&&(id, _, _, _)| {
+                    self.congestion_cooldown
+                        .get(&id)
+                        .is_none_or(|&until| tick >= until)
+                })
+                .filter_map(|&(id, cell, _, _)| {
+                    let entity = sim.substrate.entities.get(id)?;
                     // A member with something to shoot at is fighting, not
                     // jammed: the Stop would drop its target too.
-                    && entity.attack_target.target().is_none()
-                    && self.order_gate.get(id).is_none_or(|&due| tick >= due)
-                    && !self.boarders.contains(id)
-                    && !self.raiders.contains(id)
-                    && !self.raid_involves(*id)
-            })
-            .map(|(id, entity)| {
-                (
-                    id,
-                    (entity.position.rx(), entity.position.ry()),
-                    entity.navigation.nav_com().is_some()
-                        || crate::sim::movement::motion_query::is_moving(entity) == Some(true),
-                    rules
-                        .object(sim.interner.resolve(entity.type_ref()))
-                        .map(|ty| ty.movement_zone)
-                        .unwrap_or_default(),
-                )
-            })
-            .collect();
+                    (entity.attack_target.target().is_none()
+                        && self.order_gate.get(&id).is_none_or(|&due| tick >= due)
+                        && !self.boarders.contains(&id)
+                        && !self.raiders.contains(&id)
+                        && !self.raid_involves(id))
+                    .then(|| {
+                        (
+                            id,
+                            cell,
+                            entity.navigation.nav_com().is_some()
+                                || crate::sim::movement::motion_query::is_moving(entity)
+                                    == Some(true),
+                            rules
+                                .object(sim.interner.resolve(entity.type_ref()))
+                                .map(|ty| ty.movement_zone)
+                                .unwrap_or_default(),
+                        )
+                    })
+                })
+                .collect();
         let mut commands: Vec<Command> = Vec::new();
         for (unit, at, holds_destination, movement_zone) in members {
             // The yielding house's members walk off the stream's line at
@@ -12432,6 +12590,8 @@ impl SuperAi {
                 && let Some(cell) = self.yield_cell(sim, movement_zone, unit, at, home, center)
             {
                 self.gate_idle_order(unit, tick);
+                self.congestion_cooldown
+                    .insert(unit, tick + CONGESTION_MEMBER_COOLDOWN_TICKS);
                 commands.push(Command::Move {
                     entity_id: unit,
                     target_rx: cell.0,
@@ -12443,6 +12603,8 @@ impl SuperAi {
             // parked, its destination cleared and its mission kept.
             if holds_destination {
                 self.gate_idle_order(unit, tick);
+                self.congestion_cooldown
+                    .insert(unit, tick + CONGESTION_MEMBER_COOLDOWN_TICKS);
                 commands.push(Command::Stop { entity_id: unit });
             }
             self.congestion_discharge
@@ -12519,6 +12681,8 @@ impl SuperAi {
             };
             if let Some(command) = command {
                 self.gate_idle_order(unit, tick);
+                self.congestion_cooldown
+                    .insert(unit, tick + CONGESTION_MEMBER_COOLDOWN_TICKS);
                 commands.push(command);
             }
         }
@@ -12782,18 +12946,44 @@ impl SuperAi {
             .min()
     }
 
+    /// Whether `cell` stands inside the home ring (W3): within
+    /// [`HOME_JAM_RADIUS`] of the engine home or of an own standing
+    /// construction yard. The ring a base cannot help being dense in — the
+    /// engine parks every fresh infantryman in AreaGuard there, the rally
+    /// and the guard posts share its offset grid — and the traffic limb's
+    /// cue that only a wedged unit proves a jam inside it.
+    fn in_home_jam_box(&self, sim: &crate::sim::world::Simulation, cell: (u16, u16)) -> bool {
+        let near = |home: (i16, i16)| {
+            cell_distance((home.0.max(0) as u16, home.1.max(0) as u16), cell) <= HOME_JAM_RADIUS
+        };
+        self.engine_home.is_some_and(near)
+            || sim.substrate.entities.iter_sorted().any(|(_, entity)| {
+                entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Structure
+                    && !entity.lifecycle.in_limbo()
+                    && entity.lifecycle.object_alive()
+                    && CONYARD_TYPES.contains(&sim.interner.resolve(entity.type_ref()))
+                    && near((entity.position.rx() as i16, entity.position.ry() as i16))
+            })
+    }
+
     /// Whether the standing congestion jam sits on the walk from `from` to
     /// `to` — within the cluster's radius plus [`AXIS_CLEARANCE`] of the
     /// straight segment. The holds (the wave march, the alarm recall) wait
     /// only for a jam their own walk would cross: an ally-aware scan reads
     /// more jams, and a jam across the map must not hold home's defense.
+    /// A jam within [`HOME_JAM_RADIUS`] of the walk's own start is ignored
+    /// (W3): the segment read measures to its start cell, so a jam sitting
+    /// on the base ring held every march out of home against the base's
+    /// normal standing density.
     fn jam_on_corridor(&self, from: (i16, i16), to: (u16, u16)) -> bool {
         self.congestion_center.is_some_and(|jam| {
-            segment_distance(
-                from,
-                (to.0 as i16, to.1 as i16),
-                (jam.0 as i16, jam.1 as i16),
-            ) <= i32::from(CONGESTION_CLUSTER_RADIUS) + AXIS_CLEARANCE
+            cell_distance(jam, (from.0.max(0) as u16, from.1.max(0) as u16)) > HOME_JAM_RADIUS
+                && segment_distance(
+                    from,
+                    (to.0 as i16, to.1 as i16),
+                    (jam.0 as i16, jam.1 as i16),
+                ) <= i32::from(CONGESTION_CLUSTER_RADIUS) + AXIS_CLEARANCE
         })
     }
 

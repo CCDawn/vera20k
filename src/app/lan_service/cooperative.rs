@@ -366,6 +366,7 @@ mod tests {
                 start_position: LaunchStartPosition::Position(4),
                 team: LaunchTeam::Team(1),
                 difficulty: AiDifficulty::Hard,
+                super_tier: None,
             }],
         };
         let message = options_record(&options).encode("Host").unwrap();

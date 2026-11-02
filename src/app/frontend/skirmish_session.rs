@@ -2282,6 +2282,7 @@ mod tests {
                 start_position: LaunchStartPosition::Auto,
                 team: LaunchTeam::Team(3),
                 difficulty: AiDifficulty::Hard,
+                super_tier: None,
             };
             launch.opponents = vec![
                 ai.clone(),

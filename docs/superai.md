@@ -1176,16 +1176,28 @@ toward home until a cell both connects to home in the ground zone and
 passes the openness floor (`cell_openness`, `OPEN_NEIGHBOR_FLOOR` — at
 least three of the eight neighbors connected and free of structures and
 terrain objects, the choke-avoid test), and the march dispatch spreads the
-members over `SPREAD_OFFSETS` around it the way the hunt and the rescue
-already do. (4) The regroup required every ground member inside the
+members over the inner `SPREAD_OFFSETS` ring (`WAVE_MARCH_SPREAD`, 9 —
+every dispatched cell inside `WAVE_GATHER_ARRIVAL` (5); the full table's
+outer ring sent members 8 cells out, past the arrival read, and the clock
+then disbanded whole episodes for stragglers it had dispatched there
+itself — the build13 infantry hoard). (4) The regroup required every ground member inside the
 arrival ring, so one zone-skipped straggler burned the full 1800-tick
 march clock on most episodes; `WAVE_REGROUP_NUMERATOR`/`DENOMINATOR` (2/3)
-of the ground members arrived turns the march, the clock still the bound.
-The rescue's exemption narrows to match: a marching member is parked only
+of the ground members arrived turns the march, the clock still the bound —
+and the clock never disbands: it always launches the strike with the whole
+wave, blacklisting the gather only when under a third of the ground
+members stand in range (a true stall). The blacklist's re-pick keeps at
+least the jammed gather's distance from home (`valid_gather_cell`'s
+`min_home_span`), so a struck-out gather can no longer pull the next
+regroup into the base ring. The rescue's exemption narrows to match: a marching member is parked only
 while he still holds a live destination (`navigation.nav_com()`,
 `motion_query::is_moving`) or stands inside the arrival ring; an idle
 member far from the gather leaves `wave_marched` so the dispatch loop
-re-sends him instead of standing exempt for the whole clock.
+re-sends him instead of standing exempt for the whole clock. The wave
+also spends the surplus: past the plan's counts, every standing combat
+infantry beyond `GUARD_RESERVE` + `HOME_INFANTRY_QUOTA` (6) joins as
+extras — the AreaGuard garrison the engine parks home had no other
+outlet.
 
 ## The traffic limb: congestion, the engine's regroup, the rescue rework
 
@@ -1211,8 +1223,10 @@ destination (`Command::Stop`); the next pass scatters a fresh jam's parked
 vehicles and walks the infantry and the stopped movers to open discharge
 cells clear of the box (`discharge_cell`, off the traffic axis). The
 centre latches into `congestion_center`: the wave march and the alarm
-recall hold only a walk that crosses it (`jam_on_corridor`), the rescue
-only its enemy leg. The engine's regroup gets its counter (defense in
+recall hold only a walk that crosses it (`jam_on_corridor`, and never a
+jam within `HOME_JAM_RADIUS` (12) of the walk's own start), the rescue
+only its enemy leg, candidate by candidate, and no unit standing inside
+the home ring at all. The engine's regroup gets its counter (defense in
 depth since the engine hook): the newest yard pins as `engine_home`, the
 guard poster biases its home ring to it, and a yard count that rose arms
 `engine_regroup_reposts` for `REGROUP_REPOST_WINDOW_TICKS` — every combat
@@ -1223,15 +1237,23 @@ until none is left.
 The traffic law (build12: four of six houses looped for good on clumps
 their own orders fed; `Stop` never emitted). A jam the next scan finds at
 the same centre moves its attractor instead of re-scattering: a rally
-within 4 cells re-sets 8 away (`rally_avoid`), a marching wave's gather is
-struck out (`gather_blacklist`) and re-picked, and the smaller house of a
-jam shared with an ally steps sideways (`yield_cell`; ties: the higher
-house id yields). Parking cells (guard, hero, dog, rally, repost) need the
+within `CONGESTION_ATTRACTOR_REACH` (the box radius, 5) re-sets 8 away
+(`rally_avoid`), a marching wave's gather within reach is struck out
+(`gather_blacklist`) and re-picked at its old distance from home, and the
+smaller house of a jam shared with an ally steps sideways (`yield_cell`;
+ties: the higher house id yields). Parking cells (guard, hero, dog, rally,
+repost) need the
 openness floor and keep `AXIS_CLEARANCE` (3) off the home→nearest-enemy
 line (`traffic_axis`); a gather needs `GATHER_OPEN_FLOOR` (5), and the
-march clock launches the arrived share if it is half the wave, else
-disbands and strikes the gather out. A rescue's first leg walks to open
-ground nearby, only a second marches at the enemy; units past a marching
+march clock always launches the strike — only a true stall (under a third
+of the ground members arrived) adds the gather to the blacklist. Three
+build13 reads bound what a jam even is: a marching or striking wave's
+members are immune (the gather is no attractor), the home ring
+(`HOME_JAM_RADIUS` around the engine home or a yard) is provable only by
+a wedged unit, and only stationary units are members — a unit the limb
+moved rests `CONGESTION_MEMBER_COOLDOWN_TICKS` (600) out of the picks. A
+wedged unit's first rescue walks to open ground nearby, an idle one and a
+second go straight to the enemy; units past a marching
 wave's gather are not walked home through it; an air target hit three
 sorties without falling rests 6000 ticks; an allied engineer's capture
 target is skipped, a live race ceded by the higher house id.
