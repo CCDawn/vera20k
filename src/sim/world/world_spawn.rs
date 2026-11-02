@@ -2802,7 +2802,13 @@ impl Simulation {
             let gather = rules.general.gather_when_mcv_deploy;
             #[cfg(not(feature = "phobos"))]
             let gather = true;
-            if gather {
+            // Fork-only (`docs/superai.md`): a command-driven house manages
+            // its own forces, so it skips the native regroup as well. That
+            // call overwrites every own ground unit's NavCom (harvesters and
+            // engineers included) and the command layer only observes it a
+            // tick later. The base centre, base-plan recalc and AI latches
+            // written above stay; the layer relies on them.
+            if gather && !house.command_driven() {
                 self.move_ground_forces_to_base(owner_id, rules, registry, frame_effects);
             }
         }
