@@ -21948,6 +21948,42 @@ mod tests {
         );
     }
 
+    /// The recapture premise, read straight from the retail install and
+    /// pinned here as a guard: the objective's type reads `Capturable=no`
+    /// across the statue family, so an engineer's Capture cannot take it
+    /// back from any seat — the recapture module must not exist, and a
+    /// future capture-based fix needs this flag flipped by evidence first.
+    #[test]
+    #[ignore = "slow; retail; loads a match from the retail install"]
+    fn the_retail_objective_type_reads_uncapturable() {
+        let ra2 = std::path::PathBuf::from(
+            std::env::var("RA2_DIR").expect("set RA2_DIR to the retail RA2/YR install directory"),
+        );
+        let mut session = crate::headless_scenario::battle_session(
+            "XMP03T4.MAP",
+            &[(
+                crate::skirmish_launch::LaunchCountry::America,
+                crate::skirmish_launch::AiDifficulty::Normal,
+            )],
+        );
+        session.options.unit_count = 0;
+        let scenario =
+            crate::headless_scenario::load_session(&ra2, "XMP03T4.MAP", 0x00C0_FFEE, session)
+                .unwrap();
+        let rules = &scenario.runtime.resources.rules;
+        for name in ["CANEWY01", "CANEWY02", "CANEWY03", "CANEWY04"] {
+            // The statue family is sparse in the retail rules; the map's own
+            // type is the one that matters, the others only corroborate.
+            let Some(object) = rules.object(name) else {
+                continue;
+            };
+            assert!(
+                !object.capturable,
+                "retail {name} now reads Capturable=yes: revisit the recapture module"
+            );
+        }
+    }
+
     // ---- D2, pillar 2: the rescue special ----
 
     /// Charge one super weapon instance for `house` the test-only setter
