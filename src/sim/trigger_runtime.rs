@@ -137,6 +137,28 @@ pub enum TriggerEffect {
     },
 }
 
+/// One headless trigger-observation record (`--trace-triggers`): a trigger
+/// fire, one action's execution, or an action's outcome with its failure
+/// reason. Pure tooling output — never simulation state, never read back.
+///
+/// The bins stamp the tick at drain time, so the record itself carries none.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TriggerTraceEvent {
+    /// Authored trigger definition id; `None` for an action-only record.
+    pub trigger: Option<String>,
+    /// The event kind that sprang the trigger, when known.
+    pub event: Option<i32>,
+    /// The executed action kind, when the record is about an action.
+    pub action: Option<i32>,
+    /// The action's signed parameter, when it had one.
+    pub value: Option<i32>,
+    /// The action's outcome; `None` while the record only reports execution.
+    pub ok: Option<bool>,
+    /// Failure reason (e.g. an unresolved `<Player @ ..>` lobby slot) or an
+    /// effect summary (EVA line, authored text).
+    pub detail: Option<String>,
+}
+
 /// Original definition pointers translated to retained registry ordinals.
 /// Resolve once while Read6DD5B0 executes; later constructors cannot change the
 /// meaning of a short index or make a missing reference spring a new instance.
@@ -711,6 +733,17 @@ pub struct TriggerRuntime {
     #[cfg(any(test, feature = "test-support"))]
     #[serde(skip)]
     stop_before_action: Option<i32>,
+    /// Headless observation (`--trace-triggers`), independent of the test
+    /// traces above: appended when enabled, drained by the tooling bins.
+    /// Skipped by serialization and outside the hand-written equality, like
+    /// every scratch field here.
+    #[serde(skip)]
+    trigger_trace_enabled: bool,
+    #[serde(skip)]
+    trigger_trace: Vec<TriggerTraceEvent>,
+    /// One synchronous failure reason the next outcome record attaches.
+    #[serde(skip)]
+    trigger_trace_failure: Option<String>,
 }
 
 /// Draw-free transfer of the outgoing Scenario's local values into a fresh
@@ -2391,6 +2424,72 @@ impl Simulation {
         self.publish_trigger_effects(effects);
     }
 
+    /// Turn on the headless trigger observation. Pure tooling: no recorded
+    /// byte reaches simulation state, so enabling it cannot perturb a run.
+    pub fn enable_trigger_trace(&mut self) {
+        self.trigger_runtime.trigger_trace_enabled = true;
+    }
+
+    /// Drain every observation recorded since the last drain.
+    pub fn take_trigger_trace(&mut self) -> Vec<TriggerTraceEvent> {
+        std::mem::take(&mut self.trigger_runtime.trigger_trace)
+    }
+
+    /// Attach a synchronous failure reason to the action record the current
+    /// dispatch is about to finish. Enabled traces only.
+    pub(crate) fn note_trigger_failure(&mut self, detail: String) {
+        if self.trigger_runtime.trigger_trace_enabled {
+            self.trigger_runtime.trigger_trace_failure = Some(detail);
+        }
+    }
+
+    fn record_trigger_trace_start(
+        &mut self,
+        trigger: Option<String>,
+        event: Option<i32>,
+        action: i32,
+        value: Option<i32>,
+    ) {
+        if self.trigger_runtime.trigger_trace_enabled {
+            self.trigger_runtime.trigger_trace.push(TriggerTraceEvent {
+                trigger,
+                event,
+                action: Some(action),
+                value,
+                ok: None,
+                detail: None,
+            });
+        }
+    }
+
+    /// Finish the most recent action record with its outcome and, when the
+    /// action noted one, its failure reason.
+    fn finish_trigger_trace_outcome(&mut self, ok: bool) {
+        if !self.trigger_runtime.trigger_trace_enabled {
+            return;
+        }
+        let detail = self.trigger_runtime.trigger_trace_failure.take();
+        if let Some(last) = self.trigger_runtime.trigger_trace.last_mut() {
+            last.ok = Some(ok);
+            last.detail = detail;
+        }
+    }
+
+    /// Record a trigger-side effect the bins should surface (EVA line,
+    /// authored text) even though it also travels its own frame channel.
+    fn record_trigger_trace_effect(&mut self, action: i32, detail: String) {
+        if self.trigger_runtime.trigger_trace_enabled {
+            self.trigger_runtime.trigger_trace.push(TriggerTraceEvent {
+                trigger: None,
+                event: None,
+                action: Some(action),
+                value: None,
+                ok: None,
+                detail: Some(detail),
+            });
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn tag_dispatch_trace_for_test(&self) -> &[(usize, i32)] {
         &self.trigger_runtime.dispatch_trace
@@ -2701,6 +2800,19 @@ impl Simulation {
         let count = self.trigger_runtime.definitions.trigger_types[type_index]
             .actions
             .len();
+        if self.trigger_runtime.trigger_trace_enabled {
+            let id = self.trigger_runtime.definitions.trigger_types[type_index]
+                .id
+                .clone();
+            self.trigger_runtime.trigger_trace.push(TriggerTraceEvent {
+                trigger: Some(id),
+                event: Some(input.kind),
+                action: None,
+                value: None,
+                ok: None,
+                detail: None,
+            });
+        }
         if self.trigger_runtime.spring_depth == 0 {
             self.trigger_runtime.spring_actions_left = MAX_TRIGGER_SPRING_ACTIONS;
         }
@@ -3260,6 +3372,32 @@ impl Simulation {
         self.trigger_runtime
             .action_trace
             .push((action.entry.kind, action.value.unwrap_or(0)));
+        if self.trigger_runtime.trigger_trace_enabled {
+            // The record names the definition the action addresses — a Team
+            // action names the TeamType (what a spawn refusal is about), any
+            // other reference names the authored Trigger.
+            let id = match action.reference {
+                Some(DefinitionReference::Team(index)) => self
+                    .trigger_runtime
+                    .definitions
+                    .team_types
+                    .get(index)
+                    .cloned(),
+                Some(DefinitionReference::Trigger(source)) => self
+                    .trigger_runtime
+                    .definitions
+                    .trigger_types
+                    .get(source)
+                    .map(|typ| typ.id.clone()),
+                _ => None,
+            };
+            self.record_trigger_trace_start(
+                id,
+                Some(context.input.kind),
+                action.entry.kind,
+                action.value,
+            );
+        }
         // Force22 must stay outside Execute's large nonrecursive action frame.
         // Even a finite authored chain otherwise multiplies that frame until a
         // client with a smaller thread stack aborts before the depth guard.
@@ -4111,6 +4249,7 @@ impl Simulation {
                 if let Some(cell) = recent_event {
                     effects.push(TriggerEffect::RecentEventCell { cell });
                 }
+                self.finish_trigger_trace_outcome(result);
                 return result;
             }
             11 => {
@@ -4118,6 +4257,7 @@ impl Simulation {
                 // and MessageList5D3BA0 remain ordered presentation consumers.
                 let label = action.csf_label();
                 if !label.is_empty() {
+                    self.record_trigger_trace_effect(11, format!("text {label}"));
                     effects.push(TriggerEffect::LocalizedMessage {
                         csf_label: label.to_string(),
                     });
@@ -4147,13 +4287,20 @@ impl Simulation {
                 let Some(cell) = self.session.waypoint_cell(waypoint as i32) else {
                     return false;
                 };
-                return crate::sim::crates::place_crate(
+                let placed = crate::sim::crates::place_crate(
                     self,
                     rules,
                     registry,
                     cell,
                     (value != 20).then_some(value as u8),
                 );
+                if !placed {
+                    self.note_trigger_failure(format!(
+                        "crate placement refused at waypoint cell {cell:?}"
+                    ));
+                }
+                self.finish_trigger_trace_outcome(placed);
+                return placed;
             }
             101 => {
                 let Some(waypoint) = value else {
@@ -4318,6 +4465,7 @@ impl Simulation {
                 let Some(index) = value else {
                     return false;
                 };
+                self.record_trigger_trace_effect(21, format!("EVA line {index}"));
                 self.sound_events.emit(SimSoundEvent::TriggerEva { index });
                 frame_effects.flush_sound(self, rules);
             }
@@ -5180,6 +5328,10 @@ fn count_techtype(sim: &Simulation, object: &crate::rules::object_type::ObjectTy
 #[cfg(test)]
 #[path = "trigger_runtime_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "trigger_trace_tests.rs"]
+mod trigger_trace_tests;
 
 #[cfg(test)]
 #[path = "trigger_runtime_factory_owner_tests.rs"]
