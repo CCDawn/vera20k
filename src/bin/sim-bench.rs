@@ -101,6 +101,12 @@ struct Args {
     units: usize,
     houses: Option<usize>,
     computers: Option<usize>,
+    /// `--defense`: the launch's local house plays under the defense
+    /// persona (`DefenseStance::IndependentZone`) instead of sitting out.
+    defense: bool,
+    /// `--defense-start`: pins the defended house to a start waypoint index,
+    /// keeping it off the map's wave-owner slot deterministically.
+    defense_start: Option<u8>,
     ticks: Option<NonZeroU64>,
     types: Vec<String>,
     order_spread: u64,
@@ -129,6 +135,8 @@ fn parse_args() -> Result<Args, String> {
         units: 20_000,
         houses: None,
         computers: None,
+        defense: false,
+        defense_start: None,
         ticks: None,
         types: ["E1", "E2", "MTNK", "HTNK"].map(String::from).to_vec(),
         order_spread: 30,
@@ -177,6 +185,13 @@ fn parse_args() -> Result<Args, String> {
             "--units" => args.units = number(value()?)? as usize,
             "--houses" => args.houses = Some(number(value()?)? as usize),
             "--computers" => args.computers = Some(number(value()?)? as usize),
+            "--defense" => args.defense = true,
+            "--defense-start" => {
+                args.defense_start =
+                    Some(u8::try_from(number(value()?)?).map_err(|_| {
+                        "--defense-start must be a start waypoint index".to_string()
+                    })?)
+            }
             "--ticks" => {
                 args.ticks = Some(
                     NonZeroU64::new(number(value()?)?).ok_or("--ticks needs a positive number")?,
@@ -237,6 +252,15 @@ fn parse_args() -> Result<Args, String> {
     let played = args.scenario != ScenarioKind::March;
     if !played && args.computers.is_some() {
         return Err("--computers is a match option".to_string());
+    }
+    if !played && args.defense {
+        return Err("--defense is a match option".to_string());
+    }
+    if args.scenario == ScenarioKind::Super && args.defense {
+        return Err("--defense is a match option; super runs take --super-tier".to_string());
+    }
+    if args.defense_start.is_some() && !args.defense {
+        return Err("--defense-start needs --defense".to_string());
     }
     if played && let Some(flag) = march_flag {
         return Err(format!("{flag} is a march option"));
@@ -487,6 +511,9 @@ impl Frames for Bench<'_> {
                 mean.as_secs_f64() * 1000.0,
                 script.progress(self.runtime)
             );
+            if let Some(line) = script.defense_progress(self.runtime) {
+                println!("progress tick={} mean_ms=- {line}", tick + 1);
+            }
         }
     }
 }
@@ -609,7 +636,7 @@ fn main() -> Result<(), String> {
             eprintln!(
                 "usage: sim-bench [--ra2-dir <retail path>] [--map Death.mmx] \
                  [--scenario march|match|super] [--seed S] [--units 20000] [--houses N] \
-                 [--computers 7 (match)] [--ticks 300 (match: 1800)] \
+                 [--computers 7 (match)] [--defense (match)] [--ticks 300 (match: 1800)] \
                  [--types E1,E2,MTNK,HTNK] [--order-spread 30] [--return-at T] (march) \
                  [--hash-every N] [--frame-hash-every 15] [--csv <path>] [--serial-paths] [--serial-scans] \
                  [--games 1] [--max-ticks 30000] [--super-country America] \
@@ -643,7 +670,7 @@ fn main() -> Result<(), String> {
                 &args.ra2_dir,
                 &args.map,
                 args.seed,
-                sim_bench_match::session(&args.map, computers),
+                sim_bench_match::session(&args.map, computers, args.defense_start),
             )?
         }
         // The super scenario dispatches to its own run before any load.
@@ -651,6 +678,11 @@ fn main() -> Result<(), String> {
     };
     if !args.serial_paths {
         scenario.runtime.simulation.batch_path_searches();
+    }
+    // A defense run traces its triggers: the map's waves must be visible in
+    // the same run that answers them.
+    if args.defense {
+        scenario.runtime.simulation.enable_trigger_trace();
     }
     scenario
         .runtime
@@ -665,7 +697,8 @@ fn main() -> Result<(), String> {
             (houses, spawned, Plan::March(orders), ticks)
         }
         ScenarioKind::Match => {
-            let script = MatchScenario::setup(&mut scenario, args.houses, args.units)?;
+            let script =
+                MatchScenario::setup(&mut scenario, args.houses, args.units, args.defense)?;
             let ticks = args.ticks.map_or(sim_bench_match::TICKS, NonZeroU64::get);
             (script.houses(), script.spawned, Plan::Match(script), ticks)
         }
@@ -696,6 +729,9 @@ fn main() -> Result<(), String> {
     );
     if let Plan::Match(script) = &plan {
         println!("progress tick=0 {}", script.progress(runtime));
+        if let Some(line) = script.defense_progress(runtime) {
+            println!("progress tick=0 {line}");
+        }
     }
 
     #[cfg(feature = "telemetry")]
@@ -710,6 +746,33 @@ fn main() -> Result<(), String> {
         args.hash_every,
     );
     let live_at_end = runtime.simulation.entities().len();
+    if args.defense {
+        let trace = runtime.simulation.take_trigger_trace();
+        let mut spawned_teams = 0usize;
+        let mut refused = 0usize;
+        for event in &trace {
+            let Some(action) = event.action else {
+                continue;
+            };
+            // Team spawn actions 4/7/80/107: the wave spawns a defense run
+            // lives or dies on.
+            if matches!(action, 4 | 7 | 80 | 107) {
+                let ok = event.ok.unwrap_or(false);
+                spawned_teams += usize::from(ok);
+                refused += usize::from(!ok);
+                println!(
+                    "wave_action team={:?} ok={ok} detail={:?}",
+                    event.trigger, event.detail
+                );
+            } else if let Some(failure) = &event.detail {
+                println!("trigger_note action={action} {failure}");
+            }
+        }
+        println!(
+            "wave_actions spawned={spawned_teams} refused={refused} records={}",
+            trace.len()
+        );
+    }
     let csv_written = args.csv.as_ref().map_or(Ok(()), |path| {
         std::fs::write(path, csv(&measured)).map_err(|error| format!("{}: {error}", path.display()))
     });
