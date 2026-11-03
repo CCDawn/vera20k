@@ -606,14 +606,18 @@ pub struct HouseState {
     /// byte, so it stays out of the retail-state concerns entirely.
     #[serde(default)]
     command_driven: bool,
-    /// Fork-only tier mark (`docs/superai.md`): which Super-AI treatment a
-    /// command-driven house launched with, so the driver rebuild (fresh
-    /// launch and saved-game restore alike) recovers the exact tier instead
-    /// of guessing from the build-time scale. `None` for every native house
-    /// and pre-mark saves, which fall back to the scale heuristic. Like the
-    /// flag above it stays out of every native-state concern.
+    /// Fork-only driver policy (`docs/superai.md`): the treatment a
+    /// command-driven house launched with, stored as a
+    /// [`DriverPolicy`](crate::sim::driver::DriverPolicy) so a driver can
+    /// carry combinations beyond the four tiers; the driver rebuild (fresh
+    /// launch and saved-game restore alike) reads it back through the tier
+    /// inference instead of guessing from the build-time scale. `None` for
+    /// every native house and pre-mark saves, which fall back to the scale
+    /// heuristic. Saves written before the policy stored the bare tier and
+    /// deserialize into the equivalent policy. Like the flag above it stays
+    /// out of every native-state concern.
     #[serde(default)]
-    super_tier: Option<crate::super_ai::SuperAiDifficulty>,
+    super_tier: Option<crate::sim::driver::DriverPolicy>,
     /// The HouseType's `Cost*Mult=`, projected from the rules at creation.
     /// Like the flag above it is the type's, so it is left out of the state
     /// hash.
@@ -1082,12 +1086,12 @@ impl HouseState {
 
     /// Fork-only: hand this house's decisions to the external command-layer
     /// driver (`docs/superai.md`); the native AI rungs stand down for it and
-    /// the launch's tier treatment supplies its opening credits. The tier
-    /// mark rides along so the driver rebuild recovers it later. Not a
-    /// gamemd port.
-    pub fn make_command_driven(&mut self, tier: crate::super_ai::SuperAiDifficulty) {
+    /// the launch's tier treatment supplies its opening credits. The policy
+    /// rides along so the driver rebuild recovers it later. Accepts a tier
+    /// (the four mapped policies) or a policy directly. Not a gamemd port.
+    pub fn make_command_driven(&mut self, treatment: impl Into<crate::sim::driver::DriverPolicy>) {
         self.command_driven = true;
-        self.super_tier = Some(tier);
+        self.super_tier = Some(treatment.into());
     }
 
     /// Player control (`+0x1ED`): Create_Houses (`688109..10F`) grants it to
@@ -1463,11 +1467,26 @@ impl HouseState {
         self.command_driven
     }
 
-    /// The fork-only Super-AI tier this command-driven house launched with
-    /// (fork-only, `docs/superai.md`); `None` for native houses and saves
-    /// written before the mark existed.
+    /// The fork-only Super-AI tier this command-driven house's policy reads
+    /// back as (fork-only, `docs/superai.md`); `None` for native houses and
+    /// saves written before the mark existed. The strongest policy knob
+    /// decides (`DriverPolicy::infer_tier`), so a tier-launched house
+    /// reports exactly its launch tier.
     pub const fn super_tier(&self) -> Option<crate::super_ai::SuperAiDifficulty> {
-        self.super_tier
+        match self.super_tier {
+            Some(policy) => Some(policy.infer_tier()),
+            None => None,
+        }
+    }
+
+    /// The stored driver policy itself (fork-only, `docs/superai.md`); the
+    /// per-tick credit loop applies it. `None` for native houses and saves
+    /// written before the policy existed.
+    pub const fn super_tier_policy(&self) -> Option<&crate::sim::driver::DriverPolicy> {
+        match &self.super_tier {
+            Some(policy) => Some(policy),
+            None => None,
+        }
     }
 
     pub const fn country_cost_mults(&self) -> CountryCostMults {

@@ -131,17 +131,18 @@ impl HeadlessScenario {
             .expect("the house constructor interns its name")
     }
 
-    /// Apply the Super-AI tier's opening treatment to `house`
-    /// (`docs/superai.md`): Brutal and Super take the native Hard AI's
-    /// opening grant through the same kernel the launch grants computer
-    /// houses with (`apply_skirmish_ai_opening_credits`'s
-    /// `native_ai_opening_grant`; retail `[General] MultiplayerAICM=400,0,0`
-    /// gives the Hard row 400% of the opening balance), and Super
-    /// additionally halves this house's production build times — the fork's
-    /// one documented simulation-side exception
-    /// (`HouseState::set_native_build_time_scale`). Fair takes nothing: the
-    /// tier exists so strength claims can cite exactly what a pure decision
-    /// layer achieves.
+    /// Apply a driver treatment's opening kernel to `house`
+    /// (`docs/superai.md`), from a tier or a policy directly: a set
+    /// `native_hard_grant` takes the native Hard AI's opening grant through
+    /// the same kernel the launch grants computer houses with
+    /// (`apply_skirmish_ai_opening_credits`'s `native_ai_opening_grant`;
+    /// retail `[General] MultiplayerAICM=400,0,0` gives the Hard row 400%
+    /// of the opening balance), and a set `build_time_scale` scales this
+    /// house's production build times — the fork's one documented
+    /// simulation-side exception
+    /// (`HouseState::set_native_build_time_scale`). The all-off policy
+    /// takes nothing: the Fair tier exists so strength claims can cite
+    /// exactly what a pure decision layer achieves.
     ///
     /// The kernel itself lives in one owner,
     /// [`crate::sim::scenario_bootstrap::apply_super_ai_tier_to_house`]; the
@@ -149,25 +150,26 @@ impl HeadlessScenario {
     pub fn apply_super_ai_tier(
         &mut self,
         house: InternedId,
-        tier: crate::super_ai::SuperAiDifficulty,
+        treatment: impl Into<crate::sim::driver::DriverPolicy>,
     ) {
+        let policy = treatment.into();
         let state = self
             .runtime
             .simulation
             .houses
             .get_mut(&house)
-            .expect("the tier applies to a house the launch created");
+            .expect("the treatment applies to a house the launch created");
         // The launch path marks the house command-driven (the native AI
         // stands down; the fork's completion publication serves it) before
-        // the tier math. A hand-built battle session reaches the same
-        // state through here, so the flag rides along even for Fair,
-        // whose tier math alone would take nothing and leave the house
+        // the kernel math. A hand-built battle session reaches the same
+        // state through here, so the flag rides along even for the all-off
+        // policy, whose kernel alone would take nothing and leave the house
         // unmarked.
-        state.make_command_driven(tier);
+        state.make_command_driven(policy);
         crate::sim::scenario_bootstrap::apply_super_ai_tier_to_house(
             state,
             &self.runtime.resources.rules,
-            tier,
+            &policy,
         );
     }
 }
