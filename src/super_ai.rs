@@ -9598,10 +9598,32 @@ impl SuperAi {
     /// holds until the hunter falls or comes back to idle past its order
     /// gate, when the staffing pass re-tasks it. The pair rides the plain
     /// `Attack` click; the assault-wave machinery stays out of it.
+    /// Whether the unit's primary warhead spreads over no cells: the
+    /// hunt's direct-fire requirement — splash rounds fired beside a
+    /// neutral charge land on the charge itself.
+    fn is_direct_fire_hull(
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        unit: u64,
+    ) -> bool {
+        sim.substrate()
+            .entities
+            .get(unit)
+            .and_then(|entity| {
+                rules
+                    .object(sim.interner().resolve(entity.type_ref()))
+                    .and_then(|object| object.primary())
+                    .and_then(|weapon| rules.weapon(weapon))
+                    .and_then(|weapon| weapon.warhead.as_deref())
+                    .and_then(|warhead| rules.warhead(warhead))
+            })
+            .is_some_and(|warhead| warhead.cell_spread_f64 == 0.0)
+    }
+
     fn defense_leak_orders(
         &mut self,
         sim: &crate::sim::world::Simulation,
-        _rules: &crate::rules::ruleset::RuleSet,
+        rules: &crate::rules::ruleset::RuleSet,
         opening: &Opening,
         home_center: Option<(i16, i16)>,
         tick: u32,
@@ -9653,8 +9675,12 @@ impl SuperAi {
             .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))
             .next()
             .or(home_center)?;
-        // The nearest hostile mobile past the line.
-        let mut leak: Option<(i32, u64)> = None;
+        // The nearest hostile mobile past the line, carriers first: a wave
+        // rides its heroes in a transport and the transport fires out beside
+        // the charge (Defend Liberty's battle fortresses deliver Tanya onto
+        // the statue and hold the burst window). Within the same class the
+        // nearest hostile wins.
+        let mut leak: Option<((i32, i32), u64)> = None;
         for (id, entity) in sim.substrate().entities.iter_sorted() {
             if entity.lifecycle.in_limbo()
                 || !matches!(
@@ -9673,8 +9699,12 @@ impl SuperAi {
             if distance > DEFENSE_LEAK_RADIUS {
                 continue;
             }
-            if leak.is_none_or(|(kept, kept_id)| (distance, id) < (kept, kept_id)) {
-                leak = Some((distance, id));
+            let carrier = rules
+                .object(sim.interner().resolve(entity.type_ref()))
+                .is_some_and(|object| object.passengers > 0);
+            let rank = (i32::from(!carrier), distance);
+            if leak.is_none_or(|(kept_rank, kept_id)| (rank, id) < (kept_rank, kept_id)) {
+                leak = Some((rank, id));
             }
         }
         let (_, leak_id) = leak?;
@@ -9684,13 +9714,17 @@ impl SuperAi {
             .get(leak_id)
             .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))?;
         // The hunter: the nearest due line unit first, then the nearest
-        // idle combat unit off duty.
+        // idle combat unit off duty — direct-fire hulls only. A splash
+        // round fired beside the charge lands on the charge itself (a
+        // neutral statue stands in the firing line), so the hunt rides
+        // weapons whose warhead spreads over no cells.
         let hunter = {
             let persona = self.defense.as_ref().expect("checked above");
             let posted = persona
                 .line_posts
                 .iter()
                 .filter(|&&(unit, _)| self.order_gate.get(&unit).is_none_or(|&due| tick >= due))
+                .filter(|&&(unit, _)| Self::is_direct_fire_hull(sim, rules, unit))
                 .filter_map(|&(unit, _)| {
                     sim.substrate().entities.get(unit).map(|entity| {
                         let dx = i32::from(entity.position.rx() as i16) - i32::from(leak_cell.0);
@@ -9714,6 +9748,7 @@ impl SuperAi {
                             )
                             && !Self::garrisoned(entity)
                             && roster.contains(&sim.interner().resolve(entity.type_ref()))
+                            && Self::is_direct_fire_hull(sim, rules, *id)
                             && !self.defense_duty(*id)
                             && self.order_gate.get(id).is_none_or(|&due| tick >= due)
                             && matches!(
@@ -9733,6 +9768,7 @@ impl SuperAi {
                     .map(|(_, unit)| unit)
             })
         };
+
         let hunter = hunter?;
         self.defense
             .as_mut()
@@ -21658,9 +21694,15 @@ mod tests {
              [GACNST]\nStrength=1000\nFoundation=1x1\nCost=2000\nTechLevel=1\n\
              [GADEPT]\nStrength=1000\nFoundation=1x1\nUnitRepair=yes\nCost=800\nTechLevel=1\n\
              [MTNK]\nStrength=100\nSpeed=6\nSpeedType=Track\nMovementZone=Normal\nCost=700\n\
-             TechLevel=1\nLocomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n\
+             TechLevel=1\nPrimary=105mm\n\
+             Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n\
              [FV]\nStrength=120\nSpeed=10\nSpeedType=Wheel\nMovementZone=Normal\nCost=600\n\
-             TechLevel=1\nLocomotor={4A582742-9839-11d1-B709-00A024DDAFD1}\n\
+             TechLevel=1\nPrimary=Bazooka\n\
+             Locomotor={4A582742-9839-11d1-B709-00A024DDAFD1}\n\
+             [105mm]\nDamage=65\nROF=50\nRange=6\nWarhead=WH_TANK\n\
+             [Bazooka]\nDamage=40\nROF=40\nRange=6\nWarhead=WH_DIRECT\n\
+             [WH_TANK]\nCellSpread=0\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n\
+             [WH_DIRECT]\nCellSpread=0\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n\
              [CIVHOLD]\nStrength=400\nFoundation=1x1\nCanBeOccupied=yes\n\
              MaxNumberOccupants=5\nTechLevel=1\n\
              [InfantryTypes]\n2=E1\n\
@@ -21982,6 +22024,130 @@ mod tests {
                 "retail {name} now reads Capturable=yes: revisit the recapture module"
             );
         }
+    }
+
+    /// The hunt rides direct-fire hulls only: with a splash shooter nearer
+    /// the intruder and a direct shooter farther, the hunter is the direct
+    /// shooter — its rounds cannot land on the neutral charge standing in
+    /// the firing line, and the splash shooter stays out of the chase.
+    #[test]
+    fn the_leak_hunt_rides_direct_fire_hulls_only() {
+        let extra = "[BuildingTypes]\n1=GACNST\n\
+             [GACNST]\nStrength=1000\nFoundation=1x1\nCost=2000\nTechLevel=1\n\
+             [MTNK]\nStrength=100\nSpeed=6\nSpeedType=Track\nMovementZone=Normal\nCost=700\n\
+             TechLevel=1\nPrimary=105mm\n\
+             Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n\
+             [FV]\nStrength=120\nSpeed=10\nSpeedType=Wheel\nMovementZone=Normal\nCost=600\n\
+             TechLevel=1\nPrimary=WHEE\n\
+             Locomotor={4A582742-9839-11d1-B709-00A024DDAFD1}\n\
+             [105mm]\nDamage=65\nROF=50\nRange=6\nWarhead=WH_DIRECT\n\
+             [WHEE]\nDamage=30\nROF=50\nRange=6\nWarhead=WH_SPLAT\n\
+             [WH_DIRECT]\nCellSpread=0\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n\
+             [WH_SPLAT]\nCellSpread=2\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n";
+        let (mut sim, rules, ai_house, enemy_house) = defense_world_with(extra, "1=MTNK\n2=FV\n");
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        let core = sim
+            .spawn_object_at_height("CABHUT", &ai_owner, 15, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        sim.attach_object_trigger_tag(core, Some("LOSE_TAG"));
+        let splat = sim
+            .spawn_object_at_height("FV", &ai_owner, 17, 14, 0, 0, &rules)
+            .expect("the fixture cell admits the splash hull");
+        let direct = sim
+            .spawn_object_at_height("MTNK", &ai_owner, 14, 18, 0, 0, &rules)
+            .expect("the fixture cell admits the direct hull");
+        let intruder = sim
+            .spawn_object_at_height("TAGUNIT", &enemy_owner, 16, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the vehicle");
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
+
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        let commands = ai.orders(&runtime, 0);
+
+        let attack = commands.iter().find_map(|envelope| match envelope.payload {
+            super::Command::Attack {
+                attacker_id,
+                target_id,
+            } => Some((attacker_id, target_id)),
+            _ => None,
+        });
+        assert_eq!(
+            attack,
+            Some((direct, intruder)),
+            "the hunt rides the direct hull even with a splash hull nearer"
+        );
+        let persona = ai.defense.as_ref().expect("the persona stays adopted");
+        assert_eq!(
+            persona.leak_interceptors,
+            vec![direct],
+            "the splash hull stays out of the chase book"
+        );
+        let _ = splat;
+    }
+
+    /// A hero carrier draws the hunt first: a transport whose type seats
+    /// passengers stands farther out than a plain intruder, and the hunter
+    /// still takes the carrier — the wave's heroes ride it and it fires
+    /// out beside the charge.
+    #[test]
+    fn the_leak_hunt_prefers_a_hero_carrier() {
+        let extra = "[BuildingTypes]\n1=GACNST\n\
+             [GACNST]\nStrength=1000\nFoundation=1x1\nCost=2000\nTechLevel=1\n\
+             [MTNK]\nStrength=100\nSpeed=6\nSpeedType=Track\nMovementZone=Normal\nCost=700\n\
+             TechLevel=1\nPrimary=105mm\n\
+             Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n\
+             [FV]\nStrength=200\nSpeed=6\nSpeedType=Track\nMovementZone=Normal\nCost=600\n\
+             TechLevel=1\nPassengers=5\n\
+             Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n\
+             [105mm]\nDamage=65\nROF=50\nRange=6\nWarhead=WH_DIRECT\n\
+             [WH_DIRECT]\nCellSpread=0\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n";
+        let (mut sim, rules, ai_house, enemy_house) = defense_world_with(extra, "1=MTNK\n2=FV\n");
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        let core = sim
+            .spawn_object_at_height("CABHUT", &ai_owner, 15, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        sim.attach_object_trigger_tag(core, Some("LOSE_TAG"));
+        let direct = sim
+            .spawn_object_at_height("MTNK", &ai_owner, 14, 14, 0, 0, &rules)
+            .expect("the fixture cell admits the direct hull");
+        let carrier = sim
+            .spawn_object_at_height("FV", &enemy_owner, 18, 18, 0, 0, &rules)
+            .expect("the fixture cell admits the carrier");
+        let plain = sim
+            .spawn_object_at_height("TAGUNIT", &enemy_owner, 16, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the vehicle");
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
+
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        let commands = ai.orders(&runtime, 0);
+
+        let attack = commands.iter().find_map(|envelope| match envelope.payload {
+            super::Command::Attack {
+                attacker_id,
+                target_id,
+            } => Some((attacker_id, target_id)),
+            _ => None,
+        });
+        assert_eq!(
+            attack,
+            Some((direct, carrier)),
+            "the carrier outranks the nearer plain intruder"
+        );
+        assert_ne!(
+            attack.map(|(_, target)| target),
+            Some(plain),
+            "the plain intruder waits its turn behind the carrier"
+        );
     }
 
     // ---- D2, pillar 2: the rescue special ----
