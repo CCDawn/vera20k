@@ -626,9 +626,18 @@ fn main() -> Result<(), String> {
     let mut scenario = match args.scenario {
         ScenarioKind::March => headless_scenario::load(&args.ra2_dir, &args.map, args.seed)?,
         ScenarioKind::Match => {
+            // A map without `--computers` fits its lobby: the launch needs one
+            // start for the sitting-out local house and one per computer, so
+            // small defense maps (two start waypoints are common) start with
+            // as many computers as fit. An explicit `--computers` stands.
             let computers = args
                 .computers
-                .unwrap_or(sim_bench_match::COMPUTERS)
+                .unwrap_or_else(|| {
+                    let starts =
+                        headless_scenario::map_multiplayer_start_count(&args.ra2_dir, &args.map)
+                            .unwrap_or(sim_bench_match::COMPUTERS + 1);
+                    (starts.saturating_sub(1)).clamp(1, sim_bench_match::COMPUTERS)
+                })
                 .min(args.houses.unwrap_or(usize::MAX));
             headless_scenario::load_session(
                 &args.ra2_dir,

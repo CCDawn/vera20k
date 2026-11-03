@@ -533,13 +533,18 @@ impl MatchScenario {
             .filter(|start| !taken.contains(start))
             .collect();
         let playing = houses.unwrap_or(computers.len() + free.len());
-        if playing < computers.len().max(2) || playing - computers.len() > free.len() {
+        // A match wants two playing houses, but a small defense map cannot
+        // host them: with the local house sitting out, the starts that remain
+        // cap the playing count. The floor is then everything the map fits.
+        let floor = computers.len().max((computers.len() + free.len()).min(2));
+        if playing < floor || playing - computers.len() > free.len() {
             return Err(format!(
                 "{playing} houses on {} start waypoints: the launch took {} for itself and {} \
-                 computer houses, and a match needs two houses",
+                 computer houses, and a match needs {}",
                 starts.len(),
                 taken.len(),
-                computers.len()
+                computers.len(),
+                floor.max(2)
             ));
         }
         let humans = playing - computers.len();
@@ -598,7 +603,8 @@ impl MatchScenario {
             );
             let mut fronts: Vec<usize> = (0..homes.len()).filter(|&other| other != index).collect();
             fronts.sort_by_key(|&other| (squared_distance(homes[other], home), other));
-            let toward = homes[fronts[0]];
+            // A solo playing house has no front; it stages where it stands.
+            let toward = homes[fronts.first().copied().unwrap_or(index)];
             let raw = (
                 i32::from(home.0) + (i32::from(toward.0) - i32::from(home.0)) / STAGING_DIVISOR,
                 i32::from(home.1) + (i32::from(toward.1) - i32::from(home.1)) / STAGING_DIVISOR,
