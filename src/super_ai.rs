@@ -1321,6 +1321,124 @@ pub enum SuperAiDifficulty {
 /// priciest retail buildable so every queue the house owns rolls at once.
 pub const UNLIMITED_WALLET_FLOOR: i32 = 1_000_000;
 
+/// The second personality's stance (`docs/defense-ai.md`). Mode A is the
+/// shipped phase; mode B is lobby-selectable in a later pillar and carries
+/// no behavior yet.
+///
+/// Serialized as the plain unit-variant enum: bincode's non-self-describing
+/// codec writes and reads a variant index directly, so — unlike
+/// [`DriverPolicy`], whose text payloads had to admit a legacy tier shape —
+/// no `is_human_readable` branch exists yet. A future field-bearing payload
+/// adopts the policy struct's pattern (`#[serde(default)]` fields, a
+/// hand-written `Deserialize`) the moment it first rides a snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum DefenseStance {
+    /// Mode A — independent zone: hold the lane and chokepoint nearest the
+    /// base's own spawn bearing, never cross-cover.
+    #[default]
+    IndependentZone,
+    /// Mode B — full-map cooperative defense (D3, reserved): watch the
+    /// whole map, dispatch to leaks, core hits and broken friendly lines.
+    Cooperative,
+}
+
+/// The hostile presence the defense persona's field scan last read, by
+/// category: the observed wave composition the army pillar's mix reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WaveComposition {
+    pub infantry: usize,
+    pub vehicles: usize,
+    pub aircraft: usize,
+    pub buildings: usize,
+}
+
+/// One wave source's bearing read (mode A skeleton): the resolved spawn
+/// cell and its map-space octant plus Chebyshev distance from the base
+/// center — the threat axis the fortification and army pillars face. The
+/// octant runs 0..7 clockwise from map +x, so the isometric screen axes
+/// rotate it 45 degrees; consumers compare octants against each other,
+/// never against screen compass points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnBearing {
+    /// The spawn cell the trigger's action waypoint (80/107) or the
+    /// TeamType's `Waypoint=` (4/7) resolves to; `None` when neither names
+    /// a waypoint the map's table holds.
+    pub spawn_cell: Option<(i16, i16)>,
+    /// From the base center to the spawn cell, clockwise from map +x.
+    /// `None` while no base center stands (a baseless opening tick).
+    pub octant: Option<u8>,
+    pub distance_cells: Option<u32>,
+}
+
+/// The defense personality's pinned perception, mode A skeleton
+/// (`docs/defense-ai.md` D1). Filled every tick from the trigger runtime's
+/// observer views and the entity census; the four behavior pillars
+/// (fortifications, garrison, defense army, superweapons) are D2 and read
+/// it from there — until one lands, an enabled persona still emits exactly
+/// the battle commands, and its writes never feed a command decision.
+struct DefensePersona {
+    stance: DefenseStance,
+    /// Remaining logic frames until the nearest armed wave trigger fires:
+    /// the minimum over armed triggers that both carry a reinforcement or
+    /// create-team action (4/7/80/107) and time one — the instance's
+    /// elapsed-time timer (event 13/51), or its event-47 deadline at the
+    /// reading frame. `None` when no armed trigger pairs the two.
+    next_wave_estimate: Option<i32>,
+    /// One bearing per armed wave trigger's spawn action, deduplicated by
+    /// spawn cell.
+    spawn_bearings: Vec<SpawnBearing>,
+    /// The hostile presence on the field at the last scan.
+    observed_wave_composition: WaveComposition,
+    /// Standing own structures whose object-attached Tag chain reads a
+    /// destroyed-by-anything event (7) into a lose outcome (actions 2/68):
+    /// the map's "this falls, you lose" set. Chains the direct walk cannot
+    /// resolve — Tag- or trigger-less definitions, indirect links — stay
+    /// absent; that coverage gap is a recorded residual.
+    protected_targets: Vec<u64>,
+}
+
+impl DefensePersona {
+    fn new(stance: DefenseStance) -> Self {
+        Self {
+            stance,
+            next_wave_estimate: None,
+            spawn_bearings: Vec::new(),
+            observed_wave_composition: WaveComposition::default(),
+            protected_targets: Vec::new(),
+        }
+    }
+}
+
+/// The map-space octant of `to` seen from `from`: 0..7 clockwise from +x.
+/// Pure integer slope comparisons (2 and 1/2) — no float atan2 enters the
+/// persona's reads, so the values stay identical across hosts.
+fn defense_octant_between(from: (i16, i16), to: (i16, i16)) -> u8 {
+    let dx = i32::from(to.0) - i32::from(from.0);
+    let dy = i32::from(to.1) - i32::from(from.1);
+    let (ax, ay) = (dx.abs(), dy.abs());
+    if ax * 2 < ay {
+        // Within 26.6 degrees of the y axis.
+        if dy >= 0 { 2 } else { 6 }
+    } else if ay * 2 < ax {
+        // Within 26.6 degrees of the x axis.
+        if dx >= 0 { 0 } else { 4 }
+    } else {
+        match (dx >= 0, dy >= 0) {
+            (true, true) => 1,
+            (false, true) => 3,
+            (false, false) => 5,
+            (true, false) => 7,
+        }
+    }
+}
+
+/// The Chebyshev distance between two map cells.
+fn defense_chebyshev(from: (i16, i16), to: (i16, i16)) -> u32 {
+    i32::from(to.0)
+        .abs_diff(i32::from(from.0))
+        .max(i32::from(to.1).abs_diff(i32::from(from.1)))
+}
+
 /// The battlefield role a buildable combat type fills in the army mix.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Role {
@@ -2860,6 +2978,10 @@ pub struct SuperAi {
     /// it marches at: arriving toggles the radiation stance. Pinned state,
     /// never read from the runtime.
     ore_denial: std::collections::HashMap<u64, (u16, u16)>,
+    /// The defense personality, `None` while the house plays the battle AI
+    /// (the launch default). An enabled persona only fills its perception
+    /// this milestone — see [`DefensePersona`].
+    defense: Option<DefensePersona>,
 }
 
 impl SuperAi {
@@ -2995,12 +3117,25 @@ impl SuperAi {
             iron_column: None,
             prism_drop: None,
             ore_denial: std::collections::HashMap::new(),
+            defense: None,
         }
     }
 
     /// The house this player commands.
     pub const fn house(&self) -> InternedId {
         self.house
+    }
+
+    /// Adopt the defense personality at `stance`. Battle behavior keeps
+    /// running until the defense pillars land; the persona only observes.
+    pub fn enable_defense_personality(&mut self, stance: DefenseStance) {
+        self.defense = Some(DefensePersona::new(stance));
+    }
+
+    /// The adopted defense stance, `None` while the house plays the battle
+    /// AI.
+    pub fn defense_stance(&self) -> Option<DefenseStance> {
+        self.defense.as_ref().map(|persona| persona.stance)
     }
 
     /// The tier this player plays at.
@@ -3031,6 +3166,10 @@ impl SuperAi {
         let rules = &runtime.resources.rules;
         let at = sim.session().tick() + 1;
         let owner = sim.interner().resolve(self.house).to_string();
+
+        // The defense persona observes before any battle branch can return
+        // early: its reads never gate a command decision this milestone.
+        self.update_defense_perception(sim);
 
         // Deploy: the launch MCV deploys into the side's construction yard.
         // try_to_deploy tests the origin one cell up-left of the MCV with
@@ -8727,6 +8866,132 @@ impl SuperAi {
     /// The enemy's standing air-capable combat count, summed over
     /// [`AIR_THREAT_TYPES`] — the army mix's and the defense limb's shared
     /// air-pressure reading.
+    /// The defense persona's per-tick perception pass (mode A skeleton).
+    /// Reads only: the trigger runtime's observer views, the entity census
+    /// and the battle AI's latched home cell — no command decision consumes
+    /// any of it until the D2 pillars land.
+    fn update_defense_perception(&mut self, sim: &crate::sim::world::Simulation) {
+        if self.defense.is_none() {
+            return;
+        }
+        let frame = sim.session().binary_frame() as i32;
+        let home = self.engine_home.or(self.pinned_home);
+
+        // Next wave when and whence: every armed trigger pairing a spawn
+        // action with a timing read contributes its spawn bearing and its
+        // deadline; the nearest deadline is the estimate.
+        let mut next_wave: Option<i32> = None;
+        let mut bearings: Vec<SpawnBearing> = Vec::new();
+        for view in sim
+            .trigger_runtime()
+            .armed_trigger_views(frame)
+            .iter()
+            .filter(|view| view.enabled)
+        {
+            let Some(spawn) = view
+                .definition
+                .actions
+                .iter()
+                .find(|action| matches!(action.kind, 4 | 7 | 80 | 107))
+            else {
+                continue;
+            };
+            // The action's own waypoint wins (80/107 pass one); the
+            // TeamType's `Waypoint=` backs 4/7. The shared read drops the
+            // unset (0,0) packed pair the way the team owner's does.
+            let spawn_cell = spawn
+                .waypoint
+                .and_then(|waypoint| sim.session().waypoint_cell(waypoint as i32))
+                .filter(|&cell| cell != (0, 0))
+                .or_else(|| {
+                    let waypoint = spawn
+                        .team_type
+                        .as_deref()
+                        .and_then(|team| sim.interner().get(team))
+                        .map(|team| sim.team_script_vm().team_type_waypoint(team));
+                    if let Some(waypoint) = waypoint
+                        && waypoint >= 0
+                    {
+                        sim.session()
+                            .waypoint_cell(waypoint)
+                            .filter(|&cell| cell != (0, 0))
+                    } else {
+                        None
+                    }
+                });
+            if let Some(cell) = spawn_cell {
+                let bearing = SpawnBearing {
+                    spawn_cell: Some(cell),
+                    octant: home.map(|home| defense_octant_between(home, cell)),
+                    distance_cells: home.map(|home| defense_chebyshev(home, cell)),
+                };
+                if !bearings.contains(&bearing) {
+                    bearings.push(bearing);
+                }
+            }
+            // Timing: the live elapsed-time timer (13/51), else the
+            // earliest event-47 deadline at the reading frame.
+            let mut deadline = view.timer_remaining_frames;
+            for event in &view.definition.events {
+                if event.kind == 47 {
+                    let remaining = event.value.wrapping_mul(15).saturating_sub(frame);
+                    deadline = Some(deadline.map_or(remaining, |current| current.min(remaining)));
+                }
+            }
+            if let Some(remaining) = deadline {
+                next_wave = Some(next_wave.map_or(remaining, |current| current.min(remaining)));
+            }
+        }
+
+        // Observed hostile presence, by category.
+        let mut composition = WaveComposition::default();
+        for (_, entity) in sim.substrate().entities.iter_sorted() {
+            if !self.is_enemy(sim, entity.owner()) {
+                continue;
+            }
+            match entity.category() {
+                crate::map::entities::EntityCategory::Infantry => composition.infantry += 1,
+                crate::map::entities::EntityCategory::Unit => composition.vehicles += 1,
+                crate::map::entities::EntityCategory::Aircraft => composition.aircraft += 1,
+                crate::map::entities::EntityCategory::Structure => composition.buildings += 1,
+            }
+        }
+
+        // Protected targets: standing own structures whose object-attached
+        // Tag chain reads a destroyed event into a lose outcome (the direct
+        // walk; chains beyond it stay a recorded residual).
+        let protected_targets = sim
+            .substrate()
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Structure
+            })
+            .filter(|(id, _)| {
+                sim.trigger_runtime()
+                    .object_tag_definition_views(*id)
+                    .iter()
+                    .any(|chain| {
+                        chain.events.iter().any(|event| event.kind == 7)
+                            && chain
+                                .actions
+                                .iter()
+                                .any(|action| matches!(action.kind, 2 | 68))
+                    })
+            })
+            .map(|(id, _)| id)
+            .collect();
+
+        // The mutable persona borrow starts last: every read above runs
+        // against the immutable `self`.
+        let persona = self.defense.as_mut().expect("the persona stays adopted");
+        persona.spawn_bearings = bearings;
+        persona.next_wave_estimate = next_wave;
+        persona.observed_wave_composition = composition;
+        persona.protected_targets = protected_targets;
+    }
+
     fn enemy_air_count(&self, sim: &crate::sim::world::Simulation) -> usize {
         AIR_THREAT_TYPES
             .iter()
@@ -19609,5 +19874,157 @@ mod tests {
                 "the toggle cleared the outpost's flag"
             );
         }
+    }
+
+    /// One synthetic defense-map world, installed through the production
+    /// scenario-init readers (no retail install): two houses on Country0/
+    /// Country1, a repeating wave trigger (event 13 at two seconds, action
+    /// 80 spawning team TT through waypoint A), and a destroyed-to-lose
+    /// object tag for the protected-target read.
+    fn defense_world() -> (
+        crate::sim::world::Simulation,
+        crate::rules::ruleset::RuleSet,
+        InternedId,
+        InternedId,
+    ) {
+        let extra = "[Countries]\n0=Country0\n1=Country1\n[Country0]\n[Country1]\n\
+             [VehicleTypes]\n0=TAGUNIT\n[TAGUNIT]\nStrength=100\nSpeed=5\nSpeedType=Track\n\
+             MovementZone=Normal\nLocomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n";
+        let (mut sim, rules, _overlays) =
+            crate::sim::world::entry_test_fixture::fixture_with_rules(extra);
+        let country0 = sim.interner.intern("Country0");
+        let country1 = sim.interner.intern("Country1");
+        let ai_house = sim.interner.intern("DefenseHouse");
+        let enemy_house = sim.interner.intern("EnemyHouse");
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                ai_house,
+                0,
+                Some(country0),
+                false,
+                0,
+                10,
+            ));
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                enemy_house,
+                1,
+                Some(country1),
+                false,
+                0,
+                10,
+            ));
+        let map = crate::map::map_file::MapFile::from_bytes(
+            b"[Map]\nTheater=TEMPERATE\nSize=0,0,2,1\nLocalSize=0,0,2,1\n\
+              [IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n[Basic]\nNewINIFormat=4\n\
+              [Triggers]\nWAVE=<none>,<none>,Wave,0,1,1,1,0\nLOSE=Country0,<none>,Lost,0,1,1,1,0\n\
+              [Events]\nWAVE=1,13,0,2\nLOSE=1,7,0,0\n\
+              [Actions]\nWAVE=1,80,1,TT,0,0,0,0,A\nLOSE=1,2,0,0,0,0,0,0,A\n\
+              [Tags]\nWAVE_TAG=2,Wave,WAVE\nLOSE_TAG=0,Lost,LOSE\n\
+              [TeamTypes]\n0=TT\n[TT]\nHouse=Country0\nScript=S\nTaskForce=F\nWaypoint=A\nMax=1\n\
+              [ScriptTypes]\n0=S\n[S]\n0=5,0\n\
+              [TaskForces]\n0=F\n[F]\n0=1,TAGUNIT\n\
+              [Waypoints]\n0=16014\n",
+        )
+        .unwrap();
+        let teams = crate::rules::team_ai_ini::TeamAiIniRegistry::from_sources(
+            &crate::rules::ini_parser::IniFile::from_str(""),
+            &map.ini,
+            true,
+        );
+        sim.initialize_trigger_definitions(&map, &teams, None, None, None);
+        sim.install_team_ai_registry(&teams, &rules).unwrap();
+        sim.initialize_trigger_definitions(&map, &teams, None, None, None);
+        sim.session.install_waypoints(&map.waypoints);
+        sim.classify_map_triggers(&rules);
+        (sim, rules, ai_house, enemy_house)
+    }
+
+    #[test]
+    fn disabled_by_default_and_enabled_stance_reads_back() {
+        let (runtime, house) = runtime();
+        let mut ai = SuperAi::new(house, SuperAiDifficulty::Fair);
+        assert_eq!(ai.defense_stance(), None, "the launch default is off");
+        for tick in [0u32, 5] {
+            let before = ai.orders(&runtime, tick);
+            let _ = before;
+            assert_eq!(ai.defense_stance(), None);
+        }
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        assert_eq!(
+            ai.defense_stance(),
+            Some(super::DefenseStance::IndependentZone)
+        );
+        // The stance round-trips through its text payload; the plain enum
+        // is also bincode-shaped (a variant index) without any
+        // is_human_readable branch.
+        let payload = serde_json::to_string(&super::DefenseStance::IndependentZone).unwrap();
+        assert_eq!(
+            serde_json::from_str::<super::DefenseStance>(&payload).unwrap(),
+            super::DefenseStance::IndependentZone
+        );
+    }
+
+    #[test]
+    fn defense_perception_fills_wave_timing_bearings_composition_and_targets() {
+        let (mut sim, rules, ai_house, enemy_house) = defense_world();
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        // The protected target: an own structure carrying the map's
+        // destroyed-to-lose tag; the bystander structure carries none.
+        let core = sim
+            .spawn_object_at_height("CABHUT", &ai_owner, 15, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the production Structure constructor");
+        sim.attach_object_trigger_tag(core, Some("LOSE_TAG"));
+        let bystander = sim
+            .spawn_object_at_height("CABHUT", &ai_owner, 16, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the production Structure constructor");
+        // The observed wave: two vehicles and one infantry, none of it
+        // this house's.
+        sim.spawn_object_at_height("TAGUNIT", &enemy_owner, 17, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the production Unit constructor");
+        sim.spawn_object_at_height("TAGUNIT", &enemy_owner, 17, 16, 0, 0, &rules)
+            .expect("the fixture cell admits the production Unit constructor");
+        sim.spawn_object_at_height("ENGINEER", &enemy_owner, 17, 14, 0, 0, &rules)
+            .expect("the fixture cell admits the production Infantry constructor");
+        let runtime = SimRuntime::from_simulation(sim);
+
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        // The battle AI's own home latch is the bearing origin.
+        ai.pinned_home = Some((10, 10));
+        ai.engine_home = Some((10, 10));
+        let _commands = ai.orders(&runtime, 0);
+
+        let persona = ai.defense.as_ref().expect("the persona stays adopted");
+        assert_eq!(
+            persona.next_wave_estimate,
+            Some(30),
+            "event 13's two seconds read as 2*15 logic frames at frame 0"
+        );
+        assert_eq!(
+            persona.spawn_bearings,
+            vec![super::SpawnBearing {
+                spawn_cell: Some((14, 16)),
+                octant: Some(super::defense_octant_between((10, 10), (14, 16))),
+                distance_cells: Some(6),
+            }],
+            "action 80's waypoint A resolves to its cell on the map's table"
+        );
+        assert_eq!(
+            persona.observed_wave_composition,
+            super::WaveComposition {
+                infantry: 1,
+                vehicles: 2,
+                aircraft: 0,
+                buildings: 0,
+            }
+        );
+        assert_eq!(
+            persona.protected_targets,
+            vec![core],
+            "only the tagged structure reads into the protected set"
+        );
+        let _ = bystander;
     }
 }

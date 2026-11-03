@@ -128,8 +128,11 @@ impl ScenarioSession {
     /// clock), the running gate Tactical6D4941 uses: `None` while the timer
     /// is stopped, the signed remaining frames while it runs.
     pub fn scenario_countdown_remaining_frames(&self) -> Option<i32> {
-        (self.scenario_countdown.timer.start_frame() != PAUSED_START_FRAME)
-            .then(|| self.scenario_countdown.timer.remaining(self.binary_frame as i32))
+        (self.scenario_countdown.timer.start_frame() != PAUSED_START_FRAME).then(|| {
+            self.scenario_countdown
+                .timer
+                .remaining(self.binary_frame as i32)
+        })
     }
 }
 
@@ -250,12 +253,8 @@ mod tests {
             "ten native seconds run at 15 frames per second"
         );
         sim.session.binary_frame = 10;
-        assert_eq!(
-            sim.session.scenario_countdown_remaining_frames(),
-            Some(140)
-        );
-        sim.session
-            .change_scenario_timer(ScenarioTimerAction::Stop);
+        assert_eq!(sim.session.scenario_countdown_remaining_frames(), Some(140));
+        sim.session.change_scenario_timer(ScenarioTimerAction::Stop);
         assert_eq!(sim.session.scenario_countdown_remaining_frames(), None);
     }
 }
