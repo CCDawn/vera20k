@@ -5349,6 +5349,11 @@ pub struct TriggerActionView {
     pub team_type: Option<String>,
     pub value: Option<i32>,
     pub waypoint: Option<u32>,
+    /// The trigger an action 53 (enable trigger) names, when the loaded
+    /// entry resolved one — the indirect outcome hop a defense persona's
+    /// protected-target walk follows (a solo defense map's statue carries
+    /// destroyed -> enable the trigger whose action announces the loss).
+    pub enable_trigger: Option<String>,
 }
 
 /// One trigger's definition chain: the head trigger's events and actions,
@@ -5392,10 +5397,11 @@ impl TriggerRuntime {
                 break;
             }
             let typ = &self.definitions.trigger_types[index];
-            view.events.extend(typ.events.iter().map(|event| TriggerEventView {
-                kind: event.kind,
-                value: event.value,
-            }));
+            view.events
+                .extend(typ.events.iter().map(|event| TriggerEventView {
+                    kind: event.kind,
+                    value: event.value,
+                }));
             view.actions
                 .extend(typ.actions.iter().map(|action| TriggerActionView {
                     kind: action.entry.kind,
@@ -5407,6 +5413,12 @@ impl TriggerRuntime {
                     },
                     value: action.value,
                     waypoint: action.entry.waypoint_index,
+                    enable_trigger: match action.reference {
+                        Some(DefinitionReference::Trigger(trigger)) => {
+                            Some(self.definitions.trigger_types[trigger].id.clone())
+                        }
+                        _ => None,
+                    },
                 }));
             next = typ.linked;
         }
@@ -5432,6 +5444,19 @@ impl TriggerRuntime {
                 })
             })
             .collect()
+    }
+
+    /// One trigger definition's observer view, found by its authored id —
+    /// registered or not: a lose trigger may carry no tag anywhere, so no
+    /// live instance ever exists for it, while an enable-trigger hop (the
+    /// defense persona's protected-target walk) still reads its outcome.
+    pub fn trigger_definition_view(&self, trigger_id: &str) -> Option<TriggerDefinitionView> {
+        let index = self
+            .definitions
+            .trigger_types
+            .iter()
+            .position(|typ| typ.id == trigger_id)?;
+        Some(self.definition_view(Some(index)))
     }
 
     /// The definition chains attached to `object` (the retained Object

@@ -759,6 +759,27 @@ const DEFENSE_LINE_OFFSETS: [(i8, i8); 9] = [
 /// A posted unit this far past its own post reads as drifted (it fought
 /// something off) and is walked back.
 const DEFENSE_LINE_DRIFT_CELLS: i32 = 3;
+/// Posts the persona staffs around the protected core — the map's own
+/// lose-chain structure (a solo defense map's statue), the thing the
+/// waves march at. Above the per-bearing count because the core falls to
+/// a wave that reaches it, not to one that raids the base.
+const DEFENSE_OBJECTIVE_POSTS: usize = 24;
+/// Posts within this many cells of the core count toward its ring's
+/// quota.
+const DEFENSE_OBJECTIVE_RING_SPREAD: i32 = 12;
+/// The core's ring fan: the line's nine-cell hug stood off three times
+/// wider, so the posts clear the core's own defensive structures.
+const DEFENSE_OBJECTIVE_OFFSETS: [(i8, i8); 9] = [
+    (0, 0),
+    (3, 0),
+    (0, 3),
+    (-3, 0),
+    (0, -3),
+    (3, 3),
+    (-3, 3),
+    (3, -3),
+    (-3, -3),
+];
 /// A hostile mobile within this many cells of the nearest protected
 /// target — else of the home center — is past the line: a leak.
 const DEFENSE_LEAK_RADIUS: i32 = 12;
@@ -1453,6 +1474,29 @@ pub struct SpawnBearing {
     /// `None` while no base center stands (a baseless opening tick).
     pub octant: Option<u8>,
     pub distance_cells: Option<u32>,
+}
+
+/// A read-only copy of [`DefensePersona`]'s perception and book sizes, for
+/// harnesses and tests (see [`SuperAi::defense_books`]). Counts, not
+/// contents: consumers compare sizes and timers across ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DefenseBooks {
+    /// [`DefensePersona`]'s `next_wave_estimate` read.
+    pub next_wave_estimate: Option<i32>,
+    /// Distinct spawn bearings the last scan read.
+    pub spawn_bearings: usize,
+    /// The observed hostile presence, by category, at the last scan.
+    pub observed_infantry: usize,
+    pub observed_vehicles: usize,
+    pub observed_aircraft: usize,
+    /// The "this falls, you lose" structures the last walk resolved.
+    pub protected_targets: usize,
+    /// Units posted on the defense line.
+    pub line_posts: usize,
+    /// Units walking into a depot for repair.
+    pub repair_inbound: usize,
+    /// Units chasing a leak.
+    pub leak_interceptors: usize,
 }
 
 /// The defense personality's pinned perception, mode A skeleton
@@ -3270,6 +3314,24 @@ impl SuperAi {
     /// AI.
     pub fn defense_stance(&self) -> Option<DefenseStance> {
         self.defense.as_ref().map(|persona| persona.stance)
+    }
+
+    /// A read-only snapshot of the persona's perception and its own books
+    /// (the line, the repair walks, the leak chases), for harnesses and
+    /// tests; `None` while the house plays the battle AI.
+    pub fn defense_books(&self) -> Option<DefenseBooks> {
+        let persona = self.defense.as_ref()?;
+        Some(DefenseBooks {
+            next_wave_estimate: persona.next_wave_estimate,
+            spawn_bearings: persona.spawn_bearings.len(),
+            observed_infantry: persona.observed_wave_composition.infantry,
+            observed_vehicles: persona.observed_wave_composition.vehicles,
+            observed_aircraft: persona.observed_wave_composition.aircraft,
+            protected_targets: persona.protected_targets.len(),
+            line_posts: persona.line_posts.len(),
+            repair_inbound: persona.repair_inbound.len(),
+            leak_interceptors: persona.leak_interceptors.len(),
+        })
     }
 
     /// Whether a unit carries a defense-persona duty (a line post, a
@@ -9124,27 +9186,46 @@ impl SuperAi {
             }
         }
 
-        // Protected targets: standing own structures whose object-attached
-        // Tag chain reads a destroyed event into a lose outcome (the direct
-        // walk; chains beyond it stay a recorded residual).
+        // Protected targets: standing structures the map itself charges
+        // the defense with — whose object tag chain reads a destroyed
+        // event into a lose outcome. The destroyed read is unit kind 7 or
+        // structure kind 48 (the two RecordKill publishes); the lose
+        // outcome is the chain's own 2/68, or one action-53 hop (enable
+        // trigger) to a trigger that carries one — a solo defense map's
+        // statue reads destroyed -> enable the lose trigger. The owner
+        // does not gate the read: the objective is the map's, and defense
+        // maps re-own it mid-game (a destroyed garrison hands the statue
+        // to another seat through a ChangeHouse give), while a win-chain
+        // (the enemy's 67) never qualifies.
+        let carries_lose = |actions: &[crate::sim::trigger_runtime::TriggerActionView]| {
+            actions.iter().any(|action| matches!(action.kind, 2 | 68))
+        };
         let protected_targets = sim
             .substrate()
             .entities
             .iter_sorted()
             .filter(|(_, entity)| {
-                entity.owner() == self.house
-                    && entity.category() == crate::map::entities::EntityCategory::Structure
+                entity.category() == crate::map::entities::EntityCategory::Structure
             })
             .filter(|(id, _)| {
                 sim.trigger_runtime()
                     .object_tag_definition_views(*id)
                     .iter()
                     .any(|chain| {
-                        chain.events.iter().any(|event| event.kind == 7)
-                            && chain
-                                .actions
-                                .iter()
-                                .any(|action| matches!(action.kind, 2 | 68))
+                        chain
+                            .events
+                            .iter()
+                            .any(|event| matches!(event.kind, 7 | 48))
+                            && (carries_lose(&chain.actions)
+                                || chain
+                                    .actions
+                                    .iter()
+                                    .filter_map(|action| action.enable_trigger.as_deref())
+                                    .any(|id| {
+                                        sim.trigger_runtime()
+                                            .trigger_definition_view(id)
+                                            .is_some_and(|view| carries_lose(&view.actions))
+                                    }))
                     })
             })
             .map(|(id, _)| id)
@@ -9753,6 +9834,79 @@ impl SuperAi {
     /// combat units on `Guard` posts picked by the battle perimeter's own
     /// site scan. Drift past [`DEFENSE_LINE_DRIFT_CELLS`] walks the
     /// drifter back first — holding the line, never marching it.
+    /// The objective ring's quota: the baseline ring, raised to the army
+    /// mix's own answer to the observed wave (the same capped air, armor
+    /// and foot targets `defense_army_orders` fields) — the ring holds the
+    /// wave the map sends, not a token guard.
+    fn defense_objective_quota(&self, sim: &crate::sim::world::Simulation) -> usize {
+        let Some(persona) = self.defense.as_ref() else {
+            return DEFENSE_OBJECTIVE_POSTS;
+        };
+        let composition = persona.observed_wave_composition;
+        let anti_air = if composition.aircraft > 0 {
+            (composition.aircraft * DEFENSE_AA_PER_AIRCRAFT)
+                .max(DEFENSE_AA_FLOOR)
+                .min(DEFENSE_AA_CAP)
+        } else {
+            DEFENSE_AA_FLOOR
+        };
+        let anti_armor = (composition.vehicles + DEFENSE_ARMOR_MARGIN)
+            .max(DEFENSE_ARMOR_FLOOR)
+            .min(DEFENSE_ARMOR_CAP);
+        let anti_foot = (composition.infantry + DEFENSE_FOOT_MARGIN)
+            .max(DEFENSE_FOOT_FLOOR)
+            .min(DEFENSE_FOOT_CAP);
+        DEFENSE_OBJECTIVE_POSTS.max(anti_air + anti_armor + anti_foot)
+    }
+
+    /// The idle combat roster the line staffs from: own foot and hulls the
+    /// persona holds off-duty, nearest `anchor` first, each due for an
+    /// order. The bearings' and the core ring's staffing share the pool and
+    /// the order.
+    fn defense_idle_candidates(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+        anchor: (i16, i16),
+        tick: u32,
+    ) -> Vec<(i64, u64)> {
+        let roster = Self::combat_roster(opening);
+        let mut candidates: Vec<(i64, u64)> = sim
+            .substrate()
+            .entities
+            .iter_sorted()
+            .filter(|(id, entity)| {
+                entity.owner() == self.house
+                    && matches!(
+                        entity.category(),
+                        crate::map::entities::EntityCategory::Unit
+                            | crate::map::entities::EntityCategory::Infantry
+                    )
+                    && !Self::garrisoned(entity)
+                    && {
+                        let name = sim.interner().resolve(entity.type_ref());
+                        roster.contains(&name) && !Self::is_naval_type(opening, name)
+                    }
+                    && !self.defense_duty(*id)
+                    && self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                    && matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    )
+            })
+            .map(|(id, entity)| {
+                let dx = i32::from(entity.position.rx() as i16) - i32::from(anchor.0);
+                let dy = i32::from(entity.position.ry() as i16) - i32::from(anchor.1);
+                (i64::from(dx * dx + dy * dy), id)
+            })
+            .collect();
+        candidates.sort_by_key(|&(distance, id)| (distance, id));
+        candidates
+    }
+
     fn defense_line_orders(
         &mut self,
         sim: &crate::sim::world::Simulation,
@@ -9764,12 +9918,39 @@ impl SuperAi {
         if self.defense.is_none() {
             return None;
         }
+        let core = self
+            .defense
+            .as_ref()
+            .expect("checked above")
+            .protected_targets
+            .iter()
+            .filter_map(|&id| sim.substrate().entities.get(id))
+            .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))
+            .next();
+        // The core under attack collapses the window: the wave is here, so
+        // the ring staffs and reposts every tick until it holds again.
+        let under_attack = core.is_some_and(|core| {
+            sim.substrate().entities.iter_sorted().any(|(_, entity)| {
+                matches!(
+                    entity.category(),
+                    crate::map::entities::EntityCategory::Unit
+                        | crate::map::entities::EntityCategory::Infantry
+                        | crate::map::entities::EntityCategory::Aircraft
+                ) && !entity.lifecycle.in_limbo()
+                    && self.is_enemy(sim, entity.owner())
+                    && {
+                        let dx = i32::from(entity.position.rx() as i16) - i32::from(core.0);
+                        let dy = i32::from(entity.position.ry() as i16) - i32::from(core.1);
+                        dx.abs().max(dy.abs()) <= DEFENSE_LEAK_RADIUS
+                    }
+            })
+        });
         {
             let persona = self.defense.as_mut().expect("checked above");
             if tick < persona.line_due {
                 return None;
             }
-            persona.line_due = tick + DEFENSE_LINE_TICKS;
+            persona.line_due = tick + if under_attack { 1 } else { DEFENSE_LINE_TICKS };
             let house = self.house;
             persona.line_posts.retain(|&(unit, _)| {
                 sim.substrate().entities.get(unit).is_some_and(|entity| {
@@ -9808,8 +9989,66 @@ impl SuperAi {
                 target: Some(crate::sim::combat::TargetKind::Cell(post.0, post.1)),
             });
         }
-        // Staffing: one pass posts one unit, nearest idle candidate first,
-        // at the first understaffed bearing's anchor.
+        // Staffing: one pass posts one unit, nearest idle candidate first.
+        // The protected core's ring staffs ahead of the base bearings —
+        // the map's lose-chain structure is the charge the waves march at,
+        // and the base bearings answer only the raid on the base itself.
+        // Same book (line_posts); the pass paces at the window above.
+        if let Some(core) = core {
+            let staffed = self
+                .defense
+                .as_ref()
+                .expect("checked above")
+                .line_posts
+                .iter()
+                .filter(|&(unit, post)| {
+                    // A hollow row — a unit walking home to repair, or
+                    // fought off its post — does not hold the ring: the
+                    // quota admits its replacement while it is away.
+                    let at_post = sim.substrate().entities.get(*unit).is_some_and(|entity| {
+                        let cell = (
+                            i16::try_from(entity.position.rx()).unwrap_or(post.0 as i16),
+                            i16::try_from(entity.position.ry()).unwrap_or(post.1 as i16),
+                        );
+                        i32::try_from(defense_chebyshev(cell, (post.0 as i16, post.1 as i16)))
+                            .unwrap_or(i32::MAX)
+                            <= DEFENSE_LINE_DRIFT_CELLS + 1
+                    });
+                    at_post
+                        && i32::try_from(defense_chebyshev((post.0 as i16, post.1 as i16), core))
+                            .unwrap_or(i32::MAX)
+                            <= DEFENSE_OBJECTIVE_RING_SPREAD
+                })
+                .count();
+            let quota = if under_attack {
+                usize::MAX
+            } else {
+                self.defense_objective_quota(sim)
+            };
+            if staffed < quota {
+                let candidates = self.defense_idle_candidates(sim, opening, core, tick);
+                for &(_, unit) in &candidates {
+                    let Some(post) =
+                        pick_guard_post(sim, rules, unit, core, &DEFENSE_OBJECTIVE_OFFSETS, None)
+                    else {
+                        continue;
+                    };
+                    self.defense
+                        .as_mut()
+                        .expect("checked above")
+                        .line_posts
+                        .push((unit, post));
+                    self.gate_idle_order(unit, tick);
+                    return Some(Command::Guard {
+                        entity_id: unit,
+                        target: Some(crate::sim::combat::TargetKind::Cell(post.0, post.1)),
+                    });
+                }
+            }
+        }
+
+        // Then the base bearings: one pass posts one unit, nearest idle
+        // candidate first, at the first understaffed bearing's anchor.
         let bearings: Vec<SpawnBearing> = self
             .defense
             .as_ref()
@@ -9844,40 +10083,7 @@ impl SuperAi {
             if assigned >= DEFENSE_LINE_PER_BEARING {
                 continue;
             }
-            let roster = Self::combat_roster(opening);
-            let mut candidates: Vec<(i64, u64)> = sim
-                .substrate()
-                .entities
-                .iter_sorted()
-                .filter(|(id, entity)| {
-                    entity.owner() == self.house
-                        && matches!(
-                            entity.category(),
-                            crate::map::entities::EntityCategory::Unit
-                                | crate::map::entities::EntityCategory::Infantry
-                        )
-                        && !Self::garrisoned(entity)
-                        && {
-                            let name = sim.interner().resolve(entity.type_ref());
-                            roster.contains(&name) && !Self::is_naval_type(opening, name)
-                        }
-                        && !self.defense_duty(*id)
-                        && self.order_gate.get(id).is_none_or(|&due| tick >= due)
-                        && matches!(
-                            entity.passive_acquire_mission(),
-                            crate::sim::mission::MissionType::None
-                                | crate::sim::mission::MissionType::Sleep
-                                | crate::sim::mission::MissionType::Guard
-                                | crate::sim::mission::MissionType::AreaGuard
-                        )
-                })
-                .map(|(id, entity)| {
-                    let dx = i32::from(entity.position.rx() as i16) - i32::from(anchor.0);
-                    let dy = i32::from(entity.position.ry() as i16) - i32::from(anchor.1);
-                    (i64::from(dx * dx + dy * dy), id)
-                })
-                .collect();
-            candidates.sort_by_key(|&(distance, id)| (distance, id));
+            let candidates = self.defense_idle_candidates(sim, opening, anchor, tick);
             for &(_, unit) in &candidates {
                 let Some(post) =
                     pick_guard_post(sim, rules, unit, anchor, &DEFENSE_LINE_OFFSETS, None)
@@ -21090,7 +21296,7 @@ mod tests {
             more_vehicles, more
         );
         let extra = extra.as_str();
-        defense_world_build(extra)
+        defense_world_build(extra, DEFENSE_WORLD_MAP)
     }
 
     fn defense_world() -> (
@@ -21104,6 +21310,7 @@ mod tests {
 
     fn defense_world_build(
         extra: &str,
+        map_ini: &[u8],
     ) -> (
         crate::sim::world::Simulation,
         crate::rules::ruleset::RuleSet,
@@ -21134,19 +21341,7 @@ mod tests {
                 0,
                 10,
             ));
-        let map = crate::map::map_file::MapFile::from_bytes(
-            b"[Map]\nTheater=TEMPERATE\nSize=0,0,2,1\nLocalSize=0,0,2,1\n\
-              [IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n[Basic]\nNewINIFormat=4\n\
-              [Triggers]\nWAVE=<none>,<none>,Wave,0,1,1,1,0\nLOSE=Country0,<none>,Lost,0,1,1,1,0\n\
-              [Events]\nWAVE=1,13,0,2\nLOSE=1,7,0,0\n\
-              [Actions]\nWAVE=1,80,1,TT,0,0,0,0,A\nLOSE=1,2,0,0,0,0,0,0,A\n\
-              [Tags]\nWAVE_TAG=2,Wave,WAVE\nLOSE_TAG=0,Lost,LOSE\n\
-              [TeamTypes]\n0=TT\n[TT]\nHouse=Country0\nScript=S\nTaskForce=F\nWaypoint=A\nMax=1\n\
-              [ScriptTypes]\n0=S\n[S]\n0=5,0\n\
-              [TaskForces]\n0=F\n[F]\n0=1,TAGUNIT\n\
-              [Waypoints]\n0=16014\n",
-        )
-        .unwrap();
+        let map = crate::map::map_file::MapFile::from_bytes(map_ini).unwrap();
         let teams = crate::rules::team_ai_ini::TeamAiIniRegistry::from_sources(
             &crate::rules::ini_parser::IniFile::from_str(""),
             &map.ini,
@@ -21159,6 +21354,19 @@ mod tests {
         sim.classify_map_triggers(&rules);
         (sim, rules, ai_house, enemy_house)
     }
+
+    /// The D1 map's trigger set, as a literal: the wave timer, the direct
+    /// destroyed-to-lose chain, and the waypoint the wave action names.
+    const DEFENSE_WORLD_MAP: &[u8] = b"[Map]\nTheater=TEMPERATE\nSize=0,0,2,1\nLocalSize=0,0,2,1\n\
+          [IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n[Basic]\nNewINIFormat=4\n\
+          [Triggers]\nWAVE=<none>,<none>,Wave,0,1,1,1,0\nLOSE=Country0,<none>,Lost,0,1,1,1,0\n\
+          [Events]\nWAVE=1,13,0,2\nLOSE=1,7,0,0\n\
+          [Actions]\nWAVE=1,80,1,TT,0,0,0,0,A\nLOSE=1,2,0,0,0,0,0,0,A\n\
+          [Tags]\nWAVE_TAG=2,Wave,WAVE\nLOSE_TAG=0,Lost,LOSE\n\
+          [TeamTypes]\n0=TT\n[TT]\nHouse=Country0\nScript=S\nTaskForce=F\nWaypoint=A\nMax=1\n\
+          [ScriptTypes]\n0=S\n[S]\n0=5,0\n\
+          [TaskForces]\n0=F\n[F]\n0=1,TAGUNIT\n\
+          [Waypoints]\n0=16014\n";
 
     #[test]
     fn disabled_by_default_and_enabled_stance_reads_back() {
@@ -21779,5 +21987,160 @@ mod tests {
                 super::Command::QueueProduction { type_id } if Some(type_id) == e1
             )
         }));
+    }
+    // ---- D2 fix round: the protected objective (a solo defense map's core) ----
+
+    /// The Defend-Liberty map shape: the objective is a NEUTRAL structure
+    /// whose tag chain reads destroyed (event 48) into an indirect loss —
+    /// the chain's action 53 enables a further trigger whose action 68
+    /// announces the lose. The perception must protect it, and an
+    /// enemy-owned equivalent must stay out.
+    #[test]
+    fn protected_targets_read_a_neutral_objective_through_the_enable_hop() {
+        let map_ini = b"[Map]\nTheater=TEMPERATE\nSize=0,0,2,1\nLocalSize=0,0,2,1\n\
+              [IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n[Basic]\nNewINIFormat=4\n\
+              [Triggers]\nWAVE=<none>,<none>,Wave,0,1,1,1,0\nSTATUE=<none>,<none>,StatueDies,0,1,1,1,0\n\
+              YOSE=Country0,<none>,YouLose,0,1,1,1,0\nHOSTILE=Country1,<none>,TheyLose,0,1,1,1,0\n\
+              [Events]\nWAVE=1,13,0,2\nSTATUE=1,48,0,0\nYOSE=1,13,0,5\nHOSTILE=1,7,0,0\n\
+              [Actions]\nWAVE=1,80,1,TT,0,0,0,0,A\n\
+              STATUE=3,11,4,Mission.Failed,0,0,0,0,A,53,2,YOSE,0,0,0,0,A,11,4,MapMadeBy,0,0,0,0,A\n\
+              YOSE=1,68,0,0,0,0,0,0,A\nHOSTILE=1,67,0,0,0,0,0,0,A\n\
+              [Tags]\nWAVE_TAG=2,Wave,WAVE\nSTATUE_TAG=0,StatueDies,STATUE\nTHEIR_TAG=0,TheyLose,HOSTILE\n\
+              [TeamTypes]\n0=TT\n[TT]\nHouse=Country0\nScript=S\nTaskForce=F\nWaypoint=A\nMax=1\n\
+              [ScriptTypes]\n0=S\n[S]\n0=5,0\n\
+              [TaskForces]\n0=F\n[F]\n0=1,TAGUNIT\n\
+              [Waypoints]\n0=16014\n";
+        let (mut sim, rules, ai_house, enemy_house) = defense_world_build("", map_ini);
+        let _ = ai_house;
+        // The neutral custodian: registered passive, as a spectatorless
+        // map's civilian house reads to the persona (never an enemy).
+        let neutral_house = sim.interner.intern("NeutralHouse");
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                neutral_house,
+                1,
+                None,
+                false,
+                0,
+                10,
+            ));
+        sim.houses
+            .get_mut(&neutral_house)
+            .expect("the custodian house")
+            .make_multiplay_passive();
+        let neutral_owner = sim.interner.resolve(neutral_house).to_string();
+        // The objective: a neutral structure carrying the destroyed ->
+        // enable-hop chain; the enemy's own win chain stays out.
+        let statue = sim
+            .spawn_object_at_height("CABHUT", &neutral_owner, 15, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the objective structure");
+        sim.attach_object_trigger_tag(statue, Some("STATUE_TAG"));
+        let enemy = sim.interner.resolve(enemy_house).to_string();
+        let theirs = sim
+            .spawn_object_at_height("CABHUT", &enemy, 16, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the hostile structure");
+        sim.attach_object_trigger_tag(theirs, Some("THEIR_TAG"));
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
+
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        ai.pinned_home = Some((10, 10));
+        ai.engine_home = Some((10, 10));
+        let _ = ai.orders(&runtime, 0);
+
+        let persona = ai.defense.as_ref().expect("the persona stays adopted");
+        assert_eq!(
+            persona.protected_targets,
+            vec![statue],
+            "the objective reads through the enable hop; the enemy's win chain stays out"
+        );
+    }
+
+    /// The objective ring staffs ahead of the base bearings: with the
+    /// protected core standing away from the home center, the first line
+    /// pass posts the nearest idle pool unit on the core's fan, not on the
+    /// base's approach anchor.
+    #[test]
+    fn objective_ring_staffs_before_the_base_bearings() {
+        let (mut sim, rules, ai_house, _enemy_house) = defense_forces_world();
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 15, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        // The protected core, three cells past the base bearing's side of
+        // the map; the direct destroyed-to-lose chain charges it.
+        let core = sim
+            .spawn_object_at_height("CABHUT", &ai_owner, 20, 20, 0, 0, &rules)
+            .expect("the fixture cell admits the core");
+        sim.attach_object_trigger_tag(core, Some("LOSE_TAG"));
+        let tank = sim
+            .spawn_object_at_height("MTNK", &ai_owner, 17, 14, 0, 0, &rules)
+            .expect("the fixture cell admits the pool tank");
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
+
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        ai.pinned_home = Some((15, 15));
+        ai.engine_home = Some((15, 15));
+        let commands = ai.orders(&runtime, 0);
+        let posted = commands.iter().find_map(|envelope| match envelope.payload {
+            super::Command::Guard {
+                entity_id,
+                target: Some(crate::sim::combat::TargetKind::Cell(px, py)),
+            } if entity_id == tank => Some((px, py)),
+            _ => None,
+        });
+        let (px, py) = posted.expect("the first pass posts the idle tank");
+        let distance = super::defense_chebyshev(
+            (i16::try_from(px).unwrap(), i16::try_from(py).unwrap()),
+            (20, 20),
+        );
+        assert!(
+            distance <= 3,
+            "the first pass staffs the core's fan, not a base bearing: post ({px},{py})"
+        );
+        let persona = ai.defense.as_ref().expect("the persona stays adopted");
+        assert_eq!(
+            persona.line_posts,
+            vec![(tank, (px, py))],
+            "the posted tank latches into the line book"
+        );
+    }
+
+    /// The ring's quota reads the observed wave through the army mix's own
+    /// capped targets: a heavy wave raises the ring above the baseline, a
+    /// quiet map keeps it at the baseline.
+    #[test]
+    fn objective_quota_scales_with_the_observed_wave() {
+        let (mut sim, rules, ai_house, enemy_house) = defense_world();
+        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        // Thirty hostile vehicles and thirty hostile infantry on the field:
+        // the capped mix answers with 16 armor, 16 foot and the one-air
+        // floor, together above the baseline ring.
+        for (x, y) in (0..30).map(|index| (20 + index % 6, 20 + index / 6)) {
+            sim.spawn_object_at_height("TAGUNIT", &enemy_owner, x, y, 0, 0, &rules)
+                .expect("the fixture cell admits the vehicle");
+        }
+        for (x, y) in (0..30).map(|index| (26 + index % 6, 20 + index / 6)) {
+            sim.spawn_object_at_height("ENGINEER", &enemy_owner, x, y, 0, 0, &rules)
+                .expect("the fixture cell admits the infantry");
+        }
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
+
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        let _ = ai.orders(&runtime, 0);
+        let quota = ai.defense_objective_quota(&runtime.simulation);
+        assert!(
+            quota > super::DEFENSE_OBJECTIVE_POSTS,
+            "a heavy observed wave raises the ring above the baseline: got {quota}"
+        );
+        assert_eq!(
+            quota,
+            super::DEFENSE_AA_FLOOR + super::DEFENSE_ARMOR_CAP + super::DEFENSE_FOOT_CAP,
+            "the raised quota is the mix's own capped answer (no aircraft observed)"
+        );
     }
 }
