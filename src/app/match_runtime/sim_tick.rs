@@ -1259,31 +1259,27 @@ fn advance_one_simulation_frame(
             };
             // Fork-only Super-AI opponents (`docs/superai.md`): the command
             // layer drives each command-driven house — its orders merge into
-            // this frame's commands — and the tier's credit support rides
-            // along: Brutal/Super take the recurring bonus (+1000 per 600
-            // ticks, the same drip the bench applies), Unlimited tops its
-            // wallet up to `UNLIMITED_WALLET_FLOOR` every tick. Ordinary
-            // lane only, like every other command source.
+            // this frame's commands — and the house's driver policy applies
+            // its credit support (a wallet floor every tick, a recurring
+            // drip on interval ticks). Ordinary lane only, like every other
+            // command source.
             let mut due_commands = due_commands;
             if tick_lane == TickLane::Ordinary && !state.match_state.super_players.is_empty() {
-                let tick = sim.session().tick();
+                let tick = u32::try_from(sim.session().tick()).unwrap_or(u32::MAX);
                 let mut super_players = std::mem::take(&mut state.match_state.super_players);
                 for ai in super_players.iter_mut() {
-                    due_commands.extend(ai.orders(rt, u32::try_from(tick).unwrap_or(u32::MAX)));
-                    if ai.difficulty() == crate::super_ai::SuperAiDifficulty::Unlimited {
-                        let owner = rt.simulation.interner().resolve(ai.house()).to_string();
-                        let wallet =
-                            crate::sim::production::credits_for_owner(&rt.simulation, &owner);
-                        let floor = crate::super_ai::UNLIMITED_WALLET_FLOOR;
-                        if wallet < floor {
-                            rt.grant_house_credits(ai.house(), floor - wallet);
-                        }
-                    } else if ai.difficulty() != crate::super_ai::SuperAiDifficulty::Fair
-                        && tick > 0
-                        && tick % 600 == 0
-                    {
-                        rt.grant_house_credits(ai.house(), 1000);
-                    }
+                    due_commands.extend(ai.orders(rt, tick));
+                    // The credit support is the house's stored driver policy
+                    // (wallet floor / recurring drip); saves from before the
+                    // policy existed fall back to the driver's tier.
+                    let policy = rt
+                        .simulation
+                        .houses()
+                        .get(&ai.house())
+                        .and_then(|house| house.super_tier_policy())
+                        .copied()
+                        .unwrap_or_else(|| crate::sim::driver::DriverPolicy::from(ai.difficulty()));
+                    policy.apply_credit_support(rt, ai.house(), tick);
                 }
                 state.match_state.super_players = super_players;
             }

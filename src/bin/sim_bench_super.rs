@@ -25,12 +25,13 @@
 use std::time::Instant;
 
 use vera20k_core::headless_scenario::{self, SIM_TICK_MS};
+use vera20k_core::sim::driver::DriverPolicy;
 use vera20k_core::sim::house_state::HouseOutcomeKind;
 use vera20k_core::sim::intern::InternedId;
 use vera20k_core::sim::runtime::SimRuntime;
 use vera20k_core::sim::world::{FrameEffects, TickLane};
 use vera20k_core::skirmish_launch::{AiDifficulty, LaunchCountry, SkirmishLaunchSession};
-use vera20k_core::super_ai::{SuperAi, SuperAiDifficulty, UNLIMITED_WALLET_FLOOR};
+use vera20k_core::super_ai::{SuperAi, SuperAiDifficulty};
 
 /// The `--max-ticks` backstop when the flag is absent: at 66 ms a tick, half
 /// an hour of game time before a game is called dead.
@@ -176,22 +177,15 @@ pub(crate) fn run(args: &super::Args) -> Result<(), String> {
         let mut ticks = 0u64;
         let mut finished = false;
         while ticks < args.max_ticks.get() {
-            // The tier's credit support (`docs/superai.md`): Brutal/Super take
-            // the recurring +1000 per 600 ticks; Unlimited tops its wallet up
-            // to `UNLIMITED_WALLET_FLOOR` every tick, the same rule the
-            // launch's sim_tick applies. Fair stays untouched.
-            if args.super_tier == SuperAiDifficulty::Unlimited {
-                let owner =
-                    runtime.simulation.interner().resolve(super_house).to_string();
-                let wallet =
-                    vera20k_core::sim::production::credits_for_owner(&runtime.simulation, &owner);
-                let floor = UNLIMITED_WALLET_FLOOR;
-                if wallet < floor {
-                    runtime.grant_house_credits(super_house, floor - wallet);
-                }
-            } else if args.super_tier != SuperAiDifficulty::Fair && ticks > 0 && ticks % 600 == 0 {
-                runtime.grant_house_credits(super_house, 1000);
-            }
+            // The tier's credit support (`docs/superai.md`): the same driver
+            // policy the launch stores on the house, applied per tick the
+            // same way the launch's sim_tick applies it (Unlimited's wallet
+            // floor, Brutal/Super's +1000 per 600 ticks; Fair inert).
+            DriverPolicy::from(args.super_tier).apply_credit_support(
+                runtime,
+                super_house,
+                u32::try_from(ticks).unwrap_or(u32::MAX),
+            );
             let batch = ai.orders(runtime, u32::try_from(ticks).unwrap_or(u32::MAX));
             let output = runtime
                 .advance_frame(

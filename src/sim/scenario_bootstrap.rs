@@ -1146,10 +1146,12 @@ pub struct NormalizedSkirmishSlot {
     /// A human node's handle, CreateHouses' source for House+0x1602A.
     pub handle: Option<String>,
     pub(crate) difficulty: HouseDifficulty,
-    /// Fork-only Super-AI tier (`docs/superai.md`): a computer slot carrying
-    /// one becomes a command-driven house with the tier treatment applied
-    /// where the slot becomes its house; `None` is a native computer.
-    pub super_tier: Option<crate::super_ai::SuperAiDifficulty>,
+    /// Fork-only driver policy (`docs/superai.md`): a computer slot carrying
+    /// one becomes a command-driven house with the policy treatment applied
+    /// where the slot becomes its house; `None` is a native computer. The
+    /// frontend session slot still names a tier, which the launch normalizes
+    /// into its policy.
+    pub super_tier: Option<crate::sim::driver::DriverPolicy>,
 }
 
 /// Sim-owned behavioral launch descriptor (F09).
@@ -1752,7 +1754,9 @@ pub fn normalized_launch_slots(session: &SkirmishLaunchSession) -> Vec<Normalize
             handle: None,
             difficulty: HouseDifficulty::from_native(opponent.difficulty.as_i32())
                 .expect("native AI difficulty"),
-            super_tier: opponent.super_tier,
+            super_tier: opponent
+                .super_tier
+                .map(crate::sim::driver::DriverPolicy::from),
         });
     }
     slots
@@ -1898,14 +1902,15 @@ pub fn populate_launch_houses(
         }
         house.resolve_multiplay_passive(rules, Some(country_name));
         house.project_country_mults(rules, &sim.interner);
-        // Fork-only (`docs/superai.md`): a Super-AI opponent slot's house is
-        // command-driven and carries the tier treatment instead of the native
-        // AI ownership the launch would otherwise give it. The tier's opening
-        // grant here replaces this pass's `apply_skirmish_ai_opening_credits`
-        // for the house, which skips command-driven houses.
-        if let Some(tier) = slot.super_tier {
-            house.make_command_driven(tier);
-            apply_super_ai_tier_to_house(&mut house, rules, tier);
+        // Fork-only (`docs/superai.md`): a driver-policy opponent slot's house
+        // is command-driven and carries the policy treatment instead of the
+        // native AI ownership the launch would otherwise give it. The native
+        // Hard opening grant here replaces this pass's
+        // `apply_skirmish_ai_opening_credits` for the house, which skips
+        // command-driven houses.
+        if let Some(policy) = slot.super_tier {
+            house.make_command_driven(policy);
+            apply_super_ai_tier_to_house(&mut house, rules, &policy);
         }
         sim.houses.register(house);
     }
@@ -1937,50 +1942,42 @@ pub(crate) fn native_ai_opening_grant(coefficient: i32, money: i32) -> i32 {
     X87Chop53::ftol_i32_low_masked(product)
 }
 
-/// Apply the Super-AI tier's opening treatment to `house` (`docs/superai.md`).
+/// Apply a driver policy's opening treatment to `house` (`docs/superai.md`).
 ///
-/// Brutal and Super take the native Hard AI's opening grant through
+/// The kernel reads the [`crate::sim::driver::DriverPolicy`] fields: a set
+/// `native_hard_grant` takes the native Hard AI's opening grant through
 /// [`native_ai_opening_grant`] — the same kernel the launch grants computer
 /// houses with (`apply_skirmish_ai_opening_credits`), with the retail
 /// `[General] MultiplayerAICM` HARD row regardless of the house's own native
-/// difficulty — and Super additionally halves the house's production build
-/// times (`HouseState::set_native_build_time_scale`, 0.5f32), the fork's one
-/// documented simulation-side exception. Unlimited takes Super's whole
-/// treatment (the per-tick wallet floor the driver adds is a launch-loop
-/// grant, not house state). Fair takes nothing: the tier exists
+/// difficulty — and a set `build_time_scale` scales the house's production
+/// build times (`HouseState::set_native_build_time_scale`; the tiers use
+/// 0.5f32, the fork's one documented simulation-side exception). The
+/// per-tick knobs (`credit_drip`, `wallet_floor`) are launch-loop grants
+/// applied by [`crate::sim::driver::DriverPolicy::apply_credit_support`],
+/// not house state. The all-off policy takes nothing: the Fair tier exists
 /// so strength claims can cite exactly what a pure decision layer achieves.
 ///
-/// The one owner of the tier kernel; the headless harness
+/// The one owner of the policy opening kernel; the headless harness
 /// (`headless_scenario::apply_super_ai_tier`) and the launch's house
 /// construction (`populate_launch_houses`) both come through here.
 pub(crate) fn apply_super_ai_tier_to_house(
     state: &mut HouseState,
     rules: &RuleSet,
-    tier: crate::super_ai::SuperAiDifficulty,
+    policy: &crate::sim::driver::DriverPolicy,
 ) {
-    use crate::super_ai::SuperAiDifficulty;
-
-    if tier == SuperAiDifficulty::Fair {
-        return;
+    if policy.native_hard_grant {
+        let coefficient = rules
+            .general
+            .multiplayer_ai_cm
+            .get(HouseDifficulty::Hard.table_index())
+            .copied()
+            .unwrap_or(0);
+        let grant = native_ai_opening_grant(coefficient, state.economy().available_money());
+        state.economy_mut().add_credits(grant);
     }
-    let coefficient = rules
-        .general
-        .multiplayer_ai_cm
-        .get(HouseDifficulty::Hard.table_index())
-        .copied()
-        .unwrap_or(0);
-    let grant = native_ai_opening_grant(coefficient, state.economy().available_money());
-    state.economy_mut().add_credits(grant);
-    if matches!(
-        tier,
-        SuperAiDifficulty::Super | SuperAiDifficulty::Unlimited
-    ) {
-        // 0.5f32: build twice as fast as the native chain. Unlimited is
-        // Super's treatment plus the per-tick wallet floor the driver
-        // rebuild applies (`UNLIMITED_WALLET_FLOOR`).
-        state.set_native_build_time_scale(crate::util::native_x87::NativeF32Bits::from_bits(
-            0x3F00_0000,
-        ));
+    if let Some(scale) = policy.build_time_scale {
+        // The tiers scale 0.5f32: build twice as fast as the native chain.
+        state.set_native_build_time_scale(scale);
     }
 }
 
