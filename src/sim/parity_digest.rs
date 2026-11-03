@@ -74,6 +74,17 @@ pub struct ParityDigest {
     /// The original's counterpart lives on its ScenarioClass instance.
     pub scenario_rng_index_a: i32,
     pub scenario_rng_index_b: i32,
+    /// Occupied overlay cells (walls, tiberium, crates, bridges). Not populated
+    /// by every capture path (`None`-equivalent zero when no registry was at
+    /// hand) and not cross-comparable: a tooling counter, so defense-map
+    /// harnesses can see crates and walls move without a digest consumer.
+    #[serde(default)]
+    pub overlay_count: u32,
+    /// Occupied overlay cells whose OverlayType carries `Crate=`: the
+    /// pickup-able crates, money ones included. Same caveats as
+    /// `overlay_count`.
+    #[serde(default)]
+    pub crate_count: u32,
 }
 
 /// Absolute sub-cell position of an entity on one axis.
@@ -129,7 +140,35 @@ impl ParityDigest {
             entity_state_hash,
             scenario_rng_index_a,
             scenario_rng_index_b,
+            overlay_count: 0,
+            crate_count: 0,
         }
+    }
+
+    /// Fill the overlay and crate counters from the live overlay grid.
+    /// `capture` has no registry, so this is the registry-aware tail the
+    /// tooling callers append; the counters count committed state only and
+    /// never feed the state hash.
+    pub fn with_overlay_counts(
+        mut self,
+        overlay_grid: &crate::sim::overlay_grid::OverlayGrid,
+        registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    ) -> Self {
+        let mut overlay_count = 0_u32;
+        let mut crate_count = 0_u32;
+        for (_, _, cell) in overlay_grid.iter_occupied() {
+            overlay_count += 1;
+            if cell
+                .overlay_id
+                .and_then(|id| registry.flags(id))
+                .is_some_and(|flags| flags.crate_type)
+            {
+                crate_count += 1;
+            }
+        }
+        self.overlay_count = overlay_count;
+        self.crate_count = crate_count;
+        self
     }
 
     /// Serialize as one JSON line for streaming to disk.
@@ -259,5 +298,28 @@ mod tests {
         // Fractional sub-cell offsets truncate rather than round, so the value stays in
         // whole units on both sides of the comparison.
         assert_eq!(absolute_axis(2, SimFixed::from_num(0.75)), 512);
+    }
+
+    /// The tooling counters separate pickup-able crates from every other
+    /// overlay, and a capture without the registry-aware tail keeps both at
+    /// zero (old digests stay comparable to new ones).
+    #[test]
+    fn with_overlay_counts_separates_crates_from_other_overlays() {
+        let ini = crate::rules::ini_parser::IniFile::from_str(
+            "[OverlayTypes]\n0=TIB01\n1=WOOD\n[TIB01]\nTiberium=yes\n[WOOD]\nCrate=yes\n",
+        );
+        let registry = crate::rules::overlay_types::OverlayTypeRegistry::from_ini(&ini, None);
+        let mut grid = crate::sim::overlay_grid::OverlayGrid::new(4, 4);
+        grid.place_overlay(1, 1, 0, 3);
+        grid.place_overlay(2, 2, 1, 0);
+        grid.place_overlay(3, 3, 1, 0);
+
+        let counted = empty_digest().with_overlay_counts(&grid, &registry);
+        assert_eq!(counted.overlay_count, 3);
+        assert_eq!(counted.crate_count, 2);
+
+        let bare = empty_digest();
+        assert_eq!(bare.overlay_count, 0);
+        assert_eq!(bare.crate_count, 0);
     }
 }
