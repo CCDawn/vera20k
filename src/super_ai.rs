@@ -733,11 +733,6 @@ const GARRISON_DEMAND_IN_PRODUCTION: usize = 2;
 const DEFENSE_LINE_TICKS: u32 = 30;
 /// Ticks between the leak-scan passes.
 const DEFENSE_LEAK_TICKS: u32 = 30;
-/// The leak response's standing squad: the most hunters a siege draws at
-/// once. Waves leave survivor lines around the objective that grind it
-/// down between arrivals — one hunter per window cannot clear them, so
-/// every window sends another until the squad is out or the siege is dead.
-const DEFENSE_LEAK_SQUAD: usize = 2;
 /// Ticks between the repair-rotation passes.
 const DEFENSE_REPAIR_TICKS: u32 = 45;
 /// Line units per threat bearing: four hulls hold one approach.
@@ -9614,21 +9609,6 @@ impl SuperAi {
         if self.defense.is_none() {
             return None;
         }
-        // The objective in another seat's hands stands down the chase: a
-        // map's give chain can re-own the charge before the first wave
-        // (Defend Liberty hands it over in the launch tick), and a hunter
-        // beside it then acquires the charge itself — the run's own fire
-        // becomes the biggest threat the objective faces. The ring holds
-        // (Guards acquire mobiles only); the hunt waits for the charge to
-        // come home.
-        if !self
-            .defense
-            .as_ref()
-            .expect("checked above")
-            .protected_owned
-        {
-            return None;
-        }
         // The paced pass: advance the window and prune the chase — a
         // fallen hunter drops, and one back to idle past its gate has
         // finished its share.
@@ -9653,16 +9633,13 @@ impl SuperAi {
                 })
             });
         }
-        // A standing leak keeps drawing hunters until the squad is out:
-        // the survivors a wave leaves around the objective grind it down
-        // between arrivals, and one hunter cannot clear a siege line.
-        if self
+        // A hunter already out covers the standing leak.
+        if !self
             .defense
             .as_ref()
             .expect("checked above")
             .leak_interceptors
-            .len()
-            >= DEFENSE_LEAK_SQUAD
+            .is_empty()
         {
             return None;
         }
@@ -21968,65 +21945,6 @@ mod tests {
             persona.leak_interceptors,
             vec![tank],
             "the hunter latches into the chase book"
-        );
-    }
-
-    /// A standing siege keeps drawing hunters: with two intruders at the
-    /// core and three pool units, the first window sends the nearest, the
-    /// next window sends the next — the squad fills while the siege line
-    /// stands, instead of one hunter covering a leak alone.
-    #[test]
-    fn the_leak_squad_keeps_hunting_a_standing_siege() {
-        let (mut sim, rules, ai_house, enemy_house) = defense_forces_world();
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
-        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
-        let core = sim
-            .spawn_object_at_height("GACNST", &ai_owner, 15, 15, 0, 0, &rules)
-            .expect("the fixture cell admits the yard");
-        sim.attach_object_trigger_tag(core, Some("LOSE_TAG"));
-        let tank = sim
-            .spawn_object_at_height("MTNK", &ai_owner, 17, 14, 0, 0, &rules)
-            .expect("the fixture cell admits the tank");
-        let next_tank = sim
-            .spawn_object_at_height("MTNK", &ai_owner, 16, 13, 0, 0, &rules)
-            .expect("the fixture cell admits the tank");
-        sim.spawn_object_at_height("MTNK", &ai_owner, 18, 13, 0, 0, &rules)
-            .expect("the fixture cell admits the tank");
-        sim.spawn_object_at_height("TAGUNIT", &enemy_owner, 16, 15, 0, 0, &rules)
-            .expect("the fixture cell admits the vehicle");
-        sim.spawn_object_at_height("TAGUNIT", &enemy_owner, 15, 16, 0, 0, &rules)
-            .expect("the fixture cell admits the vehicle");
-        let mut runtime = SimRuntime::from_simulation(sim);
-        runtime.resources = crate::sim::runtime::SimResources::new(rules);
-
-        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
-        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
-        let first = ai.orders(&runtime, 0);
-        assert!(
-            first.iter().any(|envelope| {
-                matches!(envelope.payload, super::Command::Attack { attacker_id, .. } if attacker_id == tank)
-            }),
-            "the first window sends the nearest hunter"
-        );
-        // The next window: the squad is not out, so the siege draws the
-        // next hunter — a different unit at the same line.
-        let follow_up = ai.orders(&runtime, 30);
-        let hunt = follow_up
-            .iter()
-            .find_map(|envelope| match envelope.payload {
-                super::Command::Attack { attacker_id, .. } => Some(attacker_id),
-                _ => None,
-            });
-        assert_eq!(
-            hunt,
-            Some(next_tank),
-            "the second window sends the next hunter at the siege"
-        );
-        let persona = ai.defense.as_ref().expect("the persona stays adopted");
-        assert_eq!(
-            persona.leak_interceptors,
-            vec![tank, next_tank],
-            "both hunters ride the chase book"
         );
     }
 
