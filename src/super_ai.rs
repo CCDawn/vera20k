@@ -799,6 +799,9 @@ const DEFENSE_RESCUE_PRESSURE_MIN: usize = 6;
 const DEFENSE_RESCUE_CLUSTER_RADIUS: i32 = 5;
 /// The smallest cluster a destructive special is worth its cooldown for.
 const DEFENSE_RESCUE_CLUSTER_MIN: usize = 4;
+/// Ticks between the garrison replenish surveys (the casualty ledger's
+/// own window; the dispatch inside rides the shared garrison clock).
+const DEFENSE_REPLENISH_TICKS: u32 = 75;
 /// Ticks between the rescue's launches — the conservative cooldown.
 const DEFENSE_RESCUE_COOLDOWN_TICKS: u32 = 900;
 /// The hit latch: after a protected target is seen wounded, the rescue
@@ -1499,6 +1502,13 @@ struct DefensePersona {
     protected_hit_until: u32,
     /// Earliest tick the rescue special may fire again.
     rescue_due: u32,
+    /// The garrison casualty ledger: each surveyed target\'
+    /// occupants+inbound total at the last pass, and the deaths the
+    /// ledger has caught waiting for their refill.
+    garrison_snapshot: Vec<(u64, usize)>,
+    garrison_casualties: usize,
+    /// Earliest tick the replenish survey may run again.
+    replenish_due: u32,
 }
 
 impl DefensePersona {
@@ -1518,6 +1528,9 @@ impl DefensePersona {
             protected_health: Vec::new(),
             protected_hit_until: 0,
             rescue_due: 0,
+            garrison_snapshot: Vec::new(),
+            garrison_casualties: 0,
+            replenish_due: 0,
         }
     }
 
@@ -9206,6 +9219,10 @@ impl SuperAi {
         if let Some(command) = self.defense_line_orders(sim, rules, opening, home_center, tick) {
             return Some(vec![command]);
         }
+        if let Some(command) = self.defense_garrison_orders(sim, rules, opening, home_center, tick)
+        {
+            return Some(vec![command]);
+        }
         if let Some(command) = self.defense_army_orders(sim, rules, opening, owner, tick) {
             return Some(vec![command]);
         }
@@ -9880,6 +9897,128 @@ impl SuperAi {
             }
         }
         None
+    }
+
+    /// The garrison replenish loop (mode A): the existing garrison scan
+    /// and its dispatch keep the garrisonable holds manned exactly as the
+    /// battle branch runs them (the scan reads the side's own
+    /// `defense_bunker` rows today; the widening lands in its own branch
+    /// and this loop inherits it); this wrapper adds the casualty ledger —
+    /// a surveyed target whose occupants+inbound total dropped since the
+    /// last pass latches the deaths — and the infantry file that refills
+    /// them through the shared production choke point.
+    fn defense_garrison_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        home_center: Option<(i16, i16)>,
+        tick: u32,
+    ) -> Option<Command> {
+        if self.defense.is_none() {
+            return None;
+        }
+        let center = home_center?;
+        // The paced survey: advance the window, then the casualty ledger —
+        // a target whose garrison shrank latches the losses, and a target
+        // that fell outright charges its whole old count. The snapshot is
+        // written before the dispatch reads it, so walkers this pass arms
+        // land in the next pass's book.
+        {
+            let persona = self.defense.as_mut().expect("checked above");
+            if tick < persona.replenish_due {
+                return None;
+            }
+            persona.replenish_due = tick + DEFENSE_REPLENISH_TICKS;
+            let house = self.house;
+            let mut snapshot: Vec<(u64, usize)> = Vec::new();
+            let mut casualties = 0usize;
+            for &building in &self.garrison_targets {
+                let Some(entity) = sim.substrate().entities.get(building) else {
+                    if let Some(&(_, old)) = persona
+                        .garrison_snapshot
+                        .iter()
+                        .find(|&(old_id, _)| *old_id == building)
+                    {
+                        casualties += old;
+                    }
+                    continue;
+                };
+                // The hold may be the neutral civilian the scan latched —
+                // only standing matters here, the same read the dispatch's
+                // retention takes.
+                let standing = entity.lifecycle.object_alive() && !entity.lifecycle.in_limbo();
+                let manned = if standing {
+                    (entity.passenger_role.occupants().count().max(0) as usize)
+                        + self
+                            .garrison_inbound
+                            .iter()
+                            .filter(|&&(target, _)| target == building)
+                            .count()
+                } else {
+                    0
+                };
+                if let Some(&(_, old)) = persona
+                    .garrison_snapshot
+                    .iter()
+                    .find(|&(old_id, _)| *old_id == building)
+                {
+                    casualties += old.saturating_sub(manned);
+                }
+                if standing {
+                    snapshot.push((building, manned));
+                }
+            }
+            persona.garrison_snapshot = snapshot;
+            persona.garrison_casualties = persona.garrison_casualties.saturating_add(casualties);
+        }
+        // The dispatch: the existing garrison chain (scan + walk-in) runs
+        // exactly as the battle branch drives it.
+        if let Some(command) = self.garrison_orders(sim, rules, opening, center, tick) {
+            return Some(command);
+        }
+        // The refill: latched deaths or an outstanding scan demand put one
+        // basic soldier in the barracks line, full price, the shared
+        // retry gate pacing it.
+        let replenish_armed = self
+            .defense
+            .as_ref()
+            .is_some_and(|persona| persona.garrison_casualties > 0)
+            || self.garrison_demand > 0;
+        if !replenish_armed {
+            return None;
+        }
+        let Some(ty) = rules.object(opening.basic_infantry) else {
+            return None;
+        };
+        let queue = crate::sim::production::queue_view_for_owner(
+            sim,
+            rules,
+            &sim.interner().resolve(self.house).to_string(),
+        );
+        if queue
+            .iter()
+            .any(|item| item.queue_category == crate::sim::production::ProductionCategory::Infantry)
+        {
+            return None;
+        }
+        if crate::sim::production::credits_for_owner(
+            sim,
+            &sim.interner().resolve(self.house).to_string(),
+        ) < ty.cost
+        {
+            return None;
+        }
+        let Some(type_id) = sim.interner().get(opening.basic_infantry) else {
+            return None;
+        };
+        if !self.production_retry_ready(sim, rules, type_id, tick) {
+            return None;
+        }
+        if let Some(persona) = self.defense.as_mut() {
+            persona.garrison_casualties = persona.garrison_casualties.saturating_sub(1);
+        }
+        self.file_production(sim, rules, type_id, tick)
     }
 
     /// The army mix (mode A): the observed wave composition sets each
@@ -21123,13 +21262,19 @@ mod tests {
         InternedId,
     ) {
         defense_world_with(
-            "[BuildingTypes]\n1=GACNST\n2=GADEPT\n\
+            "[BuildingTypes]\n1=GACNST\n2=GADEPT\n3=CIVHOLD\n\
              [GACNST]\nStrength=1000\nFoundation=1x1\nCost=2000\nTechLevel=1\n\
              [GADEPT]\nStrength=1000\nFoundation=1x1\nUnitRepair=yes\nCost=800\nTechLevel=1\n\
              [MTNK]\nStrength=100\nSpeed=6\nSpeedType=Track\nMovementZone=Normal\nCost=700\n\
              TechLevel=1\nLocomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n\
              [FV]\nStrength=120\nSpeed=10\nSpeedType=Wheel\nMovementZone=Normal\nCost=600\n\
-             TechLevel=1\nLocomotor={4A582742-9839-11d1-B709-00A024DDAFD1}\n",
+             TechLevel=1\nLocomotor={4A582742-9839-11d1-B709-00A024DDAFD1}\n\
+             [CIVHOLD]\nStrength=400\nFoundation=1x1\nCanBeOccupied=yes\n\
+             MaxNumberOccupants=5\nTechLevel=1\n\
+             [InfantryTypes]\n2=E1\n\
+             [E1]\nStrength=100\nSpeed=4\nSpeedType=Foot\n\
+             MovementZone=Infantry\nCost=200\nTechLevel=1\n\
+             Locomotor={4A582744-9839-11d1-B709-00A024DDAFD1}\n",
             "1=MTNK\n2=FV\n",
         )
     }
@@ -21527,5 +21672,112 @@ mod tests {
             (17..=19).contains(&target_rx) && (17..=18).contains(&target_ry),
             "the aim lands on the densest shoulder, got ({target_rx},{target_ry})"
         );
+    }
+
+    // ---- D2, pillar 3: the garrison replenish ----
+
+    /// The casualty ledger and the refill: a surveyed hold whose
+    /// occupants+inbound total dropped since the last pass latches the
+    /// losses, the existing garrison chain keeps the dispatch running, and
+    /// the refill files the basic soldier through the shared production
+    /// choke point.
+    #[test]
+    fn defense_garrison_replenish_refills_the_casualty_ledger() {
+        let (mut sim, rules, ai_house, enemy_house) = defense_forces_world();
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let _enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 15, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        // The garrisoned hold: a neutral passive house's occupiable
+        // building next to home, revealed so the scan admits it.
+        let neutral = sim.interner.intern("NeutralHold");
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                neutral, 2, None, false, 0, 10,
+            ));
+        sim.houses
+            .get_mut(&neutral)
+            .expect("the neutral house")
+            .set_multiplay_passive_for_test(true);
+        let neutral_owner = sim.interner.resolve(neutral).to_string();
+        let hold = sim
+            .spawn_object_at_height("CIVHOLD", &neutral_owner, 16, 16, 0, 0, &rules)
+            .expect("the fixture cell admits the hold");
+        // The fog grid sizes itself with the map load the fixture skips;
+        // size it to the fixture board before revealing the hold.
+        {
+            // The fog grid sizes itself with the map load the fixture
+            // skips: install a board-sized state, then reveal the hold.
+            *sim.fog_mut_for_test() = crate::sim::vision::FogState::new(33, 33);
+            sim.fog_mut_for_test()
+                .set_ground_bits_for_test(ai_house, 16, 16, 0x08);
+        }
+        sim.houses
+            .get_mut(&ai_house)
+            .expect("the defense house")
+            .economy_mut_for_test()
+            .add_credits(99999);
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        // Seed the ledger from the previous pass: two men held the hold,
+        // and this pass finds it empty — the drop is the casualty.
+        ai.defense
+            .as_mut()
+            .expect("the persona stays adopted")
+            .garrison_snapshot
+            .push((hold, 2));
+        // First pass: the scan latches the hold (no walker nearby to
+        // dispatch), the demand arms, and the refill files the basic
+        // soldier for it.
+        let commands = ai.orders(&runtime, 0);
+        assert!(
+            ai.garrison_demand > 0,
+            "the scan latches the empty hold's demand"
+        );
+        let filed = commands.iter().find_map(|envelope| match envelope.payload {
+            super::Command::QueueProduction { type_id } => Some(type_id),
+            _ => None,
+        });
+        let expected = runtime.simulation.interner().get("E1");
+        assert_eq!(
+            filed, expected,
+            "the refill files the basic soldier for the hold"
+        );
+
+        // Second pass, past the first survey: the ledger compares the hold
+        // against the seeded book — two men held it, none hold it now —
+        // and latches the two deaths. The first pass\'
+        // empty survey rolled the seed away, so the book is re-seeded
+        // the way the prior pass would have left it. The refill itself
+        // is paced by the production retry window, so no second file
+        // goes out.
+        ai.defense
+            .as_mut()
+            .expect("the persona stays adopted")
+            .garrison_snapshot
+            .push((hold, 2));
+        let commands = ai.orders(&runtime, 100);
+        let persona = ai.defense.as_ref().expect("the persona stays adopted");
+        assert_eq!(
+            persona.garrison_casualties, 2,
+            "the ledger latches the two lost occupants"
+        );
+        assert_eq!(
+            persona.garrison_snapshot,
+            vec![(hold, 0usize)],
+            "the ledger's snapshot rolls to the surveyed state"
+        );
+        // The refill is paced, not re-filed every pass. (The battle wheel
+        // may still file its own core tank on the shared queue behind this
+        // branch — the documented residual.)
+        let e1 = runtime.simulation.interner().get("E1");
+        assert!(commands.iter().all(|envelope| {
+            !matches!(
+                envelope.payload,
+                super::Command::QueueProduction { type_id } if Some(type_id) == e1
+            )
+        }));
     }
 }
