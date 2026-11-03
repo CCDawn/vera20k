@@ -79,6 +79,7 @@ use vera20k_core::headless_scenario::{self, HeadlessScenario, SIM_TICK_MS};
 use vera20k_core::sim::command::{Command, CommandEnvelope};
 use vera20k_core::sim::intern::InternedId;
 use vera20k_core::sim::runtime::SimRuntime;
+use vera20k_core::sim::world::{FrameEffects, TickLane};
 use vera20k_core::skirmish_launch::{AiDifficulty, LaunchCountry};
 
 use sim_bench_match::MatchScenario;
@@ -474,11 +475,20 @@ trait Frames {
     fn state_hash(&self) -> u64;
     /// After each completed frame, with every completed frame's time.
     fn completed(&mut self, tick: u64, times: &[Duration]);
+    /// Whether the run reached its stop condition and the loop should end
+    /// early (the defense run's terminal frame).
+    fn stop(&self) -> bool {
+        false
+    }
 }
 
 struct Bench<'a> {
     runtime: &'a mut SimRuntime,
     plan: &'a mut Plan,
+    /// The defense run's terminal frame latched here: the frames past a
+    /// lose outcome stop committing (the sim freezes), so the loop ends
+    /// there instead of re-reading the frozen frame to the budget.
+    stopped: bool,
 }
 
 impl Frames for Bench<'_> {
@@ -490,6 +500,32 @@ impl Frames for Bench<'_> {
     }
 
     fn advance(&mut self, commands: &[CommandEnvelope]) -> Result<(), String> {
+        // The defense run keeps the frame output: a lose outcome leaves
+        // `frame_committed` false (and latches the terminal score), and
+        // every frame past it is a frozen re-read. The loop stops on that
+        // frame — the repro line carries its tick and seed.
+        let defense = matches!(&*self.plan, Plan::Match(script) if script.defense_active());
+        if defense {
+            let output = self
+                .runtime
+                .advance_frame(
+                    commands,
+                    SIM_TICK_MS,
+                    TickLane::Ordinary,
+                    FrameEffects::default(),
+                )
+                .map_err(|error| error.to_string())?;
+            if output.tick.terminal_score_finalized || !output.tick.frame_committed {
+                self.stopped = true;
+                println!(
+                    "defense_terminal tick={} frame_committed={} terminal_score_finalized={}",
+                    output.tick.tick,
+                    output.tick.frame_committed,
+                    output.tick.terminal_score_finalized
+                );
+            }
+            return Ok(());
+        }
         self.runtime
             .advance_frame_for_tooling(commands, SIM_TICK_MS)
             .map_err(|error| error.to_string())
@@ -515,6 +551,10 @@ impl Frames for Bench<'_> {
                 println!("progress tick={} mean_ms=- {line}", tick + 1);
             }
         }
+    }
+
+    fn stop(&self) -> bool {
+        self.stopped
     }
 }
 
@@ -550,6 +590,11 @@ fn run_frames(
             measured.hashes.push((tick + 1, hash));
         }
         frames.completed(tick, &measured.times);
+        // The defense run's terminal frame ends the loop early; the report
+        // and wave trace cover the frames that ran.
+        if frames.stop() {
+            return (measured, Ok(()));
+        }
     }
     (measured, Ok(()))
 }
@@ -741,6 +786,7 @@ fn main() -> Result<(), String> {
         &mut Bench {
             runtime: &mut *runtime,
             plan: &mut plan,
+            stopped: false,
         },
         ticks,
         args.hash_every,
@@ -764,8 +810,11 @@ fn main() -> Result<(), String> {
                     "wave_action team={:?} ok={ok} detail={:?}",
                     event.trigger, event.detail
                 );
-            } else if let Some(failure) = &event.detail {
-                println!("trigger_note action={action} {failure}");
+            } else {
+                println!(
+                    "trigger_note action={action} trigger={:?} event={:?} value={:?} ok={:?} detail={:?}",
+                    event.trigger, event.event, event.value, event.ok, event.detail
+                );
             }
         }
         println!(
