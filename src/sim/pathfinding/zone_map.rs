@@ -626,7 +626,7 @@ impl ZoneGrid {
     /// raw row value `0xFFFF`. Otherwise it projects the cell's own base
     /// cluster through the movement row. It reads the current native cell
     /// identity and flags rather than a cache.
-    pub(crate) fn get_zone_id_native(
+    pub fn get_zone_id_native(
         &self,
         terrain: &ResolvedTerrainGrid,
         coord: (u16, u16),
@@ -809,7 +809,7 @@ impl ZoneGrid {
         self.maps.contains_key(&mz).then_some(&self.hierarchy)
     }
 
-    pub(crate) fn bridge_records(&self) -> &[crate::sim::bridge_state::BridgeEndpointRecord] {
+    pub fn bridge_records(&self) -> &[crate::sim::bridge_state::BridgeEndpointRecord] {
         &self.bridge_records
     }
 

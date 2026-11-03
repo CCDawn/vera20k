@@ -3378,6 +3378,10 @@ impl Simulation {
         &self.interner
     }
 
+    pub fn substrate(&self) -> &ObjectSubstrate {
+        &self.substrate
+    }
+
     pub fn production(&self) -> &ProductionState {
         &self.production
     }
