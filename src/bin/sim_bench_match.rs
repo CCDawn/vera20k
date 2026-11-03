@@ -905,6 +905,13 @@ impl MatchScenario {
         self.houses.iter().filter(|house| house.computer).count()
     }
 
+    /// Whether the run seats a defense persona (`--defense`): the frame
+    /// loop reads the per-frame output on those runs and stops at the
+    /// terminal frame.
+    pub(crate) fn defense_active(&self) -> bool {
+        self.defense_ai.is_some()
+    }
+
     fn defeated(runtime: &SimRuntime, id: InternedId) -> bool {
         runtime
             .simulation
@@ -1317,7 +1324,7 @@ impl MatchScenario {
             .defense_books()
             .map(|books| {
                 format!(
-                    "wave_in={} bearings={} foe_i={} foe_v={} foe_a={} protected={} line={} repair={} leak={}",
+                    "wave_in={} bearings={} foe_i={} foe_v={} foe_a={} sched_i={} sched_v={} sched_a={} protected={} line={} repair={} leak={} statue_hp={} owned={}",
                     books
                         .next_wave_estimate
                         .map_or("-".into(), |frames| frames.to_string()),
@@ -1325,10 +1332,15 @@ impl MatchScenario {
                     books.observed_infantry,
                     books.observed_vehicles,
                     books.observed_aircraft,
+                    books.scheduled_infantry,
+                    books.scheduled_vehicles,
+                    books.scheduled_aircraft,
                     books.protected_targets,
                     books.line_posts,
                     books.repair_inbound,
                     books.leak_interceptors,
+                    books.protected_min_health,
+                    books.protected_owned,
                 )
             })
             .unwrap_or_default();

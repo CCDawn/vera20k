@@ -767,19 +767,36 @@ const DEFENSE_OBJECTIVE_POSTS: usize = 24;
 /// Posts within this many cells of the core count toward its ring's
 /// quota.
 const DEFENSE_OBJECTIVE_RING_SPREAD: i32 = 12;
-/// The core's ring fan: the line's nine-cell hug stood off three times
-/// wider, so the posts clear the core's own defensive structures.
-const DEFENSE_OBJECTIVE_OFFSETS: [(i8, i8); 9] = [
-    (0, 0),
-    (3, 0),
-    (0, 3),
-    (-3, 0),
-    (0, -3),
-    (3, 3),
-    (-3, 3),
-    (3, -3),
-    (-3, -3),
-];
+/// The core's guard fan, sized to the answer it must hold: the standing
+/// ±3 hug first, then the same 3-cell lattice's ±6, ±9 and ±12 shells out
+/// to the ring spread. An answer wider than one shell stands on the next
+/// shell out — the schedule's air answer has posts to hold at the core
+/// instead of stalling on nine cells.
+fn defense_objective_fan(answer: usize) -> Vec<(i8, i8)> {
+    // Two shells out to ±6: a wider fan spread the posts along the wave's
+    // approach and the wave ground through them one shell at a time. The
+    // objective keeps its guards concentrated; an answer wider than the
+    // fan fights from the collapse pool instead of sprawling further.
+    const SHELL_STEP: i8 = 3;
+    const SHELLS: i8 = 2;
+    let shells = SHELLS
+        .min(i8::try_from(DEFENSE_OBJECTIVE_RING_SPREAD / i32::from(SHELL_STEP)).unwrap_or(3));
+    let mut fan: Vec<(i8, i8)> = Vec::new();
+    for shell in 0..=shells {
+        for dy in -shell..=shell {
+            for dx in -shell..=shell {
+                let offset = (dx * SHELL_STEP, dy * SHELL_STEP);
+                if !fan.contains(&offset) {
+                    fan.push(offset);
+                }
+            }
+        }
+        if fan.len() >= answer {
+            break;
+        }
+    }
+    fan
+}
 /// A hostile mobile within this many cells of the nearest protected
 /// target — else of the home center — is past the line: a leak.
 const DEFENSE_LEAK_RADIUS: i32 = 12;
@@ -798,10 +815,10 @@ const DEFENSE_REAR_RING: i32 = 4;
 const DEFENSE_AA_PER_AIRCRAFT: usize = 2;
 /// The army mix's AA floor: one answer gun even with no aircraft observed.
 const DEFENSE_AA_FLOOR: usize = 1;
-/// The army mix's AA ceiling over the two-guns-per-plane answer: a wave
-/// of `n` aircraft demands at most this multiple of itself, so a huge
-/// air wave scales the answer and a lone scout cannot flood the lines.
-const DEFENSE_AA_CEILING_MULTIPLIER: usize = 3;
+/// The army mix's answer ceiling per role: a wave of `n` of one category
+/// demands at most this multiple of itself, so a huge wave scales the
+/// answer and a lone scout cannot flood the lines.
+const DEFENSE_ANSWER_CEILING_MULTIPLIER: usize = 3;
 /// The army mix's armor margin above the observed vehicles, with its
 /// floor (the baseline line) and cap.
 const DEFENSE_ARMOR_MARGIN: usize = 2;
@@ -1491,6 +1508,11 @@ pub struct DefenseBooks {
     pub observed_infantry: usize,
     pub observed_vehicles: usize,
     pub observed_aircraft: usize,
+    /// The armed wave schedule's remaining strength, by category, at the
+    /// last scan.
+    pub scheduled_infantry: usize,
+    pub scheduled_vehicles: usize,
+    pub scheduled_aircraft: usize,
     /// The "this falls, you lose" structures the last walk resolved.
     pub protected_targets: usize,
     /// Units posted on the defense line.
@@ -1499,6 +1521,13 @@ pub struct DefenseBooks {
     pub repair_inbound: usize,
     /// Units chasing a leak.
     pub leak_interceptors: usize,
+    /// The wounded-est protected target's current health at the last scan
+    /// (the statue's wound watch, for harnesses).
+    pub protected_min_health: i32,
+    /// Whether every standing protected target reads as our own at the
+    /// last scan: the map's give chains re-own the objective mid-game,
+    /// and a flipped charge is its own hazard (our fire acquires it).
+    pub protected_owned: bool,
 }
 
 /// The defense personality's pinned perception, mode A skeleton
@@ -1520,6 +1549,15 @@ struct DefensePersona {
     spawn_bearings: Vec<SpawnBearing>,
     /// The hostile presence on the field at the last scan.
     observed_wave_composition: WaveComposition,
+    /// The armed wave schedule's remaining composition, summed over every
+    /// armed trigger that both spawns a team and names its TeamType: the
+    /// answer the map still has coming, read before any of it reaches the
+    /// field.
+    scheduled_wave_composition: WaveComposition,
+    /// Whether every standing protected target reads as our own at the
+    /// last scan: the map's give chains re-own the objective mid-game,
+    /// and a flipped charge is its own hazard (our fire acquires it).
+    protected_owned: bool,
     /// Standing own structures whose object-attached Tag chain reads a
     /// destroyed-by-anything event (7) into a lose outcome (actions 2/68):
     /// the map's "this falls, you lose" set. Chains the direct walk cannot
@@ -1562,6 +1600,8 @@ impl DefensePersona {
         Self {
             stance,
             next_wave_estimate: None,
+            scheduled_wave_composition: WaveComposition::default(),
+            protected_owned: true,
             spawn_bearings: Vec::new(),
             observed_wave_composition: WaveComposition::default(),
             protected_targets: Vec::new(),
@@ -3329,10 +3369,20 @@ impl SuperAi {
             observed_infantry: persona.observed_wave_composition.infantry,
             observed_vehicles: persona.observed_wave_composition.vehicles,
             observed_aircraft: persona.observed_wave_composition.aircraft,
+            scheduled_infantry: persona.scheduled_wave_composition.infantry,
+            scheduled_vehicles: persona.scheduled_wave_composition.vehicles,
+            scheduled_aircraft: persona.scheduled_wave_composition.aircraft,
             protected_targets: persona.protected_targets.len(),
             line_posts: persona.line_posts.len(),
             repair_inbound: persona.repair_inbound.len(),
             leak_interceptors: persona.leak_interceptors.len(),
+            protected_owned: persona.protected_owned,
+            protected_min_health: persona
+                .protected_health
+                .iter()
+                .map(|&(_, health)| health)
+                .min()
+                .unwrap_or(-1),
         })
     }
 
@@ -9113,6 +9163,7 @@ impl SuperAi {
         // deadline; the nearest deadline is the estimate.
         let mut next_wave: Option<i32> = None;
         let mut bearings: Vec<SpawnBearing> = Vec::new();
+        let mut scheduled = WaveComposition::default();
         for view in sim
             .trigger_runtime()
             .armed_trigger_views(frame)
@@ -9159,6 +9210,39 @@ impl SuperAi {
                 if !bearings.contains(&bearing) {
                     bearings.push(bearing);
                 }
+            }
+            // The schedule's own answer: the team this action spawns, by
+            // its taskforce's resolved member categories — the map's
+            // remaining wave strength, read before any of it shows. The
+            // widest single wave leads: answering one wave at a time keeps
+            // every role producible (a summed schedule asks for thousands
+            // of tanks, and the deepest-deficit file order would never
+            // reach the air answer beneath it).
+            if let Some(team) = spawn
+                .team_type
+                .as_deref()
+                .and_then(|team| sim.interner().get(team))
+                .and_then(|team| sim.team_script_vm().task_force_of(team))
+            {
+                let mut wave = WaveComposition::default();
+                for entry in &team.entries {
+                    let count = entry.count.max(0) as usize;
+                    match entry.member_type.category {
+                        crate::rules::object_type::ObjectCategory::Infantry => {
+                            wave.infantry += count
+                        }
+                        crate::rules::object_type::ObjectCategory::Vehicle => {
+                            wave.vehicles += count
+                        }
+                        crate::rules::object_type::ObjectCategory::Aircraft => {
+                            wave.aircraft += count
+                        }
+                        _ => {}
+                    }
+                }
+                scheduled.infantry = scheduled.infantry.max(wave.infantry);
+                scheduled.vehicles = scheduled.vehicles.max(wave.vehicles);
+                scheduled.aircraft = scheduled.aircraft.max(wave.aircraft);
             }
             // Timing: the live elapsed-time timer (13/51), else the
             // earliest event-47 deadline at the reading frame.
@@ -9261,9 +9345,16 @@ impl SuperAi {
         let persona = self.defense.as_mut().expect("the persona stays adopted");
         persona.spawn_bearings = bearings;
         persona.next_wave_estimate = next_wave;
+        persona.scheduled_wave_composition = scheduled;
         persona.observed_wave_composition = composition;
         persona.protected_targets = protected_targets;
         persona.protected_health = protected_health;
+        persona.protected_owned = persona.protected_targets.iter().all(|&id| {
+            sim.substrate()
+                .entities
+                .get(id)
+                .is_some_and(|entity| entity.owner() == self.house)
+        });
         if core_hit {
             persona.protected_hit_until = frame.max(0) as u32 + DEFENSE_CORE_HIT_LATCH_TICKS;
         }
@@ -9837,44 +9928,59 @@ impl SuperAi {
     /// site scan. Drift past [`DEFENSE_LINE_DRIFT_CELLS`] walks the
     /// drifter back first — holding the line, never marching it.
     /// The objective ring's quota: the baseline ring, raised to the army
-    /// The mix's role targets for the observed wave: air answered two guns
-    /// to one (ceiling at [`DEFENSE_AA_CEILING_MULTIPLIER`] times the
-    /// observation, so an 80-plane wave asks for 160 guns instead of the
-    /// old flat 8), armor and foot answered with a margin over the
-    /// observed counts, every target floored so an early quiet map still
-    /// fields a baseline. `defense_army_orders` files the deficits and the
-    /// objective ring sizes itself on the sum.
-    fn defense_mix_targets(&self, sim: &crate::sim::world::Simulation) -> (usize, usize, usize) {
+    /// The mix's role targets for the wave the map holds: the field's
+    /// observed presence answered two guns to one plane, a margin over the
+    /// observed vehicles and infantry — and behind both, the armed
+    /// schedule's remaining composition answered the same way with the
+    /// flat caps lifted, so production keeps running while the schedule
+    /// holds an answer it has not fielded yet (an airstrike that spawns
+    /// on the map only becomes an observation once it is already here).
+    /// Every target floored so an early quiet map still fields a baseline.
+    /// `defense_army_orders` files the deficits and the objective ring
+    /// sizes itself on the sum.
+    fn defense_mix_targets(&self) -> (usize, usize, usize) {
         let Some(persona) = self.defense.as_ref() else {
             return (DEFENSE_AA_FLOOR, DEFENSE_ARMOR_FLOOR, DEFENSE_FOOT_FLOOR);
         };
-        let composition = persona.observed_wave_composition;
-        let anti_air = if composition.aircraft > 0 {
-            (composition.aircraft * DEFENSE_AA_PER_AIRCRAFT)
+        let observed = persona.observed_wave_composition;
+        let scheduled = persona.scheduled_wave_composition;
+        let observed_air = if observed.aircraft > 0 {
+            (observed.aircraft * DEFENSE_AA_PER_AIRCRAFT)
                 .max(DEFENSE_AA_FLOOR)
-                .min(composition.aircraft * DEFENSE_AA_CEILING_MULTIPLIER)
+                .min(observed.aircraft * DEFENSE_ANSWER_CEILING_MULTIPLIER)
         } else {
             DEFENSE_AA_FLOOR
         };
-        let anti_armor = (composition.vehicles + DEFENSE_ARMOR_MARGIN)
+        let scheduled_air = scheduled.aircraft * DEFENSE_AA_PER_AIRCRAFT;
+        let anti_air = observed_air.max(scheduled_air);
+        let observed_armor = (observed.vehicles + DEFENSE_ARMOR_MARGIN)
             .max(DEFENSE_ARMOR_FLOOR)
             .min(DEFENSE_ARMOR_CAP);
-        let anti_foot = (composition.infantry + DEFENSE_FOOT_MARGIN)
+        let scheduled_armor = if scheduled.vehicles > 0 {
+            (scheduled.vehicles + DEFENSE_ARMOR_MARGIN)
+                .min(scheduled.vehicles * DEFENSE_ANSWER_CEILING_MULTIPLIER)
+        } else {
+            0
+        };
+        let anti_armor = observed_armor.max(scheduled_armor);
+        let observed_foot = (observed.infantry + DEFENSE_FOOT_MARGIN)
             .max(DEFENSE_FOOT_FLOOR)
             .min(DEFENSE_FOOT_CAP);
+        let scheduled_foot = if scheduled.infantry > 0 {
+            (scheduled.infantry + DEFENSE_FOOT_MARGIN)
+                .min(scheduled.infantry * DEFENSE_ANSWER_CEILING_MULTIPLIER)
+        } else {
+            0
+        };
+        let anti_foot = observed_foot.max(scheduled_foot);
         (anti_air, anti_armor, anti_foot)
     }
 
     /// The objective ring's quota: the baseline ring, raised to the mix's
     /// own answer to the observed wave — the ring holds the wave the map
     /// sends, not a token guard.
-    fn defense_objective_quota(&self, sim: &crate::sim::world::Simulation) -> usize {
-        let Some(persona) = self.defense.as_ref() else {
-            return DEFENSE_OBJECTIVE_POSTS;
-        };
-        let composition = persona.observed_wave_composition;
-        let (anti_air, anti_armor, anti_foot) = self.defense_mix_targets(sim);
-        let _ = composition;
+    fn defense_objective_quota(&self) -> usize {
+        let (anti_air, anti_armor, anti_foot) = self.defense_mix_targets();
         DEFENSE_OBJECTIVE_POSTS.max(anti_air + anti_armor + anti_foot)
     }
 
@@ -9986,6 +10092,7 @@ impl SuperAi {
         home_center: Option<(i16, i16)>,
         tick: u32,
     ) -> Option<Command> {
+        let objective_fan = defense_objective_fan(self.defense_objective_quota());
         if self.defense.is_none() {
             return None;
         }
@@ -10103,7 +10210,7 @@ impl SuperAi {
             // The air sub-ring first: the core's air answer, held only by
             // the AntiAir roster at the mix's anti-air target — an 80-plane
             // wave asks for its own guns at the core, not the flat floor.
-            let (anti_air, _, _) = self.defense_mix_targets(sim);
+            let (anti_air, _, _) = self.defense_mix_targets();
             let aa_staffed = rows_near
                 .iter()
                 .filter(|&&(unit, _)| row_is_aa(sim, unit))
@@ -10117,8 +10224,7 @@ impl SuperAi {
                     Some(Role::AntiAir),
                 );
                 for &(_, unit) in &candidates {
-                    let Some(post) =
-                        pick_guard_post(sim, rules, unit, core, &DEFENSE_OBJECTIVE_OFFSETS, None)
+                    let Some(post) = pick_guard_post(sim, rules, unit, core, &objective_fan, None)
                     else {
                         continue;
                     };
@@ -10139,13 +10245,12 @@ impl SuperAi {
             let quota = if under_attack {
                 usize::MAX
             } else {
-                self.defense_objective_quota(sim)
+                self.defense_objective_quota()
             };
             if rows_near.len() < quota {
                 let candidates = self.defense_idle_candidates(sim, opening, core, tick);
                 for &(_, unit) in &candidates {
-                    let Some(post) =
-                        pick_guard_post(sim, rules, unit, core, &DEFENSE_OBJECTIVE_OFFSETS, None)
+                    let Some(post) = pick_guard_post(sim, rules, unit, core, &objective_fan, None)
                     else {
                         continue;
                     };
@@ -10252,7 +10357,6 @@ impl SuperAi {
                 return None;
             }
             persona.replenish_due = tick + DEFENSE_REPLENISH_TICKS;
-            let house = self.house;
             let mut snapshot: Vec<(u64, usize)> = Vec::new();
             let mut casualties = 0usize;
             for &building in &self.garrison_targets {
@@ -10361,7 +10465,7 @@ impl SuperAi {
         tick: u32,
     ) -> Option<Command> {
         // The role targets: the mix's own answer to the observed wave.
-        let (anti_air, anti_armor, anti_foot) = self.defense_mix_targets(sim);
+        let (anti_air, anti_armor, anti_foot) = self.defense_mix_targets();
         // The candidates per role, roster order first, the fallbacks last.
         // The deficits, most-behind first; ties hold the air, armor, foot
         // order — the answer that dies fastest leads.
@@ -22232,12 +22336,12 @@ mod tests {
 
         // Two guns per plane: 80 observed asks for 160, the floored roles
         // keep their baselines, and the ring's quota reads the sum.
-        let (anti_air, anti_armor, anti_foot) = ai.defense_mix_targets(&runtime.simulation);
+        let (anti_air, anti_armor, anti_foot) = ai.defense_mix_targets();
         assert_eq!(anti_air, 160, "eighty planes at two guns each");
         assert_eq!(anti_armor, super::DEFENSE_ARMOR_FLOOR);
         assert_eq!(anti_foot, super::DEFENSE_FOOT_FLOOR);
         assert_eq!(
-            ai.defense_objective_quota(&runtime.simulation),
+            ai.defense_objective_quota(),
             160 + super::DEFENSE_ARMOR_FLOOR + super::DEFENSE_FOOT_FLOOR,
         );
         // The deepest deficit is the air answer: the first production
@@ -22302,13 +22406,110 @@ mod tests {
             unit, fv,
             "the sub-ring takes the AA hull over the nearer ground tank"
         );
-        let distance = super::defense_chebyshev(
-            (i16::try_from(px).unwrap(), i16::try_from(py).unwrap()),
-            (20, 20),
+        // The post must be one of the core fan's own offsets: the
+        // quota this world's mix reads is 18, which opens the fan's
+        // second shell, so the cell may stand off up to six cells.
+        let offset = (
+            (i16::try_from(px).unwrap() - 20) as i8,
+            (i16::try_from(py).unwrap() - 20) as i8,
         );
         assert!(
-            distance <= 3,
+            super::defense_objective_fan(18).contains(&offset),
             "the AA post stands on the core's fan, got ({px},{py})"
+        );
+    }
+
+    /// The armed schedule pre-fields the answer before the strike: with a
+    /// wave trigger armed that spawns twenty aircraft and nothing on the
+    /// field, the mix reads the scheduled wave (forty guns) through the
+    /// same ceiling rules as an observation, and the ring's quota carries
+    /// it — production files the AA answer while the wave is still only
+    /// a trigger.
+    #[test]
+    fn scheduled_wave_pre_fields_the_answer_before_it_spawns() {
+        let map_ini = b"[Map]\nTheater=TEMPERATE\nSize=0,0,2,1\nLocalSize=0,0,2,1\n\
+              [IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n[Basic]\nNewINIFormat=4\n\
+              [Triggers]\nWAVE=<none>,<none>,Wave,0,1,1,1,0\n\
+              [Events]\nWAVE=1,13,0,900\n\
+              [Actions]\nWAVE=1,107,1,TT,0,0,0,0,U\n\
+              [Tags]\nWAVE_TAG=2,Wave,WAVE\n\
+              [TeamTypes]\n0=TT\n[TT]\nHouse=Country0\nScript=S\nTaskForce=F\nWaypoint=A\nMax=1\n\
+              [ScriptTypes]\n0=S\n[S]\n0=5,0\n\
+              [TaskForces]\n0=F\n[F]\n0=20,HORNET\n\
+              [Waypoints]\n0=16014\n";
+        let (sim, rules, ai_house, _enemy_house) = defense_world_build("", map_ini);
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
+
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        let _ = ai.orders(&runtime, 0);
+
+        let persona = ai.defense.as_ref().expect("the persona stays adopted");
+        assert_eq!(
+            persona.scheduled_wave_composition.aircraft, 20,
+            "the armed wave trigger's taskforce reads twenty aircraft"
+        );
+        let (anti_air, anti_armor, anti_foot) = ai.defense_mix_targets();
+        assert_eq!(
+            anti_air, 40,
+            "the scheduled twenty planes ask for their two-guns-per-plane answer"
+        );
+        assert_eq!(anti_armor, super::DEFENSE_ARMOR_FLOOR);
+        assert_eq!(anti_foot, super::DEFENSE_FOOT_FLOOR);
+        assert_eq!(
+            ai.defense_objective_quota(),
+            40 + super::DEFENSE_ARMOR_FLOOR + super::DEFENSE_FOOT_FLOOR,
+        );
+        let _ = rules;
+    }
+
+    /// The guard fan holds two shells: the standing ±3 hug first, the ±6
+    /// shell when the answer needs the room, and never wider — the posts
+    /// stay concentrated at the objective instead of sprawling along the
+    /// wave's approach.
+    #[test]
+    fn the_objective_fan_grows_shells_to_the_answer() {
+        let baseline = super::defense_objective_fan(super::DEFENSE_OBJECTIVE_POSTS);
+        let mut core = baseline[..9].to_vec();
+        core.sort();
+        assert_eq!(
+            core,
+            vec![
+                (-3, -3),
+                (-3, 0),
+                (-3, 3),
+                (0, -3),
+                (0, 0),
+                (0, 3),
+                (3, -3),
+                (3, 0),
+                (3, 3),
+            ],
+            "the innermost shell stays the standing ±3 hug"
+        );
+        assert!(baseline.len() >= super::DEFENSE_OBJECTIVE_POSTS);
+        assert_eq!(
+            super::defense_objective_fan(9).len(),
+            9,
+            "a hug-sized answer stops at one shell"
+        );
+        assert_eq!(
+            super::defense_objective_fan(40).len(),
+            25,
+            "a wider answer caps at the ±6 shell"
+        );
+        let huge = super::defense_objective_fan(usize::MAX);
+        assert_eq!(
+            huge.len(),
+            25,
+            "the fan never sprawls past the ±6 shell, whatever the answer"
+        );
+        let spread = i32::from(super::DEFENSE_OBJECTIVE_RING_SPREAD);
+        assert!(
+            huge.iter()
+                .all(|&(dx, dy)| i32::from(dx).abs().max(i32::from(dy).abs()) <= spread),
+            "no shell runs past the ring spread"
         );
     }
 
@@ -22333,7 +22534,7 @@ mod tests {
         let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
         ai.enable_defense_personality(super::DefenseStance::IndependentZone);
         let _ = ai.orders(&runtime, 0);
-        let quota = ai.defense_objective_quota(&runtime.simulation);
+        let quota = ai.defense_objective_quota();
         assert!(
             quota > super::DEFENSE_OBJECTIVE_POSTS,
             "a heavy observed wave raises the ring above the baseline: got {quota}"
