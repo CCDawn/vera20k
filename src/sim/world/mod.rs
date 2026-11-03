@@ -3382,6 +3382,13 @@ impl Simulation {
         &self.substrate
     }
 
+    /// Trigger-runtime read access for observers (the defense AI's wave and
+    /// protected-target reads). Every mutation stays with the trigger
+    /// owners; see [`TriggerRuntime`]'s view accessors.
+    pub fn trigger_runtime(&self) -> &TriggerRuntime {
+        &self.trigger_runtime
+    }
+
     pub fn production(&self) -> &ProductionState {
         &self.production
     }
