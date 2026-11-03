@@ -9889,7 +9889,21 @@ impl SuperAi {
         anchor: (i16, i16),
         tick: u32,
     ) -> Vec<(i64, u64)> {
+        self.defense_idle_candidates_in_role(sim, opening, anchor, tick, None)
+    }
+
+    /// The same pool, narrowed to one role's roster names when `role` is
+    /// set — the air sub-ring staffs only the AntiAir answer.
+    fn defense_idle_candidates_in_role(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+        anchor: (i16, i16),
+        tick: u32,
+        role: Option<Role>,
+    ) -> Vec<(i64, u64)> {
         let roster = Self::combat_roster(opening);
+        let role_names = role.map(|role| Self::defense_role_entries(opening, role));
         let mut candidates: Vec<(i64, u64)> = sim
             .substrate()
             .entities
@@ -9904,7 +9918,11 @@ impl SuperAi {
                     && !Self::garrisoned(entity)
                     && {
                         let name = sim.interner().resolve(entity.type_ref());
-                        roster.contains(&name) && !Self::is_naval_type(opening, name)
+                        roster.contains(&name)
+                            && !Self::is_naval_type(opening, name)
+                            && role_names
+                                .as_ref()
+                                .is_none_or(|names| names.contains(&name))
                     }
                     && !self.defense_duty(*id)
                     && self.order_gate.get(id).is_none_or(|&due| tick >= due)
@@ -10048,16 +10066,17 @@ impl SuperAi {
         // and the base bearings answer only the raid on the base itself.
         // Same book (line_posts); the pass paces at the window above.
         if let Some(core) = core {
-            let staffed = self
+            // The ring's hollow-aware rows: posted rows whose unit still
+            // stands at its post — a walker does not hold the ring, and
+            // its row admits a replacement while it is away.
+            let aa_roster = Self::defense_role_entries(opening, Role::AntiAir);
+            let rows_near: Vec<(u64, (u16, u16))> = self
                 .defense
                 .as_ref()
                 .expect("checked above")
                 .line_posts
                 .iter()
                 .filter(|&(unit, post)| {
-                    // A hollow row — a unit walking home to repair, or
-                    // fought off its post — does not hold the ring: the
-                    // quota admits its replacement while it is away.
                     let at_post = sim.substrate().entities.get(*unit).is_some_and(|entity| {
                         let cell = (
                             i16::try_from(entity.position.rx()).unwrap_or(post.0 as i16),
@@ -10072,13 +10091,57 @@ impl SuperAi {
                             .unwrap_or(i32::MAX)
                             <= DEFENSE_OBJECTIVE_RING_SPREAD
                 })
+                .map(|&(unit, post)| (unit, post))
+                .collect();
+            let row_is_aa = |sim: &crate::sim::world::Simulation, unit: u64| {
+                sim.substrate()
+                    .entities
+                    .get(unit)
+                    .map(|entity| sim.interner().resolve(entity.type_ref()).to_string())
+                    .is_some_and(|name| aa_roster.iter().any(|entry| *entry == name))
+            };
+            // The air sub-ring first: the core's air answer, held only by
+            // the AntiAir roster at the mix's anti-air target — an 80-plane
+            // wave asks for its own guns at the core, not the flat floor.
+            let (anti_air, _, _) = self.defense_mix_targets(sim);
+            let aa_staffed = rows_near
+                .iter()
+                .filter(|&&(unit, _)| row_is_aa(sim, unit))
                 .count();
+            if aa_staffed < anti_air {
+                let candidates = self.defense_idle_candidates_in_role(
+                    sim,
+                    opening,
+                    core,
+                    tick,
+                    Some(Role::AntiAir),
+                );
+                for &(_, unit) in &candidates {
+                    let Some(post) =
+                        pick_guard_post(sim, rules, unit, core, &DEFENSE_OBJECTIVE_OFFSETS, None)
+                    else {
+                        continue;
+                    };
+                    self.defense
+                        .as_mut()
+                        .expect("checked above")
+                        .line_posts
+                        .push((unit, post));
+                    self.gate_idle_order(unit, tick);
+                    return Some(Command::Guard {
+                        entity_id: unit,
+                        target: Some(crate::sim::combat::TargetKind::Cell(post.0, post.1)),
+                    });
+                }
+            }
+            // Then the mixed ring: everything else the pool fields, up to
+            // the mix's total answer — the whole pool while under attack.
             let quota = if under_attack {
                 usize::MAX
             } else {
                 self.defense_objective_quota(sim)
             };
-            if staffed < quota {
+            if rows_near.len() < quota {
                 let candidates = self.defense_idle_candidates(sim, opening, core, tick);
                 for &(_, unit) in &candidates {
                     let Some(post) =
@@ -22181,6 +22244,72 @@ mod tests {
         // filed rides the AA roster's ungated lead (the Allied IFV).
         let expected = runtime.simulation.interner().get("FV");
         assert_eq!(filed, expected, "the air wave files the AA answer first");
+    }
+
+    /// The core's air sub-ring: with hostile aircraft over the protected
+    /// core and an AA hull idle, the objective staffing posts the AA hull
+    /// onto the core's fan ahead of the mixed ring — the sub-ring answers
+    /// the wave that flies at the objective.
+    #[test]
+    fn air_sub_ring_staffs_the_aa_roster_at_the_core() {
+        let (mut sim, rules, ai_house, enemy_house) = defense_forces_world();
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        let core = sim
+            .spawn_object_at_height("CABHUT", &ai_owner, 20, 20, 0, 0, &rules)
+            .expect("the fixture cell admits the core");
+        sim.attach_object_trigger_tag(core, Some("LOSE_TAG"));
+        // The air wave: five hostile aircraft over the core.
+        for (x, y) in [(21, 21), (21, 22), (22, 21), (22, 22), (23, 21)] {
+            sim.spawn_object_at_height("HORNET", &enemy_owner, x, y, 20, 0, &rules)
+                .expect("the fixture cell admits the aircraft");
+        }
+        // The ground tank stands nearer the intruders: the leak pass at
+        // tick 0 sends it out, and the sub-ring staffs the AA hull on the
+        // next pass instead of re-hunting.
+        let tank = sim
+            .spawn_object_at_height("MTNK", &ai_owner, 17, 14, 0, 0, &rules)
+            .expect("the fixture cell admits the tank");
+        let fv = sim
+            .spawn_object_at_height("FV", &ai_owner, 10, 11, 0, 0, &rules)
+            .expect("the fixture cell admits the AA hull");
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
+
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        ai.pinned_home = Some((10, 10));
+        ai.engine_home = Some((10, 10));
+        let first = ai.orders(&runtime, 0);
+        assert!(
+            first.iter().any(|envelope| {
+                matches!(envelope.payload, super::Command::Attack { attacker_id, .. } if attacker_id == tank)
+            }),
+            "the leak pass hunts with the nearer tank"
+        );
+        let second = ai.orders(&runtime, 1);
+        let posted = second.iter().find_map(|envelope| match envelope.payload {
+            super::Command::Guard {
+                entity_id,
+                target: Some(crate::sim::combat::TargetKind::Cell(px, py)),
+            } => Some((entity_id, px, py)),
+            _ => None,
+        });
+        let (unit, px, py) = posted.expect("the sub-ring pass posts a unit");
+        assert_eq!(
+            unit, fv,
+            "the sub-ring takes the AA hull over the nearer ground tank"
+        );
+        let distance = super::defense_chebyshev(
+            (i16::try_from(px).unwrap(), i16::try_from(py).unwrap()),
+            (20, 20),
+        );
+        assert!(
+            distance <= 3,
+            "the AA post stands on the core's fan, got ({px},{py})"
+        );
     }
 
     #[test]
