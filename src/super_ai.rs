@@ -789,6 +789,21 @@ const DEFENSE_ARMOR_CAP: usize = 16;
 const DEFENSE_FOOT_MARGIN: usize = 2;
 const DEFENSE_FOOT_FLOOR: usize = 4;
 const DEFENSE_FOOT_CAP: usize = 16;
+/// The rescue's wave-peak window: a next-wave estimate at or under this
+/// many frames is "the wave is now".
+const DEFENSE_RESCUE_PEAK_FRAMES: i32 = 90;
+/// The hostile mobiles on the field that turn a peak into pressure.
+const DEFENSE_RESCUE_PRESSURE_MIN: usize = 6;
+/// The hostile mobiles within this many cells of one cell count as its
+/// strike cluster.
+const DEFENSE_RESCUE_CLUSTER_RADIUS: i32 = 5;
+/// The smallest cluster a destructive special is worth its cooldown for.
+const DEFENSE_RESCUE_CLUSTER_MIN: usize = 4;
+/// Ticks between the rescue's launches — the conservative cooldown.
+const DEFENSE_RESCUE_COOLDOWN_TICKS: u32 = 900;
+/// The hit latch: after a protected target is seen wounded, the rescue
+/// trigger stays armed this many frames.
+const DEFENSE_CORE_HIT_LATCH_TICKS: u32 = 150;
 
 /// The wall ring's wallet floor: a wall segment is 100 credits, and the
 /// ring spends dozens of them one production cycle at a time. The floor
@@ -1476,6 +1491,14 @@ struct DefensePersona {
     line_due: u32,
     leak_due: u32,
     repair_due: u32,
+    /// Each protected target's raw health at the last scan — the drop the
+    /// wound watch compares against.
+    protected_health: Vec<(u64, i32)>,
+    /// The frame the wound latch holds until: a protected target seen
+    /// dropping latches the rescue's core-hit trigger this long.
+    protected_hit_until: u32,
+    /// Earliest tick the rescue special may fire again.
+    rescue_due: u32,
 }
 
 impl DefensePersona {
@@ -1492,6 +1515,9 @@ impl DefensePersona {
             line_due: 0,
             leak_due: 0,
             repair_due: 0,
+            protected_health: Vec::new(),
+            protected_hit_until: 0,
+            rescue_due: 0,
         }
     }
 
@@ -9111,6 +9137,29 @@ impl SuperAi {
             .map(|(id, _)| id)
             .collect();
 
+        // The core's wound watch: any protected target whose raw health
+        // dropped since the last scan latches the rescue's hit window (the
+        // type is fixed per target, so raw compares need no rules read).
+        let previous = self
+            .defense
+            .as_ref()
+            .map(|persona| persona.protected_health.clone())
+            .unwrap_or_default();
+        let mut protected_health: Vec<(u64, i32)> = Vec::new();
+        let mut core_hit = false;
+        for &id in &protected_targets {
+            let Some(entity) = sim.substrate().entities.get(id) else {
+                continue;
+            };
+            let health = i32::from(entity.health.current());
+            if let Some(&(_, old)) = previous.iter().find(|&(old_id, _)| *old_id == id)
+                && health < old
+            {
+                core_hit = true;
+            }
+            protected_health.push((id, health));
+        }
+
         // The mutable persona borrow starts last: every read above runs
         // against the immutable `self`.
         let persona = self.defense.as_mut().expect("the persona stays adopted");
@@ -9118,6 +9167,10 @@ impl SuperAi {
         persona.next_wave_estimate = next_wave;
         persona.observed_wave_composition = composition;
         persona.protected_targets = protected_targets;
+        persona.protected_health = protected_health;
+        if core_hit {
+            persona.protected_hit_until = frame.max(0) as u32 + DEFENSE_CORE_HIT_LATCH_TICKS;
+        }
     }
 
     // ---- The defense personality's pillars (D2, mode A) ----
@@ -9125,9 +9178,10 @@ impl SuperAi {
     /// The defense persona's one order for this tick, or `None` to fall
     /// through to the battle branches, which keep the base's economy and
     /// its own close defense running behind it. The priority inside is
-    /// the leak response, then the repair rotation, then the line, then
-    /// the army mix — the scarcest resource first. Every branch is gated
-    /// on the persona being adopted; the battle AI reads none of it.
+    /// the rescue special, the leak response, the repair rotation, the
+    /// line, then the army mix — the scarcest resource first. Every
+    /// branch is gated on the persona being adopted; the battle AI reads
+    /// none of it.
     fn defense_orders(
         &mut self,
         sim: &crate::sim::world::Simulation,
@@ -9139,6 +9193,9 @@ impl SuperAi {
     ) -> Option<Vec<Command>> {
         if self.defense.is_none() {
             return None;
+        }
+        if let Some(commands) = self.defense_rescue_orders(sim, rules, opening, tick) {
+            return Some(commands);
         }
         if let Some(command) = self.defense_leak_orders(sim, rules, opening, home_center, tick) {
             return Some(vec![command]);
@@ -9153,6 +9210,194 @@ impl SuperAi {
             return Some(vec![command]);
         }
         None
+    }
+
+    /// The rescue special (mode A): the persona's charged supers fire at
+    /// home defense instead of the battle suite's siege scoring. The
+    /// triggers are the wave peak — a next-wave estimate inside
+    /// [`DEFENSE_RESCUE_PEAK_FRAMES`] with the observed hostile mobiles at
+    /// [`DEFENSE_RESCUE_PRESSURE_MIN`] — or a wounded protected target
+    /// (the perception's hit latch). The Iron Curtain covers the worst
+    /// wounded protected target; a destructive special (the storm, the
+    /// nuke) strikes the densest hostile cluster; the two-click chrono
+    /// pair and the rest keep the battle suite's own strategies. One
+    /// launch per [`DEFENSE_RESCUE_COOLDOWN_TICKS`]; this walk never
+    /// touches `superweapon_target_for` — the battle branch owns it.
+    fn defense_rescue_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        tick: u32,
+    ) -> Option<Vec<Command>> {
+        let (rescue_armed, protected_hit) = {
+            let persona = self.defense.as_ref()?;
+            if tick < persona.rescue_due {
+                return None;
+            }
+            let hostiles = persona.observed_wave_composition.infantry
+                + persona.observed_wave_composition.vehicles;
+            let wave_peak = persona
+                .next_wave_estimate
+                .is_some_and(|frames| frames <= DEFENSE_RESCUE_PEAK_FRAMES)
+                && hostiles >= DEFENSE_RESCUE_PRESSURE_MIN;
+            let core_hit =
+                (sim.session().binary_frame().max(0) as u32) < persona.protected_hit_until;
+            (wave_peak || core_hit, core_hit)
+        };
+        if !rescue_armed {
+            return None;
+        }
+        // The charged walk mirrors the battle branch's: the side's own two
+        // supers lead, the captured grants follow in registry order.
+        let own = [opening.super_weapon_type, opening.second_super_weapon_type];
+        let mut charged: Vec<InternedId> = sim
+            .super_weapons()
+            .get(&self.house)
+            .into_iter()
+            .flat_map(|house_sws| house_sws.iter())
+            .filter(|(_, instance)| {
+                instance.charge_start_tick() != -1 && instance.is_active() && instance.is_ready()
+            })
+            .map(|(sw_type, _)| *sw_type)
+            .collect();
+        charged.sort_by_key(|sw_type| {
+            own.iter()
+                .position(|name| sim.interner().get(name).is_some_and(|id| id == *sw_type))
+                .unwrap_or(own.len())
+        });
+        for sw_type in charged {
+            let name = sim.interner().resolve(sw_type);
+            let target = match name {
+                // The curtain rides the wounded core first; with the core
+                // untouched it covers the line's fighting edge.
+                "IronCurtainSpecial" => self.defense_shield_cell(sim, rules, protected_hit),
+                "LightningStormSpecial" | "NukeSpecial" => self.defense_cluster_cell(sim),
+                _ => continue,
+            };
+            if let Some((rx, ry)) = target {
+                self.defense.as_mut().expect("checked above").rescue_due =
+                    tick + DEFENSE_RESCUE_COOLDOWN_TICKS;
+                return Some(vec![Command::LaunchSuperWeapon {
+                    sw_type_id: sw_type,
+                    target_rx: rx,
+                    target_ry: ry,
+                }]);
+            }
+        }
+        None
+    }
+
+    /// The curtain's defense pad: the worst wounded protected target when
+    /// the core is hit, else the posted line unit sitting nearest the
+    /// densest threat — the fighting edge of the line. `None` holds the
+    /// charge; the special never targets air.
+    fn defense_shield_cell(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        core_hit: bool,
+    ) -> Option<(u16, u16)> {
+        let persona = self.defense.as_ref()?;
+        if core_hit {
+            let mut worst: Option<(i32, u64)> = None;
+            for &id in &persona.protected_targets {
+                let Some(entity) = sim.substrate().entities.get(id) else {
+                    continue;
+                };
+                let type_name = sim.interner().resolve(entity.type_ref());
+                let fraction = Self::health_fraction(rules, type_name, entity);
+                if worst.is_none_or(|(kept, _)| fraction < kept) {
+                    worst = Some((fraction, id));
+                }
+            }
+            if let Some((_, id)) = worst {
+                return sim
+                    .substrate()
+                    .entities
+                    .get(id)
+                    .map(|entity| (entity.position.rx(), entity.position.ry()));
+            }
+        }
+        // The line's fighting edge: the posted unit nearest any hostile
+        // mobile on the field.
+        let nearest_hostile_cell = sim
+            .substrate()
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                !entity.lifecycle.in_limbo()
+                    && matches!(
+                        entity.category(),
+                        crate::map::entities::EntityCategory::Unit
+                            | crate::map::entities::EntityCategory::Infantry
+                    )
+                    && self.is_enemy(sim, entity.owner())
+            })
+            .map(|(_, entity)| (entity.position.rx(), entity.position.ry()))
+            .next();
+        let mut best: Option<(i64, (u16, u16))> = None;
+        for &(unit, post) in &persona.line_posts {
+            let Some(entity) = sim.substrate().entities.get(unit) else {
+                continue;
+            };
+            let unit_cell = (entity.position.rx(), entity.position.ry());
+            let distance = match nearest_hostile_cell {
+                Some((hx, hy)) => {
+                    let dx = i32::from(unit_cell.0) - i32::from(hx);
+                    let dy = i32::from(unit_cell.1) - i32::from(hy);
+                    i64::from(dx * dx + dy * dy)
+                }
+                None => 0,
+            };
+            if best.is_none_or(|(kept, _)| distance < kept) {
+                best = Some((distance, post));
+            }
+        }
+        best.map(|(_, post)| post)
+    }
+
+    /// The destructive rescue's aim: the hostile mobile whose neighborhood
+    /// holds the most hostiles inside [`DEFENSE_RESCUE_CLUSTER_RADIUS`] —
+    /// the marching wave's shoulder — with the smallest cell breaking
+    /// ties. Below [`DEFENSE_RESCUE_CLUSTER_MIN`] the charge holds.
+    fn defense_cluster_cell(&self, sim: &crate::sim::world::Simulation) -> Option<(u16, u16)> {
+        let mut hostiles: Vec<(u16, u16)> = Vec::new();
+        for (_, entity) in sim.substrate().entities.iter_sorted() {
+            if entity.lifecycle.in_limbo()
+                || !matches!(
+                    entity.category(),
+                    crate::map::entities::EntityCategory::Unit
+                        | crate::map::entities::EntityCategory::Infantry
+                )
+                || !self.is_enemy(sim, entity.owner())
+            {
+                continue;
+            }
+            hostiles.push((entity.position.rx(), entity.position.ry()));
+        }
+        let mut best: Option<(usize, (u16, u16))> = None;
+        for &cell in &hostiles {
+            let count = hostiles
+                .iter()
+                .filter(|&&other| {
+                    (i32::from(other.0) - i32::from(cell.0)).abs() <= DEFENSE_RESCUE_CLUSTER_RADIUS
+                        && (i32::from(other.1) - i32::from(cell.1)).abs()
+                            <= DEFENSE_RESCUE_CLUSTER_RADIUS
+                })
+                .count();
+            if count < DEFENSE_RESCUE_CLUSTER_MIN {
+                continue;
+            }
+            // More hostiles wins; ties take the smaller cell (a stable,
+            // order-independent pick).
+            if best
+                .is_none_or(|(kept, kept_cell)| count > kept || (count == kept && cell < kept_cell))
+            {
+                best = Some((count, cell));
+            }
+        }
+        best.map(|(_, cell)| cell)
     }
 
     /// The leak response (mode A, basic): a hostile mobile past the line —
@@ -21163,6 +21408,124 @@ mod tests {
             persona.leak_interceptors,
             vec![tank],
             "the hunter latches into the chase book"
+        );
+    }
+
+    // ---- D2, pillar 2: the rescue special ----
+
+    /// Charge one super weapon instance for `house` the test-only setter
+    /// way, so the rescue walk sees a ready launch.
+    fn charge_super_weapon(sim: &mut crate::sim::world::Simulation, house: InternedId, name: &str) {
+        let sw = sim.interner.intern(name);
+        let mut instance = crate::sim::superweapon::SuperWeaponInstance::new(sw, house, 0);
+        instance.set_is_active_for_test(true);
+        instance.set_is_ready_for_test(true);
+        instance.set_charge_start_tick_for_test(0);
+        sim.super_weapons_mut_for_test()
+            .entry(house)
+            .or_default()
+            .insert(sw, instance);
+    }
+
+    /// The core-hit trigger: a protected target seen dropping latches the
+    /// hit window, and a charged Iron Curtain covers the worst wounded
+    /// protected target on the next pass. Untriggered or uncharged passes
+    /// never launch.
+    #[test]
+    fn defense_rescue_curtain_covers_the_wounded_core() {
+        let (mut sim, rules, ai_house, enemy_house) = defense_forces_world();
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        let core = sim
+            .spawn_object_at_height("GACNST", &ai_owner, 15, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        sim.attach_object_trigger_tag(core, Some("LOSE_TAG"));
+        // One hostile mobile nearby, under the wave-peak pressure count:
+        // only the wound can arm the rescue.
+        let _ = sim.spawn_object_at_height("TAGUNIT", &enemy_owner, 16, 15, 0, 0, &rules);
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        // Baseline pass: the wound watch latches its snapshot; nothing is
+        // charged, so nothing launches.
+        let commands = ai.orders(&runtime, 0);
+        assert!(
+            commands.iter().all(|envelope| !matches!(
+                envelope.payload,
+                super::Command::LaunchSuperWeapon { .. }
+            )),
+            "no rescue before a wound and a charge"
+        );
+        charge_super_weapon(&mut runtime.simulation, ai_house, "IronCurtainSpecial");
+        // The wound: the core drops to half (the tag row reads 1000).
+        runtime
+            .simulation
+            .entities_mut_for_test()
+            .get_mut(core)
+            .expect("the core stands")
+            .health
+            .set_for_test(500);
+        let commands = ai.orders(&runtime, 1);
+        let launch = commands.iter().find_map(|envelope| match envelope.payload {
+            super::Command::LaunchSuperWeapon {
+                sw_type_id,
+                target_rx,
+                target_ry,
+            } => Some((sw_type_id, target_rx, target_ry)),
+            _ => None,
+        });
+        let curtain = runtime.simulation.interner().get("IronCurtainSpecial");
+        assert_eq!(
+            launch,
+            curtain.map(|sw| (sw, 15u16, 15u16)),
+            "the wounded core latches the hit and the curtain covers it"
+        );
+        let persona = ai.defense.as_ref().expect("the persona stays adopted");
+        assert!(
+            persona.rescue_due > 1,
+            "the launch arms the conservative cooldown"
+        );
+    }
+
+    /// The wave-peak trigger: an imminent estimate (the fixture's armed
+    /// trigger reads 30 frames) with six observed hostiles over the
+    /// pressure floor aims a charged storm at the marching wave's densest
+    /// shoulder — the bunched four, never the strung-out pair.
+    #[test]
+    fn defense_rescue_storm_strikes_the_densest_wave_cluster() {
+        let (mut sim, rules, ai_house, enemy_house) = defense_forces_world();
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 15, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        // Four bunched at the shoulder, two strung out behind.
+        for (x, y) in [(17, 17), (17, 18), (18, 17), (19, 17), (24, 20), (26, 20)] {
+            let _ = sim.spawn_object_at_height("TAGUNIT", &enemy_owner, x, y, 0, 0, &rules);
+        }
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
+        charge_super_weapon(&mut runtime.simulation, ai_house, "LightningStormSpecial");
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        let commands = ai.orders(&runtime, 0);
+        let launch = commands.iter().find_map(|envelope| match envelope.payload {
+            super::Command::LaunchSuperWeapon {
+                sw_type_id,
+                target_rx,
+                target_ry,
+            } => Some((sw_type_id, target_rx, target_ry)),
+            _ => None,
+        });
+        let storm = runtime.simulation.interner().get("LightningStormSpecial");
+        let (sw_type_id, target_rx, target_ry) =
+            launch.expect("the wave peak with pressure launches the storm");
+        assert_eq!(sw_type_id, storm.expect("the charged type"));
+        // The aim sits on the bunched shoulder (all four within the
+        // cluster radius), never out at the stragglers.
+        assert!(
+            (17..=19).contains(&target_rx) && (17..=18).contains(&target_ry),
+            "the aim lands on the densest shoulder, got ({target_rx},{target_ry})"
         );
     }
 }
