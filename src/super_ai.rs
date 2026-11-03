@@ -723,6 +723,73 @@ const GARRISON_BUILDING_TARGET: usize = 2;
 /// never monopolizes the line.
 const GARRISON_DEMAND_IN_PRODUCTION: usize = 2;
 
+// ---- The defense personality's pillars (D2, mode A) ----
+//
+// Every window paces one behavior pass; the passes run only while the
+// persona is adopted and share the battle AI's one-order-a-tick budget
+// through the priority slot in `orders`.
+
+/// Ticks between the defense line's staffing and drift passes.
+const DEFENSE_LINE_TICKS: u32 = 30;
+/// Ticks between the leak-scan passes.
+const DEFENSE_LEAK_TICKS: u32 = 30;
+/// Ticks between the repair-rotation passes.
+const DEFENSE_REPAIR_TICKS: u32 = 45;
+/// Line units per threat bearing: four hulls hold one approach.
+const DEFENSE_LINE_PER_BEARING: usize = 4;
+/// The line's standoff from the home center toward the spawn, in cells —
+/// clamped to just short of the spawn itself when the source spawns close.
+const DEFENSE_LINE_STANDOFF: i32 = 8;
+/// A bearing's posts count as that bearing's when they sit within this
+/// many cells of its anchor.
+const DEFENSE_LINE_SPREAD: i32 = 4;
+/// The line's own post fan: nine cells hugging the anchor, so the hold
+/// position stays a wall on the approach rather than a loose ring.
+const DEFENSE_LINE_OFFSETS: [(i8, i8); 9] = [
+    (0, 0),
+    (1, 0),
+    (0, 1),
+    (-1, 0),
+    (0, -1),
+    (1, 1),
+    (-1, 1),
+    (1, -1),
+    (-1, -1),
+];
+/// A posted unit this far past its own post reads as drifted (it fought
+/// something off) and is walked back.
+const DEFENSE_LINE_DRIFT_CELLS: i32 = 3;
+/// A hostile mobile within this many cells of the nearest protected
+/// target — else of the home center — is past the line: a leak.
+const DEFENSE_LEAK_RADIUS: i32 = 12;
+/// A line unit at or below this health fraction (thousandths) rotates
+/// back for repair.
+const DEFENSE_REPAIR_FRACTION: i32 = 400;
+/// The heal that returns a repaired unit to its post: well above the
+/// rotate-out threshold, so a unit parked at the threshold never
+/// oscillates between the depot and the line.
+const DEFENSE_RETURN_FRACTION: i32 = 900;
+/// The rear-hold ring's radius: a wounded unit with no depot standing
+/// waits this far behind the home center instead (the engine repairs
+/// nothing without a `UnitRepair` dock — the residual is the pillar's).
+const DEFENSE_REAR_RING: i32 = 4;
+/// The army mix's answer guns per observed hostile aircraft.
+const DEFENSE_AA_PER_AIRCRAFT: usize = 2;
+/// The army mix's AA floor: one answer gun even with no aircraft observed.
+const DEFENSE_AA_FLOOR: usize = 1;
+/// The army mix's AA cap.
+const DEFENSE_AA_CAP: usize = 8;
+/// The army mix's armor margin above the observed vehicles, with its
+/// floor (the baseline line) and cap.
+const DEFENSE_ARMOR_MARGIN: usize = 2;
+const DEFENSE_ARMOR_FLOOR: usize = 4;
+const DEFENSE_ARMOR_CAP: usize = 16;
+/// The army mix's foot margin above the observed infantry, with its
+/// floor and cap.
+const DEFENSE_FOOT_MARGIN: usize = 2;
+const DEFENSE_FOOT_FLOOR: usize = 4;
+const DEFENSE_FOOT_CAP: usize = 16;
+
 /// The wall ring's wallet floor: a wall segment is 100 credits, and the
 /// ring spends dozens of them one production cycle at a time. The floor
 /// sits just under a tank's price, not above it: a war economy's unit
@@ -1395,6 +1462,20 @@ struct DefensePersona {
     /// resolve — Tag- or trigger-less definitions, indirect links — stay
     /// absent; that coverage gap is a recorded residual.
     protected_targets: Vec<u64>,
+    // ---- D2 pinned state: the pillars' own books. Perception fields
+    // above are overwritten every scan; these persist across scans.
+    /// The posted defense line: unit → its post cell, in assignment order.
+    line_posts: Vec<(u64, (u16, u16))>,
+    /// Units walking into a depot for repair: unit → the depot it walks to.
+    repair_inbound: Vec<(u64, u64)>,
+    /// Units currently chasing a leak; they return to the staffing pool
+    /// when the leak clears.
+    leak_interceptors: Vec<u64>,
+    /// Earliest tick each behavior pass may run again (see the
+    /// `DEFENSE_*_TICKS` windows).
+    line_due: u32,
+    leak_due: u32,
+    repair_due: u32,
 }
 
 impl DefensePersona {
@@ -1405,7 +1486,21 @@ impl DefensePersona {
             spawn_bearings: Vec::new(),
             observed_wave_composition: WaveComposition::default(),
             protected_targets: Vec::new(),
+            line_posts: Vec::new(),
+            repair_inbound: Vec::new(),
+            leak_interceptors: Vec::new(),
+            line_due: 0,
+            leak_due: 0,
+            repair_due: 0,
         }
+    }
+
+    /// Whether a duty ledger — the line, the repair walks or the leak
+    /// chases — holds this unit.
+    fn on_duty(&self, unit: u64) -> bool {
+        self.line_posts.iter().any(|&(id, _)| id == unit)
+            || self.repair_inbound.iter().any(|&(id, _)| id == unit)
+            || self.leak_interceptors.contains(&unit)
     }
 }
 
@@ -3138,6 +3233,17 @@ impl SuperAi {
         self.defense.as_ref().map(|persona| persona.stance)
     }
 
+    /// Whether a unit carries a defense-persona duty (a line post, a
+    /// repair walk or a leak chase): the battle pools — the idle ring, the
+    /// standing set, the wave's picks — must not re-task it while the
+    /// persona holds the reins. Battle behavior (the persona absent)
+    /// reads false for every unit, so the pools are untouched there.
+    fn defense_duty(&self, unit: u64) -> bool {
+        self.defense
+            .as_ref()
+            .is_some_and(|persona| persona.on_duty(unit))
+    }
+
     /// The tier this player plays at.
     pub const fn difficulty(&self) -> SuperAiDifficulty {
         self.difficulty
@@ -3903,6 +4009,21 @@ impl SuperAi {
             return vec![CommandEnvelope::new(self.house, at, command)];
         }
 
+        // The defense persona's pillars (D2, mode A): the leak response,
+        // the repair rotation, the line, the garrison replenish and the
+        // wave-mix army — each paced, at most one order a tick, all gated
+        // on the persona being adopted. The battle branches below keep the
+        // base's economy and close defense running behind it; the assault
+        // wave machinery stays battle-only (the persona holds the line, it
+        // does not march), so its pool never strips the posted line.
+        if let Some(commands) = self.defense_orders(sim, rules, opening, &owner, home_center, tick)
+        {
+            return commands
+                .into_iter()
+                .map(|command| CommandEnvelope::new(self.house, at, command))
+                .collect();
+        }
+
         // The building-repair limb (Layer 2). A damaged structure sits at a
         // fraction of its strength until something repairs it, and nothing
         // in the chain below ever does: the survey latches the worthiest
@@ -4024,17 +4145,24 @@ impl SuperAi {
             // (observed live: a besieged Yuri base that stopped attacking
             // for good). The defenders already committed keep fighting
             // either way, and a wave already marching stays out.
-            if let Some(command) = self.wave_orders(
-                sim,
-                rules,
-                opening,
-                center,
-                &standing,
-                &enemy_targets,
-                enemy_center,
-                alarm_armed,
-                tick,
-            ) {
+            // The assault wave is battle-only (D2): the defense persona
+            // holds the line instead of marching, so the wave machinery
+            // never gathers under it and its pool never strips the posted
+            // line. The gate reads no duty for any unit when the persona
+            // is absent — battle behavior is byte-identical.
+            if self.defense.is_none()
+                && let Some(command) = self.wave_orders(
+                    sim,
+                    rules,
+                    opening,
+                    center,
+                    &standing,
+                    &enemy_targets,
+                    enemy_center,
+                    alarm_armed,
+                    tick,
+                )
+            {
                 return vec![CommandEnvelope::new(self.house, at, command)];
             }
             // Layer 3: the hero's own small branch — the wave dispatch no
@@ -8992,6 +9120,678 @@ impl SuperAi {
         persona.protected_targets = protected_targets;
     }
 
+    // ---- The defense personality's pillars (D2, mode A) ----
+
+    /// The defense persona's one order for this tick, or `None` to fall
+    /// through to the battle branches, which keep the base's economy and
+    /// its own close defense running behind it. The priority inside is
+    /// the leak response, then the repair rotation, then the line, then
+    /// the army mix — the scarcest resource first. Every branch is gated
+    /// on the persona being adopted; the battle AI reads none of it.
+    fn defense_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        owner: &str,
+        home_center: Option<(i16, i16)>,
+        tick: u32,
+    ) -> Option<Vec<Command>> {
+        if self.defense.is_none() {
+            return None;
+        }
+        if let Some(command) = self.defense_leak_orders(sim, rules, opening, home_center, tick) {
+            return Some(vec![command]);
+        }
+        if let Some(command) = self.defense_repair_orders(sim, rules, opening, tick) {
+            return Some(vec![command]);
+        }
+        if let Some(command) = self.defense_line_orders(sim, rules, opening, home_center, tick) {
+            return Some(vec![command]);
+        }
+        if let Some(command) = self.defense_army_orders(sim, rules, opening, owner, tick) {
+            return Some(vec![command]);
+        }
+        None
+    }
+
+    /// The leak response (mode A, basic): a hostile mobile past the line —
+    /// within [`DEFENSE_LEAK_RADIUS`] of a protected target, else of the
+    /// home center — draws the nearest due interceptor, a posted line unit
+    /// first, else any idle combat unit. One hunter per leak: the latch
+    /// holds until the hunter falls or comes back to idle past its order
+    /// gate, when the staffing pass re-tasks it. The pair rides the plain
+    /// `Attack` click; the assault-wave machinery stays out of it.
+    fn defense_leak_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        _rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        home_center: Option<(i16, i16)>,
+        tick: u32,
+    ) -> Option<Command> {
+        if self.defense.is_none() {
+            return None;
+        }
+        // The paced pass: advance the window and prune the chase — a
+        // fallen hunter drops, and one back to idle past its gate has
+        // finished its share.
+        {
+            let persona = self.defense.as_mut().expect("checked above");
+            if tick < persona.leak_due {
+                return None;
+            }
+            persona.leak_due = tick + DEFENSE_LEAK_TICKS;
+            let house = self.house;
+            persona.leak_interceptors.retain(|&unit| {
+                sim.substrate().entities.get(unit).is_some_and(|entity| {
+                    entity.owner() == house
+                        && entity.lifecycle.object_alive()
+                        && (!matches!(
+                            entity.passive_acquire_mission(),
+                            crate::sim::mission::MissionType::None
+                                | crate::sim::mission::MissionType::Sleep
+                                | crate::sim::mission::MissionType::Guard
+                                | crate::sim::mission::MissionType::AreaGuard
+                        ) || self.order_gate.get(&unit).is_some_and(|&due| tick < due))
+                })
+            });
+        }
+        // A hunter already out covers the standing leak.
+        if !self
+            .defense
+            .as_ref()
+            .expect("checked above")
+            .leak_interceptors
+            .is_empty()
+        {
+            return None;
+        }
+        let anchor = self
+            .defense
+            .as_ref()
+            .expect("checked above")
+            .protected_targets
+            .iter()
+            .filter_map(|&id| sim.substrate().entities.get(id))
+            .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))
+            .next()
+            .or(home_center)?;
+        // The nearest hostile mobile past the line.
+        let mut leak: Option<(i32, u64)> = None;
+        for (id, entity) in sim.substrate().entities.iter_sorted() {
+            if entity.lifecycle.in_limbo()
+                || !matches!(
+                    entity.category(),
+                    crate::map::entities::EntityCategory::Unit
+                        | crate::map::entities::EntityCategory::Infantry
+                        | crate::map::entities::EntityCategory::Aircraft
+                )
+                || !self.is_enemy(sim, entity.owner())
+            {
+                continue;
+            }
+            let dx = i32::from(entity.position.rx() as i16) - i32::from(anchor.0);
+            let dy = i32::from(entity.position.ry() as i16) - i32::from(anchor.1);
+            let distance = dx.abs().max(dy.abs());
+            if distance > DEFENSE_LEAK_RADIUS {
+                continue;
+            }
+            if leak.is_none_or(|(kept, kept_id)| (distance, id) < (kept, kept_id)) {
+                leak = Some((distance, id));
+            }
+        }
+        let (_, leak_id) = leak?;
+        let leak_cell = sim
+            .substrate()
+            .entities
+            .get(leak_id)
+            .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))?;
+        // The hunter: the nearest due line unit first, then the nearest
+        // idle combat unit off duty.
+        let hunter = {
+            let persona = self.defense.as_ref().expect("checked above");
+            let posted = persona
+                .line_posts
+                .iter()
+                .filter(|&&(unit, _)| self.order_gate.get(&unit).is_none_or(|&due| tick >= due))
+                .filter_map(|&(unit, _)| {
+                    sim.substrate().entities.get(unit).map(|entity| {
+                        let dx = i32::from(entity.position.rx() as i16) - i32::from(leak_cell.0);
+                        let dy = i32::from(entity.position.ry() as i16) - i32::from(leak_cell.1);
+                        (dx * dx + dy * dy, unit)
+                    })
+                })
+                .min_by_key(|&(distance, unit)| (distance, unit))
+                .map(|(_, unit)| unit);
+            posted.or_else(|| {
+                let roster = Self::combat_roster(opening);
+                sim.substrate()
+                    .entities
+                    .iter_sorted()
+                    .filter(|(id, entity)| {
+                        entity.owner() == self.house
+                            && matches!(
+                                entity.category(),
+                                crate::map::entities::EntityCategory::Unit
+                                    | crate::map::entities::EntityCategory::Infantry
+                            )
+                            && !Self::garrisoned(entity)
+                            && roster.contains(&sim.interner().resolve(entity.type_ref()))
+                            && !self.defense_duty(*id)
+                            && self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                            && matches!(
+                                entity.passive_acquire_mission(),
+                                crate::sim::mission::MissionType::None
+                                    | crate::sim::mission::MissionType::Sleep
+                                    | crate::sim::mission::MissionType::Guard
+                                    | crate::sim::mission::MissionType::AreaGuard
+                            )
+                    })
+                    .map(|(id, entity)| {
+                        let dx = i32::from(entity.position.rx() as i16) - i32::from(leak_cell.0);
+                        let dy = i32::from(entity.position.ry() as i16) - i32::from(leak_cell.1);
+                        (dx * dx + dy * dy, id)
+                    })
+                    .min_by_key(|&(distance, unit)| (distance, unit))
+                    .map(|(_, unit)| unit)
+            })
+        };
+        let hunter = hunter?;
+        self.defense
+            .as_mut()
+            .expect("checked above")
+            .leak_interceptors
+            .push(hunter);
+        self.gate_idle_order(hunter, tick);
+        Some(Command::Attack {
+            attacker_id: hunter,
+            target_id: leak_id,
+        })
+    }
+
+    /// The repair rotation: posted line units at or below
+    /// [`DEFENSE_REPAIR_FRACTION`] walk into the nearest standing
+    /// [`Opening::service_depot`] — the engine's own `UnitRepair` dock —
+    /// and a healed unit walks back to its reserved post. No depot
+    /// standing: the wounded hold a [`DEFENSE_REAR_RING`] cell behind the
+    /// home center instead (the engine repairs nothing without a dock;
+    /// the pillar doc records the residual).
+    fn defense_repair_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        tick: u32,
+    ) -> Option<Command> {
+        if self.defense.is_none() {
+            return None;
+        }
+        // The paced pass: advance the window and prune the walks — a dead
+        // unit or a fallen depot drops out.
+        {
+            let persona = self.defense.as_mut().expect("checked above");
+            if tick < persona.repair_due {
+                return None;
+            }
+            persona.repair_due = tick + DEFENSE_REPAIR_TICKS;
+            let house = self.house;
+            persona.repair_inbound.retain(|&(unit, depot)| {
+                let walking = sim.substrate().entities.get(unit).is_some_and(|entity| {
+                    entity.owner() == house && entity.lifecycle.object_alive()
+                });
+                let depot_stands = sim.substrate().entities.get(depot).is_some_and(|entity| {
+                    entity.category() == crate::map::entities::EntityCategory::Structure
+                        && entity.lifecycle.object_alive()
+                });
+                walking && depot_stands
+            });
+        }
+        // A healed walk returns to its reserved post (one per pass).
+        let healed = {
+            let persona = self.defense.as_ref().expect("checked above");
+            persona.repair_inbound.iter().find_map(|&(unit, _)| {
+                let entity = sim.substrate().entities.get(unit)?;
+                let type_name = sim.interner().resolve(entity.type_ref());
+                if Self::health_fraction(rules, type_name, entity) < DEFENSE_RETURN_FRACTION {
+                    return None;
+                }
+                let posted = matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                        | crate::sim::mission::MissionType::Repair
+                        | crate::sim::mission::MissionType::Enter
+                );
+                let post = persona
+                    .line_posts
+                    .iter()
+                    .find(|&&(id, _)| id == unit)
+                    .map(|&(_, post)| post);
+                posted.then_some((unit, post))
+            })
+        };
+        if let Some((unit, post)) = healed {
+            self.defense
+                .as_mut()
+                .expect("checked above")
+                .repair_inbound
+                .retain(|&(id, _)| id != unit);
+            if let Some(post) = post
+                && self.order_gate.get(&unit).is_none_or(|&due| tick >= due)
+            {
+                self.gate_idle_order(unit, tick);
+                return Some(Command::Guard {
+                    entity_id: unit,
+                    target: Some(crate::sim::combat::TargetKind::Cell(post.0, post.1)),
+                });
+            }
+            // Healed without a post (or gated): the walk leaves the book
+            // and this pass moves on to the rotate-out scan below.
+        }
+        // The depot list: the nearest standing own `UnitRepair` dock per
+        // caller. The rules row gates the read — a side without a depot
+        // type never scans.
+        let depot_name = opening.service_depot;
+        let depots: Vec<(u64, (i16, i16))> =
+            if rules.object(depot_name).is_some_and(|ty| ty.unit_repair) {
+                self.own_structures(sim)
+                    .into_iter()
+                    .filter(|(_, name)| name == depot_name)
+                    .filter_map(|(id, _)| {
+                        sim.substrate().entities.get(id).and_then(|entity| {
+                            (entity.lifecycle.object_alive() && !entity.lifecycle.in_limbo())
+                                .then_some((
+                                    id,
+                                    (entity.position.rx() as i16, entity.position.ry() as i16),
+                                ))
+                        })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        // The rotate-out scan: the first posted unit at or below the wound
+        // threshold whose order gate is due (one per pass). Fighting hulls
+        // are skipped by their missions; a posted hull on Guard answers.
+        let rotate = {
+            let persona = self.defense.as_ref().expect("checked above");
+            persona.line_posts.iter().find_map(|&(unit, post)| {
+                let entity = sim.substrate().entities.get(unit)?;
+                let type_name = sim.interner().resolve(entity.type_ref());
+                if persona.repair_inbound.iter().any(|&(id, _)| id == unit) {
+                    return None;
+                }
+                if !matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                ) {
+                    return None;
+                }
+                if self.order_gate.get(&unit).is_some_and(|&due| tick < due) {
+                    return None;
+                }
+                (Self::health_fraction(rules, type_name, entity) <= DEFENSE_REPAIR_FRACTION)
+                    .then_some((unit, post))
+            })
+        };
+        let (unit, _post) = rotate?;
+        let entity = sim.substrate().entities.get(unit)?;
+        let unit_cell = (entity.position.rx() as i16, entity.position.ry() as i16);
+        if let Some((depot, _)) = depots.iter().copied().min_by_key(|&(id, cell)| {
+            let dx = i32::from(cell.0) - i32::from(unit_cell.0);
+            let dy = i32::from(cell.1) - i32::from(unit_cell.1);
+            (dx * dx + dy * dy, id)
+        }) {
+            self.defense
+                .as_mut()
+                .expect("checked above")
+                .repair_inbound
+                .push((unit, depot));
+            self.gate_idle_order(unit, tick);
+            return Some(Command::clicked_mission(
+                unit,
+                crate::sim::mission::MissionType::Enter,
+                crate::sim::combat::TargetKind::Entity(depot),
+            ));
+        }
+        // No dock standing: the wounded hold a rear ring cell behind the
+        // home center, away from the nearest threat bearing.
+        let home = self.engine_home.or(self.pinned_home)?;
+        let away = self
+            .defense
+            .as_ref()
+            .expect("checked above")
+            .spawn_bearings
+            .iter()
+            .find_map(|bearing| bearing.spawn_cell)
+            .map(|spawn| {
+                let dx = i32::from(home.0) - i32::from(spawn.0);
+                let dy = i32::from(home.1) - i32::from(spawn.1);
+                let len = dx.abs().max(dy.abs()).max(1);
+                (dx * DEFENSE_REAR_RING / len, dy * DEFENSE_REAR_RING / len)
+            })
+            .unwrap_or((0, 0));
+        let rear = on_map_cell(sim, (home.0 + away.0 as i16, home.1 + away.1 as i16), home);
+        self.gate_idle_order(unit, tick);
+        Some(Command::Guard {
+            entity_id: unit,
+            target: Some(crate::sim::combat::TargetKind::Cell(rear.0, rear.1)),
+        })
+    }
+
+    /// The line (mode A): each spawn bearing anchors a hold position
+    /// [`DEFENSE_LINE_STANDOFF`] short of home (clamped just short of the
+    /// spawn itself), staffed with up to [`DEFENSE_LINE_PER_BEARING`]
+    /// combat units on `Guard` posts picked by the battle perimeter's own
+    /// site scan. Drift past [`DEFENSE_LINE_DRIFT_CELLS`] walks the
+    /// drifter back first — holding the line, never marching it.
+    fn defense_line_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        home_center: Option<(i16, i16)>,
+        tick: u32,
+    ) -> Option<Command> {
+        if self.defense.is_none() {
+            return None;
+        }
+        {
+            let persona = self.defense.as_mut().expect("checked above");
+            if tick < persona.line_due {
+                return None;
+            }
+            persona.line_due = tick + DEFENSE_LINE_TICKS;
+            let house = self.house;
+            persona.line_posts.retain(|&(unit, _)| {
+                sim.substrate().entities.get(unit).is_some_and(|entity| {
+                    entity.owner() == house && entity.lifecycle.object_alive()
+                })
+            });
+        }
+        let home = home_center?;
+        // Drift first: the first posted unit standing idle away from its
+        // post walks back (it fought something off, or the post was
+        // overrun and re-taken).
+        let repost = {
+            let persona = self.defense.as_ref().expect("checked above");
+            persona.line_posts.iter().find_map(|&(unit, post)| {
+                let entity = sim.substrate().entities.get(unit)?;
+                let idle = matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                );
+                let cell = (entity.position.rx() as i16, entity.position.ry() as i16);
+                let drifted =
+                    i32::try_from(defense_chebyshev(cell, (post.0 as i16, post.1 as i16)))
+                        .unwrap_or(i32::MAX)
+                        > DEFENSE_LINE_DRIFT_CELLS;
+                let due = self.order_gate.get(&unit).is_none_or(|&at| tick >= at);
+                (idle && drifted && due).then_some((unit, post))
+            })
+        };
+        if let Some((unit, post)) = repost {
+            self.gate_idle_order(unit, tick);
+            return Some(Command::Guard {
+                entity_id: unit,
+                target: Some(crate::sim::combat::TargetKind::Cell(post.0, post.1)),
+            });
+        }
+        // Staffing: one pass posts one unit, nearest idle candidate first,
+        // at the first understaffed bearing's anchor.
+        let bearings: Vec<SpawnBearing> = self
+            .defense
+            .as_ref()
+            .expect("checked above")
+            .spawn_bearings
+            .clone();
+        for bearing in &bearings {
+            let Some(spawn) = bearing.spawn_cell else {
+                continue;
+            };
+            let distance = defense_chebyshev(home, spawn).max(1) as i32;
+            let standoff = DEFENSE_LINE_STANDOFF.min(distance - 2).max(2);
+            let dx = i32::from(spawn.0) - i32::from(home.0);
+            let dy = i32::from(spawn.1) - i32::from(home.1);
+            let len = dx.abs().max(dy.abs()).max(1);
+            let anchor = (
+                home.0 + (dx * standoff / len) as i16,
+                home.1 + (dy * standoff / len) as i16,
+            );
+            let assigned = self
+                .defense
+                .as_ref()
+                .expect("checked above")
+                .line_posts
+                .iter()
+                .filter(|&(_, post)| {
+                    i32::try_from(defense_chebyshev((post.0 as i16, post.1 as i16), anchor))
+                        .unwrap_or(i32::MAX)
+                        <= DEFENSE_LINE_SPREAD
+                })
+                .count();
+            if assigned >= DEFENSE_LINE_PER_BEARING {
+                continue;
+            }
+            let roster = Self::combat_roster(opening);
+            let mut candidates: Vec<(i64, u64)> = sim
+                .substrate()
+                .entities
+                .iter_sorted()
+                .filter(|(id, entity)| {
+                    entity.owner() == self.house
+                        && matches!(
+                            entity.category(),
+                            crate::map::entities::EntityCategory::Unit
+                                | crate::map::entities::EntityCategory::Infantry
+                        )
+                        && !Self::garrisoned(entity)
+                        && {
+                            let name = sim.interner().resolve(entity.type_ref());
+                            roster.contains(&name) && !Self::is_naval_type(opening, name)
+                        }
+                        && !self.defense_duty(*id)
+                        && self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                        && matches!(
+                            entity.passive_acquire_mission(),
+                            crate::sim::mission::MissionType::None
+                                | crate::sim::mission::MissionType::Sleep
+                                | crate::sim::mission::MissionType::Guard
+                                | crate::sim::mission::MissionType::AreaGuard
+                        )
+                })
+                .map(|(id, entity)| {
+                    let dx = i32::from(entity.position.rx() as i16) - i32::from(anchor.0);
+                    let dy = i32::from(entity.position.ry() as i16) - i32::from(anchor.1);
+                    (i64::from(dx * dx + dy * dy), id)
+                })
+                .collect();
+            candidates.sort_by_key(|&(distance, id)| (distance, id));
+            for &(_, unit) in &candidates {
+                let Some(post) =
+                    pick_guard_post(sim, rules, unit, anchor, &DEFENSE_LINE_OFFSETS, None)
+                else {
+                    continue;
+                };
+                self.defense
+                    .as_mut()
+                    .expect("checked above")
+                    .line_posts
+                    .push((unit, post));
+                self.gate_idle_order(unit, tick);
+                return Some(Command::Guard {
+                    entity_id: unit,
+                    target: Some(crate::sim::combat::TargetKind::Cell(post.0, post.1)),
+                });
+            }
+        }
+        None
+    }
+
+    /// The army mix (mode A): the observed wave composition sets each
+    /// role's standing target — answer guns for what the map actually
+    /// sends — and the role furthest behind claims the next unit-queue
+    /// slot through the shared production choke point
+    /// ([`Self::file_production`], the battle wheel's own pacer), so the
+    /// queues keep their single owner. The core tank and the basic
+    /// soldier stand behind their rosters as the armor and foot
+    /// fallbacks; a role whose every entry this house cannot field passes
+    /// its turn, the same rule the battle mix reads.
+    fn defense_army_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        owner: &str,
+        tick: u32,
+    ) -> Option<Command> {
+        let composition = self.defense.as_ref()?.observed_wave_composition;
+        // The role targets: air answered two guns to one, armor and foot
+        // answered with a margin over the observed counts, every target
+        // floored so an early quiet map still fields a baseline line.
+        let anti_air = if composition.aircraft > 0 {
+            (composition.aircraft * DEFENSE_AA_PER_AIRCRAFT)
+                .max(DEFENSE_AA_FLOOR)
+                .min(DEFENSE_AA_CAP)
+        } else {
+            DEFENSE_AA_FLOOR
+        };
+        let anti_armor = (composition.vehicles + DEFENSE_ARMOR_MARGIN)
+            .max(DEFENSE_ARMOR_FLOOR)
+            .min(DEFENSE_ARMOR_CAP);
+        let anti_foot = (composition.infantry + DEFENSE_FOOT_MARGIN)
+            .max(DEFENSE_FOOT_FLOOR)
+            .min(DEFENSE_FOOT_CAP);
+        // The candidates per role, roster order first, the fallbacks last.
+        let entries = |role: Role| -> Vec<&'static str> {
+            let mut names: Vec<&'static str> = Vec::new();
+            for name in opening
+                .vehicles
+                .iter()
+                .filter(|entry| entry.role == role)
+                .map(|entry| entry.name)
+            {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            for name in opening
+                .infantry
+                .iter()
+                .filter(|entry| entry.role == role)
+                .map(|entry| entry.name)
+            {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            match role {
+                Role::AntiArmor if !names.contains(&opening.main_tank) => {
+                    names.push(opening.main_tank)
+                }
+                Role::AntiInfantry if !names.contains(&opening.basic_infantry) => {
+                    names.push(opening.basic_infantry)
+                }
+                _ => {}
+            }
+            names
+        };
+        // The deficits, most-behind first; ties hold the air, armor, foot
+        // order — the answer that dies fastest leads.
+        let mut demands = [
+            (Role::AntiAir, anti_air, entries(Role::AntiAir)),
+            (Role::AntiArmor, anti_armor, entries(Role::AntiArmor)),
+            (Role::AntiInfantry, anti_foot, entries(Role::AntiInfantry)),
+        ];
+        for (_, target, names) in demands.iter_mut() {
+            let fielded = names
+                .iter()
+                .map(|&name| self.count_combat_of_type(sim, name))
+                .sum::<usize>();
+            *target = target.saturating_sub(fielded);
+        }
+        demands.sort_by_key(|&(_, deficit, _)| std::cmp::Reverse(deficit));
+        let queue = crate::sim::production::queue_view_for_owner(sim, rules, owner);
+        let credits = crate::sim::production::credits_for_owner(sim, &owner);
+        for (_, deficit, names) in demands.iter() {
+            if *deficit == 0 {
+                continue;
+            }
+            for &name in names.iter() {
+                let Some(ty) = rules.object(name) else {
+                    continue;
+                };
+                // The infantry rows file the barracks line, the hull rows
+                // the factory line — the candidate's own origin decides.
+                let infantry = name == opening.basic_infantry
+                    || opening.infantry.iter().any(|entry| entry.name == name);
+                let category = if infantry {
+                    crate::sim::production::ProductionCategory::Infantry
+                } else {
+                    crate::sim::production::ProductionCategory::Vehicle
+                };
+                if queue.iter().any(|item| item.queue_category == category) {
+                    // This line carries an item already; the next
+                    // candidate rides the other line or waits.
+                    break;
+                }
+                // The roster row's needs gate, the fallbacks ungated.
+                let needs = opening
+                    .vehicles
+                    .iter()
+                    .chain(opening.infantry.iter())
+                    .find(|entry| entry.name == name)
+                    .and_then(|entry| entry.needs);
+                if let Some(gate) = needs
+                    && !self.needs_structure_stands(sim, gate)
+                {
+                    continue;
+                }
+                if crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                    != crate::sim::production::CanBuild::Yes
+                    || credits < ty.cost
+                {
+                    continue;
+                }
+                let Some(type_id) = sim.interner().get(name) else {
+                    continue;
+                };
+                if !self.production_retry_ready(sim, rules, type_id, tick) {
+                    continue;
+                }
+                // The line holds; the surplus rolls to the idle pool like
+                // the battle wheel's own output.
+                return self.file_production(sim, rules, type_id, tick);
+            }
+        }
+        None
+    }
+
+    /// An entity's health fraction in thousandths, read against its
+    /// rules-row strength — cross-type wounds compare without floats.
+    /// A type the rules cannot place reads whole (never rotated out).
+    fn health_fraction(
+        rules: &crate::rules::ruleset::RuleSet,
+        type_name: &str,
+        entity: &crate::sim::game_entity::GameEntity,
+    ) -> i32 {
+        rules
+            .object(type_name)
+            .map(|ty| {
+                i32::from(entity.health.current().max(1)) * 1000 / i32::from(ty.strength.max(1))
+            })
+            .unwrap_or(1000)
+    }
+
     fn enemy_air_count(&self, sim: &crate::sim::world::Simulation) -> usize {
         AIR_THREAT_TYPES
             .iter()
@@ -9719,7 +10519,7 @@ impl SuperAi {
         sim.substrate()
             .entities
             .iter_sorted()
-            .filter(|(_, entity)| {
+            .filter(|(id, entity)| {
                 entity.owner() == self.house
                     && matches!(
                         entity.category(),
@@ -9731,6 +10531,10 @@ impl SuperAi {
                         let name = sim.interner().resolve(entity.type_ref());
                         roster.contains(&name) || Self::is_naval_type(opening, name)
                     }
+                    // The defense persona's posted, walking and chasing
+                    // units stay out of the battle pools (D2); the battle
+                    // persona reads no duty for any unit.
+                    && !self.defense_duty(*id)
                     && matches!(
                         entity.passive_acquire_mission(),
                         crate::sim::mission::MissionType::None
@@ -12229,6 +13033,10 @@ impl SuperAi {
                         (roster.contains(&name) || Self::is_naval_type(opening, name))
                             && name != opening.hero
                     }
+                    // The defense persona's posted, walking and chasing
+                    // units stay out of the battle pools (D2); the battle
+                    // persona reads no duty for any unit.
+                    && !self.defense_duty(*id)
                     && !self.boarders.contains(id)
                     && !self.raiders.contains(id)
                     && !(Some(sim.interner().resolve(entity.type_ref())) == opening.fortress
@@ -19880,16 +20688,44 @@ mod tests {
     /// scenario-init readers (no retail install): two houses on Country0/
     /// Country1, a repeating wave trigger (event 13 at two seconds, action
     /// 80 spawning team TT through waypoint A), and a destroyed-to-lose
-    /// object tag for the protected-target read.
+    /// object tag for the protected-target read. `more` appends rules
+    /// sections for the pillar tests' own types.
+    fn defense_world_with(
+        more: &str,
+        more_vehicles: &str,
+    ) -> (
+        crate::sim::world::Simulation,
+        crate::rules::ruleset::RuleSet,
+        InternedId,
+        InternedId,
+    ) {
+        let extra = format!(
+            "[Countries]\n0=Country0\n1=Country1\n[Country0]\n[Country1]\n\
+             [VehicleTypes]\n0=TAGUNIT\n{}[TAGUNIT]\nStrength=100\nSpeed=5\nSpeedType=Track\n\
+             MovementZone=Normal\nLocomotor={{4A582741-9839-11d1-B709-00A024DDAFD1}}\n{}",
+            more_vehicles, more
+        );
+        let extra = extra.as_str();
+        defense_world_build(extra)
+    }
+
     fn defense_world() -> (
         crate::sim::world::Simulation,
         crate::rules::ruleset::RuleSet,
         InternedId,
         InternedId,
     ) {
-        let extra = "[Countries]\n0=Country0\n1=Country1\n[Country0]\n[Country1]\n\
-             [VehicleTypes]\n0=TAGUNIT\n[TAGUNIT]\nStrength=100\nSpeed=5\nSpeedType=Track\n\
-             MovementZone=Normal\nLocomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n";
+        defense_world_with("", "")
+    }
+
+    fn defense_world_build(
+        extra: &str,
+    ) -> (
+        crate::sim::world::Simulation,
+        crate::rules::ruleset::RuleSet,
+        InternedId,
+        InternedId,
+    ) {
         let (mut sim, rules, _overlays) =
             crate::sim::world::entry_test_fixture::fixture_with_rules(extra);
         let country0 = sim.interner.intern("Country0");
@@ -19987,7 +20823,8 @@ mod tests {
             .expect("the fixture cell admits the production Unit constructor");
         sim.spawn_object_at_height("ENGINEER", &enemy_owner, 17, 14, 0, 0, &rules)
             .expect("the fixture cell admits the production Infantry constructor");
-        let runtime = SimRuntime::from_simulation(sim);
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
 
         let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
         ai.enable_defense_personality(super::DefenseStance::IndependentZone);
@@ -20026,5 +20863,306 @@ mod tests {
             "only the tagged structure reads into the protected set"
         );
         let _ = bystander;
+    }
+
+    // ---- D2, pillar 1: the defense army ----
+
+    /// The forces fixture: the D1 world plus the Allied production types
+    /// the mix and the rotation read (a yard to pin the opening, a
+    /// `UnitRepair` dock, a tank, the IFV) — every row `TechLevel=1` so
+    /// the AI house's own `CanBuild` admission answers yes.
+    fn defense_forces_world() -> (
+        crate::sim::world::Simulation,
+        crate::rules::ruleset::RuleSet,
+        InternedId,
+        InternedId,
+    ) {
+        defense_world_with(
+            "[BuildingTypes]\n1=GACNST\n2=GADEPT\n\
+             [GACNST]\nStrength=1000\nFoundation=1x1\nCost=2000\nTechLevel=1\n\
+             [GADEPT]\nStrength=1000\nFoundation=1x1\nUnitRepair=yes\nCost=800\nTechLevel=1\n\
+             [MTNK]\nStrength=100\nSpeed=6\nSpeedType=Track\nMovementZone=Normal\nCost=700\n\
+             TechLevel=1\nLocomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n\
+             [FV]\nStrength=120\nSpeed=10\nSpeedType=Wheel\nMovementZone=Normal\nCost=600\n\
+             TechLevel=1\nLocomotor={4A582742-9839-11d1-B709-00A024DDAFD1}\n",
+            "1=MTNK\n2=FV\n",
+        )
+    }
+
+    /// The mix reads the observed wave: five hostile vehicles on the field
+    /// set the armor target to seven (the observed plus the margin), and
+    /// the deficit role's next slot files the side's core tank through the
+    /// shared production choke point — the first `QueueProduction` the
+    /// persona's pass issues.
+    #[test]
+    fn defense_army_mix_files_the_deficit_role_the_wave_demands() {
+        let (mut sim, rules, ai_house, enemy_house) = defense_forces_world();
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        // The observed wave: five hostile vehicles, no foot, no air.
+        for (x, y) in [(20, 20), (20, 21), (21, 20), (21, 21), (22, 20)] {
+            sim.spawn_object_at_height("TAGUNIT", &enemy_owner, x, y, 0, 0, &rules)
+                .expect("the fixture cell admits the vehicle");
+        }
+        sim.houses
+            .get_mut(&ai_house)
+            .expect("the defense house")
+            .economy_mut_for_test()
+            .add_credits(99999);
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
+
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        let commands = ai.orders(&runtime, 0);
+
+        let filed = commands.iter().find_map(|envelope| match envelope.payload {
+            super::Command::QueueProduction { type_id } => Some(type_id),
+            _ => None,
+        });
+        let expected = runtime.simulation.interner().get("MTNK");
+        assert_eq!(
+            filed, expected,
+            "the armor deficit (7 target, 0 fielded) files the core tank"
+        );
+    }
+
+    /// The air answer: hostile aircraft observed instead of vehicles flip
+    /// the deficit to the AA role, and the roster's ungated AA entry (the
+    /// IFV) claims the slot.
+    #[test]
+    fn defense_army_mix_answers_observed_aircraft_with_the_aa_role() {
+        let (mut sim, rules, ai_house, enemy_house) = defense_forces_world();
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        // Three hostile vehicles (armor floor 4 → deficit 4 at 0 fielded)
+        // against five aircraft (AA target 10, capped to 8 → deficit 8):
+        // the air role is the deeper deficit and leads.
+        for (x, y) in [(20, 20), (20, 21), (21, 20)] {
+            sim.spawn_object_at_height("TAGUNIT", &enemy_owner, x, y, 0, 0, &rules)
+                .expect("the fixture cell admits the vehicle");
+        }
+        sim.spawn_object_at_height("HORNET", &enemy_owner, 22, 22, 20, 0, &rules)
+            .expect("the fixture cell admits the aircraft");
+        sim.spawn_object_at_height("HORNET", &enemy_owner, 22, 23, 20, 0, &rules)
+            .expect("the fixture cell admits the aircraft");
+        sim.spawn_object_at_height("HORNET", &enemy_owner, 23, 22, 20, 0, &rules)
+            .expect("the fixture cell admits the aircraft");
+        sim.spawn_object_at_height("HORNET", &enemy_owner, 23, 23, 20, 0, &rules)
+            .expect("the fixture cell admits the aircraft");
+        sim.spawn_object_at_height("HORNET", &enemy_owner, 24, 22, 20, 0, &rules)
+            .expect("the fixture cell admits the aircraft");
+        sim.houses
+            .get_mut(&ai_house)
+            .expect("the defense house")
+            .economy_mut_for_test()
+            .add_credits(99999);
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
+
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        let commands = ai.orders(&runtime, 0);
+
+        let filed = commands.iter().find_map(|envelope| match envelope.payload {
+            super::Command::QueueProduction { type_id } => Some(type_id),
+            _ => None,
+        });
+        let expected = runtime.simulation.interner().get("FV");
+        assert_eq!(
+            filed, expected,
+            "the deeper AA deficit (8 target, 0 fielded) files the IFV"
+        );
+    }
+
+    /// The line holds the bearing: the sole idle tank posts on a `Guard`
+    /// order around the anchor between home and the spawn cell — inside
+    /// the fan, closer to the spawn than home, and latched into the
+    /// persona's line book so the battle pools cannot re-task it.
+    #[test]
+    fn defense_line_posts_between_home_and_the_spawn_bearing() {
+        let (mut sim, rules, ai_house, _enemy_house) = defense_forces_world();
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 15, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        let tank = sim
+            .spawn_object_at_height("MTNK", &ai_owner, 17, 14, 0, 0, &rules)
+            .expect("the fixture cell admits the tank");
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
+
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        let commands = ai.orders(&runtime, 0);
+
+        let post = commands.iter().find_map(|envelope| match envelope.payload {
+            super::Command::Guard {
+                entity_id,
+                target: Some(crate::sim::combat::TargetKind::Cell(px, py)),
+            } if entity_id == tank => Some((px, py)),
+            _ => None,
+        });
+        let (px, py) = post.expect("the line pass posts the idle tank");
+        // The bearing's spawn sits at (14,16), one step from home (15,15):
+        // the clamp holds the anchor two cells out on the approach, and
+        // the post hugs that anchor inside the fan, never behind home.
+        let anchor = (13i32, 17i32);
+        let drift = (i32::from(px) - anchor.0)
+            .abs()
+            .max(i32::from(py) - anchor.1);
+        assert!(
+            drift <= 1,
+            "the post hugs the anchor at ({px},{py}), got drift {drift}"
+        );
+        let persona = ai.defense.as_ref().expect("the persona stays adopted");
+        assert_eq!(
+            persona.line_posts,
+            vec![(tank, (px, py))],
+            "the posted tank latches into the line book"
+        );
+    }
+
+    /// The repair rotation: a posted tank at or below the wound threshold
+    /// walks into the standing `UnitRepair` dock (the engine's own repair
+    /// chain), and a healed walk returns to its reserved post.
+    #[test]
+    fn defense_repair_rotation_walks_to_the_depot_and_returns_to_the_post() {
+        let (mut sim, rules, ai_house, _enemy_house) = defense_forces_world();
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 15, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        let depot = sim
+            .spawn_object_at_height("GADEPT", &ai_owner, 17, 16, 0, 0, &rules)
+            .expect("the fixture cell admits the dock");
+        let tank = sim
+            .spawn_object_at_height("MTNK", &ai_owner, 17, 14, 0, 0, &rules)
+            .expect("the fixture cell admits the tank");
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        ai.defense
+            .as_mut()
+            .expect("the persona stays adopted")
+            .line_posts
+            .push((tank, (17, 15)));
+        // Wound the posted tank under the rotation threshold (fraction
+        // 300 of 1000).
+        runtime
+            .simulation
+            .entities_mut_for_test()
+            .get_mut(tank)
+            .expect("the tank stands")
+            .health
+            .set_for_test(30);
+
+        let commands = ai.orders(&runtime, 0);
+        let depot_walk = commands.iter().find_map(|envelope| match envelope.payload {
+            super::Command::MegaMission {
+                entity_id,
+                mission,
+                destination: Some(crate::sim::combat::TargetKind::Entity(target)),
+                ..
+            } if entity_id == tank && mission == crate::sim::mission::MissionType::Enter => {
+                Some(target)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            depot_walk,
+            Some(depot),
+            "the wounded posted unit walks into the UnitRepair dock"
+        );
+        let persona = ai.defense.as_ref().expect("the persona stays adopted");
+        assert_eq!(
+            persona.repair_inbound,
+            vec![(tank, depot)],
+            "the repair walk latches"
+        );
+
+        // Healed past the return threshold: the walk goes home to its
+        // reserved post and the book clears. The pass window re-opens by
+        // hand — the test drives the rotation, not the clock.
+        runtime
+            .simulation
+            .entities_mut_for_test()
+            .get_mut(tank)
+            .expect("the tank stands")
+            .health
+            .set_for_test(95);
+        ai.defense
+            .as_mut()
+            .expect("the persona stays adopted")
+            .repair_due = 0;
+        // Past the depot walk's order gate: the healed walk re-orders at
+        // the next due pass, the way a real repair stay outlasts it.
+        let commands = ai.orders(&runtime, 200);
+        let repost = commands.iter().find_map(|envelope| match envelope.payload {
+            super::Command::Guard {
+                entity_id,
+                target: Some(crate::sim::combat::TargetKind::Cell(px, py)),
+            } if entity_id == tank => Some((px, py)),
+            _ => None,
+        });
+        assert_eq!(
+            repost,
+            Some((17u16, 15u16)),
+            "the healed unit returns to its reserved post"
+        );
+        let persona = ai.defense.as_ref().expect("the persona stays adopted");
+        assert!(
+            persona.repair_inbound.is_empty(),
+            "the healed walk leaves the repair book"
+        );
+    }
+
+    /// The leak response: a hostile mobile within the leak radius of the
+    /// protected core draws the nearest due combat unit on a plain
+    /// `Attack` — an independent interceptor, the wave machinery untouched
+    /// — and the hunter latches until the leak clears.
+    #[test]
+    fn defense_leak_intercept_sends_the_nearest_unit_at_the_intruder() {
+        let (mut sim, rules, ai_house, enemy_house) = defense_forces_world();
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        let core = sim
+            .spawn_object_at_height("GACNST", &ai_owner, 15, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        sim.attach_object_trigger_tag(core, Some("LOSE_TAG"));
+        let tank = sim
+            .spawn_object_at_height("MTNK", &ai_owner, 17, 14, 0, 0, &rules)
+            .expect("the fixture cell admits the tank");
+        let intruder = sim
+            .spawn_object_at_height("TAGUNIT", &enemy_owner, 16, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the vehicle");
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
+
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        let commands = ai.orders(&runtime, 0);
+
+        let attack = commands.iter().find_map(|envelope| match envelope.payload {
+            super::Command::Attack {
+                attacker_id,
+                target_id,
+            } => Some((attacker_id, target_id)),
+            _ => None,
+        });
+        assert_eq!(
+            attack,
+            Some((tank, intruder)),
+            "the leak draws the nearest combat unit onto the intruder"
+        );
+        let persona = ai.defense.as_ref().expect("the persona stays adopted");
+        assert_eq!(
+            persona.leak_interceptors,
+            vec![tank],
+            "the hunter latches into the chase book"
+        );
     }
 }
