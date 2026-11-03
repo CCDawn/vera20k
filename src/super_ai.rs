@@ -798,8 +798,10 @@ const DEFENSE_REAR_RING: i32 = 4;
 const DEFENSE_AA_PER_AIRCRAFT: usize = 2;
 /// The army mix's AA floor: one answer gun even with no aircraft observed.
 const DEFENSE_AA_FLOOR: usize = 1;
-/// The army mix's AA cap.
-const DEFENSE_AA_CAP: usize = 8;
+/// The army mix's AA ceiling over the two-guns-per-plane answer: a wave
+/// of `n` aircraft demands at most this multiple of itself, so a huge
+/// air wave scales the answer and a lone scout cannot flood the lines.
+const DEFENSE_AA_CEILING_MULTIPLIER: usize = 3;
 /// The army mix's armor margin above the observed vehicles, with its
 /// floor (the baseline line) and cap.
 const DEFENSE_ARMOR_MARGIN: usize = 2;
@@ -9835,18 +9837,22 @@ impl SuperAi {
     /// site scan. Drift past [`DEFENSE_LINE_DRIFT_CELLS`] walks the
     /// drifter back first — holding the line, never marching it.
     /// The objective ring's quota: the baseline ring, raised to the army
-    /// mix's own answer to the observed wave (the same capped air, armor
-    /// and foot targets `defense_army_orders` fields) — the ring holds the
-    /// wave the map sends, not a token guard.
-    fn defense_objective_quota(&self, sim: &crate::sim::world::Simulation) -> usize {
+    /// The mix's role targets for the observed wave: air answered two guns
+    /// to one (ceiling at [`DEFENSE_AA_CEILING_MULTIPLIER`] times the
+    /// observation, so an 80-plane wave asks for 160 guns instead of the
+    /// old flat 8), armor and foot answered with a margin over the
+    /// observed counts, every target floored so an early quiet map still
+    /// fields a baseline. `defense_army_orders` files the deficits and the
+    /// objective ring sizes itself on the sum.
+    fn defense_mix_targets(&self, sim: &crate::sim::world::Simulation) -> (usize, usize, usize) {
         let Some(persona) = self.defense.as_ref() else {
-            return DEFENSE_OBJECTIVE_POSTS;
+            return (DEFENSE_AA_FLOOR, DEFENSE_ARMOR_FLOOR, DEFENSE_FOOT_FLOOR);
         };
         let composition = persona.observed_wave_composition;
         let anti_air = if composition.aircraft > 0 {
             (composition.aircraft * DEFENSE_AA_PER_AIRCRAFT)
                 .max(DEFENSE_AA_FLOOR)
-                .min(DEFENSE_AA_CAP)
+                .min(composition.aircraft * DEFENSE_AA_CEILING_MULTIPLIER)
         } else {
             DEFENSE_AA_FLOOR
         };
@@ -9856,6 +9862,19 @@ impl SuperAi {
         let anti_foot = (composition.infantry + DEFENSE_FOOT_MARGIN)
             .max(DEFENSE_FOOT_FLOOR)
             .min(DEFENSE_FOOT_CAP);
+        (anti_air, anti_armor, anti_foot)
+    }
+
+    /// The objective ring's quota: the baseline ring, raised to the mix's
+    /// own answer to the observed wave — the ring holds the wave the map
+    /// sends, not a token guard.
+    fn defense_objective_quota(&self, sim: &crate::sim::world::Simulation) -> usize {
+        let Some(persona) = self.defense.as_ref() else {
+            return DEFENSE_OBJECTIVE_POSTS;
+        };
+        let composition = persona.observed_wave_composition;
+        let (anti_air, anti_armor, anti_foot) = self.defense_mix_targets(sim);
+        let _ = composition;
         DEFENSE_OBJECTIVE_POSTS.max(anti_air + anti_armor + anti_foot)
     }
 
@@ -9905,6 +9924,40 @@ impl SuperAi {
             .collect();
         candidates.sort_by_key(|&(distance, id)| (distance, id));
         candidates
+    }
+
+    /// A role's roster names, roster order first, the fallbacks last — the
+    /// candidate list `defense_army_orders` files and the sub-ring reads.
+    fn defense_role_entries(opening: &Opening, role: Role) -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = Vec::new();
+        for name in opening
+            .vehicles
+            .iter()
+            .filter(|entry| entry.role == role)
+            .map(|entry| entry.name)
+        {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        for name in opening
+            .infantry
+            .iter()
+            .filter(|entry| entry.role == role)
+            .map(|entry| entry.name)
+        {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        match role {
+            Role::AntiArmor if !names.contains(&opening.main_tank) => names.push(opening.main_tank),
+            Role::AntiInfantry if !names.contains(&opening.basic_infantry) => {
+                names.push(opening.basic_infantry)
+            }
+            _ => {}
+        }
+        names
     }
 
     fn defense_line_orders(
@@ -10244,63 +10297,27 @@ impl SuperAi {
         owner: &str,
         tick: u32,
     ) -> Option<Command> {
-        let composition = self.defense.as_ref()?.observed_wave_composition;
-        // The role targets: air answered two guns to one, armor and foot
-        // answered with a margin over the observed counts, every target
-        // floored so an early quiet map still fields a baseline line.
-        let anti_air = if composition.aircraft > 0 {
-            (composition.aircraft * DEFENSE_AA_PER_AIRCRAFT)
-                .max(DEFENSE_AA_FLOOR)
-                .min(DEFENSE_AA_CAP)
-        } else {
-            DEFENSE_AA_FLOOR
-        };
-        let anti_armor = (composition.vehicles + DEFENSE_ARMOR_MARGIN)
-            .max(DEFENSE_ARMOR_FLOOR)
-            .min(DEFENSE_ARMOR_CAP);
-        let anti_foot = (composition.infantry + DEFENSE_FOOT_MARGIN)
-            .max(DEFENSE_FOOT_FLOOR)
-            .min(DEFENSE_FOOT_CAP);
+        // The role targets: the mix's own answer to the observed wave.
+        let (anti_air, anti_armor, anti_foot) = self.defense_mix_targets(sim);
         // The candidates per role, roster order first, the fallbacks last.
-        let entries = |role: Role| -> Vec<&'static str> {
-            let mut names: Vec<&'static str> = Vec::new();
-            for name in opening
-                .vehicles
-                .iter()
-                .filter(|entry| entry.role == role)
-                .map(|entry| entry.name)
-            {
-                if !names.contains(&name) {
-                    names.push(name);
-                }
-            }
-            for name in opening
-                .infantry
-                .iter()
-                .filter(|entry| entry.role == role)
-                .map(|entry| entry.name)
-            {
-                if !names.contains(&name) {
-                    names.push(name);
-                }
-            }
-            match role {
-                Role::AntiArmor if !names.contains(&opening.main_tank) => {
-                    names.push(opening.main_tank)
-                }
-                Role::AntiInfantry if !names.contains(&opening.basic_infantry) => {
-                    names.push(opening.basic_infantry)
-                }
-                _ => {}
-            }
-            names
-        };
         // The deficits, most-behind first; ties hold the air, armor, foot
         // order — the answer that dies fastest leads.
         let mut demands = [
-            (Role::AntiAir, anti_air, entries(Role::AntiAir)),
-            (Role::AntiArmor, anti_armor, entries(Role::AntiArmor)),
-            (Role::AntiInfantry, anti_foot, entries(Role::AntiInfantry)),
+            (
+                Role::AntiAir,
+                anti_air,
+                Self::defense_role_entries(opening, Role::AntiAir),
+            ),
+            (
+                Role::AntiArmor,
+                anti_armor,
+                Self::defense_role_entries(opening, Role::AntiArmor),
+            ),
+            (
+                Role::AntiInfantry,
+                anti_foot,
+                Self::defense_role_entries(opening, Role::AntiInfantry),
+            ),
         ];
         for (_, target, names) in demands.iter_mut() {
             let fielded = names
@@ -22111,6 +22128,61 @@ mod tests {
     /// The ring's quota reads the observed wave through the army mix's own
     /// capped targets: a heavy wave raises the ring above the baseline, a
     /// quiet map keeps it at the baseline.
+    /// A massed air wave scales the mix's air answer by the absolute
+    /// observation, not the old flat floor: eighty hostile aircraft ask
+    /// for their own guns at the core, the ring's quota reads the sum,
+    /// and the deepest deficit files the AA roster's first entry.
+    #[test]
+    fn aa_answer_scales_with_a_massed_air_wave() {
+        let (mut sim, rules, ai_house, enemy_house) = defense_forces_world();
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        // The observed wave: eighty hostile aircraft, the wave that once
+        // flattened the flat AA floor.
+        for index in 0..80 {
+            let (x, y) = (24 + index % 8, 22 + index / 8);
+            sim.spawn_object_at_height("HORNET", &enemy_owner, x, y, 20, 0, &rules)
+                .expect("the fixture cell admits the aircraft");
+        }
+        sim.houses
+            .get_mut(&ai_house)
+            .expect("the defense house")
+            .economy_mut_for_test()
+            .add_credits(99999);
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
+
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        ai.pinned_home = Some((10, 10));
+        ai.engine_home = Some((10, 10));
+        let mut filed = None;
+        for tick in 0..6 {
+            for envelope in ai.orders(&runtime, tick) {
+                if let super::Command::QueueProduction { type_id } = envelope.payload {
+                    filed = filed.or(Some(type_id));
+                }
+            }
+        }
+
+        // Two guns per plane: 80 observed asks for 160, the floored roles
+        // keep their baselines, and the ring's quota reads the sum.
+        let (anti_air, anti_armor, anti_foot) = ai.defense_mix_targets(&runtime.simulation);
+        assert_eq!(anti_air, 160, "eighty planes at two guns each");
+        assert_eq!(anti_armor, super::DEFENSE_ARMOR_FLOOR);
+        assert_eq!(anti_foot, super::DEFENSE_FOOT_FLOOR);
+        assert_eq!(
+            ai.defense_objective_quota(&runtime.simulation),
+            160 + super::DEFENSE_ARMOR_FLOOR + super::DEFENSE_FOOT_FLOOR,
+        );
+        // The deepest deficit is the air answer: the first production
+        // filed rides the AA roster's ungated lead (the Allied IFV).
+        let expected = runtime.simulation.interner().get("FV");
+        assert_eq!(filed, expected, "the air wave files the AA answer first");
+    }
+
     #[test]
     fn objective_quota_scales_with_the_observed_wave() {
         let (mut sim, rules, ai_house, enemy_house) = defense_world();
