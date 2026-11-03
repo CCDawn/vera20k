@@ -598,6 +598,16 @@ const AIR_THREAT_TYPES: [&str; 7] = ["JUMPJET", "ZEP", "ORCA", "SHAD", "HIND", "
 /// dropped unit order would starve the branches below it.
 const SW_FIRE_RETRY_TICKS: u32 = 150;
 
+/// The free recon pair's (the spy plane's, the psychic reveal's)
+/// darkest-cell scan (S-F): the fog grid strides every fourth cell for
+/// candidates, each scored by the still-unrevealed cells inside its
+/// eight-cell box — the charge buys only map knowledge, so the darkest
+/// region's center is the aim, and a candidate nearer the enemy mass
+/// center wins the same-darkness ties (the reveal is worth most on the
+/// approach to the enemy base).
+const SW_RECON_STRIDE: u16 = 4;
+const SW_RECON_RADIUS: u16 = 8;
+
 /// The Allied jet wing's target size (retail Intruders `ORCA` / Korea's
 /// Black Eagles `BEAG`, both `Factory=AircraftType` off the Airforce
 /// Command). Six keeps the wing a real strike force — two full strike
@@ -9120,12 +9130,67 @@ impl SuperAi {
             "GeneticConverterSpecial" => self.mutator_pad(sim),
             // S-F: the paradrop's outpost pad, else the enemy's ore line.
             "ParaDropSpecial" | "AmerParaDropSpecial" => self.paradrop_target(sim),
+            // S-F: the free recon pair scouts the fog — the darkest
+            // enemy-side region's center — instead of the destructive score
+            // (a reveal spent on a known structure cell buys nothing).
+            "SpyPlaneSpecial" | "PsychicRevealSpecial" => self.darkest_fog_cell(sim),
             // S-F: the shield rides the alarm.
             "ForceShieldSpecial" => self.force_shield_target(sim, rules),
             // S-D: the scored destructive aim — nuke, storm, and every
             // other enemy-striking special.
             _ => self.scored_strike_cell(sim),
         }
+    }
+
+    /// The free recon pair's aim (S-F): the darkest unexplored region's
+    /// center. The scan strides the fog grid on [`SW_RECON_STRIDE`],
+    /// scores every unrevealed candidate by the still-unrevealed cells
+    /// inside its [`SW_RECON_RADIUS`] box, and a candidate nearer the
+    /// enemy mass center wins the same-darkness ties (the reveal is worth
+    /// most on the approach to the enemy base). Every cell already
+    /// revealed answers `None` — the special holds its charge instead of
+    /// pointing into the known map.
+    fn darkest_fog_cell(&self, sim: &crate::sim::world::Simulation) -> Option<(u16, u16)> {
+        let fog = sim.fog();
+        let (width, height) = (fog.width(), fog.height());
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let enemy = self.enemy_center(sim);
+        let revealed = |rx: u16, ry: u16| fog.is_cell_revealed(self.house, rx, ry);
+        let mut best: Option<(i32, (u16, u16))> = None;
+        let mut cy = 0u16;
+        while cy < height {
+            let mut cx = 0u16;
+            while cx < width {
+                if !revealed(cx, cy) {
+                    let max_x = (cx + SW_RECON_RADIUS).min(width - 1);
+                    let max_y = (cy + SW_RECON_RADIUS).min(height - 1);
+                    let min_x = cx.saturating_sub(SW_RECON_RADIUS);
+                    let min_y = cy.saturating_sub(SW_RECON_RADIUS);
+                    let mut darkness = 0i32;
+                    for ry in min_y..=max_y {
+                        for rx in min_x..=max_x {
+                            if !revealed(rx, ry) {
+                                darkness += 1;
+                            }
+                        }
+                    }
+                    let enemy_gap = enemy.map_or(0, |(ex, ey)| {
+                        (i32::from(cx) - i32::from(ex))
+                            .abs()
+                            .max((i32::from(cy) - i32::from(ey)).abs())
+                    });
+                    let score = darkness * 4096 - enemy_gap;
+                    if best.is_none_or(|(kept, _)| score > kept) {
+                        best = Some((score, (cx, cy)));
+                    }
+                }
+                cx += SW_RECON_STRIDE;
+            }
+            cy += SW_RECON_STRIDE;
+        }
+        best.map(|(_, cell)| cell)
     }
 
     /// The Iron Curtain's column pad (S-A): the first own 3x3 holding
@@ -19609,5 +19674,58 @@ mod tests {
                 "the toggle cleared the outpost's flag"
             );
         }
+    }
+
+    /// The free recon specials' aim (S-F): the darkest unexplored region's
+    /// center wins, and a fully lit map holds the charge instead of aiming.
+    #[test]
+    fn darkest_fog_cell_picks_the_unrevealed_pocket_and_holds_on_a_lit_map() {
+        let mut sim = crate::sim::world::Simulation::new();
+        let house = sim.intern("SuperAiTest");
+        sim.fog_mut_for_test().set_width_for_test(64);
+        sim.fog_mut_for_test().set_height_for_test(64);
+        let ai = SuperAi::new(house, SuperAiDifficulty::Fair);
+        let insert_plane = |sim: &mut crate::sim::world::Simulation, plane| {
+            sim.fog_mut_for_test()
+                .by_owner_mut_for_test()
+                .insert(house, plane);
+        };
+        // Every cell dark: the interior candidates share the full score
+        // box, so the first row-major stride candidate with the full box
+        // wins — the scan's determinism discipline.
+        insert_plane(
+            &mut sim,
+            crate::sim::vision::OwnerVisibility::new(64, 64),
+        );
+        assert_eq!(ai.darkest_fog_cell(&sim), Some((8, 8)));
+
+        // Reveal everything except a pocket in the far corner: the last
+        // dark region's interior is the aim.
+        let mut plane = crate::sim::vision::OwnerVisibility::new(64, 64);
+        for ry in 0..64u16 {
+            for rx in 0..64u16 {
+                if !(48..64).contains(&rx) || !(48..64).contains(&ry) {
+                    plane.mark_visible(rx, ry);
+                }
+            }
+        }
+        insert_plane(&mut sim, plane);
+        let picked = ai
+            .darkest_fog_cell(&sim)
+            .expect("the dark pocket is an aim");
+        assert!(
+            (48..64).contains(&picked.0) && (48..64).contains(&picked.1),
+            "the aim sits in the pocket, got {picked:?}"
+        );
+
+        // The pocket lit too: nothing dark remains, the charge holds.
+        let mut plane = crate::sim::vision::OwnerVisibility::new(64, 64);
+        for ry in 0..64u16 {
+            for rx in 0..64u16 {
+                plane.mark_visible(rx, ry);
+            }
+        }
+        insert_plane(&mut sim, plane);
+        assert_eq!(ai.darkest_fog_cell(&sim), None, "a lit map holds");
     }
 }
