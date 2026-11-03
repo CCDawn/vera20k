@@ -121,6 +121,7 @@ tools/vendor-eval/
 # Kept visible: a root CLAUDE.md would stop Claude Code reading AGENTS.md.
 !/CLAUDE.md
 !/AGENTS.md
+!/SUPERAI.md
 
 /*.js
 /*.py

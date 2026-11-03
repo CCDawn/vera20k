@@ -18,6 +18,8 @@
 VERA20K is a community-led rewrite of the original engine, `gamemd.exe`. It uses the original
 game files, so you'll need your own copy of Red Alert 2: Yuri's Revenge.
 
+> **Fork note:** this branch adds **Super AI**, a stronger computer opponent — see [SUPERAI.md](SUPERAI.md).
+
 VERA20K is made by gamers, for gamers, and gamers have the final say in where it goes.
 
 <img src="docs/images/vera20k-screenshots.png" alt="VERA20K skirmish setup screen and in-game view" width="100%">
