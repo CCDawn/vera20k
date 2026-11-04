@@ -430,6 +430,7 @@ pub(crate) fn place_production_with_overlays(
             ry,
             overlay_registry,
             None,
+            true,
         )
         .reason
         .is_some()
@@ -489,6 +490,7 @@ pub(crate) fn place_production_with_overlays(
             ry,
             overlay_registry,
             None,
+            true,
         )
         .reason
         .is_some()
@@ -640,6 +642,10 @@ fn evaluate_building_placement(
         ry,
         overlay_registry,
         native_cells,
+        // The cursor preview re-evaluates every held frame; only the real
+        // PLACE execution logs its refusal (President22's 433-line storm:
+        // a held ghost out of the Adjacent ring warned once per frame).
+        false,
     )
 }
 
@@ -654,6 +660,7 @@ fn evaluate_resolved_building_placement(
     ry: u16,
     overlay_registry: Option<&OverlayTypeRegistry>,
     native_cells: Option<&crate::map::resolved_terrain::NativeCellQuery<'_>>,
+    log_reject: bool,
 ) -> BuildingPlacementEvaluation {
     // Display4ABA94 asks452670 for the selected host, independently of the
     // ordinary foundation query. Actual upgrade Unlimbo also returns before
@@ -731,36 +738,43 @@ fn evaluate_resolved_building_placement(
         if in_build_area {
             Ok(())
         } else {
-            let providers: Vec<String> = sim
-                .substrate
-                .entities
-                .values()
-                .filter(|e| {
-                    e.category() == EntityCategory::Structure
-                        && sim.interner.resolve(e.owner()).eq_ignore_ascii_case(owner)
-                })
-                .map(|e| {
-                    let type_str = sim.interner.resolve(e.type_ref());
-                    let bn = rules.object(type_str).is_some_and(|o| o.base_normal);
-                    format!(
-                        "{}@({},{}) bn={}",
-                        type_str,
-                        e.position.rx(),
-                        e.position.ry(),
-                        bn
-                    )
-                })
-                .collect();
-            log::warn!(
-                "Placement rejected: ({},{}) {}x{} outside build area for {} adj={} providers=[{}]",
-                rx,
-                ry,
-                width,
-                height,
-                owner,
-                obj.adjacent,
-                providers.join(", "),
-            );
+            // The diagnostic names every own structure so a wrong provider
+            // set stands out in one line. The cursor preview passes
+            // `log_reject = false`: it re-runs this arm every held frame,
+            // and each of those frames used to walk every entity and
+            // format this line (President22: 433 warns for one held ghost).
+            if log_reject {
+                let providers: Vec<String> = sim
+                    .substrate
+                    .entities
+                    .values()
+                    .filter(|e| {
+                        e.category() == EntityCategory::Structure
+                            && sim.interner.resolve(e.owner()).eq_ignore_ascii_case(owner)
+                    })
+                    .map(|e| {
+                        let type_str = sim.interner.resolve(e.type_ref());
+                        let bn = rules.object(type_str).is_some_and(|o| o.base_normal);
+                        format!(
+                            "{}@({},{}) bn={}",
+                            type_str,
+                            e.position.rx(),
+                            e.position.ry(),
+                            bn
+                        )
+                    })
+                    .collect();
+                log::warn!(
+                    "Placement rejected: ({},{}) {}x{} outside build area for {} adj={} providers=[{}]",
+                    rx,
+                    ry,
+                    width,
+                    height,
+                    owner,
+                    obj.adjacent,
+                    providers.join(", "),
+                );
+            }
             Err(BuildingPlacementError::OutOfBuildArea)
         }
     })()
