@@ -5273,6 +5273,22 @@ impl SuperAi {
                     let dy = entity.position.ry() as i16 - fort_cell.1;
                     let distance =
                         (i32::from(dx) * i32::from(dx) + i32::from(dy) * i32::from(dy)) as u32;
+                    // The ground rows must connect the candidate to the
+                    // hold (the wave march's gate): a candidate across a
+                    // breach drew Enter after Enter the sim nulled at the
+                    // water, and every budget attempt died on the walk.
+                    let fort = (fort_cell.0.max(0) as u16, fort_cell.1.max(0) as u16);
+                    if !zones_connected(
+                        sim,
+                        rules
+                            .object(type_name)
+                            .map(|ty| ty.movement_zone)
+                            .unwrap_or_default(),
+                        (entity.position.rx(), entity.position.ry()),
+                        fort,
+                    ) {
+                        continue;
+                    }
                     if boarding.is_none_or(|(kept_rank, kept_distance, _)| {
                         (rank, distance) < (kept_rank, kept_distance)
                     }) {
@@ -11320,6 +11336,25 @@ impl SuperAi {
         names
     }
 
+    /// Whether `entity` is the opening's battle fortress with seats still
+    /// open: the boarding call owns it until the hold fills, so both combat
+    /// pools exclude it unconditionally. A combat order walks the fortress
+    /// away from its candidates and the engine refuses Enter on a moving
+    /// transport — the old standing-pool exclusion leaned on the reserved
+    /// `boarders` set, which the [`BOARD_MAX_ATTEMPTS`] pool-back drains,
+    /// and the idle pool never excluded the fortress at all.
+    fn under_loaded_fortress(
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+        entity: &crate::sim::game_entity::GameEntity,
+    ) -> bool {
+        Some(sim.interner().resolve(entity.type_ref())) == opening.fortress
+            && entity
+                .passenger_role
+                .cargo()
+                .is_some_and(|cargo| cargo.count() < cargo.capacity())
+    }
+
     fn idle_combat_units(
         &self,
         sim: &crate::sim::world::Simulation,
@@ -11337,6 +11372,7 @@ impl SuperAi {
                             | crate::map::entities::EntityCategory::Infantry
                     )
                     && !Self::garrisoned(entity)
+                    && !Self::under_loaded_fortress(sim, opening, entity)
                     && {
                         let name = sim.interner().resolve(entity.type_ref());
                         roster.contains(&name) || Self::is_naval_type(opening, name)
@@ -11866,10 +11902,14 @@ impl SuperAi {
     /// The hero never boards — the pick filters him out by name.
     fn boarding_cargo(opening: &Opening) -> Vec<(&'static str, usize)> {
         let mut quotas: Vec<(&'static str, usize)> = Vec::new();
+        // The hero never boards — and each hero leads its own role group —
+        // so the quota picks skip him too: a hero seat is a seat no
+        // candidate can ever take (the fifth hold slot stood open all game
+        // behind Tanya's row).
         if let Some(anti_armor) = opening
             .infantry
             .iter()
-            .find(|entry| entry.role == Role::AntiArmor)
+            .find(|entry| entry.role == Role::AntiArmor && entry.name != opening.hero)
         {
             quotas.push((anti_armor.name, 2));
         }
@@ -11882,7 +11922,7 @@ impl SuperAi {
         if let Some(anti_infantry) = opening
             .infantry
             .iter()
-            .find(|entry| entry.role == Role::AntiInfantry)
+            .find(|entry| entry.role == Role::AntiInfantry && entry.name != opening.hero)
             && !quotas.iter().any(|&(name, _)| name == anti_infantry.name)
         {
             quotas.push((anti_infantry.name, 1));
@@ -13849,12 +13889,7 @@ impl SuperAi {
                     && !self.defense_duty(*id)
                     && !self.boarders.contains(id)
                     && !self.raiders.contains(id)
-                    && !(Some(sim.interner().resolve(entity.type_ref())) == opening.fortress
-                        && !self.boarders.is_empty()
-                        && entity
-                            .passenger_role
-                            .cargo()
-                            .is_some_and(|cargo| cargo.count() < cargo.capacity()))
+                    && !Self::under_loaded_fortress(sim, opening, entity)
                     && matches!(
                         entity.passive_acquire_mission(),
                         crate::sim::mission::MissionType::None
@@ -22745,6 +22780,216 @@ mod tests {
             quota,
             super::DEFENSE_AA_FLOOR + super::DEFENSE_ARMOR_CAP + super::DEFENSE_FOOT_CAP,
             "the raised quota is the mix's own capped answer (no aircraft observed)"
+        );
+    }
+
+    // ---- user-reported fix: the empty fortress (F) ----
+
+    /// The cargo quota never seats the hero: each side's hero leads its
+    /// own role group (Tanya anti-infantry, Boris anti-armor), and the
+    /// boarding pick filters him out by name — so a quota row naming the
+    /// hero is a seat no candidate can ever take, and the hold stood open
+    /// all game. The Allied mix pins the loadout: Tanya's row yields the
+    /// fifth seat to the Ghost; Boris's yields the anti-armor pair to the
+    /// Tesla Trooper.
+    #[test]
+    fn boarding_cargo_skips_the_hero_seat() {
+        for opening in &OPENINGS {
+            let quotas = SuperAi::boarding_cargo(opening);
+            assert!(
+                quotas.iter().all(|&(name, _)| name != opening.hero),
+                "{} quota seats the unboardable hero: {quotas:?}",
+                opening.hero
+            );
+        }
+        let allied = &OPENINGS[0];
+        assert_eq!(allied.hero, "TANY");
+        assert_eq!(
+            SuperAi::boarding_cargo(allied),
+            vec![("GGI", 2), ("E1", 2), ("GHOST", 1)],
+            "the hero's seat falls to the next anti-infantry entry"
+        );
+        let soviet = OPENINGS
+            .iter()
+            .find(|opening| opening.hero == "BORIS")
+            .expect("the Soviet opening");
+        assert_eq!(
+            SuperAi::boarding_cargo(soviet)[0],
+            ("SHK", 2),
+            "Boris's row yields the anti-armor pair to the Tesla Trooper"
+        );
+    }
+
+    /// The fortress with seats open stays out of both combat pools —
+    /// unconditionally, on every tick: a combat order walks it away from
+    /// its candidates and the engine refuses Enter on a moving transport.
+    /// The old idle pool never excluded it at all and the standing pool's
+    /// exclusion leaned on the reserved `boarders` set, which the
+    /// [`BOARD_MAX_ATTEMPTS`] pool-back drains.
+    #[test]
+    fn combat_pools_leave_the_under_loaded_fortress_home() {
+        let more_vehicles = "1=MTNK\n2=BFRT\n[MTNK]\nStrength=300\nSpeed=8\nSpeedType=Track\n\
+             MovementZone=Normal\nLocomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n\
+             [BFRT]\nStrength=400\nSpeed=4\nSpeedType=Track\nMovementZone=Normal\n\
+             Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\nPassengers=5\n";
+        let (mut sim, rules, ai_house, _enemy_house) = defense_world_with("", more_vehicles);
+        let owner = sim.interner.resolve(ai_house).to_string();
+        let tank = sim
+            .spawn_object_at_height("MTNK", &owner, 15, 15, 0, 0, &rules)
+            .expect("the tank cell admits the spawn");
+        let fortress = sim
+            .spawn_object_at_height("BFRT", &owner, 16, 16, 0, 0, &rules)
+            .expect("the fortress cell admits the spawn");
+        // A fresh hull holds native Guard; the pools read the plain
+        // mission the parked units hold.
+        use crate::sim::mission::MissionId;
+        for id in [tank, fortress] {
+            sim.substrate
+                .entities
+                .get_mut(id)
+                .expect("the spawned hull")
+                .mission
+                .set_current_for_test(MissionId::NONE, 0);
+        }
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        let opening = OPENINGS
+            .iter()
+            .find(|opening| opening.fortress == Some("BFRT"))
+            .expect("the Allied opening owns the fortress");
+        for (pool_name, pool) in [
+            ("idle", ai.idle_combat_units(&sim, opening)),
+            ("standing", ai.standing_combat_units(&sim, opening)),
+        ] {
+            assert!(
+                pool.contains(&tank),
+                "{pool_name} pool holds the plain tank (the positive control): {pool:?}"
+            );
+            assert!(
+                !pool.contains(&fortress),
+                "{pool_name} pool leaves the under-loaded fortress to the boarding call"
+            );
+        }
+    }
+
+    /// The fortress with seats open stays out of both combat pools on
+    /// every tick of a live episode, and a candidate the ground rows
+    /// cannot reach — across the collapsed span — draws no Enter at all,
+    /// while a connected one boards.
+    #[test]
+    #[ignore = "slow; retail; loads a retail map with real terrain zones"]
+    fn fortress_holds_the_pools_home_and_boards_connected_candidates() {
+        use crate::sim::mission::MissionType;
+
+        let (mut scenario, ai_house, _enemy) = pacific_bridge_battle();
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+        spawn_near(&mut scenario, "GACNST", ai_house, (64, 92));
+        let fortress = spawn_near(&mut scenario, "BFRT", ai_house, (66, 92));
+        let far = far_shore(&scenario);
+        // The channel carries several spans; one deck down leaves the rest
+        // carrying the crossing, and the far candidate stays genuinely
+        // connected (an Enter would then be correct). Drop every record's
+        // deck so the shores truly split.
+        {
+            use crate::sim::bridge_state::BridgeDamageEvent;
+
+            let runtime = &mut scenario.runtime;
+            let damage = runtime.resources.rules.bridge_rules.strength + 1;
+            let midpoints: Vec<(u16, u16)> = runtime
+                .simulation
+                .zone_grid()
+                .expect("the retail map's zone grid")
+                .bridge_records()
+                .iter()
+                .map(|record| {
+                    (
+                        (i32::from(record.endpoint_a.0) + i32::from(record.endpoint_b.0)) / 2,
+                        (i32::from(record.endpoint_a.1) + i32::from(record.endpoint_b.1)) / 2,
+                    )
+                })
+                .map(|(rx, ry)| (rx as u16, ry as u16))
+                .collect();
+            for &(rx, ry) in &midpoints {
+                for _ in 0..8 {
+                    let event = BridgeDamageEvent {
+                        rx,
+                        ry,
+                        damage,
+                        warhead_ref: runtime.simulation.intern("HE"),
+                        impact_z_leptons: 624,
+                        is_ion_cannon: false,
+                    };
+                    crate::sim::world::bridge_orchestrator::apply_bridge_damage_events_with_overlay_registry(
+                        &mut runtime.simulation,
+                        &runtime.resources.rules,
+                        &[event],
+                        Some(&runtime.resources.overlay_registry),
+                        crate::sim::world::FrameEffects::default(),
+                    );
+                }
+            }
+            assert!(
+                runtime
+                    .simulation
+                    .zone_grid()
+                    .expect("the retail map's zone grid")
+                    .bridge_records()
+                    .iter()
+                    .all(|record| !record.active),
+                "every span must be down before the boarding window (setup oracle)"
+            );
+        }
+        assert_ne!(
+            ground_zone(&scenario, far),
+            ground_zone(&scenario, PACIFIC_SHORE),
+            "the breach must split the zone rows (setup oracle)"
+        );
+
+        let opening = ai
+            .opening(scenario.sim())
+            .expect("the Allied opening resolves through the standing yard");
+        let mut enters: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
+        let mut far_candidate = None;
+        let mut near_candidate = None;
+        for tick in 0..1400u32 {
+            if tick == 400 {
+                // Across the broken spans: the zone rows do not connect it
+                // to the hold.
+                far_candidate = Some(spawn_near(&mut scenario, "GGI", ai_house, far));
+            }
+            if tick == 800 {
+                near_candidate = Some(spawn_near(&mut scenario, "GGI", ai_house, (67, 93)));
+            }
+            for pool in [
+                ai.idle_combat_units(scenario.sim(), opening),
+                ai.standing_combat_units(scenario.sim(), opening),
+            ] {
+                assert!(
+                    !pool.contains(&fortress),
+                    "the under-loaded fortress never enters a combat pool (tick {tick})"
+                );
+            }
+            for order in ai.orders(&scenario.runtime, tick) {
+                if let crate::sim::command::Command::MegaMission {
+                    entity_id,
+                    mission: MissionType::Enter,
+                    ..
+                } = order.payload
+                {
+                    *enters.entry(entity_id).or_insert(0) += 1;
+                }
+            }
+        }
+        let far_candidate = far_candidate.expect("the disconnected candidate spawned");
+        let near_candidate = near_candidate.expect("the connected candidate spawned");
+        assert!(
+            !enters.contains_key(&far_candidate),
+            "the candidate across the breach draws no Enter: {enters:?}"
+        );
+        assert!(
+            enters.contains_key(&near_candidate),
+            "positive control: the connected candidate boards: {enters:?}"
         );
     }
 }
