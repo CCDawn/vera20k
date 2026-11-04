@@ -5273,6 +5273,22 @@ impl SuperAi {
                     let dy = entity.position.ry() as i16 - fort_cell.1;
                     let distance =
                         (i32::from(dx) * i32::from(dx) + i32::from(dy) * i32::from(dy)) as u32;
+                    // The ground rows must connect the candidate to the
+                    // hold (the wave march's gate): a candidate across a
+                    // breach drew Enter after Enter the sim nulled at the
+                    // water, and every budget attempt died on the walk.
+                    let fort = (fort_cell.0.max(0) as u16, fort_cell.1.max(0) as u16);
+                    if !zones_connected(
+                        sim,
+                        rules
+                            .object(type_name)
+                            .map(|ty| ty.movement_zone)
+                            .unwrap_or_default(),
+                        (entity.position.rx(), entity.position.ry()),
+                        fort,
+                    ) {
+                        continue;
+                    }
                     if boarding.is_none_or(|(kept_rank, kept_distance, _)| {
                         (rank, distance) < (kept_rank, kept_distance)
                     }) {
@@ -11320,6 +11336,25 @@ impl SuperAi {
         names
     }
 
+    /// Whether `entity` is the opening's battle fortress with seats still
+    /// open: the boarding call owns it until the hold fills, so both combat
+    /// pools exclude it unconditionally. A combat order walks the fortress
+    /// away from its candidates and the engine refuses Enter on a moving
+    /// transport — the old standing-pool exclusion leaned on the reserved
+    /// `boarders` set, which the [`BOARD_MAX_ATTEMPTS`] pool-back drains,
+    /// and the idle pool never excluded the fortress at all.
+    fn under_loaded_fortress(
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+        entity: &crate::sim::game_entity::GameEntity,
+    ) -> bool {
+        Some(sim.interner().resolve(entity.type_ref())) == opening.fortress
+            && entity
+                .passenger_role
+                .cargo()
+                .is_some_and(|cargo| cargo.count() < cargo.capacity())
+    }
+
     fn idle_combat_units(
         &self,
         sim: &crate::sim::world::Simulation,
@@ -11337,6 +11372,7 @@ impl SuperAi {
                             | crate::map::entities::EntityCategory::Infantry
                     )
                     && !Self::garrisoned(entity)
+                    && !Self::under_loaded_fortress(sim, opening, entity)
                     && {
                         let name = sim.interner().resolve(entity.type_ref());
                         roster.contains(&name) || Self::is_naval_type(opening, name)
@@ -11866,10 +11902,14 @@ impl SuperAi {
     /// The hero never boards — the pick filters him out by name.
     fn boarding_cargo(opening: &Opening) -> Vec<(&'static str, usize)> {
         let mut quotas: Vec<(&'static str, usize)> = Vec::new();
+        // The hero never boards — and each hero leads its own role group —
+        // so the quota picks skip him too: a hero seat is a seat no
+        // candidate can ever take (the fifth hold slot stood open all game
+        // behind Tanya's row).
         if let Some(anti_armor) = opening
             .infantry
             .iter()
-            .find(|entry| entry.role == Role::AntiArmor)
+            .find(|entry| entry.role == Role::AntiArmor && entry.name != opening.hero)
         {
             quotas.push((anti_armor.name, 2));
         }
@@ -11882,7 +11922,7 @@ impl SuperAi {
         if let Some(anti_infantry) = opening
             .infantry
             .iter()
-            .find(|entry| entry.role == Role::AntiInfantry)
+            .find(|entry| entry.role == Role::AntiInfantry && entry.name != opening.hero)
             && !quotas.iter().any(|&(name, _)| name == anti_infantry.name)
         {
             quotas.push((anti_infantry.name, 1));
@@ -12736,9 +12776,11 @@ impl SuperAi {
 
     /// The strike sequence: the revealed enemy superweapons first (the
     /// counter table's priority strike, whoever holds them), then the
-    /// house whose structure stands nearest the gather cell — its
-    /// factories, its defenses, then every other structure it holds, the
-    /// retail script's quarry order — nearest the gather cell first within
+    /// house whose structure stands nearest the gather cell — its yard
+    /// and war factories, its refineries, its defenses, its power, then
+    /// every other structure it holds (the economic ladder; the retail
+    /// script's quarry order plus the value classes the engine's
+    /// Greatest_Threat misses) — nearest the gather cell first within
     /// each class, so the wave works one base through instead of
     /// zigzagging between houses. Empty when no hostile structure stands.
     fn wave_strike_sequence(&self, sim: &crate::sim::world::Simulation) -> Vec<(u64, (i16, i16))> {
@@ -12774,12 +12816,16 @@ impl SuperAi {
                 leads.push((distance(cell), id, cell));
                 continue;
             }
-            let class = if WAR_FACTORY_TYPES.contains(&name) {
+            let class = if CONYARD_TYPES.contains(&name) || WAR_FACTORY_TYPES.contains(&name) {
                 0
-            } else if WAVE_DEFENSE_TYPES.contains(&name) {
+            } else if ENEMY_REFINERY_TYPES.contains(&name) {
                 1
-            } else {
+            } else if WAVE_DEFENSE_TYPES.contains(&name) {
                 2
+            } else if ENEMY_POWER_TYPES.contains(&name) {
+                3
+            } else {
+                4
             };
             hostile.push((class, distance(cell), id, cell, entity.owner()));
         }
@@ -13052,6 +13098,34 @@ impl SuperAi {
             let cell = (head_cell.0.max(0) as u16, head_cell.1.max(0) as u16);
             if !zones_connected(sim, movement_zone, from, cell) {
                 continue;
+            }
+            // A ground member already within its primary's reach of the
+            // head fires at it directly (the escort's Attack click): the
+            // walk-in's AttackMove handed every arrival to the engine's
+            // Greatest_Threat, which has no economic-value term, so the
+            // shot drifted off the head mid-fight. The engine walks an
+            // Attack into range on its own, and the head's fall re-latches
+            // the sequence — a collapsed head re-leads the ladder's next
+            // class and the next dispatch re-points.
+            let in_head_range = rules
+                .object(type_name)
+                .and_then(|ty| ty.weapon_at(0).and_then(|name| rules.weapon(name)))
+                .zip(crate::sim::combat::object_distance_to(
+                    unit,
+                    &crate::sim::combat::TargetKind::Entity(head),
+                    sim,
+                ))
+                .is_some_and(|(weapon, distance)| distance < weapon.range_leptons);
+            if in_head_range {
+                if self.futile(unit, FutilityKind::Wave, from, tick) {
+                    continue;
+                }
+                self.gate_idle_order(unit, tick);
+                self.wave_marched.push(unit);
+                return Some(Command::Attack {
+                    attacker_id: unit,
+                    target_id: head,
+                });
             }
             // Layer 3: siege-role units bombard from standoff — the
             // destination pulls back short of the aim along the home
@@ -13849,12 +13923,7 @@ impl SuperAi {
                     && !self.defense_duty(*id)
                     && !self.boarders.contains(id)
                     && !self.raiders.contains(id)
-                    && !(Some(sim.interner().resolve(entity.type_ref())) == opening.fortress
-                        && !self.boarders.is_empty()
-                        && entity
-                            .passenger_role
-                            .cargo()
-                            .is_some_and(|cargo| cargo.count() < cargo.capacity()))
+                    && !Self::under_loaded_fortress(sim, opening, entity)
                     && matches!(
                         entity.passive_acquire_mission(),
                         crate::sim::mission::MissionType::None
@@ -14455,9 +14524,20 @@ impl SuperAi {
             // for, and the limb reading the regroup as a jam Stopped the
             // members into walking home and the episode into disbanding at
             // its own clock. Its members sit the snapshot and the member
-            // picks both out until the episode ends.
-            if matches!(self.wave_stage, WaveStage::Marching | WaveStage::Striking)
-                && self.wave_members.contains(&id)
+            // picks both out until the episode ends — but a wedged member
+            // loses the immunity (the narrow-corridor report): on a bridge
+            // or choke the march jams against its own body, and a member
+            // holding a destination (or latched blocked) with nothing to
+            // shoot at is wedged by the same evidence the jam itself
+            // reads. The discharge pass and the escalation then handle it
+            // like any wedged unit; a marcher that still moves keeps the
+            // immunity whole.
+            let wave_member = matches!(self.wave_stage, WaveStage::Marching | WaveStage::Striking)
+                && self.wave_members.contains(&id);
+            if wave_member
+                && !(entity.attack_target.target().is_none()
+                    && (entity.navigation.nav_com().is_some()
+                        || entity.navigation.path_runtime().path_blocked()))
             {
                 continue;
             }
@@ -22743,6 +22823,439 @@ mod tests {
             quota,
             super::DEFENSE_AA_FLOOR + super::DEFENSE_ARMOR_CAP + super::DEFENSE_FOOT_CAP,
             "the raised quota is the mix's own capped answer (no aircraft observed)"
+        );
+    }
+
+    // ---- user-reported fix: the empty fortress (F) ----
+
+    /// The cargo quota never seats the hero: each side's hero leads its
+    /// own role group (Tanya anti-infantry, Boris anti-armor), and the
+    /// boarding pick filters him out by name — so a quota row naming the
+    /// hero is a seat no candidate can ever take, and the hold stood open
+    /// all game. The Allied mix pins the loadout: Tanya's row yields the
+    /// fifth seat to the Ghost; Boris's yields the anti-armor pair to the
+    /// Tesla Trooper.
+    #[test]
+    fn boarding_cargo_skips_the_hero_seat() {
+        for opening in &OPENINGS {
+            let quotas = SuperAi::boarding_cargo(opening);
+            assert!(
+                quotas.iter().all(|&(name, _)| name != opening.hero),
+                "{} quota seats the unboardable hero: {quotas:?}",
+                opening.hero
+            );
+        }
+        let allied = &OPENINGS[0];
+        assert_eq!(allied.hero, "TANY");
+        assert_eq!(
+            SuperAi::boarding_cargo(allied),
+            vec![("GGI", 2), ("E1", 2), ("GHOST", 1)],
+            "the hero's seat falls to the next anti-infantry entry"
+        );
+        let soviet = OPENINGS
+            .iter()
+            .find(|opening| opening.hero == "BORIS")
+            .expect("the Soviet opening");
+        assert_eq!(
+            SuperAi::boarding_cargo(soviet)[0],
+            ("SHK", 2),
+            "Boris's row yields the anti-armor pair to the Tesla Trooper"
+        );
+    }
+
+    /// The fortress with seats open stays out of both combat pools —
+    /// unconditionally, on every tick: a combat order walks it away from
+    /// its candidates and the engine refuses Enter on a moving transport.
+    /// The old idle pool never excluded it at all and the standing pool's
+    /// exclusion leaned on the reserved `boarders` set, which the
+    /// [`BOARD_MAX_ATTEMPTS`] pool-back drains.
+    #[test]
+    fn combat_pools_leave_the_under_loaded_fortress_home() {
+        let more_vehicles = "1=MTNK\n2=BFRT\n[MTNK]\nStrength=300\nSpeed=8\nSpeedType=Track\n\
+             MovementZone=Normal\nLocomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n\
+             [BFRT]\nStrength=400\nSpeed=4\nSpeedType=Track\nMovementZone=Normal\n\
+             Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\nPassengers=5\n";
+        let (mut sim, rules, ai_house, _enemy_house) = defense_world_with("", more_vehicles);
+        let owner = sim.interner.resolve(ai_house).to_string();
+        let tank = sim
+            .spawn_object_at_height("MTNK", &owner, 15, 15, 0, 0, &rules)
+            .expect("the tank cell admits the spawn");
+        let fortress = sim
+            .spawn_object_at_height("BFRT", &owner, 16, 16, 0, 0, &rules)
+            .expect("the fortress cell admits the spawn");
+        // A fresh hull holds native Guard; the pools read the plain
+        // mission the parked units hold.
+        use crate::sim::mission::MissionId;
+        for id in [tank, fortress] {
+            sim.substrate
+                .entities
+                .get_mut(id)
+                .expect("the spawned hull")
+                .mission
+                .set_current_for_test(MissionId::NONE, 0);
+        }
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        let opening = OPENINGS
+            .iter()
+            .find(|opening| opening.fortress == Some("BFRT"))
+            .expect("the Allied opening owns the fortress");
+        for (pool_name, pool) in [
+            ("idle", ai.idle_combat_units(&sim, opening)),
+            ("standing", ai.standing_combat_units(&sim, opening)),
+        ] {
+            assert!(
+                pool.contains(&tank),
+                "{pool_name} pool holds the plain tank (the positive control): {pool:?}"
+            );
+            assert!(
+                !pool.contains(&fortress),
+                "{pool_name} pool leaves the under-loaded fortress to the boarding call"
+            );
+        }
+    }
+
+    /// The fortress with seats open stays out of both combat pools on
+    /// every tick of a live episode, and a candidate the ground rows
+    /// cannot reach — across the collapsed span — draws no Enter at all,
+    /// while a connected one boards.
+    #[test]
+    #[ignore = "slow; retail; loads a retail map with real terrain zones"]
+    fn fortress_holds_the_pools_home_and_boards_connected_candidates() {
+        use crate::sim::mission::MissionType;
+
+        let (mut scenario, ai_house, _enemy) = pacific_bridge_battle();
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+
+        spawn_near(&mut scenario, "GACNST", ai_house, (64, 92));
+        let fortress = spawn_near(&mut scenario, "BFRT", ai_house, (66, 92));
+        let far = far_shore(&scenario);
+        // The channel carries several spans; one deck down leaves the rest
+        // carrying the crossing, and the far candidate stays genuinely
+        // connected (an Enter would then be correct). Drop every record's
+        // deck so the shores truly split.
+        {
+            use crate::sim::bridge_state::BridgeDamageEvent;
+
+            let runtime = &mut scenario.runtime;
+            let damage = runtime.resources.rules.bridge_rules.strength + 1;
+            let midpoints: Vec<(u16, u16)> = runtime
+                .simulation
+                .zone_grid()
+                .expect("the retail map's zone grid")
+                .bridge_records()
+                .iter()
+                .map(|record| {
+                    (
+                        (i32::from(record.endpoint_a.0) + i32::from(record.endpoint_b.0)) / 2,
+                        (i32::from(record.endpoint_a.1) + i32::from(record.endpoint_b.1)) / 2,
+                    )
+                })
+                .map(|(rx, ry)| (rx as u16, ry as u16))
+                .collect();
+            for &(rx, ry) in &midpoints {
+                for _ in 0..8 {
+                    let event = BridgeDamageEvent {
+                        rx,
+                        ry,
+                        damage,
+                        warhead_ref: runtime.simulation.intern("HE"),
+                        impact_z_leptons: 624,
+                        is_ion_cannon: false,
+                    };
+                    crate::sim::world::bridge_orchestrator::apply_bridge_damage_events_with_overlay_registry(
+                        &mut runtime.simulation,
+                        &runtime.resources.rules,
+                        &[event],
+                        Some(&runtime.resources.overlay_registry),
+                        crate::sim::world::FrameEffects::default(),
+                    );
+                }
+            }
+            assert!(
+                runtime
+                    .simulation
+                    .zone_grid()
+                    .expect("the retail map's zone grid")
+                    .bridge_records()
+                    .iter()
+                    .all(|record| !record.active),
+                "every span must be down before the boarding window (setup oracle)"
+            );
+        }
+        assert_ne!(
+            ground_zone(&scenario, far),
+            ground_zone(&scenario, PACIFIC_SHORE),
+            "the breach must split the zone rows (setup oracle)"
+        );
+
+        let opening = ai
+            .opening(scenario.sim())
+            .expect("the Allied opening resolves through the standing yard");
+        let mut enters: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
+        let mut far_candidate = None;
+        let mut near_candidate = None;
+        for tick in 0..1400u32 {
+            if tick == 400 {
+                // Across the broken spans: the zone rows do not connect it
+                // to the hold.
+                far_candidate = Some(spawn_near(&mut scenario, "GGI", ai_house, far));
+            }
+            if tick == 800 {
+                near_candidate = Some(spawn_near(&mut scenario, "GGI", ai_house, (67, 93)));
+            }
+            for pool in [
+                ai.idle_combat_units(scenario.sim(), opening),
+                ai.standing_combat_units(scenario.sim(), opening),
+            ] {
+                assert!(
+                    !pool.contains(&fortress),
+                    "the under-loaded fortress never enters a combat pool (tick {tick})"
+                );
+            }
+            for order in ai.orders(&scenario.runtime, tick) {
+                if let crate::sim::command::Command::MegaMission {
+                    entity_id,
+                    mission: MissionType::Enter,
+                    ..
+                } = order.payload
+                {
+                    *enters.entry(entity_id).or_insert(0) += 1;
+                }
+            }
+        }
+        let far_candidate = far_candidate.expect("the disconnected candidate spawned");
+        let near_candidate = near_candidate.expect("the connected candidate spawned");
+        assert!(
+            !enters.contains_key(&far_candidate),
+            "the candidate across the breach draws no Enter: {enters:?}"
+        );
+        assert!(
+            enters.contains_key(&near_candidate),
+            "positive control: the connected candidate boards: {enters:?}"
+        );
+    }
+
+    // ---- user-reported fix: the strike value ladder (H) ----
+
+    /// The strike ladder reads the economic classes: yard and war factory
+    /// lead, then the refinery, the defenses, the power, and only then
+    /// everything else — distance orders within a class alone. The old
+    /// ladder knew factories and defenses alone and threw the economy
+    /// into the undifferentiated rest, so the wave shelled hut-classes
+    /// while the yard and the refineries stood.
+    #[test]
+    fn wave_strike_sequence_orders_the_economic_classes() {
+        let extra = "[BuildingTypes]\n2=NACNST\n3=NAREFN\n4=NALASR\n5=NAPOWR\n\
+             [NACNST]\nStrength=1000\nFoundation=1x1\n\
+             [NAREFN]\nStrength=900\nFoundation=1x1\n\
+             [NALASR]\nStrength=600\nFoundation=1x1\n\
+             [NAPOWR]\nStrength=700\nFoundation=1x1\n";
+        let (mut sim, rules, ai_house, enemy_house) = defense_world_with(extra, "");
+        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        // One structure per class, distances deliberately inverted against
+        // the ladder (the yard spawned farthest, the rest-class hut
+        // farther still): the class order must override the cells.
+        let power = sim
+            .spawn_object_at_height("NAPOWR", &enemy_owner, 10, 10, 0, 0, &rules)
+            .expect("the power cell admits the spawn");
+        let defense = sim
+            .spawn_object_at_height("NALASR", &enemy_owner, 10, 13, 0, 0, &rules)
+            .expect("the defense cell admits the spawn");
+        let refinery = sim
+            .spawn_object_at_height("NAREFN", &enemy_owner, 10, 16, 0, 0, &rules)
+            .expect("the refinery cell admits the spawn");
+        let yard = sim
+            .spawn_object_at_height("NACNST", &enemy_owner, 10, 19, 0, 0, &rules)
+            .expect("the yard cell admits the spawn");
+        let hut = sim
+            .spawn_object_at_height("CABHUT", &enemy_owner, 10, 22, 0, 0, &rules)
+            .expect("the rest-class cell admits the spawn");
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.wave_gather = Some((10, 10));
+        assert_eq!(
+            ai.wave_strike_sequence(&sim),
+            vec![
+                (yard, (10, 19)),
+                (refinery, (10, 16)),
+                (defense, (10, 13)),
+                (power, (10, 10)),
+                (hut, (10, 22)),
+            ],
+            "yard > refinery > defense > power > rest, distance only within a class"
+        );
+    }
+
+    /// A ground member already within its primary's reach of the strike
+    /// head fires at it directly — the Attack click, not the walk-in's
+    /// AttackMove that handed every arrival to the engine's
+    /// Greatest_Threat — while a member out of range still walks in at
+    /// the head cell.
+    #[test]
+    fn strike_dispatch_fires_in_range_ground_members_at_the_head() {
+        use crate::sim::combat::TargetKind;
+
+        let extra = "[BuildingTypes]\n1=GACNST\n2=NAPOWR\n\
+             [GACNST]\nStrength=1000\nFoundation=1x1\n\
+             [NAPOWR]\nStrength=700\nFoundation=1x1\n\
+             [105mm]\nDamage=65\nROF=50\nRange=6\nWarhead=WH_DIRECT\n\
+             [WH_DIRECT]\nCellSpread=0\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n";
+        let more_vehicles = "1=MTNK\n[MTNK]\nStrength=100\nSpeed=6\nSpeedType=Track\n\
+             MovementZone=Normal\nCost=700\nTechLevel=1\nPrimary=105mm\n\
+             Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n";
+        let (mut sim, rules, ai_house, enemy_house) = defense_world_with(extra, more_vehicles);
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        let head = sim
+            .spawn_object_at_height("NAPOWR", &enemy_owner, 16, 16, 0, 0, &rules)
+            .expect("the fixture cell admits the head");
+        let head_cell = {
+            let head_entity = sim.substrate().entities.get(head).expect("the head");
+            (
+                head_entity.position.rx() as i16,
+                head_entity.position.ry() as i16,
+            )
+        };
+        // The in-range member stands on the head's doorstep (the 105mm
+        // reaches 6 cells); the out-of-range one stands at home.
+        let near = sim
+            .spawn_object_at_height("MTNK", &ai_owner, 17, 16, 0, 0, &rules)
+            .expect("the fixture cell admits the near tank");
+        let walker = sim
+            .spawn_object_at_height("MTNK", &ai_owner, 10, 12, 0, 0, &rules)
+            .expect("the fixture cell admits the walker");
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        let opening = ai
+            .opening(&sim)
+            .expect("the Allied opening resolves through the standing yard");
+        // The strike stage latched with the head leading; the dispatch is
+        // called directly so the other limbs' one-order budget and pacing
+        // stay out of the picture.
+        ai.wave_stage = super::WaveStage::Striking;
+        ai.wave_members = vec![near, walker];
+        ai.wave_stage_since = 0;
+        ai.wave_targets = vec![(head, head_cell)];
+
+        let first = ai.wave_dispatch_strike(&sim, &rules, opening, (10, 10), None, 0);
+        assert_eq!(
+            first,
+            Some(crate::sim::command::Command::Attack {
+                attacker_id: near,
+                target_id: head,
+            }),
+            "the member in range fires at the head directly"
+        );
+        let second = ai.wave_dispatch_strike(&sim, &rules, opening, (10, 10), None, 0);
+        assert_eq!(
+            second,
+            Some(crate::sim::command::Command::AttackMove {
+                entity_id: walker,
+                target: None,
+                destination: Some(TargetKind::Cell(
+                    head_cell.0.max(0) as u16,
+                    head_cell.1.max(0) as u16
+                )),
+            }),
+            "the member out of range still walks in at the head cell"
+        );
+    }
+
+    // ---- user-reported fix: the narrow-corridor jams (I) ----
+
+    /// A wedged wave member — stationary in the choke, still holding its
+    /// march destination, nothing to shoot at — loses the march immunity
+    /// (W3) and the jam machine takes over: the scan Stops it and the
+    /// discharge pass walks it clear of the box. A member that still
+    /// marches — nothing held, nothing latched — keeps the immunity: the
+    /// machine never touches it.
+    #[test]
+    fn wedged_wave_member_loses_the_march_immunity() {
+        use crate::sim::components::NavTargetRef;
+
+        let (mut sim, rules, ai_house, _enemy_house) = defense_world_with(
+            "[BuildingTypes]\n1=GACNST\n[GACNST]\nStrength=1000\nFoundation=1x1\n",
+            "1=MTNK\n[MTNK]\nStrength=100\nSpeed=6\nSpeedType=Track\nMovementZone=Normal\n\
+             Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n",
+        );
+        let owner = sim.interner.resolve(ai_house).to_string();
+        sim.spawn_object_at_height("GACNST", &owner, 10, 10, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        // A choke box: nine members wedged mid-march (each still holding
+        // its march NavCom at its own cell), plus one plain marcher among
+        // them. The nine fill the cluster quota; the box also sits inside
+        // the home ring, so the wedged evidence is what proves the jam.
+        let wedged_cells = [
+            (14u16, 14u16),
+            (14, 15),
+            (14, 16),
+            (15, 14),
+            (15, 15),
+            (15, 16),
+            (16, 14),
+            (16, 15),
+            (16, 16),
+        ];
+        let plain = sim
+            .spawn_object_at_height("MTNK", &owner, 16, 17, 0, 0, &rules)
+            .expect("the fixture cell admits the plain marcher");
+        let mut wedged = Vec::new();
+        for &(x, y) in &wedged_cells {
+            let tank = sim
+                .spawn_object_at_height("MTNK", &owner, x, y, 0, 0, &rules)
+                .expect("the fixture cell admits the wedged tank");
+            sim.substrate
+                .entities
+                .get_mut(tank)
+                .expect("the wedged tank")
+                .navigation
+                .set_nav_com_for_test(Some(NavTargetRef::cell(x, y)));
+            wedged.push(tank);
+        }
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
+
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        // The wave mid-march: every tank is a member and already marched,
+        // so the march dispatch stays out of the picture and the stage
+        // holds through the window.
+        let mut members = wedged.clone();
+        members.push(plain);
+        ai.wave_stage = super::WaveStage::Marching;
+        ai.wave_members = members.clone();
+        ai.wave_marched = members;
+        ai.wave_gather = Some((28, 28));
+        ai.wave_stage_since = 0;
+
+        let mut wedged_orders: std::collections::BTreeMap<u64, u32> =
+            std::collections::BTreeMap::new();
+        let mut plain_orders = 0u32;
+        for tick in 0..400u32 {
+            for envelope in ai.orders(&runtime, tick) {
+                match envelope.payload {
+                    crate::sim::command::Command::Stop { entity_id }
+                    | crate::sim::command::Command::Move { entity_id, .. }
+                    | crate::sim::command::Command::Scatter { entity_id } => {
+                        if wedged.contains(&entity_id) {
+                            *wedged_orders.entry(entity_id).or_insert(0) += 1;
+                        }
+                        if entity_id == plain {
+                            plain_orders += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            wedged_orders.len(),
+            wedged.len(),
+            "every wedged member draws the jam machine: {wedged_orders:?}"
+        );
+        assert_eq!(
+            plain_orders, 0,
+            "the plain marcher keeps its immunity: no Stop, Move or Scatter"
         );
     }
 }
