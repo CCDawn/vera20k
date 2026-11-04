@@ -12776,9 +12776,11 @@ impl SuperAi {
 
     /// The strike sequence: the revealed enemy superweapons first (the
     /// counter table's priority strike, whoever holds them), then the
-    /// house whose structure stands nearest the gather cell — its
-    /// factories, its defenses, then every other structure it holds, the
-    /// retail script's quarry order — nearest the gather cell first within
+    /// house whose structure stands nearest the gather cell — its yard
+    /// and war factories, its refineries, its defenses, its power, then
+    /// every other structure it holds (the economic ladder; the retail
+    /// script's quarry order plus the value classes the engine's
+    /// Greatest_Threat misses) — nearest the gather cell first within
     /// each class, so the wave works one base through instead of
     /// zigzagging between houses. Empty when no hostile structure stands.
     fn wave_strike_sequence(&self, sim: &crate::sim::world::Simulation) -> Vec<(u64, (i16, i16))> {
@@ -12814,12 +12816,16 @@ impl SuperAi {
                 leads.push((distance(cell), id, cell));
                 continue;
             }
-            let class = if WAR_FACTORY_TYPES.contains(&name) {
+            let class = if CONYARD_TYPES.contains(&name) || WAR_FACTORY_TYPES.contains(&name) {
                 0
-            } else if WAVE_DEFENSE_TYPES.contains(&name) {
+            } else if ENEMY_REFINERY_TYPES.contains(&name) {
                 1
-            } else {
+            } else if WAVE_DEFENSE_TYPES.contains(&name) {
                 2
+            } else if ENEMY_POWER_TYPES.contains(&name) {
+                3
+            } else {
+                4
             };
             hostile.push((class, distance(cell), id, cell, entity.owner()));
         }
@@ -13092,6 +13098,34 @@ impl SuperAi {
             let cell = (head_cell.0.max(0) as u16, head_cell.1.max(0) as u16);
             if !zones_connected(sim, movement_zone, from, cell) {
                 continue;
+            }
+            // A ground member already within its primary's reach of the
+            // head fires at it directly (the escort's Attack click): the
+            // walk-in's AttackMove handed every arrival to the engine's
+            // Greatest_Threat, which has no economic-value term, so the
+            // shot drifted off the head mid-fight. The engine walks an
+            // Attack into range on its own, and the head's fall re-latches
+            // the sequence — a collapsed head re-leads the ladder's next
+            // class and the next dispatch re-points.
+            let in_head_range = rules
+                .object(type_name)
+                .and_then(|ty| ty.weapon_at(0).and_then(|name| rules.weapon(name)))
+                .zip(crate::sim::combat::object_distance_to(
+                    unit,
+                    &crate::sim::combat::TargetKind::Entity(head),
+                    sim,
+                ))
+                .is_some_and(|(weapon, distance)| distance < weapon.range_leptons);
+            if in_head_range {
+                if self.futile(unit, FutilityKind::Wave, from, tick) {
+                    continue;
+                }
+                self.gate_idle_order(unit, tick);
+                self.wave_marched.push(unit);
+                return Some(Command::Attack {
+                    attacker_id: unit,
+                    target_id: head,
+                });
             }
             // Layer 3: siege-role units bombard from standoff — the
             // destination pulls back short of the aim along the home
@@ -22990,6 +23024,132 @@ mod tests {
         assert!(
             enters.contains_key(&near_candidate),
             "positive control: the connected candidate boards: {enters:?}"
+        );
+    }
+
+    // ---- user-reported fix: the strike value ladder (H) ----
+
+    /// The strike ladder reads the economic classes: yard and war factory
+    /// lead, then the refinery, the defenses, the power, and only then
+    /// everything else — distance orders within a class alone. The old
+    /// ladder knew factories and defenses alone and threw the economy
+    /// into the undifferentiated rest, so the wave shelled hut-classes
+    /// while the yard and the refineries stood.
+    #[test]
+    fn wave_strike_sequence_orders_the_economic_classes() {
+        let extra = "[BuildingTypes]\n2=NACNST\n3=NAREFN\n4=NALASR\n5=NAPOWR\n\
+             [NACNST]\nStrength=1000\nFoundation=1x1\n\
+             [NAREFN]\nStrength=900\nFoundation=1x1\n\
+             [NALASR]\nStrength=600\nFoundation=1x1\n\
+             [NAPOWR]\nStrength=700\nFoundation=1x1\n";
+        let (mut sim, rules, ai_house, enemy_house) = defense_world_with(extra, "");
+        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        // One structure per class, distances deliberately inverted against
+        // the ladder (the yard spawned farthest, the rest-class hut
+        // farther still): the class order must override the cells.
+        let power = sim
+            .spawn_object_at_height("NAPOWR", &enemy_owner, 10, 10, 0, 0, &rules)
+            .expect("the power cell admits the spawn");
+        let defense = sim
+            .spawn_object_at_height("NALASR", &enemy_owner, 10, 13, 0, 0, &rules)
+            .expect("the defense cell admits the spawn");
+        let refinery = sim
+            .spawn_object_at_height("NAREFN", &enemy_owner, 10, 16, 0, 0, &rules)
+            .expect("the refinery cell admits the spawn");
+        let yard = sim
+            .spawn_object_at_height("NACNST", &enemy_owner, 10, 19, 0, 0, &rules)
+            .expect("the yard cell admits the spawn");
+        let hut = sim
+            .spawn_object_at_height("CABHUT", &enemy_owner, 10, 22, 0, 0, &rules)
+            .expect("the rest-class cell admits the spawn");
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.wave_gather = Some((10, 10));
+        assert_eq!(
+            ai.wave_strike_sequence(&sim),
+            vec![
+                (yard, (10, 19)),
+                (refinery, (10, 16)),
+                (defense, (10, 13)),
+                (power, (10, 10)),
+                (hut, (10, 22)),
+            ],
+            "yard > refinery > defense > power > rest, distance only within a class"
+        );
+    }
+
+    /// A ground member already within its primary's reach of the strike
+    /// head fires at it directly — the Attack click, not the walk-in's
+    /// AttackMove that handed every arrival to the engine's
+    /// Greatest_Threat — while a member out of range still walks in at
+    /// the head cell.
+    #[test]
+    fn strike_dispatch_fires_in_range_ground_members_at_the_head() {
+        use crate::sim::combat::TargetKind;
+
+        let extra = "[BuildingTypes]\n1=GACNST\n2=NAPOWR\n\
+             [GACNST]\nStrength=1000\nFoundation=1x1\n\
+             [NAPOWR]\nStrength=700\nFoundation=1x1\n\
+             [105mm]\nDamage=65\nROF=50\nRange=6\nWarhead=WH_DIRECT\n\
+             [WH_DIRECT]\nCellSpread=0\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n";
+        let more_vehicles = "1=MTNK\n[MTNK]\nStrength=100\nSpeed=6\nSpeedType=Track\n\
+             MovementZone=Normal\nCost=700\nTechLevel=1\nPrimary=105mm\n\
+             Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n";
+        let (mut sim, rules, ai_house, enemy_house) = defense_world_with(extra, more_vehicles);
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        let head = sim
+            .spawn_object_at_height("NAPOWR", &enemy_owner, 16, 16, 0, 0, &rules)
+            .expect("the fixture cell admits the head");
+        let head_cell = {
+            let head_entity = sim.substrate().entities.get(head).expect("the head");
+            (
+                head_entity.position.rx() as i16,
+                head_entity.position.ry() as i16,
+            )
+        };
+        // The in-range member stands on the head's doorstep (the 105mm
+        // reaches 6 cells); the out-of-range one stands at home.
+        let near = sim
+            .spawn_object_at_height("MTNK", &ai_owner, 17, 16, 0, 0, &rules)
+            .expect("the fixture cell admits the near tank");
+        let walker = sim
+            .spawn_object_at_height("MTNK", &ai_owner, 10, 12, 0, 0, &rules)
+            .expect("the fixture cell admits the walker");
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        let opening = ai
+            .opening(&sim)
+            .expect("the Allied opening resolves through the standing yard");
+        // The strike stage latched with the head leading; the dispatch is
+        // called directly so the other limbs' one-order budget and pacing
+        // stay out of the picture.
+        ai.wave_stage = super::WaveStage::Striking;
+        ai.wave_members = vec![near, walker];
+        ai.wave_stage_since = 0;
+        ai.wave_targets = vec![(head, head_cell)];
+
+        let first = ai.wave_dispatch_strike(&sim, &rules, opening, (10, 10), None, 0);
+        assert_eq!(
+            first,
+            Some(crate::sim::command::Command::Attack {
+                attacker_id: near,
+                target_id: head,
+            }),
+            "the member in range fires at the head directly"
+        );
+        let second = ai.wave_dispatch_strike(&sim, &rules, opening, (10, 10), None, 0);
+        assert_eq!(
+            second,
+            Some(crate::sim::command::Command::AttackMove {
+                entity_id: walker,
+                target: None,
+                destination: Some(TargetKind::Cell(
+                    head_cell.0.max(0) as u16,
+                    head_cell.1.max(0) as u16
+                )),
+            }),
+            "the member out of range still walks in at the head cell"
         );
     }
 }
