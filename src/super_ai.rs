@@ -679,6 +679,15 @@ const DEFENSE_FLOOR: usize = 2;
 /// can only move guns around, never inflate the armament program as a
 /// whole beyond the tier the air war justifies.
 const DEFENSE_PER_YARD_BASIC: usize = 2;
+/// The ground towers' wartime/heavy steps over the peace baselines
+/// ([`DEFENSE_PER_YARD_BASIC`]/[`DEFENSE_PER_YARD_HEAVY`]), the AA
+/// ladder's shape on the ground rows: one extra tower per yard once
+/// hostile ground combat actually fields, two against a massed assault.
+const DEFENSE_PER_YARD_WARTIME: usize = 3;
+const DEFENSE_PER_YARD_ASSAULT: usize = 4;
+/// Hostile ground combat units standing that count as a massed assault:
+/// the tier where every yard wants its fourth ground tower.
+const GROUND_HEAVY_THREATS: usize = 8;
 /// The AA tower's per-yard ladder: one always (a base never stands
 /// without its AA answer — the bombers must meet a tower, not a tower
 /// the first raid taught the queue to buy), two once hostile air
@@ -5876,7 +5885,10 @@ impl SuperAi {
             .get(&self.house)
             .is_some_and(|house| sim.interner().resolve(house.house_type_id()) == "French");
         let enemy_air = self.enemy_air_count(sim);
-        let heavy_per_yard = DEFENSE_PER_YARD_HEAVY + usize::from(late_sink);
+        let enemy_ground = self.enemy_ground_count(sim);
+        let heavy_per_yard =
+            ground_per_yard_quota(enemy_ground).max(DEFENSE_PER_YARD_HEAVY)
+                + usize::from(late_sink);
         let defenses = [
             (
                 opening.defense_aa,
@@ -5892,7 +5904,7 @@ impl SuperAi {
             ),
             (
                 opening.defense_basic,
-                DEFENSE_PER_YARD_BASIC,
+                ground_per_yard_quota(enemy_ground),
                 BASIC_DEFENSE_TARGET * 2,
                 true,
             ),
@@ -10677,6 +10689,25 @@ impl SuperAi {
             .iter()
             .map(|&name| self.count_enemy_units_of_type(sim, name))
             .sum()
+    }
+
+    /// The hostile ground combat count — vehicles and foot soldiers
+    /// standing — the ground towers' tiered per-yard quota's threat read
+    /// ([`ground_per_yard_quota`]), the same standing census the air
+    /// ladder reads over [`AIR_THREAT_TYPES`].
+    fn enemy_ground_count(&self, sim: &crate::sim::world::Simulation) -> usize {
+        sim.substrate()
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                self.is_enemy(sim, entity.owner())
+                    && matches!(
+                        entity.category(),
+                        crate::map::entities::EntityCategory::Unit
+                            | crate::map::entities::EntityCategory::Infantry
+                    )
+            })
+            .count()
     }
 
     /// The specialist a wheel slot goes to once the core has its
@@ -16005,6 +16036,24 @@ fn aa_per_yard_quota(enemy_air: usize) -> usize {
     }
 }
 
+/// The ground towers' per-yard quota against the hostile ground combat
+/// count — the defense limb's tiered ground answer, the AA ladder's shape
+/// on the ground rows: the peace baselines
+/// ([`DEFENSE_PER_YARD_BASIC`]/[`DEFENSE_PER_YARD_HEAVY`]) while the map is
+/// quiet, one extra tower per yard once hostile ground combat fields, two
+/// against a massed assault ([`GROUND_HEAVY_THREATS`]). The limb re-reads
+/// the count every slot, so a peace treaty drops the tier back and the
+/// queue rests at the baseline ring.
+fn ground_per_yard_quota(enemy_ground: usize) -> usize {
+    if enemy_ground >= GROUND_HEAVY_THREATS {
+        DEFENSE_PER_YARD_ASSAULT
+    } else if enemy_ground > 0 {
+        DEFENSE_PER_YARD_WARTIME
+    } else {
+        DEFENSE_PER_YARD_BASIC
+    }
+}
+
 /// The mobile-AA quota the vehicle pipeline owes the army: the
 /// [`AA_UNIT_FLOOR`] pair stands before hostile air exists, and every
 /// two hostile aircraft lift the target one more, capped at
@@ -16813,11 +16862,12 @@ mod tests {
     use super::{
         AA_COUNTER_AIR_THREATS, AA_COUNTER_ROLE_SHARE, AA_COUNTER_VEHICLE_FLOOR, AA_UNIT_CAP,
         AA_UNIT_FLOOR, AIR_WING_TARGET, BUILD_QUEUE_RETRY_TICKS, DEFENSE_PER_YARD_AA_BASE,
-        DEFENSE_PER_YARD_AA_HEAVY, DEFENSE_PER_YARD_AA_WARTIME, EXPANSION_MIN_DISTANCE,
+        DEFENSE_PER_YARD_AA_HEAVY, DEFENSE_PER_YARD_AA_WARTIME, DEFENSE_PER_YARD_ASSAULT,
+        DEFENSE_PER_YARD_BASIC, DEFENSE_PER_YARD_WARTIME, EXPANSION_MIN_DISTANCE,
         FLOATER_COUNTER_THREATS, FLOATER_TYPES, OPENINGS, ORE_ENEMY_DIRECTION_BIAS,
         ROLE_SHARE_BASE, ROLE_SHARE_BOOST, Role, RosterEntry, SuperAi, SuperAiDifficulty,
         TECH_BUILDING_TYPES, aa_per_yard_quota, aa_unit_target, aa_vehicle_target, anti_air_demand,
-        capture_priority_rank, enemy_direction_bias, foundation_keeps_gap,
+        capture_priority_rank, enemy_direction_bias, foundation_keeps_gap, ground_per_yard_quota,
         nearest_connected_target, rally_anchor, spy_infiltration_rank, tech_bank_short,
         wall_ring_cells,
     };
@@ -23170,6 +23220,32 @@ mod tests {
             ai.wall_next_cell(scenario.sim(), rules, opening, overlays, false),
             Some(placed),
             "the fallen placed cell is served past retirement"
+        );
+    }
+
+    /// The ground towers' per-yard quota tiers with the ground war (B3),
+    /// the AA ladder's shape on the ground rows: the peace baseline while
+    /// the map is quiet, one extra tower once hostile ground combat
+    /// fields, two against a massed assault.
+    #[test]
+    fn ground_tower_quota_tiers_with_the_ground_war() {
+        assert_eq!(ground_per_yard_quota(0), DEFENSE_PER_YARD_BASIC);
+        assert_eq!(
+            ground_per_yard_quota(1),
+            DEFENSE_PER_YARD_WARTIME,
+            "one hostile rifle lifts the ground rows out of peace"
+        );
+        assert_eq!(ground_per_yard_quota(7), DEFENSE_PER_YARD_WARTIME);
+        assert_eq!(ground_per_yard_quota(8), DEFENSE_PER_YARD_ASSAULT);
+        assert_eq!(ground_per_yard_quota(24), DEFENSE_PER_YARD_ASSAULT);
+        assert_eq!(
+            (
+                DEFENSE_PER_YARD_BASIC,
+                DEFENSE_PER_YARD_WARTIME,
+                DEFENSE_PER_YARD_ASSAULT
+            ),
+            (2, 3, 4),
+            "the ground ladder rides one step above the AA's at every tier"
         );
     }
 
