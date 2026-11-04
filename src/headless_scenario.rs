@@ -132,6 +132,26 @@ impl HeadlessScenario {
             .expect("the house constructor interns its name")
     }
 
+    /// Bring the map's multiplayer lobby slots (`<Player @ A..H>`) into the
+    /// loaded scenario as passive houses, one per consecutive start waypoint
+    /// (at most eight), and install the start-slot table the `PlayerAt`
+    /// trigger selectors read. This is what a lobby launch would add and a
+    /// spectatorless load lacks: without it, a defense map's slot-owned
+    /// reinforcement teams resolve no owner and their spawn actions fail
+    /// silently. Call before the first tick; the constructor spends no draws,
+    /// so a run without it keeps every earlier digest identical.
+    pub fn install_lobby_slot_houses(&mut self) -> Vec<InternedId> {
+        let starts = (0..)
+            .map_while(|index| self.map.waypoints.get(&index))
+            .count();
+        let runtime = &mut self.runtime;
+        crate::sim::scenario_bootstrap::install_lobby_slot_houses(
+            &mut runtime.simulation,
+            starts,
+            &runtime.resources.rules,
+        )
+    }
+
     /// Apply a driver treatment's opening kernel to `house`
     /// (`docs/superai.md`), from a tier or a policy directly: a set
     /// `native_hard_grant` takes the native Hard AI's opening grant through
@@ -192,6 +212,30 @@ pub fn load(retail_dir: &Path, map_file_name: &str, seed: u32) -> Result<Headles
         seed,
         battle_session(map_file_name, &[]),
     )
+}
+
+/// How many multiplayer start waypoints the named map defines, read through
+/// the light metadata path (no rules, theater or Simulation). A lobby sizes
+/// itself to this, which is how small maps start a match with fewer houses.
+pub fn map_multiplayer_start_count(
+    retail_dir: &Path,
+    map_file_name: &str,
+) -> Result<usize, String> {
+    let assets =
+        AssetManager::new(retail_dir, MediaArchiveMode::STOCK_DIGITAL).map_err(|error| {
+            format!(
+                "open retail MIX archives in {}: {error}",
+                retail_dir.display()
+            )
+        })?;
+    let loaded = crate::map::source::load_map_ini_by_name_or_path_with_assets(
+        retail_dir,
+        map_file_name,
+        &assets,
+    )
+    .map_err(|error| format!("read map {map_file_name}: {error}"))?;
+    let waypoints = crate::map::waypoints::parse_waypoints(&loaded.ini);
+    Ok(crate::map::waypoints::multiplayer_start_waypoints(&waypoints).len())
 }
 
 /// Load `map_file_name` as `session` launches it (see [`battle_session`]).
@@ -591,15 +635,21 @@ impl HeadlessScenario {
     /// Advance one committed simulation frame with no player commands,
     /// through the same bound-resource runtime transaction the app uses.
     pub fn tick(&mut self) {
-        let _ = self
-            .runtime
+        let _ = self.tick_with_output();
+    }
+
+    /// [`HeadlessScenario::tick`] returning the frame's output, so tooling
+    /// bins can observe the trigger effects (EVA lines, authored text) the
+    /// committed frame published.
+    pub fn tick_with_output(&mut self) -> crate::sim::world::SimFrameOutput {
+        self.runtime
             .advance_frame(
                 &[],
                 SIM_TICK_MS,
                 crate::sim::world::TickLane::Ordinary,
                 crate::sim::world::FrameEffects::default(),
             )
-            .expect("simulation frame failed; prior world mutations remain");
+            .expect("simulation frame failed; prior world mutations remain")
     }
 }
 

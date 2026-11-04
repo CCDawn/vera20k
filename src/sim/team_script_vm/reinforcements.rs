@@ -60,7 +60,16 @@ impl Simulation {
         explicit_owner: Option<InternedId>,
         rules: &RuleSet,
     ) -> Option<u64> {
-        let owner = explicit_owner.or_else(|| self.team_type_house(team_type, rules))?;
+        let owner = match explicit_owner.or_else(|| self.team_type_house(team_type, rules)) {
+            Some(owner) => owner,
+            None => {
+                self.note_trigger_failure(format!(
+                    "team {}: owner not resolvable (lobby slot house missing?)",
+                    self.interner.resolve(team_type)
+                ));
+                return None;
+            }
+        };
         let zone = self.team_initial_zone(team_type);
         let placement_scope_active = self.object_placement_scope_active();
         let id = self.team_script_vm.construct_team(
@@ -136,6 +145,10 @@ impl Simulation {
             return (false, None);
         };
         let Some(owner) = self.team_type_house(team_type, rules) else {
+            self.note_trigger_failure(format!(
+                "team {}: owner not resolvable (lobby slot house missing?)",
+                self.interner.resolve(team_type)
+            ));
             return (false, None);
         };
         let waypoint = if waypoint_override == -1 {
@@ -730,13 +743,23 @@ impl Simulation {
                         })
             })
         {
+            self.note_trigger_failure(format!(
+                "team {}: Full StorageClass fill is unported",
+                self.interner.resolve(team_type)
+            ));
             log::warn!(
                 "TeamType {} Full StorageClass fill exceeds the represented miner hold",
                 self.interner.resolve(team_type)
             );
             return None;
         }
-        let owner = self.team_type_house(team_type, rules)?;
+        let owner = self.team_type_house(team_type, rules).or_else(|| {
+            self.note_trigger_failure(format!(
+                "team {}: owner not resolvable (lobby slot house missing?)",
+                self.interner.resolve(team_type)
+            ));
+            None
+        })?;
         let zone = self.team_initial_zone(team_type);
         let team = self.team_script_vm.construct_team_instance(
             team_type,

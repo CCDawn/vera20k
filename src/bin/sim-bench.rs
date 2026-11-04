@@ -104,6 +104,7 @@ use vera20k_core::sim::command::{Command, CommandEnvelope};
 use vera20k_core::sim::intern::InternedId;
 use vera20k_core::sim::runtime::SimRuntime;
 use vera20k_core::sim::scenario_session::ScenarioGameMode;
+use vera20k_core::sim::world::{FrameEffects, TickLane};
 use vera20k_core::skirmish_launch::{AiDifficulty, LaunchCountry};
 
 use sim_bench_match::MatchScenario;
@@ -132,6 +133,12 @@ struct Args {
     units: usize,
     houses: Option<usize>,
     computers: Option<usize>,
+    /// `--defense`: the launch's local house plays under the defense
+    /// persona (`DefenseStance::IndependentZone`) instead of sitting out.
+    defense: bool,
+    /// `--defense-start`: pins the defended house to a start waypoint index,
+    /// keeping it off the map's wave-owner slot deterministically.
+    defense_start: Option<u8>,
     ticks: Option<NonZeroU64>,
     types: Vec<String>,
     order_spread: u64,
@@ -177,6 +184,8 @@ fn parse_args_from(mut argv: impl Iterator<Item = String>) -> Result<Args, Strin
         units: 20_000,
         houses: None,
         computers: None,
+        defense: false,
+        defense_start: None,
         ticks: None,
         types: ["E1", "E2", "MTNK", "HTNK"].map(String::from).to_vec(),
         order_spread: 30,
@@ -230,6 +239,13 @@ fn parse_args_from(mut argv: impl Iterator<Item = String>) -> Result<Args, Strin
             "--units" => args.units = number(value()?)? as usize,
             "--houses" => args.houses = Some(number(value()?)? as usize),
             "--computers" => args.computers = Some(number(value()?)? as usize),
+            "--defense" => args.defense = true,
+            "--defense-start" => {
+                args.defense_start =
+                    Some(u8::try_from(number(value()?)?).map_err(|_| {
+                        "--defense-start must be a start waypoint index".to_string()
+                    })?)
+            }
             "--ticks" => {
                 args.ticks = Some(
                     NonZeroU64::new(number(value()?)?).ok_or("--ticks needs a positive number")?,
@@ -294,7 +310,16 @@ fn parse_args_from(mut argv: impl Iterator<Item = String>) -> Result<Args, Strin
     if marched && args.computers.is_some() {
         return Err("--computers is a match and skirmish option".to_string());
     }
-    if !marched && let Some(flag) = march_flag {
+    if !marched && args.defense {
+        return Err("--defense is a match option".to_string());
+    }
+    if args.scenario == ScenarioKind::Super && args.defense {
+        return Err("--defense is a match option; super runs take --super-tier".to_string());
+    }
+    if args.defense_start.is_some() && !args.defense {
+        return Err("--defense-start needs --defense".to_string());
+    }
+    if marched && let Some(flag) = march_flag {
         return Err(format!("{flag} is a march option"));
     }
     if args.scenario == ScenarioKind::Super {
@@ -527,12 +552,21 @@ trait Frames {
     fn state_hash(&self) -> u64;
     /// After each completed frame, with every completed frame's time.
     fn completed(&mut self, tick: u64, times: &[Duration]);
+    /// Whether the run reached its stop condition and the loop should end
+    /// early (the defense run's terminal frame).
+    fn stop(&self) -> bool {
+        false
+    }
 }
 
 struct Bench<'a> {
     runtime: &'a mut SimRuntime,
     plan: &'a mut Plan,
     tick_ms: u32,
+    /// The defense run's terminal frame latched here: the frames past a
+    /// lose outcome stop committing (the sim freezes), so the loop ends
+    /// there instead of re-reading the frozen frame to the budget.
+    stopped: bool,
 }
 
 impl Frames for Bench<'_> {
@@ -545,6 +579,32 @@ impl Frames for Bench<'_> {
     }
 
     fn advance(&mut self, commands: &[CommandEnvelope]) -> Result<Option<u32>, String> {
+        // The defense run keeps the frame output: a lose outcome leaves
+        // `frame_committed` false (and latches the terminal score), and
+        // every frame past it is a frozen re-read. The loop stops on that
+        // frame — the repro line carries its tick and seed.
+        let defense = matches!(&*self.plan, Plan::Match(script) if script.defense_active());
+        if defense {
+            let output = self
+                .runtime
+                .advance_frame(
+                    commands,
+                    self.tick_ms,
+                    TickLane::Ordinary,
+                    FrameEffects::default(),
+                )
+                .map_err(|error| error.to_string())?;
+            if output.tick.terminal_score_finalized || !output.tick.frame_committed {
+                self.stopped = true;
+                println!(
+                    "defense_terminal tick={} frame_committed={} terminal_score_finalized={}",
+                    output.tick.tick,
+                    output.tick.frame_committed,
+                    output.tick.terminal_score_finalized
+                );
+            }
+            return Ok(None);
+        }
         self.runtime
             .advance_frame_for_tooling(commands, self.tick_ms)
             .map_err(|error| error.to_string())
@@ -569,6 +629,15 @@ impl Frames for Bench<'_> {
             tick + 1,
             mean.as_secs_f64() * 1000.0,
         );
+        if let Plan::Match(script) = &*self.plan
+            && let Some(line) = script.defense_progress(self.runtime)
+        {
+            println!("progress tick={} mean_ms=- {line}", tick + 1);
+        }
+    }
+
+    fn stop(&self) -> bool {
+        self.stopped
     }
 }
 
@@ -611,6 +680,11 @@ fn run_frames(
             measured.frame_records.push((tick + 1, hash, checksum));
         }
         frames.completed(tick, &measured.times);
+        // The defense run's terminal frame ends the loop early; the report
+        // and wave trace cover the frames that ran.
+        if frames.stop() {
+            return (measured, Ok(()));
+        }
     }
     (measured, Ok(()))
 }
@@ -709,7 +783,7 @@ fn main() -> Result<(), String> {
                 "usage: sim-bench [--ra2-dir <retail path>] [--map Death.mmx] \
                  [--scenario march|match|skirmish|super] [--seed S] [--units 20000] [--houses N] \
                  [--computers N (match, skirmish; default the map's most, at most 7)] \
-                 [--ticks 300 (match: 1800, skirmish: 9000)] \
+                 [--defense (match)] [--ticks 300 (match: 1800, skirmish: 9000)] \
                  [--types E1,E2,MTNK,HTNK] [--order-spread 30] [--return-at T] (march) \
                  [--hash-every N] [--frame-hash-every 15] [--csv <path>] [--serial-paths] [--serial-scans] \
                  [--games 1] [--max-ticks 30000] [--super-country America] \
@@ -737,7 +811,7 @@ fn main() -> Result<(), String> {
                 &args.ra2_dir,
                 &args.map,
                 args.seed,
-                sim_bench_match::session(&args.map, computers),
+                sim_bench_match::session(&args.map, computers, args.defense_start),
             )?
         }
         ScenarioKind::Skirmish => headless_scenario::load_session(
@@ -752,6 +826,11 @@ fn main() -> Result<(), String> {
     if !args.serial_paths {
         scenario.runtime.simulation.batch_path_searches();
     }
+    // A defense run traces its triggers: the map's waves must be visible in
+    // the same run that answers them.
+    if args.defense {
+        scenario.runtime.simulation.enable_trigger_trace();
+    }
     scenario
         .runtime
         .simulation
@@ -765,7 +844,8 @@ fn main() -> Result<(), String> {
             (houses, spawned, Plan::March(orders), ticks)
         }
         ScenarioKind::Match => {
-            let script = MatchScenario::setup(&mut scenario, args.houses, args.units)?;
+            let script =
+                MatchScenario::setup(&mut scenario, args.houses, args.units, args.defense)?;
             let ticks = args.ticks.map_or(sim_bench_match::TICKS, NonZeroU64::get);
             (script.houses(), script.spawned, Plan::Match(script), ticks)
         }
@@ -815,6 +895,9 @@ fn main() -> Result<(), String> {
     println!("simulation_tick_ms={tick_ms}");
     if let Plan::Match(script) = &plan {
         println!("progress tick=0 {}", script.progress(runtime));
+        if let Some(line) = script.defense_progress(runtime) {
+            println!("progress tick=0 {line}");
+        }
     }
 
     #[cfg(feature = "telemetry")]
@@ -825,12 +908,43 @@ fn main() -> Result<(), String> {
             runtime: &mut *runtime,
             plan: &mut plan,
             tick_ms,
+            stopped: false,
         },
         ticks,
         args.hash_every,
         args.frame_hashes.is_some(),
     );
     let live_at_end = runtime.simulation.entities().len();
+    if args.defense {
+        let trace = runtime.simulation.take_trigger_trace();
+        let mut spawned_teams = 0usize;
+        let mut refused = 0usize;
+        for event in &trace {
+            let Some(action) = event.action else {
+                continue;
+            };
+            // Team spawn actions 4/7/80/107: the wave spawns a defense run
+            // lives or dies on.
+            if matches!(action, 4 | 7 | 80 | 107) {
+                let ok = event.ok.unwrap_or(false);
+                spawned_teams += usize::from(ok);
+                refused += usize::from(!ok);
+                println!(
+                    "wave_action team={:?} ok={ok} detail={:?}",
+                    event.trigger, event.detail
+                );
+            } else {
+                println!(
+                    "trigger_note action={action} trigger={:?} event={:?} value={:?} ok={:?} detail={:?}",
+                    event.trigger, event.event, event.value, event.ok, event.detail
+                );
+            }
+        }
+        println!(
+            "wave_actions spawned={spawned_teams} refused={refused} records={}",
+            trace.len()
+        );
+    }
     let csv_written = args.csv.as_ref().map_or(Ok(()), |path| {
         std::fs::write(path, csv(&measured)).map_err(|error| format!("{}: {error}", path.display()))
     });

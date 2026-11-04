@@ -41,7 +41,10 @@ use vera20k_core::sim::command::{Command, CommandEnvelope};
 use vera20k_core::sim::intern::InternedId;
 use vera20k_core::sim::production::ProductionCategory;
 use vera20k_core::sim::runtime::SimRuntime;
-use vera20k_core::skirmish_launch::{AiDifficulty, LaunchCountry, SkirmishLaunchSession};
+use vera20k_core::skirmish_launch::{
+    AiDifficulty, LaunchCountry, LaunchStartPosition, SkirmishLaunchSession,
+};
+use vera20k_core::super_ai::{DefenseStance, SuperAi, SuperAiDifficulty};
 
 /// Objects in a squad.
 const SQUAD: usize = 30;
@@ -298,6 +301,14 @@ struct House {
     name: String,
     /// The house's own AI plays it; the script only gives it its start.
     computer: bool,
+    /// The defense persona plays this house: the script gives it its base
+    /// and its army, then stands down (no squads, no strikes, no queues);
+    /// the persona's own AI issues every command instead.
+    defended: bool,
+    /// An inert seat holder (a defense run passivizes the computer houses so
+    /// the map's waves read alone): it keeps its launch seat and MCV and
+    /// receives no base, no army and no script.
+    inert: bool,
     arsenal: Arsenal,
     home: (u16, u16),
     staging: (u16, u16),
@@ -322,6 +333,9 @@ pub(crate) struct MatchScenario {
     houses: Vec<House>,
     pub(crate) spawned: usize,
     reinforcements: usize,
+    /// The defense persona's AI, when the run seats one (`--defense`); its
+    /// orders merge after the script's every frame.
+    defense_ai: Option<SuperAi>,
 }
 
 /// Cell claims over the engine capacity; coordinates are already canonical.
@@ -485,11 +499,21 @@ fn place_mobile(
 
 /// The launch for a match on `map` against `computers` computer houses: the
 /// match's credits and tech level, and no starting units beside the MCVs.
-pub(crate) fn session(map: &str, computers: usize) -> SkirmishLaunchSession {
+/// `defense_start` pins the defended house (the launch's local slot) to a
+/// start waypoint index, so a run can keep the defense AI off the map's
+/// wave-owner slot deterministically.
+pub(crate) fn session(
+    map: &str,
+    computers: usize,
+    defense_start: Option<u8>,
+) -> SkirmishLaunchSession {
     let mut session = battle_session(map, &COMPUTER_ROSTER[..computers]);
     session.options.starting_credits = CREDITS;
     session.options.tech_level = TECH_LEVEL;
     session.options.unit_count = 0;
+    if let Some(index) = defense_start {
+        session.local_slot_mut().start_position = LaunchStartPosition::Position(index);
+    }
     session
 }
 
@@ -506,6 +530,7 @@ impl MatchScenario {
         scenario: &mut HeadlessScenario,
         houses: Option<usize>,
         units: usize,
+        defense: bool,
     ) -> Result<Self, String> {
         let starts: Vec<(u16, u16)> = (0..)
             .map_while(|index| scenario.map.waypoints.get(&index))
@@ -516,6 +541,33 @@ impl MatchScenario {
         let local_home =
             local.and_then(|id| sim.houses().get(&id)?.base_center().map(|home| (id, home)));
         let mut taken: Vec<_> = local_home.iter().map(|&(_, home)| home).collect();
+        // With `defense`, the launch's own local house stays an active house
+        // and the defense persona plays it: it keeps the start the launch
+        // seated it on (the start-slot table names it), so the map's waves
+        // and the other houses have it where a real player would stand. Its
+        // home is that seat's start waypoint; the MCV's cell backs the
+        // lookup, as when a map's waypoint table lacks the seat.
+        let mut defense_home: Option<(u16, u16)> = None;
+        let defense_id = defense.then(|| sim.session().current_house()).flatten();
+        if let Some(defended) = defense_id {
+            defense_home = sim
+                .session()
+                .start_slot_houses()
+                .iter()
+                .find(|&(_, owner)| *owner == defended)
+                .and_then(|(&index, _)| starts.get(index as usize))
+                .copied()
+                .or_else(|| {
+                    sim.entities()
+                        .values()
+                        .find(|entity| {
+                            entity.owner() == defended
+                                && entity.category() != EntityCategory::Structure
+                        })
+                        .map(|entity| (entity.position.rx(), entity.position.ry()))
+                });
+            taken.extend(defense_home);
+        }
         let computers: Vec<(InternedId, (u16, u16))> = sim
             .houses()
             .order()
@@ -532,27 +584,50 @@ impl MatchScenario {
             .copied()
             .filter(|start| !taken.contains(start))
             .collect();
-        let playing = houses.unwrap_or(computers.len() + free.len());
-        let local_plays = local_home.is_some() && playing == computers.len() + free.len() + 1;
-        let seated = computers.len() + usize::from(local_plays);
-        if playing < seated.max(2) || playing - seated > free.len() {
+        // The defended seat: the launch's local house playing under the
+        // defense persona, at the start the launch seated it on.
+        let defense_seated = usize::from(defense_id.is_some() && defense_home.is_some());
+        if defense && defense_seated == 0 {
+            return Err(
+                "--defense needs the launch's local house seated on a start waypoint".into(),
+            );
+        }
+        let playing = houses.unwrap_or(computers.len() + free.len()) + defense_seated;
+        // An explicit request to fill every start seats the launch's own
+        // house as a player too; under `--defense` the persona always has it.
+        let local_plays =
+            !defense && local_home.is_some() && playing == computers.len() + free.len() + 1;
+        let seated = computers.len() + usize::from(local_plays) + defense_seated;
+        // A match wants two playing houses, but a small defense map cannot
+        // host them: with the local house sitting out, the starts that remain
+        // cap the playing count. The floor is then everything the map fits.
+        let floor = if defense {
+            computers
+                .len()
+                .max((computers.len() + free.len() + defense_seated).min(2))
+        } else {
+            seated.max(2)
+        };
+        if playing < floor || playing - seated > free.len() {
             return Err(format!(
                 "{playing} houses on {} start waypoints: the launch took {} for itself and {} \
-                 computer houses, and a match needs two houses",
+                 computer houses, and a match needs {}",
                 starts.len(),
                 taken.len(),
-                computers.len()
+                computers.len(),
+                floor.max(2)
             ));
         }
-        if !local_plays && let Some(local) = local {
+        if !local_plays && defense_id.is_none() && let Some(local) = local {
             sim.make_house_multiplay_passive(local);
         }
         let humans = playing - seated;
 
-        let mut players: Vec<(InternedId, (u16, u16), bool)> = computers
-            .iter()
-            .map(|&(id, home)| (id, home, true))
-            .collect();
+        let mut players: Vec<(InternedId, (u16, u16), bool)> = Vec::new();
+        if let (Some(id), Some(home)) = (defense_id, defense_home) {
+            players.push((id, home, false));
+        }
+        players.extend(computers.iter().map(|&(id, home)| (id, home, true)));
         if local_plays {
             let (id, home) = local_home.expect("local seat checked above");
             players.push((id, home, false));
@@ -561,6 +636,19 @@ impl MatchScenario {
             let country = HUMAN_COUNTRIES[index % HUMAN_COUNTRIES.len()];
             let id = scenario.add_human_house(&format!("Bench{index:02}"), country);
             players.push((id, home, false));
+        }
+        // A defense run stands every computer house's native AI down after
+        // reading its seat, through the same command-driven mark a super run
+        // gives its own house (the Fair tier's kernel takes nothing): the
+        // houses keep their launch seats (the start-slot table the map's
+        // wave selectors read), stay at war so the persona's reads see the
+        // wave teams they own, and build nothing and march nothing, so the
+        // wave pressure reads alone. MultiplayPassive is not the tool: the
+        // persona reads passive houses as non-enemies.
+        if defense {
+            for &(id, _) in &computers {
+                scenario.apply_super_ai_tier(id, SuperAiDifficulty::Fair);
+            }
         }
 
         let grid = scenario.map.header.cell_grid();
@@ -594,6 +682,7 @@ impl MatchScenario {
         let mut houses = Vec::with_capacity(players.len());
         for (index, &(id, home, computer)) in players.iter().enumerate() {
             let sim = &mut runtime.simulation;
+            let defended = defense_id == Some(id);
             let state = &sim.houses()[&id];
             let side_index = state.side_index();
             let country = state
@@ -608,7 +697,8 @@ impl MatchScenario {
             );
             let mut fronts: Vec<usize> = (0..homes.len()).filter(|&other| other != index).collect();
             fronts.sort_by_key(|&other| (squared_distance(homes[other], home), other));
-            let toward = homes[fronts[0]];
+            // A solo playing house has no front; it stages where it stands.
+            let toward = homes[fronts.first().copied().unwrap_or(index)];
             let raw = (
                 i32::from(home.0) + (i32::from(toward.0) - i32::from(home.0)) / STAGING_DIVISOR,
                 i32::from(home.1) + (i32::from(toward.1) - i32::from(home.1)) / STAGING_DIVISOR,
@@ -628,6 +718,8 @@ impl MatchScenario {
                 id,
                 name: sim.interner().resolve(id).to_string(),
                 computer,
+                defended,
+                inert: computer && defense,
                 arsenal,
                 home,
                 staging,
@@ -645,9 +737,12 @@ impl MatchScenario {
         }
 
         let mut spawned = 0;
-        // A computer house deploys its own MCV at its start.
-        for house in houses.iter().filter(|house| house.computer) {
-            ground.reserve(house.home, DEPLOY_PAD);
+        // A computer house deploys its own MCV at its start; an inert seat
+        // holder parks its MCV untouched.
+        if !defense {
+            for house in houses.iter().filter(|house| house.computer) {
+                ground.reserve(house.home, DEPLOY_PAD);
+            }
         }
         for house in houses.iter_mut() {
             let owner = house.name.clone();
@@ -665,6 +760,11 @@ impl MatchScenario {
                 ),
                 grid,
             );
+            // An inert seat holder stands empty: its launch MCV parks at the
+            // seat, and nothing is placed for it.
+            if house.inert {
+                continue;
+            }
             // The construction yard heads the list; a computer house's comes
             // from its MCV.
             let base = &house.arsenal.base[usize::from(house.computer)..];
@@ -731,10 +831,14 @@ impl MatchScenario {
         }
 
         // The armies, a house at a time, each as near its staging cell as
-        // the other armies and the bases leave room for.
+        // the other armies and the bases leave room for. An inert seat
+        // holder fields nothing, so the defense run's foes are the map's.
         let quota = units / houses.len();
         let count = houses.len();
         for (index, house) in houses.iter_mut().enumerate() {
+            if house.inert {
+                continue;
+            }
             let owner = house.name.clone();
             let share = quota + usize::from(index < units % count);
             let heroes = house.arsenal.heroes.len().min(share);
@@ -761,7 +865,9 @@ impl MatchScenario {
             }
             spawned += army.len();
             house.known.extend(army.iter().map(|&(id, _)| id));
-            if house.computer {
+            // The defended house's army stays home as its garrison: the
+            // persona posts it, the script never marches it.
+            if house.computer || house.defended {
                 continue;
             }
             let entities = runtime.simulation.entities();
@@ -791,10 +897,22 @@ impl MatchScenario {
         runtime
             .simulation
             .resolve_type_handles(&runtime.resources.rules);
+        // The defense persona binds last, once its house's base and army
+        // stand: `apply_super_ai_tier` marks the house command-driven (the
+        // native AI stands down) and takes the Fair tier's no-op kernel, so
+        // the persona's decisions stay pure — the same treatment a super run
+        // gives its house.
+        let defense_ai = defense_id.map(|house| {
+            scenario.apply_super_ai_tier(house, SuperAiDifficulty::Fair);
+            let mut ai = SuperAi::new(house, SuperAiDifficulty::Fair);
+            ai.enable_defense_personality(DefenseStance::IndependentZone);
+            ai
+        });
         Ok(Self {
             houses,
             spawned,
             reinforcements: 0,
+            defense_ai,
         })
     }
 
@@ -804,6 +922,13 @@ impl MatchScenario {
 
     pub(crate) fn computers(&self) -> usize {
         self.houses.iter().filter(|house| house.computer).count()
+    }
+
+    /// Whether the run seats a defense persona (`--defense`): the frame
+    /// loop reads the per-frame output on those runs and stops at the
+    /// terminal frame.
+    pub(crate) fn defense_active(&self) -> bool {
+        self.defense_ai.is_some()
     }
 
     fn defeated(runtime: &SimRuntime, id: InternedId) -> bool {
@@ -902,7 +1027,12 @@ impl MatchScenario {
         let mut orders = Vec::new();
         for index in 0..self.houses.len() {
             let (id, stagger) = (self.houses[index].id, index as u64);
-            if self.houses[index].computer || Self::defeated(runtime, id) {
+            // The defended house plays under the defense persona, never the
+            // script: no rally, no squads, no focus fire, no queues.
+            if self.houses[index].computer
+                || self.houses[index].defended
+                || Self::defeated(runtime, id)
+            {
                 continue;
             }
             if tick == 0 {
@@ -1115,6 +1245,12 @@ impl MatchScenario {
                 }
             }
         }
+        // The defense persona's own orders, after the script's: its house is
+        // the script's, so nothing above emitted for it.
+        if let Some(ai) = self.defense_ai.as_mut() {
+            let tick = u32::try_from(tick).unwrap_or(u32::MAX);
+            orders.extend(ai.orders(runtime, tick));
+        }
         orders
     }
 
@@ -1180,6 +1316,62 @@ impl MatchScenario {
             factories[2]
         )
     }
+
+    /// The defense run's progress line: the defended house's own force, its
+    /// defeat and the persona's books, or `None` without `--defense`.
+    pub(crate) fn defense_progress(&self, runtime: &SimRuntime) -> Option<String> {
+        let ai = self.defense_ai.as_ref()?;
+        let house = self.houses.iter().find(|house| house.defended)?;
+        let sim = &runtime.simulation;
+        let mut counts = [0usize; 4];
+        for entity in sim.entities().values() {
+            if entity.is_alive() && !entity.in_limbo() && entity.owner() == house.id {
+                counts[match entity.category() {
+                    EntityCategory::Infantry => 0,
+                    EntityCategory::Unit => 1,
+                    EntityCategory::Aircraft => 2,
+                    EntityCategory::Structure => 3,
+                }] += 1;
+            }
+        }
+        let defeated = sim
+            .houses()
+            .get(&house.id)
+            .is_some_and(|state| state.is_defeated());
+        let credits = sim
+            .houses()
+            .get(&house.id)
+            .map(|state| i64::from(state.economy().credits()))
+            .unwrap_or(0);
+        let books = ai
+            .defense_books()
+            .map(|books| {
+                format!(
+                    "wave_in={} bearings={} foe_i={} foe_v={} foe_a={} sched_i={} sched_v={} sched_a={} protected={} line={} repair={} leak={} statue_hp={} owned={}",
+                    books
+                        .next_wave_estimate
+                        .map_or("-".into(), |frames| frames.to_string()),
+                    books.spawn_bearings,
+                    books.observed_infantry,
+                    books.observed_vehicles,
+                    books.observed_aircraft,
+                    books.scheduled_infantry,
+                    books.scheduled_vehicles,
+                    books.scheduled_aircraft,
+                    books.protected_targets,
+                    books.line_posts,
+                    books.repair_inbound,
+                    books.leak_interceptors,
+                    books.protected_min_health,
+                    books.protected_owned,
+                )
+            })
+            .unwrap_or_default();
+        Some(format!(
+            "defense name={} infantry={} vehicles={} aircraft={} buildings={} credits={credits} defeated={defeated} {books}",
+            house.name, counts[0], counts[1], counts[2], counts[3],
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1239,7 +1431,8 @@ mod scale_target_tests {
             .current_house()
             .expect("local player");
         let initial_houses = scenario.sim().houses().len();
-        let script = MatchScenario::setup(&mut scenario, Some(30), 60).expect("all 30 starts play");
+        let script =
+            MatchScenario::setup(&mut scenario, Some(30), 60, false).expect("all 30 starts play");
         assert_eq!(script.houses(), 30);
         assert_eq!(scenario.sim().houses().len(), initial_houses + 29);
         assert!(script.houses.iter().any(|house| house.id == local));

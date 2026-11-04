@@ -363,6 +363,37 @@ pub(crate) fn place_crate(
     true
 }
 
+/// [`place_crate`] for the headless tooling bins (`parity-digest --crate-e2e`):
+/// the runtime crate-placement owner with no draw of its own beyond the
+/// placement's own snap, returning the cell the crate actually occupies. A
+/// `powerup` of `Some(0)` stores the Money selection, so the later pickup
+/// spends no selection draw.
+pub fn place_crate_at_for_tooling(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    overlay_registry: &OverlayTypeRegistry,
+    requested: (i16, i16),
+    powerup: Option<u8>,
+) -> Option<(i16, i16)> {
+    let before: std::collections::BTreeSet<usize> = sim
+        .crate_authority
+        .slots()
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| !slot.is_empty())
+        .map(|(index, _)| index)
+        .collect();
+    if !place_crate(sim, rules, overlay_registry, requested, powerup) {
+        return None;
+    }
+    sim.crate_authority
+        .slots()
+        .iter()
+        .enumerate()
+        .find(|(index, slot)| !slot.is_empty() && !before.contains(index))
+        .map(|(_, slot)| (slot.cell_x, slot.cell_y))
+}
+
 /// Active Map rectangle used by random placement ([`Simulation::map_rect`]);
 /// LocalSize and the canonical Rust cell-array extent do not own these draws.
 fn crate_random_frame(sim: &Simulation) -> Option<CrateRandomFrame> {
