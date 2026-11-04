@@ -4252,16 +4252,24 @@ impl SuperAi {
                                     )
                                     // A packed field keeps the uniform
                                     // walk's degraded pass — a gun at home
-                                    // beats a canceled gun.
+                                    // beats a canceled gun. The owner filter
+                                    // keeps the degraded pass inside the
+                                    // BaseNormal ring: an ungated fallback
+                                    // answered candidates the engine refuses
+                                    // for real (President22's 433-place
+                                    // reject storm on a ring-saturated
+                                    // start area).
                                     .or_else(|| {
                                         home_center.and_then(|home| {
-                                            find_site_around(
+                                            find_site_around_capped(
                                                 sim,
                                                 rules,
                                                 &runtime.resources.overlay_registry,
                                                 ty,
                                                 home,
                                                 self.house,
+                                                Some(owner.as_str()),
+                                                SITE_SEARCH_RADIUS,
                                             )
                                         })
                                     })
@@ -4290,25 +4298,33 @@ impl SuperAi {
                                         )
                                         // A packed field keeps the uniform
                                         // walk's degraded pass — a gun at
-                                        // home beats a canceled gun.
+                                        // home beats a canceled gun. The
+                                        // owner filter keeps the degraded
+                                        // pass inside the BaseNormal ring
+                                        // (same reason as the fort
+                                        // fallback above).
                                         .or_else(|| {
-                                            find_site_around(
+                                            find_site_around_capped(
                                                 sim,
                                                 rules,
                                                 &runtime.resources.overlay_registry,
                                                 ty,
                                                 home,
                                                 self.house,
+                                                Some(owner.as_str()),
+                                                SITE_SEARCH_RADIUS,
                                             )
                                         })
                                     } else {
-                                        find_site_around(
+                                        find_site_around_capped(
                                             sim,
                                             rules,
                                             &runtime.resources.overlay_registry,
                                             ty,
                                             home,
                                             self.house,
+                                            Some(owner.as_str()),
+                                            SITE_SEARCH_RADIUS,
                                         )
                                     }
                                 }),
@@ -17700,8 +17716,8 @@ mod tests {
         RosterEntry, SuperAi, SuperAiDifficulty, TECH_BUILDING_TYPES, aa_per_yard_quota,
         aa_unit_target, aa_vehicle_target, anti_air_demand, capture_priority_rank,
         enemy_direction_bias, entrance_choke_cell, find_defense_site_around, foundation_keeps_gap,
-        ground_per_yard_quota, nearest_connected_target, rally_anchor,
-        spy_infiltration_rank, tech_bank_short, wall_ring_cells,
+        ground_per_yard_quota, nearest_connected_target, rally_anchor, spy_infiltration_rank,
+        tech_bank_short, wall_ring_cells,
     };
     use crate::sim::intern::InternedId;
     use crate::sim::runtime::SimRuntime;
@@ -24853,6 +24869,103 @@ mod tests {
         // The mirrored walks do not collide on one cell: the bias moved
         // the pick across the yard.
         assert_ne!(east, west);
+    }
+
+    /// The home scan's degraded (no-spacing) pass stays inside the engine's
+    /// build-area ring when the scan names the owner: a saturated ring whose
+    /// every candidate cell fails the placement read returns None instead of
+    /// answering an out-of-ring origin the engine refuses at apply time.
+    /// Ungated, the degraded pass fed one ready building to
+    /// `production_placement::is_within_build_area`'s reject arm hundreds of
+    /// times per game (native Display4A8EB0: the `Adjacent+1` ring over
+    /// friendly `BaseNormal` providers; Adjacent lives at TechnoType+0xEB4,
+    /// constructor default 3 at `0x0045DEAC`).
+    #[test]
+    fn home_scan_degraded_pass_refuses_out_of_ring_candidates() {
+        let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
+        else {
+            return;
+        };
+        let mut sim = crate::sim::world::Simulation::new();
+        let house = sim.intern("SuperAiTest");
+        let owner = sim.interner().resolve(house).to_string();
+        crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
+        let home: (i16, i16) = (12, 12);
+        sim.spawn_object_at_height(
+            "GACNST",
+            "SuperAiTest",
+            u16::try_from(home.0).expect("home cell"),
+            u16::try_from(home.1).expect("home cell"),
+            0,
+            0,
+            &rules,
+        )
+        .expect("the yard stands");
+        let registry = crate::rules::overlay_types::OverlayTypeRegistry::from_ini(
+            &crate::rules::ini_parser::IniFile::from_str(""),
+            None,
+        );
+        // Saturate every build-area origin: a neutral fill over [8,18] — the
+        // origins whose `Adjacent+1` ring reaches the 4x4 yard at [12,15] for
+        // a 2x2 placer (GAPOWR, Adjacent 2) — so each in-ring origin fails
+        // the placement read, while out-of-ring cells stay free for the
+        // ungated walk. GASPYSAT holds a 2x2 foundation without an ART
+        // section, so the walk skips a footprint a standing blocker (or the
+        // yard) already covers; even-origin spawns tile the box anyway.
+        // Neutral owners never provide build area to the test house.
+        let (blocker_w, blocker_h) = rules
+            .object("GASPYSAT")
+            .expect("the spy satellite reads")
+            .foundation
+            .dimensions();
+        let mut occupied: Vec<(u16, u16)> = (12..=15)
+            .flat_map(|x| (12..=15).map(move |y| (x, y)))
+            .collect();
+        for y in 8..=18 {
+            for x in 8..=18 {
+                let cells: Vec<(u16, u16)> = (0..blocker_w)
+                    .flat_map(|dx| {
+                        (0..blocker_h).map(move |dy| (x + u16::from(dx), y + u16::from(dy)))
+                    })
+                    .collect();
+                if cells.iter().any(|cell| occupied.contains(cell)) {
+                    continue;
+                }
+                sim.spawn_object_at_height("GASPYSAT", "Neutral", x, y, 0, 0, &rules)
+                    .unwrap_or_else(|| panic!("the blocker stands at ({x},{y})"));
+                occupied.extend(cells);
+            }
+        }
+        let ty = rules
+            .object("GAPOWR")
+            .expect("the Allied power plant reads");
+        let radius = 6;
+        // Without the owner filter the degraded pass answers the first clear
+        // cell, which sits past the ring the engine enforces at apply time.
+        let ungated =
+            super::find_site_around_capped(&sim, &rules, &registry, ty, home, house, None, radius)
+                .expect("the ungated degraded pass still answers a candidate");
+        assert!(
+            !crate::sim::production::is_within_build_area(
+                &sim, &rules, &owner, ty, ungated.0, ungated.1,
+            ),
+            "the ungated pick {ungated:?} must sit outside the yard's ring"
+        );
+        // With the owner filter the same saturated scan admits no candidate.
+        assert_eq!(
+            super::find_site_around_capped(
+                &sim,
+                &rules,
+                &registry,
+                ty,
+                home,
+                house,
+                Some(owner.as_str()),
+                radius,
+            ),
+            None,
+            "the gated scan must refuse every out-of-ring candidate"
+        );
     }
 
     /// The outpost gun floor (C1): a bare expansion claims the core row
