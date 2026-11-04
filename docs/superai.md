@@ -817,12 +817,14 @@ Each side's `Wall=yes` segment — the Allied and Soviet walls, and
 Yuri's Citadel Wall (`GAFWLL`, actively registered at BuildingTypes
 312 despite the old French-wall comment beside it) — queues one
 100-credit cycle at a time and places one cell per cycle around the
-first superweapon, then the second, then the yard; the engine's own
-auto-fill closes the spans toward standing segments for free. The
-walk skips cells the live overlay grid already holds a wall on,
-retires a spent ring once and for all (a fallen segment is never
-rebuilt), and cancels a stranded ready segment rather than wedging
-the one placement slot. The gap generator and the French Grand Cannon
+standing superweapons, then the yards (home and outpost), then the
+refineries; the engine's own auto-fill closes the spans toward
+standing segments for free. The walk skips cells the live overlay
+grid already holds a wall on, retires a spent ring, and rebuilds a
+placed segment the raider has since broken — one segment per fallen
+cell, seen standing before it fell — and cancels a stranded ready
+segment rather than wedging the one placement slot. The gap generator
+and the French Grand Cannon
 ride the gun limb's queue step behind the core lines — the generator
 behind the Allied battle lab (its shroud bubble is fully native), the
 cannon behind the radar and a live French-country check, because

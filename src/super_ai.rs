@@ -2857,6 +2857,15 @@ pub struct SuperAi {
     /// refused alike — so a refused cell is never knocked on twice ahead of
     /// a fresher one. Pinned state, never read from the runtime.
     wall_cells: std::collections::HashSet<(u16, u16)>,
+    /// The wall ring cells the walk has seen carrying a wall (B1's
+    /// placed-cell memory): own strikes that landed and rings a map or the
+    /// auto-fill completed. A cell the book holds that the live overlay no
+    /// longer reads a wall on is a fallen segment the ring owes one
+    /// segment back — the single-segment rebuild. A strike the engine
+    /// refused never enters the book (it was never seen standing), so the
+    /// rebuild cannot loop on a refusing cell. Pinned state, never read
+    /// from the runtime.
+    wall_built: std::collections::HashSet<(u16, u16)>,
     /// The tick the wall limb may queue again after an escape pass. One
     /// timestamp covers the whole target roster because the pass only
     /// fires once every ring was tried and refused; see
@@ -3268,6 +3277,7 @@ impl SuperAi {
             place_pause_until: std::collections::HashMap::new(),
             walled: std::collections::HashSet::new(),
             wall_cells: std::collections::HashSet::new(),
+            wall_built: std::collections::HashSet::new(),
             wall_target_cooldown_until: 0,
             wall_window_due: 0,
             rally_gate: std::collections::HashMap::new(),
@@ -6063,8 +6073,9 @@ impl SuperAi {
 
             // The wall ring (Layer 2.8). A perimeter of the side's wall
             // segments goes up one production cycle at a time around the
-            // first superweapon, then the second, then the construction
-            // yard — the pieces an early raider values most. The limb sits
+            // standing superweapons, then the yards (home and outpost),
+            // then the refineries — the pieces an early raider values most.
+            // The limb sits
             // ahead of the gun queue and the ladder walk on purpose: at the
             // chain's old tail it drew ~3 turns per 10000 ticks while the
             // superweapon and the rebuilds held the slot, and `guns_settled`
@@ -8939,19 +8950,23 @@ impl SuperAi {
     }
 
     /// The next ring cell the wall placement should issue into, walking the
-    /// targets first superweapon, then second superweapon, then construction
-    /// yard — the pieces an early raider values most — and retiring every
-    /// target whose ring is spent (every cell holds a wall, or was tried and
-    /// refused) into [`Self::walled`]. A ring walk reads the live overlay
-    /// grid, so cells already carrying a wall segment are skipped without
-    /// spending a tried-cell mark or a placement strike on them. With
-    /// `escape` set — a ready segment needs a home now — a walk that finds
-    /// nothing gives the tried-cell book one clean second pass on the yard's
-    /// ring, the perpetual fallback, so the walk can move again next tick;
-    /// whatever still refuses re-fills the book and the strike counter paces
-    /// the type, and a ring the auto-fill completed in the meantime answers
-    /// `None`, which the caller answers by canceling the segment instead of
-    /// wedging the one placement slot.
+    /// targets first the standing superweapons, then the construction yards
+    /// (home and outpost), then the refineries — the pieces an early raider
+    /// values most — and retiring every target whose ring is spent (every
+    /// cell holds a wall, or was tried and refused) into [`Self::walled`].
+    /// A ring walk reads the live overlay grid, so cells already carrying a
+    /// wall segment are skipped without spending a tried-cell mark or a
+    /// placement strike on them. A target also owes one segment back for
+    /// every placed cell the raider has since broken (the single-segment
+    /// rebuild, [`Self::wall_built`]) — the rebuild answers ahead of the
+    /// retirement skip, so a breached ring re-arms even after it retired.
+    /// With `escape` set — a ready segment needs a home now — a walk that
+    /// finds nothing gives the tried-cell book one clean second pass on the
+    /// yard's ring, the perpetual fallback, so the walk can move again next
+    /// tick; whatever still refuses re-fills the book and the strike counter
+    /// paces the type, and a ring the auto-fill completed in the meantime
+    /// answers `None`, which the caller answers by canceling the segment
+    /// instead of wedging the one placement slot.
     fn wall_next_cell(
         &mut self,
         sim: &crate::sim::world::Simulation,
@@ -8966,27 +8981,27 @@ impl SuperAi {
                 .and_then(|id| overlays.flags(id))
                 .is_some_and(|flags| flags.wall)
         };
+        // The target roster (B1): every standing structure of the priority
+        // types — both superweapons, every construction yard (the home and
+        // the outpost's), every refinery — collected in the substrate
+        // order's determinism discipline.
+        let mut targets: Vec<(u64, &'static str, u16, u16)> = Vec::new();
         for name in [
             opening.super_weapon_building,
             opening.second_super_weapon_building,
             opening.construction_yard,
+            opening.refinery,
         ] {
-            let Some((id, rx, ry)) =
-                sim.substrate()
-                    .entities
-                    .iter_sorted()
-                    .find_map(|(eid, entity)| {
-                        (entity.owner() == self.house
-                            && entity.category() == crate::map::entities::EntityCategory::Structure
-                            && sim.interner().resolve(entity.type_ref()) == name)
-                            .then_some((eid, entity.position.rx(), entity.position.ry()))
-                    })
-            else {
-                continue;
-            };
-            if self.walled.contains(&id) {
-                continue;
+            for (eid, entity) in sim.substrate().entities.iter_sorted() {
+                if entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Structure
+                    && sim.interner().resolve(entity.type_ref()) == name
+                {
+                    targets.push((eid, name, entity.position.rx(), entity.position.ry()));
+                }
             }
+        }
+        for (id, name, rx, ry) in targets {
             let Some(ty) = rules.object(name) else {
                 continue;
             };
@@ -8995,17 +9010,45 @@ impl SuperAi {
             // against a `u16` wrap belongs on the absolute cell, never on
             // the offset — filtering the offset would clip those two edges
             // off the ring entirely.
-            let cell = wall_ring_cells(ty.foundation.cell_bounds())
+            let ring: Vec<(u16, u16)> = wall_ring_cells(ty.foundation.cell_bounds())
                 .into_iter()
                 .map(|(dx, dy)| (rx as i16 + dx, ry as i16 + dy))
                 .filter(|&(x, y)| x >= 0 && y >= 0)
                 .map(|(x, y)| (x as u16, y as u16))
-                .find(|&cell| !self.wall_cells.contains(&cell) && !holds_wall(cell));
+                .collect();
+            // The placed-cell memory (B1): every ring cell seen carrying a
+            // wall — own strikes that landed and rings a map or auto-fill
+            // completed — enters [`Self::wall_built`] here, ahead of the
+            // retirement skip, so a retired target's standing ring still
+            // teaches the book.
+            for &cell in &ring {
+                if holds_wall(cell) {
+                    self.wall_built.insert(cell);
+                }
+            }
+            // The single-segment rebuild (B1): a placed cell the raider has
+            // since broken owes one segment back, answered ahead of the
+            // retirement skip. Only cells the walk saw standing qualify —
+            // a strike the engine refused never entered the book, so a
+            // blocked ring still retires and the escape cooldown stays the
+            // pacing it was.
+            if let Some(&cell) = ring
+                .iter()
+                .find(|&cell| self.wall_built.contains(cell) && !holds_wall(*cell))
+            {
+                return Some(cell);
+            }
+            if self.walled.contains(&id) {
+                continue;
+            }
+            let cell =
+                ring.into_iter()
+                    .find(|&cell| !self.wall_cells.contains(&cell) && !holds_wall(cell));
             match cell {
                 Some(cell) => return Some(cell),
-                // The ring is spent. One and done either way: a ring fully
-                // walked needs no more segments, and a fallen segment is
-                // never rebuilt.
+                // The ring is spent. A ring fully walked needs no more
+                // segments; a fallen segment re-opens through the
+                // [`Self::wall_built`] rebuild above.
                 None => {
                     self.walled.insert(id);
                 }
@@ -22975,4 +23018,159 @@ mod tests {
         );
         assert_eq!(ai.psychic_alarm_focus(&sim, &rules), None);
     }
+
+    /// The wall roster (B1): the walk serves the outpost yard's and the
+    /// refinery's own rings after the home yard's, and every roster target
+    /// retires when its ring is spent.
+    #[test]
+    #[ignore = "slow; retail; loads a retail map"]
+    fn wall_targets_walk_the_outpost_yard_and_the_refinery() {
+        let (mut scenario, ai_house, _enemy) = pacific_bridge_battle();
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+        spawn_near(&mut scenario, "GACNST", ai_house, (64, 92));
+        spawn_near(&mut scenario, "GACNST", ai_house, (96, 40));
+        spawn_near(&mut scenario, "GAREFN", ai_house, (72, 64));
+        let opening = OPENINGS
+            .iter()
+            .find(|opening| opening.construction_yard == "GACNST")
+            .expect("the Allied opening");
+        let rules = &scenario.runtime.resources.rules;
+        let overlays = &scenario.runtime.resources.overlay_registry;
+        let standing = |sim: &crate::sim::world::Simulation, name: &str| -> Vec<u64> {
+            sim.substrate()
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == ai_house
+                        && entity.category() == crate::map::entities::EntityCategory::Structure
+                        && sim.interner().resolve(entity.type_ref()) == name
+                })
+                .map(|(id, _)| id)
+                .collect()
+        };
+        let (yard_ids, refinery_ids) = {
+            let sim = scenario.sim();
+            (standing(sim, "GACNST"), standing(sim, "GAREFN"))
+        };
+        assert_eq!(yard_ids.len(), 2, "home and outpost yards stand");
+        assert_eq!(refinery_ids.len(), 1, "the refinery stands");
+
+        // The placement branch's book-keeping: every answered cell enters
+        // the tried book, until the whole roster retires.
+        let mut served: Vec<(u16, u16)> = Vec::new();
+        while let Some(cell) =
+            ai.wall_next_cell(scenario.sim(), rules, opening, overlays, false)
+        {
+            ai.wall_cells.insert(cell);
+            served.push(cell);
+            assert!(served.len() < 500, "the roster walk must terminate");
+        }
+        for id in yard_ids.iter().chain(refinery_ids.iter()) {
+            assert!(ai.walled.contains(id), "every roster target retires");
+        }
+        // The refinery's and the outpost yard's own perimeters appear in
+        // the served set — the walk reached past the home yard.
+        let sim = scenario.sim();
+        for id in refinery_ids.iter().chain(yard_ids.iter()) {
+            let Some(entity) = sim.substrate().entities.get(*id) else {
+                continue;
+            };
+            let Some(ty) = rules.object(sim.interner().resolve(entity.type_ref())) else {
+                continue;
+            };
+            let (rx, ry) = (entity.position.rx(), entity.position.ry());
+            let ring: std::collections::HashSet<(u16, u16)> =
+                wall_ring_cells(ty.foundation.cell_bounds())
+                    .into_iter()
+                    .map(|(dx, dy)| (rx as i16 + dx, ry as i16 + dy))
+                    .filter(|&(x, y)| x >= 0 && y >= 0)
+                    .map(|(x, y)| (x as u16, y as u16))
+                    .collect();
+            let name = sim.interner().resolve(entity.type_ref());
+            assert!(
+                served.iter().any(|cell| ring.contains(cell)),
+                "the walk served {name}'s ring"
+            );
+        }
+    }
+
+    /// The single-segment rebuild (B1): a ring cell the walk saw carrying a
+    /// wall enters the placed-cell book, and once that segment falls the
+    /// walk answers the same cell even though the target already retired —
+    /// one segment back for the fallen cell. A tried-and-refused cell never
+    /// enters the book, so it never re-opens a retired ring.
+    #[test]
+    #[ignore = "slow; retail; loads a retail map"]
+    fn wall_rebuild_answers_a_fallen_placed_cell_past_retirement() {
+        let (mut scenario, ai_house, _enemy) = pacific_bridge_battle();
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+        spawn_near(&mut scenario, "GACNST", ai_house, (64, 92));
+        let opening = OPENINGS
+            .iter()
+            .find(|opening| opening.construction_yard == "GACNST")
+            .expect("the Allied opening");
+        let rules = &scenario.runtime.resources.rules;
+        let overlays = &scenario.runtime.resources.overlay_registry;
+        let wall_id = (0..=u8::MAX)
+            .find(|&id| overlays.flags(id).is_some_and(|flags| flags.wall))
+            .expect("the retail overlay table carries a wall");
+        let (yard_id, rx, ry) = scenario
+            .sim()
+            .substrate()
+            .entities
+            .iter_sorted()
+            .find_map(|(id, entity)| {
+                (entity.owner() == ai_house
+                    && entity.category() == crate::map::entities::EntityCategory::Structure
+                    && scenario.sim().interner().resolve(entity.type_ref()) == "GACNST")
+                    .then_some((id, entity.position.rx(), entity.position.ry()))
+            })
+            .expect("the standing yard");
+        let bounds = rules.object("GACNST").unwrap().foundation.cell_bounds();
+        let ring: Vec<(u16, u16)> = wall_ring_cells(bounds)
+            .into_iter()
+            .map(|(dx, dy)| (rx as i16 + dx, ry as i16 + dy))
+            .filter(|&(x, y)| x >= 0 && y >= 0)
+            .map(|(x, y)| (x as u16, y as u16))
+            .collect();
+
+        // A placed segment stands on a ring cell the walk has not tried:
+        // the walk skips it (the overlay holds) and learns the cell into
+        // the placed-cell book.
+        let placed = ring[0];
+        scenario
+            .runtime
+            .simulation
+            .place_overlay_for_test(placed, wall_id, 0, overlays);
+        while let Some(cell) =
+            ai.wall_next_cell(scenario.sim(), rules, opening, overlays, false)
+        {
+            ai.wall_cells.insert(cell);
+            assert!(ai.wall_cells.len() < 100, "the ring walk must terminate");
+        }
+        assert!(
+            ai.wall_built.contains(&placed),
+            "the standing segment is learned into the placed-cell book"
+        );
+        assert!(
+            ai.walled.contains(&yard_id),
+            "the fully tried ring retires"
+        );
+
+        // The segment falls: the walk answers the same cell past
+        // retirement — the single-segment rebuild.
+        scenario
+            .runtime
+            .simulation
+            .overlay_cell_mut_for_test(placed.0, placed.1)
+            .overlay_id = None;
+        assert_eq!(
+            ai.wall_next_cell(scenario.sim(), rules, opening, overlays, false),
+            Some(placed),
+            "the fallen placed cell is served past retirement"
+        );
+    }
+
 }
