@@ -4122,14 +4122,52 @@ impl SuperAi {
                             site
                         }
                         None => home_center.and_then(|home| {
-                            find_site_around(
-                                sim,
-                                rules,
-                                &runtime.resources.overlay_registry,
-                                ty,
-                                home,
-                                self.house,
-                            )
+                            // The gun route (B2): a defense gun the gun limb
+                            // queued (the placement intent's home mark)
+                            // scans the enemy-facing weighted rings — the
+                            // traffic axis's aim is the threat bearing, and
+                            // the axis itself the approach line the tower
+                            // covers. Every other home item keeps the
+                            // uniform ring.
+                            let gun_intent = self
+                                .placement_intent
+                                .is_some_and(|(intent, expansion)| {
+                                    intent == ready.type_id && !expansion
+                                });
+                            if gun_intent {
+                                find_defense_site_around(
+                                    sim,
+                                    rules,
+                                    &runtime.resources.overlay_registry,
+                                    ty,
+                                    home,
+                                    self.house,
+                                    self.traffic_axis.map(|(_, aim)| aim),
+                                    self.traffic_axis,
+                                )
+                                // A packed field keeps the uniform walk's
+                                // degraded pass — a gun at home beats a
+                                // canceled gun.
+                                .or_else(|| {
+                                    find_site_around(
+                                        sim,
+                                        rules,
+                                        &runtime.resources.overlay_registry,
+                                        ty,
+                                        home,
+                                        self.house,
+                                    )
+                                })
+                            } else {
+                                find_site_around(
+                                    sim,
+                                    rules,
+                                    &runtime.resources.overlay_registry,
+                                    ty,
+                                    home,
+                                    self.house,
+                                )
+                            }
                         }),
                     }
                 })
@@ -16509,7 +16547,6 @@ fn scan_site_rings(
     } else {
         1
     };
-    let (fmin_x, fmin_y, fmax_x, fmax_y) = ty.foundation.cell_bounds();
     for radius in 1..=max_radius {
         for dy in -radius..=radius {
             for dx in -radius..=radius {
@@ -16520,68 +16557,194 @@ fn scan_site_rings(
                 if origin.0 <= 0 || origin.1 <= 0 {
                     continue;
                 }
-                if keep_gap
-                    && !foundation_keeps_gap(
-                        (
-                            i32::from(origin.0) + i32::from(fmin_x),
-                            i32::from(origin.1) + i32::from(fmin_y),
-                            i32::from(origin.0) + i32::from(fmax_x),
-                            i32::from(origin.1) + i32::from(fmax_y),
-                        ),
-                        &own_rects,
-                        clearance,
-                    )
-                {
-                    continue;
-                }
-                if crate::sim::build_site::can_place_building_at(
+                if site_candidate_legal(
                     sim,
                     rules,
-                    Some(registry),
+                    registry,
                     ty,
                     origin,
-                    Some(house),
-                    None,
-                    None,
-                ) && build_area_owner.is_none_or(|owner| {
-                    crate::sim::production::is_within_build_area(
-                        sim,
-                        rules,
-                        owner,
-                        ty,
-                        origin.0 as u16,
-                        origin.1 as u16,
-                    )
-                })
-                    // The spaced pass clears the engine's build-area ring on
-                    // its own: the home scans pass no owner (the legacy
-                    // first-legal-cell pick sat close enough that the ring
-                    // held by default), but the gap term pushes the first
-                    // passing candidate well past the BaseNormal ring and
-                    // the engine's placement validation refuses it for real
-                    // (observed: six AI houses re-placing one ready
-                    // building for thousands of ticks — two for a whole
-                    // game — because the spaced scan always answered
-                    // *some* candidate and the degraded pass never got its
-                    // turn). Reading the owner back from the interner keeps
-                    // every legacy signature; the degraded pass below keeps
-                    // the exact old predicate.
-                    && (!keep_gap
-                        || crate::sim::production::is_within_build_area(
-                            sim,
-                            rules,
-                            sim.interner().resolve(house),
-                            ty,
-                            origin.0 as u16,
-                            origin.1 as u16,
-                        ))
-                {
+                    house,
+                    build_area_owner,
+                    &own_rects,
+                    clearance,
+                    keep_gap,
+                ) {
                     return Some((origin.0 as u16, origin.1 as u16));
                 }
             }
         }
     }
     None
+}
+
+/// The per-candidate admission [`scan_site_rings`] and the defense gun's
+/// weighted walk share: the spacing term (when `keep_gap`), the engine's
+/// own placement read, and the build-area ring — the owner filter when the
+/// scan names one, and the spaced pass's own-yard ring. The spaced pass
+/// clears the engine's build-area ring on its own: the home scans pass no
+/// owner (the legacy first-legal-cell pick sat close enough that the ring
+/// held by default), but the gap term pushes the first passing candidate
+/// well past the BaseNormal ring and the engine's placement validation
+/// refuses it for real (observed: six AI houses re-placing one ready
+/// building for thousands of ticks — two for a whole game — because the
+/// spaced scan always answered *some* candidate and the degraded pass
+/// never got its turn). Reading the owner back from the interner keeps
+/// every legacy signature.
+fn site_candidate_legal(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    ty: &crate::rules::object_type::ObjectType,
+    origin: (i16, i16),
+    house: InternedId,
+    build_area_owner: Option<&str>,
+    own_rects: &[(i32, i32, i32, i32)],
+    clearance: i32,
+    keep_gap: bool,
+) -> bool {
+    let (fmin_x, fmin_y, fmax_x, fmax_y) = ty.foundation.cell_bounds();
+    if keep_gap
+        && !foundation_keeps_gap(
+            (
+                i32::from(origin.0) + i32::from(fmin_x),
+                i32::from(origin.1) + i32::from(fmin_y),
+                i32::from(origin.0) + i32::from(fmax_x),
+                i32::from(origin.1) + i32::from(fmax_y),
+            ),
+            own_rects,
+            clearance,
+        )
+    {
+        return false;
+    }
+    crate::sim::build_site::can_place_building_at(
+        sim,
+        rules,
+        Some(registry),
+        ty,
+        origin,
+        Some(house),
+        None,
+        None,
+    ) && build_area_owner.is_none_or(|owner| {
+        crate::sim::production::is_within_build_area(
+            sim,
+            rules,
+            owner,
+            ty,
+            origin.0 as u16,
+            origin.1 as u16,
+        )
+    }) && (!keep_gap
+        || crate::sim::production::is_within_build_area(
+            sim,
+            rules,
+            sim.interner().resolve(house),
+            ty,
+            origin.0 as u16,
+            origin.1 as u16,
+        ))
+}
+
+/// The defense gun's home walk (B2): [`site_candidate_legal`]'s spaced
+/// admission over the whole [`SITE_SEARCH_RADIUS`], ranked before the
+/// pick — [`enemy_direction_bias`] ranks the enemy-facing half of the
+/// field first, the traffic-axis distance breaks the tie toward the
+/// approach corridor, the standing yard's near rings beat the far ones,
+/// and the fixed row-major order breaks the last tie — so a tower stands
+/// on the side the threat comes from instead of the uniform ring's first
+/// cell. The yard-foundation shadow (the near ring on the threat's side
+/// can hold no spaced candidate while the lee side can) is why this is a
+/// whole-field ranking, not a ring-by-ring walk: the ring rule would
+/// hand every east threat's tower to the west. A packed field that
+/// refuses every spaced candidate falls back to the caller's uniform
+/// [`find_site_around`], degraded pass included.
+fn find_defense_site_around(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    ty: &crate::rules::object_type::ObjectType,
+    center: (i16, i16),
+    house: InternedId,
+    enemy_cell: Option<(i16, i16)>,
+    axis: Option<((i16, i16), (i16, i16))>,
+) -> Option<(u16, u16)> {
+    let own_rects = own_structure_rects(sim, rules, house);
+    let clearance = if EXIT_CLEARANCE_TYPES.contains(&ty.id.as_str()) {
+        2
+    } else {
+        1
+    };
+    let mut best: Option<((i32, i32, i32, i32, i32), (u16, u16))> = None;
+    for radius in 1..=SITE_SEARCH_RADIUS {
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx.abs() != radius && dy.abs() != radius {
+                    continue;
+                }
+                let origin = (center.0 + dx, center.1 + dy);
+                if origin.0 <= 0 || origin.1 <= 0 {
+                    continue;
+                }
+                if !site_candidate_legal(
+                    sim,
+                    rules,
+                    registry,
+                    ty,
+                    origin,
+                    house,
+                    None,
+                    &own_rects,
+                    clearance,
+                    true,
+                ) {
+                    continue;
+                }
+                // The weighted key: the enemy-facing bias first, the
+                // traffic-axis distance second (closer to the approach
+                // line wins; squared-cell integer arithmetic, monotone in
+                // the true distance), then the closer ring, then the
+                // row-major order's earlier cell.
+                let bias = enemy_direction_bias(enemy_cell, center, origin);
+                let axis_distance = axis_distance_cells_squared(axis, origin);
+                let key = (
+                    bias,
+                    -axis_distance,
+                    -i32::from(radius),
+                    -i32::from(dy),
+                    -i32::from(dx),
+                );
+                if best.is_none_or(|(kept, _)| key > kept) {
+                    best = Some((key, (origin.0 as u16, origin.1 as u16)));
+                }
+            }
+        }
+    }
+    best.map(|(_, cell)| cell)
+}
+
+/// The squared distance from `cell` to the home→aim traffic-axis line, in
+/// integer cell arithmetic (i64 cross products; a squared metric is
+/// monotone in the true distance). A `None` axis or a degenerate segment
+/// reads zero.
+fn axis_distance_cells_squared(
+    axis: Option<((i16, i16), (i16, i16))>,
+    cell: (i16, i16),
+) -> i32 {
+    let Some(((ax, ay), (bx, by))) = axis else {
+        return 0;
+    };
+    let (dx, dy) = (i64::from(bx) - i64::from(ax), i64::from(by) - i64::from(ay));
+    let length_squared = dx * dx + dy * dy;
+    if length_squared == 0 {
+        return 0;
+    }
+    let (px, py) = (
+        i64::from(cell.0) - i64::from(ax),
+        i64::from(cell.1) - i64::from(ay),
+    );
+    let cross = (dx * py - dy * px).abs();
+    ((cross * cross / length_squared).min(i64::from(i32::MAX))) as i32
 }
 
 /// The first legal placement origin for `ty`, scanning outward from `center`
@@ -16867,9 +17030,9 @@ mod tests {
         FLOATER_COUNTER_THREATS, FLOATER_TYPES, OPENINGS, ORE_ENEMY_DIRECTION_BIAS,
         ROLE_SHARE_BASE, ROLE_SHARE_BOOST, Role, RosterEntry, SuperAi, SuperAiDifficulty,
         TECH_BUILDING_TYPES, aa_per_yard_quota, aa_unit_target, aa_vehicle_target, anti_air_demand,
-        capture_priority_rank, enemy_direction_bias, foundation_keeps_gap, ground_per_yard_quota,
-        nearest_connected_target, rally_anchor, spy_infiltration_rank, tech_bank_short,
-        wall_ring_cells,
+        capture_priority_rank, enemy_direction_bias, find_defense_site_around,
+        foundation_keeps_gap, ground_per_yard_quota, nearest_connected_target, rally_anchor,
+        spy_infiltration_rank, tech_bank_short, wall_ring_cells,
     };
     use crate::sim::intern::InternedId;
     use crate::sim::runtime::SimRuntime;
@@ -23247,6 +23410,67 @@ mod tests {
             (2, 3, 4),
             "the ground ladder rides one step above the AA's at every tier"
         );
+    }
+
+    /// The gun ring walk's enemy-axis weighting (B2): a hostile bearing
+    /// east of the yard hands the pillbox a cell on the east side, the
+    /// mirrored western bearing a cell on the west side — the tower stands
+    /// on the side the threat comes from. The yard's own foundation
+    /// shadows the near ring on the threat's side, which is exactly why
+    /// the walk ranks the whole field instead of the first legal ring.
+    #[test]
+    fn gun_site_walk_answers_the_enemy_facing_side() {
+        let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
+        else {
+            return;
+        };
+        let mut sim = crate::sim::world::Simulation::new();
+        let house = sim.intern("SuperAiTest");
+        crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
+        sim.spawn_object_at_height("GACNST", "SuperAiTest", 16, 16, 0, 0, &rules)
+            .expect("the yard stands");
+        let registry = crate::rules::overlay_types::OverlayTypeRegistry::from_ini(
+            &crate::rules::ini_parser::IniFile::from_str(""),
+            None,
+        );
+        let ty = rules.object("GAPILL").expect("the Allied pillbox reads");
+        let center = (16_i16, 16_i16);
+        // The bearing reads sit close enough that the bias's 5/4 ratio
+        // splits the ring: the western cells fall outside it for an
+        // eastern threat (7*5/4 < 9) and the eastern for a western one.
+        let east = find_defense_site_around(
+            &sim,
+            &rules,
+            &registry,
+            ty,
+            center,
+            house,
+            Some((23, 16)),
+            Some((center, (23, 16))),
+        )
+        .expect("an empty field admits a pillbox");
+        let west = find_defense_site_around(
+            &sim,
+            &rules,
+            &registry,
+            ty,
+            center,
+            house,
+            Some((9, 16)),
+            Some((center, (9, 16))),
+        )
+        .expect("an empty field admits a pillbox");
+        assert!(
+            i32::from(east.0) > i32::from(center.0),
+            "the eastern threat's tower stands east: got {east:?}"
+        );
+        assert!(
+            i32::from(west.0) < i32::from(center.0),
+            "the western threat's tower stands west: got {west:?}"
+        );
+        // The mirrored walks do not collide on one cell: the bias moved
+        // the pick across the yard.
+        assert_ne!(east, west);
     }
 
 }
