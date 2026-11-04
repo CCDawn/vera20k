@@ -11998,11 +11998,9 @@ impl SuperAi {
         if house.multiplay_passive() {
             return false;
         }
-        let me = sim.interner().resolve(self.house);
-        let them = sim.interner().resolve(owner);
         let alliances = sim.house_alliances();
-        !crate::map::houses::is_allied_with(alliances, me, them)
-            && !crate::map::houses::is_allied_with(alliances, them, me)
+        !alliances.is_allied(&sim.interner, self.house, owner)
+            && !alliances.is_allied(&sim.interner, owner, self.house)
     }
 
     /// Enemy infantry (the engine files foot soldiers under the Infantry
