@@ -1034,6 +1034,17 @@ const FACTORY_CREDITS: i32 = 1500;
 /// brownout (observed live: blackouts at eight plants standing).
 const POWER_CAP: usize = 16;
 
+/// The production build-out's wallet reserve (D2-C): the share of the
+/// current balance the unit lines do not spend into, percent. A defense
+/// house's repairs (the structure-repair toggle, the line's rotate-outs),
+/// the wall ring's rebuilds and the fort program's guns all draw from the
+/// unspent tail — a wallet drained to zero by the soldier ladder leaves
+/// the walls unqueued and the wounded unrepaired with credits still
+/// ticking past. Fifteen percent: large enough to answer one tower or a
+/// ring of wall segments at any balance above a few hundred, small
+/// enough to cost the army under a sixth of its throughput.
+const FORT_WALLET_RESERVE_PCT: i64 = 15;
+
 /// The power margin (Layer 2): while the grid's headroom (`output - drain`)
 /// sits below the draw of one more war factory plus refinery — a fixed
 /// estimate, the retail plants' drain is a few dozen points apiece — a
@@ -3538,6 +3549,26 @@ impl SuperAi {
         self.defense
             .as_ref()
             .is_some_and(|persona| persona.on_duty(unit))
+    }
+
+    /// Whether a surplus unit of `cost` may file from the current balance
+    /// without cutting into the fort wallet reserve
+    /// ([`FORT_WALLET_RESERVE_PCT`]): the battle house spends freely, the
+    /// persona's unit lines stop at the reserve tail so the repairs, the
+    /// wall rebuilds and the fort program's guns always draw from a funded
+    /// pool. The fort program itself (the gun loop), the wall limb and the
+    /// repair toggles are not reserve-gated — the reserve is theirs.
+    fn above_fort_reserve(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        owner: &str,
+        cost: i32,
+    ) -> bool {
+        if self.defense.is_none() {
+            return true;
+        }
+        let credits = i64::from(crate::sim::production::credits_for_owner(sim, owner));
+        credits - i64::from(cost) >= credits * FORT_WALLET_RESERVE_PCT / 100
     }
 
     /// The tier this player plays at.
@@ -6491,6 +6522,28 @@ impl SuperAi {
                 (radar_name, 1),
                 (opening.battle_lab, 1),
             ];
+            // The production build-out's pressure read (D2-C): the persona
+            // tiers on the wave the map holds — the gun walk's own read of
+            // the observed presence versus the armed schedule — the battle
+            // AI on the standing hostile ground war. The quotas the rungs
+            // below target walk the Mental-Omega late-game shape (three
+            // barracks, four war factories) up with the war and back down
+            // with the peace; see [`barracks_quota`]/[`factory_quota`].
+            let wave_ground = match self.defense.as_ref() {
+                Some(persona) => {
+                    let observed = persona.observed_wave_composition;
+                    let scheduled = persona.scheduled_wave_composition;
+                    (observed.infantry + observed.vehicles)
+                        .max(scheduled.infantry + scheduled.vehicles)
+                }
+                None => self.enemy_ground_count(sim),
+            };
+            // The infantry line's throughput rungs: past the lab the
+            // pressure quota adds barracks (one stands from the opening) so
+            // the line trains in parallel while the war runs. Ahead of the
+            // monuments: throughput answers the waves now, the monuments
+            // are late game.
+            ladder.push((opening.barracks, barracks_quota(wave_ground)));
             // The annex rungs (`Opening::econ_upgrades`) splice in between
             // the battle lab and the superweapon steps: cheaper than either
             // super and compounding (income, cost, vision), so the lab's
@@ -6522,7 +6575,11 @@ impl SuperAi {
                 // Grinder alternate.
                 (opening.service_depot, 1),
                 (opening.power, POWER_TARGET),
-                (opening.war_factory, FACTORY_BUILDOUT),
+                // The fleet tail targets the pressure quota, not a fixed
+                // build-out: a quiet map holds the pair, a war brings the
+                // fourth factory forward instead of waiting for the ladder
+                // tail.
+                (opening.war_factory, factory_quota(wave_ground)),
             ]);
             // The first five steps are the opening; the expansion beyond
             // them waits for a battle tank to leave the factory —
@@ -7459,6 +7516,10 @@ impl SuperAi {
                     crate::sim::production::credits_for_owner(sim, &owner),
                     ty.cost,
                 ))
+            // The persona's fort wallet reserve: the surplus hull line
+            // stops at the reserve tail (the repairs, the wall rebuilds
+            // and the guns draw from it); the battle house spends freely.
+            && self.above_fort_reserve(sim, &owner, ty.cost)
             && let Some(type_id) = sim.interner().get(name)
             // The choke point (build12: four houses re-filed their core tank
             // ~every tick for thousands of ticks). Root cause unproven: the lit
@@ -7628,6 +7689,12 @@ impl SuperAi {
                     crate::sim::production::credits_for_owner(sim, &owner),
                     ty.cost,
                 ))
+            // The persona's fort wallet reserve, the soldier ladder
+            // included: the cheap ladder is the line that skims a finite
+            // wallet to zero while the fort program still claims towers
+            // (observed on FaceOfDeath3: the last twelve thousand credits
+            // went to soldiers with the gun walk unfilled).
+            && self.above_fort_reserve(sim, &owner, ty.cost)
             && let Some(type_id) = sim.interner().get(name)
             // The vehicle line's choke point: a refused soldier re-files
             // once per window, an accepted one never waits on it.
@@ -10911,7 +10978,12 @@ impl SuperAi {
     /// queues keep their single owner. The core tank and the basic
     /// soldier stand behind their rosters as the armor and foot
     /// fallbacks; a role whose every entry this house cannot field passes
-    /// its turn, the same rule the battle mix reads.
+    /// its turn, the same rule the battle mix reads. Every arm of the
+    /// mix stops at the fort wallet reserve
+    /// ([`FORT_WALLET_RESERVE_PCT`]). Past the targets the idle fill
+    /// keeps both lines rolling while the wallet holds above the
+    /// reserve — the surplus rolls to the idle pool, the next wave's
+    /// answer already standing.
     fn defense_army_orders(
         &mut self,
         sim: &crate::sim::world::Simulation,
@@ -10989,6 +11061,11 @@ impl SuperAi {
                 if crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
                     != crate::sim::production::CanBuild::Yes
                     || credits < ty.cost
+                    // The wave answer still stops at the fort wallet
+                    // reserve ([`FORT_WALLET_RESERVE_PCT`]) — the answer
+                    // that drains the wallet to zero buys repairs and
+                    // walls nothing for the rest of the war.
+                    || !self.above_fort_reserve(sim, owner, ty.cost)
                 {
                     continue;
                 }
@@ -11001,6 +11078,42 @@ impl SuperAi {
                 // The line holds; the surplus rolls to the idle pool like
                 // the battle wheel's own output.
                 return self.file_production(sim, rules, type_id, tick);
+            }
+        }
+        // The idle fill (D2-C): every role target met, the lines used to
+        // rest until the next wave cadence while the wallet banked — a
+        // quiet stretch hollowed the fielded answer the next wave spends.
+        // Surplus production keeps both lines rolling while the wallet
+        // holds above the reserve: the core soldier rides the idle
+        // infantry line, the core hull the idle vehicle line, the surplus
+        // rolling to the idle pool like the battle wheel's own output.
+        for (infantry, name) in [(true, opening.basic_infantry), (false, opening.main_tank)] {
+            let category = if infantry {
+                crate::sim::production::ProductionCategory::Infantry
+            } else {
+                crate::sim::production::ProductionCategory::Vehicle
+            };
+            if queue.iter().any(|item| item.queue_category == category) {
+                continue;
+            }
+            let Some(ty) = rules.object(name) else {
+                continue;
+            };
+            if crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                != crate::sim::production::CanBuild::Yes
+                || credits < ty.cost
+                || !self.above_fort_reserve(sim, owner, ty.cost)
+            {
+                continue;
+            }
+            let Some(type_id) = sim.interner().get(name) else {
+                continue;
+            };
+            if !self.production_retry_ready(sim, rules, type_id, tick) {
+                continue;
+            }
+            if let Some(command) = self.file_production(sim, rules, type_id, tick) {
+                return Some(command);
             }
         }
         None
@@ -16811,6 +16924,41 @@ fn ground_per_yard_quota(enemy_ground: usize) -> usize {
     }
 }
 
+/// The barracks build-out's standing target against the same ground
+/// pressure tiers the gun rows read ([`ground_per_yard_quota`]): the
+/// opening pair stands quiet, a fielded hostile ground force adds one,
+/// and a massed assault runs the Mental Omega late-game shape — three
+/// barracks feeding the infantry line in parallel (the engine's own
+/// multiple-factory pace, retail `MultipleFactory`). A pressure drop
+/// walks the target back down, so the rung rests once the standing count
+/// covers the reduced quota (the walk rebuilds up to the target, it never
+/// sells down to it).
+fn barracks_quota(enemy_ground: usize) -> usize {
+    if enemy_ground >= GROUND_HEAVY_THREATS {
+        3
+    } else if enemy_ground > 0 {
+        2
+    } else {
+        1
+    }
+}
+
+/// The war-factory build-out's standing target, the barracks quota's
+/// shape on the vehicle line: two factories stand quiet, three against a
+/// fielded ground force, four — [`FACTORY_BUILDOUT`], the late-game
+/// shape — against a massed assault. The old build-out reached this tail
+/// unconditionally and only at the ladder's end; the pressure read brings
+/// the fleet forward while the war runs and holds the quiet pair.
+fn factory_quota(enemy_ground: usize) -> usize {
+    if enemy_ground >= GROUND_HEAVY_THREATS {
+        FACTORY_BUILDOUT
+    } else if enemy_ground > 0 {
+        FACTORY_BUILDOUT - 1
+    } else {
+        2
+    }
+}
+
 /// The mobile-AA quota the vehicle pipeline owes the army: the
 /// [`AA_UNIT_FLOOR`] pair stands before hostile air exists, and every
 /// two hostile aircraft lift the target one more, capped at
@@ -17784,13 +17932,13 @@ mod tests {
         DEFENSE_PER_YARD_AA_BASE, DEFENSE_PER_YARD_AA_HEAVY, DEFENSE_PER_YARD_AA_WARTIME,
         DEFENSE_PER_YARD_ASSAULT, DEFENSE_PER_YARD_BASIC, DEFENSE_PER_YARD_WARTIME,
         ENEMY_BARRACKS_TYPES, ENEMY_REFINERY_TYPES, ENTRANCE_POST_MAX, ENTRANCE_POST_MIN,
-        EXPANSION_MIN_DISTANCE, FLOATER_COUNTER_THREATS, FLOATER_TYPES, OPENINGS,
+        EXPANSION_MIN_DISTANCE, FACTORY_BUILDOUT, FLOATER_COUNTER_THREATS, FLOATER_TYPES, OPENINGS,
         ORE_ENEMY_DIRECTION_BIAS, PlacementRoute, ROLE_SHARE_BASE, ROLE_SHARE_BOOST, Role,
         RosterEntry, SuperAi, SuperAiDifficulty, TECH_BUILDING_TYPES, aa_per_yard_quota,
-        aa_unit_target, aa_vehicle_target, anti_air_demand, capture_priority_rank,
-        enemy_direction_bias, entrance_choke_cell, find_defense_site_around, foundation_keeps_gap,
-        ground_per_yard_quota, nearest_connected_target, rally_anchor, spy_infiltration_rank,
-        tech_bank_short, wall_ring_cells,
+        aa_unit_target, aa_vehicle_target, anti_air_demand, barracks_quota, capture_priority_rank,
+        enemy_direction_bias, entrance_choke_cell, factory_quota, find_defense_site_around,
+        foundation_keeps_gap, ground_per_yard_quota, nearest_connected_target, rally_anchor,
+        spy_infiltration_rank, tech_bank_short, wall_ring_cells,
     };
     use crate::sim::intern::InternedId;
     use crate::sim::runtime::SimRuntime;
@@ -24872,6 +25020,16 @@ mod tests {
         assert_eq!(ground_per_yard_quota(7), DEFENSE_PER_YARD_WARTIME);
         assert_eq!(ground_per_yard_quota(8), DEFENSE_PER_YARD_ASSAULT);
         assert_eq!(ground_per_yard_quota(24), DEFENSE_PER_YARD_ASSAULT);
+        // The production build-out rides the same tiers: the Mental-Omega
+        // late-game shape (three barracks, four war factories) is the
+        // assault tier, a fielded force adds one line, peace holds the
+        // opening pair.
+        assert_eq!(barracks_quota(0), 1);
+        assert_eq!(barracks_quota(1), 2);
+        assert_eq!(barracks_quota(8), 3);
+        assert_eq!(factory_quota(0), 2);
+        assert_eq!(factory_quota(1), FACTORY_BUILDOUT - 1);
+        assert_eq!(factory_quota(8), FACTORY_BUILDOUT);
         assert_eq!(
             (
                 DEFENSE_PER_YARD_BASIC,
