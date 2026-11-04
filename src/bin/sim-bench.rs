@@ -310,7 +310,7 @@ fn parse_args_from(mut argv: impl Iterator<Item = String>) -> Result<Args, Strin
     if marched && args.computers.is_some() {
         return Err("--computers is a match and skirmish option".to_string());
     }
-    if !marched && args.defense {
+    if args.scenario != ScenarioKind::Match && args.defense {
         return Err("--defense is a match option".to_string());
     }
     if args.scenario == ScenarioKind::Super && args.defense {
@@ -596,11 +596,35 @@ impl Frames for Bench<'_> {
                 .map_err(|error| error.to_string())?;
             if output.tick.terminal_score_finalized || !output.tick.frame_committed {
                 self.stopped = true;
+                // The freeze is polarity-blind (victory and defeat both
+                // leave the frame uncommitted); the latched score rows
+                // name the survivors and the natural scores, so the
+                // repro line says whose terminal it was.
+                let score = self
+                    .runtime
+                    .simulation
+                    .terminal_score_snapshot()
+                    .map(|snapshot| {
+                        snapshot
+                            .rows
+                            .iter()
+                            .map(|row| {
+                                format!(
+                                    "{}:{}:{}",
+                                    self.runtime.simulation.interner().resolve(row.owner),
+                                    row.survived,
+                                    row.score
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    });
                 println!(
-                    "defense_terminal tick={} frame_committed={} terminal_score_finalized={}",
+                    "defense_terminal tick={} frame_committed={} terminal_score_finalized={} score={}",
                     output.tick.tick,
                     output.tick.frame_committed,
-                    output.tick.terminal_score_finalized
+                    output.tick.terminal_score_finalized,
+                    score.as_deref().unwrap_or("-")
                 );
             }
             return Ok(None);
