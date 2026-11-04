@@ -508,6 +508,11 @@ const FORTRESS_UNLOAD_IDLE_TICKS: u32 = 300;
 /// scan with no upper bound walked one owner's MCV ~100 cells into enemy
 /// territory and it never deployed (observed).
 const EXPANSION_MAX_SITE_DISTANCE: i16 = 70;
+/// The outpost siting's hard enemy floor (C2): a field within this many
+/// cells of the enemy's standing center is refused outright — the
+/// [`enemy_direction_bias`] only nudges ties, and a base that close
+/// deploys into the raider's opening walk.
+const EXPANSION_ENEMY_FLOOR: i16 = 18;
 
 /// The primary wheel's time arm (Layer 2.9 / outpost P4): past this many
 /// ticks since the last toggle the carrier alternates even while the slot
@@ -7439,6 +7444,14 @@ impl SuperAi {
                     segment_distance(from, (cx, cy), base) <= ALLIED_BASE_CORRIDOR
                         || i32::from((cx - base.0).abs().max((cy - base.1).abs()))
                             < i32::from(distance)
+                }) {
+                    continue;
+                }
+                // The hard enemy floor (C2): the bias only nudges ties — a
+                // field this close to the enemy's standing center is
+                // refused outright, whatever its richness.
+                if enemy_center.is_some_and(|(ex, ey)| {
+                    (cx - ex).abs().max((cy - ey).abs()) < EXPANSION_ENEMY_FLOOR
                 }) {
                     continue;
                 }
@@ -21028,6 +21041,105 @@ mod tests {
         assert!(
             distance(first, neighbor_cell) < super::ORE_FIELD_EXCLUSION_RADIUS as u32,
             "setup: the neighbor refinery must contest the first pick (at {neighbor_cell:?})"
+        );
+    }
+
+    /// The outpost siting's hard enemy floor (C2): a hostile combat mass
+    /// camped on the winning field pulls the enemy center onto it, and the
+    /// survey refuses every cell within [`EXPANSION_ENEMY_FLOOR`] of that
+    /// center — the bias only nudges ties, the floor keeps the yard out of
+    /// the raider's ground outright.
+    #[test]
+    #[ignore = "slow; retail; loads a retail map"]
+    fn ore_field_survey_refuses_ground_inside_the_enemy_floor() {
+        let (mut scenario, human) = retail_battle();
+        let enemy_house = scenario
+            .sim()
+            .houses()
+            .iter()
+            .find(|(_, house)| !house.is_controlled_by_human(true))
+            .map(|(&id, _)| id)
+            .expect("the battle's opponent");
+        let ai = SuperAi::new(human, SuperAiDifficulty::Fair);
+        let mcv_cell = scenario
+            .sim()
+            .substrate()
+            .entities
+            .iter_sorted()
+            .find(|(_, entity)| {
+                entity.owner() == human
+                    && entity.category() == crate::map::entities::EntityCategory::Unit
+                    && scenario.sim().interner().resolve(entity.type_ref()) == "AMCV"
+            })
+            .map(|(_, entity)| (entity.position.rx() as i16, entity.position.ry() as i16))
+            .expect("the launch MCV");
+        let survey = |scenario: &crate::headless_scenario::HeadlessScenario,
+                      ai: &SuperAi,
+                      from: (i16, i16)| {
+            ai.best_ore_field(
+                scenario.sim(),
+                &scenario.runtime.resources.rules,
+                &scenario.runtime.resources.overlay_registry,
+                from,
+                None,
+                Some("GAREFN"),
+            )
+        };
+        let first = survey(&scenario, &ai, mcv_cell)
+            .expect("the retail battle map hosts a reachable far ore field");
+
+        // A hostile combat mass camps the winning field: nine tanks in a
+        // tight block own the enemy center outright.
+        for dy in 0..3_i16 {
+            for dx in 0..3_i16 {
+                spawn_near(
+                    &mut scenario,
+                    "HTNK",
+                    enemy_house,
+                    (
+                        (first.0 as i16 + dx).max(0) as u16,
+                        (first.1 as i16 + dy).max(0) as u16,
+                    ),
+                );
+            }
+        }
+        let enemy_center = {
+            let sim = scenario.sim();
+            let mut sum_x = 0_i64;
+            let mut sum_y = 0_i64;
+            let mut count = 0_u64;
+            for (_, entity) in sim.substrate().entities.iter_sorted() {
+                if !matches!(
+                    entity.category(),
+                    crate::map::entities::EntityCategory::Unit
+                        | crate::map::entities::EntityCategory::Infantry
+                ) || entity.lifecycle.in_limbo()
+                    || entity.owner() != enemy_house
+                {
+                    continue;
+                }
+                sum_x += i64::from(entity.position.rx());
+                sum_y += i64::from(entity.position.ry());
+                count += 1;
+            }
+            (count > 0).then(|| ((sum_x / count as i64) as i32, (sum_y / count as i64) as i32))
+        }
+        .expect("the camped mass stands");
+        let second = survey(&scenario, &ai, mcv_cell);
+        let floor_distance = |cell: (u16, u16)| {
+            (i32::from(cell.0) - enemy_center.0)
+                .abs()
+                .max((i32::from(cell.1) - enemy_center.1).abs())
+        };
+        assert!(
+            floor_distance(first) < i32::from(super::EXPANSION_ENEMY_FLOOR),
+            "setup: the camped mass must sit on the first pick (center {enemy_center:?}, \
+             first {first:?})"
+        );
+        assert!(
+            second.is_none_or(|cell| floor_distance(cell) >= i32::from(super::EXPANSION_ENEMY_FLOOR)),
+            "the survey latched ground inside the enemy floor: pick {second:?}, \
+             enemy center {enemy_center:?}"
         );
     }
 
