@@ -907,6 +907,66 @@ const DEFENSE_RESCUE_COOLDOWN_TICKS: u32 = 900;
 /// trigger stays armed this many frames.
 const DEFENSE_CORE_HIT_LATCH_TICKS: u32 = 150;
 
+/// ---- D2 active defense: the perimeter engagement and the surplus
+/// forward interception. Both march the standing garrison under the
+/// wave-pressure budget: the pools are capped, the ring keeps a floor,
+/// and the leak hunter and the rescue triggers above them stay untouched.
+///
+/// A hostile ground group this dense stands at the perimeter: its densest
+/// cell within this many cells of a fort anchor
+/// ([`Self::defense_fort_anchors`]) turns the posted line's wait into a
+/// march — the ring walks out and meets the group there instead of
+/// letting it close on the posts. Wider than [`DEFENSE_LEAK_RADIUS`], so
+/// the march starts before the leak; a chrono wave that spawns beside the
+/// objective lands inside this band and is met the same way.
+const DEFENSE_PERIMETER_RADIUS: i32 = 24;
+/// The smallest hostile group the perimeter meets — a lone scout inside
+/// the band stays the leak hunter's business, not the line's.
+const DEFENSE_PERIMETER_CLUSTER_MIN: usize = 2;
+/// Posted units above this many may leave on the perimeter march: the
+/// ring never walks out empty.
+const DEFENSE_PERIMETER_RING_FLOOR: usize = 2;
+/// The most units the perimeter engagement may hold off its posts at
+/// once — the aggro-dragging guardrail.
+const DEFENSE_PERIMETER_POOL_CAP: usize = 6;
+/// Ticks between the perimeter engagement passes.
+const DEFENSE_PERIMETER_TICKS: u32 = 15;
+/// A marching cluster closer than this to an anchor is already the
+/// perimeter's business; the forward interception survey ignores it.
+const DEFENSE_INTERCEPT_INNER_RANGE: i32 = 24;
+/// The forward interception's reach: a cluster whose nearest anchor
+/// stands farther than this is left to its march — committing that far
+/// out walks the garrison off the map.
+const DEFENSE_INTERCEPT_OUTER_RANGE: i32 = 64;
+/// Hostile mobiles within this many cells of the densest cell count as
+/// one marching cluster.
+const DEFENSE_INTERCEPT_CLUSTER_RADIUS: i32 = 8;
+/// The smallest marching cluster a forward commit answers — below it the
+/// wave is scouts, and the perimeter pass meets them at the posts.
+const DEFENSE_INTERCEPT_CLUSTER_MIN: usize = 3;
+/// Ticks between the forward interception surveys.
+const DEFENSE_INTERCEPT_TICKS: u32 = 45;
+/// The commit gate: the garrison's available power must reach this
+/// fraction (numerator over denominator) of the marching cluster's
+/// before anyone marches out — the pre-commit survey fails shut, and an
+/// under-matched line keeps the wall.
+const DEFENSE_INTERCEPT_RATIO_NUM: i32 = 3;
+const DEFENSE_INTERCEPT_RATIO_DEN: i32 = 2;
+/// Posted units above this many are the ring's floor: the detachment
+/// draws only the surplus above it, and the line keeps the rest.
+const DEFENSE_INTERCEPT_RING_FLOOR: usize = 4;
+/// The detachment's size cap: a commit bigger than this drags the whole
+/// line out with the wave's escort — the same lesson the single hunter
+/// teaches the leak.
+const DEFENSE_INTERCEPT_DETACH_CAP: usize = 6;
+/// The detachment withdraws once its remaining power fell below this
+/// fraction (thousandths) of the power it left with.
+const DEFENSE_INTERCEPT_WITHDRAW_FRACTION: i32 = 600;
+/// The intercept aim stands this fraction (thousandths) of the way from
+/// the cluster centroid back toward the defended anchor: the wave's own
+/// path, so the AttackMove meets it head-on instead of chasing its tail.
+const DEFENSE_INTERCEPT_MEET_FRACTION: i32 = 250;
+
 /// The wall ring's wallet floor: a wall segment is 100 credits, and the
 /// ring spends dozens of them one production cycle at a time. The floor
 /// sits just under a tank's price, not above it: a war economy's unit
@@ -1709,6 +1769,30 @@ struct DefensePersona {
     garrison_casualties: usize,
     /// Earliest tick the replenish survey may run again.
     replenish_due: u32,
+    /// The perimeter engagement pool: unit → the cell it returns to when
+    /// its engagement clears — its post when posted, its standing cell
+    /// when it joined off the idle overflow.
+    perimeter_pool: Vec<(u64, (u16, u16))>,
+    /// The hostile centroid the pool last marched at; `None` when no
+    /// engagement stands.
+    perimeter_aim: Option<(u16, u16)>,
+    /// Earliest tick the perimeter pass may run again.
+    perimeter_due: u32,
+    /// The forward interception detachment: unit → its return cell and
+    /// the power it left with.
+    intercept_detachment: Vec<(u64, (u16, u16), i32)>,
+    /// The cluster cell the detachment aims at; `None` when no commit
+    /// stands.
+    intercept_aim: Option<(u16, u16)>,
+    /// The power the detachment committed with — the withdraw ladder's
+    /// rung.
+    intercept_commit_power: i32,
+    /// The marching cluster's cell and nearest-anchor distance at the
+    /// last survey — the approach read (a commit answers a cluster that
+    /// is closing, not one parked in the band).
+    intercept_threat: Option<((i16, i16), i32)>,
+    /// Earliest tick the interception survey may run again.
+    intercept_due: u32,
 }
 
 impl DefensePersona {
@@ -1733,15 +1817,37 @@ impl DefensePersona {
             garrison_snapshot: Vec::new(),
             garrison_casualties: 0,
             replenish_due: 0,
+            perimeter_pool: Vec::new(),
+            perimeter_aim: None,
+            perimeter_due: 0,
+            intercept_detachment: Vec::new(),
+            intercept_aim: None,
+            intercept_commit_power: 0,
+            intercept_threat: None,
+            intercept_due: 0,
         }
     }
 
-    /// Whether a duty ledger — the line, the repair walks or the leak
-    /// chases — holds this unit.
+    /// Whether a duty ledger — the line, the repair walks, the leak
+    /// chases or the active-defense marches — holds this unit.
     fn on_duty(&self, unit: u64) -> bool {
         self.line_posts.iter().any(|&(id, _)| id == unit)
             || self.repair_inbound.iter().any(|&(id, _)| id == unit)
             || self.leak_interceptors.contains(&unit)
+            || self.marching(unit)
+    }
+
+    /// Whether one of the active-defense marches — the perimeter pool or
+    /// the forward detachment — holds this unit. These members stay in
+    /// `line_posts` (they walk back to those posts on release), so the
+    /// books that would otherwise walk them home mid-march read this
+    /// first.
+    fn marching(&self, unit: u64) -> bool {
+        self.perimeter_pool.iter().any(|&(id, _)| id == unit)
+            || self
+                .intercept_detachment
+                .iter()
+                .any(|&(id, _, _)| id == unit)
     }
 }
 
@@ -1789,6 +1895,20 @@ fn defense_bearing_anchor(home: (i16, i16), spawn: (i16, i16)) -> (i16, i16) {
     (
         home.0 + (dx * standoff / len) as i16,
         home.1 + (dy * standoff / len) as i16,
+    )
+}
+
+/// The forward interception's meet point: the marching cluster's
+/// centroid walked [`DEFENSE_INTERCEPT_MEET_FRACTION`] of the way back
+/// toward the defended anchor — a cell on the wave's own path, so the
+/// detachment's AttackMove meets it head-on instead of chasing its tail.
+/// Pure integer math; the caller clamps the answer onto the map.
+fn defense_meet_cell(core: (i16, i16), anchor: (i16, i16)) -> (i16, i16) {
+    let dx = i32::from(anchor.0) - i32::from(core.0);
+    let dy = i32::from(anchor.1) - i32::from(core.1);
+    (
+        core.0 + (dx * DEFENSE_INTERCEPT_MEET_FRACTION / 1000) as i16,
+        core.1 + (dy * DEFENSE_INTERCEPT_MEET_FRACTION / 1000) as i16,
     )
 }
 
@@ -9880,8 +10000,18 @@ impl SuperAi {
         if let Some(command) = self.defense_leak_orders(sim, rules, opening, home_center, tick) {
             return Some(vec![command]);
         }
+        // The active-defense marches (D2): the perimeter engagement
+        // answers the group at the wall, the forward interception the
+        // wave still marching in — each paced, each capped, both under
+        // the wave-pressure budget the pillars already share.
+        if let Some(commands) = self.defense_perimeter_orders(sim, rules, opening, tick) {
+            return Some(commands);
+        }
         if let Some(command) = self.defense_repair_orders(sim, rules, opening, tick) {
             return Some(vec![command]);
+        }
+        if let Some(commands) = self.defense_intercept_orders(sim, rules, opening, tick) {
+            return Some(commands);
         }
         if let Some(command) = self.defense_line_orders(sim, rules, opening, home_center, tick) {
             return Some(vec![command]);
@@ -10216,6 +10346,7 @@ impl SuperAi {
             let posted = persona
                 .line_posts
                 .iter()
+                .filter(|&&(unit, _)| !persona.marching(unit))
                 .filter(|&&(unit, _)| self.order_gate.get(&unit).is_none_or(|&due| tick >= due))
                 .filter(|&&(unit, _)| Self::is_direct_fire_hull(sim, rules, unit))
                 .filter_map(|&(unit, _)| {
@@ -10273,6 +10404,610 @@ impl SuperAi {
             attacker_id: hunter,
             target_id: leak_id,
         })
+    }
+
+    /// The quick power read the active-defense surveys lean on: a unit's
+    /// retail cost — the one value the rules hold for every combat type.
+    /// An unknown type reads as zero; a wounded hull holds its cost.
+    fn defense_unit_power(
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        unit: u64,
+    ) -> i32 {
+        sim.substrate()
+            .entities
+            .get(unit)
+            .and_then(|entity| rules.object(sim.interner().resolve(entity.type_ref())))
+            .map(|object| object.cost.max(0))
+            .unwrap_or(0)
+    }
+
+    /// The hostile ground mobiles on the field as (unit, cell) pairs in
+    /// substrate order — the read both active-defense passes start from.
+    fn defense_hostile_ground(
+        &self,
+        sim: &crate::sim::world::Simulation,
+    ) -> Vec<(u64, (i16, i16))> {
+        sim.substrate()
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                !entity.lifecycle.in_limbo()
+                    && matches!(
+                        entity.category(),
+                        crate::map::entities::EntityCategory::Unit
+                            | crate::map::entities::EntityCategory::Infantry
+                    )
+                    && self.is_enemy(sim, entity.owner())
+            })
+            .map(|(id, entity)| {
+                (
+                    id,
+                    (entity.position.rx() as i16, entity.position.ry() as i16),
+                )
+            })
+            .collect()
+    }
+
+    /// The densest hostile group among `band`: the cell whose
+    /// [`DEFENSE_INTERCEPT_CLUSTER_RADIUS`] neighborhood holds the most,
+    /// ties to the smaller cell (the rescue cluster's own stable pick at
+    /// the interception's radius). Returns the members and their mean
+    /// cell — integer sums, order-independent, the centroid stays a
+    /// deterministic read.
+    fn defense_marching_cluster(
+        band: &[(u64, (i16, i16))],
+    ) -> Option<(Vec<(u64, (i16, i16))>, (i16, i16))> {
+        let mut best: Option<(usize, (i16, i16))> = None;
+        for &(_, cell) in band {
+            let count = band
+                .iter()
+                .filter(|&&(_, other)| {
+                    defense_chebyshev(other, cell) as i32 <= DEFENSE_INTERCEPT_CLUSTER_RADIUS
+                })
+                .count();
+            if best
+                .is_none_or(|(kept, kept_cell)| count > kept || (count == kept && cell < kept_cell))
+            {
+                best = Some((count, cell));
+            }
+        }
+        let (_, core) = best?;
+        let members: Vec<(u64, (i16, i16))> = band
+            .iter()
+            .copied()
+            .filter(|&(_, cell)| {
+                defense_chebyshev(cell, core) as i32 <= DEFENSE_INTERCEPT_CLUSTER_RADIUS
+            })
+            .collect();
+        let (sum_x, sum_y, count) = members
+            .iter()
+            .fold((0i64, 0i64, 0usize), |(ax, ay, n), &(_, (x, y))| {
+                (ax + i64::from(x), ay + i64::from(y), n + 1)
+            });
+        let centroid = (
+            (sum_x / count.max(1) as i64) as i16,
+            (sum_y / count.max(1) as i64) as i16,
+        );
+        Some((members, centroid))
+    }
+
+    /// The perimeter engagement (D2 active defense): a hostile ground
+    /// group whose densest cell stands within [`DEFENSE_PERIMETER_RADIUS`]
+    /// of a fort anchor ([`Self::defense_fort_anchors`]) turns the posted
+    /// line's wait into a march — the ring's surplus walks out and
+    /// AttackMoves at the group's centroid, the idle overflow rotates in
+    /// behind it, and when the band clears every marcher Guards back to
+    /// the cell it left. A chrono wave that spawns beside the objective
+    /// stands inside the band on arrival and is met the same way. The
+    /// pool's caps and the ring floor keep the wall manned; the leak
+    /// hunter and the rescue triggers above it run untouched.
+    fn defense_perimeter_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        tick: u32,
+    ) -> Option<Vec<Command>> {
+        // The paced pass: advance the window first, then prune — a fallen
+        // marcher drops, and one another book has reclaimed (the repair
+        // walk, the leak chase) leaves the pool to that book.
+        {
+            let persona = self.defense.as_mut()?;
+            if tick < persona.perimeter_due {
+                return None;
+            }
+            persona.perimeter_due = tick + DEFENSE_PERIMETER_TICKS;
+        }
+        let house = self.house;
+        let claimed: Vec<u64> = {
+            let persona = self.defense.as_ref().expect("checked above");
+            persona
+                .repair_inbound
+                .iter()
+                .map(|&(id, _)| id)
+                .chain(persona.leak_interceptors.iter().copied())
+                .collect()
+        };
+        {
+            let persona = self.defense.as_mut().expect("checked above");
+            persona.perimeter_pool.retain(|&(unit, _)| {
+                sim.substrate().entities.get(unit).is_some_and(|entity| {
+                    entity.owner() == house
+                        && entity.lifecycle.object_alive()
+                        && !claimed.contains(&unit)
+                })
+            });
+        }
+        let anchors = self.defense_fort_anchors(sim);
+        let hostiles = self.defense_hostile_ground(sim);
+        // The engagement: the anchor whose perimeter band holds the most
+        // hostiles, ties to the smaller anchor cell (a stable pick).
+        let mut engagement: Option<(usize, (i16, i16), i64, i64)> = None;
+        for &(anchor, _) in &anchors {
+            let mut count = 0usize;
+            let (mut sum_x, mut sum_y) = (0i64, 0i64);
+            for &(_, cell) in &hostiles {
+                if defense_chebyshev(cell, anchor) as i32 <= DEFENSE_PERIMETER_RADIUS {
+                    count += 1;
+                    sum_x += i64::from(cell.0);
+                    sum_y += i64::from(cell.1);
+                }
+            }
+            if count < DEFENSE_PERIMETER_CLUSTER_MIN {
+                continue;
+            }
+            if engagement.is_none_or(|(kept, kept_anchor, _, _)| {
+                count > kept || (count == kept && anchor < kept_anchor)
+            }) {
+                engagement = Some((count, anchor, sum_x, sum_y));
+            }
+        }
+        let Some((count, anchor, sum_x, sum_y)) = engagement else {
+            // The band cleared: every marcher walks back to the cell it
+            // left, and the books close. A gated marcher waits its gate —
+            // the next window releases it.
+            let (pool, had_aim) = {
+                let persona = self.defense.as_mut().expect("checked above");
+                (
+                    std::mem::take(&mut persona.perimeter_pool),
+                    persona.perimeter_aim.take().is_some(),
+                )
+            };
+            if pool.is_empty() && !had_aim {
+                return None;
+            }
+            let mut commands: Vec<Command> = Vec::new();
+            for (unit, home) in pool {
+                if self.order_gate.get(&unit).is_none_or(|&due| tick >= due) {
+                    self.gate_idle_order(unit, tick);
+                    commands.push(Command::Guard {
+                        entity_id: unit,
+                        target: Some(crate::sim::combat::TargetKind::Cell(home.0, home.1)),
+                    });
+                }
+            }
+            return if commands.is_empty() {
+                None
+            } else {
+                Some(commands)
+            };
+        };
+        let centroid = (
+            (sum_x / count.max(1) as i64) as i16,
+            (sum_y / count.max(1) as i64) as i16,
+        );
+        let aim_cell = on_map_cell(sim, centroid, anchor);
+        self.defense.as_mut().expect("checked above").perimeter_aim = Some(aim_cell);
+        let mut commands: Vec<Command> = Vec::new();
+        // The standing marchers first: any idle member whose gate is due
+        // marches again at the group's current centroid.
+        let pool = self
+            .defense
+            .as_ref()
+            .expect("checked above")
+            .perimeter_pool
+            .clone();
+        for &(unit, _) in &pool {
+            let Some(entity) = sim.substrate().entities.get(unit) else {
+                continue;
+            };
+            let idle = matches!(
+                entity.passive_acquire_mission(),
+                crate::sim::mission::MissionType::None
+                    | crate::sim::mission::MissionType::Sleep
+                    | crate::sim::mission::MissionType::Guard
+                    | crate::sim::mission::MissionType::AreaGuard
+            );
+            if idle && self.order_gate.get(&unit).is_none_or(|&due| tick >= due) {
+                self.gate_idle_order(unit, tick);
+                commands.push(Command::AttackMove {
+                    entity_id: unit,
+                    target: None,
+                    destination: Some(crate::sim::combat::TargetKind::Cell(aim_cell.0, aim_cell.1)),
+                });
+            }
+        }
+        // Recruitment while the pool rides under its cap: the posted
+        // ring's surplus first (nearest the group; the air answer is held
+        // back while a ground hull stands), then the idle overflow's
+        // rotation — the units the staffing quota left standing around the
+        // ring. A wounded hull stays out (it belongs to the repair
+        // rotation) and the ring keeps its floor.
+        let recruits: Vec<(u64, (u16, u16))> = {
+            let persona = self.defense.as_ref().expect("checked above");
+            if persona.perimeter_pool.len() >= DEFENSE_PERIMETER_POOL_CAP {
+                Vec::new()
+            } else {
+                let aa_roster = Self::defense_role_entries(opening, Role::AntiAir);
+                let is_aa = |unit: u64| {
+                    sim.substrate()
+                        .entities
+                        .get(unit)
+                        .map(|entity| sim.interner().resolve(entity.type_ref()).to_string())
+                        .is_some_and(|name| aa_roster.iter().any(|entry| *entry == name))
+                };
+                let healthy = |unit: u64| {
+                    sim.substrate().entities.get(unit).is_some_and(|entity| {
+                        Self::health_fraction(
+                            rules,
+                            sim.interner().resolve(entity.type_ref()),
+                            entity,
+                        ) > DEFENSE_REPAIR_FRACTION
+                    })
+                };
+                let unclaimed = |unit: u64| {
+                    !persona.marching(unit)
+                        && !persona.repair_inbound.iter().any(|&(id, _)| id == unit)
+                        && !persona.leak_interceptors.contains(&unit)
+                };
+                let at_post: Vec<(u8, i64, u64, (u16, u16))> = persona
+                    .line_posts
+                    .iter()
+                    .filter_map(|&(unit, post)| {
+                        let entity = sim.substrate().entities.get(unit)?;
+                        if entity.owner() != house
+                            || !entity.lifecycle.object_alive()
+                            || Self::garrisoned(entity)
+                            || !unclaimed(unit)
+                            || !healthy(unit)
+                        {
+                            return None;
+                        }
+                        let cell = (entity.position.rx() as i16, entity.position.ry() as i16);
+                        if defense_chebyshev(cell, (post.0 as i16, post.1 as i16))
+                            > (DEFENSE_LINE_DRIFT_CELLS + 1) as u32
+                        {
+                            return None;
+                        }
+                        let dist = defense_chebyshev(cell, centroid) as i64;
+                        Some((u8::from(is_aa(unit)), dist, unit, post))
+                    })
+                    .collect();
+                let mut ranked: Vec<(u8, u8, i64, u64, (u16, u16))> = at_post
+                    .iter()
+                    .map(|&(is_aa, dist, unit, post)| (is_aa, 0u8, dist, unit, post))
+                    .collect();
+                for (dist, unit) in self.defense_idle_candidates(sim, opening, centroid, tick) {
+                    if !unclaimed(unit) || !healthy(unit) {
+                        continue;
+                    }
+                    let Some(entity) = sim.substrate().entities.get(unit) else {
+                        continue;
+                    };
+                    let home = on_map_cell(
+                        sim,
+                        (entity.position.rx() as i16, entity.position.ry() as i16),
+                        anchor,
+                    );
+                    ranked.push((
+                        u8::from(is_aa(unit)),
+                        1u8,
+                        dist,
+                        unit,
+                        (home.0 as u16, home.1 as u16),
+                    ));
+                }
+                ranked.sort_by_key(|&(is_aa, from_idle, dist, unit, _)| {
+                    (is_aa, from_idle, dist, unit)
+                });
+                let mut posted_taken = 0usize;
+                let mut chosen: Vec<(u64, (u16, u16))> = Vec::new();
+                for &(_, from_idle, _, unit, home) in &ranked {
+                    if persona.perimeter_pool.len() + chosen.len() >= DEFENSE_PERIMETER_POOL_CAP {
+                        break;
+                    }
+                    if from_idle == 0 {
+                        if at_post.len() - posted_taken <= DEFENSE_PERIMETER_RING_FLOOR {
+                            continue;
+                        }
+                        posted_taken += 1;
+                    }
+                    chosen.push((unit, home));
+                }
+                chosen
+            }
+        };
+        {
+            let persona = self.defense.as_mut().expect("checked above");
+            persona.perimeter_pool.extend(recruits.iter().copied());
+        }
+        for &(unit, _) in &recruits {
+            self.gate_idle_order(unit, tick);
+            commands.push(Command::AttackMove {
+                entity_id: unit,
+                target: None,
+                destination: Some(crate::sim::combat::TargetKind::Cell(aim_cell.0, aim_cell.1)),
+            });
+        }
+        if commands.is_empty() {
+            None
+        } else {
+            Some(commands)
+        }
+    }
+
+    /// The surplus forward interception (D2 active defense): a hostile
+    /// ground cluster still out in the marching band — past the
+    /// perimeter, inside [`DEFENSE_INTERCEPT_OUTER_RANGE`] of an anchor,
+    /// and closing on it — draws one pre-committed detachment of the
+    /// ring's surplus. The commit survey fails shut: the garrison's
+    /// available power must reach [`DEFENSE_INTERCEPT_RATIO_NUM`] over
+    /// [`DEFENSE_INTERCEPT_RATIO_DEN`] of the cluster's, the ring keeps
+    /// [`DEFENSE_INTERCEPT_RING_FLOOR`] posts after the split, and at
+    /// most [`DEFENSE_INTERCEPT_DETACH_CAP`] march — a survey that fails
+    /// keeps the wall. The detachment AttackMoves at the wave's own path
+    /// — the centroid walked [`DEFENSE_INTERCEPT_MEET_FRACTION`] back
+    /// toward the anchor — and withdraws when the cluster dies or its
+    /// remaining power fell below [`DEFENSE_INTERCEPT_WITHDRAW_FRACTION`]
+    /// of what it left with. The leak hunter and the rescue triggers run
+    /// untouched above it.
+    fn defense_intercept_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        tick: u32,
+    ) -> Option<Vec<Command>> {
+        // The paced survey: advance the window, then prune the
+        // detachment — a fallen member drops, and one another book has
+        // reclaimed leaves to that book.
+        {
+            let persona = self.defense.as_mut()?;
+            if tick < persona.intercept_due {
+                return None;
+            }
+            persona.intercept_due = tick + DEFENSE_INTERCEPT_TICKS;
+        }
+        let house = self.house;
+        let claimed: Vec<u64> = {
+            let persona = self.defense.as_ref().expect("checked above");
+            persona
+                .repair_inbound
+                .iter()
+                .map(|&(id, _)| id)
+                .chain(persona.leak_interceptors.iter().copied())
+                .collect()
+        };
+        {
+            let persona = self.defense.as_mut().expect("checked above");
+            persona.intercept_detachment.retain(|&(unit, _, _)| {
+                sim.substrate().entities.get(unit).is_some_and(|entity| {
+                    entity.owner() == house
+                        && entity.lifecycle.object_alive()
+                        && !claimed.contains(&unit)
+                })
+            });
+        }
+        let anchors = self.defense_fort_anchors(sim);
+        let hostiles = self.defense_hostile_ground(sim);
+        // The marching band: hostile ground past the perimeter, inside
+        // the reach.
+        let band: Vec<(u64, (i16, i16))> = hostiles
+            .into_iter()
+            .filter(|&(_, cell)| {
+                let nearest = anchors
+                    .iter()
+                    .map(|&(anchor, _)| defense_chebyshev(cell, anchor) as i32)
+                    .min()
+                    .unwrap_or(i32::MAX);
+                DEFENSE_INTERCEPT_INNER_RANGE < nearest && nearest <= DEFENSE_INTERCEPT_OUTER_RANGE
+            })
+            .collect();
+        let Some((members, core)) = Self::defense_marching_cluster(&band) else {
+            // No wave marching: a standing detachment walks home.
+            let detachment = {
+                let persona = self.defense.as_mut().expect("checked above");
+                persona.intercept_threat = None;
+                persona.intercept_aim = None;
+                persona.intercept_commit_power = 0;
+                std::mem::take(&mut persona.intercept_detachment)
+            };
+            if detachment.is_empty() {
+                return None;
+            }
+            let mut commands: Vec<Command> = Vec::new();
+            for (unit, home, _) in detachment {
+                if self.order_gate.get(&unit).is_none_or(|&due| tick >= due) {
+                    self.gate_idle_order(unit, tick);
+                    commands.push(Command::Guard {
+                        entity_id: unit,
+                        target: Some(crate::sim::combat::TargetKind::Cell(home.0, home.1)),
+                    });
+                }
+            }
+            return if commands.is_empty() {
+                None
+            } else {
+                Some(commands)
+            };
+        };
+        let Some(&(nearest_anchor, _)) = anchors
+            .iter()
+            .min_by_key(|&&(anchor, _)| (defense_chebyshev(core, anchor), anchor))
+        else {
+            return None;
+        };
+        let nearest_dist = defense_chebyshev(core, nearest_anchor) as i32;
+        let closing = {
+            let persona = self.defense.as_ref().expect("checked above");
+            persona
+                .intercept_threat
+                .is_none_or(|(_, dist)| nearest_dist < dist)
+        };
+        self.defense
+            .as_mut()
+            .expect("checked above")
+            .intercept_threat = Some((core, nearest_dist));
+        let cluster_power: i32 = members
+            .iter()
+            .map(|&(unit, _)| Self::defense_unit_power(sim, rules, unit))
+            .sum();
+        let detachment = self
+            .defense
+            .as_ref()
+            .expect("checked above")
+            .intercept_detachment
+            .clone();
+        if !detachment.is_empty() {
+            // The ladder: below the withdraw fraction of the committed
+            // power the detachment walks home; above it, the idle members
+            // re-aim at the cluster's current path.
+            let committed = self
+                .defense
+                .as_ref()
+                .expect("checked above")
+                .intercept_commit_power;
+            let remaining: i32 = detachment.iter().map(|&(_, _, power)| power).sum();
+            if committed > 0 && remaining * 1000 < committed * DEFENSE_INTERCEPT_WITHDRAW_FRACTION {
+                let detachment = {
+                    let persona = self.defense.as_mut().expect("checked above");
+                    persona.intercept_aim = None;
+                    persona.intercept_commit_power = 0;
+                    std::mem::take(&mut persona.intercept_detachment)
+                };
+                let mut commands: Vec<Command> = Vec::new();
+                for (unit, home, _) in detachment {
+                    if self.order_gate.get(&unit).is_none_or(|&due| tick >= due) {
+                        self.gate_idle_order(unit, tick);
+                        commands.push(Command::Guard {
+                            entity_id: unit,
+                            target: Some(crate::sim::combat::TargetKind::Cell(home.0, home.1)),
+                        });
+                    }
+                }
+                return if commands.is_empty() {
+                    None
+                } else {
+                    Some(commands)
+                };
+            }
+            let meet = on_map_cell(sim, defense_meet_cell(core, nearest_anchor), nearest_anchor);
+            self.defense.as_mut().expect("checked above").intercept_aim = Some(meet);
+            let mut commands: Vec<Command> = Vec::new();
+            for &(unit, _, _) in &detachment {
+                let Some(entity) = sim.substrate().entities.get(unit) else {
+                    continue;
+                };
+                let idle = matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                );
+                if idle && self.order_gate.get(&unit).is_none_or(|&due| tick >= due) {
+                    self.gate_idle_order(unit, tick);
+                    commands.push(Command::AttackMove {
+                        entity_id: unit,
+                        target: None,
+                        destination: Some(crate::sim::combat::TargetKind::Cell(meet.0, meet.1)),
+                    });
+                }
+            }
+            return if commands.is_empty() {
+                None
+            } else {
+                Some(commands)
+            };
+        }
+        // The commit survey: the ring's at-post surplus, nearest the
+        // cluster first, the air answer held back while a ground hull
+        // stands. The floor, the ratio and the cap gate it; a failed
+        // survey keeps the wall.
+        if !closing || members.len() < DEFENSE_INTERCEPT_CLUSTER_MIN || cluster_power <= 0 {
+            return None;
+        }
+        let surplus: Vec<(u8, i64, u64, (u16, u16))> = {
+            let persona = self.defense.as_ref().expect("checked above");
+            let aa_roster = Self::defense_role_entries(opening, Role::AntiAir);
+            let mut at_post: Vec<(u8, i64, u64, (u16, u16))> = persona
+                .line_posts
+                .iter()
+                .filter_map(|&(unit, post)| {
+                    let entity = sim.substrate().entities.get(unit)?;
+                    if entity.owner() != house
+                        || !entity.lifecycle.object_alive()
+                        || Self::garrisoned(entity)
+                        || persona.marching(unit)
+                        || persona.repair_inbound.iter().any(|&(id, _)| id == unit)
+                        || persona.leak_interceptors.contains(&unit)
+                    {
+                        return None;
+                    }
+                    let cell = (entity.position.rx() as i16, entity.position.ry() as i16);
+                    if defense_chebyshev(cell, (post.0 as i16, post.1 as i16))
+                        > (DEFENSE_LINE_DRIFT_CELLS + 1) as u32
+                    {
+                        return None;
+                    }
+                    let name = sim.interner().resolve(entity.type_ref());
+                    if Self::health_fraction(rules, name, entity) <= DEFENSE_REPAIR_FRACTION {
+                        return None;
+                    }
+                    let is_aa = u8::from(aa_roster.iter().any(|entry| *entry == name));
+                    let dist = defense_chebyshev(cell, core) as i64;
+                    Some((is_aa, dist, unit, post))
+                })
+                .collect();
+            at_post.sort_by_key(|&(is_aa, dist, unit, _)| (is_aa, dist, unit));
+            if at_post.len() <= DEFENSE_INTERCEPT_RING_FLOOR {
+                return None;
+            }
+            let take = at_post
+                .len()
+                .saturating_sub(DEFENSE_INTERCEPT_RING_FLOOR)
+                .min(DEFENSE_INTERCEPT_DETACH_CAP);
+            at_post.truncate(take);
+            at_post
+        };
+        let our_power: i32 = surplus
+            .iter()
+            .map(|&(_, _, unit, _)| Self::defense_unit_power(sim, rules, unit))
+            .sum();
+        if our_power * DEFENSE_INTERCEPT_RATIO_DEN < cluster_power * DEFENSE_INTERCEPT_RATIO_NUM {
+            return None;
+        }
+        let meet = on_map_cell(sim, defense_meet_cell(core, nearest_anchor), nearest_anchor);
+        let mut commands: Vec<Command> = Vec::new();
+        {
+            let persona = self.defense.as_mut().expect("checked above");
+            for &(_, _, unit, post) in &surplus {
+                let power = Self::defense_unit_power(sim, rules, unit);
+                persona.intercept_detachment.push((unit, post, power));
+                commands.push(Command::AttackMove {
+                    entity_id: unit,
+                    target: None,
+                    destination: Some(crate::sim::combat::TargetKind::Cell(meet.0, meet.1)),
+                });
+            }
+            persona.intercept_aim = Some(meet);
+            persona.intercept_commit_power = our_power;
+        }
+        for &(_, _, unit, _) in &surplus {
+            self.gate_idle_order(unit, tick);
+        }
+        Some(commands)
     }
 
     /// The repair rotation: posted line units at or below
@@ -10672,6 +11407,11 @@ impl SuperAi {
         let repost = {
             let persona = self.defense.as_ref().expect("checked above");
             persona.line_posts.iter().find_map(|&(unit, post)| {
+                // An active-defense marcher is not a drifter: the pool or
+                // the detachment that holds it walks it home itself.
+                if persona.marching(unit) {
+                    return None;
+                }
                 let entity = sim.substrate().entities.get(unit)?;
                 let idle = matches!(
                     entity.passive_acquire_mission(),
