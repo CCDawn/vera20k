@@ -29,7 +29,7 @@
 //! real match. Every choice depends only on the simulation state and the
 //! tick, in integer math, so a run is as deterministic as the simulation.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use vera20k_core::headless_scenario::{HeadlessScenario, battle_session};
 use vera20k_core::map::cell_index::CellGrid;
@@ -618,7 +618,10 @@ impl MatchScenario {
                 floor.max(2)
             ));
         }
-        if !local_plays && defense_id.is_none() && let Some(local) = local {
+        if !local_plays
+            && defense_id.is_none()
+            && let Some(local) = local
+        {
             sim.make_house_multiplay_passive(local);
         }
         let humans = playing - seated;
@@ -1347,7 +1350,7 @@ impl MatchScenario {
             .defense_books()
             .map(|books| {
                 format!(
-                    "wave_in={} bearings={} foe_i={} foe_v={} foe_a={} sched_i={} sched_v={} sched_a={} protected={} line={} repair={} leak={} statue_hp={} owned={}",
+                    "wave_in={} bearings={} foe_i={} foe_v={} foe_a={} sched_i={} sched_v={} sched_a={} protected={} line={} repair={} leak={} statue_hp={} owned={} guns={}",
                     books
                         .next_wave_estimate
                         .map_or("-".into(), |frames| frames.to_string()),
@@ -1364,12 +1367,69 @@ impl MatchScenario {
                     books.leak_interceptors,
                     books.protected_min_health,
                     books.protected_owned,
+                    books.gun_wants,
                 )
             })
             .unwrap_or_default();
+        let spent = sim
+            .houses()
+            .get(&house.id)
+            .map(|state| i64::from(state.economy().spent_credits()))
+            .unwrap_or(0);
         Some(format!(
-            "defense name={} infantry={} vehicles={} aircraft={} buildings={} credits={credits} defeated={defeated} {books}",
+            "defense name={} infantry={} vehicles={} aircraft={} buildings={} credits={credits} spent={spent} defeated={defeated} {books}",
             house.name, counts[0], counts[1], counts[2], counts[3],
+        ))
+    }
+
+    /// The defense run's force census: per type name, the hostile mobile
+    /// force and the defended house's own mobile force and structures.
+    /// Bench telemetry for tuning (what the line fights, what it fields,
+    /// whether the tower census keeps growing); read-only, no simulation
+    /// effect. Hostile = owned by a non-Neutral house other than the
+    /// defended one — a wave map's attackers ride computer houses, its
+    /// scenery is Neutral.
+    pub(crate) fn defense_census(&self, runtime: &SimRuntime) -> Option<String> {
+        let house = self.houses.iter().find(|house| house.defended)?;
+        let sim = &runtime.simulation;
+        let neutral = sim.interner().get("Neutral");
+        let mut own: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut own_struct: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut foe: BTreeMap<&str, usize> = BTreeMap::new();
+        for entity in sim.entities().values() {
+            if !entity.is_alive() || entity.in_limbo() {
+                continue;
+            }
+            let type_name = sim.interner().resolve(entity.type_ref());
+            if entity.owner() == house.id {
+                if entity.category() == EntityCategory::Structure {
+                    *own_struct.entry(type_name).or_default() += 1;
+                } else {
+                    *own.entry(type_name).or_default() += 1;
+                }
+            } else if Some(entity.owner()) != neutral
+                && entity.category() != EntityCategory::Structure
+            {
+                *foe.entry(type_name).or_default() += 1;
+            }
+        }
+        let fmt = |map: &BTreeMap<&str, usize>| -> String {
+            let parts: Vec<String> = map
+                .iter()
+                .filter(|(_, count)| **count > 0)
+                .map(|(name, count)| format!("{name}:{count}"))
+                .collect();
+            if parts.is_empty() {
+                "-".into()
+            } else {
+                parts.join(",")
+            }
+        };
+        Some(format!(
+            "census own=[{}] foe=[{}] bld=[{}]",
+            fmt(&own),
+            fmt(&foe),
+            fmt(&own_struct)
         ))
     }
 }

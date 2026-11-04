@@ -688,10 +688,15 @@ impl Frames for Bench<'_> {
             tick + 1,
             mean.as_secs_f64() * 1000.0,
         );
-        if let Plan::Match(script) = &*self.plan
-            && let Some(line) = script.defense_progress(self.runtime)
-        {
-            println!("progress tick={} mean_ms=- {line}", tick + 1);
+        if let Plan::Match(script) = &*self.plan {
+            if let Some(line) = script.defense_progress(self.runtime) {
+                println!("progress tick={} mean_ms=- {line}", tick + 1);
+            }
+            if (tick + 1) % 500 == 0
+                && let Some(line) = script.defense_census(self.runtime)
+            {
+                println!("census tick={} {line}", tick + 1);
+            }
         }
     }
 
@@ -924,9 +929,9 @@ fn main() -> Result<(), String> {
                     .iter()
                     .copied()
                     .filter(|&id| {
-                        houses.get(&id).is_some_and(|house| {
-                            !house.is_human() && !house.multiplay_passive()
-                        })
+                        houses
+                            .get(&id)
+                            .is_some_and(|house| !house.is_human() && !house.multiplay_passive())
                     })
                     .collect()
             };

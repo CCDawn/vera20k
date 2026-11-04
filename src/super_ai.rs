@@ -814,6 +814,14 @@ const DEFENSE_FORT_ANCHOR_SPREAD: i32 = 4;
 /// top of the battle caps: without it the yard fill alone exhausted the
 /// caps before the first fort gun queued.
 const DEFENSE_FORT_GUN_EXTRA: usize = 2;
+/// The fort anchor's own quota ring, in cells: the towers an anchor counts
+/// as its answer. Tighter than the yards' [`BASE_CLUSTER_RADIUS`] — a
+/// bearing anchor stands exactly at that radius from the home center, so a
+/// yard-radius read fills the anchor's quota with towers that guard the
+/// yard while the corridor the anchor stands on stays naked. Fort guns
+/// place on the anchor's own weighted rings ([`PlacementRoute::Fort`]), so
+/// everything the anchor arms lands inside this ring.
+const DEFENSE_FORT_GUN_RING: i16 = 4;
 /// The fort anchors are not structures, so the wall walk keys their ring
 /// retirement by this tag packed with the cell — a namespace no entity id
 /// reaches.
@@ -1592,7 +1600,7 @@ enum PlacementRoute {
 /// A read-only copy of [`DefensePersona`]'s perception and book sizes, for
 /// harnesses and tests (see [`SuperAi::defense_books`]). Counts, not
 /// contents: consumers compare sizes and timers across ticks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DefenseBooks {
     /// [`DefensePersona`]'s `next_wave_estimate` read.
     pub next_wave_estimate: Option<i32>,
@@ -1622,6 +1630,9 @@ pub struct DefenseBooks {
     /// last scan: the map's give chains re-own the objective mid-game,
     /// and a flipped charge is its own hazard (our fire acquires it).
     pub protected_owned: bool,
+    /// The last gun walk's wants, `NAME@route` comma-joined, `-` at rest
+    /// (harness telemetry only).
+    pub gun_wants: String,
 }
 
 /// The defense personality's pinned perception, mode A skeleton
@@ -3059,6 +3070,10 @@ pub struct SuperAi {
     /// cannot misroute a different item. Pinned state, never read from the
     /// runtime.
     placement_intent: Option<(InternedId, PlacementRoute)>,
+    /// Harness telemetry: the last [`Self::defense_gun_wants`] walk's
+    /// result, `NAME@route` comma-joined (`-` when the walk rested).
+    /// Read-only; never feeds a decision.
+    gun_want_note: String,
     /// The structure the repair limb switched repair on for: the command is
     /// a toggle (a re-issue would switch the repair back off), so the
     /// activation latches until the building's repair byte reads off again
@@ -3406,6 +3421,7 @@ impl SuperAi {
             mcv_stuck_since: std::collections::HashMap::new(),
             mcv_abandoned: std::collections::HashMap::new(),
             placement_intent: None,
+            gun_want_note: String::from("-"),
             repairing_structure: None,
             repair_due: 0,
             now_tick: 0,
@@ -3503,6 +3519,7 @@ impl SuperAi {
             repair_inbound: persona.repair_inbound.len(),
             leak_interceptors: persona.leak_interceptors.len(),
             protected_owned: persona.protected_owned,
+            gun_wants: self.gun_want_note.clone(),
             protected_min_health: persona
                 .protected_health
                 .iter()
@@ -6088,6 +6105,17 @@ impl SuperAi {
         if opening.radar == "GAAIRC" {
             radar_candidates[1] = "AMRADR";
         }
+        // The gun rows' radar gate reads the whole class standing, not the
+        // climb's pick: a base whose radar is the class twin (a seeded
+        // AMRADR behind a non-American house's GAAIRC pick, and the
+        // reverse) held the heavy tower's gate shut forever — the tower
+        // never entered the walk's wants at all (FoD3: ATESLA never queued
+        // in a whole run).
+        let radar_standing: Vec<&'static str> = radar_candidates
+            .iter()
+            .copied()
+            .filter(|&name| self.count_structures_of_type(sim, name) >= 1)
+            .collect();
         let radar_name = radar_candidates
             .into_iter()
             .find(|&name| {
@@ -6168,8 +6196,14 @@ impl SuperAi {
             .houses()
             .get(&self.house)
             .is_some_and(|house| sim.interner().resolve(house.house_type_id()) == "French");
-        let gun_wants =
-            self.defense_gun_wants(sim, opening, &bases, late_sink, radar_name, french_house);
+        let gun_wants = self.defense_gun_wants(
+            sim,
+            opening,
+            &bases,
+            late_sink,
+            &radar_standing,
+            french_house,
+        );
         let guns_wanted = any_tank
             && self
                 .structure_center(sim, opening.construction_yard)
@@ -11114,7 +11148,7 @@ impl SuperAi {
         opening: &Opening,
         bases: &[(i16, i16)],
         late_sink: bool,
-        radar_name: &'static str,
+        radar_class: &[&'static str],
         french_house: bool,
     ) -> Vec<(&'static str, PlacementRoute)> {
         // The fort anchors join the bases only while the persona is
@@ -11178,7 +11212,9 @@ impl SuperAi {
                 opening.defense_heavy,
                 heavy_per_yard,
                 HEAVY_DEFENSE_CAP * 4 + usize::from(late_sink) * bases.len(),
-                self.count_structures_of_type(sim, radar_name) >= 1,
+                radar_class
+                    .iter()
+                    .any(|&name| self.count_structures_of_type(sim, name) >= 1),
             ),
             (
                 opening.defense_basic,
@@ -11224,10 +11260,12 @@ impl SuperAi {
                 2,
                 opening.country_cannon.is_some()
                     && french_house
-                    && self.count_structures_of_type(sim, radar_name) >= 1,
+                    && radar_class
+                        .iter()
+                        .any(|&name| self.count_structures_of_type(sim, name) >= 1),
             ),
         ];
-        defenses
+        let wants = defenses
             .iter()
             .filter_map(|&(name, per_yard, global_bound, gate)| {
                 // The fort anchors widen the row's house-wide bound: the
@@ -11239,22 +11277,57 @@ impl SuperAi {
                 if !gate || self.count_structures_of_type(sim, name) >= bound {
                     return None;
                 }
-                let under_floor = |cell: (i16, i16)| {
-                    self.count_structures_of_type_near(sim, name, cell, BASE_CLUSTER_RADIUS)
+                // Each quota site counts its own ring: the yards their
+                // [`BASE_CLUSTER_RADIUS`] cluster, a fort anchor the tighter
+                // ring it arms. The bearing anchors stand exactly at that
+                // cluster radius from the home center, so a yard-radius read
+                // fills an anchor's quota with towers that guard the yard —
+                // the corridor the anchor stands on stays naked while the
+                // walk reads every site filled and rests.
+                let site_ring = |index: usize| -> i16 {
+                    if index >= fort_start {
+                        DEFENSE_FORT_GUN_RING
+                    } else {
+                        BASE_CLUSTER_RADIUS
+                    }
+                };
+                let under_floor = |index: usize| {
+                    self.count_structures_of_type_near(sim, name, bases[index], site_ring(index))
                         < OUTPOST_GUN_FLOOR.min(per_yard)
                 };
-                if let Some(index) = bases.iter().skip(1).position(|&cell| under_floor(cell)) {
-                    return Some((name, base_route(index + 1)));
+                if let Some(index) = (1..bases.len()).find(|&index| under_floor(index)) {
+                    return Some((name, base_route(index)));
                 }
-                bases
-                    .iter()
-                    .position(|&cell| {
-                        self.count_structures_of_type_near(sim, name, cell, BASE_CLUSTER_RADIUS)
-                            < per_yard
+                (0..bases.len())
+                    .find(|&index| {
+                        self.count_structures_of_type_near(
+                            sim,
+                            name,
+                            bases[index],
+                            site_ring(index),
+                        ) < per_yard
                     })
                     .map(|index| (name, base_route(index)))
             })
-            .collect()
+            .collect::<Vec<_>>();
+        // The harness note: the walk's result in issue order, `-` at rest.
+        self.gun_want_note = if wants.is_empty() {
+            String::from("-")
+        } else {
+            wants
+                .iter()
+                .map(|(name, route)| {
+                    let tag = match route {
+                        PlacementRoute::Home => "home",
+                        PlacementRoute::Expansion => "expansion",
+                        PlacementRoute::Fort { .. } => "fort",
+                    };
+                    format!("{name}@{tag}")
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        wants
     }
 
     /// The specialist a wheel slot goes to once the core has its
@@ -24992,7 +25065,7 @@ mod tests {
         let bases = [(10_i16, 10_i16), (24_i16, 20_i16)];
         // Peace quotas; no radar stands, so the heavy row's gate stays
         // closed and the read is the AA and pillbox rows alone.
-        let wants = ai.defense_gun_wants(&sim, opening, &bases, false, "GAAIRC", false);
+        let wants = ai.defense_gun_wants(&sim, opening, &bases, false, &["GAAIRC"], false);
         assert_eq!(
             wants.iter().find(|(name, _)| *name == "GAPILL"),
             Some(&("GAPILL", PlacementRoute::Expansion)),
@@ -25001,7 +25074,7 @@ mod tests {
         // The floor stands: the home fill resumes the row.
         sim.spawn_object_at_height("GAPILL", &ai_owner, 29, 20, 0, 0, &rules)
             .expect("the outpost pillbox stands");
-        let wants = ai.defense_gun_wants(&sim, opening, &bases, false, "GAAIRC", false);
+        let wants = ai.defense_gun_wants(&sim, opening, &bases, false, &["GAAIRC"], false);
         assert_eq!(
             wants.iter().find(|(name, _)| *name == "GAPILL"),
             Some(&("GAPILL", PlacementRoute::Home)),
@@ -25021,10 +25094,13 @@ mod tests {
         InternedId,
     ) {
         let (sim, rules, ai_house, enemy_house) = defense_world_with(
-            "[BuildingTypes]\n1=GACNST\n2=GAPILL\n3=NASAM\n4=GAWALL\n\
+            "[BuildingTypes]\n1=GACNST\n2=GAPILL\n3=NASAM\n4=GAWALL\n5=ATESLA\n6=GAAIRC\n7=AMRADR\n\
              [GACNST]\nStrength=1000\nFoundation=1x1\nCost=2000\nTechLevel=1\n\
              [GAPILL]\nStrength=400\nFoundation=1x1\nCost=500\nTechLevel=1\n\
              [NASAM]\nStrength=400\nFoundation=1x1\nCost=600\nTechLevel=1\n\
+             [ATESLA]\nStrength=400\nFoundation=1x1\nCost=1500\nTechLevel=1\n\
+             [GAAIRC]\nStrength=1000\nFoundation=1x1\nCost=2000\nTechLevel=1\n\
+             [AMRADR]\nStrength=1000\nFoundation=1x1\nCost=2000\nTechLevel=1\n\
              [GAWALL]\nStrength=100\nFoundation=1x1\nWall=yes\nToOverlay=WALLO\n\
              Cost=100\nTechLevel=1\n\
              [OverlayTypes]\n239=WALLO\n[WALLO]\nWall=yes\nLand=Clear\n",
@@ -25074,7 +25150,7 @@ mod tests {
             .expect("the Allied opening");
         let anchor = super::defense_bearing_anchor((10, 10), (30, 10));
         let bases = [(10_i16, 10_i16)];
-        let wants = ai.defense_gun_wants(&sim, opening, &bases, false, "GAAIRC", false);
+        let wants = ai.defense_gun_wants(&sim, opening, &bases, false, &["GAAIRC"], false);
         assert!(
             wants.iter().any(|&(name, route)| name == "GAPILL"
                 && route
@@ -25092,12 +25168,111 @@ mod tests {
         // The battle read: no persona, no fort routes — the yards keep the
         // home/expansion split exactly as before.
         let mut battle = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
-        let battle_wants = battle.defense_gun_wants(&sim, opening, &bases, false, "GAAIRC", false);
+        let battle_wants =
+            battle.defense_gun_wants(&sim, opening, &bases, false, &["GAAIRC"], false);
         assert!(
             battle_wants
                 .iter()
                 .all(|&(_, route)| !matches!(route, PlacementRoute::Fort { .. })),
             "the battle read returns no fort routes: {battle_wants:?}"
+        );
+    }
+
+    /// The heavy row's radar gate reads the whole class standing: a base
+    /// whose standing radar is the class twin (the FoD3 shape — a seeded
+    /// AMRADR behind a non-American house's GAAIRC pick) still opens the
+    /// gate. The twin-only read was the defect: the gate counted the
+    /// climb's pick alone and the heavy tower never entered the walk.
+    #[test]
+    fn the_heavy_row_opens_on_any_class_radar() {
+        let (mut sim, rules, _overlays, ai_house, _enemy) = defense_fort_world();
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        sim.spawn_object_at_height("ATESLA", &ai_owner, 11, 10, 0, 0, &rules)
+            .expect("the home prism stands");
+        sim.spawn_object_at_height("AMRADR", &ai_owner, 12, 10, 0, 0, &rules)
+            .expect("the twin radar stands");
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        ai.engine_home = Some((10, 10));
+        {
+            let persona = ai.defense.as_mut().expect("the persona stays adopted");
+            persona.scheduled_wave_composition = super::WaveComposition {
+                vehicles: 20,
+                ..Default::default()
+            };
+        }
+        let opening = OPENINGS
+            .iter()
+            .find(|opening| opening.construction_yard == "GACNST")
+            .expect("the Allied opening");
+        let bases = [(10_i16, 10_i16)];
+        // The climb's pick alone standing nowhere: the gate stays shut —
+        // the heavy row rests (the pre-fix read).
+        let wants = ai.defense_gun_wants(&sim, opening, &bases, false, &["GAAIRC"], false);
+        assert!(
+            wants.iter().all(|&(name, _)| name != "ATESLA"),
+            "no class radar standing holds the heavy row shut: {wants:?}"
+        );
+        // The twin stands: the class read opens the gate and the heavy row
+        // claims its next tower (quota 4, two standing at home).
+        let wants =
+            ai.defense_gun_wants(&sim, opening, &bases, false, &["GAAIRC", "AMRADR"], false);
+        assert!(
+            wants.iter().any(|&(name, _)| name == "ATESLA"),
+            "the twin radar opens the heavy row: {wants:?}"
+        );
+    }
+
+    /// The fort anchor counts only its own ring: home towers that sit
+    /// inside the yard cluster but outside [`DEFENSE_FORT_GUN_RING`] of the
+    /// anchor leave the anchor's quota untouched, so the corridor anchor
+    /// claims its gun even with the home ring at quota (the yard-radius
+    /// read bench the anchor while the corridor stayed naked).
+    #[test]
+    fn the_fort_anchor_counts_its_own_ring_only() {
+        let (mut sim, rules, _overlays, ai_house, _enemy) = defense_fort_world();
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        // The home ring at its wartime quota, all on the bearing's side but
+        // 6+ cells short of the standoff anchor.
+        for (rx, ry) in [(11_u16, 10_u16), (12, 10), (11, 11), (12, 11)] {
+            sim.spawn_object_at_height("GAPILL", &ai_owner, rx, ry, 0, 0, &rules)
+                .expect("the home pillbox stands");
+        }
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        ai.pinned_home = Some((10, 10));
+        ai.engine_home = Some((10, 10));
+        {
+            let persona = ai.defense.as_mut().expect("the persona stays adopted");
+            persona.scheduled_wave_composition = super::WaveComposition {
+                vehicles: 20,
+                ..Default::default()
+            };
+            persona.spawn_bearings = vec![super::SpawnBearing {
+                spawn_cell: Some((30, 10)),
+                octant: Some(super::defense_octant_between((10, 10), (30, 10))),
+                distance_cells: Some(20),
+            }];
+        }
+        let opening = OPENINGS
+            .iter()
+            .find(|opening| opening.construction_yard == "GACNST")
+            .expect("the Allied opening");
+        let anchor = super::defense_bearing_anchor((10, 10), (30, 10));
+        let bases = [(10_i16, 10_i16)];
+        let wants = ai.defense_gun_wants(&sim, opening, &bases, false, &["GAAIRC"], false);
+        assert!(
+            wants.iter().any(|&(name, route)| name == "GAPILL"
+                && route
+                    == PlacementRoute::Fort {
+                        anchor,
+                        spawn: (30, 10)
+                    }),
+            "the home quota does not bench the corridor anchor: {wants:?}"
         );
     }
 
