@@ -810,22 +810,46 @@ const DEFENSE_FORT_BEARING_CAP: usize = 3;
 /// collapses into it: two bearings pointing at one chokepoint would
 /// otherwise run two programs on the same ground.
 const DEFENSE_FORT_ANCHOR_SPREAD: i32 = 4;
-/// Each fort anchor's own headroom on the gun rows' house-wide bounds, on
-/// top of the battle caps: without it the yard fill alone exhausted the
-/// caps before the first fort gun queued.
-const DEFENSE_FORT_GUN_EXTRA: usize = 2;
-/// The fort anchor's own quota ring, in cells: the towers an anchor counts
-/// as its answer. Tighter than the yards' [`BASE_CLUSTER_RADIUS`] — a
-/// bearing anchor stands exactly at that radius from the home center, so a
-/// yard-radius read fills the anchor's quota with towers that guard the
-/// yard while the corridor the anchor stands on stays naked. Fort guns
-/// place on the anchor's own weighted rings ([`PlacementRoute::Fort`]), so
-/// everything the anchor arms lands inside this ring.
+/// The fort anchor's own ring, in cells: the towers an anchor counts as
+/// its answer and its mix-rule reads. Tighter than the yards'
+/// [`BASE_CLUSTER_RADIUS`] — a bearing anchor stands exactly at that
+/// radius from the home center, so a yard-radius read fills the anchor
+/// with towers that guard the yard while the corridor the anchor stands
+/// on stays naked. Fort guns place on the anchor's own weighted rings
+/// ([`PlacementRoute::Fort`]), so everything the anchor arms lands
+/// inside this ring.
 const DEFENSE_FORT_GUN_RING: i16 = 4;
 /// The fort anchors are not structures, so the wall walk keys their ring
 /// retirement by this tag packed with the cell — a namespace no entity id
 /// reaches.
 const DEFENSE_FORT_WALL_KEY: u64 = 0xAAAA_0000_0000_0000;
+/// ---- D2 corridor forts: the fort program's unlimited tail. The fort
+/// and corridor anchors' guns are money- and grid-gated from here on —
+/// no per-anchor quota, no house-wide bound — and the anchors walk out
+/// along the approaches the waves actually use.
+/// A hostile cluster observed within this many cells of a recorded one
+/// refreshes that entry; farther out it opens a new corridor.
+const DEFENSE_CORRIDOR_MERGE_RADIUS: i32 = 12;
+/// The most corridors the ledger holds; the oldest entry yields when a
+/// wider map's waves open more approaches than the program can ladder.
+const DEFENSE_CORRIDOR_LEDGER_CAP: usize = 6;
+/// The ladder step: each corridor anchor stands this far past the last,
+/// close enough for the stone before it to carry the build area out to
+/// it — a placed tower is a `BaseNormal=yes` provider, and the ring it
+/// opens reaches about this far. The link before must hold a gun before
+/// the next enters, so the chain reaches as far as the wallet ladders
+/// it and never queues against ground the build area cannot touch.
+const DEFENSE_CORRIDOR_STEP: i32 = 3;
+/// The corridor mix rule: one AA gun per this many ground guns at an
+/// anchor, and only while the observed-or-scheduled wave carries
+/// aircraft — a ground war ladders direct-fire towers alone.
+const DEFENSE_CORRIDOR_AA_PER_GROUND: usize = 3;
+/// The corridor program's pace: ticks one fort gun past the anchors'
+/// floors rests before the next queues. A pace, not a cap — the towers
+/// still build without limit — it keeps the growth tail's slots alive
+/// between them so a rich wallet ladders the corridor without starving
+/// the barracks and factory rungs behind the gun loop.
+const DEFENSE_CORRIDOR_GUN_WINDOW: u32 = 450;
 /// The core's guard fan, sized to the answer it must hold: the standing
 /// ±3 hug first, then the same 3-cell lattice's ±6, ±9 and ±12 shells out
 /// to the ring spread. An answer wider than one shell stands on the next
@@ -1812,6 +1836,11 @@ struct DefensePersona {
     intercept_threat: Option<((i16, i16), i32)>,
     /// Earliest tick the interception survey may run again.
     intercept_due: u32,
+    /// The corridor ledger: hostile cluster cells observed at the
+    /// perimeter or marching in the band — the attack approaches, oldest
+    /// first. The corridor fort chain
+    /// ([`SuperAi::defense_corridor_anchors`]) ladders out along these.
+    corridor_cells: Vec<(u16, u16)>,
 }
 
 impl DefensePersona {
@@ -1844,6 +1873,7 @@ impl DefensePersona {
             intercept_commit_power: 0,
             intercept_threat: None,
             intercept_due: 0,
+            corridor_cells: Vec::new(),
         }
     }
 
@@ -3263,6 +3293,10 @@ pub struct SuperAi {
     /// cannot misroute a different item. Pinned state, never read from the
     /// runtime.
     placement_intent: Option<(InternedId, PlacementRoute)>,
+    /// Earliest tick the corridor fort track may queue another gun past
+    /// the anchors' floors; see [`DEFENSE_CORRIDOR_GUN_WINDOW`]. Pinned
+    /// state, never read from the runtime.
+    fort_gun_window_due: u32,
     /// Harness telemetry: the last [`Self::defense_gun_wants`] walk's
     /// result, `NAME@route` comma-joined (`-` when the walk rested).
     /// Read-only; never feeds a decision.
@@ -3614,6 +3648,7 @@ impl SuperAi {
             mcv_stuck_since: std::collections::HashMap::new(),
             mcv_abandoned: std::collections::HashMap::new(),
             placement_intent: None,
+            fort_gun_window_due: 0,
             gun_want_note: String::from("-"),
             repairing_structure: None,
             repair_due: 0,
@@ -4470,7 +4505,14 @@ impl SuperAi {
                             match intent_route {
                                 Some(PlacementRoute::Fort { anchor, spawn }) => {
                                     let axis = Some((anchor, spawn));
-                                    find_defense_site_around(
+                                    // The corridor anchors sit past the
+                                    // yards' ring: the scan keeps its
+                                    // candidates inside the build area the
+                                    // laddered stones carry, so the ready
+                                    // gun never storms the place-strike
+                                    // counter against ground the area
+                                    // cannot touch.
+                                    find_defense_site_around_in_area(
                                         sim,
                                         rules,
                                         &runtime.resources.overlay_registry,
@@ -4479,6 +4521,7 @@ impl SuperAi {
                                         self.house,
                                         Some(spawn),
                                         axis,
+                                        Some(owner.as_str()),
                                     )
                                     // A packed field keeps the uniform
                                     // walk's degraded pass — a gun at home
@@ -6413,6 +6456,7 @@ impl SuperAi {
             sim,
             opening,
             &bases,
+            tick,
             late_sink,
             &radar_standing,
             french_house,
@@ -6639,6 +6683,14 @@ impl SuperAi {
                         // candidate takes its turn meanwhile.
                         && let Some(command) = self.file_production(sim, rules, type_id, tick)
                     {
+                        // The corridor track's pace (D2-E): a fort gun
+                        // past the anchors' floors arms the window — the
+                        // next one queues after
+                        // [`DEFENSE_CORRIDOR_GUN_WINDOW`], leaving the
+                        // growth tail its slots between the towers.
+                        if matches!(route, PlacementRoute::Fort { .. }) {
+                            self.fort_gun_window_due = tick + DEFENSE_CORRIDOR_GUN_WINDOW;
+                        }
                         self.placement_intent = Some((type_id, route));
                         return vec![CommandEnvelope::new(self.house, at, command)];
                     }
@@ -10484,6 +10536,36 @@ impl SuperAi {
             .unwrap_or(0)
     }
 
+    /// The corridor ledger's record: a hostile cluster cell observed at
+    /// the perimeter or marching in the band. One within
+    /// [`DEFENSE_CORRIDOR_MERGE_RADIUS`] of a recorded entry refreshes
+    /// it (the corridor tracks the wave's shoulder); farther out it
+    /// opens a new approach, the oldest yielding past
+    /// [`DEFENSE_CORRIDOR_LEDGER_CAP`]. Deterministic in the substrate
+    /// order's discipline.
+    fn record_corridor_cell(&mut self, cell: (i16, i16)) {
+        let Some(persona) = self.defense.as_mut() else {
+            return;
+        };
+        let cell = (cell.0.max(0) as u16, cell.1.max(0) as u16);
+        let standing = persona.corridor_cells.iter().position(|&other| {
+            defense_chebyshev(
+                (other.0 as i16, other.1 as i16),
+                (cell.0 as i16, cell.1 as i16),
+            ) as i32
+                <= DEFENSE_CORRIDOR_MERGE_RADIUS
+        });
+        match standing {
+            Some(index) => persona.corridor_cells[index] = cell,
+            None => {
+                persona.corridor_cells.push(cell);
+                if persona.corridor_cells.len() > DEFENSE_CORRIDOR_LEDGER_CAP {
+                    persona.corridor_cells.remove(0);
+                }
+            }
+        }
+    }
+
     /// The hostile ground mobiles on the field as (unit, cell) pairs in
     /// substrate order — the read both active-defense passes start from.
     fn defense_hostile_ground(
@@ -10661,6 +10743,9 @@ impl SuperAi {
         );
         let aim_cell = on_map_cell(sim, centroid, anchor);
         self.defense.as_mut().expect("checked above").perimeter_aim = Some(aim_cell);
+        // The engagement marks its approach: the corridor fort chain
+        // ladders out along the approaches the waves actually use.
+        self.record_corridor_cell(centroid);
         let mut commands: Vec<Command> = Vec::new();
         // The standing marchers first: any idle member whose gate is due
         // marches again at the group's current centroid.
@@ -10921,6 +11006,9 @@ impl SuperAi {
             .as_mut()
             .expect("checked above")
             .intercept_threat = Some((core, nearest_dist));
+        // The marching cluster marks its approach: the corridor fort
+        // chain ladders out along the approaches the waves actually use.
+        self.record_corridor_cell(core);
         let cluster_power: i32 = members
             .iter()
             .map(|&(unit, _)| Self::defense_unit_power(sim, rules, unit))
@@ -12134,6 +12222,89 @@ impl SuperAi {
         anchors
     }
 
+    /// The corridor fort chain (D2-E): each recorded approach
+    /// ([`DefensePersona::corridor_cells`]) extrapolates into build sites
+    /// walked out from the nearest standing fort anchor — the objective's
+    /// or a bearing's — one [`DEFENSE_CORRIDOR_STEP`] at a time toward
+    /// the threat cell. A link enters only while the link before it
+    /// holds a gun within [`DEFENSE_FORT_GUN_RING`]: the stones
+    /// themselves are `BaseNormal=yes` providers, so each landed tower
+    /// carries the build area one step farther out and the chain reaches
+    /// as far as the wallet ladders it — no fixed depth, only ground the
+    /// build area can actually touch. A site within
+    /// [`DEFENSE_FORT_ANCHOR_SPREAD`] of an accepted anchor (the standing
+    /// forts, or a link another corridor already claimed) collapses into
+    /// it, but the walk continues past it: two approaches sharing a
+    /// chokepoint ladder through the same stones. Each anchor carries the
+    /// threat cell it faces — the placement scan's enemy-facing bias.
+    fn defense_corridor_anchors(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+    ) -> Vec<((i16, i16), (i16, i16))> {
+        let Some(persona) = self.defense.as_ref() else {
+            return Vec::new();
+        };
+        if persona.corridor_cells.is_empty() {
+            return Vec::new();
+        }
+        let towers = [
+            opening.defense_aa,
+            opening.defense_heavy,
+            opening.defense_basic,
+        ];
+        let holds_gun = |cell: (i16, i16)| {
+            towers.iter().any(|&name| {
+                self.count_structures_of_type_near(sim, name, cell, DEFENSE_FORT_GUN_RING) > 0
+            })
+        };
+        let forts = self.defense_fort_anchors(sim);
+        let mut accepted: Vec<(i16, i16)> = forts.iter().map(|&(anchor, _)| anchor).collect();
+        let mut out: Vec<((i16, i16), (i16, i16))> = Vec::new();
+        let collapsed = |accepted: &[(i16, i16)], cell: (i16, i16)| {
+            accepted
+                .iter()
+                .any(|&other| defense_chebyshev(other, cell) as i32 <= DEFENSE_FORT_ANCHOR_SPREAD)
+        };
+        for &threat in &persona.corridor_cells {
+            let threat = (threat.0 as i16, threat.1 as i16);
+            // The walk starts at the standing anchor nearest the
+            // approach — the chain extends an armed fort, never floats
+            // free of the base.
+            let Some(start) = forts
+                .iter()
+                .copied()
+                .min_by_key(|&(anchor, _)| (defense_chebyshev(threat, anchor), anchor))
+                .map(|(anchor, _)| anchor)
+            else {
+                continue;
+            };
+            let mut prev = start;
+            while defense_chebyshev(threat, prev) as i32 > DEFENSE_CORRIDOR_STEP {
+                let dx = i32::from(threat.0) - i32::from(prev.0);
+                let dy = i32::from(threat.1) - i32::from(prev.1);
+                let len = dx.abs().max(dy.abs()).max(1);
+                let next = (
+                    prev.0 + (dx * DEFENSE_CORRIDOR_STEP / len) as i16,
+                    prev.1 + (dy * DEFENSE_CORRIDOR_STEP / len) as i16,
+                );
+                // The ladder predicate: the stone before must hold a
+                // gun, or the chain stops here — the next step would
+                // stand past the build area's reach and only feed
+                // placement refusals.
+                if !holds_gun(prev) {
+                    break;
+                }
+                if !collapsed(&accepted, next) {
+                    accepted.push(next);
+                    out.push((next, threat));
+                }
+                prev = next;
+            }
+        }
+        out
+    }
+
     /// The gun limb's wants, one row per gated defense type. The tiered
     /// per-yard quotas read the standing threat counts here (the AA
     /// ladder, B3's ground ladder); the first gated type with a base under
@@ -12145,37 +12316,46 @@ impl SuperAi {
     /// ring arms. The house-wide bounds still cap the program — the split
     /// moves guns, never inflates them.
     ///
-    /// The defense persona's fortification branch (D2-B) rides the same
-    /// walk: the persona's fort anchors — the protected objective first,
-    /// then the line's standoff bearings
-    /// ([`Self::defense_fort_anchors`]) — join the base list, each anchor
-    /// filling the same tiered per-yard quotas
-    /// ([`aa_per_yard_quota`]/[`ground_per_yard_quota`], the persona's
-    /// observed-or-scheduled wave pressure driving the tier) and the rows'
-    /// house-wide bounds lifting by [`DEFENSE_FORT_GUN_EXTRA`] per anchor.
-    /// A fort want returns its own [`PlacementRoute::Fort`], so the ready
-    /// gun's weighted scan centers the anchor instead of the yard.
+    /// The defense persona's fortification branch (D2-B/D2-E) rides past
+    /// the yard rows: the fort anchors — the protected objective, then
+    /// the line's standoff bearings ([`Self::defense_fort_anchors`]) —
+    /// and the corridor chain ([`Self::defense_corridor_anchors`]) run
+    /// their own track, where money and a positive grid are the only
+    /// caps. Each anchor asks for the one gun its ring misses next —
+    /// the AA leg opens only while the wave carries aircraft and holds
+    /// one AA gun per [`DEFENSE_CORRIDOR_AA_PER_GROUND`] ground guns,
+    /// the heavy tower leads while its radar gate stands, the pillbox
+    /// answers behind it when the wallet refuses the heavy. The sites
+    /// rank most-naked first, so the program spreads along the corridor
+    /// instead of stacking one anchor. Past each anchor's floors the
+    /// track rides its pacing window ([`DEFENSE_CORRIDOR_GUN_WINDOW`],
+    /// armed where the gun files) — a pace, not a cap, keeping the
+    /// growth tail's slots alive between the towers. A fort want returns
+    /// its own [`PlacementRoute::Fort`], so the ready gun's weighted
+    /// scan centers the anchor instead of the yard.
     fn defense_gun_wants(
         &mut self,
         sim: &crate::sim::world::Simulation,
         opening: &Opening,
         bases: &[(i16, i16)],
+        tick: u32,
         late_sink: bool,
         radar_class: &[&'static str],
         french_house: bool,
     ) -> Vec<(&'static str, PlacementRoute)> {
-        // The fort anchors join the bases only while the persona is
-        // adopted; the battle read keeps the yard list verbatim. Each
-        // anchor carries the wave source it faces (the anchor itself when
-        // no bearing resolves).
-        let forts = if self.defense.is_some() {
-            self.defense_fort_anchors(sim)
+        let yards: Vec<(i16, i16)> = bases.to_vec();
+        // The fort anchors and the corridor chain join only while the
+        // persona is adopted; the battle read keeps the yard list
+        // verbatim. Each anchor carries the wave source it faces (the
+        // anchor itself when no bearing resolves; the corridor's threat
+        // cell for a chain link).
+        let fort_sites = if self.defense.is_some() {
+            let mut sites = self.defense_fort_anchors(sim);
+            sites.extend(self.defense_corridor_anchors(sim, opening));
+            sites
         } else {
             Vec::new()
         };
-        let mut bases: Vec<(i16, i16)> = bases.to_vec();
-        bases.extend(forts.iter().map(|&(anchor, _)| anchor));
-        let fort_start = bases.len() - forts.len();
         // The quota tier's threat read: the battle census counts what
         // stands; the persona tiers on the wave the map holds — the
         // observed presence answered by the armed schedule's remaining
@@ -12193,21 +12373,6 @@ impl SuperAi {
             }
             None => (self.enemy_air_count(sim), self.enemy_ground_count(sim)),
         };
-        // The route a base's gun rides: the yards keep the home/expansion
-        // split, every fort anchor its own [`PlacementRoute::Fort`] aimed
-        // at the bearing it stands on.
-        let fort_count = forts.len();
-        let fort_sites = forts.clone();
-        let base_route = move |index: usize| {
-            if index >= fort_start {
-                let (anchor, spawn) = fort_sites[index - fort_start];
-                PlacementRoute::Fort { anchor, spawn }
-            } else if index >= 1 {
-                PlacementRoute::Expansion
-            } else {
-                PlacementRoute::Home
-            }
-        };
         // The ground rows tier with the standing ground war
         // ([`ground_per_yard_quota`]); the heavy tower keeps its peace
         // baseline ([`DEFENSE_PER_YARD_HEAVY`]) and its late-sink step on
@@ -12224,7 +12389,7 @@ impl SuperAi {
             (
                 opening.defense_heavy,
                 heavy_per_yard,
-                HEAVY_DEFENSE_CAP * 4 + usize::from(late_sink) * bases.len(),
+                HEAVY_DEFENSE_CAP * 4 + usize::from(late_sink) * yards.len(),
                 radar_class
                     .iter()
                     .any(|&name| self.count_structures_of_type(sim, name) >= 1),
@@ -12278,51 +12443,107 @@ impl SuperAi {
                         .any(|&name| self.count_structures_of_type(sim, name) >= 1),
             ),
         ];
-        let wants = defenses
+        let mut wants: Vec<(&'static str, PlacementRoute)> = defenses
             .iter()
             .filter_map(|&(name, per_yard, global_bound, gate)| {
-                // The fort anchors widen the row's house-wide bound: the
-                // battle cap still holds for the yards, and each anchor's
-                // own quota buys past it by [`DEFENSE_FORT_GUN_EXTRA`] —
-                // without the lift the yard fill alone exhausted the cap
-                // before the first fort gun queued.
-                let bound = global_bound + DEFENSE_FORT_GUN_EXTRA * fort_count;
-                if !gate || self.count_structures_of_type(sim, name) >= bound {
+                // The yards' own caps, read over the yard clusters alone:
+                // the fort track keeps its own books from here on, so a
+                // corridor campaign can no longer eat a yard's quota.
+                if !gate
+                    || self.count_structures_of_type_near_any(
+                        sim,
+                        name,
+                        &yards,
+                        BASE_CLUSTER_RADIUS,
+                    ) >= global_bound
+                {
                     return None;
                 }
-                // Each quota site counts its own ring: the yards their
-                // [`BASE_CLUSTER_RADIUS`] cluster, a fort anchor the tighter
-                // ring it arms. The bearing anchors stand exactly at that
-                // cluster radius from the home center, so a yard-radius read
-                // fills an anchor's quota with towers that guard the yard —
-                // the corridor the anchor stands on stays naked while the
-                // walk reads every site filled and rests.
-                let site_ring = |index: usize| -> i16 {
-                    if index >= fort_start {
-                        DEFENSE_FORT_GUN_RING
-                    } else {
-                        BASE_CLUSTER_RADIUS
-                    }
-                };
                 let under_floor = |index: usize| {
-                    self.count_structures_of_type_near(sim, name, bases[index], site_ring(index))
+                    self.count_structures_of_type_near(sim, name, yards[index], BASE_CLUSTER_RADIUS)
                         < OUTPOST_GUN_FLOOR.min(per_yard)
                 };
-                if let Some(index) = (1..bases.len()).find(|&index| under_floor(index)) {
-                    return Some((name, base_route(index)));
+                if (1..yards.len()).any(|index| under_floor(index)) {
+                    return Some((name, PlacementRoute::Expansion));
                 }
-                (0..bases.len())
+                (0..yards.len())
                     .find(|&index| {
                         self.count_structures_of_type_near(
                             sim,
                             name,
-                            bases[index],
-                            site_ring(index),
+                            yards[index],
+                            BASE_CLUSTER_RADIUS,
                         ) < per_yard
                     })
-                    .map(|index| (name, base_route(index)))
+                    .map(|index| {
+                        (
+                            name,
+                            if index >= 1 {
+                                PlacementRoute::Expansion
+                            } else {
+                                PlacementRoute::Home
+                            },
+                        )
+                    })
             })
             .collect::<Vec<_>>();
+        // The fort track (D2-E): the anchors' guns are money- and
+        // grid-gated from here on. Each standing anchor — objective,
+        // bearing or corridor link — asks for the one gun its ring
+        // misses next, ranked most-naked first; a naked anchor fills at
+        // full speed, a standing one rides the pacing window armed where
+        // the gun files.
+        if !fort_sites.is_empty() {
+            let heavy_open = radar_class
+                .iter()
+                .any(|&name| self.count_structures_of_type(sim, name) >= 1);
+            let air_answer = enemy_air > 0;
+            let window_open = tick >= self.fort_gun_window_due;
+            let mut sites: Vec<((i16, i16), (i16, i16), usize, usize)> = fort_sites
+                .iter()
+                .map(|&(anchor, spawn)| {
+                    let ground_near = self.count_structures_of_type_near(
+                        sim,
+                        opening.defense_heavy,
+                        anchor,
+                        DEFENSE_FORT_GUN_RING,
+                    ) + self.count_structures_of_type_near(
+                        sim,
+                        opening.defense_basic,
+                        anchor,
+                        DEFENSE_FORT_GUN_RING,
+                    );
+                    let aa_near = self.count_structures_of_type_near(
+                        sim,
+                        opening.defense_aa,
+                        anchor,
+                        DEFENSE_FORT_GUN_RING,
+                    );
+                    (anchor, spawn, ground_near, aa_near)
+                })
+                .collect();
+            sites.sort_by_key(|&(anchor, _, ground, aa)| (ground + aa, anchor));
+            for (anchor, spawn, ground_near, aa_near) in sites {
+                let route = PlacementRoute::Fort { anchor, spawn };
+                if air_answer && aa_near * DEFENSE_CORRIDOR_AA_PER_GROUND <= ground_near {
+                    // The AA leg: the wave carries aircraft, and the
+                    // anchor's share of them stands due.
+                    if aa_near == 0 || window_open {
+                        wants.push((opening.defense_aa, route));
+                    }
+                } else if heavy_open {
+                    // The ground leg: the heavy tower leads, the pillbox
+                    // answers behind it when the wallet refuses the
+                    // heavy — the loop's own fall-through by price.
+                    if ground_near == 0 || window_open {
+                        wants.push((opening.defense_heavy, route));
+                        wants.push((opening.defense_basic, route));
+                    }
+                } else if ground_near == 0 || window_open {
+                    wants.push((opening.defense_basic, route));
+                }
+            }
+        }
         // The harness note: the walk's result in issue order, `-` at rest.
         self.gun_want_note = if wants.is_empty() {
             String::from("-")
@@ -16240,6 +16461,31 @@ impl SuperAi {
             .count()
     }
 
+    /// The same count across several sites at once: a structure near any
+    /// `sites` cell within `radius` counts once. The yard rows' own caps
+    /// read this — the fort and corridor towers standing outside every
+    /// yard cluster no longer eat a yard's quota.
+    fn count_structures_of_type_near_any(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        type_name: &str,
+        sites: &[(i16, i16)],
+        radius: i16,
+    ) -> usize {
+        self.own_structures(sim)
+            .iter()
+            .filter(|(_, name)| name == type_name)
+            .filter(|(id, _)| {
+                sim.substrate().entities.get(*id).is_some_and(|entity| {
+                    let (ex, ey) = (entity.position.rx() as i16, entity.position.ry() as i16);
+                    sites
+                        .iter()
+                        .any(|&(sx, sy)| (ex - sx).abs().max((ey - sy).abs()) <= radius)
+                })
+            })
+            .count()
+    }
+
     /// Whether a standing yard of this house sits within `radius` cells
     /// (Chebyshev) of `site` — the remote-refinery routing's admission:
     /// the engine admits a placement only inside a friendly structure's
@@ -18485,6 +18731,30 @@ fn find_defense_site_around(
     enemy_cell: Option<(i16, i16)>,
     axis: Option<((i16, i16), (i16, i16))>,
 ) -> Option<(u16, u16)> {
+    find_defense_site_around_in_area(
+        sim, rules, registry, ty, center, house, enemy_cell, axis, None,
+    )
+}
+
+/// [`find_defense_site_around`] with the engine's own build-area
+/// predicate folded into the scan. The corridor anchors (D2-E) sit past
+/// the yards' ring, so a candidate the build area cannot touch must not
+/// win the weighted scan — the engine would refuse it at apply time and
+/// the ready gun would storm the place-strike counter against ground
+/// the laddered stones cannot reach yet. A `None` owner keeps the
+/// legacy scans verbatim (they center on a yard whose build area
+/// already covers their reach).
+fn find_defense_site_around_in_area(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    ty: &crate::rules::object_type::ObjectType,
+    center: (i16, i16),
+    house: InternedId,
+    enemy_cell: Option<(i16, i16)>,
+    axis: Option<((i16, i16), (i16, i16))>,
+    build_area_owner: Option<&str>,
+) -> Option<(u16, u16)> {
     let own_rects = own_structure_rects(sim, rules, house);
     let clearance = if EXIT_CLEARANCE_TYPES.contains(&ty.id.as_str()) {
         2
@@ -18503,7 +18773,16 @@ fn find_defense_site_around(
                     continue;
                 }
                 if !site_candidate_legal(
-                    sim, rules, registry, ty, origin, house, None, &own_rects, clearance, true,
+                    sim,
+                    rules,
+                    registry,
+                    ty,
+                    origin,
+                    house,
+                    build_area_owner,
+                    &own_rects,
+                    clearance,
+                    true,
                 ) {
                     continue;
                 }
