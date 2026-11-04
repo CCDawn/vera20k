@@ -6145,6 +6145,48 @@ impl SuperAi {
                 }
             }
 
+            // The roster's tech-center existence commission (Layer 2): a
+            // roster entry whose `needs` gate names a structure the fixed
+            // ladder never builds — the Robot Control Center behind the
+            // Robot Tank, the only such entry in the retail tables — is a
+            // commission the mix can never fire while the gate stands
+            // unsatisfied (observed: a Robot Tank cameo lit since the lab
+            // and never once produced, the control center absent from every
+            // build list). The commission queues the center once the battle
+            // lab stands, gated on roster membership so a side whose tables
+            // name no such entry never queues one, and the count check
+            // keeps it a rebuild too. The side's radar stays out of the
+            // search beside the lab: both are ladder rungs of their own,
+            // and the radar rows' gates (the retail radar prerequisites
+            // above every factory) would otherwise shadow the center — the
+            // first candidate wins, and a standing radar would sit in
+            // front of the control center forever. The fortress
+            // commission's treatment: the claim sits ahead of the walk's
+            // tail, not behind it — past the lab the ladder still holds
+            // rungs (the monuments, the depot, the power and factory
+            // buildouts) and every one that files takes the free queue
+            // with it, so a rung trailing that tail waited whole games
+            // behind spending that never ends in a war.
+            let tech_center = opening
+                .vehicles
+                .iter()
+                .chain(opening.infantry.iter())
+                .filter_map(|entry| entry.needs)
+                .find(|&name| name != opening.battle_lab && name != opening.radar);
+            if let Some(center) = tech_center
+                && self.count_structures_of_type(sim, center) == 0
+                && self.count_structures_of_type(sim, opening.battle_lab) >= 1
+                && let Some(ty) = rules.object(center)
+                && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
+                && let Some(type_id) = sim.interner().get(center)
+                // The center's retry gate: a refused file cools and the
+                // ladder rungs take their turn meanwhile.
+                && let Some(command) = self.file_production(sim, rules, type_id, tick)
+            {
+                self.placement_intent = None;
+                return vec![CommandEnvelope::new(self.house, at, command)];
+            }
+
             let mut ladder = vec![
                 (opening.power, 1),
                 (opening.refinery, 1),
@@ -16626,7 +16668,8 @@ fn find_site_beyond(
 mod tests {
     use super::{
         AA_COUNTER_AIR_THREATS, AA_COUNTER_ROLE_SHARE, AA_COUNTER_VEHICLE_FLOOR, AA_UNIT_CAP,
-        AA_UNIT_FLOOR, AIR_WING_TARGET, BUILD_QUEUE_RETRY_TICKS, DEFENSE_PER_YARD_AA_BASE,
+        AA_UNIT_FLOOR, AIR_WING_TARGET, BUILD_QUEUE_RETRY_TICKS, CORE_BEFORE_SPECIALISTS,
+        DEFENSE_PER_YARD_AA_BASE,
         DEFENSE_PER_YARD_AA_HEAVY, DEFENSE_PER_YARD_AA_WARTIME, EXPANSION_MIN_DISTANCE,
         FLOATER_COUNTER_THREATS, FLOATER_TYPES, OPENINGS, ORE_ENEMY_DIRECTION_BIAS,
         ROLE_SHARE_BASE, ROLE_SHARE_BOOST, Role, RosterEntry, SuperAi, SuperAiDifficulty,
@@ -20456,13 +20499,14 @@ mod tests {
         );
     }
 
-    /// The Robot Tank fix (Layer 2 E): America's Robot Control Center rung
-    /// queues once the battle lab stands, and a Robot Tank — the roster
-    /// entry whose `needs` gate the center satisfies — rolls out. The
-    /// commission used to be dead forever: the center named in no build
-    /// list, the gate never cleared, the cameo lit all game.
+    /// The Robot Tank fix (Layer 2 G): America's Robot Control Center
+    /// existence commission queues once the battle lab stands — ahead of
+    /// the ladder's tail, so the monuments and buildouts that file after
+    /// the lab cannot starve it — and a Robot Tank (the roster entry whose
+    /// `needs` gate the center satisfies) is then filed by the vehicle
+    /// mix. The commission used to be dead forever: the center named in
+    /// no build list, the gate never cleared, the cameo lit all game.
     #[test]
-    #[ignore = "slow; retail; loads a match and drives tens of thousands of frames"]
     fn robot_center_fields_robots() {
         let (mut scenario, human) = retail_battle();
         let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
@@ -20481,35 +20525,95 @@ mod tests {
                 })
                 .count()
         };
-        let units_of_type = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
-            scenario
-                .sim()
-                .substrate()
-                .entities
-                .iter_sorted()
-                .filter(|(_, entity)| {
-                    entity.owner() == human
-                        && matches!(
-                            entity.category(),
-                            crate::map::entities::EntityCategory::Unit
-                                | crate::map::entities::EntityCategory::Infantry
-                        )
-                        && scenario.sim().interner().resolve(entity.type_ref()) == name
-                })
-                .count()
-        };
 
-        let tick = drive_until(&mut scenario, &mut ai, 60000, |scenario| {
-            structures_of_type(scenario, "GAROBO") >= 1 && units_of_type(scenario, "ROBO") >= 1
+        // The chain drives in stages, each named by its own assert: a flat
+        // budget reads one number for three different starvations (the lab
+        // climb, the center's commission, the tank's mix pick) and the
+        // failure names none of them.
+        let tick_lab = drive_until(&mut scenario, &mut ai, 26000, |scenario| {
+            structures_of_type(scenario, "GATECH") >= 1
+        });
+        assert!(
+            structures_of_type(&scenario, "GATECH") >= 1,
+            "the battle lab stands (tick {tick_lab})"
+        );
+        let tick_center = drive_until(&mut scenario, &mut ai, 20000, |scenario| {
+            structures_of_type(scenario, "GAROBO") >= 1
         });
         assert!(
             structures_of_type(&scenario, "GAROBO") >= 1,
-            "the Robot Control Center stood (tick {tick}, battle lab {})",
+            "the Robot Control Center stood once the lab did (tick {tick_center}, lab {})",
             structures_of_type(&scenario, "GATECH")
         );
+
+        // The rollout, premises forced: a fresh battle whose ladder stands
+        // complete (the yard, the factory, the lab, the center, the miner
+        // fleet at its floor, the mobile AA and the armor share met) so
+        // the vehicle wheel's economy and ladder branches rest and the
+        // first specialist slot reaches the roster mix. A real game reaches
+        // the same pick through the same chain, only paced by the war —
+        // the miner top-ups and the commissions the mix's own rules put
+        // ahead of it. The center standing is the `needs` gate; the mix's
+        // AntiInfantry deficit is the claim.
+        let (mut scenario, human, _enemy) =
+            pacific_bridge_battle_as(crate::skirmish_launch::LaunchCountry::America);
+        let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
+        scenario.apply_super_ai_tier(human, SuperAiDifficulty::Fair);
+        spawn_near(&mut scenario, "GACNST", human, (64, 92));
+        spawn_near(&mut scenario, "GAPOWR", human, (60, 90));
+        spawn_near(&mut scenario, "GAPOWR", human, (62, 90));
+        spawn_near(&mut scenario, "GAWEAP", human, (58, 94));
+        spawn_near(&mut scenario, "GATECH", human, (56, 92));
+        spawn_near(&mut scenario, "GAROBO", human, (70, 94));
+        // The economy gate reads the fleet against the floor, not the
+        // docks: five miners rest `economy_first` with no refinery at all,
+        // so the premise stays inside the map's proven land band.
+        for cell in [(60, 96), (62, 96), (64, 98), (66, 99), (68, 99)] {
+            spawn_near(&mut scenario, "CMIN", human, cell);
+        }
+        for cell in [(66, 96), (68, 96)] {
+            spawn_near(&mut scenario, "FV", human, cell);
+        }
+        // The armor share met by hand: with two Mirage hulls standing, the
+        // mix's first deficit is AntiInfantry — the Robot Tank's own row.
+        for cell in [(62, 98), (64, 96)] {
+            spawn_near(&mut scenario, "MGTK", human, cell);
+        }
+        ai.vehicle_slots = CORE_BEFORE_SPECIALISTS as u32 + 1;
+        // The wheel's one-off commissions are not this test's subject: with
+        // their latches set the fresh base starts at the specialist wheel
+        // instead of spending its first turns on the 2000-credit fortress
+        // and the ferry hull.
+        ai.fortress_issued = true;
+        ai.transport_issued = true;
+
+        let mut robo_queued = None;
+        use crate::sim::world::{FrameEffects, TickLane};
+        for tick in 0..8000u32 {
+            let orders = ai.orders(&scenario.runtime, tick);
+            for order in &orders {
+                if let crate::sim::command::Command::QueueProduction { type_id } = order.payload
+                    && scenario.sim().interner().resolve(type_id) == "ROBO"
+                {
+                    robo_queued = Some(tick);
+                }
+            }
+            if robo_queued.is_some() {
+                break;
+            }
+            scenario
+                .runtime
+                .advance_frame(
+                    &orders,
+                    crate::headless_scenario::SIM_TICK_MS,
+                    TickLane::Ordinary,
+                    FrameEffects::default(),
+                )
+                .expect("simulation frame failed");
+        }
         assert!(
-            units_of_type(&scenario, "ROBO") >= 1,
-            "a Robot Tank rolled out once its control center stood (tick {tick})"
+            robo_queued.is_some(),
+            "the mix filed the Robot Tank once its center stood ({robo_queued:?})"
         );
     }
 
