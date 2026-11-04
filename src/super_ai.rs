@@ -799,6 +799,25 @@ const DEFENSE_OBJECTIVE_POSTS: usize = 24;
 /// Posts within this many cells of the core count toward its ring's
 /// quota.
 const DEFENSE_OBJECTIVE_RING_SPREAD: i32 = 12;
+/// The defense persona's fortification program (D2-B): the fort anchors —
+/// the protected objective, then the line's standoff bearings — share the
+/// battle AI's gun rows and wall ring walk through
+/// [`Self::defense_gun_wants`] and [`Self::wall_next_cell`]. At most this
+/// many bearing anchors join the objective, nearest home first; a map
+/// with more spawn points arms the nearest ones.
+const DEFENSE_FORT_BEARING_CAP: usize = 3;
+/// A fort anchor within this many Chebyshev cells of an accepted one
+/// collapses into it: two bearings pointing at one chokepoint would
+/// otherwise run two programs on the same ground.
+const DEFENSE_FORT_ANCHOR_SPREAD: i32 = 4;
+/// Each fort anchor's own headroom on the gun rows' house-wide bounds, on
+/// top of the battle caps: without it the yard fill alone exhausted the
+/// caps before the first fort gun queued.
+const DEFENSE_FORT_GUN_EXTRA: usize = 2;
+/// The fort anchors are not structures, so the wall walk keys their ring
+/// retirement by this tag packed with the cell — a namespace no entity id
+/// reaches.
+const DEFENSE_FORT_WALL_KEY: u64 = 0xAAAA_0000_0000_0000;
 /// The core's guard fan, sized to the answer it must hold: the standing
 /// ±3 hug first, then the same 3-cell lattice's ±6, ±9 and ±12 shells out
 /// to the ring spread. An answer wider than one shell stands on the next
@@ -1527,6 +1546,28 @@ pub struct SpawnBearing {
     pub distance_cells: Option<u32>,
 }
 
+/// The placement route a queued building's ready item rides (the
+/// placement intent's mark): the home yard's uniform rings, the expansion
+/// yard's capped rings, or — the defense persona's fortification branch
+/// (D2-B) — the weighted threat scan centered on that program's fort
+/// anchor, aimed at the bearing the anchor stands on. A stale entry
+/// cannot misroute a different item: a canceled intent's type is never
+/// ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlacementRoute {
+    Home,
+    Expansion,
+    /// The defense persona's fort anchor: `anchor` is the cell the gun
+    /// defends (the objective's ring or a line standoff anchor), `spawn`
+    /// the wave source it faces (`anchor` itself when the anchor is the
+    /// objective, whose threat reads through the weighted scan's
+    /// enemy-facing bias alone).
+    Fort {
+        anchor: (i16, i16),
+        spawn: (i16, i16),
+    },
+}
+
 /// A read-only copy of [`DefensePersona`]'s perception and book sizes, for
 /// harnesses and tests (see [`SuperAi::defense_books`]). Counts, not
 /// contents: consumers compare sizes and timers across ticks.
@@ -1689,6 +1730,23 @@ fn defense_chebyshev(from: (i16, i16), to: (i16, i16)) -> u32 {
     i32::from(to.0)
         .abs_diff(i32::from(from.0))
         .max(i32::from(to.1).abs_diff(i32::from(from.1)))
+}
+
+/// The defense line's standoff anchor toward one spawn: `home` walked
+/// [`DEFENSE_LINE_STANDOFF`] cells toward the spawn, clamped just short of
+/// the spawn itself when it starts close. The line's posts and the fort
+/// program's bearing anchors ([`SuperAi::defense_fort_anchors`]) share the
+/// one shape, so the forts stand where the line already holds.
+fn defense_bearing_anchor(home: (i16, i16), spawn: (i16, i16)) -> (i16, i16) {
+    let distance = defense_chebyshev(home, spawn).max(1) as i32;
+    let standoff = DEFENSE_LINE_STANDOFF.min(distance - 2).max(2);
+    let dx = i32::from(spawn.0) - i32::from(home.0);
+    let dy = i32::from(spawn.1) - i32::from(home.1);
+    let len = dx.abs().max(dy.abs()).max(1);
+    (
+        home.0 + (dx * standoff / len) as i16,
+        home.1 + (dy * standoff / len) as i16,
+    )
 }
 
 /// The battlefield role a buildable combat type fills in the army mix.
@@ -2971,14 +3029,15 @@ pub struct SuperAi {
     /// orders. Pinned state, never read from the runtime.
     mcv_abandoned: std::collections::HashMap<u64, ()>,
     /// Where the growth plan wants the building it just queued placed: the
-    /// type plus whether it routes to the expansion yard's rings instead of
-    /// the home yard's. Set at every building queue site (defense guns for
-    /// the under-quota base, the expansion cluster's power and refinery),
-    /// read by the placement branch and overwritten at the next queue — a
-    /// canceled intent's type is never ready, so a stale entry cannot
-    /// misroute a different item. Pinned state, never read from the
+    /// type plus the [`PlacementRoute`] the ready item rides — the home
+    /// yard's rings, the expansion yard's capped rings, or the defense
+    /// persona's fort anchor. Set at every building queue site (defense
+    /// guns for the under-quota base, the expansion cluster's power and
+    /// refinery), read by the placement branch and overwritten at the next
+    /// queue — a canceled intent's type is never ready, so a stale entry
+    /// cannot misroute a different item. Pinned state, never read from the
     /// runtime.
-    placement_intent: Option<(InternedId, bool)>,
+    placement_intent: Option<(InternedId, PlacementRoute)>,
     /// The structure the repair limb switched repair on for: the command is
     /// a toggle (a re-issue would switch the repair back off), so the
     /// activation latches until the building's repair byte reads off again
@@ -3921,10 +3980,14 @@ impl SuperAi {
                         .is_some_and(|wall| sim.interner().get(wall) == Some(item.type_id))
                     // An outpost-intent item (P3) takes the same cancel
                     // escape: its ring never falls back home, so a paused
-                    // one is a certain cancel, never a wedge.
+                    // one is a certain cancel, never a wedge. A fort intent
+                    // keeps the home fallback below, so it stays out of the
+                    // escape like any home item.
                     || self
                         .placement_intent
-                        .is_some_and(|(intent, expansion)| intent == item.type_id && expansion)
+                        .is_some_and(|(intent, route)| {
+                            intent == item.type_id && route == PlacementRoute::Expansion
+                        })
             })
             .last()
             && let Some(ty) = rules.object(sim.interner().resolve(ready.type_id))
@@ -4016,7 +4079,9 @@ impl SuperAi {
                 if self.place_pause_until.contains_key(&ready.type_id)
                     && self
                         .placement_intent
-                        .is_some_and(|(intent, expansion)| intent == ready.type_id && expansion)
+                        .is_some_and(|(intent, route)| {
+                            intent == ready.type_id && route == PlacementRoute::Expansion
+                        })
                 {
                     self.placement_intent = None;
                     return vec![CommandEnvelope::new(
@@ -4088,8 +4153,9 @@ impl SuperAi {
                             && !self.remote_refinery_stood)
                             || self
                                 .placement_intent
-                                .is_some_and(|(intent_type, expansion)| {
-                                    intent_type == ready.type_id && expansion
+                                .is_some_and(|(intent_type, route)| {
+                                    intent_type == ready.type_id
+                                        && route == PlacementRoute::Expansion
                                 })
                     });
                     match expansion_route {
@@ -4134,54 +4200,95 @@ impl SuperAi {
                             }
                             site
                         }
-                        None => home_center.and_then(|home| {
-                            // The gun route (B2): a defense gun the gun limb
-                            // queued (the placement intent's home mark)
-                            // scans the enemy-facing weighted rings — the
-                            // traffic axis's aim is the threat bearing, and
-                            // the axis itself the approach line the tower
-                            // covers. Every other home item keeps the
-                            // uniform ring.
-                            let gun_intent = self
+                        None => {
+                            // The fort route (D2-B): a defense gun the fort
+                            // program queued scans the weighted rings around
+                            // its own anchor — the bearing it stands on is
+                            // the aim and the approach line the tower
+                            // covers, exactly the home gun route's shape
+                            // centered on the fort instead of the yard.
+                            let intent_route = self
                                 .placement_intent
-                                .is_some_and(|(intent, expansion)| {
-                                    intent == ready.type_id && !expansion
+                                .and_then(|(intent_type, route)| {
+                                    (intent_type == ready.type_id).then_some(route)
                                 });
-                            if gun_intent {
-                                find_defense_site_around(
-                                    sim,
-                                    rules,
-                                    &runtime.resources.overlay_registry,
-                                    ty,
-                                    home,
-                                    self.house,
-                                    self.traffic_axis.map(|(_, aim)| aim),
-                                    self.traffic_axis,
-                                )
-                                // A packed field keeps the uniform walk's
-                                // degraded pass — a gun at home beats a
-                                // canceled gun.
-                                .or_else(|| {
-                                    find_site_around(
+                            match intent_route {
+                                Some(PlacementRoute::Fort { anchor, spawn }) => {
+                                    let axis = Some((anchor, spawn));
+                                    find_defense_site_around(
                                         sim,
                                         rules,
                                         &runtime.resources.overlay_registry,
                                         ty,
-                                        home,
+                                        anchor,
                                         self.house,
+                                        Some(spawn),
+                                        axis,
                                     )
-                                })
-                            } else {
-                                find_site_around(
-                                    sim,
-                                    rules,
-                                    &runtime.resources.overlay_registry,
-                                    ty,
-                                    home,
-                                    self.house,
-                                )
+                                    // A packed field keeps the uniform
+                                    // walk's degraded pass — a gun at home
+                                    // beats a canceled gun.
+                                    .or_else(|| {
+                                        home_center.and_then(|home| {
+                                            find_site_around(
+                                                sim,
+                                                rules,
+                                                &runtime.resources.overlay_registry,
+                                                ty,
+                                                home,
+                                                self.house,
+                                            )
+                                        })
+                                    })
+                                }
+                                route => home_center.and_then(|home| {
+                                    // The gun route (B2): a defense gun the
+                                    // gun limb queued (the placement intent's
+                                    // home mark) scans the enemy-facing
+                                    // weighted rings — the traffic axis's aim
+                                    // is the threat bearing, and the axis
+                                    // itself the approach line the tower
+                                    // covers. Every other home item keeps the
+                                    // uniform ring.
+                                    let gun_intent =
+                                        matches!(route, Some(PlacementRoute::Home));
+                                    if gun_intent {
+                                        find_defense_site_around(
+                                            sim,
+                                            rules,
+                                            &runtime.resources.overlay_registry,
+                                            ty,
+                                            home,
+                                            self.house,
+                                            self.traffic_axis.map(|(_, aim)| aim),
+                                            self.traffic_axis,
+                                        )
+                                        // A packed field keeps the uniform
+                                        // walk's degraded pass — a gun at
+                                        // home beats a canceled gun.
+                                        .or_else(|| {
+                                            find_site_around(
+                                                sim,
+                                                rules,
+                                                &runtime.resources.overlay_registry,
+                                                ty,
+                                                home,
+                                                self.house,
+                                            )
+                                        })
+                                    } else {
+                                        find_site_around(
+                                            sim,
+                                            rules,
+                                            &runtime.resources.overlay_registry,
+                                            ty,
+                                            home,
+                                            self.house,
+                                        )
+                                    }
+                                }),
                             }
-                        }),
+                        }
                     }
                 })
                 }
@@ -5951,14 +6058,8 @@ impl SuperAi {
             .houses()
             .get(&self.house)
             .is_some_and(|house| sim.interner().resolve(house.house_type_id()) == "French");
-        let gun_wants = self.defense_gun_wants(
-            sim,
-            opening,
-            &bases,
-            late_sink,
-            radar_name,
-            french_house,
-        );
+        let gun_wants =
+            self.defense_gun_wants(sim, opening, &bases, late_sink, radar_name, french_house);
         let guns_wanted = any_tank
             && self
                 .structure_center(sim, opening.construction_yard)
@@ -6160,7 +6261,7 @@ impl SuperAi {
             }
 
             if any_tank && grid_black {
-                for (name, expansion) in gun_wants {
+                for (name, route) in gun_wants {
                     // Guns queue only from a wallet that can pay for them
                     // outright: a broke base that queues a 1500-credit
                     // Prism Tower parks it in the one building slot at
@@ -6181,7 +6282,7 @@ impl SuperAi {
                         // candidate takes its turn meanwhile.
                         && let Some(command) = self.file_production(sim, rules, type_id, tick)
                     {
-                        self.placement_intent = Some((type_id, expansion));
+                        self.placement_intent = Some((type_id, route));
                         return vec![CommandEnvelope::new(self.house, at, command)];
                     }
                 }
@@ -6372,7 +6473,7 @@ impl SuperAi {
                         // preemption at the block's head.
                         && let Some(command) = self.file_production(sim, rules, type_id, tick)
                 {
-                    self.placement_intent = Some((type_id, true));
+                    self.placement_intent = Some((type_id, PlacementRoute::Expansion));
                     return vec![CommandEnvelope::new(self.house, at, command)];
                 }
                 if cluster_refineries < 1
@@ -6385,7 +6486,7 @@ impl SuperAi {
                         // preemption at the block's head.
                         && let Some(command) = self.file_production(sim, rules, type_id, tick)
                 {
-                    self.placement_intent = Some((type_id, true));
+                    self.placement_intent = Some((type_id, PlacementRoute::Expansion));
                     return vec![CommandEnvelope::new(self.house, at, command)];
                 }
                 // The expansion's own production lines (Layer 2.6): a
@@ -6429,7 +6530,7 @@ impl SuperAi {
                         // preemption at the block's head.
                         && let Some(command) = self.file_production(sim, rules, type_id, tick)
                 {
-                    self.placement_intent = Some((type_id, true));
+                    self.placement_intent = Some((type_id, PlacementRoute::Expansion));
                     return vec![CommandEnvelope::new(self.house, at, command)];
                 }
                 // The reserved factory slot (P2): the house-wide growth
@@ -6451,7 +6552,7 @@ impl SuperAi {
                         // below gets its second carrier.
                         && let Some(command) = self.file_production(sim, rules, type_id, tick)
                 {
-                    self.placement_intent = Some((type_id, true));
+                    self.placement_intent = Some((type_id, PlacementRoute::Expansion));
                     return vec![CommandEnvelope::new(self.house, at, command)];
                 }
             }
@@ -8997,32 +9098,70 @@ impl SuperAi {
         // types — both superweapons, every construction yard (the home and
         // the outpost's), every refinery — collected in the substrate
         // order's determinism discipline.
-        let mut targets: Vec<(u64, &'static str, u16, u16)> = Vec::new();
+        let mut targets: Vec<(u64, (i16, i16, i16, i16), u16, u16)> = Vec::new();
+        // The defense persona's fort targets (D2-B): the protected
+        // objective's structures ring and rebuild through the same ledger,
+        // and each fort anchor carries a one-cell ring — the wave breaks
+        // the wall before it reaches the posted line, and a broken segment
+        // owes one back ([`Self::wall_built`]). The fort targets walk ahead
+        // of the battle roster: the objective is the charge the persona
+        // exists to hold.
+        if self.defense.is_some() {
+            let persona = self.defense.as_ref().expect("checked above");
+            for &id in &persona.protected_targets {
+                let Some(entity) = sim.substrate().entities.get(id) else {
+                    continue;
+                };
+                if entity.owner() != self.house || !entity.lifecycle.object_alive() {
+                    continue;
+                }
+                let name = sim.interner().resolve(entity.type_ref());
+                if let Some(ty) = rules.object(name) {
+                    targets.push((
+                        id,
+                        ty.foundation.cell_bounds(),
+                        entity.position.rx(),
+                        entity.position.ry(),
+                    ));
+                }
+            }
+            for (anchor, _) in self.defense_fort_anchors(sim) {
+                let key = DEFENSE_FORT_WALL_KEY
+                    | (u64::from(anchor.0 as u16) << 16)
+                    | u64::from(anchor.1 as u16);
+                targets.push((key, (0, 0, 0, 0), anchor.0 as u16, anchor.1 as u16));
+            }
+        }
         for name in [
             opening.super_weapon_building,
             opening.second_super_weapon_building,
             opening.construction_yard,
             opening.refinery,
         ] {
+            let Some(ty) = rules.object(name) else {
+                continue;
+            };
             for (eid, entity) in sim.substrate().entities.iter_sorted() {
                 if entity.owner() == self.house
                     && entity.category() == crate::map::entities::EntityCategory::Structure
                     && sim.interner().resolve(entity.type_ref()) == name
                 {
-                    targets.push((eid, name, entity.position.rx(), entity.position.ry()));
+                    targets.push((
+                        eid,
+                        ty.foundation.cell_bounds(),
+                        entity.position.rx(),
+                        entity.position.ry(),
+                    ));
                 }
             }
         }
-        for (id, name, rx, ry) in targets {
-            let Some(ty) = rules.object(name) else {
-                continue;
-            };
+        for (id, bounds, rx, ry) in targets {
             // The ring's relative cells go negative (a 0-based foundation's
             // top and left ring edges sit at -1), so the map-side guard
             // against a `u16` wrap belongs on the absolute cell, never on
             // the offset — filtering the offset would clip those two edges
             // off the ring entirely.
-            let ring: Vec<(u16, u16)> = wall_ring_cells(ty.foundation.cell_bounds())
+            let ring: Vec<(u16, u16)> = wall_ring_cells(bounds)
                 .into_iter()
                 .map(|(dx, dy)| (rx as i16 + dx, ry as i16 + dy))
                 .filter(|&(x, y)| x >= 0 && y >= 0)
@@ -9053,9 +9192,9 @@ impl SuperAi {
             if self.walled.contains(&id) {
                 continue;
             }
-            let cell =
-                ring.into_iter()
-                    .find(|&cell| !self.wall_cells.contains(&cell) && !holds_wall(cell));
+            let cell = ring
+                .into_iter()
+                .find(|&cell| !self.wall_cells.contains(&cell) && !holds_wall(cell));
             match cell {
                 Some(cell) => return Some(cell),
                 // The ring is spent. A ring fully walked needs no more
@@ -10398,15 +10537,9 @@ impl SuperAi {
             let Some(spawn) = bearing.spawn_cell else {
                 continue;
             };
-            let distance = defense_chebyshev(home, spawn).max(1) as i32;
-            let standoff = DEFENSE_LINE_STANDOFF.min(distance - 2).max(2);
-            let dx = i32::from(spawn.0) - i32::from(home.0);
-            let dy = i32::from(spawn.1) - i32::from(home.1);
-            let len = dx.abs().max(dy.abs()).max(1);
-            let anchor = (
-                home.0 + (dx * standoff / len) as i16,
-                home.1 + (dy * standoff / len) as i16,
-            );
+            // The line's standoff anchor ([`defense_bearing_anchor`], the
+            // shape the fort program's bearing anchors share).
+            let anchor = defense_bearing_anchor(home, spawn);
             let assigned = self
                 .defense
                 .as_ref()
@@ -10710,6 +10843,79 @@ impl SuperAi {
             .count()
     }
 
+    /// The defense persona's fort anchors (D2-B): the protected
+    /// objective's cell first — the map's lose chain is the charge the
+    /// waves march at — then the line's standoff anchors
+    /// ([`defense_bearing_anchor`], the line's own math), nearest home
+    /// first, capped at [`DEFENSE_FORT_BEARING_CAP`] bearings. An anchor
+    /// within [`DEFENSE_FORT_ANCHOR_SPREAD`] of an accepted one collapses
+    /// into it. Each anchor carries the wave source it faces — the
+    /// bearing's spawn cell, or the anchor itself for the objective. The
+    /// gun rows ([`Self::defense_gun_wants`]) and the wall ring walk
+    /// ([`Self::wall_next_cell`]) read the same list, so one program arms
+    /// both.
+    fn defense_fort_anchors(
+        &self,
+        sim: &crate::sim::world::Simulation,
+    ) -> Vec<((i16, i16), (i16, i16))> {
+        let Some(persona) = self.defense.as_ref() else {
+            return Vec::new();
+        };
+        let collapsed = |anchors: &[((i16, i16), (i16, i16))], cell: (i16, i16)| {
+            anchors.iter().any(|&((ax, ay), _)| {
+                i32::try_from(defense_chebyshev((ax, ay), cell)).unwrap_or(i32::MAX)
+                    <= DEFENSE_FORT_ANCHOR_SPREAD
+            })
+        };
+        let mut anchors: Vec<((i16, i16), (i16, i16))> = Vec::new();
+        // The objective: every standing own protected target's cell, the
+        // substrate order's determinism. The map's give chains re-own the
+        // objective mid-game — a flipped charge is not a fort site.
+        for &id in &persona.protected_targets {
+            let Some(entity) = sim.substrate().entities.get(id) else {
+                continue;
+            };
+            if entity.owner() != self.house || !entity.lifecycle.object_alive() {
+                continue;
+            }
+            let cell = (entity.position.rx() as i16, entity.position.ry() as i16);
+            if collapsed(&anchors, cell) {
+                continue;
+            }
+            anchors.push((cell, cell));
+        }
+        // The bearings: the line's standoff anchors, nearest home first
+        // (stable on the spawn cell's order past the distance tie).
+        let Some(home) = self.engine_home.or(self.pinned_home) else {
+            return anchors;
+        };
+        let mut bearings: Vec<((i16, i16), (i16, i16), u32)> = persona
+            .spawn_bearings
+            .iter()
+            .filter_map(|bearing| {
+                let spawn = bearing.spawn_cell?;
+                Some((
+                    defense_bearing_anchor(home, spawn),
+                    spawn,
+                    defense_chebyshev(home, spawn),
+                ))
+            })
+            .collect();
+        bearings.sort_by_key(|&(_, spawn, distance)| (distance, spawn));
+        let mut bearing_anchors = 0;
+        for (anchor, spawn, _) in bearings {
+            if bearing_anchors >= DEFENSE_FORT_BEARING_CAP {
+                break;
+            }
+            if collapsed(&anchors, anchor) {
+                continue;
+            }
+            anchors.push((anchor, spawn));
+            bearing_anchors += 1;
+        }
+        anchors
+    }
+
     /// The gun limb's wants, one row per gated defense type. The tiered
     /// per-yard quotas read the standing threat counts here (the AA
     /// ladder, B3's ground ladder); the first gated type with a base under
@@ -10720,6 +10926,17 @@ impl SuperAi {
     /// the wall ring guards is never a naked foundation while the home
     /// ring arms. The house-wide bounds still cap the program — the split
     /// moves guns, never inflates them.
+    ///
+    /// The defense persona's fortification branch (D2-B) rides the same
+    /// walk: the persona's fort anchors — the protected objective first,
+    /// then the line's standoff bearings
+    /// ([`Self::defense_fort_anchors`]) — join the base list, each anchor
+    /// filling the same tiered per-yard quotas
+    /// ([`aa_per_yard_quota`]/[`ground_per_yard_quota`], the persona's
+    /// observed-or-scheduled wave pressure driving the tier) and the rows'
+    /// house-wide bounds lifting by [`DEFENSE_FORT_GUN_EXTRA`] per anchor.
+    /// A fort want returns its own [`PlacementRoute::Fort`], so the ready
+    /// gun's weighted scan centers the anchor instead of the yard.
     fn defense_gun_wants(
         &mut self,
         sim: &crate::sim::world::Simulation,
@@ -10728,15 +10945,57 @@ impl SuperAi {
         late_sink: bool,
         radar_name: &'static str,
         french_house: bool,
-    ) -> Vec<(&'static str, bool)> {
-        let enemy_air = self.enemy_air_count(sim);
-        let enemy_ground = self.enemy_ground_count(sim);
+    ) -> Vec<(&'static str, PlacementRoute)> {
+        // The fort anchors join the bases only while the persona is
+        // adopted; the battle read keeps the yard list verbatim. Each
+        // anchor carries the wave source it faces (the anchor itself when
+        // no bearing resolves).
+        let forts = if self.defense.is_some() {
+            self.defense_fort_anchors(sim)
+        } else {
+            Vec::new()
+        };
+        let mut bases: Vec<(i16, i16)> = bases.to_vec();
+        bases.extend(forts.iter().map(|&(anchor, _)| anchor));
+        let fort_start = bases.len() - forts.len();
+        // The quota tier's threat read: the battle census counts what
+        // stands; the persona tiers on the wave the map holds — the
+        // observed presence answered by the armed schedule's remaining
+        // composition, whichever is hotter. Both feed the same
+        // ([`aa_per_yard_quota`]/[`ground_per_yard_quota`]) ladders.
+        let (enemy_air, enemy_ground) = match self.defense.as_ref() {
+            Some(persona) => {
+                let observed = persona.observed_wave_composition;
+                let scheduled = persona.scheduled_wave_composition;
+                (
+                    observed.aircraft.max(scheduled.aircraft),
+                    (observed.infantry + observed.vehicles)
+                        .max(scheduled.infantry + scheduled.vehicles),
+                )
+            }
+            None => (self.enemy_air_count(sim), self.enemy_ground_count(sim)),
+        };
+        // The route a base's gun rides: the yards keep the home/expansion
+        // split, every fort anchor its own [`PlacementRoute::Fort`] aimed
+        // at the bearing it stands on.
+        let fort_count = forts.len();
+        let fort_sites = forts.clone();
+        let base_route = move |index: usize| {
+            if index >= fort_start {
+                let (anchor, spawn) = fort_sites[index - fort_start];
+                PlacementRoute::Fort { anchor, spawn }
+            } else if index >= 1 {
+                PlacementRoute::Expansion
+            } else {
+                PlacementRoute::Home
+            }
+        };
         // The ground rows tier with the standing ground war
         // ([`ground_per_yard_quota`]); the heavy tower keeps its peace
         // baseline ([`DEFENSE_PER_YARD_HEAVY`]) and its late-sink step on
         // top of the tier.
-        let heavy_per_yard =
-            ground_per_yard_quota(enemy_ground).max(DEFENSE_PER_YARD_HEAVY) + usize::from(late_sink);
+        let heavy_per_yard = ground_per_yard_quota(enemy_ground).max(DEFENSE_PER_YARD_HEAVY)
+            + usize::from(late_sink);
         let defenses = [
             (
                 opening.defense_aa,
@@ -10800,15 +11059,21 @@ impl SuperAi {
         defenses
             .iter()
             .filter_map(|&(name, per_yard, global_bound, gate)| {
-                if !gate || self.count_structures_of_type(sim, name) >= global_bound {
+                // The fort anchors widen the row's house-wide bound: the
+                // battle cap still holds for the yards, and each anchor's
+                // own quota buys past it by [`DEFENSE_FORT_GUN_EXTRA`] —
+                // without the lift the yard fill alone exhausted the cap
+                // before the first fort gun queued.
+                let bound = global_bound + DEFENSE_FORT_GUN_EXTRA * fort_count;
+                if !gate || self.count_structures_of_type(sim, name) >= bound {
                     return None;
                 }
                 let under_floor = |cell: (i16, i16)| {
                     self.count_structures_of_type_near(sim, name, cell, BASE_CLUSTER_RADIUS)
                         < OUTPOST_GUN_FLOOR.min(per_yard)
                 };
-                if bases.iter().skip(1).copied().any(under_floor) {
-                    return Some((name, true));
+                if let Some(index) = bases.iter().skip(1).position(|&cell| under_floor(cell)) {
+                    return Some((name, base_route(index + 1)));
                 }
                 bases
                     .iter()
@@ -10816,7 +11081,7 @@ impl SuperAi {
                         self.count_structures_of_type_near(sim, name, cell, BASE_CLUSTER_RADIUS)
                             < per_yard
                     })
-                    .map(|index| (name, index >= 1))
+                    .map(|index| (name, base_route(index)))
             })
             .collect()
     }
@@ -14303,7 +14568,12 @@ impl SuperAi {
             .own_structures(sim)
             .first()
             .and_then(|&(id, _)| sim.substrate().entities.get(id))
-            .map(|entity| (i32::from(entity.position.rx()), i32::from(entity.position.ry())));
+            .map(|entity| {
+                (
+                    i32::from(entity.position.rx()),
+                    i32::from(entity.position.ry()),
+                )
+            });
         let mut best: Option<(i32, (u16, u16))> = None;
         for (_, entity) in sim.substrate().entities.iter_sorted() {
             if entity.lifecycle.in_limbo()
@@ -14317,7 +14587,10 @@ impl SuperAi {
             {
                 continue;
             }
-            let (rx, ry) = (i32::from(entity.position.rx()), i32::from(entity.position.ry()));
+            let (rx, ry) = (
+                i32::from(entity.position.rx()),
+                i32::from(entity.position.ry()),
+            );
             if !sites.iter().any(|&(sx, sy, radius)| {
                 (rx - i32::from(sx)).abs() <= radius && (ry - i32::from(sy)).abs() <= radius
             }) {
@@ -14331,7 +14604,10 @@ impl SuperAi {
                 })
                 .unwrap_or(0);
             if best.is_none_or(|(kept, _)| distance_squared < kept) {
-                best = Some((distance_squared, (entity.position.rx(), entity.position.ry())));
+                best = Some((
+                    distance_squared,
+                    (entity.position.rx(), entity.position.ry()),
+                ));
             }
         }
         best.map(|(_, cell)| cell)
@@ -16825,16 +17101,7 @@ fn find_defense_site_around(
                     continue;
                 }
                 if !site_candidate_legal(
-                    sim,
-                    rules,
-                    registry,
-                    ty,
-                    origin,
-                    house,
-                    None,
-                    &own_rects,
-                    clearance,
-                    true,
+                    sim, rules, registry, ty, origin, house, None, &own_rects, clearance, true,
                 ) {
                     continue;
                 }
@@ -16865,10 +17132,7 @@ fn find_defense_site_around(
 /// integer cell arithmetic (i64 cross products; a squared metric is
 /// monotone in the true distance). A `None` axis or a degenerate segment
 /// reads zero.
-fn axis_distance_cells_squared(
-    axis: Option<((i16, i16), (i16, i16))>,
-    cell: (i16, i16),
-) -> i32 {
+fn axis_distance_cells_squared(axis: Option<((i16, i16), (i16, i16))>, cell: (i16, i16)) -> i32 {
     let Some(((ax, ay), (bx, by))) = axis else {
         return 0;
     };
@@ -17165,7 +17429,7 @@ mod tests {
         AA_UNIT_FLOOR, AIR_WING_TARGET, BUILD_QUEUE_RETRY_TICKS, DEFENSE_PER_YARD_AA_BASE,
         DEFENSE_PER_YARD_AA_HEAVY, DEFENSE_PER_YARD_AA_WARTIME, DEFENSE_PER_YARD_ASSAULT,
         DEFENSE_PER_YARD_BASIC, DEFENSE_PER_YARD_WARTIME, EXPANSION_MIN_DISTANCE,
-        FLOATER_COUNTER_THREATS, FLOATER_TYPES, OPENINGS, ORE_ENEMY_DIRECTION_BIAS,
+        FLOATER_COUNTER_THREATS, FLOATER_TYPES, OPENINGS, ORE_ENEMY_DIRECTION_BIAS, PlacementRoute,
         ROLE_SHARE_BASE, ROLE_SHARE_BOOST, Role, RosterEntry, SuperAi, SuperAiDifficulty,
         TECH_BUILDING_TYPES, aa_per_yard_quota, aa_unit_target, aa_vehicle_target, anti_air_demand,
         capture_priority_rank, enemy_direction_bias, find_defense_site_around,
@@ -20892,10 +21156,8 @@ mod tests {
                 ai.expansion_yard_issued,
                 ai.expansion_abandoned,
                 ai.expansion2_site,
-                ai.placement_intent.map(|(ty, expansion)| (
-                    expansion,
-                    scenario.sim().interner().resolve(ty).to_string()
-                )),
+                ai.placement_intent
+                    .map(|(ty, route)| (route, scenario.sim().interner().resolve(ty).to_string())),
             ),
         );
     }
@@ -21218,7 +21480,8 @@ mod tests {
              first {first:?})"
         );
         assert!(
-            second.is_none_or(|cell| floor_distance(cell) >= i32::from(super::EXPANSION_ENEMY_FLOOR)),
+            second
+                .is_none_or(|cell| floor_distance(cell) >= i32::from(super::EXPANSION_ENEMY_FLOOR)),
             "the survey latched ground inside the enemy floor: pick {second:?}, \
              enemy center {enemy_center:?}"
         );
@@ -22147,10 +22410,7 @@ mod tests {
         // Every cell dark: the interior candidates share the full score
         // box, so the first row-major stride candidate with the full box
         // wins — the scan's determinism discipline.
-        insert_plane(
-            &mut sim,
-            crate::sim::vision::OwnerVisibility::new(64, 64),
-        );
+        insert_plane(&mut sim, crate::sim::vision::OwnerVisibility::new(64, 64));
         assert_eq!(ai.darkest_fog_cell(&sim), Some((8, 8)));
 
         // Reveal everything except a pocket in the far corner: the last
@@ -23941,9 +24201,7 @@ mod tests {
         // The placement branch's book-keeping: every answered cell enters
         // the tried book, until the whole roster retires.
         let mut served: Vec<(u16, u16)> = Vec::new();
-        while let Some(cell) =
-            ai.wall_next_cell(scenario.sim(), rules, opening, overlays, false)
-        {
+        while let Some(cell) = ai.wall_next_cell(scenario.sim(), rules, opening, overlays, false) {
             ai.wall_cells.insert(cell);
             served.push(cell);
             assert!(served.len() < 500, "the roster walk must terminate");
@@ -24026,9 +24284,7 @@ mod tests {
             .runtime
             .simulation
             .place_overlay_for_test(placed, wall_id, 0, overlays);
-        while let Some(cell) =
-            ai.wall_next_cell(scenario.sim(), rules, opening, overlays, false)
-        {
+        while let Some(cell) = ai.wall_next_cell(scenario.sim(), rules, opening, overlays, false) {
             ai.wall_cells.insert(cell);
             assert!(ai.wall_cells.len() < 100, "the ring walk must terminate");
         }
@@ -24036,10 +24292,7 @@ mod tests {
             ai.wall_built.contains(&placed),
             "the standing segment is learned into the placed-cell book"
         );
-        assert!(
-            ai.walled.contains(&yard_id),
-            "the fully tried ring retires"
-        );
+        assert!(ai.walled.contains(&yard_id), "the fully tried ring retires");
 
         // The segment falls: the walk answers the same cell past
         // retirement — the single-segment rebuild.
@@ -24169,7 +24422,7 @@ mod tests {
         let wants = ai.defense_gun_wants(&sim, opening, &bases, false, "GAAIRC", false);
         assert_eq!(
             wants.iter().find(|(name, _)| *name == "GAPILL"),
-            Some(&("GAPILL", true)),
+            Some(&("GAPILL", PlacementRoute::Expansion)),
             "the bare outpost claims the pillbox row ahead of the home fill"
         );
         // The floor stands: the home fill resumes the row.
@@ -24178,9 +24431,216 @@ mod tests {
         let wants = ai.defense_gun_wants(&sim, opening, &bases, false, "GAAIRC", false);
         assert_eq!(
             wants.iter().find(|(name, _)| *name == "GAPILL"),
-            Some(&("GAPILL", false)),
+            Some(&("GAPILL", PlacementRoute::Home)),
             "with the floor met the home fill claims the row"
         );
+    }
+
+    /// The fort program fixture: the gun/wall rows the fort program reads,
+    /// plus a wall overlay table so the wall walk test can stand and break
+    /// real segments (the entry fixture's own overlay table carries no
+    /// wall; the walk reads the registry it is handed).
+    fn defense_fort_world() -> (
+        crate::sim::world::Simulation,
+        crate::rules::ruleset::RuleSet,
+        crate::rules::overlay_types::OverlayTypeRegistry,
+        InternedId,
+        InternedId,
+    ) {
+        let (sim, rules, ai_house, enemy_house) = defense_world_with(
+            "[BuildingTypes]\n1=GACNST\n2=GAPILL\n3=NASAM\n4=GAWALL\n\
+             [GACNST]\nStrength=1000\nFoundation=1x1\nCost=2000\nTechLevel=1\n\
+             [GAPILL]\nStrength=400\nFoundation=1x1\nCost=500\nTechLevel=1\n\
+             [NASAM]\nStrength=400\nFoundation=1x1\nCost=600\nTechLevel=1\n\
+             [GAWALL]\nStrength=100\nFoundation=1x1\nWall=yes\nToOverlay=WALLO\n\
+             Cost=100\nTechLevel=1\n\
+             [OverlayTypes]\n239=WALLO\n[WALLO]\nWall=yes\nLand=Clear\n",
+            "",
+        );
+        let overlays = crate::rules::overlay_types::OverlayTypeRegistry::from_ini(
+            &crate::rules::ini_parser::IniFile::from_str(
+                "[OverlayTypes]\n239=WALLO\n[WALLO]\nWall=yes\n",
+            ),
+            None,
+        );
+        (sim, rules, overlays, ai_house, enemy_house)
+    }
+
+    /// The fort gun wants (D2-B): with the persona adopted and one wave
+    /// bearing armed, the row's next gun rides the [`PlacementRoute::Fort`]
+    /// at the bearing's standoff anchor — the anchor fills the same tiered
+    /// quota the yards do, aimed at the wave source. The battle read keeps
+    /// its own routes: without the persona no Fort route ever returns.
+    #[test]
+    fn the_fort_claims_guns_at_the_bearing_anchor() {
+        let (mut sim, rules, _overlays, ai_house, _enemy) = defense_fort_world();
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        ai.pinned_home = Some((10, 10));
+        ai.engine_home = Some((10, 10));
+        // The armed schedule and the bearing it marches from — the fort
+        // program's pressure and aim reads.
+        {
+            let persona = ai.defense.as_mut().expect("the persona stays adopted");
+            persona.scheduled_wave_composition = super::WaveComposition {
+                vehicles: 20,
+                ..Default::default()
+            };
+            persona.spawn_bearings = vec![super::SpawnBearing {
+                spawn_cell: Some((30, 10)),
+                octant: Some(super::defense_octant_between((10, 10), (30, 10))),
+                distance_cells: Some(20),
+            }];
+        }
+        let opening = OPENINGS
+            .iter()
+            .find(|opening| opening.construction_yard == "GACNST")
+            .expect("the Allied opening");
+        let anchor = super::defense_bearing_anchor((10, 10), (30, 10));
+        let bases = [(10_i16, 10_i16)];
+        let wants = ai.defense_gun_wants(&sim, opening, &bases, false, "GAAIRC", false);
+        assert!(
+            wants.iter().any(|&(name, route)| name == "GAPILL"
+                && route
+                    == PlacementRoute::Fort {
+                        anchor,
+                        spawn: (30, 10)
+                    }),
+            "the pillbox row claims a gun at the bearing anchor: {wants:?}"
+        );
+        assert!(
+            wants.iter().any(|&(name, route)| name == "NASAM"
+                && matches!(route, PlacementRoute::Fort { anchor: a, .. } if a == anchor)),
+            "the AA row claims its fort gun too: {wants:?}"
+        );
+        // The battle read: no persona, no fort routes — the yards keep the
+        // home/expansion split exactly as before.
+        let mut battle = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        let battle_wants = battle.defense_gun_wants(&sim, opening, &bases, false, "GAAIRC", false);
+        assert!(
+            battle_wants
+                .iter()
+                .all(|&(_, route)| !matches!(route, PlacementRoute::Fort { .. })),
+            "the battle read returns no fort routes: {battle_wants:?}"
+        );
+    }
+
+    /// The fort anchors' shape: the line's standoff anchor math, two
+    /// bearings pointing at one chokepoint collapsing into one program,
+    /// and the bearing cap holding at [`DEFENSE_FORT_BEARING_CAP`].
+    #[test]
+    fn the_fort_anchors_collapse_and_cap_the_bearings() {
+        let (sim, _rules, _overlays, ai_house, _enemy) = defense_fort_world();
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        ai.pinned_home = Some((10, 10));
+        ai.engine_home = Some((10, 10));
+        {
+            let persona = ai.defense.as_mut().expect("the persona stays adopted");
+            let bearing = |cell: (i16, i16)| super::SpawnBearing {
+                spawn_cell: Some(cell),
+                octant: None,
+                distance_cells: None,
+            };
+            persona.spawn_bearings = vec![
+                bearing((14, 10)), // near: standoff 2, its own anchor
+                bearing((30, 10)), // far east
+                bearing((30, 14)), // collapses into the far east anchor
+                bearing((10, 30)), // far south
+                bearing((50, 10)), // past the cap: refused
+            ];
+        }
+        let anchors = ai.defense_fort_anchors(&sim);
+        let cells: Vec<(i16, i16)> = anchors.iter().map(|&(cell, _)| cell).collect();
+        assert_eq!(
+            cells,
+            vec![(12, 10), (10, 18), (18, 10)],
+            "nearest first, the near-collapsed bearing dropped, the cap at \
+             {cap}: {cells:?}",
+            cap = super::DEFENSE_FORT_BEARING_CAP
+        );
+        // Each anchor aims at the wave source it stands on.
+        assert_eq!(anchors[2], ((18, 10), (30, 10)));
+    }
+
+    /// The fort wall ring (D2-B): the walk serves the bearing anchor's
+    /// one-cell ring ahead of the yard's, the standing segment teaches the
+    /// placed-cell book, and once it falls the walk answers the same cell
+    /// past retirement — the single-segment rebuild the objective and the
+    /// line share with the yards.
+    #[test]
+    fn the_wall_walk_serves_and_rebuilds_the_fort_anchor() {
+        let (mut sim, rules, overlays, ai_house, _enemy) = defense_fort_world();
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        ai.enable_defense_personality(super::DefenseStance::IndependentZone);
+        ai.pinned_home = Some((10, 10));
+        ai.engine_home = Some((10, 10));
+        {
+            let persona = ai.defense.as_mut().expect("the persona stays adopted");
+            persona.spawn_bearings = vec![super::SpawnBearing {
+                spawn_cell: Some((30, 10)),
+                octant: None,
+                distance_cells: Some(20),
+            }];
+        }
+        let opening = OPENINGS
+            .iter()
+            .find(|opening| opening.construction_yard == "GACNST")
+            .expect("the Allied opening");
+        let anchor = super::defense_bearing_anchor((10, 10), (30, 10));
+        let anchor_ring: std::collections::HashSet<(u16, u16)> =
+            super::wall_ring_cells((0, 0, 0, 0))
+                .into_iter()
+                .map(|(dx, dy)| (anchor.0 + dx, anchor.1 + dy))
+                .filter(|&(x, y)| x >= 0 && y >= 0)
+                .map(|(x, y)| (x as u16, y as u16))
+                .collect();
+        // The first answer is the anchor's ring — the fort targets walk
+        // ahead of the battle roster.
+        let first = ai
+            .wall_next_cell(&sim, &rules, opening, &overlays, false)
+            .expect("the anchor ring owes a wall");
+        assert!(
+            anchor_ring.contains(&first),
+            "the walk serves the anchor's ring first: {first:?}"
+        );
+        // A standing segment on the served cell: the walk learns it into
+        // the placed-cell book, then retires the spent anchor and the
+        // yard's own walk finishes.
+        let wall_id = (0..=u8::MAX)
+            .find(|&id| overlays.flags(id).is_some_and(|flags| flags.wall))
+            .expect("the fixture overlay table carries a wall");
+        sim.place_overlay_for_test(first, wall_id, 0, &overlays);
+        let mut served = vec![first];
+        while let Some(cell) = ai.wall_next_cell(&sim, &rules, opening, &overlays, false) {
+            ai.wall_cells.insert(cell);
+            served.push(cell);
+            assert!(served.len() < 60, "the roster walk must terminate");
+        }
+        assert!(
+            ai.wall_built.contains(&first),
+            "the standing segment teaches the placed-cell book"
+        );
+        let anchor_key = super::DEFENSE_FORT_WALL_KEY
+            | (u64::from(anchor.0 as u16) << 16)
+            | u64::from(anchor.1 as u16);
+        assert!(
+            ai.walled.contains(&anchor_key),
+            "the fully served anchor retires"
+        );
+        // The segment falls: the walk answers the same cell past
+        // retirement — the single-segment rebuild.
+        sim.overlay_cell_mut_for_test(first.0, first.1).overlay_id = None;
+        let rebuilt = ai
+            .wall_next_cell(&sim, &rules, opening, &overlays, false)
+            .expect("the broken segment owes one back");
+        assert_eq!(rebuilt, first, "the rebuild answers the fallen cell");
     }
 
     /// The garrison scan's own-building branch (the garrison addendum):
@@ -24213,7 +24673,10 @@ mod tests {
                     })
                     .map(|(id, _)| id)
             };
-            (id_of("CIVHOLD").expect("the hall"), id_of("GACNST").expect("the yard"))
+            (
+                id_of("CIVHOLD").expect("the hall"),
+                id_of("GACNST").expect("the yard"),
+            )
         };
         assert!(
             ai.garrison_targets.contains(&hall),
