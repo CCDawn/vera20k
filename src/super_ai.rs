@@ -14526,9 +14526,20 @@ impl SuperAi {
             // for, and the limb reading the regroup as a jam Stopped the
             // members into walking home and the episode into disbanding at
             // its own clock. Its members sit the snapshot and the member
-            // picks both out until the episode ends.
-            if matches!(self.wave_stage, WaveStage::Marching | WaveStage::Striking)
-                && self.wave_members.contains(&id)
+            // picks both out until the episode ends — but a wedged member
+            // loses the immunity (the narrow-corridor report): on a bridge
+            // or choke the march jams against its own body, and a member
+            // holding a destination (or latched blocked) with nothing to
+            // shoot at is wedged by the same evidence the jam itself
+            // reads. The discharge pass and the escalation then handle it
+            // like any wedged unit; a marcher that still moves keeps the
+            // immunity whole.
+            let wave_member = matches!(self.wave_stage, WaveStage::Marching | WaveStage::Striking)
+                && self.wave_members.contains(&id);
+            if wave_member
+                && !(entity.attack_target.target().is_none()
+                    && (entity.navigation.nav_com().is_some()
+                        || entity.navigation.path_runtime().path_blocked()))
             {
                 continue;
             }
@@ -23150,6 +23161,103 @@ mod tests {
                 )),
             }),
             "the member out of range still walks in at the head cell"
+        );
+    }
+
+    // ---- user-reported fix: the narrow-corridor jams (I) ----
+
+    /// A wedged wave member — stationary in the choke, still holding its
+    /// march destination, nothing to shoot at — loses the march immunity
+    /// (W3) and the jam machine takes over: the scan Stops it and the
+    /// discharge pass walks it clear of the box. A member that still
+    /// marches — nothing held, nothing latched — keeps the immunity: the
+    /// machine never touches it.
+    #[test]
+    fn wedged_wave_member_loses_the_march_immunity() {
+        use crate::sim::components::NavTargetRef;
+
+        let (mut sim, rules, ai_house, _enemy_house) = defense_world_with(
+            "[BuildingTypes]\n1=GACNST\n[GACNST]\nStrength=1000\nFoundation=1x1\n",
+            "1=MTNK\n[MTNK]\nStrength=100\nSpeed=6\nSpeedType=Track\nMovementZone=Normal\n\
+             Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n",
+        );
+        let owner = sim.interner.resolve(ai_house).to_string();
+        sim.spawn_object_at_height("GACNST", &owner, 10, 10, 0, 0, &rules)
+            .expect("the fixture cell admits the yard");
+        // A choke box: nine members wedged mid-march (each still holding
+        // its march NavCom at its own cell), plus one plain marcher among
+        // them. The nine fill the cluster quota; the box also sits inside
+        // the home ring, so the wedged evidence is what proves the jam.
+        let wedged_cells = [
+            (14u16, 14u16),
+            (14, 15),
+            (14, 16),
+            (15, 14),
+            (15, 15),
+            (15, 16),
+            (16, 14),
+            (16, 15),
+            (16, 16),
+        ];
+        let plain = sim
+            .spawn_object_at_height("MTNK", &owner, 16, 17, 0, 0, &rules)
+            .expect("the fixture cell admits the plain marcher");
+        let mut wedged = Vec::new();
+        for &(x, y) in &wedged_cells {
+            let tank = sim
+                .spawn_object_at_height("MTNK", &owner, x, y, 0, 0, &rules)
+                .expect("the fixture cell admits the wedged tank");
+            sim.substrate
+                .entities
+                .get_mut(tank)
+                .expect("the wedged tank")
+                .navigation
+                .set_nav_com_for_test(Some(NavTargetRef::cell(x, y)));
+            wedged.push(tank);
+        }
+        let mut runtime = SimRuntime::from_simulation(sim);
+        runtime.resources = crate::sim::runtime::SimResources::new(rules);
+
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        // The wave mid-march: every tank is a member and already marched,
+        // so the march dispatch stays out of the picture and the stage
+        // holds through the window.
+        let mut members = wedged.clone();
+        members.push(plain);
+        ai.wave_stage = super::WaveStage::Marching;
+        ai.wave_members = members.clone();
+        ai.wave_marched = members;
+        ai.wave_gather = Some((28, 28));
+        ai.wave_stage_since = 0;
+
+        let mut wedged_orders: std::collections::BTreeMap<u64, u32> =
+            std::collections::BTreeMap::new();
+        let mut plain_orders = 0u32;
+        for tick in 0..400u32 {
+            for envelope in ai.orders(&runtime, tick) {
+                match envelope.payload {
+                    crate::sim::command::Command::Stop { entity_id }
+                    | crate::sim::command::Command::Move { entity_id, .. }
+                    | crate::sim::command::Command::Scatter { entity_id } => {
+                        if wedged.contains(&entity_id) {
+                            *wedged_orders.entry(entity_id).or_insert(0) += 1;
+                        }
+                        if entity_id == plain {
+                            plain_orders += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            wedged_orders.len(),
+            wedged.len(),
+            "every wedged member draws the jam machine: {wedged_orders:?}"
+        );
+        assert_eq!(
+            plain_orders, 0,
+            "the plain marcher keeps its immunity: no Stop, Move or Scatter"
         );
     }
 }
