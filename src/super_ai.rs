@@ -3010,6 +3010,13 @@ pub struct SuperAi {
     /// excluded from the generic wave pool until their order completes.
     /// Pinned state, never read from the runtime.
     raiders: Vec<u64>,
+    /// The Floating Disks' committed raid targets: (disc, structure) pairs
+    /// the dispatch latched at issue time. The commitments cover the
+    /// in-flight window — the drain link installs on arrival, so two discs
+    /// dispatched a window apart read no link yet and would stack on the
+    /// substrate's first plant without the book. Pinned state, never read
+    /// from the runtime.
+    disc_raids: Vec<(u64, u64)>,
     /// The tick the next raider window may issue at; see
     /// [`RAIDER_RETRY_TICKS`]. Pinned state, never read from the runtime.
     raid_due: u32,
@@ -3295,6 +3302,7 @@ impl SuperAi {
             boarders: Vec::new(),
             board_attempts: std::collections::HashMap::new(),
             raiders: Vec::new(),
+            disc_raids: Vec::new(),
             raid_due: 0,
             ferry_due: 0,
             deploy_issued: std::collections::HashSet::new(),
@@ -4415,17 +4423,41 @@ impl SuperAi {
                     entity.owner() == self.house
                         && entity.lifecycle.object_alive()
                         && !entity.lifecycle.in_limbo()
-                        && !(self.order_gate.get(&id).is_none_or(|&due| tick >= due)
-                            && matches!(
-                                entity.passive_acquire_mission(),
-                                crate::sim::mission::MissionType::None
-                                    | crate::sim::mission::MissionType::Sleep
-                                    | crate::sim::mission::MissionType::Guard
-                                    | crate::sim::mission::MissionType::AreaGuard
-                            ))
+                        // A Floating Disk holding a drain link stays
+                        // reserved whatever its mission reads: it is
+                        // raiding (the plant's DrainingMe names it), and
+                        // releasing it would hand the latched raider to
+                        // the wave pool. The link's loss — the razed
+                        // target's engine break — clears the latch and
+                        // the release window reopens.
+                        && (entity.drain.target().is_some()
+                            || !(self.order_gate.get(&id).is_none_or(|&due| tick >= due)
+                                && matches!(
+                                    entity.passive_acquire_mission(),
+                                    crate::sim::mission::MissionType::None
+                                        | crate::sim::mission::MissionType::Sleep
+                                        | crate::sim::mission::MissionType::Guard
+                                        | crate::sim::mission::MissionType::AreaGuard
+                                )))
                 })
             });
             self.ore_denial.retain(|id, _| self.raiders.contains(id));
+            // The commitment book follows its raiders: a dead disc or a
+            // razed target drops its pair, so the plant's slot re-arms for
+            // the next window and the de-dup never holds a ghost.
+            self.disc_raids.retain(|(disc, target)| {
+                sim.substrate().entities.get(*disc).is_some_and(|entity| {
+                    entity.owner() == self.house && entity.lifecycle.object_alive()
+                }) && sim
+                    .substrate()
+                    .entities
+                    .get(*target)
+                    .is_some_and(|entity| {
+                        entity.category() == crate::map::entities::EntityCategory::Structure
+                            && entity.lifecycle.object_alive()
+                            && !entity.lifecycle.in_limbo()
+                    })
+            });
             // The Desolator's arrival: standing within two cells of his
             // latched harvester cell, the stance toggles once (the deploy
             // is a toggle — `deploy_issued` keeps the re-issue off) and the
@@ -4543,9 +4575,21 @@ impl SuperAi {
                         break;
                     }
                     if type_name == RAIDER_DISK
-                        && let Some((_, cell)) = self.disc_raid_target(sim)
+                        // A disc holding a live drain link stays attached:
+                        // re-ordering it would walk it off the plant its
+                        // link feeds. The latch's loss (the target razed,
+                        // the engine's own link break) leaves the disc
+                        // idle here, and the next window re-picks it.
+                        && entity.drain.target().is_none()
+                        && let Some((target, cell)) = self.disc_raid_target(sim, from)
                         && !self.futile(id, FutilityKind::Raid, from, tick)
                     {
+                        if let Some(slot) = self.disc_raids.iter_mut().find(|pair| pair.0 == id)
+                        {
+                            slot.1 = target;
+                        } else {
+                            self.disc_raids.push((id, target));
+                        }
                         raid = Some((
                             id,
                             Command::AttackMove {
@@ -11960,27 +12004,63 @@ impl SuperAi {
         best.map(|(_, id, cell)| (cell, id))
     }
 
-    /// The Floating Disk's raid target: the enemy's first standing power
-    /// plant (the blinding cut), else its first refinery. A live
-    /// structure's own cell, limbo construction excluded.
-    fn disc_raid_target(&self, sim: &crate::sim::world::Simulation) -> Option<(u64, (i16, i16))> {
-        sim.substrate()
-            .entities
-            .iter_sorted()
-            .find(|(_, entity)| {
-                entity.category() == crate::map::entities::EntityCategory::Structure
-                    && !entity.lifecycle.in_limbo()
-                    && self.is_enemy(sim, entity.owner())
-                    && (ENEMY_POWER_TYPES.contains(&sim.interner().resolve(entity.type_ref()))
-                        || ENEMY_REFINERY_TYPES
-                            .contains(&sim.interner().resolve(entity.type_ref())))
-            })
-            .map(|(id, entity)| {
-                (
-                    id,
-                    (entity.position.rx() as i16, entity.position.ry() as i16),
-                )
-            })
+    /// The Floating Disk's raid target for one raider standing at `from`:
+    /// the nearest enemy power plant the house has revealed and that no own
+    /// disc drains or is already flying at (the blinding cut, shared out —
+    /// one disc per plant), else the nearest refinery the same way (the
+    /// money drain, once every plant is taken or down). A live structure's
+    /// own cell, limbo construction excluded.
+    fn disc_raid_target(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        from: (u16, u16),
+    ) -> Option<(u64, (i16, i16))> {
+        // The taken set: the dispatch's own in-flight commitments plus the
+        // engine's live drain links — the two latches of one raid, the
+        // bookkeeping and the `DrainTarget` the sim installs on arrival.
+        let taken: Vec<u64> = self
+            .disc_raids
+            .iter()
+            .map(|&(_, target)| target)
+            .chain(
+                sim.substrate()
+                    .entities
+                    .iter_sorted()
+                    .filter(|(_, entity)| {
+                        entity.owner() == self.house
+                            && entity.category() == crate::map::entities::EntityCategory::Unit
+                            && entity.lifecycle.object_alive()
+                    })
+                    .filter_map(|(_, entity)| entity.drain.target()),
+            )
+            .collect();
+        let nearest_free = |types: &[&str]| -> Option<(u64, (i16, i16))> {
+            let mut best: Option<(u32, u64, (i16, i16))> = None;
+            for (id, entity) in sim.substrate().entities.iter_sorted() {
+                if entity.category() != crate::map::entities::EntityCategory::Structure
+                    || entity.lifecycle.in_limbo()
+                    || !self.is_enemy(sim, entity.owner())
+                    || !types.contains(&sim.interner().resolve(entity.type_ref()))
+                    || taken.contains(&id)
+                {
+                    continue;
+                }
+                let (rx, ry) = (entity.position.rx(), entity.position.ry());
+                // A dark plant is a guess, not a target: the raid reads
+                // only what the house's scouts have revealed.
+                if !sim.fog().is_cell_revealed(self.house, rx, ry) {
+                    continue;
+                }
+                let dx = i32::from(rx) - i32::from(from.0);
+                let dy = i32::from(ry) - i32::from(from.1);
+                let distance = (dx * dx + dy * dy) as u32;
+                if best.is_none_or(|(kept, _, _)| distance < kept) {
+                    best = Some((distance, id, (rx as i16, ry as i16)));
+                }
+            }
+            best.map(|(_, id, cell)| (id, cell))
+        };
+        nearest_free(&ENEMY_POWER_TYPES).or_else(|| nearest_free(&ENEMY_REFINERY_TYPES))
     }
 
     /// The nearest revealed enemy structure the spy's arrival pays on,
@@ -22850,5 +22930,85 @@ mod tests {
             super::DEFENSE_AA_FLOOR + super::DEFENSE_ARMOR_CAP + super::DEFENSE_FOOT_CAP,
             "the raised quota is the mix's own capped answer (no aircraft observed)"
         );
+    }
+
+    /// The Floating Disk's raid aim (Layer 3 D): the nearest revealed
+    /// enemy plant no own disc drains, the refinery line the fallback once
+    /// every plant is taken — one disc per plant, not a stack on the
+    /// substrate's first row, and only what the house's scouts have
+    /// revealed.
+    #[test]
+    fn disc_raid_aims_the_nearest_unlatched_plant_then_the_refinery() {
+        let (mut scenario, ai_house, enemy_house) = pacific_bridge_battle();
+        let ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+
+        let disc = spawn_near(&mut scenario, "DISK", ai_house, (66, 99));
+        let drainer_near = spawn_near(&mut scenario, "DISK", ai_house, (68, 99));
+        let drainer_far = spawn_near(&mut scenario, "DISK", ai_house, (70, 99));
+        let plant_near = spawn_near(&mut scenario, "NAPOWR", enemy_house, (74, 96));
+        let plant_far = spawn_near(&mut scenario, "NAPOWR", enemy_house, (92, 82));
+        let refinery = spawn_near(&mut scenario, "NAREFN", enemy_house, (97, 76));
+
+        // The raid reads only what the house has revealed: the spawned
+        // cells themselves (the spawn spiral may land off the anchor).
+        let revealed: Vec<(u16, u16)> = [plant_near, plant_far, refinery]
+            .iter()
+            .filter_map(|&id| {
+                scenario
+                    .sim()
+                    .substrate()
+                    .entities
+                    .get(id)
+                    .map(|entity| (entity.position.rx(), entity.position.ry()))
+            })
+            .collect();
+        scenario
+            .runtime
+            .simulation
+            .fog_mut_for_test()
+            .reveal_cells_for_owner(ai_house, revealed);
+
+        let from = {
+            let entity = scenario.sim().substrate().entities.get(disc).unwrap();
+            (entity.position.rx(), entity.position.ry())
+        };
+
+        // Free field: the nearest plant.
+        let (near_id, _) = ai
+            .disc_raid_target(scenario.sim(), from)
+            .expect("a revealed plant aims");
+        assert_eq!(near_id, plant_near, "the nearest revealed plant aims first");
+
+        // A live drain link takes its plant out of the set — the engine's
+        // own latch, read off the drainer's DrainTarget.
+        scenario
+            .runtime
+            .simulation
+            .substrate_mut_for_test()
+            .entities
+            .get_mut(drainer_near)
+            .unwrap()
+            .drain
+            .set_target_for_test(Some(plant_near));
+        let (far_id, _) = ai
+            .disc_raid_target(scenario.sim(), from)
+            .expect("a free plant remains");
+        assert_eq!(far_id, plant_far, "the latched plant leaves the set");
+
+        // The second latch empties the plant set: the money drain — the
+        // nearest free refinery — takes the raid.
+        scenario
+            .runtime
+            .simulation
+            .substrate_mut_for_test()
+            .entities
+            .get_mut(drainer_far)
+            .unwrap()
+            .drain
+            .set_target_for_test(Some(plant_far));
+        let (cash_id, _) = ai
+            .disc_raid_target(scenario.sim(), from)
+            .expect("the refinery line takes the raid");
+        assert_eq!(cash_id, refinery, "with the plants taken, the refinery drains");
     }
 }
