@@ -708,6 +708,14 @@ const DEFENSE_PER_YARD_HEAVY: usize = 2;
 const DEFENSE_PER_YARD_BUNKER: usize = 1;
 const BUNKER_DEFENSE_CAP: usize = 3;
 
+/// The outpost yard's gun floor (C1): each expansion keeps one gun of a
+/// core row even while the home ring is still under its own quota — the
+/// wall ring alone does not turn a raider, and a naked expansion invites
+/// the walk-in the home ring never sees. The floor rides ahead of the
+/// home fill in the gun-wants order, and the house-wide bounds still cap
+/// the program (the split moves guns, never inflates them).
+const OUTPOST_GUN_FLOOR: usize = 1;
+
 /// The counter-trigger table (retail aimd's `Enemy owns >= N` triggers),
 /// read on the stuck scan's cadence. The air counter: six hostile
 /// aircraft standing arm the AA defense team — the mobile-AA quota's
@@ -5922,89 +5930,14 @@ impl SuperAi {
             .houses()
             .get(&self.house)
             .is_some_and(|house| sim.interner().resolve(house.house_type_id()) == "French");
-        let enemy_air = self.enemy_air_count(sim);
-        let enemy_ground = self.enemy_ground_count(sim);
-        let heavy_per_yard =
-            ground_per_yard_quota(enemy_ground).max(DEFENSE_PER_YARD_HEAVY)
-                + usize::from(late_sink);
-        let defenses = [
-            (
-                opening.defense_aa,
-                aa_per_yard_quota(enemy_air),
-                AA_DEFENSE_CAP * 3,
-                true,
-            ),
-            (
-                opening.defense_heavy,
-                heavy_per_yard,
-                HEAVY_DEFENSE_CAP * 4 + usize::from(late_sink) * bases.len(),
-                self.count_structures_of_type(sim, radar_name) >= 1,
-            ),
-            (
-                opening.defense_basic,
-                ground_per_yard_quota(enemy_ground),
-                BASIC_DEFENSE_TARGET * 2,
-                true,
-            ),
-            // The garrison bunker: one cheap hole per yard, three to a
-            // house — the Battle Bunker's roof for five soldiers, the Tank
-            // Bunker's hole for one tank, over the perimeter the pillboxes
-            // already hold (the garrison limb fills both). Its row sits
-            // behind the pillbox's so sentry density still wins a contested
-            // slot, and the sides without a bunker hold the pillbox's name
-            // below — never read, the `None` gate short-circuits first.
-            (
-                opening.defense_bunker.unwrap_or(opening.defense_basic),
-                DEFENSE_PER_YARD_BUNKER,
-                BUNKER_DEFENSE_CAP,
-                opening.defense_bunker.is_some(),
-            ),
-            // The defense extension (Layer 2.9): the gap generator and the
-            // Grand Cannon ride the same gun queue step as the core
-            // lines, so the blackout gate above covers them for free — both
-            // are retail `Powered=yes` with `Power=-100` and only queue
-            // while the grid reads `output >= drain`, with the power
-            // preemption standing a plant first when the pending drain
-            // would run the grid red. Their entries sit after the core
-            // lines, so a base arms itself before it decorates. The sides
-            // without a piece hold the basic pillbox's name below — never
-            // read, because the gate's `&&` chain short-circuits on the
-            // `None` field and the gun filter reads the count only behind a
-            // true gate.
-            (
-                opening.gap_generator.unwrap_or(opening.defense_basic),
-                1,
-                2,
-                opening.gap_generator.is_some()
-                    && self.count_structures_of_type(sim, opening.battle_lab) >= 1,
-            ),
-            (
-                opening.country_cannon.unwrap_or(opening.defense_basic),
-                1,
-                2,
-                opening.country_cannon.is_some()
-                    && french_house
-                    && self.count_structures_of_type(sim, radar_name) >= 1,
-            ),
-        ];
-        // The first gated type with a base under its quota claims the next
-        // gun, that base's rings the placement intent's target; an empty
-        // list — every base at every quota — rests the limb.
-        let gun_wants: Vec<(&'static str, bool)> = defenses
-            .iter()
-            .filter_map(|&(name, per_yard, global_bound, gate)| {
-                if !gate || self.count_structures_of_type(sim, name) >= global_bound {
-                    return None;
-                }
-                bases
-                    .iter()
-                    .position(|&cell| {
-                        self.count_structures_of_type_near(sim, name, cell, BASE_CLUSTER_RADIUS)
-                            < per_yard
-                    })
-                    .map(|index| (name, index >= 1))
-            })
-            .collect();
+        let gun_wants = self.defense_gun_wants(
+            sim,
+            opening,
+            &bases,
+            late_sink,
+            radar_name,
+            french_house,
+        );
         let guns_wanted = any_tank
             && self
                 .structure_center(sim, opening.construction_yard)
@@ -10746,6 +10679,117 @@ impl SuperAi {
                     )
             })
             .count()
+    }
+
+    /// The gun limb's wants, one row per gated defense type. The tiered
+    /// per-yard quotas read the standing threat counts here (the AA
+    /// ladder, B3's ground ladder); the first gated type with a base under
+    /// its quota claims the next gun, that base's rings the placement
+    /// intent's target; an empty list — every base at every quota — rests
+    /// the limb. The outpost floor (C1) rides ahead: an expansion under
+    /// its one-gun floor claims the row before the home fill, so the yard
+    /// the wall ring guards is never a naked foundation while the home
+    /// ring arms. The house-wide bounds still cap the program — the split
+    /// moves guns, never inflates them.
+    fn defense_gun_wants(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+        bases: &[(i16, i16)],
+        late_sink: bool,
+        radar_name: &'static str,
+        french_house: bool,
+    ) -> Vec<(&'static str, bool)> {
+        let enemy_air = self.enemy_air_count(sim);
+        let enemy_ground = self.enemy_ground_count(sim);
+        // The ground rows tier with the standing ground war
+        // ([`ground_per_yard_quota`]); the heavy tower keeps its peace
+        // baseline ([`DEFENSE_PER_YARD_HEAVY`]) and its late-sink step on
+        // top of the tier.
+        let heavy_per_yard =
+            ground_per_yard_quota(enemy_ground).max(DEFENSE_PER_YARD_HEAVY) + usize::from(late_sink);
+        let defenses = [
+            (
+                opening.defense_aa,
+                aa_per_yard_quota(enemy_air),
+                AA_DEFENSE_CAP * 3,
+                true,
+            ),
+            (
+                opening.defense_heavy,
+                heavy_per_yard,
+                HEAVY_DEFENSE_CAP * 4 + usize::from(late_sink) * bases.len(),
+                self.count_structures_of_type(sim, radar_name) >= 1,
+            ),
+            (
+                opening.defense_basic,
+                ground_per_yard_quota(enemy_ground),
+                BASIC_DEFENSE_TARGET * 2,
+                true,
+            ),
+            // The garrison bunker: one cheap hole per yard, three to a
+            // house — the Battle Bunker's roof for five soldiers, the Tank
+            // Bunker's hole for one tank, over the perimeter the pillboxes
+            // already hold (the garrison limb fills both). Its row sits
+            // behind the pillbox's so sentry density still wins a contested
+            // slot, and the sides without a bunker hold the pillbox's name
+            // below — never read, the `None` gate short-circuits first.
+            (
+                opening.defense_bunker.unwrap_or(opening.defense_basic),
+                DEFENSE_PER_YARD_BUNKER,
+                BUNKER_DEFENSE_CAP,
+                opening.defense_bunker.is_some(),
+            ),
+            // The defense extension (Layer 2.9): the gap generator and the
+            // Grand Cannon ride the same gun queue step as the core
+            // lines, so the blackout gate above covers them for free — both
+            // are retail `Powered=yes` with `Power=-100` and only queue
+            // while the grid reads `output >= drain`, with the power
+            // preemption standing a plant first when the pending drain
+            // would run the grid red. Their entries sit after the core
+            // lines, so a base arms itself before it decorates. The sides
+            // without a piece hold the basic pillbox's name below — never
+            // read, because the gate's `&&` chain short-circuits on the
+            // `None` field and the gun filter reads the count only behind a
+            // true gate.
+            (
+                opening.gap_generator.unwrap_or(opening.defense_basic),
+                1,
+                2,
+                opening.gap_generator.is_some()
+                    && self.count_structures_of_type(sim, opening.battle_lab) >= 1,
+            ),
+            (
+                opening.country_cannon.unwrap_or(opening.defense_basic),
+                1,
+                2,
+                opening.country_cannon.is_some()
+                    && french_house
+                    && self.count_structures_of_type(sim, radar_name) >= 1,
+            ),
+        ];
+        defenses
+            .iter()
+            .filter_map(|&(name, per_yard, global_bound, gate)| {
+                if !gate || self.count_structures_of_type(sim, name) >= global_bound {
+                    return None;
+                }
+                let under_floor = |cell: (i16, i16)| {
+                    self.count_structures_of_type_near(sim, name, cell, BASE_CLUSTER_RADIUS)
+                        < OUTPOST_GUN_FLOOR.min(per_yard)
+                };
+                if bases.iter().skip(1).copied().any(under_floor) {
+                    return Some((name, true));
+                }
+                bases
+                    .iter()
+                    .position(|&cell| {
+                        self.count_structures_of_type_near(sim, name, cell, BASE_CLUSTER_RADIUS)
+                            < per_yard
+                    })
+                    .map(|index| (name, index >= 1))
+            })
+            .collect()
     }
 
     /// The specialist a wheel slot goes to once the core has its
@@ -23471,6 +23515,47 @@ mod tests {
         // The mirrored walks do not collide on one cell: the bias moved
         // the pick across the yard.
         assert_ne!(east, west);
+    }
+
+    /// The outpost gun floor (C1): a bare expansion claims the core row
+    /// ahead of the home fill, and once its one-gun floor stands the home
+    /// yard's quota fills first again.
+    #[test]
+    fn the_outpost_gun_floor_claims_the_row_before_the_home_fill() {
+        let (mut sim, rules, ai_house, _enemy) = defense_world_with(
+            "[BuildingTypes]\n1=GACNST\n2=GAPILL\n\
+             [GACNST]\nStrength=1000\nFoundation=1x1\nCost=2000\nTechLevel=1\n\
+             [GAPILL]\nStrength=400\nFoundation=1x1\nCost=500\nTechLevel=1\n",
+            "",
+        );
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
+            .expect("the home yard stands");
+        sim.spawn_object_at_height("GACNST", &ai_owner, 24, 20, 0, 0, &rules)
+            .expect("the outpost yard stands");
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        let opening = OPENINGS
+            .iter()
+            .find(|opening| opening.construction_yard == "GACNST")
+            .expect("the Allied opening");
+        let bases = [(10_i16, 10_i16), (24_i16, 20_i16)];
+        // Peace quotas; no radar stands, so the heavy row's gate stays
+        // closed and the read is the AA and pillbox rows alone.
+        let wants = ai.defense_gun_wants(&sim, opening, &bases, false, "GAAIRC", false);
+        assert_eq!(
+            wants.iter().find(|(name, _)| *name == "GAPILL"),
+            Some(&("GAPILL", true)),
+            "the bare outpost claims the pillbox row ahead of the home fill"
+        );
+        // The floor stands: the home fill resumes the row.
+        sim.spawn_object_at_height("GAPILL", &ai_owner, 29, 20, 0, 0, &rules)
+            .expect("the outpost pillbox stands");
+        let wants = ai.defense_gun_wants(&sim, opening, &bases, false, "GAAIRC", false);
+        assert_eq!(
+            wants.iter().find(|(name, _)| *name == "GAPILL"),
+            Some(&("GAPILL", false)),
+            "with the floor met the home fill claims the row"
+        );
     }
 
 }
