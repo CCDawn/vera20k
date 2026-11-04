@@ -190,6 +190,12 @@ pub struct GameplayConfig {
     /// primary output on that same edge with nothing configured behind it.
     /// Local pacing policy; never read by the simulation.
     pub pause_on_focus_loss: bool,
+    /// VERA fork-only switch (no gamemd key): when set, the interactive match
+    /// seats every command-driven Super-AI house whose enemies hold no other
+    /// command-driven AI in the defense persona (`docs/defense-ai.md`) — its
+    /// pressure then comes from map waves instead of an AI opponent. Testing
+    /// switch for defense maps; the lobby picker is a later pillar.
+    pub defense_ai: bool,
 }
 
 impl Default for GameplayConfig {
@@ -197,6 +203,7 @@ impl Default for GameplayConfig {
         Self {
             input_delay_ticks: default_input_delay_ticks(),
             pause_on_focus_loss: false,
+            defense_ai: false,
         }
     }
 }
@@ -378,6 +385,7 @@ impl GameConfig {
                 ("gameplay", "pause_on_focus_loss") => {
                     parse_bool(value).map(|on| gameplay.pause_on_focus_loss = on)
                 }
+                ("gameplay", "defense_ai") => parse_bool(value).map(|on| gameplay.defense_ai = on),
                 ("profile", "name") => parse_string(value).map(|name| profile.name = Some(name)),
                 ("ini", "profile") => parse_string(value).and_then(|name| {
                     ini.profile = name.parse().map_err(anyhow::Error::msg)?;
@@ -943,6 +951,19 @@ name = "   "
             config.profile.name.as_deref(),
             Some("Tab\there é \"q\" # not a comment")
         );
+    }
+
+    /// Fork-only testing switch: off without the key, on when the config
+    /// asks for it.
+    #[test]
+    fn defense_ai_defaults_off_and_reads_the_set_value() {
+        let config =
+            GameConfig::parse("[paths]\nra2_dir = 'a'\n[gameplay]\npause_on_focus_loss = true\n")
+                .unwrap();
+        assert!(!config.gameplay.defense_ai);
+        let config =
+            GameConfig::parse("[paths]\nra2_dir = 'a'\n[gameplay]\ndefense_ai = true\n").unwrap();
+        assert!(config.gameplay.defense_ai);
     }
 
     #[test]
