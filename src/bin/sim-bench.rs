@@ -139,6 +139,11 @@ struct Args {
     /// `--defense-start`: pins the defended house to a start waypoint index,
     /// keeping it off the map's wave-owner slot deterministically.
     defense_start: Option<u8>,
+    /// `--super-drivers`: the skirmish scenario seats a Super driver (the
+    /// `--super-tier` tier) on every computer house instead of the native
+    /// AI — the same seating an app match gives its command-driven houses,
+    /// so build-choice defects (out-of-ring place attempts) reproduce.
+    super_drivers: bool,
     ticks: Option<NonZeroU64>,
     types: Vec<String>,
     order_spread: u64,
@@ -186,6 +191,7 @@ fn parse_args_from(mut argv: impl Iterator<Item = String>) -> Result<Args, Strin
         computers: None,
         defense: false,
         defense_start: None,
+        super_drivers: false,
         ticks: None,
         types: ["E1", "E2", "MTNK", "HTNK"].map(String::from).to_vec(),
         order_spread: 30,
@@ -290,6 +296,7 @@ fn parse_args_from(mut argv: impl Iterator<Item = String>) -> Result<Args, Strin
                 }
             }
             "--frame-profile" => args.frame_profile = true,
+            "--super-drivers" => args.super_drivers = true,
             "--lan" => args.lan = true,
             "--frame-hashes" => args.frame_hashes = Some(PathBuf::from(value()?)),
             "--client-timing" => args.client_timing = true,
@@ -312,6 +319,9 @@ fn parse_args_from(mut argv: impl Iterator<Item = String>) -> Result<Args, Strin
     }
     if args.scenario != ScenarioKind::Match && args.defense {
         return Err("--defense is a match option".to_string());
+    }
+    if args.scenario != ScenarioKind::Skirmish && args.super_drivers {
+        return Err("--super-drivers is a skirmish option".to_string());
     }
     if args.scenario == ScenarioKind::Super && args.defense {
         return Err("--defense is a match option; super runs take --super-tier".to_string());
@@ -521,6 +531,16 @@ enum Plan {
     March(Vec<Vec<CommandEnvelope>>),
     Match(MatchScenario),
     Skirmish,
+    /// The skirmish scenario with a Super driver per computer house: each
+    /// entry is `(house, tier, driver)`, driven with the tier's credit
+    /// support the way the super scenario drives its local house.
+    SkirmishSuper(
+        Vec<(
+            InternedId,
+            vera20k_core::super_ai::SuperAiDifficulty,
+            vera20k_core::super_ai::SuperAi,
+        )>,
+    ),
 }
 
 /// Zero for no frames, as when the first frame failed.
@@ -575,6 +595,21 @@ impl Frames for Bench<'_> {
             Plan::March(orders) => orders.get(tick as usize).cloned().unwrap_or_default(),
             Plan::Match(script) => script.orders(self.runtime, tick),
             Plan::Skirmish => Vec::new(),
+            Plan::SkirmishSuper(drivers) => {
+                let mut batch = Vec::new();
+                let tick = u32::try_from(tick).unwrap_or(u32::MAX);
+                for (house, tier, driver) in drivers.iter_mut() {
+                    // The tier's credit support, the same per-tick application
+                    // the launch's sim_tick and the super scenario use.
+                    vera20k_core::sim::driver::DriverPolicy::from(*tier).apply_credit_support(
+                        self.runtime,
+                        *house,
+                        tick,
+                    );
+                    batch.extend(driver.orders(self.runtime, tick));
+                }
+                batch
+            }
         }
     }
 
@@ -799,6 +834,9 @@ fn report(out: &mut impl Write, measured: &Measured, warmup: u64) -> std::io::Re
 }
 
 fn main() -> Result<(), String> {
+    // Warn-level records (the placement-reject line among them) reach stderr,
+    // so a run's reject count is greppable without touching the timings.
+    let _ = vera20k_core::util::logging::init_stderr_logger("warn");
     let args = match parse_args() {
         Ok(args) => args,
         Err(error) => {
@@ -811,6 +849,7 @@ fn main() -> Result<(), String> {
                  [--types E1,E2,MTNK,HTNK] [--order-spread 30] [--return-at T] (march) \
                  [--hash-every N] [--frame-hash-every 15] [--csv <path>] [--serial-paths] [--serial-scans] \
                  [--games 1] [--max-ticks 30000] [--super-country America] \
+                 [--super-drivers] (skirmish: seat Super drivers on the computers) \
                  [--builtin-country Russia] [--builtin-difficulty hard]
                  [--super-tier fair] (super) [--frame-profile] [--lan] [--frame-hashes <path>] [--client-timing]"
             );
@@ -874,12 +913,43 @@ fn main() -> Result<(), String> {
             (script.houses(), script.spawned, Plan::Match(script), ticks)
         }
         ScenarioKind::Skirmish => {
-            let simulation = &mut scenario.runtime.simulation;
-            if let Some(local) = simulation.session().current_house() {
-                simulation.make_house_multiplay_passive(local);
-            }
+            let computer_ids: Vec<InternedId> = {
+                let simulation = &mut scenario.runtime.simulation;
+                if let Some(local) = simulation.session().current_house() {
+                    simulation.make_house_multiplay_passive(local);
+                }
+                let houses = simulation.houses();
+                houses
+                    .order()
+                    .iter()
+                    .copied()
+                    .filter(|&id| {
+                        houses.get(&id).is_some_and(|house| {
+                            !house.is_human() && !house.multiplay_passive()
+                        })
+                    })
+                    .collect()
+            };
             let ticks = args.ticks.map_or(SKIRMISH_TICKS, NonZeroU64::get);
-            (simulation.houses().order().len(), 0, Plan::Skirmish, ticks)
+            if !args.super_drivers {
+                let seated = scenario.runtime.simulation.houses().order().len();
+                (seated, 0, Plan::Skirmish, ticks)
+            } else {
+                // Seat a Super driver on every computer house the launch
+                // built: `apply_super_ai_tier` marks them command-driven
+                // (their native AI rungs stand down), and the tier plays
+                // pure decisions — the app match's seating, headless.
+                let tier = args.super_tier;
+                for &id in &computer_ids {
+                    scenario.apply_super_ai_tier(id, tier);
+                }
+                let drivers = computer_ids
+                    .into_iter()
+                    .map(|id| (id, tier, vera20k_core::super_ai::SuperAi::new(id, tier)))
+                    .collect();
+                let seated = scenario.runtime.simulation.houses().order().len();
+                (seated, 0, Plan::SkirmishSuper(drivers), ticks)
+            }
         }
         // The super scenario dispatches to its own run before any load.
         ScenarioKind::Super => unreachable!("super dispatched before the load"),
@@ -896,12 +966,12 @@ fn main() -> Result<(), String> {
     let warmup = match plan {
         Plan::March(_) => args.order_spread,
         Plan::Match(_) => sim_bench_match::WARMUP,
-        Plan::Skirmish => 0,
+        Plan::Skirmish | Plan::SkirmishSuper(_) => 0,
     };
     let computers = match &plan {
         Plan::March(_) => 0,
         Plan::Match(script) => script.computers(),
-        Plan::Skirmish => computers,
+        Plan::Skirmish | Plan::SkirmishSuper(_) => computers,
     };
     let tick_ms = args.tick_ms();
     let runtime = &mut scenario.runtime;
