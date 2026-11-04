@@ -3240,6 +3240,20 @@ impl Simulation {
         )
     }
 
+    /// [`Simulation::parity_digest`] with the overlay and crate counters
+    /// filled from the live overlay grid (`registry` classifies the crate
+    /// overlays). Read-only and side-effect free like the base digest.
+    pub fn parity_digest_with_overlay_counts(
+        &self,
+        registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    ) -> crate::sim::parity_digest::ParityDigest {
+        let digest = self.parity_digest();
+        match self.overlay_grid() {
+            Some(grid) => digest.with_overlay_counts(grid, registry),
+            None => digest,
+        }
+    }
+
     /// Capture all three complete logical RNG objects as immutable evidence.
     pub fn rng_state(&self) -> SimulationRngState {
         SimulationRngState {
@@ -3380,6 +3394,13 @@ impl Simulation {
 
     pub fn substrate(&self) -> &ObjectSubstrate {
         &self.substrate
+    }
+
+    /// Trigger-runtime read access for observers (the defense AI's wave and
+    /// protected-target reads). Every mutation stays with the trigger
+    /// owners; see [`TriggerRuntime`]'s view accessors.
+    pub fn trigger_runtime(&self) -> &TriggerRuntime {
+        &self.trigger_runtime
     }
 
     pub fn production(&self) -> &ProductionState {

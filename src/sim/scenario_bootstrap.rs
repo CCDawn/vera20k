@@ -30,6 +30,10 @@ mod scenario_special_money_retail_tests;
 #[path = "building_ai_sale_tag_retail_tests.rs"]
 mod building_ai_sale_tag_retail_tests;
 
+#[cfg(test)]
+#[path = "lobby_slot_houses_retail_tests.rs"]
+mod lobby_slot_houses_retail_tests;
+
 use std::collections::HashMap;
 
 use crate::map::entities::EntityCategory;
@@ -1914,6 +1918,77 @@ pub fn populate_launch_houses(
         }
         sim.houses.register(house);
     }
+}
+
+/// The multiplayer lobby's start slots as native names them (`Player@A..H`,
+/// the `<Player @ A>` selector table at `0x007E23F0`), in slot order.
+pub const LOBBY_SLOT_HOUSE_NAMES: [&str; 8] = [
+    "<Player @ A>",
+    "<Player @ B>",
+    "<Player @ C>",
+    "<Player @ D>",
+    "<Player @ E>",
+    "<Player @ F>",
+    "<Player @ G>",
+    "<Player @ H>",
+];
+
+/// Bring the multiplayer lobby's start-slot houses (`<Player @ A..H>`) into an
+/// already-loaded scenario, one per `starts` slot, and install the
+/// start-slot -> House table that the `PlayerAt` trigger selectors read
+/// (`House510F60` -> `Scenario510ED0`; see
+/// [`Simulation::house_by_trigger_selector`]).
+///
+/// This is the headless stand-in for the lobby's own house pass: a spectatorless
+/// map load (e.g. `parity-digest --map`) creates no start-slot houses, so a
+/// defense map's reinforcement teams owned by `<Player @ B>` silently find no
+/// owner and their trigger spends itself for nothing. Every house is the same
+/// launch constructor's output as [`populate_launch_houses`] makes — no draws,
+/// no starting force, no alliance change — then forced passive, so it owns
+/// trigger-spawned teams without entering the defeat scan or the crate pickup
+/// admission. Call before the first tick; the table is hashed lockstep state.
+///
+/// Returns the interned owners actually installed, in slot order.
+pub fn install_lobby_slot_houses(
+    sim: &mut Simulation,
+    starts: usize,
+    rules: &RuleSet,
+) -> Vec<crate::sim::intern::InternedId> {
+    let count = starts.min(LOBBY_SLOT_HOUSE_NAMES.len());
+    if count == 0 {
+        return Vec::new();
+    }
+    let slots: Vec<NormalizedSkirmishSlot> = LOBBY_SLOT_HOUSE_NAMES[..count]
+        .iter()
+        .enumerate()
+        .map(|(index, owner_name)| NormalizedSkirmishSlot {
+            owner_name: (*owner_name).to_owned(),
+            country: LaunchCountry::America,
+            color_index: index as u8,
+            start_position: crate::skirmish_launch::LaunchStartPosition::Auto,
+            team: crate::skirmish_launch::LaunchTeam::None,
+            is_human: false,
+            observer: false,
+            source_human_index: None,
+            handle: None,
+            difficulty: HouseDifficulty::Normal,
+            super_tier: None,
+        })
+        .collect();
+    populate_launch_houses(sim, &slots, rules);
+    let mut installed = Vec::with_capacity(count);
+    for (index, owner_name) in LOBBY_SLOT_HOUSE_NAMES[..count].iter().enumerate() {
+        let Some(id) = sim.interner.get(owner_name) else {
+            continue;
+        };
+        if let Some(house) = sim.houses.get_mut(&id) {
+            house.make_multiplay_passive();
+        }
+        installed.push((index as u32, id));
+    }
+    let owners: Vec<crate::sim::intern::InternedId> = installed.iter().map(|&(_, id)| id).collect();
+    sim.session.install_start_slot_houses(installed);
+    owners
 }
 
 /// Bit pattern of the `0.01` double at `0x007E3808` read by
