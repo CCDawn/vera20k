@@ -13735,9 +13735,12 @@ impl SuperAi {
             let (rx, ry) = (entity.position.rx(), entity.position.ry());
             let owner = entity.owner();
             if owner == self.house {
-                if opening.defense_bunker == Some(name) {
-                    bunkers.push((distance_to(rx, ry), id));
-                }
+                // The side's own occupiable structures (the garrison
+                // addendum): the defense bunker the branch first named,
+                // and — with the fork overlay garrisoning the power plants
+                // — every plant the overlay arms. Same nearest-first
+                // ordering as the civilians' follow.
+                bunkers.push((distance_to(rx, ry), id));
                 continue;
             }
             // Neutral: a passive house, never a combatant's.
@@ -23367,7 +23370,7 @@ mod tests {
         };
         let (mut sim, tank, americans) =
             crate::sim::psychic_detection::psychic_sensor_watch_fixture(&rules);
-        let mut ai = SuperAi::new(americans, SuperAiDifficulty::Fair);
+        let ai = SuperAi::new(americans, SuperAiDifficulty::Fair);
         // The Russian tank stands 14 cells from the powered NAPSIS
         // (`PsychicDetectionRadius=15`): the walker's cell is the focus.
         assert_eq!(ai.psychic_alarm_focus(&sim, &rules), Some((2, 2)));
@@ -23670,4 +23673,49 @@ mod tests {
         );
     }
 
+    /// The garrison scan's own-building branch (the garrison addendum):
+    /// an own occupiable structure — the fork overlay's power plant, or
+    /// the fixture's civilian hall — latches as a target with its full
+    /// capacity's demand, and an own building without the keys never does.
+    #[test]
+    fn garrison_scan_latches_own_occupiable_structures() {
+        let (mut sim, rules, ai_house, _enemy) = defense_forces_world();
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        sim.spawn_object_at_height("CIVHOLD", &ai_owner, 12, 12, 0, 0, &rules)
+            .expect("the own hall stands");
+        sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
+            .expect("the yard stands");
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        let opening = OPENINGS
+            .iter()
+            .find(|opening| opening.construction_yard == "GACNST")
+            .expect("the Allied opening");
+        ai.garrison_scan(&sim, &rules, opening, (10, 10));
+        let (hall, yard) = {
+            let sim = &sim;
+            let id_of = |name: &str| {
+                sim.substrate()
+                    .entities
+                    .iter_sorted()
+                    .find(|(_, entity)| {
+                        entity.owner() == ai_house
+                            && sim.interner().resolve(entity.type_ref()) == name
+                    })
+                    .map(|(id, _)| id)
+            };
+            (id_of("CIVHOLD").expect("the hall"), id_of("GACNST").expect("the yard"))
+        };
+        assert!(
+            ai.garrison_targets.contains(&hall),
+            "the own occupiable hall is a target"
+        );
+        assert_eq!(
+            ai.garrison_demand, 5,
+            "the hall's full capacity rides the demand"
+        );
+        assert!(
+            !ai.garrison_targets.contains(&yard),
+            "the plain yard is not a garrison target"
+        );
+    }
 }
