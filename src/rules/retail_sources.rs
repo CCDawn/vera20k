@@ -221,7 +221,11 @@ impl RetailRulesSources {
 
     /// VERA-only source composition; physical source identities remain intact.
     /// No extra native Rules pass is introduced by a personal override.
+    /// The Super AI fork's own overlay merges first (the garrison
+    /// addendum's occupiable power plants), so a personal row keeps the
+    /// last word.
     pub fn with_personal_rules(mut self, personal_rules: PersonalRules) -> Self {
+        crate::rules::superai_overlay::apply_garrison_overlay(&mut self.rulesmd.ini);
         personal_rules.apply_root(&mut self.rulesmd.ini);
         if let Some(langrule) = self.langrule.as_mut() {
             personal_rules.apply_base_layer(&mut langrule.ini);

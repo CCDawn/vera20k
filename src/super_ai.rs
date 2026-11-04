@@ -508,6 +508,11 @@ const FORTRESS_UNLOAD_IDLE_TICKS: u32 = 300;
 /// scan with no upper bound walked one owner's MCV ~100 cells into enemy
 /// territory and it never deployed (observed).
 const EXPANSION_MAX_SITE_DISTANCE: i16 = 70;
+/// The outpost siting's hard enemy floor (C2): a field within this many
+/// cells of the enemy's standing center is refused outright — the
+/// [`enemy_direction_bias`] only nudges ties, and a base that close
+/// deploys into the raider's opening walk.
+const EXPANSION_ENEMY_FLOOR: i16 = 18;
 
 /// The primary wheel's time arm (Layer 2.9 / outpost P4): past this many
 /// ticks since the last toggle the carrier alternates even while the slot
@@ -598,6 +603,16 @@ const AIR_THREAT_TYPES: [&str; 7] = ["JUMPJET", "ZEP", "ORCA", "SHAD", "HIND", "
 /// dropped unit order would starve the branches below it.
 const SW_FIRE_RETRY_TICKS: u32 = 150;
 
+/// The free recon pair's (the spy plane's, the psychic reveal's)
+/// darkest-cell scan (S-F): the fog grid strides every fourth cell for
+/// candidates, each scored by the still-unrevealed cells inside its
+/// eight-cell box — the charge buys only map knowledge, so the darkest
+/// region's center is the aim, and a candidate nearer the enemy mass
+/// center wins the same-darkness ties (the reveal is worth most on the
+/// approach to the enemy base).
+const SW_RECON_STRIDE: u16 = 4;
+const SW_RECON_RADIUS: u16 = 8;
+
 /// The Allied jet wing's target size (retail Intruders `ORCA` / Korea's
 /// Black Eagles `BEAG`, both `Factory=AircraftType` off the Airforce
 /// Command). Six keeps the wing a real strike force — two full strike
@@ -669,6 +684,15 @@ const DEFENSE_FLOOR: usize = 2;
 /// can only move guns around, never inflate the armament program as a
 /// whole beyond the tier the air war justifies.
 const DEFENSE_PER_YARD_BASIC: usize = 2;
+/// The ground towers' wartime/heavy steps over the peace baselines
+/// ([`DEFENSE_PER_YARD_BASIC`]/[`DEFENSE_PER_YARD_HEAVY`]), the AA
+/// ladder's shape on the ground rows: one extra tower per yard once
+/// hostile ground combat actually fields, two against a massed assault.
+const DEFENSE_PER_YARD_WARTIME: usize = 3;
+const DEFENSE_PER_YARD_ASSAULT: usize = 4;
+/// Hostile ground combat units standing that count as a massed assault:
+/// the tier where every yard wants its fourth ground tower.
+const GROUND_HEAVY_THREATS: usize = 8;
 /// The AA tower's per-yard ladder: one always (a base never stands
 /// without its AA answer — the bombers must meet a tower, not a tower
 /// the first raid taught the queue to buy), two once hostile air
@@ -688,6 +712,14 @@ const DEFENSE_PER_YARD_HEAVY: usize = 2;
 /// the whole program.
 const DEFENSE_PER_YARD_BUNKER: usize = 1;
 const BUNKER_DEFENSE_CAP: usize = 3;
+
+/// The outpost yard's gun floor (C1): each expansion keeps one gun of a
+/// core row even while the home ring is still under its own quota — the
+/// wall ring alone does not turn a raider, and a naked expansion invites
+/// the walk-in the home ring never sees. The floor rides ahead of the
+/// home fill in the gun-wants order, and the house-wide bounds still cap
+/// the program (the split moves guns, never inflates them).
+const OUTPOST_GUN_FLOOR: usize = 1;
 
 /// The counter-trigger table (retail aimd's `Enemy owns >= N` triggers),
 /// read on the stuck scan's cadence. The air counter: six hostile
@@ -2847,6 +2879,15 @@ pub struct SuperAi {
     /// refused alike — so a refused cell is never knocked on twice ahead of
     /// a fresher one. Pinned state, never read from the runtime.
     wall_cells: std::collections::HashSet<(u16, u16)>,
+    /// The wall ring cells the walk has seen carrying a wall (B1's
+    /// placed-cell memory): own strikes that landed and rings a map or the
+    /// auto-fill completed. A cell the book holds that the live overlay no
+    /// longer reads a wall on is a fallen segment the ring owes one
+    /// segment back — the single-segment rebuild. A strike the engine
+    /// refused never enters the book (it was never seen standing), so the
+    /// rebuild cannot loop on a refusing cell. Pinned state, never read
+    /// from the runtime.
+    wall_built: std::collections::HashSet<(u16, u16)>,
     /// The tick the wall limb may queue again after an escape pass. One
     /// timestamp covers the whole target roster because the pass only
     /// fires once every ring was tried and refused; see
@@ -3258,6 +3299,7 @@ impl SuperAi {
             place_pause_until: std::collections::HashMap::new(),
             walled: std::collections::HashSet::new(),
             wall_cells: std::collections::HashSet::new(),
+            wall_built: std::collections::HashSet::new(),
             wall_target_cooldown_until: 0,
             wall_window_due: 0,
             rally_gate: std::collections::HashMap::new(),
@@ -4093,14 +4135,52 @@ impl SuperAi {
                             site
                         }
                         None => home_center.and_then(|home| {
-                            find_site_around(
-                                sim,
-                                rules,
-                                &runtime.resources.overlay_registry,
-                                ty,
-                                home,
-                                self.house,
-                            )
+                            // The gun route (B2): a defense gun the gun limb
+                            // queued (the placement intent's home mark)
+                            // scans the enemy-facing weighted rings — the
+                            // traffic axis's aim is the threat bearing, and
+                            // the axis itself the approach line the tower
+                            // covers. Every other home item keeps the
+                            // uniform ring.
+                            let gun_intent = self
+                                .placement_intent
+                                .is_some_and(|(intent, expansion)| {
+                                    intent == ready.type_id && !expansion
+                                });
+                            if gun_intent {
+                                find_defense_site_around(
+                                    sim,
+                                    rules,
+                                    &runtime.resources.overlay_registry,
+                                    ty,
+                                    home,
+                                    self.house,
+                                    self.traffic_axis.map(|(_, aim)| aim),
+                                    self.traffic_axis,
+                                )
+                                // A packed field keeps the uniform walk's
+                                // degraded pass — a gun at home beats a
+                                // canceled gun.
+                                .or_else(|| {
+                                    find_site_around(
+                                        sim,
+                                        rules,
+                                        &runtime.resources.overlay_registry,
+                                        ty,
+                                        home,
+                                        self.house,
+                                    )
+                                })
+                            } else {
+                                find_site_around(
+                                    sim,
+                                    rules,
+                                    &runtime.resources.overlay_registry,
+                                    ty,
+                                    home,
+                                    self.house,
+                                )
+                            }
                         }),
                     }
                 })
@@ -4253,7 +4333,24 @@ impl SuperAi {
                 return vec![CommandEnvelope::new(self.house, at, command)];
             }
             let idle = self.idle_combat_units(sim, opening);
-            let alarm_armed = self.base_alarm_armed(sim, tick);
+            let mut alarm_armed = self.base_alarm_armed(sim, tick);
+            // The psychic early warning (A2): a hostile walking the sensor
+            // network's radius arms the same alarm before the first
+            // building hit — the stance latches the walker's cell as its
+            // focus, so the defense deployment (and the spy defense reusing
+            // this chain) meets the intruder at the perimeter, not the
+            // yard. The latch refreshes every tick the walker stands in
+            // range; the hold (`DEFENSE_HOLD_TICKS`) keeps the stance
+            // armed through the walk-in gap after it leaves the radius.
+            let psychic_focus = if alarm_armed {
+                None
+            } else {
+                self.psychic_alarm_focus(sim, rules)
+            };
+            if let Some(cell) = psychic_focus {
+                self.defense_focus = Some((cell, tick + DEFENSE_HOLD_TICKS));
+            }
+            alarm_armed = alarm_armed || psychic_focus.is_some();
             if alarm_armed || self.defense_focus.is_some() {
                 if let Some(command) =
                     self.base_defense_orders(sim, rules, opening, &idle, tick, alarm_armed)
@@ -5854,86 +5951,14 @@ impl SuperAi {
             .houses()
             .get(&self.house)
             .is_some_and(|house| sim.interner().resolve(house.house_type_id()) == "French");
-        let enemy_air = self.enemy_air_count(sim);
-        let heavy_per_yard = DEFENSE_PER_YARD_HEAVY + usize::from(late_sink);
-        let defenses = [
-            (
-                opening.defense_aa,
-                aa_per_yard_quota(enemy_air),
-                AA_DEFENSE_CAP * 3,
-                true,
-            ),
-            (
-                opening.defense_heavy,
-                heavy_per_yard,
-                HEAVY_DEFENSE_CAP * 4 + usize::from(late_sink) * bases.len(),
-                self.count_structures_of_type(sim, radar_name) >= 1,
-            ),
-            (
-                opening.defense_basic,
-                DEFENSE_PER_YARD_BASIC,
-                BASIC_DEFENSE_TARGET * 2,
-                true,
-            ),
-            // The garrison bunker: one cheap hole per yard, three to a
-            // house — the Battle Bunker's roof for five soldiers, the Tank
-            // Bunker's hole for one tank, over the perimeter the pillboxes
-            // already hold (the garrison limb fills both). Its row sits
-            // behind the pillbox's so sentry density still wins a contested
-            // slot, and the sides without a bunker hold the pillbox's name
-            // below — never read, the `None` gate short-circuits first.
-            (
-                opening.defense_bunker.unwrap_or(opening.defense_basic),
-                DEFENSE_PER_YARD_BUNKER,
-                BUNKER_DEFENSE_CAP,
-                opening.defense_bunker.is_some(),
-            ),
-            // The defense extension (Layer 2.9): the gap generator and the
-            // Grand Cannon ride the same gun queue step as the core
-            // lines, so the blackout gate above covers them for free — both
-            // are retail `Powered=yes` with `Power=-100` and only queue
-            // while the grid reads `output >= drain`, with the power
-            // preemption standing a plant first when the pending drain
-            // would run the grid red. Their entries sit after the core
-            // lines, so a base arms itself before it decorates. The sides
-            // without a piece hold the basic pillbox's name below — never
-            // read, because the gate's `&&` chain short-circuits on the
-            // `None` field and the gun filter reads the count only behind a
-            // true gate.
-            (
-                opening.gap_generator.unwrap_or(opening.defense_basic),
-                1,
-                2,
-                opening.gap_generator.is_some()
-                    && self.count_structures_of_type(sim, opening.battle_lab) >= 1,
-            ),
-            (
-                opening.country_cannon.unwrap_or(opening.defense_basic),
-                1,
-                2,
-                opening.country_cannon.is_some()
-                    && french_house
-                    && self.count_structures_of_type(sim, radar_name) >= 1,
-            ),
-        ];
-        // The first gated type with a base under its quota claims the next
-        // gun, that base's rings the placement intent's target; an empty
-        // list — every base at every quota — rests the limb.
-        let gun_wants: Vec<(&'static str, bool)> = defenses
-            .iter()
-            .filter_map(|&(name, per_yard, global_bound, gate)| {
-                if !gate || self.count_structures_of_type(sim, name) >= global_bound {
-                    return None;
-                }
-                bases
-                    .iter()
-                    .position(|&cell| {
-                        self.count_structures_of_type_near(sim, name, cell, BASE_CLUSTER_RADIUS)
-                            < per_yard
-                    })
-                    .map(|index| (name, index >= 1))
-            })
-            .collect();
+        let gun_wants = self.defense_gun_wants(
+            sim,
+            opening,
+            &bases,
+            late_sink,
+            radar_name,
+            french_house,
+        );
         let guns_wanted = any_tank
             && self
                 .structure_center(sim, opening.construction_yard)
@@ -6052,8 +6077,9 @@ impl SuperAi {
 
             // The wall ring (Layer 2.8). A perimeter of the side's wall
             // segments goes up one production cycle at a time around the
-            // first superweapon, then the second, then the construction
-            // yard — the pieces an early raider values most. The limb sits
+            // standing superweapons, then the yards (home and outpost),
+            // then the refineries — the pieces an early raider values most.
+            // The limb sits
             // ahead of the gun queue and the ladder walk on purpose: at the
             // chain's old tail it drew ~3 turns per 10000 ticks while the
             // superweapon and the rebuilds held the slot, and `guns_settled`
@@ -7434,6 +7460,14 @@ impl SuperAi {
                     segment_distance(from, (cx, cy), base) <= ALLIED_BASE_CORRIDOR
                         || i32::from((cx - base.0).abs().max((cy - base.1).abs()))
                             < i32::from(distance)
+                }) {
+                    continue;
+                }
+                // The hard enemy floor (C2): the bias only nudges ties — a
+                // field this close to the enemy's standing center is
+                // refused outright, whatever its richness.
+                if enemy_center.is_some_and(|(ex, ey)| {
+                    (cx - ex).abs().max((cy - ey).abs()) < EXPANSION_ENEMY_FLOOR
                 }) {
                     continue;
                 }
@@ -8928,19 +8962,23 @@ impl SuperAi {
     }
 
     /// The next ring cell the wall placement should issue into, walking the
-    /// targets first superweapon, then second superweapon, then construction
-    /// yard — the pieces an early raider values most — and retiring every
-    /// target whose ring is spent (every cell holds a wall, or was tried and
-    /// refused) into [`Self::walled`]. A ring walk reads the live overlay
-    /// grid, so cells already carrying a wall segment are skipped without
-    /// spending a tried-cell mark or a placement strike on them. With
-    /// `escape` set — a ready segment needs a home now — a walk that finds
-    /// nothing gives the tried-cell book one clean second pass on the yard's
-    /// ring, the perpetual fallback, so the walk can move again next tick;
-    /// whatever still refuses re-fills the book and the strike counter paces
-    /// the type, and a ring the auto-fill completed in the meantime answers
-    /// `None`, which the caller answers by canceling the segment instead of
-    /// wedging the one placement slot.
+    /// targets first the standing superweapons, then the construction yards
+    /// (home and outpost), then the refineries — the pieces an early raider
+    /// values most — and retiring every target whose ring is spent (every
+    /// cell holds a wall, or was tried and refused) into [`Self::walled`].
+    /// A ring walk reads the live overlay grid, so cells already carrying a
+    /// wall segment are skipped without spending a tried-cell mark or a
+    /// placement strike on them. A target also owes one segment back for
+    /// every placed cell the raider has since broken (the single-segment
+    /// rebuild, [`Self::wall_built`]) — the rebuild answers ahead of the
+    /// retirement skip, so a breached ring re-arms even after it retired.
+    /// With `escape` set — a ready segment needs a home now — a walk that
+    /// finds nothing gives the tried-cell book one clean second pass on the
+    /// yard's ring, the perpetual fallback, so the walk can move again next
+    /// tick; whatever still refuses re-fills the book and the strike counter
+    /// paces the type, and a ring the auto-fill completed in the meantime
+    /// answers `None`, which the caller answers by canceling the segment
+    /// instead of wedging the one placement slot.
     fn wall_next_cell(
         &mut self,
         sim: &crate::sim::world::Simulation,
@@ -8955,27 +8993,27 @@ impl SuperAi {
                 .and_then(|id| overlays.flags(id))
                 .is_some_and(|flags| flags.wall)
         };
+        // The target roster (B1): every standing structure of the priority
+        // types — both superweapons, every construction yard (the home and
+        // the outpost's), every refinery — collected in the substrate
+        // order's determinism discipline.
+        let mut targets: Vec<(u64, &'static str, u16, u16)> = Vec::new();
         for name in [
             opening.super_weapon_building,
             opening.second_super_weapon_building,
             opening.construction_yard,
+            opening.refinery,
         ] {
-            let Some((id, rx, ry)) =
-                sim.substrate()
-                    .entities
-                    .iter_sorted()
-                    .find_map(|(eid, entity)| {
-                        (entity.owner() == self.house
-                            && entity.category() == crate::map::entities::EntityCategory::Structure
-                            && sim.interner().resolve(entity.type_ref()) == name)
-                            .then_some((eid, entity.position.rx(), entity.position.ry()))
-                    })
-            else {
-                continue;
-            };
-            if self.walled.contains(&id) {
-                continue;
+            for (eid, entity) in sim.substrate().entities.iter_sorted() {
+                if entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Structure
+                    && sim.interner().resolve(entity.type_ref()) == name
+                {
+                    targets.push((eid, name, entity.position.rx(), entity.position.ry()));
+                }
             }
+        }
+        for (id, name, rx, ry) in targets {
             let Some(ty) = rules.object(name) else {
                 continue;
             };
@@ -8984,17 +9022,45 @@ impl SuperAi {
             // against a `u16` wrap belongs on the absolute cell, never on
             // the offset — filtering the offset would clip those two edges
             // off the ring entirely.
-            let cell = wall_ring_cells(ty.foundation.cell_bounds())
+            let ring: Vec<(u16, u16)> = wall_ring_cells(ty.foundation.cell_bounds())
                 .into_iter()
                 .map(|(dx, dy)| (rx as i16 + dx, ry as i16 + dy))
                 .filter(|&(x, y)| x >= 0 && y >= 0)
                 .map(|(x, y)| (x as u16, y as u16))
-                .find(|&cell| !self.wall_cells.contains(&cell) && !holds_wall(cell));
+                .collect();
+            // The placed-cell memory (B1): every ring cell seen carrying a
+            // wall — own strikes that landed and rings a map or auto-fill
+            // completed — enters [`Self::wall_built`] here, ahead of the
+            // retirement skip, so a retired target's standing ring still
+            // teaches the book.
+            for &cell in &ring {
+                if holds_wall(cell) {
+                    self.wall_built.insert(cell);
+                }
+            }
+            // The single-segment rebuild (B1): a placed cell the raider has
+            // since broken owes one segment back, answered ahead of the
+            // retirement skip. Only cells the walk saw standing qualify —
+            // a strike the engine refused never entered the book, so a
+            // blocked ring still retires and the escape cooldown stays the
+            // pacing it was.
+            if let Some(&cell) = ring
+                .iter()
+                .find(|&cell| self.wall_built.contains(cell) && !holds_wall(*cell))
+            {
+                return Some(cell);
+            }
+            if self.walled.contains(&id) {
+                continue;
+            }
+            let cell =
+                ring.into_iter()
+                    .find(|&cell| !self.wall_cells.contains(&cell) && !holds_wall(cell));
             match cell {
                 Some(cell) => return Some(cell),
-                // The ring is spent. One and done either way: a ring fully
-                // walked needs no more segments, and a fallen segment is
-                // never rebuilt.
+                // The ring is spent. A ring fully walked needs no more
+                // segments; a fallen segment re-opens through the
+                // [`Self::wall_built`] rebuild above.
                 None => {
                     self.walled.insert(id);
                 }
@@ -10625,6 +10691,136 @@ impl SuperAi {
             .sum()
     }
 
+    /// The hostile ground combat count — vehicles and foot soldiers
+    /// standing — the ground towers' tiered per-yard quota's threat read
+    /// ([`ground_per_yard_quota`]), the same standing census the air
+    /// ladder reads over [`AIR_THREAT_TYPES`].
+    fn enemy_ground_count(&self, sim: &crate::sim::world::Simulation) -> usize {
+        sim.substrate()
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                self.is_enemy(sim, entity.owner())
+                    && matches!(
+                        entity.category(),
+                        crate::map::entities::EntityCategory::Unit
+                            | crate::map::entities::EntityCategory::Infantry
+                    )
+            })
+            .count()
+    }
+
+    /// The gun limb's wants, one row per gated defense type. The tiered
+    /// per-yard quotas read the standing threat counts here (the AA
+    /// ladder, B3's ground ladder); the first gated type with a base under
+    /// its quota claims the next gun, that base's rings the placement
+    /// intent's target; an empty list — every base at every quota — rests
+    /// the limb. The outpost floor (C1) rides ahead: an expansion under
+    /// its one-gun floor claims the row before the home fill, so the yard
+    /// the wall ring guards is never a naked foundation while the home
+    /// ring arms. The house-wide bounds still cap the program — the split
+    /// moves guns, never inflates them.
+    fn defense_gun_wants(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+        bases: &[(i16, i16)],
+        late_sink: bool,
+        radar_name: &'static str,
+        french_house: bool,
+    ) -> Vec<(&'static str, bool)> {
+        let enemy_air = self.enemy_air_count(sim);
+        let enemy_ground = self.enemy_ground_count(sim);
+        // The ground rows tier with the standing ground war
+        // ([`ground_per_yard_quota`]); the heavy tower keeps its peace
+        // baseline ([`DEFENSE_PER_YARD_HEAVY`]) and its late-sink step on
+        // top of the tier.
+        let heavy_per_yard =
+            ground_per_yard_quota(enemy_ground).max(DEFENSE_PER_YARD_HEAVY) + usize::from(late_sink);
+        let defenses = [
+            (
+                opening.defense_aa,
+                aa_per_yard_quota(enemy_air),
+                AA_DEFENSE_CAP * 3,
+                true,
+            ),
+            (
+                opening.defense_heavy,
+                heavy_per_yard,
+                HEAVY_DEFENSE_CAP * 4 + usize::from(late_sink) * bases.len(),
+                self.count_structures_of_type(sim, radar_name) >= 1,
+            ),
+            (
+                opening.defense_basic,
+                ground_per_yard_quota(enemy_ground),
+                BASIC_DEFENSE_TARGET * 2,
+                true,
+            ),
+            // The garrison bunker: one cheap hole per yard, three to a
+            // house — the Battle Bunker's roof for five soldiers, the Tank
+            // Bunker's hole for one tank, over the perimeter the pillboxes
+            // already hold (the garrison limb fills both). Its row sits
+            // behind the pillbox's so sentry density still wins a contested
+            // slot, and the sides without a bunker hold the pillbox's name
+            // below — never read, the `None` gate short-circuits first.
+            (
+                opening.defense_bunker.unwrap_or(opening.defense_basic),
+                DEFENSE_PER_YARD_BUNKER,
+                BUNKER_DEFENSE_CAP,
+                opening.defense_bunker.is_some(),
+            ),
+            // The defense extension (Layer 2.9): the gap generator and the
+            // Grand Cannon ride the same gun queue step as the core
+            // lines, so the blackout gate above covers them for free — both
+            // are retail `Powered=yes` with `Power=-100` and only queue
+            // while the grid reads `output >= drain`, with the power
+            // preemption standing a plant first when the pending drain
+            // would run the grid red. Their entries sit after the core
+            // lines, so a base arms itself before it decorates. The sides
+            // without a piece hold the basic pillbox's name below — never
+            // read, because the gate's `&&` chain short-circuits on the
+            // `None` field and the gun filter reads the count only behind a
+            // true gate.
+            (
+                opening.gap_generator.unwrap_or(opening.defense_basic),
+                1,
+                2,
+                opening.gap_generator.is_some()
+                    && self.count_structures_of_type(sim, opening.battle_lab) >= 1,
+            ),
+            (
+                opening.country_cannon.unwrap_or(opening.defense_basic),
+                1,
+                2,
+                opening.country_cannon.is_some()
+                    && french_house
+                    && self.count_structures_of_type(sim, radar_name) >= 1,
+            ),
+        ];
+        defenses
+            .iter()
+            .filter_map(|&(name, per_yard, global_bound, gate)| {
+                if !gate || self.count_structures_of_type(sim, name) >= global_bound {
+                    return None;
+                }
+                let under_floor = |cell: (i16, i16)| {
+                    self.count_structures_of_type_near(sim, name, cell, BASE_CLUSTER_RADIUS)
+                        < OUTPOST_GUN_FLOOR.min(per_yard)
+                };
+                if bases.iter().skip(1).copied().any(under_floor) {
+                    return Some((name, true));
+                }
+                bases
+                    .iter()
+                    .position(|&cell| {
+                        self.count_structures_of_type_near(sim, name, cell, BASE_CLUSTER_RADIUS)
+                            < per_yard
+                    })
+                    .map(|index| (name, index >= 1))
+            })
+            .collect()
+    }
+
     /// The specialist a wheel slot goes to once the core has its
     /// [`CORE_BEFORE_SPECIALISTS`] slots: the roster role furthest behind
     /// its demanded share. Hostile aircraft lift anti-air's demand to
@@ -11011,12 +11207,67 @@ impl SuperAi {
             "GeneticConverterSpecial" => self.mutator_pad(sim),
             // S-F: the paradrop's outpost pad, else the enemy's ore line.
             "ParaDropSpecial" | "AmerParaDropSpecial" => self.paradrop_target(sim),
+            // S-F: the free recon pair scouts the fog — the darkest
+            // enemy-side region's center — instead of the destructive score
+            // (a reveal spent on a known structure cell buys nothing).
+            "SpyPlaneSpecial" | "PsychicRevealSpecial" => self.darkest_fog_cell(sim),
             // S-F: the shield rides the alarm.
             "ForceShieldSpecial" => self.force_shield_target(sim, rules),
             // S-D: the scored destructive aim — nuke, storm, and every
             // other enemy-striking special.
             _ => self.scored_strike_cell(sim),
         }
+    }
+
+    /// The free recon pair's aim (S-F): the darkest unexplored region's
+    /// center. The scan strides the fog grid on [`SW_RECON_STRIDE`],
+    /// scores every unrevealed candidate by the still-unrevealed cells
+    /// inside its [`SW_RECON_RADIUS`] box, and a candidate nearer the
+    /// enemy mass center wins the same-darkness ties (the reveal is worth
+    /// most on the approach to the enemy base). Every cell already
+    /// revealed answers `None` — the special holds its charge instead of
+    /// pointing into the known map.
+    fn darkest_fog_cell(&self, sim: &crate::sim::world::Simulation) -> Option<(u16, u16)> {
+        let fog = sim.fog();
+        let (width, height) = (fog.width(), fog.height());
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let enemy = self.enemy_center(sim);
+        let revealed = |rx: u16, ry: u16| fog.is_cell_revealed(self.house, rx, ry);
+        let mut best: Option<(i32, (u16, u16))> = None;
+        let mut cy = 0u16;
+        while cy < height {
+            let mut cx = 0u16;
+            while cx < width {
+                if !revealed(cx, cy) {
+                    let max_x = (cx + SW_RECON_RADIUS).min(width - 1);
+                    let max_y = (cy + SW_RECON_RADIUS).min(height - 1);
+                    let min_x = cx.saturating_sub(SW_RECON_RADIUS);
+                    let min_y = cy.saturating_sub(SW_RECON_RADIUS);
+                    let mut darkness = 0i32;
+                    for ry in min_y..=max_y {
+                        for rx in min_x..=max_x {
+                            if !revealed(rx, ry) {
+                                darkness += 1;
+                            }
+                        }
+                    }
+                    let enemy_gap = enemy.map_or(0, |(ex, ey)| {
+                        (i32::from(cx) - i32::from(ex))
+                            .abs()
+                            .max((i32::from(cy) - i32::from(ey)).abs())
+                    });
+                    let score = darkness * 4096 - enemy_gap;
+                    if best.is_none_or(|(kept, _)| score > kept) {
+                        best = Some((score, (cx, cy)));
+                    }
+                }
+                cx += SW_RECON_STRIDE;
+            }
+            cy += SW_RECON_STRIDE;
+        }
+        best.map(|(_, cell)| cell)
     }
 
     /// The Iron Curtain's column pad (S-A): the first own 3x3 holding
@@ -13558,9 +13809,12 @@ impl SuperAi {
             let (rx, ry) = (entity.position.rx(), entity.position.ry());
             let owner = entity.owner();
             if owner == self.house {
-                if opening.defense_bunker == Some(name) {
-                    bunkers.push((distance_to(rx, ry), id));
-                }
+                // The side's own occupiable structures (the garrison
+                // addendum): the defense bunker the branch first named,
+                // and — with the fork overlay garrisoning the power plants
+                // — every plant the overlay arms. Same nearest-first
+                // ordering as the civilians' follow.
+                bunkers.push((distance_to(rx, ry), id));
                 continue;
             }
             // Neutral: a passive house, never a combatant's.
@@ -14020,6 +14274,67 @@ impl SuperAi {
         };
         let last = house.strategy_emergency().last_building_attack_frame();
         last > 0 && i64::from(tick) - i64::from(last) <= i64::from(BASE_ALARM_TICKS)
+    }
+
+    /// The psychic early warning (A2): the hostile combat unit standing
+    /// inside one of the house's operational PsychicDetection buildings'
+    /// radius, nearest any own yard — the sensor network's warning ahead
+    /// of the first building hit, the same chain the spy defense (E)
+    /// reuses. The engine's own sites
+    /// ([`Simulation::psychic_detection_sites`]) are the source; a
+    /// Chebyshev cell read of their leptons radii keeps the AI's scan
+    /// cheap. `None` — no sensor stands or no hostile walks in.
+    fn psychic_alarm_focus(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+    ) -> Option<(u16, u16)> {
+        let sites: Vec<(i16, i16, i32)> = sim
+            .psychic_detection_sites(self.house, rules)
+            .map(|(coord, radius)| ((coord.x >> 8) as i16, (coord.y >> 8) as i16, radius >> 8))
+            .collect();
+        if sites.is_empty() {
+            return None;
+        }
+        // The threat read's anchor: the first own structure's cell (the
+        // base's standing center) — the detected walker nearest it is the
+        // one marching on the base.
+        let anchor = self
+            .own_structures(sim)
+            .first()
+            .and_then(|&(id, _)| sim.substrate().entities.get(id))
+            .map(|entity| (i32::from(entity.position.rx()), i32::from(entity.position.ry())));
+        let mut best: Option<(i32, (u16, u16))> = None;
+        for (_, entity) in sim.substrate().entities.iter_sorted() {
+            if entity.lifecycle.in_limbo()
+                || !entity.lifecycle.object_alive()
+                || !matches!(
+                    entity.category(),
+                    crate::map::entities::EntityCategory::Unit
+                        | crate::map::entities::EntityCategory::Infantry
+                )
+                || !self.is_enemy(sim, entity.owner())
+            {
+                continue;
+            }
+            let (rx, ry) = (i32::from(entity.position.rx()), i32::from(entity.position.ry()));
+            if !sites.iter().any(|&(sx, sy, radius)| {
+                (rx - i32::from(sx)).abs() <= radius && (ry - i32::from(sy)).abs() <= radius
+            }) {
+                continue;
+            }
+            let distance_squared = anchor
+                .map(|(ax, ay)| {
+                    let dx = rx - ax;
+                    let dy = ry - ay;
+                    dx * dx + dy * dy
+                })
+                .unwrap_or(0);
+            if best.is_none_or(|(kept, _)| distance_squared < kept) {
+                best = Some((distance_squared, (entity.position.rx(), entity.position.ry())));
+            }
+        }
+        best.map(|(_, cell)| cell)
     }
 
     /// The base-alarm limb's one order for this tick, or `None` to fall
@@ -15897,6 +16212,24 @@ fn aa_per_yard_quota(enemy_air: usize) -> usize {
     }
 }
 
+/// The ground towers' per-yard quota against the hostile ground combat
+/// count — the defense limb's tiered ground answer, the AA ladder's shape
+/// on the ground rows: the peace baselines
+/// ([`DEFENSE_PER_YARD_BASIC`]/[`DEFENSE_PER_YARD_HEAVY`]) while the map is
+/// quiet, one extra tower per yard once hostile ground combat fields, two
+/// against a massed assault ([`GROUND_HEAVY_THREATS`]). The limb re-reads
+/// the count every slot, so a peace treaty drops the tier back and the
+/// queue rests at the baseline ring.
+fn ground_per_yard_quota(enemy_ground: usize) -> usize {
+    if enemy_ground >= GROUND_HEAVY_THREATS {
+        DEFENSE_PER_YARD_ASSAULT
+    } else if enemy_ground > 0 {
+        DEFENSE_PER_YARD_WARTIME
+    } else {
+        DEFENSE_PER_YARD_BASIC
+    }
+}
+
 /// The mobile-AA quota the vehicle pipeline owes the army: the
 /// [`AA_UNIT_FLOOR`] pair stands before hostile air exists, and every
 /// two hostile aircraft lift the target one more, capped at
@@ -16352,7 +16685,6 @@ fn scan_site_rings(
     } else {
         1
     };
-    let (fmin_x, fmin_y, fmax_x, fmax_y) = ty.foundation.cell_bounds();
     for radius in 1..=max_radius {
         for dy in -radius..=radius {
             for dx in -radius..=radius {
@@ -16363,68 +16695,194 @@ fn scan_site_rings(
                 if origin.0 <= 0 || origin.1 <= 0 {
                     continue;
                 }
-                if keep_gap
-                    && !foundation_keeps_gap(
-                        (
-                            i32::from(origin.0) + i32::from(fmin_x),
-                            i32::from(origin.1) + i32::from(fmin_y),
-                            i32::from(origin.0) + i32::from(fmax_x),
-                            i32::from(origin.1) + i32::from(fmax_y),
-                        ),
-                        &own_rects,
-                        clearance,
-                    )
-                {
-                    continue;
-                }
-                if crate::sim::build_site::can_place_building_at(
+                if site_candidate_legal(
                     sim,
                     rules,
-                    Some(registry),
+                    registry,
                     ty,
                     origin,
-                    Some(house),
-                    None,
-                    None,
-                ) && build_area_owner.is_none_or(|owner| {
-                    crate::sim::production::is_within_build_area(
-                        sim,
-                        rules,
-                        owner,
-                        ty,
-                        origin.0 as u16,
-                        origin.1 as u16,
-                    )
-                })
-                    // The spaced pass clears the engine's build-area ring on
-                    // its own: the home scans pass no owner (the legacy
-                    // first-legal-cell pick sat close enough that the ring
-                    // held by default), but the gap term pushes the first
-                    // passing candidate well past the BaseNormal ring and
-                    // the engine's placement validation refuses it for real
-                    // (observed: six AI houses re-placing one ready
-                    // building for thousands of ticks — two for a whole
-                    // game — because the spaced scan always answered
-                    // *some* candidate and the degraded pass never got its
-                    // turn). Reading the owner back from the interner keeps
-                    // every legacy signature; the degraded pass below keeps
-                    // the exact old predicate.
-                    && (!keep_gap
-                        || crate::sim::production::is_within_build_area(
-                            sim,
-                            rules,
-                            sim.interner().resolve(house),
-                            ty,
-                            origin.0 as u16,
-                            origin.1 as u16,
-                        ))
-                {
+                    house,
+                    build_area_owner,
+                    &own_rects,
+                    clearance,
+                    keep_gap,
+                ) {
                     return Some((origin.0 as u16, origin.1 as u16));
                 }
             }
         }
     }
     None
+}
+
+/// The per-candidate admission [`scan_site_rings`] and the defense gun's
+/// weighted walk share: the spacing term (when `keep_gap`), the engine's
+/// own placement read, and the build-area ring — the owner filter when the
+/// scan names one, and the spaced pass's own-yard ring. The spaced pass
+/// clears the engine's build-area ring on its own: the home scans pass no
+/// owner (the legacy first-legal-cell pick sat close enough that the ring
+/// held by default), but the gap term pushes the first passing candidate
+/// well past the BaseNormal ring and the engine's placement validation
+/// refuses it for real (observed: six AI houses re-placing one ready
+/// building for thousands of ticks — two for a whole game — because the
+/// spaced scan always answered *some* candidate and the degraded pass
+/// never got its turn). Reading the owner back from the interner keeps
+/// every legacy signature.
+fn site_candidate_legal(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    ty: &crate::rules::object_type::ObjectType,
+    origin: (i16, i16),
+    house: InternedId,
+    build_area_owner: Option<&str>,
+    own_rects: &[(i32, i32, i32, i32)],
+    clearance: i32,
+    keep_gap: bool,
+) -> bool {
+    let (fmin_x, fmin_y, fmax_x, fmax_y) = ty.foundation.cell_bounds();
+    if keep_gap
+        && !foundation_keeps_gap(
+            (
+                i32::from(origin.0) + i32::from(fmin_x),
+                i32::from(origin.1) + i32::from(fmin_y),
+                i32::from(origin.0) + i32::from(fmax_x),
+                i32::from(origin.1) + i32::from(fmax_y),
+            ),
+            own_rects,
+            clearance,
+        )
+    {
+        return false;
+    }
+    crate::sim::build_site::can_place_building_at(
+        sim,
+        rules,
+        Some(registry),
+        ty,
+        origin,
+        Some(house),
+        None,
+        None,
+    ) && build_area_owner.is_none_or(|owner| {
+        crate::sim::production::is_within_build_area(
+            sim,
+            rules,
+            owner,
+            ty,
+            origin.0 as u16,
+            origin.1 as u16,
+        )
+    }) && (!keep_gap
+        || crate::sim::production::is_within_build_area(
+            sim,
+            rules,
+            sim.interner().resolve(house),
+            ty,
+            origin.0 as u16,
+            origin.1 as u16,
+        ))
+}
+
+/// The defense gun's home walk (B2): [`site_candidate_legal`]'s spaced
+/// admission over the whole [`SITE_SEARCH_RADIUS`], ranked before the
+/// pick — [`enemy_direction_bias`] ranks the enemy-facing half of the
+/// field first, the traffic-axis distance breaks the tie toward the
+/// approach corridor, the standing yard's near rings beat the far ones,
+/// and the fixed row-major order breaks the last tie — so a tower stands
+/// on the side the threat comes from instead of the uniform ring's first
+/// cell. The yard-foundation shadow (the near ring on the threat's side
+/// can hold no spaced candidate while the lee side can) is why this is a
+/// whole-field ranking, not a ring-by-ring walk: the ring rule would
+/// hand every east threat's tower to the west. A packed field that
+/// refuses every spaced candidate falls back to the caller's uniform
+/// [`find_site_around`], degraded pass included.
+fn find_defense_site_around(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    ty: &crate::rules::object_type::ObjectType,
+    center: (i16, i16),
+    house: InternedId,
+    enemy_cell: Option<(i16, i16)>,
+    axis: Option<((i16, i16), (i16, i16))>,
+) -> Option<(u16, u16)> {
+    let own_rects = own_structure_rects(sim, rules, house);
+    let clearance = if EXIT_CLEARANCE_TYPES.contains(&ty.id.as_str()) {
+        2
+    } else {
+        1
+    };
+    let mut best: Option<((i32, i32, i32, i32, i32), (u16, u16))> = None;
+    for radius in 1..=SITE_SEARCH_RADIUS {
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx.abs() != radius && dy.abs() != radius {
+                    continue;
+                }
+                let origin = (center.0 + dx, center.1 + dy);
+                if origin.0 <= 0 || origin.1 <= 0 {
+                    continue;
+                }
+                if !site_candidate_legal(
+                    sim,
+                    rules,
+                    registry,
+                    ty,
+                    origin,
+                    house,
+                    None,
+                    &own_rects,
+                    clearance,
+                    true,
+                ) {
+                    continue;
+                }
+                // The weighted key: the enemy-facing bias first, the
+                // traffic-axis distance second (closer to the approach
+                // line wins; squared-cell integer arithmetic, monotone in
+                // the true distance), then the closer ring, then the
+                // row-major order's earlier cell.
+                let bias = enemy_direction_bias(enemy_cell, center, origin);
+                let axis_distance = axis_distance_cells_squared(axis, origin);
+                let key = (
+                    bias,
+                    -axis_distance,
+                    -i32::from(radius),
+                    -i32::from(dy),
+                    -i32::from(dx),
+                );
+                if best.is_none_or(|(kept, _)| key > kept) {
+                    best = Some((key, (origin.0 as u16, origin.1 as u16)));
+                }
+            }
+        }
+    }
+    best.map(|(_, cell)| cell)
+}
+
+/// The squared distance from `cell` to the home→aim traffic-axis line, in
+/// integer cell arithmetic (i64 cross products; a squared metric is
+/// monotone in the true distance). A `None` axis or a degenerate segment
+/// reads zero.
+fn axis_distance_cells_squared(
+    axis: Option<((i16, i16), (i16, i16))>,
+    cell: (i16, i16),
+) -> i32 {
+    let Some(((ax, ay), (bx, by))) = axis else {
+        return 0;
+    };
+    let (dx, dy) = (i64::from(bx) - i64::from(ax), i64::from(by) - i64::from(ay));
+    let length_squared = dx * dx + dy * dy;
+    if length_squared == 0 {
+        return 0;
+    }
+    let (px, py) = (
+        i64::from(cell.0) - i64::from(ax),
+        i64::from(cell.1) - i64::from(ay),
+    );
+    let cross = (dx * py - dy * px).abs();
+    ((cross * cross / length_squared).min(i64::from(i32::MAX))) as i32
 }
 
 /// The first legal placement origin for `ty`, scanning outward from `center`
@@ -16705,13 +17163,14 @@ mod tests {
     use super::{
         AA_COUNTER_AIR_THREATS, AA_COUNTER_ROLE_SHARE, AA_COUNTER_VEHICLE_FLOOR, AA_UNIT_CAP,
         AA_UNIT_FLOOR, AIR_WING_TARGET, BUILD_QUEUE_RETRY_TICKS, DEFENSE_PER_YARD_AA_BASE,
-        DEFENSE_PER_YARD_AA_HEAVY, DEFENSE_PER_YARD_AA_WARTIME, EXPANSION_MIN_DISTANCE,
+        DEFENSE_PER_YARD_AA_HEAVY, DEFENSE_PER_YARD_AA_WARTIME, DEFENSE_PER_YARD_ASSAULT,
+        DEFENSE_PER_YARD_BASIC, DEFENSE_PER_YARD_WARTIME, EXPANSION_MIN_DISTANCE,
         FLOATER_COUNTER_THREATS, FLOATER_TYPES, OPENINGS, ORE_ENEMY_DIRECTION_BIAS,
         ROLE_SHARE_BASE, ROLE_SHARE_BOOST, Role, RosterEntry, SuperAi, SuperAiDifficulty,
         TECH_BUILDING_TYPES, aa_per_yard_quota, aa_unit_target, aa_vehicle_target, anti_air_demand,
-        capture_priority_rank, enemy_direction_bias, foundation_keeps_gap,
-        nearest_connected_target, rally_anchor, spy_infiltration_rank, tech_bank_short,
-        wall_ring_cells,
+        capture_priority_rank, enemy_direction_bias, find_defense_site_around,
+        foundation_keeps_gap, ground_per_yard_quota, nearest_connected_target, rally_anchor,
+        spy_infiltration_rank, tech_bank_short, wall_ring_cells,
     };
     use crate::sim::intern::InternedId;
     use crate::sim::runtime::SimRuntime;
@@ -20666,6 +21125,105 @@ mod tests {
         );
     }
 
+    /// The outpost siting's hard enemy floor (C2): a hostile combat mass
+    /// camped on the winning field pulls the enemy center onto it, and the
+    /// survey refuses every cell within [`EXPANSION_ENEMY_FLOOR`] of that
+    /// center — the bias only nudges ties, the floor keeps the yard out of
+    /// the raider's ground outright.
+    #[test]
+    #[ignore = "slow; retail; loads a retail map"]
+    fn ore_field_survey_refuses_ground_inside_the_enemy_floor() {
+        let (mut scenario, human) = retail_battle();
+        let enemy_house = scenario
+            .sim()
+            .houses()
+            .iter()
+            .find(|(_, house)| !house.is_controlled_by_human(true))
+            .map(|(&id, _)| id)
+            .expect("the battle's opponent");
+        let ai = SuperAi::new(human, SuperAiDifficulty::Fair);
+        let mcv_cell = scenario
+            .sim()
+            .substrate()
+            .entities
+            .iter_sorted()
+            .find(|(_, entity)| {
+                entity.owner() == human
+                    && entity.category() == crate::map::entities::EntityCategory::Unit
+                    && scenario.sim().interner().resolve(entity.type_ref()) == "AMCV"
+            })
+            .map(|(_, entity)| (entity.position.rx() as i16, entity.position.ry() as i16))
+            .expect("the launch MCV");
+        let survey = |scenario: &crate::headless_scenario::HeadlessScenario,
+                      ai: &SuperAi,
+                      from: (i16, i16)| {
+            ai.best_ore_field(
+                scenario.sim(),
+                &scenario.runtime.resources.rules,
+                &scenario.runtime.resources.overlay_registry,
+                from,
+                None,
+                Some("GAREFN"),
+            )
+        };
+        let first = survey(&scenario, &ai, mcv_cell)
+            .expect("the retail battle map hosts a reachable far ore field");
+
+        // A hostile combat mass camps the winning field: nine tanks in a
+        // tight block own the enemy center outright.
+        for dy in 0..3_i16 {
+            for dx in 0..3_i16 {
+                spawn_near(
+                    &mut scenario,
+                    "HTNK",
+                    enemy_house,
+                    (
+                        (first.0 as i16 + dx).max(0) as u16,
+                        (first.1 as i16 + dy).max(0) as u16,
+                    ),
+                );
+            }
+        }
+        let enemy_center = {
+            let sim = scenario.sim();
+            let mut sum_x = 0_i64;
+            let mut sum_y = 0_i64;
+            let mut count = 0_u64;
+            for (_, entity) in sim.substrate().entities.iter_sorted() {
+                if !matches!(
+                    entity.category(),
+                    crate::map::entities::EntityCategory::Unit
+                        | crate::map::entities::EntityCategory::Infantry
+                ) || entity.lifecycle.in_limbo()
+                    || entity.owner() != enemy_house
+                {
+                    continue;
+                }
+                sum_x += i64::from(entity.position.rx());
+                sum_y += i64::from(entity.position.ry());
+                count += 1;
+            }
+            (count > 0).then(|| ((sum_x / count as i64) as i32, (sum_y / count as i64) as i32))
+        }
+        .expect("the camped mass stands");
+        let second = survey(&scenario, &ai, mcv_cell);
+        let floor_distance = |cell: (u16, u16)| {
+            (i32::from(cell.0) - enemy_center.0)
+                .abs()
+                .max((i32::from(cell.1) - enemy_center.1).abs())
+        };
+        assert!(
+            floor_distance(first) < i32::from(super::EXPANSION_ENEMY_FLOOR),
+            "setup: the camped mass must sit on the first pick (center {enemy_center:?}, \
+             first {first:?})"
+        );
+        assert!(
+            second.is_none_or(|cell| floor_distance(cell) >= i32::from(super::EXPANSION_ENEMY_FLOOR)),
+            "the survey latched ground inside the enemy floor: pick {second:?}, \
+             enemy center {enemy_center:?}"
+        );
+    }
+
     /// The ore survey's enemy-direction term is a tie nudge with both
     /// signs and no hard side: a field toward the enemy wins the ties a
     /// backward field loses, no enemy reading at all leaves the score
@@ -21570,6 +22128,59 @@ mod tests {
                 "the toggle cleared the outpost's flag"
             );
         }
+    }
+
+    /// The free recon specials' aim (S-F): the darkest unexplored region's
+    /// center wins, and a fully lit map holds the charge instead of aiming.
+    #[test]
+    fn darkest_fog_cell_picks_the_unrevealed_pocket_and_holds_on_a_lit_map() {
+        let mut sim = crate::sim::world::Simulation::new();
+        let house = sim.intern("SuperAiTest");
+        sim.fog_mut_for_test().set_width_for_test(64);
+        sim.fog_mut_for_test().set_height_for_test(64);
+        let ai = SuperAi::new(house, SuperAiDifficulty::Fair);
+        let insert_plane = |sim: &mut crate::sim::world::Simulation, plane| {
+            sim.fog_mut_for_test()
+                .by_owner_mut_for_test()
+                .insert(house, plane);
+        };
+        // Every cell dark: the interior candidates share the full score
+        // box, so the first row-major stride candidate with the full box
+        // wins — the scan's determinism discipline.
+        insert_plane(
+            &mut sim,
+            crate::sim::vision::OwnerVisibility::new(64, 64),
+        );
+        assert_eq!(ai.darkest_fog_cell(&sim), Some((8, 8)));
+
+        // Reveal everything except a pocket in the far corner: the last
+        // dark region's interior is the aim.
+        let mut plane = crate::sim::vision::OwnerVisibility::new(64, 64);
+        for ry in 0..64u16 {
+            for rx in 0..64u16 {
+                if !(48..64).contains(&rx) || !(48..64).contains(&ry) {
+                    plane.mark_visible(rx, ry);
+                }
+            }
+        }
+        insert_plane(&mut sim, plane);
+        let picked = ai
+            .darkest_fog_cell(&sim)
+            .expect("the dark pocket is an aim");
+        assert!(
+            (48..64).contains(&picked.0) && (48..64).contains(&picked.1),
+            "the aim sits in the pocket, got {picked:?}"
+        );
+
+        // The pocket lit too: nothing dark remains, the charge holds.
+        let mut plane = crate::sim::vision::OwnerVisibility::new(64, 64);
+        for ry in 0..64u16 {
+            for rx in 0..64u16 {
+                plane.mark_visible(rx, ry);
+            }
+        }
+        insert_plane(&mut sim, plane);
+        assert_eq!(ai.darkest_fog_cell(&sim), None, "a lit map holds");
     }
 
     /// One synthetic defense-map world, installed through the production
@@ -23256,6 +23867,365 @@ mod tests {
         assert_eq!(
             plain_orders, 0,
             "the plain marcher keeps its immunity: no Stop, Move or Scatter"
+        );
+    }
+    /// The psychic early warning (A2): a hostile standing inside the
+    /// powered sensor network's radius is the alarm's focus ahead of any
+    /// building hit; outside every radius the read is quiet.
+    #[test]
+    fn psychic_detection_raises_the_alarm_before_a_hit() {
+        let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
+        else {
+            return;
+        };
+        let (mut sim, tank, americans) =
+            crate::sim::psychic_detection::psychic_sensor_watch_fixture(&rules);
+        let ai = SuperAi::new(americans, SuperAiDifficulty::Fair);
+        // The Russian tank stands 14 cells from the powered NAPSIS
+        // (`PsychicDetectionRadius=15`): the walker's cell is the focus.
+        assert_eq!(ai.psychic_alarm_focus(&sim, &rules), Some((2, 2)));
+
+        // The same walker beyond every sensor radius: the read is quiet.
+        sim.substrate_mut_for_test()
+            .entities
+            .get_mut(tank)
+            .unwrap()
+            .position = crate::sim::movement::ground_pose::Position::new(
+            40,
+            40,
+            0,
+            None,
+            crate::util::fixed_math::SIM_ZERO,
+            crate::util::fixed_math::SIM_ZERO,
+        );
+        assert_eq!(ai.psychic_alarm_focus(&sim, &rules), None);
+    }
+
+    /// The wall roster (B1): the walk serves the outpost yard's and the
+    /// refinery's own rings after the home yard's, and every roster target
+    /// retires when its ring is spent.
+    #[test]
+    #[ignore = "slow; retail; loads a retail map"]
+    fn wall_targets_walk_the_outpost_yard_and_the_refinery() {
+        let (mut scenario, ai_house, _enemy) = pacific_bridge_battle();
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+        spawn_near(&mut scenario, "GACNST", ai_house, (64, 92));
+        spawn_near(&mut scenario, "GACNST", ai_house, (96, 40));
+        spawn_near(&mut scenario, "GAREFN", ai_house, (72, 64));
+        let opening = OPENINGS
+            .iter()
+            .find(|opening| opening.construction_yard == "GACNST")
+            .expect("the Allied opening");
+        let rules = &scenario.runtime.resources.rules;
+        let overlays = &scenario.runtime.resources.overlay_registry;
+        let standing = |sim: &crate::sim::world::Simulation, name: &str| -> Vec<u64> {
+            sim.substrate()
+                .entities
+                .iter_sorted()
+                .filter(|(_, entity)| {
+                    entity.owner() == ai_house
+                        && entity.category() == crate::map::entities::EntityCategory::Structure
+                        && sim.interner().resolve(entity.type_ref()) == name
+                })
+                .map(|(id, _)| id)
+                .collect()
+        };
+        let (yard_ids, refinery_ids) = {
+            let sim = scenario.sim();
+            (standing(sim, "GACNST"), standing(sim, "GAREFN"))
+        };
+        assert_eq!(yard_ids.len(), 2, "home and outpost yards stand");
+        assert_eq!(refinery_ids.len(), 1, "the refinery stands");
+
+        // The placement branch's book-keeping: every answered cell enters
+        // the tried book, until the whole roster retires.
+        let mut served: Vec<(u16, u16)> = Vec::new();
+        while let Some(cell) =
+            ai.wall_next_cell(scenario.sim(), rules, opening, overlays, false)
+        {
+            ai.wall_cells.insert(cell);
+            served.push(cell);
+            assert!(served.len() < 500, "the roster walk must terminate");
+        }
+        for id in yard_ids.iter().chain(refinery_ids.iter()) {
+            assert!(ai.walled.contains(id), "every roster target retires");
+        }
+        // The refinery's and the outpost yard's own perimeters appear in
+        // the served set — the walk reached past the home yard.
+        let sim = scenario.sim();
+        for id in refinery_ids.iter().chain(yard_ids.iter()) {
+            let Some(entity) = sim.substrate().entities.get(*id) else {
+                continue;
+            };
+            let Some(ty) = rules.object(sim.interner().resolve(entity.type_ref())) else {
+                continue;
+            };
+            let (rx, ry) = (entity.position.rx(), entity.position.ry());
+            let ring: std::collections::HashSet<(u16, u16)> =
+                wall_ring_cells(ty.foundation.cell_bounds())
+                    .into_iter()
+                    .map(|(dx, dy)| (rx as i16 + dx, ry as i16 + dy))
+                    .filter(|&(x, y)| x >= 0 && y >= 0)
+                    .map(|(x, y)| (x as u16, y as u16))
+                    .collect();
+            let name = sim.interner().resolve(entity.type_ref());
+            assert!(
+                served.iter().any(|cell| ring.contains(cell)),
+                "the walk served {name}'s ring"
+            );
+        }
+    }
+
+    /// The single-segment rebuild (B1): a ring cell the walk saw carrying a
+    /// wall enters the placed-cell book, and once that segment falls the
+    /// walk answers the same cell even though the target already retired —
+    /// one segment back for the fallen cell. A tried-and-refused cell never
+    /// enters the book, so it never re-opens a retired ring.
+    #[test]
+    #[ignore = "slow; retail; loads a retail map"]
+    fn wall_rebuild_answers_a_fallen_placed_cell_past_retirement() {
+        let (mut scenario, ai_house, _enemy) = pacific_bridge_battle();
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        scenario.apply_super_ai_tier(ai_house, SuperAiDifficulty::Fair);
+        spawn_near(&mut scenario, "GACNST", ai_house, (64, 92));
+        let opening = OPENINGS
+            .iter()
+            .find(|opening| opening.construction_yard == "GACNST")
+            .expect("the Allied opening");
+        let rules = &scenario.runtime.resources.rules;
+        let overlays = &scenario.runtime.resources.overlay_registry;
+        let wall_id = (0..=u8::MAX)
+            .find(|&id| overlays.flags(id).is_some_and(|flags| flags.wall))
+            .expect("the retail overlay table carries a wall");
+        let (yard_id, rx, ry) = scenario
+            .sim()
+            .substrate()
+            .entities
+            .iter_sorted()
+            .find_map(|(id, entity)| {
+                (entity.owner() == ai_house
+                    && entity.category() == crate::map::entities::EntityCategory::Structure
+                    && scenario.sim().interner().resolve(entity.type_ref()) == "GACNST")
+                    .then_some((id, entity.position.rx(), entity.position.ry()))
+            })
+            .expect("the standing yard");
+        let bounds = rules.object("GACNST").unwrap().foundation.cell_bounds();
+        let ring: Vec<(u16, u16)> = wall_ring_cells(bounds)
+            .into_iter()
+            .map(|(dx, dy)| (rx as i16 + dx, ry as i16 + dy))
+            .filter(|&(x, y)| x >= 0 && y >= 0)
+            .map(|(x, y)| (x as u16, y as u16))
+            .collect();
+
+        // A placed segment stands on a ring cell the walk has not tried:
+        // the walk skips it (the overlay holds) and learns the cell into
+        // the placed-cell book.
+        let placed = ring[0];
+        scenario
+            .runtime
+            .simulation
+            .place_overlay_for_test(placed, wall_id, 0, overlays);
+        while let Some(cell) =
+            ai.wall_next_cell(scenario.sim(), rules, opening, overlays, false)
+        {
+            ai.wall_cells.insert(cell);
+            assert!(ai.wall_cells.len() < 100, "the ring walk must terminate");
+        }
+        assert!(
+            ai.wall_built.contains(&placed),
+            "the standing segment is learned into the placed-cell book"
+        );
+        assert!(
+            ai.walled.contains(&yard_id),
+            "the fully tried ring retires"
+        );
+
+        // The segment falls: the walk answers the same cell past
+        // retirement — the single-segment rebuild.
+        scenario
+            .runtime
+            .simulation
+            .overlay_cell_mut_for_test(placed.0, placed.1)
+            .overlay_id = None;
+        assert_eq!(
+            ai.wall_next_cell(scenario.sim(), rules, opening, overlays, false),
+            Some(placed),
+            "the fallen placed cell is served past retirement"
+        );
+    }
+
+    /// The ground towers' per-yard quota tiers with the ground war (B3),
+    /// the AA ladder's shape on the ground rows: the peace baseline while
+    /// the map is quiet, one extra tower once hostile ground combat
+    /// fields, two against a massed assault.
+    #[test]
+    fn ground_tower_quota_tiers_with_the_ground_war() {
+        assert_eq!(ground_per_yard_quota(0), DEFENSE_PER_YARD_BASIC);
+        assert_eq!(
+            ground_per_yard_quota(1),
+            DEFENSE_PER_YARD_WARTIME,
+            "one hostile rifle lifts the ground rows out of peace"
+        );
+        assert_eq!(ground_per_yard_quota(7), DEFENSE_PER_YARD_WARTIME);
+        assert_eq!(ground_per_yard_quota(8), DEFENSE_PER_YARD_ASSAULT);
+        assert_eq!(ground_per_yard_quota(24), DEFENSE_PER_YARD_ASSAULT);
+        assert_eq!(
+            (
+                DEFENSE_PER_YARD_BASIC,
+                DEFENSE_PER_YARD_WARTIME,
+                DEFENSE_PER_YARD_ASSAULT
+            ),
+            (2, 3, 4),
+            "the ground ladder rides one step above the AA's at every tier"
+        );
+    }
+
+    /// The gun ring walk's enemy-axis weighting (B2): a hostile bearing
+    /// east of the yard hands the pillbox a cell on the east side, the
+    /// mirrored western bearing a cell on the west side — the tower stands
+    /// on the side the threat comes from. The yard's own foundation
+    /// shadows the near ring on the threat's side, which is exactly why
+    /// the walk ranks the whole field instead of the first legal ring.
+    #[test]
+    fn gun_site_walk_answers_the_enemy_facing_side() {
+        let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
+        else {
+            return;
+        };
+        let mut sim = crate::sim::world::Simulation::new();
+        let house = sim.intern("SuperAiTest");
+        crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
+        sim.spawn_object_at_height("GACNST", "SuperAiTest", 16, 16, 0, 0, &rules)
+            .expect("the yard stands");
+        let registry = crate::rules::overlay_types::OverlayTypeRegistry::from_ini(
+            &crate::rules::ini_parser::IniFile::from_str(""),
+            None,
+        );
+        let ty = rules.object("GAPILL").expect("the Allied pillbox reads");
+        let center = (16_i16, 16_i16);
+        // The bearing reads sit close enough that the bias's 5/4 ratio
+        // splits the ring: the western cells fall outside it for an
+        // eastern threat (7*5/4 < 9) and the eastern for a western one.
+        let east = find_defense_site_around(
+            &sim,
+            &rules,
+            &registry,
+            ty,
+            center,
+            house,
+            Some((23, 16)),
+            Some((center, (23, 16))),
+        )
+        .expect("an empty field admits a pillbox");
+        let west = find_defense_site_around(
+            &sim,
+            &rules,
+            &registry,
+            ty,
+            center,
+            house,
+            Some((9, 16)),
+            Some((center, (9, 16))),
+        )
+        .expect("an empty field admits a pillbox");
+        assert!(
+            i32::from(east.0) > i32::from(center.0),
+            "the eastern threat's tower stands east: got {east:?}"
+        );
+        assert!(
+            i32::from(west.0) < i32::from(center.0),
+            "the western threat's tower stands west: got {west:?}"
+        );
+        // The mirrored walks do not collide on one cell: the bias moved
+        // the pick across the yard.
+        assert_ne!(east, west);
+    }
+
+    /// The outpost gun floor (C1): a bare expansion claims the core row
+    /// ahead of the home fill, and once its one-gun floor stands the home
+    /// yard's quota fills first again.
+    #[test]
+    fn the_outpost_gun_floor_claims_the_row_before_the_home_fill() {
+        let (mut sim, rules, ai_house, _enemy) = defense_world_with(
+            "[BuildingTypes]\n1=GACNST\n2=GAPILL\n\
+             [GACNST]\nStrength=1000\nFoundation=1x1\nCost=2000\nTechLevel=1\n\
+             [GAPILL]\nStrength=400\nFoundation=1x1\nCost=500\nTechLevel=1\n",
+            "",
+        );
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
+            .expect("the home yard stands");
+        sim.spawn_object_at_height("GACNST", &ai_owner, 24, 20, 0, 0, &rules)
+            .expect("the outpost yard stands");
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        let opening = OPENINGS
+            .iter()
+            .find(|opening| opening.construction_yard == "GACNST")
+            .expect("the Allied opening");
+        let bases = [(10_i16, 10_i16), (24_i16, 20_i16)];
+        // Peace quotas; no radar stands, so the heavy row's gate stays
+        // closed and the read is the AA and pillbox rows alone.
+        let wants = ai.defense_gun_wants(&sim, opening, &bases, false, "GAAIRC", false);
+        assert_eq!(
+            wants.iter().find(|(name, _)| *name == "GAPILL"),
+            Some(&("GAPILL", true)),
+            "the bare outpost claims the pillbox row ahead of the home fill"
+        );
+        // The floor stands: the home fill resumes the row.
+        sim.spawn_object_at_height("GAPILL", &ai_owner, 29, 20, 0, 0, &rules)
+            .expect("the outpost pillbox stands");
+        let wants = ai.defense_gun_wants(&sim, opening, &bases, false, "GAAIRC", false);
+        assert_eq!(
+            wants.iter().find(|(name, _)| *name == "GAPILL"),
+            Some(&("GAPILL", false)),
+            "with the floor met the home fill claims the row"
+        );
+    }
+
+    /// The garrison scan's own-building branch (the garrison addendum):
+    /// an own occupiable structure — the fork overlay's power plant, or
+    /// the fixture's civilian hall — latches as a target with its full
+    /// capacity's demand, and an own building without the keys never does.
+    #[test]
+    fn garrison_scan_latches_own_occupiable_structures() {
+        let (mut sim, rules, ai_house, _enemy) = defense_forces_world();
+        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        sim.spawn_object_at_height("CIVHOLD", &ai_owner, 12, 12, 0, 0, &rules)
+            .expect("the own hall stands");
+        sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
+            .expect("the yard stands");
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        let opening = OPENINGS
+            .iter()
+            .find(|opening| opening.construction_yard == "GACNST")
+            .expect("the Allied opening");
+        ai.garrison_scan(&sim, &rules, opening, (10, 10));
+        let (hall, yard) = {
+            let sim = &sim;
+            let id_of = |name: &str| {
+                sim.substrate()
+                    .entities
+                    .iter_sorted()
+                    .find(|(_, entity)| {
+                        entity.owner() == ai_house
+                            && sim.interner().resolve(entity.type_ref()) == name
+                    })
+                    .map(|(id, _)| id)
+            };
+            (id_of("CIVHOLD").expect("the hall"), id_of("GACNST").expect("the yard"))
+        };
+        assert!(
+            ai.garrison_targets.contains(&hall),
+            "the own occupiable hall is a target"
+        );
+        assert_eq!(
+            ai.garrison_demand, 5,
+            "the hall's full capacity rides the demand"
+        );
+        assert!(
+            !ai.garrison_targets.contains(&yard),
+            "the plain yard is not a garrison target"
         );
     }
 }
