@@ -967,6 +967,25 @@ const DEFENSE_INTERCEPT_WITHDRAW_FRACTION: i32 = 600;
 /// path, so the AttackMove meets it head-on instead of chasing its tail.
 const DEFENSE_INTERCEPT_MEET_FRACTION: i32 = 250;
 
+/// ---- D2 quality production. The mix leads with the best hull the
+/// wallet can field, and keeps a cheap contingent for the wall: the
+/// candidate order per line walks cost-descending, with the cheapest row
+/// pulled to the front only while the fodder contingent sits under its
+/// share. The share rides the wave pressure — a live wave asks for
+/// bodies at the line, a quiet map asks for quality alone.
+/// The wave pressure (observed-or-scheduled ground hostiles) at which
+/// the fodder share widens to its wartime size.
+const DEFENSE_QUALITY_PRESSURE: usize = 8;
+/// The fodder share in peace (numerator over denominator of the
+/// fielded count): roughly one cheap hull in eight screens the quality
+/// line.
+const DEFENSE_FODDER_PEACE_NUM: usize = 1;
+const DEFENSE_FODDER_PEACE_DEN: usize = 8;
+/// The fodder share in wartime: every third fielded hull holds the
+/// wall while the quality line shoots behind it.
+const DEFENSE_FODDER_WARTIME_NUM: usize = 1;
+const DEFENSE_FODDER_WARTIME_DEN: usize = 3;
+
 /// The wall ring's wallet floor: a wall segment is 100 credits, and the
 /// ring spends dozens of them one production cycle at a time. The floor
 /// sits just under a tank's price, not above it: a war economy's unit
@@ -1910,6 +1929,49 @@ fn defense_meet_cell(core: (i16, i16), anchor: (i16, i16)) -> (i16, i16) {
         core.0 + (dx * DEFENSE_INTERCEPT_MEET_FRACTION / 1000) as i16,
         core.1 + (dy * DEFENSE_INTERCEPT_MEET_FRACTION / 1000) as i16,
     )
+}
+
+/// One production line's candidate order under the quality policy: the
+/// rows walk cost-descending — the best hull first — with the cheapest
+/// row pulled to the front only while the fodder contingent sits under
+/// its wave-pressure share (the wall's bodies, [`DEFENSE_QUALITY_PRESSURE`]
+/// and friends). Ties hold the roster's own order. The caller's
+/// affordability and buildability gates still walk the list and skip —
+/// a poor wallet files the best hull it can afford, never a stall.
+fn defense_quality_order(
+    candidates: &[(i32, usize, &'static str)],
+    wartime: bool,
+    fielded_total: usize,
+    fodder_fielded: usize,
+) -> Vec<&'static str> {
+    let (num, den) = if wartime {
+        (DEFENSE_FODDER_WARTIME_NUM, DEFENSE_FODDER_WARTIME_DEN)
+    } else {
+        (DEFENSE_FODDER_PEACE_NUM, DEFENSE_FODDER_PEACE_DEN)
+    };
+    let mut ranked: Vec<(i32, usize, &'static str)> = candidates.to_vec();
+    ranked.sort_by_key(|&(cost, index, _)| (std::cmp::Reverse(cost), index));
+    let cheapest = candidates
+        .iter()
+        .copied()
+        .min_by_key(|&(cost, index, _)| (cost, index))
+        .map(|(_, _, name)| name);
+    let cheapest = match cheapest {
+        Some(name) => name,
+        None => return Vec::new(),
+    };
+    if fodder_fielded < fielded_total * num / den {
+        let mut order = vec![cheapest];
+        order.extend(
+            ranked
+                .into_iter()
+                .filter(|&(_, _, name)| name != cheapest)
+                .map(|(_, _, name)| name),
+        );
+        order
+    } else {
+        ranked.into_iter().map(|(_, _, name)| name).collect()
+    }
 }
 
 /// The battlefield role a buildable combat type fills in the army mix.
@@ -11734,9 +11796,21 @@ impl SuperAi {
     ) -> Option<Command> {
         // The role targets: the mix's own answer to the observed wave.
         let (anti_air, anti_armor, anti_foot) = self.defense_mix_targets();
-        // The candidates per role, roster order first, the fallbacks last.
-        // The deficits, most-behind first; ties hold the air, armor, foot
-        // order — the answer that dies fastest leads.
+        // The candidates per role, under the quality policy: the rows
+        // walk cost-descending with the cheapest pulled forward only
+        // while the fodder contingent sits under its share — the wave
+        // pressure ([`DEFENSE_QUALITY_PRESSURE`]) sizes the contingent.
+        // The deficits, most-behind first; ties hold the air, armor,
+        // foot order — the answer that dies fastest leads.
+        let wartime = match self.defense.as_ref() {
+            Some(persona) => {
+                let observed = persona.observed_wave_composition;
+                let scheduled = persona.scheduled_wave_composition;
+                (observed.infantry + observed.vehicles).max(scheduled.infantry + scheduled.vehicles)
+                    >= DEFENSE_QUALITY_PRESSURE
+            }
+            None => false,
+        };
         let mut demands = [
             (
                 Role::AntiAir,
@@ -11768,7 +11842,29 @@ impl SuperAi {
             if *deficit == 0 {
                 continue;
             }
-            for &name in names.iter() {
+            let candidates: Vec<(i32, usize, &'static str)> = names
+                .iter()
+                .enumerate()
+                .map(|(index, &name)| {
+                    (
+                        rules.object(name).map(|ty| ty.cost).unwrap_or(0),
+                        index,
+                        name,
+                    )
+                })
+                .collect();
+            let fielded_total = names
+                .iter()
+                .map(|&name| self.count_combat_of_type(sim, name))
+                .sum::<usize>();
+            let fodder_fielded = candidates
+                .iter()
+                .copied()
+                .min_by_key(|&(cost, index, _)| (cost, index))
+                .map(|(_, _, name)| self.count_combat_of_type(sim, name))
+                .unwrap_or(0);
+            let order = defense_quality_order(&candidates, wartime, fielded_total, fodder_fielded);
+            for &name in order.iter() {
                 let Some(ty) = rules.object(name) else {
                     continue;
                 };
@@ -11824,10 +11920,15 @@ impl SuperAi {
         // rest until the next wave cadence while the wallet banked — a
         // quiet stretch hollowed the fielded answer the next wave spends.
         // Surplus production keeps both lines rolling while the wallet
-        // holds above the reserve: the core soldier rides the idle
-        // infantry line, the core hull the idle vehicle line, the surplus
-        // rolling to the idle pool like the battle wheel's own output.
-        for (infantry, name) in [(true, opening.basic_infantry), (false, opening.main_tank)] {
+        // holds above the reserve, the surplus rolling to the idle pool
+        // like the battle wheel's own output. Under the quality policy
+        // the filler is the line's own roster in the quality order — the
+        // best hull each line can build, with the cheapest row pulled
+        // forward while the fodder contingent sits under its share. The
+        // gates walk the order and skip (a gated tier-2 row, a hull the
+        // wallet cannot yet carry), so the line files the best row it
+        // can afford and never stalls on saving up.
+        for infantry in [true, false] {
             let category = if infantry {
                 crate::sim::production::ProductionCategory::Infantry
             } else {
@@ -11836,24 +11937,83 @@ impl SuperAi {
             if queue.iter().any(|item| item.queue_category == category) {
                 continue;
             }
-            let Some(ty) = rules.object(name) else {
-                continue;
+            // The line's roster: the core row first (a side whose tables
+            // name no extra rows still fields its core), then the
+            // opening's own rows of that line's table, deduplicated in
+            // order.
+            let mut roster: Vec<&'static str> = Vec::new();
+            roster.push(if infantry {
+                opening.basic_infantry
+            } else {
+                opening.main_tank
+            });
+            let table = if infantry {
+                &opening.infantry
+            } else {
+                &opening.vehicles
             };
-            if crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
-                != crate::sim::production::CanBuild::Yes
-                || credits < ty.cost
-                || !self.above_fort_reserve(sim, owner, ty.cost)
-            {
-                continue;
+            for entry in table.iter() {
+                if !roster.contains(&entry.name) {
+                    roster.push(entry.name);
+                }
             }
-            let Some(type_id) = sim.interner().get(name) else {
-                continue;
-            };
-            if !self.production_retry_ready(sim, rules, type_id, tick) {
-                continue;
-            }
-            if let Some(command) = self.file_production(sim, rules, type_id, tick) {
-                return Some(command);
+            let candidates: Vec<(i32, usize, &'static str)> = roster
+                .iter()
+                .enumerate()
+                .map(|(index, &name)| {
+                    (
+                        rules.object(name).map(|ty| ty.cost).unwrap_or(0),
+                        index,
+                        name,
+                    )
+                })
+                .collect();
+            let fielded_total = roster
+                .iter()
+                .map(|&name| self.count_combat_of_type(sim, name))
+                .sum::<usize>();
+            let fodder_fielded = candidates
+                .iter()
+                .copied()
+                .min_by_key(|&(cost, index, _)| (cost, index))
+                .map(|(_, _, name)| self.count_combat_of_type(sim, name))
+                .unwrap_or(0);
+            let order = defense_quality_order(&candidates, wartime, fielded_total, fodder_fielded);
+            for &name in order.iter() {
+                let Some(ty) = rules.object(name) else {
+                    continue;
+                };
+                // The roster row's needs gate, the core row ungated — the
+                // engine's own CanBuild skips `Prerequisite=` chains for a
+                // house no human controls, so a gated row behind a missing
+                // lab would queue on a lit cameo and never fire.
+                let needs = opening
+                    .vehicles
+                    .iter()
+                    .chain(opening.infantry.iter())
+                    .find(|entry| entry.name == name)
+                    .and_then(|entry| entry.needs);
+                if let Some(gate) = needs
+                    && !self.needs_structure_stands(sim, gate)
+                {
+                    continue;
+                }
+                if crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                    != crate::sim::production::CanBuild::Yes
+                    || credits < ty.cost
+                    || !self.above_fort_reserve(sim, owner, ty.cost)
+                {
+                    continue;
+                }
+                let Some(type_id) = sim.interner().get(name) else {
+                    continue;
+                };
+                if !self.production_retry_ready(sim, rules, type_id, tick) {
+                    continue;
+                }
+                if let Some(command) = self.file_production(sim, rules, type_id, tick) {
+                    return Some(command);
+                }
             }
         }
         None
