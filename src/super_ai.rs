@@ -1083,6 +1083,13 @@ const NAVAL_SORTIE_FLEET_MIN: usize = 2;
 /// perimeter attack and the alarm recall.
 const SENTRY_DOGS_PER_YARD: usize = 2;
 
+/// The sentry choke post's band: how far out of home along the traffic
+/// axis the entrance post sits ([`entrance_choke_cell`]) — far enough to
+/// meet the walk-in at the perimeter, near enough the engine's leash
+/// holds the dog against the chase home.
+const ENTRANCE_POST_MIN: i32 = 5;
+const ENTRANCE_POST_MAX: i32 = 13;
+
 /// Ticks between amphibious-ferry windows (the transport's dock, sail and
 /// unload legs, [`Self::ferry_orders`]): the branch is a pacing problem —
 /// one leg per window, the order gate pacing each passenger's boarding
@@ -1198,6 +1205,11 @@ const ENEMY_POWER_TYPES: [&str; 3] = ["GAPOWR", "NAPOWR", "YAPOWR"];
 /// Enemy refineries the Floating Disk raids when no plant stands.
 const ENEMY_REFINERY_TYPES: [&str; 3] = ["GAREFN", "NAREFN", "YAREFN"];
 
+/// Enemy barracks the spy infiltrates for the veteran foot: the arrival
+/// grants the spy's house veteran infantry (retail `Factory=InfantryType`
+/// on all three sides' sections, the Infiltrate arm behind the cash arm).
+const ENEMY_BARRACKS_TYPES: [&str; 3] = ["GAPILE", "NAHAND", "YABRCK"];
+
 /// Neutral tech buildings the spy runs at — the engine's `[AI]
 /// NeutralTechBuildings=` list (Rules+ADC through the list reader,
 /// `ProcessedRulesLayers::neutral_tech_buildings`), retail value
@@ -1208,10 +1220,19 @@ const ENEMY_REFINERY_TYPES: [&str; 3] = ["GAREFN", "NAREFN", "YAREFN"];
 const TECH_BUILDING_TYPES: [&str; 6] =
     ["CAAIRP", "CATHOSP", "CAOILD", "CAOUTP", "CAMACH", "CAPOWR"];
 
-/// The Allied infiltrator: commissioned once, behind the battle lab, and
-/// walked at the nearest revealed neutral tech building. Countries whose
-/// cameo refuses the type simply never commission one (`can_build` gate).
+/// The Allied infiltrator: commissioned behind the battle lab up to
+/// [`SPY_QUOTA`] standing, each walked at the nearest revealed enemy
+/// structure the infiltration table pays on (the neutral tech tour when
+/// no aim stands revealed). Countries whose cameo refuses the type simply
+/// never commission one (`can_build` gate).
 const SPY_TYPE: &str = "SPY";
+
+/// The spy quota: retail prices the infiltrator at half a soldier, so the
+/// pressure comes in numbers — the runners working the aim table while
+/// the standing count keeps the refill armed. The old quota of one, once
+/// per game, was a single loss silencing the chain for the rest of the
+/// match.
+const SPY_QUOTA: usize = 3;
 
 /// The retail MCVs — the vehicles the Iron Curtain must never center on
 /// (the substrate's first vehicle was all too often the expansion MCV).
@@ -3038,9 +3059,6 @@ pub struct SuperAi {
     /// at; see [`STUCK_TIMEOUT`]. Pinned state, never read from the
     /// runtime.
     stuck_since: std::collections::HashMap<u64, ((u16, u16), u32)>,
-    /// Whether the spy's single commission has issued; the quota is one per
-    /// game. Pinned state, never read from the runtime.
-    spy_issued: bool,
     /// Whether a naval-sortie episode is launching: the target latched, the
     /// hulls dispatched one per tick until only the home guard remains —
     /// the wave episode's shape, at sea. Pinned state, never read from the
@@ -3309,7 +3327,6 @@ impl SuperAi {
             deploy_due: 0,
             scout_blacklist: std::collections::HashSet::new(),
             stuck_since: std::collections::HashMap::new(),
-            spy_issued: false,
             naval_sortie_launching: false,
             naval_sortie_target: None,
             naval_sortie_launched: Vec::new(),
@@ -4448,15 +4465,11 @@ impl SuperAi {
             self.disc_raids.retain(|(disc, target)| {
                 sim.substrate().entities.get(*disc).is_some_and(|entity| {
                     entity.owner() == self.house && entity.lifecycle.object_alive()
-                }) && sim
-                    .substrate()
-                    .entities
-                    .get(*target)
-                    .is_some_and(|entity| {
-                        entity.category() == crate::map::entities::EntityCategory::Structure
-                            && entity.lifecycle.object_alive()
-                            && !entity.lifecycle.in_limbo()
-                    })
+                }) && sim.substrate().entities.get(*target).is_some_and(|entity| {
+                    entity.category() == crate::map::entities::EntityCategory::Structure
+                        && entity.lifecycle.object_alive()
+                        && !entity.lifecycle.in_limbo()
+                })
             });
             // The Desolator's arrival: standing within two cells of his
             // latched harvester cell, the stance toggles once (the deploy
@@ -4584,8 +4597,7 @@ impl SuperAi {
                         && let Some((target, cell)) = self.disc_raid_target(sim, from)
                         && !self.futile(id, FutilityKind::Raid, from, tick)
                     {
-                        if let Some(slot) = self.disc_raids.iter_mut().find(|pair| pair.0 == id)
-                        {
+                        if let Some(slot) = self.disc_raids.iter_mut().find(|pair| pair.0 == id) {
                             slot.1 = target;
                         } else {
                             self.disc_raids.push((id, target));
@@ -4741,17 +4753,25 @@ impl SuperAi {
             // dog's own Guard mission bites the spy and the raiding
             // infantry that step to the door, and the engine's leash walks
             // it back after every chase — so the AI's whole job is handing
-            // out the posts. Two dogs per standing yard hold the ring; the
-            // "on post" count reads the live Guard missions, so a sentry
-            // the alarm recalled or the enemy killed frees its slot and a
-            // fresh one takes it. The others stay in the idle pools — the
-            // perimeter attack and the alarm recall reach them — and the
-            // wave dispatch skips the type outright. The order gate paces
-            // the post the way it paces the generic poster's, so a dropped
+            // out the posts. Two dogs per standing yard hold the ring, and
+            // the entrance choke ([`entrance_choke_cell`], the traffic
+            // axis's throat a walk-in crosses) holds one more when the
+            // enemy's road is known — the off-axis ring never looks at the
+            // road, and the infiltrator arrives down it. The "on post"
+            // count reads the live Guard missions, so a sentry the alarm
+            // recalled or the enemy killed frees its slot and a fresh one
+            // takes it. The others stay in the idle pools — the perimeter
+            // attack and the alarm recall reach them — and the wave
+            // dispatch skips the type outright. The order gate paces the
+            // post the way it paces the generic poster's, so a dropped
             // order waits its window instead of re-issuing per tick.
             {
-                let sentry_cap =
-                    SENTRY_DOGS_PER_YARD * self.own_yard_centers(sim, opening).len().max(1);
+                let choke = self
+                    .traffic_axis
+                    .and_then(|(home, aim)| entrance_choke_cell(sim, home, aim));
+                let sentry_cap = SENTRY_DOGS_PER_YARD
+                    * self.own_yard_centers(sim, opening).len().max(1)
+                    + usize::from(choke.is_some());
                 let dogs_on_post = sim
                     .substrate()
                     .entities
@@ -4789,15 +4809,45 @@ impl SuperAi {
                     if let Some((dog, entity)) = pick {
                         let from = (entity.position.rx(), entity.position.ry());
                         let type_name = sim.interner().resolve(entity.type_ref());
-                        if let Some((px, py)) = open_ring_cell(
-                            sim,
-                            rules,
-                            center,
-                            from,
-                            dog,
-                            type_name,
-                            self.traffic_axis,
-                        ) && !self.futile(dog, FutilityKind::GuardPost, from, tick)
+                        // The choke post first — one dog on the road's
+                        // throat, held while a kennel-mate stands within
+                        // two cells of it (the covered read) and the
+                        // poster's dog can reach the cell; the off-axis
+                        // ring cells take the rest. The ring walk is the
+                        // fallback, the shape it keeps with no axis known.
+                        let movement_zone = rules
+                            .object(type_name)
+                            .map(|ty| ty.movement_zone)
+                            .unwrap_or_default();
+                        let post = choke
+                            .filter(|&cell| {
+                                !sim.substrate().entities.iter_sorted().any(|(_, entity)| {
+                                    entity.owner() == self.house
+                                        && entity.lifecycle.object_alive()
+                                        && !entity.lifecycle.in_limbo()
+                                        && entity.category()
+                                            == crate::map::entities::EntityCategory::Infantry
+                                        && Self::is_dog(sim.interner().resolve(entity.type_ref()))
+                                        && cell_distance(
+                                            (entity.position.rx(), entity.position.ry()),
+                                            cell,
+                                        ) <= 2
+                                })
+                            })
+                            .filter(|&cell| zones_connected(sim, movement_zone, from, cell))
+                            .or_else(|| {
+                                open_ring_cell(
+                                    sim,
+                                    rules,
+                                    center,
+                                    from,
+                                    dog,
+                                    type_name,
+                                    self.traffic_axis,
+                                )
+                            });
+                        if let Some((px, py)) = post
+                            && !self.futile(dog, FutilityKind::GuardPost, from, tick)
                         {
                             self.gate_idle_order(dog, tick);
                             return vec![CommandEnvelope::new(
@@ -7318,6 +7368,25 @@ impl SuperAi {
             // replacement.
             if scout_want {
                 Some(opening.scout)
+            } else if let Some(dog) = self.dog_sentry_short(sim, opening)
+                && rules.object(dog).is_some_and(|ty| {
+                    crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                        == crate::sim::production::CanBuild::Yes
+                })
+            {
+                // The hounds' floor, the rotation's reservation: the sentry
+                // ring's kennel ([`SENTRY_DOGS_PER_YARD`] per standing
+                // yard) tops up ahead of the hero and spy reservations,
+                // because a ring without its dogs greets every infiltrator
+                // with an empty doorway — and a role deficit window is a
+                // poor time to learn that. The scouts walk as hounds too
+                // (the Allied pair, the Soviet pair, Yuri's twin), so the
+                // floor reads the whole standing kennel against the quota
+                // and grows it with the yards; `can_build`, per the
+                // country-lock lesson — Yuri's twins name the other sides'
+                // barracks in retail, and the AI house's own quirk skips
+                // the chain where the player's would refuse.
+                Some(dog)
             } else if !self.hero_issued
                 && self.count_structures_of_type(sim, opening.battle_lab) >= 1
                 && rules.object(opening.hero).is_some_and(|ty| {
@@ -7325,17 +7394,20 @@ impl SuperAi {
                 })
             {
                 Some(opening.hero)
-            } else if !self.spy_issued
+            } else if self.count_combat_of_type(sim, SPY_TYPE) < SPY_QUOTA
                 && self.count_structures_of_type(sim, opening.battle_lab) >= 1
                 && rules.object(SPY_TYPE).is_some_and(|ty| {
                     crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
                         == crate::sim::production::CanBuild::Yes
                 })
             {
-                // Layer 3: the spy — a quota of one, behind the battle lab,
-                // `can_build`-gated so a country that refuses the infiltrator
-                // simply never spends the slot (the same country-lock lesson
-                // as the jet table).
+                // Layer 3: the spy — a quota of [`SPY_QUOTA`] behind the
+                // battle lab, refilled as the runners are spent (retail
+                // prices the infiltrator at half a soldier, so the pressure
+                // comes in numbers and the second wave follows the first),
+                // `can_build`-gated so a country that refuses the
+                // infiltrator simply never spends the slot (the same
+                // country-lock lesson as the jet table).
                 Some(SPY_TYPE)
             } else {
                 // The same mix over the infantry roster, the core soldier
@@ -7370,9 +7442,6 @@ impl SuperAi {
         {
             if name == opening.hero {
                 self.hero_issued = true;
-            }
-            if name == SPY_TYPE {
-                self.spy_issued = true;
             }
             self.infantry_slots += 1;
             return vec![CommandEnvelope::new(self.house, at, command)];
@@ -12065,10 +12134,10 @@ impl SuperAi {
 
     /// The nearest revealed enemy structure the spy's arrival pays on,
     /// priority class first ([`spy_infiltration_rank`]: the enemy's
-    /// superweapon, then its radar, its power plants, any standing
-    /// structure) and nearest within a class — with the ground rows still
-    /// connecting it to `from`, since a revealed aim across a breach is a
-    /// walk the sim nulls, not an infiltration.
+    /// superweapon, then its radar, its power plants, its refineries, its
+    /// barracks, any standing structure) and nearest within a class — with
+    /// the ground rows still connecting it to `from`, since a revealed aim
+    /// across a breach is a walk the sim nulls, not an infiltration.
     fn nearest_enemy_infiltration_target(
         &self,
         sim: &crate::sim::world::Simulation,
@@ -12202,6 +12271,31 @@ impl SuperAi {
     fn is_dog(type_name: &str) -> bool {
         const DOG_TYPES: [&str; 3] = ["ADOG", "DOG", "YDOG"];
         DOG_TYPES.contains(&type_name)
+    }
+
+    /// The roster's hound when the sentry floor is short: the ring's
+    /// kennel quota ([`SENTRY_DOGS_PER_YARD`] per standing yard) against
+    /// the whole standing count — the scouts double as sentries, so the
+    /// floor reads the pool, not the posts — and `None` where the roster
+    /// names no hound or the floor stands met. The barracks rotation's
+    /// reservation: without it, the hound row fields only when an
+    /// AntiInfantry deficit window happens to reach it, and the
+    /// counter-infiltration ring waits on chance while the yard count
+    /// grows the quota past the scout pair. The caller owns the
+    /// `can_build` gate — Yuri's twins name the other sides' barracks in
+    /// retail, and the AI house's quirk is what keeps the row live.
+    fn dog_sentry_short(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        opening: &Opening,
+    ) -> Option<&'static str> {
+        let dog = opening
+            .infantry
+            .iter()
+            .find(|entry| Self::is_dog(entry.name))
+            .map(|entry| entry.name)?;
+        let floor = SENTRY_DOGS_PER_YARD * self.own_yard_centers(sim, opening).len().max(1);
+        (self.count_combat_of_type(sim, dog) < floor).then_some(dog)
     }
 
     /// Whether the entity stands inside a garrison hole: a building's
@@ -16008,8 +16102,11 @@ fn capture_priority_rank(type_name: &str) -> Option<usize> {
 
 /// The spy's infiltration priority for an enemy structure type: the
 /// superweapon buildings first (the arrival resets the charging special's
-/// clock), then the radars (the blackout), the power plants (the dip) —
-/// and every other standing enemy structure last, the walk still worth the
+/// clock), then the radars (the blackout), the power plants (the dip), the
+/// refineries (the cash — the arrival pays [`stolen_money`] of the
+/// owner's available credits, and every retail refinery stores ore), the
+/// barracks (the veteran foot — retail `Factory=InfantryType`) — and
+/// every other standing enemy structure last, the walk still worth the
 /// walk even when the arrival teaches nothing.
 fn spy_infiltration_rank(type_name: &str) -> u8 {
     if ENEMY_SUPERWEAPON_TYPES.contains(&type_name) {
@@ -16018,8 +16115,12 @@ fn spy_infiltration_rank(type_name: &str) -> u8 {
         1
     } else if ENEMY_POWER_TYPES.contains(&type_name) {
         2
-    } else {
+    } else if ENEMY_REFINERY_TYPES.contains(&type_name) {
         3
+    } else if ENEMY_BARRACKS_TYPES.contains(&type_name) {
+        4
+    } else {
+        5
     }
 }
 
@@ -16160,6 +16261,48 @@ fn connected_ring_cell(
 /// zone-gated, openness-floored ring pick, and the cell also keeps
 /// [`AXIS_CLEARANCE`] off the home→enemy `axis` when one is known — a post
 /// on every wave's corridor parks a unit in the next wave's way.
+/// The entrance choke cell for the dogs' sentry ring: the first cell
+/// [`ENTRANCE_POST_MIN`]..=[`ENTRANCE_POST_MAX`] cells out of `home`
+/// toward `aim` — the traffic axis, the enemy's road in — that sits on
+/// the map with open ground around it. The perimeter's throat, where a
+/// posted dog's Guard mission bites the infiltrator walking in, instead
+/// of the yard's rear ring the off-axis spread otherwise holds. `None`
+/// with no axis or no open cell in the band; the ring keeps its
+/// off-axis cells then. Pure so the post stays unit testable.
+fn entrance_choke_cell(
+    sim: &crate::sim::world::Simulation,
+    home: (i16, i16),
+    aim: (i16, i16),
+) -> Option<(u16, u16)> {
+    let (dx, dy) = (
+        i32::from(aim.0) - i32::from(home.0),
+        i32::from(aim.1) - i32::from(home.1),
+    );
+    let span = dx.abs().max(dy.abs());
+    if span == 0 {
+        return None;
+    }
+    for distance in ENTRANCE_POST_MIN..=ENTRANCE_POST_MAX {
+        let cell = on_map_cell(
+            sim,
+            (
+                (i32::from(home.0) + dx * distance / span) as i16,
+                (i32::from(home.1) + dy * distance / span) as i16,
+            ),
+            (home.0, home.1),
+        );
+        if cell_openness(
+            sim,
+            crate::rules::locomotor_type::MovementZone::Normal,
+            cell,
+        ) >= OPEN_NEIGHBOR_FLOOR
+        {
+            return Some(cell);
+        }
+    }
+    None
+}
+
 fn open_ring_cell(
     sim: &crate::sim::world::Simulation,
     rules: &crate::rules::ruleset::RuleSet,
@@ -16749,14 +16892,14 @@ mod tests {
     use super::{
         AA_COUNTER_AIR_THREATS, AA_COUNTER_ROLE_SHARE, AA_COUNTER_VEHICLE_FLOOR, AA_UNIT_CAP,
         AA_UNIT_FLOOR, AIR_WING_TARGET, BUILD_QUEUE_RETRY_TICKS, CORE_BEFORE_SPECIALISTS,
-        DEFENSE_PER_YARD_AA_BASE,
-        DEFENSE_PER_YARD_AA_HEAVY, DEFENSE_PER_YARD_AA_WARTIME, EXPANSION_MIN_DISTANCE,
-        FLOATER_COUNTER_THREATS, FLOATER_TYPES, OPENINGS, ORE_ENEMY_DIRECTION_BIAS,
-        ROLE_SHARE_BASE, ROLE_SHARE_BOOST, Role, RosterEntry, SuperAi, SuperAiDifficulty,
-        TECH_BUILDING_TYPES, aa_per_yard_quota, aa_unit_target, aa_vehicle_target, anti_air_demand,
-        capture_priority_rank, enemy_direction_bias, foundation_keeps_gap,
-        nearest_connected_target, rally_anchor, spy_infiltration_rank, tech_bank_short,
-        wall_ring_cells,
+        DEFENSE_PER_YARD_AA_BASE, DEFENSE_PER_YARD_AA_HEAVY, DEFENSE_PER_YARD_AA_WARTIME,
+        ENEMY_BARRACKS_TYPES, ENEMY_REFINERY_TYPES, ENTRANCE_POST_MAX, ENTRANCE_POST_MIN,
+        EXPANSION_MIN_DISTANCE, FLOATER_COUNTER_THREATS, FLOATER_TYPES, OPENINGS,
+        ORE_ENEMY_DIRECTION_BIAS, ROLE_SHARE_BASE, ROLE_SHARE_BOOST, Role, RosterEntry, SuperAi,
+        SuperAiDifficulty, TECH_BUILDING_TYPES, aa_per_yard_quota, aa_unit_target,
+        aa_vehicle_target, anti_air_demand, capture_priority_rank, enemy_direction_bias,
+        entrance_choke_cell, foundation_keeps_gap, nearest_connected_target, rally_anchor,
+        spy_infiltration_rank, tech_bank_short, wall_ring_cells,
     };
     use crate::sim::intern::InternedId;
     use crate::sim::runtime::SimRuntime;
@@ -17404,16 +17547,19 @@ mod tests {
         );
 
         // The spy's retarget order: the enemy's superweapon first, then the
-        // radar, the power plants, and any standing structure last.
+        // radar, the power plants, the refineries (the cash), the barracks
+        // (the veteran foot), and any standing structure last.
         assert_eq!(spy_infiltration_rank("GAWEAT"), 0);
         assert_eq!(spy_infiltration_rank("YAGNTC"), 0);
         assert_eq!(spy_infiltration_rank("NARADR"), 1);
         assert_eq!(spy_infiltration_rank("AMRADR"), 1);
         assert_eq!(spy_infiltration_rank("YAPOWR"), 2);
+        assert_eq!(spy_infiltration_rank("NAREFN"), 3);
+        assert_eq!(spy_infiltration_rank("NAHAND"), 4);
         assert_eq!(
             spy_infiltration_rank("GAWEAP"),
-            3,
-            "any standing enemy structure still outranks the neutral tour"
+            5,
+            "any standing enemy structure still trails the paying rows"
         );
     }
 
@@ -23009,6 +23155,122 @@ mod tests {
         let (cash_id, _) = ai
             .disc_raid_target(scenario.sim(), from)
             .expect("the refinery line takes the raid");
-        assert_eq!(cash_id, refinery, "with the plants taken, the refinery drains");
+        assert_eq!(
+            cash_id, refinery,
+            "with the plants taken, the refinery drains"
+        );
+    }
+
+    /// The spy's aim table pays on the real retail economics (Layer 3 E):
+    /// every side's refinery stores ore (`Storage=` above zero — the cash
+    /// arm's stolen money pays off the owner's credits) and every side's
+    /// barracks stamps the veteran foot (`Factory=InfantryType` — the
+    /// Infiltrate arm), so the table's two paying rows aim at arrivals
+    /// that actually pay, read through the production parser straight
+    /// from the retail tables; then the rank ladder itself, the classes
+    /// never inverting.
+    #[test]
+    fn spy_ranks_pay_the_refinery_and_barracks_rows() {
+        use crate::rules::retail_ini_fixture::retail_ini;
+
+        if let Some(rules) = retail_ini("rulesmd.ini") {
+            for name in ENEMY_REFINERY_TYPES {
+                let storage = rules
+                    .section_or_empty(name)
+                    .get_for_test("Storage")
+                    .and_then(|value| value.parse::<i32>().ok());
+                assert!(
+                    storage.is_some_and(|value| value > 0),
+                    "{name} stores ore (Storage={storage:?})"
+                );
+            }
+            for name in ENEMY_BARRACKS_TYPES {
+                let factory = rules.section_or_empty(name).get_for_test("Factory");
+                assert_eq!(factory, Some("InfantryType"), "{name} stamps veterans");
+            }
+        }
+
+        assert_eq!(spy_infiltration_rank("GAWEAT"), 0);
+        assert_eq!(spy_infiltration_rank("NARADR"), 1);
+        assert_eq!(spy_infiltration_rank("YAPOWR"), 2);
+        assert_eq!(spy_infiltration_rank("GAREFN"), 3);
+        assert_eq!(spy_infiltration_rank("GAPILE"), 4);
+        assert_eq!(spy_infiltration_rank("GAWEAP"), 5);
+        let ladder = ["GAWEAT", "NARADR", "YAPOWR", "NAREFN", "YABRCK", "GAWEAP"];
+        for pair in ladder.windows(2) {
+            assert!(
+                spy_infiltration_rank(pair[0]) < spy_infiltration_rank(pair[1]),
+                "{} ranks below {}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// The entrance choke post (Layer 3 E): the walk out of home along
+    /// the traffic axis lands an open cell in the perimeter band — near
+    /// enough for the engine's leash, far enough to meet the walk-in —
+    /// stepped along the enemy's road in, off the yard's rear ring; no
+    /// aim, no post.
+    #[test]
+    fn sentry_choke_post_walks_the_enemy_road() {
+        let (scenario, _human) = retail_battle();
+        let home = (64i16, 92i16);
+        let aim = (90i16, 70i16);
+
+        let post = entrance_choke_cell(scenario.sim(), home, aim).expect("a road choke posts");
+        let dx = i32::from(post.0) - i32::from(home.0);
+        let dy = i32::from(post.1) - i32::from(home.1);
+        // The walk counts axis steps (the dominant coordinate's cells), so
+        // the band reads off the Chebyshev distance.
+        let band = dx.abs().max(dy.abs());
+        assert!(
+            (ENTRANCE_POST_MIN..=ENTRANCE_POST_MAX).contains(&band),
+            "the post sits in the perimeter band (distance {band})"
+        );
+        // Along the road: the step's direction agrees with home->aim.
+        let toward = i32::from(aim.0 - home.0) * dx + i32::from(aim.1 - home.1) * dy;
+        assert!(
+            toward > 0,
+            "the post walks the road, not the rear ({toward})"
+        );
+
+        assert_eq!(
+            entrance_choke_cell(scenario.sim(), home, home),
+            None,
+            "no aim, no choke"
+        );
+    }
+
+    /// The dogs' sentry floor (Layer 3 E): the ring's kennel quota reads
+    /// the standing hounds against two per standing yard — an empty
+    /// kennel owes the ring its hounds, a met one asks for nothing, and
+    /// Yuri's roster row rides the AI house's own `can_build` quirk (the
+    /// twins' retail `Prerequisite=` names the other sides' barracks).
+    /// The decision is asserted at its own seam: on this map the
+    /// garrison's neutral occupiables latch a demand that claims every
+    /// infantry turn of a full drive, so the wheel-level file rides the
+    /// same helper the specialist arm calls.
+    #[test]
+    fn dog_sentry_floor_tops_the_kennel_to_the_ring_quota() {
+        let (mut scenario, ai_house, _enemy) =
+            pacific_bridge_battle_as(crate::skirmish_launch::LaunchCountry::Yuri);
+        let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
+        spawn_near(&mut scenario, "YACNST", ai_house, (64, 92));
+        let opening = ai.opening(scenario.sim()).expect("the Yuri yard resolves");
+        assert_eq!(opening.barracks, "YABRCK");
+        assert_eq!(
+            ai.dog_sentry_short(scenario.sim(), opening),
+            Some("YDOG"),
+            "the empty kennel owes the ring its hounds"
+        );
+        for cell in [(60, 96), (62, 96)] {
+            spawn_near(&mut scenario, "YDOG", ai_house, cell);
+        }
+        assert_eq!(
+            ai.dog_sentry_short(scenario.sim(), opening),
+            None,
+            "the met kennel asks for nothing"
+        );
     }
 }
