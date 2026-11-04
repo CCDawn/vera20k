@@ -16,6 +16,7 @@ use thiserror::Error;
 use crate::rules::flh::Flh;
 use crate::rules::ini_parser::{IniFile, IniSection};
 use crate::rules::object_type::{BuildingHiddenOccupancyProfile, HIDDEN_OCCUPY_SLOT_COUNT};
+use crate::util::lookup_hash::LookupMap;
 use crate::util::native_x87::NativeF64Bits;
 
 /// A war factory's unload art, read by `BuildingTypeClass::LoadVisualAssets
@@ -339,6 +340,15 @@ pub struct AnimTypeRuntimeConfig {
     /// Raw `MakeInfantry=` index. Native defaults to -1 and treats every
     /// other value as enabling the AnimClass cell-occupation lifecycle.
     pub make_infantry: i32,
+    /// Phobos `AnimTypeExt::MakeInfantryOwner` (`OwnerHouseKind`, default
+    /// `Victim`): the House a `MakeInfantry=` animation takes.
+    #[cfg(feature = "phobos")]
+    pub(crate) phobos_make_infantry_owner: crate::rules::ares_warhead::HouseSelector,
+    /// Phobos `CreateUnit=` + `CreateUnit.Owner` (default `Victim`) +
+    /// `CreateUnit.RemapAnim` (default no): `Some` when the animation names a
+    /// unit type, which overrides the owner kind and permits remap.
+    #[cfg(feature = "phobos")]
+    pub(crate) phobos_create_unit: Option<(crate::rules::ares_warhead::HouseSelector, bool)>,
     pub bouncer: bool,
     pub spawns: Option<String>,
     pub spawn_count: i32,
@@ -752,6 +762,23 @@ fn parse_anim_runtime_config(section: &IniSection) -> AnimTypeRuntimeConfig {
         // [`ArtRegistry::apply_anim_type_references`].
         tiberium_spawn_type: None,
         make_infantry: section.read_int("MakeInfantry", -1),
+        #[cfg(feature = "phobos")]
+        phobos_make_infantry_owner: crate::rules::ares_warhead::HouseSelector::Victim
+            .read(section, "MakeInfantryOwner"),
+        // `CreateUnit` is a `Nullable<TechnoTypeClass*>`: `none` clears it and
+        // an authored name is a presence signal here. A name no factory
+        // resolves is treated as present (the type itself is not modeled).
+        #[cfg(feature = "phobos")]
+        phobos_create_unit: section
+            .read_name("CreateUnit", 0x80)
+            .filter(|name| !crate::rules::ini_parser::is_native_none_type_name(name))
+            .map(|_| {
+                (
+                    crate::rules::ares_warhead::HouseSelector::Victim
+                        .read(section, "CreateUnit.Owner"),
+                    section.read_ares_bool("CreateUnit.RemapAnim", false),
+                )
+            }),
         bouncer: section.read_bool("Bouncer", false),
         spawns: None,
         spawn_count: section.read_int("SpawnCount", 0),
@@ -895,8 +922,9 @@ pub struct ArtRegistry {
     can_hide_things: HashMap<String, bool>,
     /// section ID (uppercase) -> `OccupyHeight=`, defaulting to art `Height=`.
     occupy_heights: HashMap<String, i32>,
-    /// section ID (uppercase) -> generic AnimType runtime metadata.
-    anim_runtime_configs: HashMap<String, AnimTypeRuntimeConfig>,
+    /// section ID (uppercase) -> generic AnimType runtime metadata. Every
+    /// anim reads its type's here each frame; only looked up.
+    anim_runtime_configs: LookupMap<String, AnimTypeRuntimeConfig>,
     /// First native Anim slot's immutable image projection. Unlike orphan
     /// ART metadata, these requests came from the retained ProcessedType.
     anim_type_images: HashMap<String, crate::rules::object_image::ObjectImageState>,
@@ -1025,7 +1053,8 @@ impl ArtRegistry {
         let mut entry_names: HashMap<String, String> = HashMap::new();
         let mut can_hide_things: HashMap<String, bool> = HashMap::new();
         let mut occupy_heights: HashMap<String, i32> = HashMap::new();
-        let mut anim_runtime_configs: HashMap<String, AnimTypeRuntimeConfig> = HashMap::new();
+        let mut anim_runtime_configs: LookupMap<String, AnimTypeRuntimeConfig> =
+            LookupMap::default();
         let mut anim_theater_flags = HashMap::new();
         let mut damage_fire_offsets_valid = true;
 
@@ -1316,7 +1345,7 @@ impl ArtRegistry {
             entry_names: HashMap::new(),
             can_hide_things: HashMap::new(),
             occupy_heights: HashMap::new(),
-            anim_runtime_configs: HashMap::new(),
+            anim_runtime_configs: LookupMap::default(),
             anim_type_images: HashMap::new(),
             anim_theater_flags: HashMap::new(),
             scheduler_anim_types: BTreeSet::new(),
@@ -1344,7 +1373,16 @@ impl ArtRegistry {
 
     /// Generic native-like AnimType runtime metadata for an art section.
     pub fn anim_runtime_config(&self, image_id: &str) -> Option<&AnimTypeRuntimeConfig> {
-        self.anim_runtime_configs.get(&image_id.to_uppercase())
+        // An ASCII name without a lowercase letter is its own uppercase and
+        // needs no uppercase copy.
+        if image_id
+            .bytes()
+            .all(|byte| byte.is_ascii() && !byte.is_ascii_lowercase())
+        {
+            self.anim_runtime_configs.get(image_id)
+        } else {
+            self.anim_runtime_configs.get(&image_id.to_uppercase())
+        }
     }
 
     /// Apply the canonical RulesClass processing receipt before asset binding.

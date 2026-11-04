@@ -371,6 +371,11 @@ pub enum SnapshotRestoreError {
         object_id: u64,
         reason: &'static str,
     },
+    #[error("entity {object_id} has invalid Unit follower state: {reason}")]
+    InvalidUnitFollowerState {
+        object_id: u64,
+        reason: &'static str,
+    },
     #[error("invalid saved planning graph: {reason}")]
     InvalidPlanningReferences { reason: &'static str },
     #[error("non-Building entity {owner_id} retains animation slot {slot}")]
@@ -1162,6 +1167,35 @@ fn restore_object_references(
     // complete modeled pointer graph before mutating even weak references or
     // derived caches, so a failed restore remains an atomic rejection.
     for (entity_id, entity) in sim.substrate.entities.iter_sorted() {
+        // UnitClass::Load744470 queues +6C8 for swizzling (gamemd.exe).
+        // Preserve the independent +6D0 byte, cycles and physically present
+        // dead/limbo Units; only class identity and reference resolution apply.
+        if (entity.unit_follower().is_some() || entity.is_unit_follower())
+            && entity.category() != crate::map::entities::EntityCategory::Unit
+        {
+            return Err(SnapshotRestoreError::InvalidUnitFollowerState {
+                object_id: entity_id,
+                reason: "the relationship and follower byte belong to a Unit",
+            });
+        }
+        if let Some(follower_id) = entity.unit_follower() {
+            require_resolved_reference(
+                entity_ids.contains(&follower_id),
+                "EntityStore",
+                entity_id,
+                "unit_follower",
+                "EntityStore",
+                follower_id,
+            )?;
+            if sim.substrate.entities.get(follower_id).unwrap().category()
+                != crate::map::entities::EntityCategory::Unit
+            {
+                return Err(SnapshotRestoreError::InvalidUnitFollowerState {
+                    object_id: entity_id,
+                    reason: "the follower reference must name a Unit",
+                });
+            }
+        }
         if let Some(anim_id) = entity
             .parasite
             .class()
@@ -1771,8 +1805,11 @@ impl Simulation {
         }
         self.validate_frame_continuation_for_restore()
             .map_err(|reason| SnapshotRestoreError::InvalidFrameContinuation { reason })?;
-        if let Some(observer) = self.session.observer_house()
-            && !self.houses.contains_key(&observer)
+        if self
+            .session
+            .observer_houses()
+            .iter()
+            .any(|observer| !self.houses.contains_key(observer))
         {
             return Err(SnapshotRestoreError::InvalidMultiplayerSession {
                 reason: "observer House is absent",
@@ -1901,6 +1938,9 @@ impl Simulation {
                 }
             }
         }
+        let cell_grid = self.cell_grid();
+        self.terrain_objects.configure_cell_grid(cell_grid);
+        self.houses.configure_cell_grid(cell_grid);
         self.terrain_objects
             .validate_membership()
             .map_err(|reason| SnapshotRestoreError::InvalidCellMembership { reason })?;
@@ -3337,7 +3377,7 @@ mod tests {
                 let graph_b = hierarchy_b.level(level).unwrap();
                 assert_eq!(graph_a.record_slot_count(), graph_b.record_slot_count());
                 for slot in 0..graph_a.record_slot_count() {
-                    let zone = u16::try_from(slot).unwrap();
+                    let zone = crate::sim::pathfinding::zone_map::ZoneId::try_from(slot).unwrap();
                     // Record equality includes the retained native+20 threat
                     // seed; equal connectivity alone does not prove its input.
                     assert_eq!(graph_a.record(zone), graph_b.record(zone));
@@ -3474,6 +3514,7 @@ mod tests {
             !crate::rules::PHOBOS_ENABLED,
             !crate::rules::NPATCH_ENABLED,
             !crate::rules::VERAX_ENABLED,
+            !crate::rules::NPBUG_ENABLED,
         );
         // A complete header with no body proves capability admission runs before
         // Simulation deserialization, even without bound scenario resources.
@@ -3742,7 +3783,7 @@ mod tests {
             sim.session.install_network_timing(73);
             sim.session.install_multiplayer_house_identity(
                 crate::skirmish_modes::MpModeClass::Battle,
-                Some(owner),
+                vec![owner],
             );
             let mut header = crate::map::preview::ScenarioStartHeader::default();
             header.read_ini(&crate::rules::ini_parser::IniFile::from_str(
@@ -3755,7 +3796,7 @@ mod tests {
             assert_eq!(restored.session.game_mode(), mode);
             assert_eq!(restored.session.start_header().coop_human_start_spots(), 2);
             assert_eq!(restored.session.network_max_ahead_frames(), Some(73));
-            assert_eq!(restored.session.observer_house(), Some(owner));
+            assert_eq!(restored.session.observer_houses(), [owner]);
             assert_eq!(
                 restored.session.multiplayer_mode_class(),
                 Some(crate::skirmish_modes::MpModeClass::Battle)
@@ -5730,7 +5771,7 @@ mod tests {
         sim.fog.reveal_all_for_owner(owner);
         crate::sim::vision::apply_gap_generators(
             &mut sim.fog,
-            sim.house_alliances.as_map(),
+            &sim.house_alliances,
             &[(gapper, 6, 6, 2)],
             &sim.interner,
         );
@@ -7388,6 +7429,7 @@ mod tests {
             coordinate,
             10,
             rules.warhead("WH").unwrap(),
+            true,
             (RAD_NO_ATTACKER, None, warhead_id),
             crate::sim::world::FrameEffects::default(),
         );

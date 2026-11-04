@@ -41,9 +41,9 @@ impl Simulation {
         // 6E244F..6E24B8: raw cell land feeds SelectAnim48A4F0. Construct
         // immediately (2600h/-15), so Anim.Start precedes the outer damage.
         let land = detonation_anim::land_at(self, coordinate);
-        if let Some(effect) =
-            detonation_anim::effect(self, rules, warhead, damage, land, coordinate, coordinate)
-        {
+        if let Some(effect) = detonation_anim::effect(
+            self, rules, warhead, damage, land, coordinate, coordinate, false,
+        ) {
             super::damage_consequences::admit_explosion_effect(self, rules, effect);
         }
 
@@ -58,15 +58,19 @@ impl Simulation {
             force_create: false,
             flags: 0,
         });
-        Some(world_receiver::apply_area_damage(
-            self,
-            rules,
-            overlays,
-            coordinate,
-            damage,
-            warhead,
-            (RAD_NO_ATTACKER, None, warhead_ref),
-            frame_effects,
-        ))
+        Some(
+            world_receiver::apply_area_damage(
+                self,
+                rules,
+                overlays,
+                coordinate,
+                damage,
+                warhead,
+                true,
+                (RAD_NO_ATTACKER, None, warhead_ref),
+                frame_effects,
+            )
+            .bridge_state_changed,
+        )
     }
 }

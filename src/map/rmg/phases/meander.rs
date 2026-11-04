@@ -149,7 +149,11 @@ fn angle_off_heading(cell: (i32, i32), reference: (i32, i32), heading: f64) -> f
         HALF_PI
     } else {
         let ratio = -(f64::from(cell.1 - reference.1) / f64::from(dx));
-        let angle = ratio.atan();
+        // Every client must generate the same map, and host `atan`s disagree
+        // in the last bit (`atan(2)` among them), so this is libm's on every
+        // target. The original's FPATAN may differ from it in that bit, which
+        // reorders the frontier only on a near-tie of the f32 cost.
+        let angle = libm::atan(ratio);
         if dx < 0 { angle + PI } else { angle }
     };
     angle = (angle - heading).abs();
@@ -432,6 +436,16 @@ mod tests {
                 assert!((0.0..=PI).contains(&angle), "dx={dx} dy={dy} -> {angle}");
             }
         }
+    }
+
+    #[test]
+    fn the_off_heading_angle_is_the_same_on_every_target() {
+        // atan(2): host C libraries disagree in its last bit (Apple's gives
+        // 1.1071487177940906); every client takes libm's.
+        assert_eq!(
+            angle_off_heading((11, 8), (10, 10), 0.0).to_bits(),
+            1.107_148_717_794_090_4_f64.to_bits()
+        );
     }
 
     #[test]

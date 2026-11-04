@@ -70,7 +70,7 @@
       || !(url.protocol === 'wss:' || (url.protocol === 'ws:' && local))
       || url.username || url.password || url.pathname !== '/' || url.search || url.hash
       || !Number.isInteger(maxDatagram) || maxDatagram < 1 || maxDatagram > 2048) {
-      throw new Error('Invalid compiled WebSocket proxy configuration');
+      throw new Error('Invalid WebSocket proxy origin');
     }
     url.pathname = `/game/${channel}`;
     const state = {
@@ -90,7 +90,8 @@
     const ws = state.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN
       || ws.bufferedAmount + bytes.length > MAX_SEND_BYTES) return 1;
-    try { ws.send(bytes); return 0; }
+    // bytes views Wasm memory, and send() refuses a view of the threaded build's shared memory.
+    try { ws.send(bytes.slice()); return 0; }
     catch { reconnect(state); return 1; }
   };
 

@@ -131,11 +131,21 @@ fn dispatch(state: &mut AppState, action: WolLoginAction) {
 }
 
 /// `0x10F`'s teardown has run: Back returns 0 to `WOL_Main` (the welcome
-/// again); Login starts the connect over the empty backdrop.
+/// again); Login starts the connect over the empty backdrop. The online
+/// sign-in is the visit's first page, so its Back leaves WOL.
 pub(super) fn commit_close(state: &mut AppState, result: u16) {
     state.frontend.wol_login_art = None;
     if result != LOGIN {
-        App::reopen_wol_welcome(state);
+        if state
+            .frontend
+            .wol
+            .as_ref()
+            .is_some_and(|visit| visit.modern_ui())
+        {
+            App::return_from_wol(state);
+        } else {
+            App::reopen_wol_welcome(state);
+        }
         return;
     }
     if let Some(visit) = state.frontend.wol.as_mut() {

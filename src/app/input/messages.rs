@@ -588,6 +588,30 @@ pub(crate) fn post_chat_line(state: &mut AppState, name: &str, text: &str, rgb: 
     );
 }
 
+/// Radar subtitle callback `0x005BF360`: literal text, scheme 0 and native
+/// MessageList duration buckets; cue Position/RGB belong to full-screen movies.
+pub(crate) fn post_movie_subtitle(state: &mut AppState, text: &str, duration: u32) {
+    let rgb = state.rules().map_or(MESSAGE_RGB_SYSTEM, |rules| {
+        country_message_rgb(0, &rules.color_schemes)
+    });
+    post_resolved_message(state, &movie_subtitle_post(text, duration, rgb));
+}
+
+fn movie_subtitle_post(
+    text: &str,
+    duration: u32,
+    rgb: [f32; 3],
+) -> crate::ui::messages::MessagePost<'_> {
+    crate::ui::messages::MessagePost {
+        prefix: None,
+        text,
+        rgb,
+        // 0x005BF360 passes the cue duration as Add_Message's signed timeout.
+        timeout_ms: message_timeout_ms_from_buckets(duration as i32),
+        silent: false,
+    }
+}
+
 /// The observer gate's silent `TXT_OBSERVER_CANT_SEND` row in the "Grey"
 /// scheme (`0x004E12D0` with `0x00822728`), flags 0x16, MessageDelay*900
 /// (`0x0055EED0..0x0055EF2C`).
@@ -657,6 +681,12 @@ fn post_grey_row(state: &mut AppState, text: &str, localize: bool, silent: bool)
         },
         localize,
     );
+}
+
+/// A relay speed change (`network_match::post_speed_changes`). gamemd has
+/// no such line, so `text` is VERA's own, not a CSF key.
+pub(crate) fn post_match_speed(state: &mut AppState, text: &str) {
+    post_grey_row(state, text, false, false);
 }
 
 pub(super) fn post_command_backpressure(state: &mut AppState) {
@@ -907,6 +937,35 @@ fn message_instances(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn movie_subtitle_rows_keep_native_duration_and_literal_text() {
+        let rgb = [0.2, 0.3, 0.4];
+        let post = movie_subtitle_post("test subtitle", 180, rgb);
+        assert_eq!(post.text, "test subtitle");
+        assert_eq!(post.rgb, rgb);
+        assert!(post.prefix.is_none());
+        let mut list = crate::ui::messages::MessageList::new(3, 0, 6, 600);
+        let result = list.add_message(&post, 1_000, &|s| s.len() as i32);
+        assert!(result.play_sound, "native callback uses silent=0");
+        assert_eq!(list.messages()[0].deadline_ms, Some(3_880));
+        list.manage(3_879);
+        assert_eq!(list.messages().len(), 1);
+        list.manage(3_880);
+        assert_eq!(
+            list.messages().len(),
+            1,
+            "MessageList expires strictly after its deadline"
+        );
+        list.manage(3_881);
+        assert!(list.messages().is_empty());
+        assert!(
+            movie_subtitle_post("persistent", u32::MAX, rgb)
+                .timeout_ms
+                .is_none()
+        );
+        assert_eq!(movie_subtitle_post("zero", 0, rgb).timeout_ms, Some(0));
+    }
 
     #[cfg(feature = "ares")]
     #[test]

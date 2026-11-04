@@ -430,6 +430,7 @@ fn native_area_receipt_tracks_dispatch_and_strict_iron_curtain_boundary() {
             (10, 20),
             input["damage"].as_i64().unwrap() as i32,
             rules.warhead("HE").unwrap(),
+            true,
             (RAD_NO_ATTACKER, None, he),
             Some(combat_aoe::AoEAirImpact {
                 sub_x: SimFixed::from_num(128),

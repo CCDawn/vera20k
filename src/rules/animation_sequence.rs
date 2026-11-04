@@ -121,6 +121,55 @@ pub enum SequenceKind {
     AirDeathFinish,
 }
 
+impl SequenceKind {
+    /// Map a native `Sequence` name (the `DiscardOn.Sequences` token) to the
+    /// ported kind. `ready`/`guard` both drive `Stand` and `fireup` drives
+    /// `Attack`; native sequences VERA does not model (`carry`, `tumble`,
+    /// `wetdie1`, `wetdie2`) answer `None`.
+    pub fn from_native_name(name: &str) -> Option<Self> {
+        Some(match name.trim().to_ascii_lowercase().as_str() {
+            "ready" | "guard" => Self::Stand,
+            "prone" => Self::Prone,
+            "walk" => Self::Walk,
+            "fireup" => Self::Attack,
+            "fireprone" => Self::FireProne,
+            "secondaryfire" => Self::SecondaryFire,
+            "secondaryprone" => Self::SecondaryProne,
+            "down" => Self::Down,
+            "crawl" => Self::Crawl,
+            "up" => Self::Up,
+            "idle1" => Self::Idle1,
+            "idle2" => Self::Idle2,
+            "die1" => Self::Die1,
+            "die2" => Self::Die2,
+            "die3" => Self::Die3,
+            "die4" => Self::Die4,
+            "die5" => Self::Die5,
+            "deploy" => Self::Deploy,
+            "deployed" => Self::Deployed,
+            "deployedfire" => Self::DeployedFire,
+            "deployedidle" => Self::DeployedIdle,
+            "undeploy" => Self::Undeploy,
+            "paradrop" => Self::Paradrop,
+            "cheer" => Self::Cheer,
+            "panic" => Self::Panic,
+            "shovel" => Self::Shovel,
+            "fly" => Self::Fly,
+            "hover" => Self::Hover,
+            "firefly" => Self::FireFly,
+            "tread" => Self::Tread,
+            "swim" => Self::Swim,
+            "wetattack" => Self::WetAttack,
+            "wetidle1" => Self::WetIdle1,
+            "wetidle2" => Self::WetIdle2,
+            "airdeathstart" => Self::AirDeathStart,
+            "airdeathfalling" => Self::AirDeathFalling,
+            "airdeathfinish" => Self::AirDeathFinish,
+            _ => return None,
+        })
+    }
+}
+
 /// How a sequence behaves when it reaches its last frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum LoopMode {

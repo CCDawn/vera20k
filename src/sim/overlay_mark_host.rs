@@ -446,6 +446,7 @@ impl Simulation {
             descriptor,
             AnimWorldCoord { x, y, z: ground_z },
             constructor,
+            crate::sim::world::FrameEffects::default(),
         )?;
         let Some(tiberium) = request
             .tiberium
@@ -453,13 +454,8 @@ impl Simulation {
         else {
             return Ok(anim_id);
         };
-        let remap_color = tiberium
-            .color
-            .as_deref()
-            .and_then(|color| {
-                crate::rules::color_scheme::scheme_entry_by_name(&rules.color_schemes, color)
-            })
-            .and_then(|entry| u8::try_from(entry).ok())
+        let remap_color = u8::try_from(tiberium.color_scheme() / 2)
+            .ok()
             .map(crate::rules::house_colors::HouseColorIndex);
         if let Some(color) = remap_color {
             assert!(self.substrate.anims.set_anim_remap(

@@ -363,6 +363,7 @@ impl Simulation {
                             object,
                             house,
                             &self.interner,
+                            &self.substrate.entities,
                         )
                     });
                     let Some(crew) = crew else {

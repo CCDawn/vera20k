@@ -9,6 +9,7 @@ fn native() -> &'static Value {
 fn point<const N: usize>(v: &Value) -> [i32; N] {
     std::array::from_fn(|i| v[i].as_i64().unwrap() as i32)
 }
+#[cfg(not(feature = "phobos"))]
 fn coord(v: &Value) -> DriveCoord {
     let [x, y, z] = point(v);
     DriveCoord { x, y, z }
@@ -23,6 +24,15 @@ fn viewport(v: &Value) -> SurfaceLineViewport {
         zoom: 1.,
     }
 }
+fn style() -> FlareStyle {
+    FlareStyle {
+        #[cfg(feature = "phobos")]
+        color: [255, 0, 0],
+        #[cfg(feature = "phobos")]
+        z_adjust: 0,
+    }
+}
+#[cfg(not(feature = "phobos"))]
 fn draws(row: &Value) -> Vec<SurfaceDraw> {
     let input = &row["input"];
     let view = viewport(input);
@@ -65,12 +75,14 @@ fn draws(row: &Value) -> Vec<SurfaceDraw> {
         coord(&input["source"]),
         coord(&input["target"]),
         main.draws().ranged(190, 270),
+        style(),
         view,
     ));
     result.extend(opaque("opaque_after"));
     result
 }
 
+#[cfg(not(feature = "phobos"))]
 #[test]
 fn original_beam_commands_match_color_boundaries_offsets_strength_and_cumulative_depth() {
     assert_eq!(native()["cases"].as_array().unwrap().len(), 18);
@@ -162,16 +174,27 @@ fn composite_preserves_opaque_beam_order_and_advances_only_the_shared_main_draws
             rect: [25, 25, 3, 1],
             word: 0xFFFF,
         },
-        TacticalLineCall::Designation([from, to]),
+        TacticalLineCall::Designation {
+            id: 7,
+            coords: [from, to],
+            style: style(),
+        },
         TacticalLineCall::Opaque {
             rect: [25, 25, 3, 1],
             word: 0xFFFF,
         },
     ];
     let view = viewport(&native()["cases"][0]["input"]);
+    let mut shades = AirstrikeShades::default();
     for ms in [0, 128] {
-        let result = composite(&calls, ms, &main.draws(), view);
+        shades.step(&calls, &main.draws());
+        let result = composite(&calls, ms, &shades, view);
+        // Phobos's hook at 0x007058F6 resumes past the stock draw at
+        // 0x00705905 and draws only its own scale.
+        #[cfg(not(feature = "phobos"))]
         reference.draws().ranged(190, 270);
+        #[cfg(feature = "phobos")]
+        reference.draws().ranged(745, 1000);
         assert_eq!(result.first(), Some(&opaque));
         assert_eq!(result.last(), Some(&opaque));
         assert_eq!(
@@ -181,6 +204,62 @@ fn composite_preserves_opaque_beam_order_and_advances_only_the_shared_main_draws
     }
 }
 
+/// Phobos `TechnoClass_DrawAirstrikeFlare_LineColor` (`0x007058F6`) and
+/// `_DotColor` (`0x0070597A`): every line takes the scaled base colour and one
+/// depth, `min(zSrc, zDest) + AirstrikeLineZAdjust`, and the dot keeps the
+/// unscaled word even though the target end here is the lower one, where the
+/// stock draw skips it.
+#[cfg(feature = "phobos")]
+#[test]
+fn phobos_flare_scales_the_lines_flattens_their_depth_and_always_draws_the_dot() {
+    use crate::util::native_x87::adjust_for_z_standard;
+    let from = DriveCoord {
+        x: 5248,
+        y: 5248,
+        z: 100,
+    };
+    let to = DriveCoord {
+        x: 5504,
+        y: 5248,
+        z: 0,
+    };
+    let style = FlareStyle {
+        color: [12, 200, 45],
+        z_adjust: 7,
+    };
+    let draws = geometry(
+        from,
+        to,
+        745,
+        style,
+        viewport(&native()["cases"][0]["input"]),
+    );
+    // `(BYTE)(base * 0.745)` truncates 8.94, 149.0 and 33.525.
+    let line_rgb = [8, 149, 33];
+    let z = (-32 - adjust_for_z_standard(100)).min(-32 - adjust_for_z_standard(0)) + 7;
+    let dot_word = crate::render::native_surface_format::RGB565.pack_rgb8(style.color);
+    let (mut lines, mut dots) = (0, 0);
+    for draw in &draws {
+        match draw {
+            SurfaceDraw::OpaqueRect { word, .. } => {
+                dots += 1;
+                assert_eq!(*word, dot_word);
+            }
+            SurfaceDraw::Line(line) => {
+                lines += 1;
+                assert_eq!(line.z_adjust, [z, z]);
+                let SurfaceLineBlend::Mix { rgb, .. } = line.blend else {
+                    panic!("the airstrike beam is a mixed-color line");
+                };
+                assert_eq!(rgb, line_rgb);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((lines, dots), (12, 4));
+}
+
+#[cfg(not(feature = "phobos"))]
 #[test]
 #[ignore = "requires GPU; original Boris705860 pixels through shared4BEAC0 pipeline"]
 fn production_airstrike_beam_matches_original_pixels_and_preserves_depth() {

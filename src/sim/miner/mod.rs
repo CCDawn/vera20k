@@ -227,6 +227,12 @@ pub struct Miner {
 }
 
 impl Miner {
+    /// `UnitClass::IsHarvesting`, the bit the DiscardOn harvesting condition
+    /// reads.
+    pub(crate) fn is_harvesting(&self) -> bool {
+        self.harvesting
+    }
+
     /// Create a new miner in SearchOre state with the given kind and config.
     ///
     /// `obj_storage` is the per-unit `Storage=` value from rules.ini (in bales).
@@ -300,6 +306,15 @@ impl Miner {
     /// The bales in the hold, oldest first.
     pub fn cargo(&self) -> &[CargoBale] {
         &self.cargo
+    }
+
+    /// StorageClass::AddAmount @ 0x006C9690, represented as whole bales.
+    /// Native adds to the selected slot without clearing or capacity clamping;
+    /// harvesting owns its admission limit, while Full reinforcements add the
+    /// positive Type.Storage to a freshly zeroed hold (CreateMembers65DE7B).
+    pub(crate) fn add_bales(&mut self, bale: CargoBale, amount: u16) {
+        self.cargo
+            .extend(std::iter::repeat_n(bale, usize::from(amount)));
     }
 
     /// The hold's capacity in bales.

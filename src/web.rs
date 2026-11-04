@@ -1,12 +1,20 @@
 //! Browser host boundary. App remains the owner of the frontend and match lifecycle.
+pub(crate) mod ime;
+
 use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
+
+// The host awaits `initThreadPool(workers)` after `init()`, before any
+// simulation work. Without it the same package runs that work serially.
+#[cfg(feature = "wasm-threads")]
+pub use wasm_bindgen_rayon::init_thread_pool;
 
 thread_local! {
     static CANVAS: RefCell<Option<web_sys::HtmlCanvasElement>> = const { RefCell::new(None) };
     static STATUS: RefCell<Option<js_sys::Function>> = const { RefCell::new(None) };
     static WRITE: RefCell<Option<js_sys::Function>> = const { RefCell::new(None) };
     static REMOVE: RefCell<Option<js_sys::Function>> = const { RefCell::new(None) };
+    static REPLAY: RefCell<Option<js_sys::Function>> = const { RefCell::new(None) };
     static LIFECYCLE: RefCell<crate::browser_lifecycle::Lifecycle> = RefCell::new(Default::default());
     static ON_LIFECYCLE: RefCell<Option<js_sys::Function>> = const { RefCell::new(None) };
     static WAKE: RefCell<Option<winit::event_loop::EventLoopProxy<()>>> = const { RefCell::new(None) };
@@ -87,7 +95,9 @@ pub(crate) fn spawn_finished(report: &str) {
 }
 
 pub(crate) fn engine_exited() {
-    crate::audio::web_output::shutdown();
+    crate::audio::web_output::pause();
+    remove_spawn_files();
+    ime::remove();
     MUSIC.with(|slot| slot.borrow_mut().take());
     SFX.with(|slot| slot.borrow_mut().take());
     WAKE.with(|slot| slot.borrow_mut().take());
@@ -105,12 +115,17 @@ fn request_spawn_action(action: crate::app::SpawnAction) -> Result<(), JsValue> 
         return Err(JsValue::from_str("No start_spawn launch is running"));
     }
     SPAWN_ACTIONS.with(|actions| actions.borrow_mut().push_back(action));
+    wake();
+    Ok(())
+}
+
+/// Run the event loop's next pass now, even while it waits.
+fn wake() {
     WAKE.with(|slot| {
         if let Some(proxy) = slot.borrow().as_ref() {
             let _ = proxy.send_event(());
         }
     });
-    Ok(())
 }
 
 /// docs/spawn.md "Scripted leave and resign": leave the running multiplayer
@@ -211,13 +226,23 @@ const SPAWN_DIRECTORY: &str = "/spawn";
 #[wasm_bindgen]
 pub fn import_spawn_file(name: &str, bytes: Vec<u8>) -> Result<(), JsValue> {
     relative_path(name)?;
-    if LIFECYCLE.with(|slot| slot.borrow().started()) {
+    if !LIFECYCLE.with(|slot| slot.borrow().idle()) {
         return Err(JsValue::from_str(
-            "Import launch files before starting; reload for another launch",
+            "Import launch files before starting or after the engine exited",
         ));
     }
     crate::util::file_system::import_file(format!("{SPAWN_DIRECTORY}/{name}"), bytes);
     Ok(())
+}
+
+/// One launch's map and spawn.ini, which holds its tokens, end with it.
+fn remove_spawn_files() {
+    let Ok(entries) = crate::util::file_system::read_dir(SPAWN_DIRECTORY) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let _ = crate::util::file_system::remove_file(entry.path());
+    }
 }
 
 /// Install durability callbacks before starting. A callback queues asynchronous host storage;
@@ -228,10 +253,43 @@ pub fn set_persistence_callbacks(write: js_sys::Function, remove: js_sys::Functi
     REMOVE.with(|slot| *slot.borrow_mut() = Some(remove));
 }
 
+/// Install before starting to receive each closed replay segment as `(name, bytes)`.
+/// Persistence is separate: whatever its callbacks report must be restorable.
+#[wasm_bindgen]
+pub fn set_replay_callback(callback: js_sys::Function) {
+    REPLAY.with(|slot| *slot.borrow_mut() = Some(callback));
+}
+
+pub(crate) fn has_replay_callback() -> bool {
+    REPLAY.with(|slot| slot.borrow().is_some())
+}
+
+pub(crate) fn hand_over_replay(name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    // Release the slot before calling user JS, which may register a callback.
+    let Some(callback) = REPLAY.with(|slot| slot.borrow().clone()) else {
+        return Ok(());
+    };
+    callback
+        .call2(
+            &JsValue::NULL,
+            &name.into(),
+            &js_sys::Uint8Array::from(bytes),
+        )
+        .map_err(|error| anyhow::anyhow!("Host replay callback failed: {error:?}"))?;
+    Ok(())
+}
+
 #[wasm_bindgen]
 pub fn restore_user_file(path: &str, bytes: Vec<u8>, modified_ms: f64) -> Result<(), JsValue> {
-    if LIFECYCLE.with(|slot| slot.borrow().started()) {
-        return Err(JsValue::from_str("Restore user data before starting"));
+    if !LIFECYCLE.with(|slot| slot.borrow().idle()) {
+        return Err(JsValue::from_str(
+            "Restore user data before starting or after the engine exited",
+        ));
+    }
+    // Builds that sent replays through the persistence callback left them in
+    // hosts' storage. Refusing one would abort that host's whole restore.
+    if path.starts_with("/replays/") {
+        return Ok(());
     }
     if !path.starts_with("/saves/") {
         return Err(JsValue::from_str("User data must be below /saves/"));
@@ -287,14 +345,15 @@ pub fn start_game(
 }
 
 /// Start directly into spawn.ini's match. Its match-ended callback is
-/// followed by engine-exited; starting another game requires a new instance.
+/// followed by engine-exited; once that has returned, another launch may
+/// import its files and call this again. A panic requires a new instance.
 #[wasm_bindgen]
 pub fn start_spawn(
     canvas: web_sys::HtmlCanvasElement,
     on_status: js_sys::Function,
     spawn_ini: String,
 ) -> Result<(), JsValue> {
-    if LIFECYCLE.with(|slot| slot.borrow().started()) {
+    if !LIFECYCLE.with(|slot| slot.borrow().may_start(true)) {
         return Err(JsValue::from_str("Game already started; reload to restart"));
     }
     let request = read_spawn(spawn_ini)?;
@@ -303,6 +362,13 @@ pub fn start_spawn(
     );
     app.set_spawn_request(request);
     run(canvas, on_status, app, true)
+}
+
+/// Whether `start_spawn` may run now: before the first launch and after a
+/// clean exit, not while a game runs, after `start_game` or after a panic.
+#[wasm_bindgen]
+pub fn can_start_spawn() -> bool {
+    LIFECYCLE.with(|slot| slot.borrow().may_start(true))
 }
 
 fn read_spawn(
@@ -362,7 +428,7 @@ fn run(
     external: bool,
 ) -> Result<(), JsValue> {
     use winit::platform::web::EventLoopExtWebSys;
-    if LIFECYCLE.with(|slot| slot.borrow().started()) {
+    if !LIFECYCLE.with(|slot| slot.borrow().may_start(external)) {
         return Err(JsValue::from_str("Game already started; reload to restart"));
     }
     let event_loop =

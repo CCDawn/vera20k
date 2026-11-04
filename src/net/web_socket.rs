@@ -66,7 +66,7 @@ impl UdpSocket {
         })
     }
 
-    pub fn set_relay(&mut self, endpoint: SocketAddrV4) -> io::Result<()> {
+    pub fn set_relay(&mut self, endpoint: SocketAddrV4, gateway: &str) -> io::Result<()> {
         #[cfg(feature = "wasm-lan")]
         if self.lan.is_some() {
             return Err(io::Error::new(
@@ -74,12 +74,8 @@ impl UdpSocket {
                 "a browser LAN socket cannot carry a relay session",
             ));
         }
-        let next = open(
-            super::browser_proxy_url(),
-            self.channel,
-            vera20k_relay_protocol::MAX_DATAGRAM,
-        )
-        .map_err(|_| io::Error::other("browser proxy configuration is unavailable"))?;
+        let next = open(gateway, self.channel, vera20k_relay_protocol::MAX_DATAGRAM)
+            .map_err(|_| io::Error::other("browser proxy configuration is unavailable"))?;
         if let Some(previous) = self.id.replace(next) {
             close(previous);
         }

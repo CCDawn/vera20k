@@ -192,6 +192,8 @@ impl Simulation {
             sub_y,
             z,
             world_z: spawn.coord.z,
+            z_adjust: crate::sim::anim_class::COMBAT_EXPLOSION_Z_ADJUST,
+            owner_house: None,
             death: Some(spawn),
         };
         if super::world_receiver::callbacks_enabled(self) {
@@ -225,6 +227,7 @@ impl Simulation {
                 crate::sim::anim_class::AnimConstructorInput::Runtime,
                 crate::sim::anim_class::AnimConstructorInput::Preconsumed,
             ),
+            crate::sim::world::FrameEffects::default(),
         ) {
             Ok(anim) => anim,
             Err(error) => {
@@ -518,6 +521,7 @@ impl Simulation {
                 crate::sim::crew_survival::foundation_cells(rx, ry, &object.foundation)
             {
                 let (x, y) = super::inviso_scatter::random_direction_coord(
+                    self.cell_grid(),
                     &mut self.scenario_rng,
                     i32::from(cell_rx) * 256 + 0x80,
                     i32::from(cell_ry) * 256 + 0x80,

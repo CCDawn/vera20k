@@ -21,8 +21,8 @@
 //! - Part of render/ — depends on assets/ (SHP/Palette), render/batch (GPU upload).
 //! - Reads from sim/ via EntityStore iteration (GameEntity fields).
 
-use std::collections::{HashMap, HashSet};
 use crate::util::time::Instant;
+use std::collections::{HashMap, HashSet};
 
 use crate::assets::asset_manager::AssetManager;
 use crate::assets::mix_archive::SharedBytes;
@@ -462,7 +462,8 @@ pub struct ShpSpriteEntry {
     pub offset_x: f32,
     /// Y offset from the cell center to the sprite's top-left corner.
     pub offset_y: f32,
-    /// Logical canvas [x, y, width, height] retained for picking and sorting.
+    /// Logical canvas [x, y, width, height] for non-Building depth and sorting.
+    /// Building viewport admission uses the type bounds, not this selected canvas.
     /// Drawing and native Z use the stored frame rectangle above instead.
     pub canvas_rect: [f32; 4],
     /// SHP format bit 1: only the extended walker consumes BUILDNGZ.
@@ -627,6 +628,11 @@ pub struct SpriteAtlas {
     /// Object type → physical frame count of its resolved object SHP. Kept
     /// separately from presentation counts, which may exclude shadow frames.
     object_shp_frame_counts: HashMap<String, u16>,
+    /// BuildingType render bounds (465570), in unzoomed surface pixels.
+    /// Derived from immutable scenario image bindings, independent of palette,
+    /// health/frame and camera. Growth publishes it with the atlas transaction;
+    /// map/theater/rules reload drops the atlas and its bounds together.
+    building_type_bounds: HashMap<String, [i32; 4]>,
     /// Keys with nothing to draw: the SHP is missing or fails to decode, or
     /// the frame is empty. Remembered so a refresh never renders them again.
     unrenderable: HashSet<ShpSpriteKey>,
@@ -709,6 +715,7 @@ impl SpriteAtlas {
             make_frame_counts: HashMap::new(),
             active_anim_frame_counts: HashMap::new(),
             object_shp_frame_counts: HashMap::new(),
+            building_type_bounds: HashMap::new(),
             unrenderable: HashSet::new(),
             covered_objects: HashMap::new(),
             covered_anim_remaps: HashSet::new(),
@@ -746,6 +753,12 @@ impl SpriteAtlas {
         self.object_shp_frame_counts
             .get(&type_id.to_ascii_uppercase())
             .copied()
+    }
+
+    /// Native relative type bounds; `None` means this type has not been prepared.
+    /// A known empty image/rectangle remains `Some`, including its origin.
+    pub(crate) fn building_type_bounds(&self, type_id: &str) -> Option<[i32; 4]> {
+        self.building_type_bounds.get(type_id).copied()
     }
 
     /// Exact frame lookup; an absent frame is not substituted or wrapped.
@@ -1505,12 +1518,48 @@ fn insert_object_keys(
             // CanBeOccupied bodies additionally select frames2/3. Missing
             // entries retain the existing garrison-body fallback in the draw
             // consumer; this does not invent a frame for a shorter SHP.
-            let can_be_occupied = rules
-                .and_then(|r| r.object(type_str))
-                .is_some_and(|obj| obj.can_be_occupied);
+            let object = rules.and_then(|r| r.object(type_str));
+            let can_be_occupied = object.is_some_and(|obj| obj.can_be_occupied);
             if can_be_occupied {
                 for frame in 2u16..=3 {
                     insert(frame);
+                }
+            }
+            // A Gate=yes body selects more than frames 0/1. GetCurrentFrame
+            // 43EF90's completed gate arm (0x0043F0BD..0x0043F0F5) returns 0
+            // above ConditionYellow and GateStages+1 at or below it, with no
+            // undamaged fallback; DrawBody's Mission Open arm
+            // (0x0043D546..0x0043D68F) draws ftol(progress*GateStages) clamped
+            // to 0..GateStages-1, plus GateStages+1 when damaged. The body
+            // therefore reaches exactly {0..GateStages-1} u {GateStages+1..=
+            // 2*GateStages}, never GateStages itself. Without these keys a
+            // damaged retail GAGATE_A requested frame 10, missed the atlas and
+            // vanished (#3592); the type-level coverage check never re-admits
+            // a type once frames 0/1 are present.
+            //
+            // No draw-side fallback accompanies this: ShapeFile::GetFrameData
+            // (0x0069E740) returns NULL for an index past the SHP (0x0069E7B2
+            // -> 0x0069E7D0) and DrawSHP draws nothing, which the consumer's
+            // skip of an absent Structure key already mirrors. A mod gate with
+            // authored damaged stages must show them. A gate SHP physically
+            // shorter than 2*GateStages+1 instead falls to the packing-time
+            // facing/frame-0 substitution further down in render_shp_frame, a
+            // pre-existing exposure the CanBeOccupied frames 2/3 already
+            // share. Retail G?GATE_A only looks undamaged at low health because
+            // its frames 10..19 are byte-identical copies of 0..9.
+            if let Some((rules, object)) = rules.zip(object).filter(|(_, object)| object.gate) {
+                let stages = rules
+                    .art()
+                    .resolve_metadata_entry(type_str, &object.image)
+                    .map_or(9, |entry| entry.building_gate_stages);
+                if let Some(stages) = u16::try_from(stages)
+                    .ok()
+                    .filter(|&stages| stages > 0 && stages <= u16::MAX / 2)
+                {
+                    // Frames 0 and 1 are already requested above.
+                    for frame in (2..stages).chain(stages + 1..=stages * 2) {
+                        insert(frame);
+                    }
                 }
             }
         }
@@ -2152,6 +2201,52 @@ pub(crate) fn prepare_sprite_atlas(
         );
     }
 
+    let mut building_type_bounds = previous_atlas
+        .as_ref()
+        .map(|atlas| atlas.building_type_bounds.clone())
+        .unwrap_or_default();
+    for (type_id, _) in &new_objects {
+        if building_type_bounds.contains_key(type_id) {
+            continue;
+        }
+        let Some(object) = rules
+            .and_then(|rules| rules.object(type_id))
+            .filter(|object| {
+                object.category == crate::rules::object_type::ObjectCategory::Building
+            })
+        else {
+            continue;
+        };
+        // Reuse the body/bib bindings already chosen above and the registered
+        // make filename; do not resolve another candidate or decode pixels.
+        let Some(main) = object_sources.get(&(ShpImageKind::Object, type_id.clone())) else {
+            continue;
+        };
+        let make_file = shp_files.get(&(
+            ShpImageKind::Object,
+            format!("{type_id}_MAKE").to_ascii_uppercase(),
+        ));
+        let make = make_file.and_then(|file| asset_manager.get_ref(file));
+        if make_file.is_some() && make.is_none() {
+            continue;
+        }
+        let bib = art
+            .and_then(|art| art.resolve_metadata_entry(type_id, &object.image))
+            .and_then(|entry| entry.bib_shape.as_ref())
+            .and_then(|bib| object_sources.get(&(ShpImageKind::Object, bib.to_ascii_uppercase())))
+            .and_then(Option::as_ref);
+        match building_type_render_bounds(
+            main.as_ref().map(|source| source.data.as_ref()),
+            make,
+            bib.map(|source| source.data.as_ref()),
+        ) {
+            Ok(bounds) => {
+                building_type_bounds.insert(type_id.clone(), bounds);
+            }
+            Err(error) => log::warn!("Building bounds unavailable for {type_id}: {error}"),
+        }
+    }
+
     // Step 1c': a war factory's unload art (`ArtEntry::factory_door`), every
     // frame of each SHP, shadows included. `BuildingClass::DrawIt @
     // 0x0043D290` draws it through the building's own DrawSHP, like the bib.
@@ -2686,6 +2781,7 @@ pub(crate) fn prepare_sprite_atlas(
         make_frame_counts,
         active_anim_frame_counts,
         object_shp_frame_counts,
+        building_type_bounds,
         shp_files,
         projectile_files,
         new_objects,
@@ -2712,6 +2808,7 @@ pub(crate) struct ShpAtlasUpload {
     make_frame_counts: HashMap<String, u16>,
     active_anim_frame_counts: HashMap<String, u16>,
     object_shp_frame_counts: HashMap<String, u16>,
+    building_type_bounds: HashMap<String, [i32; 4]>,
     shp_files: HashMap<(ShpImageKind, String), String>,
     projectile_files: HashMap<String, (String, u16)>,
     new_objects: HashSet<(String, HouseColorIndex)>,
@@ -2768,6 +2865,7 @@ impl ShpAtlasUpload {
             make_frame_counts,
             active_anim_frame_counts,
             object_shp_frame_counts,
+            building_type_bounds,
             shp_files,
             projectile_files,
             new_objects,
@@ -2782,6 +2880,7 @@ impl ShpAtlasUpload {
         atlas.make_frame_counts = make_frame_counts;
         atlas.active_anim_frame_counts = active_anim_frame_counts;
         atlas.object_shp_frame_counts = object_shp_frame_counts;
+        atlas.building_type_bounds = building_type_bounds;
         atlas.shp_files = shp_files;
         atlas.projectile_files = projectile_files;
         for (type_id, color) in new_objects {
@@ -2803,6 +2902,42 @@ impl ShpAtlasUpload {
         );
         atlas
     }
+}
+
+/// BuildingTypeClass::GetRenderDimensions465570, original gamemd instructions:
+/// fold all body frames, all buildup frames, then bib frame0, in that order.
+/// SHPStruct::GetFrameBounds69E7E0 reads signed header rectangles; center
+/// only by the main canvas.
+/// Shared ordered union retains the native strict-maximum-edge +1 behavior.
+fn building_type_render_bounds(
+    main: Option<&[u8]>,
+    buildup: Option<&[u8]>,
+    bib: Option<&[u8]>,
+) -> Result<[i32; 4], crate::assets::error::AssetError> {
+    let Some(main) = main else {
+        return Ok([0; 4]);
+    };
+    let canvas = ShpFile::canvas_size_from_bytes(main)?.map(|word| i32::from(word as i16));
+    let mut accumulated = None;
+    for source in [Some(main), buildup].into_iter().flatten() {
+        let count = ShpFile::frame_count_from_bytes(source)? as i16;
+        for frame in 0..count.max(0) {
+            crate::util::rect::union_native_draw_bounds(
+                &mut accumulated,
+                ShpFile::frame_bounds_from_bytes(source, frame as usize)?,
+            );
+        }
+    }
+    if let Some(bib) = bib {
+        crate::util::rect::union_native_draw_bounds(
+            &mut accumulated,
+            ShpFile::frame_bounds_from_bytes(bib, 0)?,
+        );
+    }
+    let mut bounds = accumulated.unwrap_or([0; 4]);
+    bounds[0] -= canvas[0] / 2;
+    bounds[1] -= canvas[1] / 2;
+    Ok(bounds)
 }
 
 /// One type's decoded SHP and the draw offsets every key of it shares.
@@ -2914,6 +3049,18 @@ fn load_shp_source(
                     .iter()
                     .flat_map(|load| load.shp_names(theater_ext, theater_name))
                     .collect()
+            } else if art.is_some_and(|art| {
+                art.iter_entries().any(|(_, entry)| {
+                    entry
+                        .bib_shape
+                        .as_deref()
+                        .is_some_and(|bib| bib.eq_ignore_ascii_case(base_type_id))
+                })
+            }) {
+                // BuildingTypeClass::LoadVisualAssets @ 0x0045F856..0x0045F922
+                // loads BibShape through 5F96B0, then 5F9710 on a miss. The
+                // raw bib name needs no ART entry or NewTheater flag of its own.
+                art_data::building_shp_names(base_type_id, theater_name).to_vec()
             } else {
                 art_data::object_shp_candidates(art, &image, theater_ext, theater_name)
             }
@@ -2957,7 +3104,6 @@ fn load_shp_source(
 
     if shp.frames.is_empty() {
         log::warn!("{} has no frames", found_name);
-        return None;
     }
 
     log::debug!(
@@ -3039,7 +3185,7 @@ fn render_shp_frame(
         0
     };
 
-    let frame = &shp.frames[frame_idx];
+    let frame = shp.frames.get(frame_idx)?;
     if frame.frame_width == 0 || frame.frame_height == 0 {
         log::debug!(
             "{} frame {} is empty ({}x{})",

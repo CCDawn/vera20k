@@ -220,6 +220,10 @@ impl<'a> FireSubject<'a> {
                 is_locomotor: warhead.is_locomotor,
                 psychedelic: warhead.psychedelic,
                 bomb_disarm: warhead.bomb_disarm,
+                #[cfg(feature = "phobos")]
+                airstrike: warhead.airstrike,
+                #[cfg(feature = "phobos")]
+                airstrike_targets: warhead.airstrike_targets,
                 armor_rejects_fire: armor.is_some_and(|armor| {
                     // Ares 3.0 hook100542A0 admits ForceFire OR nonzero
                     // multiplier; this is the shared GetFireError gate, not
@@ -457,6 +461,10 @@ impl<'a> FireSubject<'a> {
                         is_simple_deployer: target_obj.is_simple_deployer,
                         non_vehicle: target_obj.non_vehicle,
                         is_1x1_with_undeploy: target_obj.is_1x1_with_undeploy(),
+                        #[cfg(feature = "phobos")]
+                        allow_airstrike: target_obj.allow_airstrike,
+                        #[cfg(feature = "phobos")]
+                        can_c4: target_obj.can_c4,
                     },
                 ),
                 // GetFireError6FC177 preserves the original Object receiver
@@ -568,6 +576,49 @@ impl FireQuery for WorldQuery<'_, '_> {
             .map(|weapon| subject.weapon_facts(weapon, self.target.obj))
     }
 
+    /// Phobos `TechnoClass_CanFire` (`0x6FC339`): the cell arm gates the firer
+    /// with `AttachEffect.CheckOnFirer`, and the techno arm asks the target's
+    /// (or, with the same key, the firer's) effects.
+    fn attach_effect_gate(&mut self, weapon_index: i32) -> bool {
+        #[cfg(feature = "phobos")]
+        {
+            let subject = self.subject;
+            let Some(weapon) = subject.weapon_at(weapon_index) else {
+                return true;
+            };
+            if !weapon.has_attach_effect_gates() {
+                return true;
+            }
+            let firer = Some(subject.firer);
+            if weapon.attach_effect_check_on_firer
+                && !subject.world.weapon_attach_effects_allow(
+                    weapon,
+                    Some(subject.firer),
+                    firer,
+                    subject.rules,
+                )
+            {
+                return false;
+            }
+            if let Some(target) = self.target.entity
+                && !subject.world.weapon_attach_effects_allow(
+                    weapon,
+                    Some(target),
+                    firer,
+                    subject.rules,
+                )
+            {
+                return false;
+            }
+            true
+        }
+        #[cfg(not(feature = "phobos"))]
+        {
+            let _ = weapon_index;
+            true
+        }
+    }
+
     fn in_range(&mut self) -> bool {
         let subject = self.subject;
         let Some(target) = subject.target else {
@@ -600,6 +651,7 @@ impl FireQuery for WorldQuery<'_, '_> {
                         overlay_registry: subject.overlay_registry,
                         alliances: subject.fog.map(|fog| fog.alliances),
                     },
+                    Some(&subject.world.substrate.entities),
                 )
                 .unwrap_or(false)
             }
@@ -646,6 +698,7 @@ impl FireQuery for WorldQuery<'_, '_> {
                     weapon,
                     subject.rules,
                     &subject.world.interner,
+                    Some(&subject.world.substrate.entities),
                 )
             }
         }
@@ -694,6 +747,7 @@ impl FireQuery for WorldQuery<'_, '_> {
         i32::from(target.visual_character(
             subject.rules.general.cloaking_stages,
             invisible,
+            subject.world.shared_owned_by_current_house(target),
             crate::sim::cloak_disguise::VisualCharacterQuery::sensor(true, sensed, false),
         ))
     }
@@ -1013,7 +1067,7 @@ mod terrain_target_tests {
             &world,
             &world.interner,
             world.resolved_terrain.as_ref(),
-            Some(world.house_alliances.as_map()),
+            Some(&world.house_alliances),
         )
         .expect("a live Terrain Object is a selection target");
         assert_eq!(weapon.unwrap().weapon_id, "105mm");

@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hash;
 
-use crate::map::cell_index::canonical_cell_coord;
+use crate::map::cell_index::CellGrid;
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::rules::ruleset::RuleSet;
 use crate::rules::terrain_object_type::TerrainObjectType;
@@ -259,7 +259,10 @@ impl TerrainObjectState {
                 if terrain.is_some_and(|grid| grid.native_fixed_cell_index(x, y).is_none()) {
                     return None;
                 }
-                canonical_cell_coord(i32::from(x), i32::from(y))
+                terrain
+                    .map(|grid| grid.cell_grid())
+                    .unwrap_or_default()
+                    .canonical_coord(i32::from(x), i32::from(y))
             })
             .collect()
     }
@@ -463,6 +466,9 @@ pub(crate) enum TerrainAreaReceiveResult {
 /// outside this owner writes them.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TerrainObjectStore {
+    /// Derived from the loaded map; restored before membership validation.
+    #[serde(skip)]
+    cell_grid: CellGrid,
     animations: BTreeMap<u64, TerrainAnimationState>,
     objects: BTreeMap<u64, TerrainObjectState>,
     cells: BTreeMap<(u16, u16), u64>,
@@ -476,6 +482,9 @@ pub struct TerrainObjectStore {
 }
 
 impl TerrainObjectStore {
+    pub(crate) fn configure_cell_grid(&mut self, grid: CellGrid) {
+        self.cell_grid = grid;
+    }
     /// Every represented object by stable id.
     pub fn objects(&self) -> &BTreeMap<u64, TerrainObjectState> {
         &self.objects
@@ -491,7 +500,9 @@ impl TerrainObjectStore {
     }
 
     pub fn id_at(&self, cell: (u16, u16)) -> Option<u64> {
-        let key = canonical_cell_coord(i32::from(cell.0), i32::from(cell.1))?;
+        let key = self
+            .cell_grid
+            .canonical_coord(i32::from(cell.0), i32::from(cell.1))?;
         self.cells.get(&key).copied()
     }
 
@@ -537,7 +548,11 @@ impl TerrainObjectStore {
     /// ObjectLoad5F5E80 swizzles the saved Next; it does not reconstruct order.
     pub(crate) fn validate_membership(&self) -> Result<(), String> {
         for (&cell, &head) in &self.cells {
-            if canonical_cell_coord(i32::from(cell.0), i32::from(cell.1)) != Some(cell) {
+            if self
+                .cell_grid
+                .canonical_coord(i32::from(cell.0), i32::from(cell.1))
+                != Some(cell)
+            {
                 return Err(format!(
                     "Terrain cell {cell:?} is not a canonical real slot"
                 ));
@@ -634,7 +649,9 @@ impl TerrainObjectStore {
     /// `[Terrain]` construction starts from an empty store.
     pub(crate) fn clear(&mut self) {
         let next_epoch = self.membership_epoch.wrapping_add(1);
+        let grid = self.cell_grid;
         *self = Self::default();
+        self.cell_grid = grid;
         self.membership_epoch = next_epoch;
     }
 
@@ -771,7 +788,10 @@ impl TerrainObjectStore {
     }
 
     fn refresh_spawning_cell(&mut self, cell: (u16, u16)) {
-        let Some(cell) = canonical_cell_coord(i32::from(cell.0), i32::from(cell.1)) else {
+        let Some(cell) = self
+            .cell_grid
+            .canonical_coord(i32::from(cell.0), i32::from(cell.1))
+        else {
             return;
         };
         // CanPlaceTiberium483969..48399A stops at the first Terrain and

@@ -135,7 +135,7 @@ fn super_weapon_pointer_target_is_valid(
         .is_some_and(|target| {
             target.category() == crate::map::entities::EntityCategory::Structure
                 && crate::map::houses::is_allied_with(
-                    sim.house_alliances(),
+                    sim.house_alliances().as_map(),
                     sim.interner().resolve(target.owner()),
                     sim.interner().resolve(viewer),
                 )
@@ -490,7 +490,10 @@ pub(crate) fn place_ready_building_at_cell(
     );
     // Clear placement mode immediately so the foundation preview stops following
     // the cursor after the order is issued.
-    state.match_state.input.submit_building_placement();
+    state
+        .match_state
+        .input
+        .submit_building_placement(&mut state.match_state.match_presentation.sidebar_projection);
     log::info!(
         "Ready building placement queued: owner={} type={} cell=({}, {}) execute_tick=current",
         owner,

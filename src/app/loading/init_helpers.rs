@@ -363,11 +363,14 @@ pub(crate) fn bind_rules_art_metadata(
 /// complete retained scheduler closure, including authored animations that
 /// have since expired, rather than constructing their objects again. The
 /// Terrain phase preserves the distinct fresh/saved shape residency.
+/// Map-authored trigger and script animations bind tolerantly; the ones that
+/// bind join that closure.
 pub(crate) fn bind_rules_asset_closure(
     rules: &mut RuleSet,
     fixed_art: &IniFile,
     overlay_registry: &crate::rules::overlay_types::OverlayTypeRegistry,
     roots: &[String],
+    authored_anim_roots: &[String],
     assets: &AssetManager,
     theater_ext: &str,
     theater_name: &str,
@@ -378,6 +381,7 @@ pub(crate) fn bind_rules_asset_closure(
     let tolerant_roots = tolerant_anim_class_roots(rules);
     let unbound = rules.bind_anim_class_assets(&tolerant_roots, assets, theater_ext, theater_name);
     crate::rules::effect_asset_catalog::log_unbound_combat_explosion_roots(unbound);
+    rules.bind_anim_class_assets(authored_anim_roots, assets, theater_ext, theater_name);
     rules.bind_effect_assets(assets, theater_ext, theater_name);
     rules.bind_building_buildup_assets(assets, theater_name);
     rules.bind_building_rubble_assets(assets, theater_ext, theater_name);
@@ -410,9 +414,7 @@ pub(crate) fn startup_crate_anim_remap_keys(
         let tiberium = overlay_registry
             .tiberium_type_for_overlay(&rules.tiberium_types, overlay_id)
             .and_then(|type_id| rules.tiberium_types.get(type_id))?;
-        let color = tiberium.color.as_deref()?;
-        let entry = crate::rules::color_scheme::scheme_entry_by_name(&rules.color_schemes, color)?;
-        let color = u8::try_from(entry)
+        let color = u8::try_from(tiberium.color_scheme() / 2)
             .ok()
             .map(crate::rules::house_colors::HouseColorIndex)?;
         Some((
@@ -684,6 +686,35 @@ pub(crate) fn finish_presentation_assets(
     };
     #[cfg(not(feature = "ares"))]
     let outcome_banner_side_art = None;
+    // `[EndGameScreens]` may name the local player's own country a win/lose
+    // card. It takes the retail `GRFXTXT` banner's slot in the tactical
+    // viewport, so it is built with the world like the banner art above; the
+    // player's Custom End Game Banner switch is read when it is drawn.
+    let end_game_banner = {
+        let country = simulation
+            .session()
+            .current_house()
+            .and_then(|house| simulation.houses().get(&house))
+            .and_then(|house| house.country())
+            .map(|country| simulation.resolve(country).to_owned());
+        match country {
+            Some(country) => crate::app::presentation::outcome_banner::EndGameBanner::build(
+                gpu,
+                batch,
+                asset_manager,
+                rules.end_game_screens(),
+                &country,
+            ),
+            None => {
+                if !rules.end_game_screens().is_empty() {
+                    log::warn!(
+                        "[EndGameScreens]: no local country at load; the retail end-game banner stays"
+                    );
+                }
+                None
+            }
+        }
+    };
     let fnt_file = asset_manager.get_ref("GAME.FNT").and_then(|data| {
         crate::assets::fnt_file::FntFile::from_bytes(data)
             .map_err(|error| log::warn!("Failed to parse GAME.FNT: {error}"))
@@ -724,6 +755,7 @@ pub(crate) fn finish_presentation_assets(
         #[cfg(feature = "phobos")]
         sw_sidebar_art,
         outcome_banner_side_art,
+        end_game_banner,
         software_cursor,
         overlay_names: overlays.overlay_names,
         overlay_radar_colors: overlays.overlay_radar_colors,
@@ -925,14 +957,7 @@ mod tests {
             .tiberium_type_for_overlay(&rules.tiberium_types, overlay_id)
             .and_then(|type_id| rules.tiberium_types.get(type_id))
             .expect("tiberium authority for startup crate CellAnim");
-        assert_eq!(tiberium.color.as_deref(), Some("NeonGreen"));
-        assert_eq!(
-            crate::rules::color_scheme::scheme_entry_by_name(
-                &rules.color_schemes,
-                tiberium.color.as_deref().unwrap(),
-            ),
-            Some(1)
-        );
+        assert_eq!(tiberium.color_scheme(), 3);
 
         assert_eq!(
             startup_crate_anim_remap_keys(&rules, &overlay_registry),

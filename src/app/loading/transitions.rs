@@ -92,6 +92,7 @@ pub(crate) fn fallback_map_load_result() -> init::MapLoadResult {
             #[cfg(feature = "phobos")]
             sw_sidebar_art: None,
             outcome_banner_side_art: None,
+            end_game_banner: None,
             software_cursor: None,
             overlay_names: BTreeMap::new(),
             overlay_radar_colors: HashMap::new(),
@@ -167,6 +168,7 @@ pub(crate) fn install_world_presentation(
         .match_presentation
         .electric_bolts
         .clear_on_load();
+    state.match_state.match_presentation.airstrike_shades = Default::default();
     if let Some(runtime) = state.match_state.sim_runtime.as_ref() {
         state
             .match_state
@@ -196,6 +198,15 @@ pub(crate) fn install_world_presentation(
         .match_presentation
         .super_timer_blinks
         .clear();
+    state
+        .match_state
+        .match_presentation
+        .super_timer_next_flip_ms = None;
+    state
+        .match_state
+        .match_presentation
+        .super_timer_dock
+        .reset();
     sync_in_game_options_speed_from_sim(state);
 
     state.match_state.match_presentation.tile_atlas = assets.tile_atlas;
@@ -228,6 +239,7 @@ pub(crate) fn install_world_presentation(
             .configure(assets.sw_sidebar_ui, significance);
     }
     state.match_state.match_presentation.outcome_banner_side_art = assets.outcome_banner_side_art;
+    state.match_state.match_presentation.end_game_banner = assets.end_game_banner;
     // `Game_LoadUI_LoadSideData` resolves the dialog background pair once per
     // game load. The shell chrome atlas carries the three side slots, so a
     // changed pair drops it and the next paint rebuilds with the side's art;
@@ -349,6 +361,13 @@ pub(crate) fn install_world_presentation(
             &state.renderer.batch_renderer,
             assets,
             rules.digital_display_types().types(),
+        );
+        overlay.load_insignia_shapes(
+            &state.renderer.gpu.device,
+            &state.renderer.gpu.queue,
+            &state.renderer.batch_renderer,
+            assets,
+            rules,
         );
     }
     // Phobos placement preview strips embed the active theater's palette and
@@ -631,7 +650,7 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
     // Clear_Scene6851F0 -> 534450 resets BeaconManagerClass (53499B).
     // Display Init_Clear4A88C0 clears +11B0..+11B2, not beacon mode +11B4.
     state.match_state.match_presentation.beacons = Default::default();
-    state.match_state.input.minimap_dragging = false;
+    state.match_state.input.cancel_minimap_press();
     state.match_state.input.tactical_mouse.reset_for_new_view();
     state.match_state.input.keys_held.clear();
     state.match_state.input.cursor_x = tactical_width as f32 * 0.5;

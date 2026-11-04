@@ -113,7 +113,7 @@ struct HierarchyEdgeBuckets {
     buckets: Vec<Vec<HierarchyTempEdge>>,
     /// Every pushed edge's bucket and pair, so a repeat is found without
     /// scanning its bucket (large maps hold hundreds per bucket).
-    pushed: LookupSet<u64>,
+    pushed: LookupSet<(usize, ZoneId, ZoneId)>,
 }
 
 impl HierarchyEdgeBuckets {
@@ -138,7 +138,8 @@ impl HierarchyEdgeBuckets {
 
     /// Push `edge` unless `bucket` already holds its exact pair.
     fn push_new(&mut self, bucket: usize, edge: HierarchyTempEdge) {
-        let key = (bucket as u64) << 32 | u64::from(edge.existing) << 16 | u64::from(edge.current);
+        // Tuple identity prevents the extended IDs from overlapping packed fields.
+        let key = (bucket, edge.existing, edge.current);
         if self.pushed.insert(key) {
             self.buckets[bucket].push(edge);
         }
@@ -256,6 +257,7 @@ pub(crate) fn rebuild_base_zone_topology(
             zone_count,
             &adjacency,
             MovementZone::all_ground()[row],
+            crate::map::cell_index::CellGrid::for_extent(width, height),
         )
     });
 
@@ -287,7 +289,12 @@ pub(crate) fn build_zone_map_from_base_topology(
                 return ZONE_INVALID;
             }
             let derived = derived_by_base[base_id as usize];
-            if derived > 1 && derived != u16::MAX {
+            if derived > 1
+                && derived
+                    != super::zone_map::raw_zone_invalid(
+                        crate::map::cell_index::CellGrid::for_extent(width, height),
+                    )
+            {
                 derived
             } else {
                 ZONE_INVALID
@@ -327,9 +334,9 @@ fn rebuild_node_indices(
     levels: &[u8],
     width: u16,
     height: u16,
-) -> (Vec<u16>, u16, BaseEdgeBuckets) {
-    let mut node_indices = vec![0u16; movement_classes.len()];
-    let mut next_node: u16 = 1;
+) -> (Vec<ZoneId>, ZoneId, BaseEdgeBuckets) {
+    let mut node_indices = vec![0 as ZoneId; movement_classes.len()];
+    let mut next_node: ZoneId = 1;
     let mut edge_buckets = BaseEdgeBuckets::new();
 
     for ry in 0..height {
@@ -368,9 +375,9 @@ fn rebuild_node_indices(
 fn flood_fill_node_index(
     start_x: u16,
     start_y: u16,
-    node_id: u16,
+    node_id: ZoneId,
     movement_classes: &[u8],
-    node_indices: &mut [u16],
+    node_indices: &mut [ZoneId],
     levels: &[u8],
     width: u16,
     height: u16,
@@ -547,7 +554,7 @@ fn register_scanline_edge(
     reference_y: i32,
     current_zone: ZoneId,
     captured_class: u8,
-    node_indices: &[u16],
+    node_indices: &[ZoneId],
     levels: &[u8],
     width: u16,
     height: u16,
@@ -575,11 +582,12 @@ fn register_scanline_edge(
 
 fn rebuild_zone_ids_for_movement_zone(
     movement_classes: &[u8],
-    node_indices: &[u16],
-    node_count: u16,
-    node_adj: &[Vec<u16>],
+    node_indices: &[ZoneId],
+    node_count: ZoneId,
+    node_adj: &[Vec<ZoneId>],
     movement_zone: MovementZone,
-) -> Vec<u16> {
+    grid: crate::map::cell_index::CellGrid,
+) -> Vec<ZoneId> {
     let mut node_movement_classes = vec![zone_class::OUTSIDE; node_count as usize + 1];
     for (&node, &movement_class) in node_indices.iter().zip(movement_classes.iter()) {
         if node != 0 && node_movement_classes[node as usize] == zone_class::OUTSIDE {
@@ -588,10 +596,10 @@ fn rebuild_zone_ids_for_movement_zone(
     }
 
     let Some(row_index) = movement_zone.matrix_row() else {
-        return vec![0u16; node_count as usize + 1];
+        return vec![0 as ZoneId; node_count as usize + 1];
     };
     let row = passability::MOVEMENT_ZONE_PASSABILITY[row_index];
-    let mut zone_id_by_node = vec![1u16; node_count as usize + 1];
+    let mut zone_id_by_node = vec![1 as ZoneId; node_count as usize + 1];
     for node in 1..=node_count {
         let movement_class = node_movement_classes[node as usize] as usize;
         if row[movement_class] == 1 {
@@ -599,7 +607,7 @@ fn rebuild_zone_ids_for_movement_zone(
         }
     }
 
-    let mut next_label: u16 = 2;
+    let mut next_label: ZoneId = 2;
     for start_node in 1..=node_count {
         if zone_id_by_node[start_node as usize] != 0 {
             continue;
@@ -621,7 +629,7 @@ fn rebuild_zone_ids_for_movement_zone(
         next_label += 1;
     }
 
-    zone_id_by_node[0] = u16::MAX;
+    zone_id_by_node[0] = super::zone_map::raw_zone_invalid(grid);
     zone_id_by_node
 }
 
@@ -645,7 +653,7 @@ fn register_bridge_base_edges(
             continue;
         }
         let pair = (a.min(b), a.max(b));
-        let bucket = usize::from(((pair.0 & 15) << 4) | (pair.1 & 15));
+        let bucket = (((pair.0 & 15) << 4) | (pair.1 & 15)) as usize;
         // Native includes node0; class7 prevents traversal, but the edge is
         // retained in native bucket/adjacency state. Generic register excludes0.
         if !edge_buckets.buckets[bucket].contains(&pair) {
@@ -949,6 +957,7 @@ mod tests {
                 zone_count,
                 &adjacency,
                 MovementZone::all_ground()[row],
+                crate::map::cell_index::CellGrid::Retail,
             )
         });
         BaseZoneTopology {
@@ -1297,8 +1306,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn large_map_hierarchy_preserves_ids_and_edges_above_65535() {
+        let mut base = hierarchy_base(vec![zone_class::GROUND; 600 * 500], vec![1; 600 * 500]);
+        for row in &mut base.raw_zone_ids_by_row {
+            row[0] = ZoneId::MAX;
+        }
+        let hierarchy = build_zone_hierarchy(&base, None, &[], 600, 500);
+        let fine = hierarchy.level(0).unwrap();
+        assert!(fine.zone_count() > 65535);
+        let high = fine.zone_at(599, 499);
+        assert!(high > 65535);
+        assert!(fine.record(high).is_some());
+        let saved = crate::util::save_codec::serialize(&base).unwrap();
+        let restored: BaseZoneTopology = crate::util::save_codec::deserialize(&saved).unwrap();
+        assert_eq!(restored.raw_zone_ids_by_row[0][0], ZoneId::MAX);
+        let rebuilt = build_zone_hierarchy(&restored, None, &[], 600, 500);
+        assert_eq!(rebuilt.level(0).unwrap().zone_at(599, 499), high);
+        assert_eq!(rebuilt.level(0).unwrap().edges(high), fine.edges(high));
+        // A left neighbour whose ID sets the retail word's sign bit keeps its
+        // same-row edge, not only the diagonal scan's flag-1 copy.
+        let (left, right) = (0..500u16)
+            .flat_map(|y| (0..599u16).map(move |x| (fine.zone_at(x, y), fine.zone_at(x + 1, y))))
+            .find(|&(left, right)| (0x8000..=0xffff).contains(&left) && right > left)
+            .unwrap();
+        assert!(fine.edges(right).contains(&ZoneEdgeRecord::new(left, 0)));
+
+        let marked: crate::sim::pathfinding::zone_hierarchy::MarkedZones =
+            [high].into_iter().collect();
+        assert!(marked.contains(&high));
+        assert!(!marked.contains(&(high & 0xffff)));
+
+        // These two pairs collided in the old bucket/16-bit-field packed key.
+        let mut edges = HierarchyEdgeBuckets::new();
+        hierarchy::register_native_hierarchy_pair(
+            &mut edges,
+            65538,
+            1,
+            0,
+            crate::map::cell_index::CellGrid::Extended,
+        );
+        hierarchy::register_native_hierarchy_pair(
+            &mut edges,
+            2,
+            1,
+            0,
+            crate::map::cell_index::CellGrid::Extended,
+        );
+        let mut graph = ZoneLevelGraph::new(65538);
+        edges.drain_into(&mut graph);
+        let neighbors: Vec<_> = graph.edges(1).iter().map(|edge| edge.neighbor).collect();
+        assert_eq!(neighbors, vec![65538, 2]);
+    }
+
     fn unique_hierarchy_base(width: u16, height: u16) -> BaseZoneTopology {
-        let zone_ids: Vec<ZoneId> = (1..=width * height).collect();
+        let zone_ids: Vec<ZoneId> = (1..=u32::from(width) * u32::from(height))
+            .map(|id| id as ZoneId)
+            .collect();
         hierarchy_base(vec![zone_class::GROUND; zone_ids.len()], zone_ids)
     }
 
@@ -1312,6 +1376,57 @@ mod tests {
                 .any(|edge| edge.neighbor == zb && edge.flag == 0),
             "missing flag-0 edge {a:?} zone {za} -> {b:?} zone {zb}"
         );
+    }
+
+    /// Bridge pairs have no zero filter, so a threat search estimates the edge
+    /// to record 0 before the Outside passability gate rejects it (`0x0042C580`).
+    #[test]
+    fn threat_search_reads_record_zero_through_a_bridge_edge() {
+        use crate::sim::pathfinding::zone_hierarchy::{
+            ZonePrecheckExclusions, ZonePrecheckOutcome, ZonePrecheckThreat, zone_precheck_flat,
+        };
+        let mut classes = vec![zone_class::GROUND; 10];
+        classes[9] = zone_class::OUTSIDE;
+        let mut ids = vec![1; 10];
+        ids[9] = 0;
+        let terrain = redirect_terrain(10, 1, Some(100), None, |cell| {
+            if cell.rx == 2 {
+                cell.final_tile_index = 100;
+            }
+        });
+        let bridge = BridgeEndpointRecord {
+            endpoint_a: (2, 0),
+            endpoint_b: (9, 0),
+            active: true,
+            bridge_kind: BridgeRecordKind::High,
+        };
+        let hierarchy = build_zone_hierarchy(
+            &hierarchy_base(classes, ids),
+            Some(&terrain),
+            &[bridge],
+            10,
+            1,
+        );
+        let level2 = hierarchy.level(2).unwrap();
+        assert!(level2.edges(1).iter().any(|edge| edge.neighbor == 0));
+
+        let level0 = hierarchy.level(0).unwrap();
+        let outcome = zone_precheck_flat(
+            &hierarchy,
+            level0.zone_at(0, 0),
+            level0.zone_at(8, 0),
+            MovementZone::Normal,
+            &ZonePrecheckExclusions::default(),
+            Some(ZonePrecheckThreat::new(
+                crate::util::native_x87::NativeF64Bits::ONE,
+                &|_| Ok(0),
+            )),
+        )
+        .unwrap();
+        let ZonePrecheckOutcome::Passed(result) = outcome else {
+            panic!("the ground route remains passable");
+        };
+        assert_eq!(result.paths[2], vec![1, 2]);
     }
 
     #[test]
@@ -1469,7 +1584,9 @@ mod tests {
                 bridge_kind: BridgeRecordKind::High,
             },
         ];
-        let zone_ids: Vec<ZoneId> = (1..=width * height).collect();
+        let zone_ids: Vec<ZoneId> = (1..=u32::from(width) * u32::from(height))
+            .map(|id| id as ZoneId)
+            .collect();
         let mut buckets = HierarchyEdgeBuckets::new();
         register_high_bridge_hierarchy_edges(
             &mut buckets,
@@ -1480,7 +1597,7 @@ mod tests {
             height,
             Some((2, 2)),
         );
-        let mut graph = ZoneLevelGraph::new(width * height);
+        let mut graph = ZoneLevelGraph::new((u32::from(width) * u32::from(height)) as ZoneId);
         buckets.drain_into(&mut graph);
 
         assert!(
@@ -1572,11 +1689,23 @@ mod tests {
         );
         assert_eq!(
             level2.record(1),
-            Some(ZoneRecord::from_seed(1, 0, zone_class::GROUND, (0, 0)))
+            Some(ZoneRecord::from_seed(
+                1,
+                0,
+                zone_class::GROUND,
+                (0, 0),
+                crate::map::cell_index::CellGrid::Retail
+            ))
         );
         assert_eq!(
             level2.record(2),
-            Some(ZoneRecord::from_seed(2, 0, zone_class::GROUND, (8, 0)))
+            Some(ZoneRecord::from_seed(
+                2,
+                0,
+                zone_class::GROUND,
+                (8, 0),
+                crate::map::cell_index::CellGrid::Retail
+            ))
         );
 
         let level1 = hierarchy.level(1).unwrap();
@@ -1587,15 +1716,33 @@ mod tests {
         );
         assert_eq!(
             level1.record(1),
-            Some(ZoneRecord::from_seed(1, 1, zone_class::GROUND, (0, 0)))
+            Some(ZoneRecord::from_seed(
+                1,
+                1,
+                zone_class::GROUND,
+                (0, 0),
+                crate::map::cell_index::CellGrid::Retail
+            ))
         );
         assert_eq!(
             level1.record(2),
-            Some(ZoneRecord::from_seed(2, 1, zone_class::GROUND, (4, 0)))
+            Some(ZoneRecord::from_seed(
+                2,
+                1,
+                zone_class::GROUND,
+                (4, 0),
+                crate::map::cell_index::CellGrid::Retail
+            ))
         );
         assert_eq!(
             level1.record(3),
-            Some(ZoneRecord::from_seed(3, 2, zone_class::GROUND, (8, 0)))
+            Some(ZoneRecord::from_seed(
+                3,
+                2,
+                zone_class::GROUND,
+                (8, 0),
+                crate::map::cell_index::CellGrid::Retail
+            ))
         );
 
         let level0 = hierarchy.level(0).unwrap();
@@ -1611,7 +1758,8 @@ mod tests {
                     zone,
                     parent,
                     zone_class::GROUND,
-                    ((zone as i16 - 1) * 2, 0)
+                    ((zone as i16 - 1) * 2, 0),
+                    crate::map::cell_index::CellGrid::Retail
                 ))
             );
         }
@@ -1658,11 +1806,23 @@ mod tests {
         );
         assert_eq!(
             level0.record(1),
-            Some(ZoneRecord::from_seed(1, 1, zone_class::GROUND, (0, 0)))
+            Some(ZoneRecord::from_seed(
+                1,
+                1,
+                zone_class::GROUND,
+                (0, 0),
+                crate::map::cell_index::CellGrid::Retail
+            ))
         );
         assert_eq!(
             level0.record(2),
-            Some(ZoneRecord::from_seed(2, 2, zone_class::BEACH, (2, 0)))
+            Some(ZoneRecord::from_seed(
+                2,
+                2,
+                zone_class::BEACH,
+                (2, 0),
+                crate::map::cell_index::CellGrid::Retail
+            ))
         );
         assert_eq!(level0.edges(2), &[ZoneEdgeRecord::new(1, 1)]);
         assert_eq!(level0.edges(1), &[ZoneEdgeRecord::new(2, 1)]);

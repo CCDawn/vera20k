@@ -171,6 +171,24 @@ pub fn is_fear_application_blocked(obj: &ObjectType, entity: &GameEntity) -> boo
     obj.fearless || has_weapon_ability(entity.veterancy.rank_kind(), obj, Ability::Fearless)
 }
 
+/// InfantryClass::FireAt @0x0051DF60, retail gamemd.exe instructions:
+/// 51DF82..51DFAA, after the base returns a Bullet. This write has no
+/// Fearless/FEARLESS gate; mission queuing remains with the FireAt caller.
+pub(crate) fn apply_empty_magazine_panic(obj: &ObjectType, entity: &mut GameEntity) -> bool {
+    if entity.lifecycle.in_limbo()
+        || !obj.fraidycat
+        || entity.ammo().is_none_or(|ammo| ammo.current() != 0)
+    {
+        return false;
+    }
+    entity
+        .infantry
+        .as_mut()
+        .expect("Infantry FireAt requires its class runtime")
+        .fear_level = MAX_FEAR;
+    true
+}
+
 pub fn can_decay_fear(obj: &ObjectType) -> bool {
     !obj.fearless
 }
@@ -208,10 +226,18 @@ pub fn apply_fear_from_damage(
     condition_red_ratio: f64,
     condition_yellow_ratio: f64,
 ) {
-    if damage_landed == 0
-        || entity.health.current() == 0
-        || is_fear_application_blocked(obj, entity)
-    {
+    if damage_landed == 0 || entity.health.current() == 0 {
+        return;
+    }
+    let latch = damager_present
+        && entity
+            .infantry
+            .as_ref()
+            .is_some_and(|infantry| infantry.fear_level <= FEAR_LATCH_CEILING);
+    // Retail gamemd.exe InfantryClass::ReceiveDamage @0x00517FA0:
+    //518C5C..518C91 returns from the sourced Fraidycat latch before the
+    //Fearless/FEARLESS gates at518C94/518CC8. Panic keeps its shared gate.
+    if !(latch && obj.fraidycat) && is_fear_application_blocked(obj, entity) {
         return;
     }
     let Some(infantry) = entity.infantry.as_mut() else {
@@ -221,7 +247,7 @@ pub fn apply_fear_from_damage(
     // ceiling *sets* fear outright — 300 for a Fraidycat, 100 otherwise — instead
     // of adding to it. Only a hit with no damager, or one taken while fear is
     // already above the ceiling, runs the health-band ladder below.
-    if damager_present && infantry.fear_level <= FEAR_LATCH_CEILING {
+    if latch {
         infantry.fear_level = if obj.fraidycat {
             MAX_FEAR
         } else {
@@ -260,7 +286,7 @@ fn repeated_fear_add(
 }
 
 impl crate::sim::world::Simulation {
-    /// Original `InfantryClass` fear receiver5200B0, called by InfantryAI at
+    /// gamemd.exe `InfantryClass__Fear_Decay_Handler @ 0x005200B0`, called by InfantryAI at
     /// 51BF0B after Foot Process and before FireAtTarget5206B0/sequencer520AE0.
     /// Caller owns survival/warped admission. Returns the existing NULL Scatter
     /// owner's immediate Process bridge-state-change result.
@@ -302,13 +328,36 @@ impl crate::sim::world::Simulation {
                     .expect("retained Infantry runtime")
                     .fear_level -= 1;
             }
-            // REQUIRED SEPARATE MECHANISM:5200E1..520105 reads live
-            // Techno+2FC after fear reaches0, calls the shared IsArmed701120
-            // if Ammo0, and refills from Type+684. The shared Ammo owner now
-            // retains the constructor/chrono count, but this fear refill and
-            // ordinary ground fire debit cycle remain separate. Stock E1's
-            // negative count bypasses this arm. Saved zero-ammo controls
-            // retain its native producer for that lifecycle migration.
+            // InfantryClass__Fear_Decay_Handler @0x005200B0, retail gamemd.exe:
+            //5200E1..520105: only this positive-fear visit reaching zero can refill an empty
+            // armed actor. Copy the current type's signed Ammo; no reload
+            // timer, RNG draw or detach belongs to this arm. Installed Ares
+            // InfantryClass_UpdatePanic_DontReload (5200D7) resumes at 52010B.
+            #[cfg(not(feature = "ares"))]
+            let refill = self.substrate.entities.get(id).and_then(|actor| {
+                if actor.infantry.as_ref()?.fear_level != 0 || actor.ammo()?.current() != 0 {
+                    return None;
+                }
+                let object = self.object_type(actor.type_ref(), rules)?;
+                crate::sim::combat::combat_weapon::is_armed(
+                    actor,
+                    object,
+                    &self.substrate.entities,
+                    rules,
+                    &self.interner,
+                )
+                .then_some(object.ammo)
+            });
+            #[cfg(not(feature = "ares"))]
+            if let Some(type_ammo) = refill {
+                self.substrate
+                    .entities
+                    .get_mut(id)
+                    .expect("retained fear receiver")
+                    .ammo_mut()
+                    .expect("empty Techno ammo was read above")
+                    .refill_empty_from_type(type_ammo);
+            }
             let actor = self
                 .substrate
                 .entities
@@ -710,6 +759,10 @@ pub fn apply_prone_speed(speed: SimFixed, crawls: bool, multiplier: Option<f64>)
     };
     SimFixed::from_num(adjusted)
 }
+
+#[cfg(test)]
+#[path = "infantry_damage_fear_tests.rs"]
+mod damage_fear_tests;
 
 #[cfg(test)]
 mod tests {

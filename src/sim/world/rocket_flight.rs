@@ -203,7 +203,7 @@ impl RocketHost for RocketProcessHost<'_> {
         let coordinate = ProjectileCoord::new(coord[0], coord[1], coord[2]);
         let land = crate::sim::combat::detonation_anim::land_at(self.sim, coordinate);
         if let Some(effect) = crate::sim::combat::detonation_anim::effect(
-            self.sim, self.rules, warhead, damage, land, coordinate, coordinate,
+            self.sim, self.rules, warhead, damage, land, coordinate, coordinate, false,
         ) {
             super::damage_consequences::admit_explosion_effect(self.sim, self.rules, effect);
         }
@@ -236,9 +236,11 @@ impl RocketHost for RocketProcessHost<'_> {
             ProjectileCoord::new(coord[0], coord[1], coord[2]),
             damage,
             warhead_type,
+            true,
             (self.id, None, warhead_ref),
             self.frame_effects,
-        );
+        )
+        .bridge_state_changed;
     }
     fn uninit(&mut self) {
         self.sim.uninit_with_context(

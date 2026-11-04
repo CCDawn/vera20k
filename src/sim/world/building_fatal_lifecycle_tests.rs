@@ -1556,8 +1556,9 @@ impl Fixture {
 /// and without the stock smudges joined.
 #[test]
 fn original_ready_mtnk_shot_runs_building_fires_crew_and_deferred_cleanup() {
-    // Stock oracle; Ares replaces the Unit tail (737F97) and GetCrew (707D20).
-    if cfg!(feature = "ares") {
+    // Stock oracle; Ares replaces the Unit tail (737F97) and GetCrew (707D20),
+    // and Phobos `ROF.RandomDelay` (`0x006FD0B5`) redraws the rearm jitter.
+    if cfg!(any(feature = "ares", feature = "phobos")) {
         return;
     }
     for path in [

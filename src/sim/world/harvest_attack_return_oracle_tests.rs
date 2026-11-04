@@ -149,8 +149,15 @@ impl Replay {
             entity.weapon_burst =
                 serde_json::from_value(json!({"index": control["burst"]})).unwrap();
             let object = scene.rules.object("HARV").unwrap();
+            let entity = scene.sim.substrate.entities.get(scene.miner).unwrap();
             assert_eq!(
-                crate::sim::combat::combat_weapon::is_armed(entity, object),
+                crate::sim::combat::combat_weapon::is_armed(
+                    entity,
+                    object,
+                    &scene.sim.substrate.entities,
+                    &scene.rules,
+                    &scene.sim.interner
+                ),
                 int(&row["idle_control_receipt"]["is_armed_eax"]) & 255 != 0,
                 "{}: native IsArmed return byte",
                 input["name"]

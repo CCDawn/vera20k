@@ -90,15 +90,14 @@ use std::ops::ControlFlow;
 use super::combat_targeting::AttackerSnapshot;
 use super::combat_weapon::{
     AttackerFacts, SelectedWeapon, attacker_facts, controlled_transport_house, get_weapon,
-    is_ally_by_object, is_armed, is_armed_from_facts, is_occupied, occupied_reach_cells,
-    passive_scan_class_bits, primary_warhead_spares_medium_and_wood, resolve_selected_weapon,
-    resolve_weapon_index, techno_target_facts, weapon_damage_value, what_weapon_should_i_use,
+    is_ally_by_object, is_armed, is_occupied, occupied_reach_cells, passive_scan_class_bits,
+    primary_warhead_spares_medium_and_wood, resolve_selected_weapon, resolve_weapon_index,
+    techno_target_facts, weapon_damage_value, what_weapon_should_i_use,
 };
 use super::threat_mask::{self, InfantryScanner};
 use super::threat_range::{ScanRange, scan_range};
 use crate::map::cell_index::{NativeCellIdentity, square_ring_cells};
 use crate::map::entities::EntityCategory;
-use crate::map::houses::HouseAllianceMap;
 use crate::map::resolved_terrain::{NativeCellQuery, ResolvedTerrainGrid};
 use crate::rules::object_type::{ObjectType, VhpScan};
 use crate::rules::ruleset::RuleSet;
@@ -106,6 +105,7 @@ use crate::rules::weapon_type::WeaponType;
 use crate::sim::components::DriveCoord;
 use crate::sim::entity_store::EntityStore;
 use crate::sim::game_entity::{DistributedFireCandidate, GameEntity};
+use crate::sim::house_diplomacy::HouseAlliances;
 use crate::sim::intern::{InternedId, StringInterner};
 use crate::sim::mission::MissionType;
 use crate::sim::movement::ground_pose::{object_get_coords, position_world_coord};
@@ -203,22 +203,15 @@ impl ThreatCoefficients {
     ) -> Self {
         let general = &rules.general;
         if scorer_house_byte_set {
+            // CalculateThreatScore70CD10 loads the five stored type
+            // doubles. ReadINI71551E..715720 already resolved their defaults.
+            let coefficients = scorer_type.threat_coefficients();
             Self {
-                my_effectiveness: scorer_type
-                    .my_effectiveness_coefficient
-                    .unwrap_or(general.my_effectiveness_coefficient_default),
-                target_effectiveness: scorer_type
-                    .target_effectiveness_coefficient
-                    .unwrap_or(general.target_effectiveness_coefficient_default),
-                target_special_threat: scorer_type
-                    .target_special_threat_coefficient
-                    .unwrap_or(general.target_special_threat_coefficient_default),
-                target_strength: scorer_type
-                    .target_strength_coefficient
-                    .unwrap_or(general.target_strength_coefficient_default),
-                target_distance: scorer_type
-                    .target_distance_coefficient
-                    .unwrap_or(general.target_distance_coefficient_default),
+                my_effectiveness: coefficients.my_effectiveness(),
+                target_effectiveness: coefficients.target_effectiveness(),
+                target_special_threat: coefficients.target_special_threat(),
+                target_strength: coefficients.target_strength(),
+                target_distance: coefficients.target_distance(),
             }
         } else {
             Self {
@@ -338,7 +331,7 @@ pub(crate) fn calculate_threat_score(
     rules: &RuleSet,
     interner: &StringInterner,
     terrain: Option<&ResolvedTerrainGrid>,
-    alliances: Option<&HouseAllianceMap>,
+    alliances: Option<&HouseAlliances>,
     coefficients: ThreatCoefficients,
     reference: ThreatReference,
     scorer_enemy_house: Option<InternedId>,
@@ -756,7 +749,7 @@ impl ScanContext<'_> {
         })
     }
 
-    fn alliances(&self) -> Option<&HouseAllianceMap> {
+    fn alliances(&self) -> Option<&HouseAlliances> {
         self.los.alliances
     }
 
@@ -1240,6 +1233,8 @@ pub(crate) fn greatest_threat(
         standing.human,
         healer,
         scanner,
+        entities,
+        interner,
         lost_building,
     ) {
         ControlFlow::Continue(scan) => scan,
@@ -1553,6 +1548,8 @@ fn scanner_mask<'r>(
     human: bool,
     healer: bool,
     scanner: &GameEntity,
+    entities: &EntityStore,
+    interner: &StringInterner,
     lost_building: impl FnOnce() -> Option<u64>,
 ) -> ControlFlow<Option<u64>, (u32, bool)> {
     let literal = attacker.scan_mission.literal_mask();
@@ -1565,7 +1562,7 @@ fn scanner_mask<'r>(
                 human,
                 engineer: attacker_obj.engineer,
                 lost_building,
-                armed: is_armed_from_facts(attacker_obj, facts),
+                armed: is_armed(scanner, attacker_obj, entities, rules, interner),
                 infiltrate: attacker_obj.infiltrate,
                 vehicle_thief: attacker_obj.vehicle_thief,
                 thief: attacker_obj.thief,
@@ -1744,10 +1741,13 @@ thread_local! {
 /// reads nothing the walk changes except the shared Dummy, which a
 /// candidate's cell lookups can stamp and a later candidate's read, and the
 /// Scenario stream a computer's disguise detection draws from. Each
-/// candidate is therefore scored on a private copy of both. When any of them
-/// stamped the Dummy the list is scored again one by one on the shared
-/// Dummy, as natively; otherwise only the candidates that drew are, in list
-/// order on the shared stream.
+/// candidate is therefore scored on a private copy of both. Whether a
+/// candidate draws does not depend on the stream, but a side-by-side roll
+/// came from wherever its worker's copy had got to, so the candidates that
+/// drew are scored again, in list order on the shared stream, and only
+/// their second scores count. When any candidate stamped the Dummy (the ones
+/// that drew, in their second scoring) the list is scored again one by one
+/// on the shared Dummy and the stream as the walk found them, as natively.
 fn flat_scores(
     ctx: &ScanContext<'_>,
     walk: WalkArgs,
@@ -1768,23 +1768,28 @@ fn flat_scores(
             let drew = ctx.scenario_draws.get() != draws;
             (score, stamped, drew)
         });
-        if scored.iter().all(|&(_, stamped, _)| !stamped) {
-            #[cfg(any(test, feature = "test-support"))]
-            FLAT_WALKS_SIDE_BY_SIDE.set(FLAT_WALKS_SIDE_BY_SIDE.get() + 1);
-            // Whether a candidate draws does not depend on the stream: the
-            // ones that drew are scored again, in list order, on the shared
-            // stream.
-            return scored
+        if scored.iter().all(|&(_, stamped, drew)| drew || !stamped) {
+            let stream = ctx.scenario_rng.borrow().clone();
+            let draws = ctx.scenario_draws.get();
+            let scores: Option<Vec<_>> = scored
                 .into_iter()
                 .zip(candidates)
                 .map(|((score, _, drew), candidate)| {
-                    if drew {
-                        flat_score(ctx, walk, candidate)
-                    } else {
-                        score
+                    if !drew {
+                        return Some(score);
                     }
+                    let (score, stamped) =
+                        dummy.detached_stamps(|| flat_score(ctx, walk, candidate));
+                    (!stamped).then_some(score)
                 })
                 .collect();
+            if let Some(scores) = scores {
+                #[cfg(any(test, feature = "test-support"))]
+                FLAT_WALKS_SIDE_BY_SIDE.set(FLAT_WALKS_SIDE_BY_SIDE.get() + 1);
+                return scores;
+            }
+            *ctx.scenario_rng.borrow_mut() = stream;
+            ctx.scenario_draws.set(draws);
         }
     }
     candidates
@@ -2002,6 +2007,16 @@ fn evaluate_candidate(
         ctx.attacker_obj,
         scanner_facts,
         Some(&candidate_facts),
+        |index| {
+            get_weapon(
+                ctx.scanner,
+                ctx.attacker_obj,
+                index,
+                ctx.entities,
+                ctx.rules,
+                ctx.interner,
+            )
+        },
     );
     let selected = resolve_weapon_index(
         ctx.rules,
@@ -2240,7 +2255,13 @@ fn evaluate_candidate(
         ScanRange::NoCutoff => true,
         ScanRange::CanFireAt => match (
             &selected,
-            is_armed_from_facts(ctx.attacker_obj, ctx.scanner_facts),
+            is_armed(
+                ctx.scanner,
+                ctx.attacker_obj,
+                ctx.entities,
+                ctx.rules,
+                ctx.interner,
+            ),
         ) {
             // RESIDUAL: an Is_Armed-true scanner with no weapon in the
             // selected slot (an occupied building whose occupant is unarmed, a
@@ -2272,6 +2293,7 @@ fn evaluate_candidate(
                         ctx.interner,
                         &cells,
                         &ctx.los,
+                        Some(ctx.entities),
                     )
                 }
                 None => super::in_range::mapless_in_range(
@@ -2280,6 +2302,7 @@ fn evaluate_candidate(
                     selected.weapon,
                     ctx.rules,
                     ctx.interner,
+                    Some(ctx.entities),
                 ),
             },
             _ => unarmed_range_ok(),
@@ -2419,14 +2442,19 @@ fn evaluate_candidate(
         && !vehicle_like(ctx, candidate, candidate_obj)
         && building
         && !ctx.engineer
-        && (!is_armed(candidate, candidate_obj)
-            || super::threat_posed::live_threat_posed(
-                candidate,
-                Some(candidate_obj),
-                ctx.entities,
-                ctx.rules,
-                ctx.interner,
-            ) == 0)
+        && (!is_armed(
+            candidate,
+            candidate_obj,
+            ctx.entities,
+            ctx.rules,
+            ctx.interner,
+        ) || super::threat_posed::live_threat_posed(
+            candidate,
+            Some(candidate_obj),
+            ctx.entities,
+            ctx.rules,
+            ctx.interner,
+        ) == 0)
     {
         return None;
     }
@@ -2542,7 +2570,13 @@ fn evaluate_candidate(
             factory: candidate_obj.has_factory(),
             can_be_occupied: candidate_obj.can_be_occupied,
             occupants: candidate.passenger_role.occupants().count(),
-            armed: is_armed(candidate, candidate_obj),
+            armed: is_armed(
+                candidate,
+                candidate_obj,
+                ctx.entities,
+                ctx.rules,
+                ctx.interner,
+            ),
         },
     )?;
     // `0x006F88BF..0x006F8924`: the ThreatAvoidance factor is 1.0 unless the
@@ -2672,9 +2706,7 @@ fn probe_is_illegal(
         world,
         rules: ctx.rules,
         overlay_registry: ctx.los.overlay_registry,
-        fog: ctx
-            .fog
-            .map(|fog| fog.fire_view(world.house_alliances.as_map())),
+        fog: ctx.fog.map(|fog| fog.fire_view(&world.house_alliances)),
         firer,
         obj: ctx.attacker_obj,
         target: Some(super::TargetKind::Entity(candidate.stable_id())),
@@ -3116,3 +3148,7 @@ mod unarmed_tests;
 #[cfg(test)]
 #[path = "greatest_threat_healer_guard_tests.rs"]
 mod healer_guard_tests;
+
+#[cfg(test)]
+#[path = "greatest_threat_coefficient_tests.rs"]
+mod coefficient_tests;

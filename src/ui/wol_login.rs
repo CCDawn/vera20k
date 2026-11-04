@@ -75,11 +75,14 @@ pub(crate) const PAGE: MenuPageSpec = MenuPageSpec {
     },
 };
 
+/// The online sign-in opens the visit: Login alone, and Back leaves WOL with
+/// the welcome Main Menu's help.
 const ONLINE_PAGE: MenuPageSpec = MenuPageSpec {
-    stacked: &[MenuPageButtonSpec {
-        csf_key: "GUI:OK",
-        ..PAGE.stacked[0]
-    }],
+    stacked: &[PAGE.stacked[0]],
+    back: MenuPageButtonSpec {
+        tooltip_key: "STT:WOLWelcomeBack",
+        ..PAGE.back
+    },
     ..PAGE
 };
 
@@ -681,10 +684,10 @@ impl WolLoginLayout {
     }
 
     pub(crate) fn tooltip_key(&self, control: u16) -> Option<&'static str> {
-        if self.policy == LoginPolicy::Online && control != BACK {
-            return None;
+        match self.policy {
+            LoginPolicy::Online => (control == BACK).then_some(ONLINE_PAGE.back.tooltip_key),
+            LoginPolicy::Legacy => tooltip_key(control),
         }
-        tooltip_key(control)
     }
 
     pub(crate) fn new(width: i32, height: i32) -> Self {
@@ -1027,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn online_page_has_only_username_ok_and_back_and_validates_names() {
+    fn online_page_has_only_username_login_and_back_and_validates_names() {
         let layout = WolLoginLayout::new(800, 600).with_policy(LoginPolicy::Online);
         assert_eq!(
             layout
@@ -1038,7 +1041,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             [LOGIN, BACK]
         );
-        assert_eq!(layout.page_spec().button(LOGIN).unwrap().csf_key, "GUI:OK");
+        assert_eq!(
+            layout.page_spec().button(LOGIN).unwrap().csf_key,
+            "GUI:Login"
+        );
+        assert_eq!(layout.tooltip_key(BACK), Some("STT:WOLWelcomeBack"));
+        assert_eq!(layout.tooltip_key(LOGIN), None);
         let native = WolLoginLayout::new(800, 600);
         for rect in [
             layout.password,

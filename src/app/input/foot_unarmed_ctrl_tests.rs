@@ -92,6 +92,9 @@ fn retail_unarmed_ctrl_click_matches_original_selection_and_navigation() {
         assert!(!crate::sim::combat::combat_weapon::is_armed(
             actor,
             retail.rules.object("CMIN").unwrap(),
+            sim.entities(),
+            &retail.rules,
+            sim.interner(),
         ));
         let before = sim.state_hash();
         let rng = sim.rng_state();

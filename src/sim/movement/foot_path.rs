@@ -59,9 +59,47 @@ struct FootSearchEntry<'a> {
     /// The unlifted mover's own cell. Lifting it would change any answer
     /// about that cell, so asking one marks the search.
     own_cell: Option<(i16, i16)>,
+    /// The own cell's index on a regular terrain, where a real candidate is
+    /// at the own cell exactly when it has that index
+    /// ([`crate::map::resolved_terrain::ResolvedTerrainGrid::regular_cell_index`]).
+    own_index: Option<usize>,
     read_own_cell: std::cell::Cell<bool>,
+    /// The cell asked from: an expansion asks about up to eight neighbours
+    /// from one cell.
+    previous: LastRealCell,
     /// A Unit whose type is `Passive=`.
     passive_unit: bool,
+    /// The path batch's test whether a re-path goes on
+    /// ([`crate::sim::pathfinding::SearchFootEntry::keeps_searching`]);
+    /// none for every other search.
+    keep_searching: Option<&'a dyn Fn(u32) -> bool>,
+}
+
+/// The last coordinate whose lookup found a real cell, with that cell. Such
+/// a lookup has no side effect, so it is not repeated; one that misses
+/// stamps the shared Dummy, so it is made at each ask.
+#[derive(Default)]
+struct LastRealCell(std::cell::Cell<Option<((u16, u16), NativeCellIdentity)>>);
+
+impl LastRealCell {
+    /// `terrain`'s cell at `coord`
+    /// ([`crate::map::resolved_terrain::ResolvedTerrainGrid::native_cell_identity`]).
+    fn lookup(
+        &self,
+        terrain: &crate::map::resolved_terrain::ResolvedTerrainGrid,
+        coord: (u16, u16),
+    ) -> NativeCellIdentity {
+        if let Some((kept, cell)) = self.0.get()
+            && kept == coord
+        {
+            return cell;
+        }
+        let cell = terrain.native_cell_identity((coord.0 as i16, coord.1 as i16));
+        if let NativeCellIdentity::Real(_) = cell {
+            self.0.set(Some((coord, cell)));
+        }
+        cell
+    }
 }
 
 /// Whether Mark0 has lifted the searching mover off its cell.
@@ -86,9 +124,7 @@ impl crate::sim::pathfinding::SearchFootEntry for FootSearchEntry<'_> {
             .as_ref()
             .ok_or("Foot search requires map cells")?;
         let receiver = self.receiver.as_ref().map_err(Clone::clone)?;
-        let previous = query
-            .from
-            .map(|coord| terrain.native_cell_identity((coord.0 as i16, coord.1 as i16)));
+        let previous = query.from.map(|coord| self.previous.lookup(terrain, coord));
         let candidate = match query.candidate {
             crate::sim::pathfinding::SearchEntryCandidate::CopiedCoord(coord) => {
                 terrain.native_cell_identity((coord.0 as i16, coord.1 as i16))
@@ -96,10 +132,16 @@ impl crate::sim::pathfinding::SearchFootEntry for FootSearchEntry<'_> {
             crate::sim::pathfinding::SearchEntryCandidate::RetainedNativeCell(cell) => cell,
         };
         if let Some(own) = self.own_cell
-            && let NativeCellIdentity::Real(_) = candidate
-            && terrain.native_cell_coord(candidate) == own
+            && let NativeCellIdentity::Real(index) = candidate
         {
-            self.read_own_cell.set(true);
+            let at_own = self.own_index.map_or_else(
+                || terrain.native_cell_coord(candidate) == own,
+                |own_index| index == own_index,
+            );
+            debug_assert_eq!(at_own, terrain.native_cell_coord(candidate) == own);
+            if at_own {
+                self.read_own_cell.set(true);
+            }
         }
         receiver.can_enter(
             candidate,
@@ -137,6 +179,10 @@ impl crate::sim::pathfinding::SearchFootEntry for FootSearchEntry<'_> {
     }
     fn is_passive_unit(&self) -> bool {
         self.passive_unit
+    }
+    fn keeps_searching(&self, expanded: u32) -> bool {
+        self.keep_searching
+            .is_none_or(|keep_searching| keep_searching(expanded))
     }
     fn finishing_threat_coefficient(
         &self,
@@ -401,7 +447,7 @@ impl Simulation {
         frame_effects: FrameEffects<'_>,
     ) -> Result<FootPathOutcome, String> {
         // A batched request waits for the next frame's batch as if the +640
-        // timer still ran (`path_batch`, a proposed deviation): 75AF4B..75AF66
+        // timer still ran (`path_batch`, a sim-scale deviation): 75AF4B..75AF66
         // calls the owner's vt+0x548 and returns. So does the admission
         // retry's recursion, whose +640 the retry just expired, unless it is
         // the Foot's first request in a frame the batch answered. A request
@@ -605,12 +651,22 @@ impl Simulation {
                         counts,
                         MoverLift::Marked,
                         None,
+                        None,
                     )
                     .0
                 }
             }
         };
-        //4D3EAC restores Mark1 before inspecting the core result.
+        //4D3E82..3E9F copies a successful route before Mark1's callbacks.
+        if let Ok(path) = &searched {
+            let actor = self
+                .substrate
+                .entities
+                .get_mut(id)
+                .ok_or("retired Find_Path direction receiver")?;
+            request.install_route(actor, path);
+        }
+        //4D3EAC restores Mark1 before the timer and follower continuation.
         self.foot_mark_put(id, rules, registry, frame_effects);
         if let Err(super::movement_path::MovePathFailure::Search(
             crate::sim::pathfinding::zone_search::PathSearchFailure::CellEntryUnavailable(cause),
@@ -630,7 +686,30 @@ impl Simulation {
         match searched {
             Ok(path) => {
                 debug_assert!(path.len() >= 2, "AStar routes leave the start cell");
-                request.install_route(actor, path);
+                //4D3EF7..3F22 retains the full core tail, even when the
+                //Foot+5E0 copy above is limited to24 words.
+                let last_step = &path[path.len() - 2..];
+                let last_direction = crate::sim::components::direction_from_step(
+                    (last_step[0].0 as i16, last_step[0].1 as i16),
+                    last_step[1],
+                );
+                self.continue_unit_follower_paths(
+                    request,
+                    goal,
+                    last_direction,
+                    rules,
+                    registry,
+                    frame_effects,
+                )?;
+                //4D3FF0..4003 queries the live initiator's current Cell
+                //only after every follower destination/search callback.
+                let actor = self
+                    .substrate
+                    .entities
+                    .get_mut(id)
+                    .ok_or("Find_Path initiator retired during follower callbacks")?;
+                let current = (actor.position.rx() as i16, actor.position.ry() as i16);
+                actor.navigation.path_replay_mut().rebase(current);
                 Ok(Ok(()))
             }
             Err(MovePathFailure::Search(
@@ -646,7 +725,138 @@ impl Simulation {
                 Err("Find_Path core requires PathGrid; no native failure inferred".into())
             }
             Err(MovePathFailure::Search(Search::CellEntryUnavailable(cause))) => Err(cause),
+            Err(MovePathFailure::Search(Search::Stopped)) => {
+                Err("Find_Path's own search stopped; only batched searches stop".into())
+            }
         }
+    }
+
+    /// FootClass::Find_Path @ 0x004D3920's Unit follower continuation,
+    /// 0x004D3ECD..0x004D3FE1 (original instructions). It routes successive
+    /// peers behind the requested/redirected endpoint through the ordinary
+    /// queue, destination and Find_Path owners. IsTrain and House do not
+    /// gate this branch; a marked follower does not propagate recursively.
+    fn continue_unit_follower_paths(
+        &mut self,
+        request: &FootPathRequest,
+        goal: DriveCoord,
+        last_direction: u8,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: FrameEffects<'_>,
+    ) -> Result<(), String> {
+        let actor = self
+            .substrate
+            .entities
+            .get(request.entity_id)
+            .ok_or("retired Find_Path follower initiator")?;
+        if actor.category() != EntityCategory::Unit
+            || actor
+                .navigation
+                .path_replay()
+                .remaining_directions()
+                .is_empty()
+            || actor.is_unit_follower()
+        {
+            return Ok(());
+        }
+        let Some(first) = actor.unit_follower() else {
+            return Ok(());
+        };
+        let mut next = Some(first);
+        let mut destination = coord_cell(goal);
+        let reverse = crate::util::direction::opposite_direction(last_direction & 7)
+            .expect("masked path direction");
+        let mut visited = std::collections::BTreeSet::from([request.entity_id]);
+        //A malformed graph can retain false follower bytes on every edge,
+        //causing nested Find_Path calls before the outer loop revisits an
+        //identity. Check only this admitted traversal, without forbidding
+        //cycles at map admission/save or adding a persistent graph cache.
+        let mut probe = next;
+        while let Some(id) = probe {
+            if !visited.insert(id) {
+                return Err("Find_Path reached a cyclic Unit follower chain".into());
+            }
+            let peer = self
+                .substrate
+                .entities
+                .get(id)
+                .filter(|peer| peer.category() == EntityCategory::Unit)
+                .ok_or("Find_Path follower reference names a missing Unit")?;
+            probe = peer.unit_follower();
+        }
+        visited.clear();
+        visited.insert(request.entity_id);
+        while let Some(id) = next {
+            //The native loop has no completed result for a surviving cycle.
+            //Report that unsupported traversal instead of imposing a hop
+            //limit or pretending a truncated chain succeeded.
+            if !visited.insert(id) {
+                return Err("Find_Path reached a cyclic Unit follower chain".into());
+            }
+            destination = {
+                let cells = NativeCellQuery::canonical(
+                    self.resolved_terrain
+                        .as_ref()
+                        .ok_or("Find_Path followers require map cells")?,
+                );
+                let cell = cells.lookup(destination);
+                cells.coord(cells.neighbor(cell, usize::from(reverse)))
+            };
+            let nav = self
+                .substrate
+                .entities
+                .get(id)
+                .ok_or("Find_Path follower reference names a retired Unit")?
+                .navigation
+                .nav_com();
+            let already_routed = match nav {
+                Some(nav) => {
+                    coord_cell(super::navcom::nav_target_coordinate(
+                        nav,
+                        None,
+                        self,
+                        self.resolved_terrain.as_ref(),
+                        Some((rules, &self.interner)),
+                    )?) == destination
+                }
+                None => false,
+            };
+            if !already_routed {
+                crate::sim::mission::authority::queue_entity_mission_deferred(
+                    self.substrate
+                        .entities
+                        .get_mut(id)
+                        .ok_or("retired Find_Path follower queue receiver")?,
+                    MissionId::from_known(MissionType::Move),
+                );
+                self.redirect_find_path_destination(
+                    id,
+                    destination,
+                    rules,
+                    registry,
+                    frame_effects,
+                )?;
+                let peer_request = FootPathRequest::track(
+                    &self.substrate.entities,
+                    id,
+                    DriveCoord::from(cell_center(destination.into(), 0)),
+                    0,
+                    self.playfield_bounds(),
+                )
+                .ok_or("retired Find_Path follower search receiver")?;
+                //4D3FD9 ignores the child's AL, then reads its live next
+                //pointer after callbacks, including failure cleanup.
+                let _ = self.foot_find_path(&peer_request, rules, registry, frame_effects)?;
+            }
+            next = self
+                .substrate
+                .entities
+                .get(id)
+                .ok_or("Find_Path follower retired during its callbacks")?
+                .unit_follower();
+        }
+        Ok(())
     }
 
     /// The core search (AStar 0x0042C900 with its bridge markers and both
@@ -664,6 +874,7 @@ impl Simulation {
         counts: &crate::sim::pathfinding::BlockerNeighborCounts,
         lift: MoverLift,
         facts: Option<&crate::sim::world::EntryFacts>,
+        keep_searching: Option<&dyn Fn(u32) -> bool>,
     ) -> (
         Result<Vec<(u16, u16)>, super::movement_path::MovePathFailure>,
         bool,
@@ -719,12 +930,19 @@ impl Simulation {
             threat_coefficient: self.foot_path_threat_coefficient(id),
             unlisted,
             own_cell: unlisted.map(|_| (own_cell.0 as i16, own_cell.1 as i16)),
+            own_index: unlisted
+                .and(self.resolved_terrain.as_ref())
+                .and_then(|terrain| {
+                    terrain.regular_cell_index((own_cell.0 as i16, own_cell.1 as i16))
+                }),
             read_own_cell: std::cell::Cell::new(false),
+            previous: LastRealCell::default(),
             passive_unit: actor.category() == EntityCategory::Unit
                 && self
                     .interner
                     .object_type(actor.type_ref(), rules)
                     .is_some_and(|object| object.passive),
+            keep_searching,
         };
         let searched = request.search(
             goal,
@@ -1429,6 +1647,31 @@ impl Simulation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lookup that found a real cell is kept; one that missed is made
+    /// again, stamping the shared Dummy at each ask.
+    #[test]
+    fn only_a_lookup_that_found_a_real_cell_is_kept() {
+        use crate::map::resolved_terrain::{test_flat_cell, test_grid};
+        let mut terrain = test_grid(4, 4, test_flat_cell);
+        let hole = (3, 3);
+        let allocated: Vec<_> = (0..4)
+            .flat_map(|y| (0..4).map(move |x| (x, y)))
+            .filter(|&cell| cell != hole)
+            .collect();
+        terrain.test_set_native_allocated_cells(&allocated);
+        let dummy = terrain.shared_cell_dummy();
+        let last = LastRealCell::default();
+        let real = terrain.native_cell_identity((1, 2));
+        assert!(matches!(real, NativeCellIdentity::Real(_)));
+        assert_eq!(last.lookup(&terrain, (1, 2)), real);
+        assert_eq!(last.lookup(&terrain, (1, 2)), real);
+        for _ in 0..2 {
+            dummy.stamp_coord(-5, -6);
+            assert_eq!(last.lookup(&terrain, hole), NativeCellIdentity::Dummy);
+            assert_eq!(dummy.snapshot().coord, (3, 3), "the miss stamps again");
+        }
+    }
 
     #[test]
     fn signed_lepton_cell_conversion_truncates_toward_zero() {

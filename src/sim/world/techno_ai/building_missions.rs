@@ -83,19 +83,19 @@
 //! through `combat::laser` and share the app LaserDraw/DSurface owner. The
 //! remaining non-house randomized spread path belongs to DrawBeam550260.
 //! - Guard's status-1 contact arm: foundation waiters and the full arrival
-//!   position producer are bounded by the depot corpus. WeaponsFactory
-//!   ClearBibArea449540 is dormant with retail data because every stock
-//!   WeaponsFactory retains HasStupidGuardMode.
+//!   position producer are bounded by the depot corpus.
 //! - Voxel HVA frames now reach `emit_building_turret_vxl`: original43DA80
 //!   selects +148 modulo the turret's frames (or the barrel's frames on the
 //!   barrel-only arm); a separate barrel uses frame0. Native component
 //!   comparisons live in tools/voxel_oracle/building_barrel.json. This does
 //!   not close the other building Attack residuals in #757.
-//! - Dormant with retail data: the SAM arm (`0x0044AD07`, `SAM=` unset), the
-//!   upgrade arm (`0x0044B2BC`, no `PowersUpBuilding=`), Mission_Guard's
+//! - Dormant with retail data: the SAM arm (`0x0044AD07`, `SAM=` unset), Mission_Guard's
 //!   SuperWeapon gate (`0x00449716..0x00449753`, no armed type sets
 //!   `SuperWeapon=`) and BuildingClass::SetTarget's TickTank/Artillary
 //!   undeploy (`0x00443C07..0x00443C54`, neither key set).
+//! Installed-upgrade Attack44B2BC is handled in fire_arm: its first stored
+//! type's normal records decide suppression or fixed slots0/1, ahead of
+//! Prism and delayed-fire handling. Legal authored maps can reach it.
 //!
 //! ## Dependency rules
 //! - Part of sim/; sim/ never depends on render/, ui/, audio/, net/.
@@ -738,7 +738,7 @@ fn mission_guard(sim: &mut Simulation, id: u64, rules: &RuleSet, ctx: ObjectAiCt
         .known()
         .unwrap_or(MissionType::Guard);
     // vt+0x2AC, `BuildingClass::Is_Armed 0x00458DB0`.
-    if combat_weapon::is_armed(entity, obj) {
+    if combat_weapon::is_armed(entity, obj, &sim.substrate.entities, rules, &sim.interner) {
         let empty_garrison = obj.can_be_occupied && entity.passenger_role.occupants().is_empty();
         let has_target = entity.attack_target.target().is_some();
         if let Some(entity) = sim.substrate.entities.get_mut(id) {
@@ -823,6 +823,18 @@ fn mission_guard(sim: &mut Simulation, id: u64, rules: &RuleSet, ctx: ObjectAiCt
                 return 1;
             }
         }
+    }
+    //449929..449940: after status1's contact scan, re-read the factory type
+    //and clear its bib through the same449540 owner as Unload. Ignore its
+    //answer: Guard remains in status1 even when the head is already clear.
+    if status == 1
+        && let Some(entity) = sim.substrate.entities.get(id)
+        && let Some(object) = sim.object_type(entity.type_ref(), rules)
+        && object.weapons_factory
+    {
+        let location = crate::sim::movement::ground_pose::position_world_coord(&entity.position);
+        let track = crate::sim::movement::factory_exit_track_coordinate(location, object);
+        clear_factory_exit_bib(sim, id, track, rules, ctx);
     }
     // `0x00449970..0x004499B5`, reached from every status: a UnitReload
     // type in radio contact (`0x0065AE30`, any slot filled) asks its first
@@ -1174,7 +1186,8 @@ pub(super) fn gattling_idle(
     }
 }
 
-/// The OK arm (`0x0044B2BC`): a Prism tower forwards ([`prism_arm`]); an
+/// The OK arm (`0x0044B2BC`): an installed slot-0 upgrade first decides
+/// whether to fire both slots; otherwise a Prism tower forwards ([`prism_arm`]); an
 /// `IsAnimDelayedFire=` building arms its delayed shot (`0x0044B630..
 /// 0x0044B666`: `+0x714` = DelayedFireDelay, `+0x708` = the weapon, `+0x704`
 /// = 1) for [`process_delayed_fire`]; any other calls the existing live
@@ -1188,6 +1201,45 @@ fn fire_arm(
     ctx: ObjectAiCtx<'_>,
     bridge_state_changed: &mut bool,
 ) {
+    //44B2BC..44B2F7: any nonzero count admits slot0 only. A hole falls
+    //through; a present type suppresses all other shot arms, even when its
+    //712130 predicate refuses to fire. The common OK tail still runs.
+    let first_upgrade = sim.substrate.entities.get(id).and_then(|entity| {
+        let upgrades = entity.building_upgrades();
+        (upgrades.count() != 0)
+            .then(|| upgrades.types()[0])
+            .flatten()
+            .and_then(|type_ref| sim.interner.object_type(type_ref, rules))
+    });
+    if let Some(upgrade) = first_upgrade {
+        if combat_weapon::has_shared_or_bursting_weapons(upgrade, rules) {
+            for weapon in [0, 1] {
+                //44B2DD/44B6C7 reload TarCom for EACH FireAt. The previous
+                //transaction may clear/retask it or remove the actor; no
+                //extra rearm, health or selection gate belongs here. A null
+                //target returns before FireAt6FDDAE has any side effect.
+                if let Some(target) = sim
+                    .substrate
+                    .entities
+                    .get(id)
+                    .and_then(|entity| entity.attack_target.target())
+                {
+                    *bridge_state_changed |= sim
+                        .commit_fire_visit(
+                            crate::sim::combat::world_fire::FireVisit::Building {
+                                id,
+                                shot: BuildingShot::Mission { weapon, target },
+                            },
+                            rules,
+                            ctx.overlay_registry,
+                            ctx.effects,
+                        )
+                        .bridge_state_changed;
+                }
+            }
+        }
+        return;
+    }
     let Some(obj) = sim
         .substrate
         .entities

@@ -61,9 +61,9 @@ fn estimate_zone_threat(
         return lookup(target_index);
     }
     let decode = |index: i32| {
-        let remainder = index.wrapping_sub(1) % 130;
+        let remainder = index.wrapping_sub(1) % (i32::from(graph.cell_grid().side()) / 4 + 2);
         let x = remainder.wrapping_mul(4);
-        let y = (index.wrapping_sub(remainder) / 130)
+        let y = (index.wrapping_sub(remainder) / (i32::from(graph.cell_grid().side()) / 4 + 2))
             .wrapping_mul(4)
             .wrapping_sub(4);
         let raw = (x as i16, y as i16);
@@ -75,8 +75,11 @@ fn estimate_zone_threat(
     };
     let (source_raw, source) = decode(index(source)?);
     let (target_raw, target) = decode(target_index);
-    let read =
-        |coord: (i16, i16)| lookup(crate::sim::house_threat::HouseSpatialThreat::index(coord));
+    let read = |coord: (i16, i16)| {
+        lookup(
+            crate::sim::house_threat::HouseSpatialThreat::index_for_grid(graph.cell_grid(), coord),
+        )
+    };
     if source == target {
         let a = read(target_raw)?;
         return Ok(a.wrapping_add(read(source_raw)?) >> 1);
@@ -175,15 +178,20 @@ impl ZoneRecord {
         parent: ZoneId,
         zone_type: u8,
         seed: (i16, i16),
+        grid: crate::map::cell_index::CellGrid,
     ) -> Self {
         let mut record = Self::new(zone_id, parent, zone_type);
         record.native_threat_index =
-            Some(crate::sim::house_threat::HouseSpatialThreat::index(seed));
+            Some(crate::sim::house_threat::HouseSpatialThreat::index_for_grid(grid, seed));
         record
     }
 
+    /// Record 0, the Outside sentinel, has no seed: Original581F90 clears its
+    /// temporary record's +20 (58205F) and copies it (58A59F). Bridge pairs can
+    /// target it, and 42C580 estimates that edge before passability rejects it.
     pub(crate) fn native_threat_index(self) -> Option<i32> {
         self.native_threat_index
+            .or((self.zone_id == ZONE_INVALID).then_some(0))
     }
 }
 
@@ -216,6 +224,9 @@ pub struct ZoneLevelGraph {
 }
 
 impl ZoneLevelGraph {
+    pub(crate) fn cell_grid(&self) -> crate::map::cell_index::CellGrid {
+        crate::map::cell_index::CellGrid::for_extent(self.width, self.height)
+    }
     pub(crate) fn new(zone_count: ZoneId) -> Self {
         Self {
             records: vec![None; zone_count as usize + 1],
@@ -254,7 +265,9 @@ impl ZoneLevelGraph {
         let Ok(expected) = ZoneId::try_from(self.records.len()) else {
             return false;
         };
-        if record.zone_id != expected {
+        if (!self.cell_grid().is_extended() && expected > u32::from(u16::MAX))
+            || record.zone_id != expected
+        {
             return false;
         }
         self.records.push(Some(record));
@@ -556,7 +569,7 @@ pub struct MarkedZones {
 
 impl MarkedZones {
     pub(crate) fn contains(&self, zone: &ZoneId) -> bool {
-        let zone = usize::from(*zone);
+        let zone = *zone as usize;
         self.bits
             .get(zone / 64)
             .is_some_and(|word| word & (1 << (zone % 64)) != 0)
@@ -567,7 +580,7 @@ impl FromIterator<ZoneId> for MarkedZones {
     fn from_iter<I: IntoIterator<Item = ZoneId>>(zones: I) -> Self {
         let mut bits = Vec::new();
         for zone in zones {
-            let zone = usize::from(zone);
+            let zone = zone as usize;
             if bits.len() <= zone / 64 {
                 bits.resize(zone / 64 + 1, 0);
             }
@@ -931,7 +944,7 @@ fn search_precheck_level_in(
         cost: NativeF32Bits::from_bits(0),
         depth: 0,
     });
-    best.set(usize::from(start), NativeF32Bits::from_bits(0));
+    best.set(start as usize, NativeF32Bits::from_bits(0));
     heap.push(0, by_cost(nodes));
     #[cfg(any(test, feature = "test-support"))]
     let mut pops = Vec::new();
@@ -976,7 +989,7 @@ fn search_precheck_level_in(
             };
             let new_cost = precheck_edge_cost(cost, base_cost, threat_cost, edge.flag);
             if best
-                .get(usize::from(neighbor))
+                .get(neighbor as usize)
                 .is_some_and(|best| !precheck_cost_less(new_cost, best))
             {
                 continue;
@@ -994,7 +1007,7 @@ fn search_precheck_level_in(
                 continue;
             }
             {
-                best.set(usize::from(neighbor), new_cost);
+                best.set(neighbor as usize, new_cost);
                 let next = nodes.len();
                 nodes.push(PrecheckNode {
                     parent: Some(index),

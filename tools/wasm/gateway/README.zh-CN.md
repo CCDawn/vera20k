@@ -15,15 +15,19 @@ VERA_RELAY_HOST=relay.example.com VERA_RELAY_PORT=5000 \
 
 `VERA_RELAY_HOST` 必填，`VERA_RELAY_PORT` 默认为 5000。请配置与大厅下发的 `RelayGrant.address` 对应的 relay；网关不能使用另一台 relay 的凭据进行替代。浏览器不能选择上游目标。`VERA_LOBBY_URL` 默认为 `https://lobby.vera20k.org`，必须是 HTTPS origin。`/v1/*` 转发原有的请求方法、路径、Authorization 和请求体，不转换 JSON、不跟随重定向，也不重放请求，并保留上游的状态码和响应体。CORS 仅允许 `VERA_WEB_ORIGIN`、GET/POST 方法以及 Authorization/Content-Type 请求头。不会转发浏览器自动携带的 cookie。
 
-浏览器的 `WS_PROXY_URL` 会编译进 `wasm-net` 构建，默认值为 `wss://wss.vera20k.com`。这是客户端配置，与服务端的 UDP 目标分别设置。请在该 origin 部署终止 TLS 的反向代理，将 `/game/*` 路由的 WebSocket Upgrade 连接以及 `/v1/*` HTTP 请求转发到本进程。保留浏览器的 Origin 请求头；WebSocket 空闲超时至少设为 70 秒。Node 服务默认绑定 `127.0.0.1:8788`（可通过 `HOST` 和 `PORT` 覆盖），不提供游戏静态文件。静态站点和网关可以分别托管。
+大厅按请求来源地址实施按网络的限制，而代理请求的来源地址是网关自身。若要让每个浏览器玩家使用各自的限制，请把 `VERA_GATEWAY_KEY` 设为大厅 Worker 的 `GATEWAY_KEY` 密钥：一个至少 32 个字符的随机字符串（`openssl rand -hex 32`）。网关随后会在每个 `/v1/*` 请求中附带该密钥和玩家地址（socket 对端地址，或 `VERA_CLIENT_IP_HEADER` 指定的请求头）；没有密钥时，大厅会忽略请求中指定的地址。未设置时，所有浏览器玩家共享网关的地址及其限制。
 
-局域网信令默认关闭。设置 `VERA_LAN_SIGNAL=1` 后会为 `wasm-lan` 构建启用 `/lan/signal`：按公网地址分组、分配虚拟 IPv4，并在组内转发 WebRTC 描述和候选地址；游戏数据报不经过网关。部署在反向代理后时，把 `VERA_CLIENT_IP_HEADER` 设为该代理写入的请求头（例如 `cf-connecting-ip`；`x-forwarded-for` 取最后一项），并把 `/lan/*` 的 WebSocket Upgrade 转发到本进程。客户端能直连网关时不要设置该项。`VERA_LAN_STUN` 可选，填写逗号分隔的 `stun:` 地址，用于隐藏 host candidate 的网络；TURN 会被拒绝。限制定义在 `signal.mjs`：256 个连接、每组 16 人、单条消息 16 KiB、每连接每秒 64 条。
+浏览器的 `WS_PROXY_URL` 会编译进 `wasm-net` 构建，默认值为 `wss://wss.vera20k.com`。外部启动可以用 `spawn.ini` 的 `[Relay] GatewayUrl` 为这一局单独指定网关；网关必须转发到客户端票据对应的 relay。这是客户端配置，与服务端的 UDP 目标分别设置。请在该 origin 部署终止 TLS 的反向代理，将 `/game/*` 路由的 WebSocket Upgrade 连接以及 `/v1/*` HTTP 请求转发到本进程。把 `VERA_CLIENT_IP_HEADER` 设为该代理写入浏览器地址的请求头（例如 `cf-connecting-ip`；`x-forwarded-for` 取最后一项）；客户端能直连网关时不要设置该项。保留浏览器的 Origin 请求头；WebSocket 空闲超时至少设为 70 秒。Node 服务默认绑定 `127.0.0.1:8788`（可通过 `HOST` 和 `PORT` 覆盖），不提供游戏静态文件。静态站点和网关可以分别托管。
+
+局域网信令默认关闭。设置 `VERA_LAN_SIGNAL=1` 后会为 `wasm-lan` 构建启用 `/lan/signal`：按公网地址分组、分配虚拟 IPv4，并在组内转发 WebRTC 描述和候选地址；游戏数据报不经过网关。部署在反向代理后时，把 `/lan/*` 的 WebSocket Upgrade 转发到本进程；分组使用 `VERA_CLIENT_IP_HEADER` 给出的地址。`VERA_LAN_STUN` 可选，填写逗号分隔的 `stun:` 地址，用于隐藏 host candidate 的网络；TURN 会被拒绝。限制定义在 `signal.mjs`：256 个连接、每组 16 人、单条消息 16 KiB、每连接每秒最多接收 64 条消息或 Ping。JSON、Ping 和 Pong 写入都会检查待发送队列（含帧头预留）：每接收端最多 256 KiB，所有信令连接合计最多 1 MiB。写入会超过任一上限时，按正常成员清理流程移除对应接收端；欢迎消息被拒绝的连接不会发布加入通知。离开的浏览器的虚拟地址会保留两分钟，直到其他成员已不再使用它；只有请求取回该地址的信令重连才能获得它。
 
 本地开发可以使用 `VERA_WEB_ORIGIN=http://localhost:8000`。若大厅使用 HTTP，必须同时设置 `VERA_ALLOW_LOCAL_HTTP=1`，并使用回环地址的大厅 origin，例如 `VERA_LOBBY_URL=http://127.0.0.1:8790`。远程 HTTP 地址会被拒绝。此时浏览器也必须使用匹配的本地代理 origin `ws://localhost:8788` 进行编译。
 
 所有游戏载荷仍保持加密，但 HTTP 代理会处理大厅 bearer 和包含密钥的响应。因此，网关属于受信任的大厅基础设施；不要记录请求头、请求体、响应体、票据或载荷密钥。网关不需要 relay 签名密钥，也不需要零售资源。WS Origin 检查只是现有 relay 身份认证的补充，不能认证任意非浏览器客户端。
 
-传输限制集中定义在 `server.mjs` 中：最多 256 个 WebSocket、128 个待完成 HTTP 请求，HTTP 请求体上限 64 KiB、响应体上限 1 MiB，单条消息上限 2048 字节，UDP 发送队列上限 256 包 / 256 KiB，WS 待发送数据上限 1 MiB。每条连接每秒最多收发合计 2048 份数据报，同时受每秒合计 16384 份的全局限制。消息的分片数量和缓冲也有限制。溢出会关闭对应传输连接，恢复方式仍只由原游戏协议决定。HTTP 响应使用流背压，请求的绝对超时为 12 秒。关闭 socket 时会释放队列和 UDP 端口。每 30 秒一次的 WS Ping/Pong 心跳不会改变游戏准备状态、票据或 Leave 语义。
+传输限制集中定义在 `server.mjs` 中：最多 256 个 WebSocket、128 个待完成 HTTP 请求，HTTP 请求体上限 64 KiB、响应体上限 1 MiB，单条消息上限 2048 字节，UDP 发送队列上限 256 包 / 256 KiB，WS 待发送数据上限 1 MiB。每条连接每秒最多收发合计 2048 份数据报，所有连接按最大最小公平原则共享每秒 16384 份的全局预算：每个一秒窗口为每条连接预留其上一窗口尝试发送的数量（不超过均分份额），超出预留的流量只能使用未被预留的预算。超出预算或遇到已满队列的数据报会像 UDP 丢包一样被丢弃，连接保持打开，恢复方式仍只由原游戏协议决定。文本、空消息或超长消息会关闭对应传输连接。消息的分片数量和缓冲也有限制。HTTP 响应使用流背压，请求的绝对超时为 12 秒。关闭 socket 时会释放队列和 UDP 端口。
+
+对客户端 Ping 的 Pong 回复使用单独的公平预算：每连接每秒最多 64 帧，所有游戏连接共享每秒 1024 帧；超出时按正常清理流程关闭对应传输连接。Pong 和网关自身的心跳 Ping 都必须满足含帧头预留的 1 MiB WS 待发送队列上限，否则关闭该慢速连接。心跳不计入共享预算，因此其他连接无法耗尽安静玩家的心跳额度；控制帧也不占用游戏数据报额度。每 30 秒一次的 WS Ping/Pong 心跳不会改变游戏准备状态、票据或 Leave 语义。
 
 锁定的 `ws` 版本包含上游针对[分片内存耗尽](https://github.com/websockets/ws/security/advisories/GHSA-96hv-2xvq-fx4p)和[关闭原因内存泄露](https://github.com/websockets/ws/security/advisories/GHSA-58qx-3vcg-4xpx)的修复。实现依据 [ws 8.22.0 限制说明](https://github.com/websockets/ws/blob/8.22.0/doc/ws.md)和[已连接 UDP 的语义](https://nodejs.org/api/dgram.html#socketconnectport-address-callback)。
 

@@ -174,7 +174,7 @@ fn speed_frame_budget(game_speed: i32) -> (i32, i32) {
 /// The launch speed whose PreCalcFrameRate row is `frames_per_second`: the
 /// inverse of [`speed_frame_budget`] over the in-game speeds 0..=6. The VERA
 /// lobby signs this rate into relay ordering certificates
-/// (services/lobby/protocol.md, launch speed `[60,45,30,20,15,12,10]`).
+/// (docs/lobby-protocol.md, launch speed `[60,45,30,20,15,12,10]`).
 pub fn game_speed_for_frame_rate(frames_per_second: u16) -> Option<i32> {
     (0..=i32::from(crate::sim::game_options::IN_GAME_OPTIONS_MAX_SPEED))
         .find(|&speed| speed_frame_budget(speed).1 == i32::from(frames_per_second))

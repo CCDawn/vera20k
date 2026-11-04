@@ -1,8 +1,9 @@
 //! Explicit source selection for shell assets with a confirmed RA2/YR variant.
 //!
-//! Its callers are the startup splash and the main-menu movie, the only art
-//! the YR Loading & Menu Movie option switches. That scope is the user's
-//! choice: other shell screens don't take this resolver unless the user asks.
+//! Its callers are the startup splash and the main-menu movie. The offline
+//! Skirmish and LAN/WOL lobby backgrounds follow the same
+//! `[VERA] YROriginalStyle=` choice through the chrome atlas instead. No
+//! other shell screen takes this resolver unless the user asks.
 //! Shared and YR-only resources continue through `AssetManager`'s ordinary
 //! lookup. A RA2 style choice names its exact archive and member so a missing
 //! RA2 copy is diagnosable instead of silently resolving the active YR asset.

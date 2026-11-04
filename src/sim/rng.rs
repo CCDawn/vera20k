@@ -607,6 +607,14 @@ impl SimRng {
         }
         (self.next_u32() as i32) % n as i32
     }
+
+    /// `Randomizer::RandomDouble` (YRpp `Helpers/Randomizer.h`):
+    /// `RandomRanged(1, INT_MAX) / (INT_MAX + 1)`, one inclusive-range draw
+    /// into `[1/2^31, 1)`. Phobos probability gates (`ArmorMultiplier.Chance`,
+    /// `Critical.Chance`) compare against it.
+    pub fn random_double(&mut self) -> f64 {
+        f64::from(self.next_range_i32_inclusive(1, i32::MAX)) / 2_147_483_648.0
+    }
 }
 
 #[cfg(test)]
@@ -950,5 +958,22 @@ mod tests {
             }
         }
         assert_eq!(compared, 98);
+    }
+
+    /// `RandomDouble` is one `RandomRanged(1, INT_MAX)` draw scaled by
+    /// `2^31`, so it advances the shared cursor exactly like that draw.
+    #[test]
+    fn random_double_consumes_one_inclusive_range_draw() {
+        let mut doubled = SimRng::new(0x5EED);
+        let mut ranged = SimRng::new(0x5EED);
+        let value = doubled.random_double();
+        let raw = ranged.next_range_i32_inclusive(1, i32::MAX);
+        assert_eq!(value, f64::from(raw) / 2_147_483_648.0);
+        assert!((0.0..1.0).contains(&value), "{value}");
+        assert_eq!(
+            doubled.native_state_hex(),
+            ranged.native_state_hex(),
+            "same cursor advance"
+        );
     }
 }

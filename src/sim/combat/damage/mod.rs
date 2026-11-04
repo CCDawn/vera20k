@@ -40,6 +40,10 @@ pub(crate) struct DefenceDivisors {
     pub house_type_armor: NativeF32Bits,
     /// `Techno+0x158`, the per-object ArmorMultiplier.
     pub unit_armor: NativeF64Bits,
+    /// Phobos `TechnoClass_ReceiveDamage_ArmorMultiplier` (`0x00701966`, 6
+    /// bytes replaced): the active AttachEffect armor product, divided as its
+    /// own step after the stock divide and before the STRONGER rank divide.
+    pub ae_armor: f64,
     /// `Rules+0x688` `VeteranArmor=` when the target's rank holds STRONGER.
     pub rank_armor: Option<NativeF64Bits>,
 }
@@ -49,6 +53,7 @@ impl Default for DefenceDivisors {
         Self {
             house_type_armor: NativeF32Bits::from_bits(1.0_f32.to_bits()),
             unit_armor: NativeF64Bits::ONE,
+            ae_armor: 1.0,
             rank_armor: None,
         }
     }

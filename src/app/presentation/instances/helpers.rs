@@ -34,6 +34,49 @@ pub(crate) enum TacticalEntityPurpose {
     ScreenSelection,
 }
 
+/// Phobos `IsControlledByCurrentPlayer_Wrapper` (`Ext/Techno/Hooks.cpp:626`):
+/// in campaign, a human or player-controlled owner answers from the
+/// `DisguiseBlinkingVisibility` flags; every other viewer uses
+/// `CanTargetHouse` against the current player (observers answer true, which
+/// VERA approximates with the absence of a local House). Without the
+/// capability the original House50B6F0 flag stands.
+fn disguise_owner_visible(
+    sim: &crate::sim::world::Simulation,
+    entity: &GameEntity,
+    local_owner_id: Option<InternedId>,
+    rules: Option<&crate::rules::ruleset::RuleSet>,
+    owner_is_allied: bool,
+) -> bool {
+    #[cfg(feature = "phobos")]
+    if let Some(rules) = rules {
+        use crate::rules::phobos_shields::AffectedHouse;
+        let flags = rules.phobos_draw_globals().disguise_blinking_visibility;
+        let campaign = !sim.session().game_mode_nonzero();
+        let player_controlled = campaign
+            && sim
+                .houses()
+                .get(&entity.owner())
+                .is_some_and(|house| house.is_human() || house.player_control());
+        return if player_controlled {
+            (flags.contains(AffectedHouse::ALLIES) && owner_is_allied)
+                || flags.contains(AffectedHouse::OWNER)
+        } else {
+            local_owner_id.is_none_or(|observer| {
+                crate::sim::combat::can_target_house(
+                    flags,
+                    observer,
+                    entity.owner(),
+                    sim.houses(),
+                    sim.house_alliances(),
+                    sim.interner(),
+                )
+            })
+        };
+    }
+    let _ = (sim, entity, local_owner_id, rules, owner_is_allied);
+    sim.house_is_human_player(entity.owner())
+}
+
 /// Gather facts for the simulation-owned visual-character query without
 /// retaining a second ownership, alliance, sensor or Rules state in rendering.
 pub(crate) fn observer_draw_context(
@@ -45,7 +88,7 @@ pub(crate) fn observer_draw_context(
 ) -> crate::render::draw_state::ObserverDrawContext {
     let owner = sim.interner().resolve(entity.owner());
     let allied = local_owner.is_some_and(|observer| {
-        crate::map::houses::is_allied_with(sim.house_alliances(), observer, owner)
+        crate::map::houses::is_allied_with(sim.house_alliances().as_map(), observer, owner)
     });
     let object = rules.and_then(|r| sim.interner().object_type(entity.type_ref(), r));
     let disguise_cell = entity
@@ -62,11 +105,12 @@ pub(crate) fn observer_draw_context(
             );
             cells.coord(cell)
         });
+    let disguise_owner_visible = disguise_owner_visible(sim, entity, local_owner_id, rules, allied);
     crate::render::draw_state::ObserverDrawContext {
         owner_is_allied: allied,
         owner_is_mutually_allied: allied
             && local_owner.is_some_and(|observer| {
-                crate::map::houses::is_allied_with(sim.house_alliances(), owner, observer)
+                crate::map::houses::is_allied_with(sim.house_alliances().as_map(), owner, observer)
             }),
         observer_present: local_owner_id.is_some(),
         detects_cloak: local_owner_id.is_some_and(|observer| {
@@ -83,6 +127,7 @@ pub(crate) fn observer_draw_context(
         }),
         is_campaign: !sim.session().game_mode_nonzero(),
         owner_is_current_player: sim.house_is_human_player(entity.owner()),
+        disguise_owner_visible,
         disguise_cell_present: disguise_cell.is_some(),
         detects_disguise: local_owner_id
             .zip(disguise_cell)
@@ -271,7 +316,7 @@ fn compose_tactical_screen_entity_encounter_order(
                         local_owner,
                         local_owner_id,
                         fog,
-                        sim.house_alliances(),
+                        sim.house_alliances().as_map(),
                         ignore_visibility,
                         current_frame,
                         0,
@@ -542,7 +587,7 @@ pub(crate) fn translucent_fog_conceals(
         Some(interner.resolve(viewer)),
         Some(viewer),
         sim.fog(),
-        sim.house_alliances(),
+        sim.house_alliances().as_map(),
         &entity.position,
         interner.resolve(entity.owner()),
         sim.session().game_options().fog_of_war,
@@ -566,7 +611,7 @@ pub(crate) fn translucent_fog_conceals_bullet(
         .map(|entity| sim.interner().resolve(entity.owner()));
     let allied = source_owner.is_some_and(|owner| {
         local_owner.is_some_and(|local| {
-            crate::map::houses::is_allied_with(sim.house_alliances(), local, owner)
+            crate::map::houses::is_allied_with(sim.house_alliances().as_map(), local, owner)
         })
     });
     if allied {
@@ -950,6 +995,79 @@ mod tests {
     }
 
     #[test]
+    fn undeployable_building_band_uses_registered_screen_candidates() {
+        use crate::app::input::entity_pick::compute_box_selection_snapshot;
+        use crate::rules::ini_parser::IniFile;
+        use crate::rules::retail_ini_fixture::retail_battle_rules_for_map_with_patch;
+
+        let Some(retail) = retail_battle_rules_for_map_with_patch(
+            "Hills.mmx",
+            &IniFile::from_str("[GAPILL]\nUndeploysInto=AMCV\n[GAPOWR]\nUndeploysInto=AMCV\n"),
+        ) else {
+            return;
+        };
+        let rules = &retail.rules;
+        assert!(rules.object("GAPILL").unwrap().is_1x1_with_undeploy());
+        assert!(!rules.object("GAPOWR").unwrap().is_1x1_with_undeploy());
+        let mut sim = crate::sim::arena_fixture::rival_arena(rules, 1);
+        let owner = sim.interner().get("Americans").unwrap();
+        sim.session_mut_for_test()
+            .set_current_house_for_test(Some(owner));
+        sim.intern_rule_type_ids(rules);
+        sim.resolve_type_handles(rules);
+        let pill = sim
+            .spawn_object("GAPILL", "Americans", 16, 16, 0, rules)
+            .unwrap();
+        let power = sim
+            .spawn_object("GAPOWR", "Americans", 20, 16, 0, rules)
+            .unwrap();
+        for id in [pill, power] {
+            assert!(sim.display_layers().layer_of(id).is_some());
+        }
+        let bounds = (-1.0e6, -1.0e6, 1.0e6, 1.0e6);
+        let order = |bulk| {
+            compose_tactical_screen_entity_encounter_order(
+                &sim,
+                bounds,
+                Some("Americans"),
+                Some(owner),
+                sim.fog(),
+                false,
+                0,
+                bulk,
+                Some(rules),
+            )
+        };
+        let ordinary = order(false);
+        let preflight = order(true);
+        for id in [pill, power] {
+            assert!(ordinary.contains(&id), "registered local building {id}");
+            assert!(preflight.contains(&id));
+        }
+        let mutation = compute_box_selection_snapshot(
+            sim.entities(),
+            &preflight,
+            &ordinary,
+            &[],
+            Some((sim.fog(), sim.house_alliances().as_map())),
+            Some("Americans"),
+            bounds.0,
+            bounds.1,
+            bounds.2,
+            bounds.3,
+            false,
+            Some(rules),
+            Some(sim.houses()),
+            Some(sim.interner()),
+        )
+        .expect("registered buildings consume the band");
+        // Building459C00 calls465D40 before Techno6FC030: Undeploy alone
+        // does not admit the larger power plant's fixed-ART foundation.
+        assert_eq!(mutation.select, [pill]);
+        assert!(mutation.clear);
+    }
+
+    #[test]
     fn item83_band_preflight_source_bulk_registers_hidden_live_building_only() {
         use crate::app::input::entity_pick::compute_box_selection_snapshot;
         use crate::sim::combat::Health;
@@ -1045,7 +1163,7 @@ mod tests {
             &preflight,
             &visible,
             &[],
-            Some((sim.fog(), sim.house_alliances())),
+            Some((sim.fog(), sim.house_alliances().as_map())),
             Some("Americans"),
             building_anchor.0 - 1.0,
             building_anchor.1 - 1.0,
@@ -1069,7 +1187,7 @@ mod tests {
                 &preflight,
                 &visible,
                 &[],
-                Some((sim.fog(), sim.house_alliances())),
+                Some((sim.fog(), sim.house_alliances().as_map())),
                 Some("Americans"),
                 mobile_anchor.0 - 1.0,
                 mobile_anchor.1 - 1.0,

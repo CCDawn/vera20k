@@ -48,6 +48,8 @@ Ladda ner installationsprogrammet för Windows, macOS eller Linux från
 [releasesidan](https://github.com/YuriPlanet/vera20k/releases). Det hittar ditt Yuri's Revenge och
 installerar VERA20K i en ny mapp.
 
+Använd **Options** för ljud och kontroller och **Vera Options** för VERA-specifika funktioner.
+
 För att starta skirmish-matcher eller kampanjer i YR för en spelare från en CnCNet-klient, se
 [installationen av offlineklienten](integrations/cncnet/README.md).
 
@@ -64,29 +66,6 @@ Underhållarna hjälper till med granskning, integrering och sammanslagning. Du 
 erkännande för ditt bidrag.
 
 Diskussionen sker på [Discord](https://discord.gg/kmjRUn5m5F) och i QQ-gruppen (1097193563).
-
-## Inställningar
-
-Använd **Options** för ljud och kontroller och **Vera Options** för VERA-specifika funktioner.
-Spelarinställningar, kortkommandon och lobbyval sparas i `VERA.INI`:
-
-- **Windows-installationsprogrammet:** bredvid `vera20k.exe`.
-- **macOS:** `~/Library/Application Support/VERA20k/VERA.INI`.
-- **Linux:** `~/.local/share/VERA20k/VERA.INI` eller i din XDG-datamapp.
-
-I `config.toml` anger du spelmappen och kan välja en annan inställningsmapp.
-
-Aktivera **Mouse Wheel Zoom** i **Vera Options**, eller sätt `[VERA] MouseWheelZoom=yes`
-i `VERA.INI` (standard `no`).
-
-Om `VERA.INI` saknas skapar VERA filen och importerar befintliga inställningar en gång.
-Om det inte finns några gamla inställningar börjar filen tom och VERA använder inbyggda
-standardvärden tills inställningar sparas. Originalfilerna `RA2MD.INI` och `KeyboardMD.ini`
-läses bara vid import och skrivs aldrig över.
-
-`VERARULES.INI` i samma mapp innehåller valfria ändringar av spelreglerna. Filen innehåller från
-början bortkommenterade exempel och låter uppdrags- och kartregler styra. Se
-[personliga regler](docs/personal-rules.md) för hur du redigerar och åsidosätter dem.
 
 ## Arkitektur
 
@@ -132,7 +111,9 @@ portar sedan dess beteende till Rust och kontrollerar det med
 
 ## Anpassning
 
-VERA20K fungerar som standard precis som originalspelet. Varje ny funktion, även tillägg från
+Kartkapaciteten väljs automatiskt utan byggflagga: summan av bredd och höjd i `Size` får vara högst 1024. Upp till 512 behålls den ursprungliga adresseringen; större kartor använder det utökade rutnätet. Generator, sparversioner och valideringsgränser: [stora kartor](README.md#large-maps).
+
+VERA20K fungerar som standard precis som originalspelet. Varje annan ny funktion, även tillägg från
 moddar som Ares, måste vara avstängd tills den slås på med något av följande:
 
 - **En spelarinställning i VERA**, under **Options → Vera Options**, som sparas i avsnittet `[VERA]` i `VERA.INI`.

@@ -373,6 +373,7 @@ impl crate::sim::world::Simulation {
                     entity.veterancy.rank(),
                     0,
                 )
+                .and_then(|record| record.weapon_id)
                 .is_some(),
             ))
         }) else {
@@ -418,7 +419,8 @@ impl crate::sim::world::Simulation {
         let mut state = entity.gattling;
         let weapon = |index: i32| {
             crate::sim::combat::combat_weapon::weapon_for_index(obj, veterancy, index)
-                .map(|(weapon_id, _)| rules.weapon(weapon_id))
+                .and_then(|record| record.weapon_id)
+                .map(|weapon_id| rules.weapon(weapon_id))
         };
         let owner = gattling_sound_owner(id);
         // Share the process owner's draw capability without retaining its

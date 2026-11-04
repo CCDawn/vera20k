@@ -86,6 +86,8 @@ pub(in crate::app::shell_wol::live_service) fn start(
         token: None,
         cursor: 0,
         active_match: None,
+        spawned: false,
+        abandoned: false,
     };
     let (jobs, translations) = std::sync::mpsc::channel::<(u64, String, String, &'static str)>();
     let mut translator = Client {
@@ -94,6 +96,8 @@ pub(in crate::app::shell_wol::live_service) fn start(
         token: None,
         cursor: 0,
         active_match: None,
+        spawned: false,
+        abandoned: false,
     };
     let translated = output.clone();
     wasm_bindgen_futures::spawn_local(async move {

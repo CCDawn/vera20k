@@ -347,9 +347,11 @@ pub fn install_cell_attack_target_for_test(
 ) -> bool {
     // Read weapon presence before the mutable borrow.
     let has_weapon = match entities.get(attacker_id) {
-        Some(a) => rules
-            .and_then(|r| interner.object_type(a.type_ref(), r))
-            .is_some_and(|obj| combat_weapon::is_armed(a, obj)),
+        Some(a) => rules.is_some_and(|rules| {
+            interner
+                .object_type(a.type_ref(), rules)
+                .is_some_and(|obj| combat_weapon::is_armed(a, obj, entities, rules, interner))
+        }),
         None => return false,
     };
 

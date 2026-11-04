@@ -92,6 +92,7 @@ impl<'a> SimulationAuthoredLoadHost<'a> {
                 descriptor,
                 world,
                 AnimConstructorInput::AssignedIdentity(native_unique_id),
+                crate::sim::world::FrameEffects::default(),
             )
             .map_err(Into::into)
     }

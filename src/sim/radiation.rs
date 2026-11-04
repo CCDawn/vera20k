@@ -47,7 +47,10 @@ const LEPTONS_PER_CELL: i32 = crate::util::lepton::LEPTONS_PER_CELL_I32;
 
 /// Fallback square bound when no terrain grid is loaded (headless tests):
 /// the engine-native full grid extent.
-const FALLBACK_BOUNDS: (u16, u16) = (512, 512);
+const FALLBACK_BOUNDS: (u16, u16) = (
+    crate::map::cell_index::CELL_ROW_STRIDE as u16,
+    crate::map::cell_index::CELL_ROW_STRIDE as u16,
+);
 
 /// One radiation site, keyed by its center cell. A second detonation on the
 /// same center MERGES into the existing site (level/duration reset); different

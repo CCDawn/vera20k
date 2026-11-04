@@ -464,8 +464,9 @@ fn gsi_04_01_production_size_diamond_closes_exact_capacity_edge() {
     assert!(grid.cell(2, 511).is_some());
     assert!(grid.cell(3, 511).is_none());
 
+    // Sum 513 now selects the extended array; past its capacity is rejected.
     let mut oversized = make_map(Vec::new(), Vec::new(), Vec::new());
-    oversized.header.width = N + 1;
+    oversized.header.width = 1024;
     oversized.header.height = M;
     let (rejected, rejected_stats) = build_production_grid_without_theater(&oversized, &mut cache);
     assert_eq!((rejected.width(), rejected.height()), (0, 0));
@@ -922,9 +923,10 @@ fn gsi_04_02_last_tiles_pack_materialization_precedes_tmp_lat_and_final_state() 
     }];
 
     let mut cache = crate::map::tile_variant_selector::TileVariantSelectorCache::default();
-    cache.complete_theater_registry_load(Some(5), None);
     let mut deterministic_main = || 0;
-    let mut fill = |_low, _high| 0;
+    // Fill's whole tile index is the draw; 5 is the fixture's LastTiles
+    // boundary, which only Pack5 cells translate (to 8).
+    let mut fill = |_low, _high| 5;
     let without_lat = {
         let mut selector = cache.begin_load(&mut deterministic_main);
         ResolvedTerrainGrid::build_with_variant_selector(
@@ -1032,7 +1034,6 @@ fn gsi_04_02_last_tiles_provenance_gates_both_materialization_paths() {
     );
 
     let mut cache = crate::map::tile_variant_selector::TileVariantSelectorCache::default();
-    cache.complete_theater_registry_load(Some(5), None);
     let mut forbidden_main = || panic!("compatibility fixture has no variants");
     let mut fill = |_low, _high| 0;
     let production_manual = {
@@ -1104,10 +1105,11 @@ fn gsi_04_02_last_tiles_does_not_translate_fill_or_dummy_only_pack_misses() {
     }];
     let dummy = SharedCellDummy::fresh();
     let mut cache = crate::map::tile_variant_selector::TileVariantSelectorCache::default();
-    cache.complete_theater_registry_load(Some(5), None);
     let mut forbidden_main = || panic!("Fill and misses do not draw Main");
     let mut selector = cache.begin_load(&mut forbidden_main);
-    let mut fill = |_low, _high| 0;
+    // Fill's whole tile index is the draw; 5 is the fixture's LastTiles
+    // boundary, which only Pack5 cells translate (to 8).
+    let mut fill = |_low, _high| 5;
 
     let cells = materialize_map_load_cells(
         &map,
@@ -1849,21 +1851,10 @@ fn gsi_04_03a_level_prefill_wraps_before_absolute_last_isomap_overwrite() {
     map.header.level = 260;
 
     let mut cache = crate::map::tile_variant_selector::TileVariantSelectorCache::default();
-    assert_eq!(cache.cached_clear_tile_base(), 0);
-    assert_eq!(cache.cached_water_set_base(), 0);
-
-    // Stock RMG preview A publishes both resolved bases for the following
-    // ordinary load B. Repeating preview A preserves the same values.
-    cache.complete_theater_registry_load(Some(37), Some(50));
-    assert_eq!(cache.cached_clear_tile_base(), 37);
-    assert_eq!(cache.cached_water_set_base(), 50);
-    cache.complete_theater_registry_load(Some(37), Some(50));
-    assert_eq!(cache.cached_water_set_base(), 50);
-
     let seed = 0xA55A_1234;
     let mut expected_scenario = SimRng::new(seed);
     let expected_tiles: Vec<_> = (0..10)
-        .map(|_| 50 + expected_scenario.next_range_u32_inclusive(0, 3) as i32)
+        .map(|_| expected_scenario.next_range_u32_inclusive(0, 3) as i32)
         .collect();
     let mut scenario_rng = SimRng::new(seed);
     let mut scenario_calls = 0usize;
@@ -1921,16 +1912,10 @@ fn gsi_04_03a_level_prefill_wraps_before_absolute_last_isomap_overwrite() {
         expected_scenario.logical_state()
     );
     assert_eq!(main_rng.logical_state(), main_before);
-
-    // A registry with neither role publishes native reset sentinels only
-    // after its own Fill, for use by the following load.
-    cache.complete_theater_registry_load(None, None);
-    assert_eq!(cache.cached_clear_tile_base(), -1);
-    assert_eq!(cache.cached_water_set_base(), -1);
 }
 
 #[test]
-fn gsi_04_02_clear_and_unknown_use_prior_cached_clear_and_equal_scenario_bounds() {
+fn gsi_04_02_clear_and_unknown_fill_zero_with_equal_scenario_bounds() {
     for fill in ["Clear", "unknown"] {
         let mut map = make_map(Vec::new(), Vec::new(), Vec::new());
         map.header.width = 3;
@@ -1938,9 +1923,6 @@ fn gsi_04_02_clear_and_unknown_use_prior_cached_clear_and_equal_scenario_bounds(
         map.header.fill = fill.to_string();
 
         let mut cache = crate::map::tile_variant_selector::TileVariantSelectorCache::default();
-        // The already parsed current theater may resolve ClearTile=0, but
-        // Fill snapshots the prior process-global value (37).
-        cache.complete_theater_registry_load(Some(37), Some(50));
         let mut forbidden_main = || panic!("Fill must not draw Main");
         let mut selector = cache.begin_load(&mut forbidden_main);
         let mut scenario_rng = SimRng::new(0x1234_5678);
@@ -1963,7 +1945,7 @@ fn gsi_04_02_clear_and_unknown_use_prior_cached_clear_and_equal_scenario_bounds(
         assert!(
             cells
                 .iter()
-                .all(|cell| { cell.tile_index == 37 && cell.sub_tile == 0 && cell.z == 0 })
+                .all(|cell| { cell.tile_index == 0 && cell.sub_tile == 0 && cell.z == 0 })
         );
         assert_eq!(scenario_calls, 10);
         assert_eq!(scenario_rng.logical_state(), scenario_before);
@@ -1992,16 +1974,14 @@ fn gsi_04_02_production_build_prefills_before_selector_and_skips_outside_slots()
         b"[TileSet0000]\nTilesInSet=64\nFileName=ground\nSetName=Ground\n",
     );
     theater.rmg_tiles.clear_tile = Some(0);
-    // Preview A published 50, while this already-parsed ordinary theater B
-    // resolves 1. B's Fill must retain A until B publishes afterward.
+    // This theater resolves WaterSet 1; Fill reads no theater base.
     theater.rmg_tiles.water_set = Some(1);
 
     let mut cache = crate::map::tile_variant_selector::TileVariantSelectorCache::default();
-    cache.complete_theater_registry_load(Some(37), Some(50));
     let seed = 0xCAFE_BABE;
     let mut scenario_rng = SimRng::new(seed);
     let mut expected_scenario = scenario_rng.clone();
-    let expected_first = 50 + expected_scenario.next_range_u32_inclusive(0, 3) as i32;
+    let expected_first = expected_scenario.next_range_u32_inclusive(0, 3) as i32;
     for _ in 1..10 {
         let _ = expected_scenario.next_range_u32_inclusive(0, 3);
     }
@@ -2064,12 +2044,6 @@ fn gsi_04_02_production_build_prefills_before_selector_and_skips_outside_slots()
     }
     assert_eq!(main_rng.logical_state(), expected_main.logical_state());
     assert_ne!(main_rng.logical_state(), main_before);
-
-    // The production orchestrator publishes the current theater only
-    // after Fill and variant resolution have released their snapshots.
-    cache.complete_theater_registry_load(theater.rmg_tiles.clear_tile, theater.rmg_tiles.water_set);
-    assert_eq!(cache.cached_clear_tile_base(), 0);
-    assert_eq!(cache.cached_water_set_base(), 1);
 }
 
 #[test]
@@ -3829,7 +3803,7 @@ fn authored_load_lat_reads_live_cardinals_in_north_east_south_west_order() {
         cells[ny * 3 + nx].final_tile_index = 99;
         let mut grid = ResolvedTerrainGrid::from_cells(3, 3, cells);
         let mut state = LoadCellRecalcState::synthetic(&registry, grid.cells.len());
-        state.lat_config = Some(lat_config.clone());
+        state.lat_config = Some(std::borrow::Cow::Owned(lat_config.clone()));
         state.slope_config = Some(lat::SlopeFixupConfig {
             ramp_base: -1,
             ramp_smooth: -1,
@@ -3846,7 +3820,7 @@ fn authored_load_lat_reads_live_cardinals_in_north_east_south_west_order() {
 
     let mut edge = ResolvedTerrainGrid::from_cells(1, 1, vec![make_test_cell(0, 0)]);
     let mut state = LoadCellRecalcState::synthetic(&registry, 1);
-    state.lat_config = Some(lat_config);
+    state.lat_config = Some(std::borrow::Cow::Owned(lat_config));
     state.slope_config = Some(lat::SlopeFixupConfig {
         ramp_base: -1,
         ramp_smooth: -1,
@@ -3866,9 +3840,9 @@ fn authored_load_lat_reads_live_cardinals_in_north_east_south_west_order() {
     guarded.cells[0].final_tile_index = 99;
     guarded.stamp_dummy_cell_requested_coord(7, 8);
     let mut state = LoadCellRecalcState::synthetic(&registry, 1);
-    state.lat_config = Some(lat::LatConfig::from_tile_ids(
+    state.lat_config = Some(std::borrow::Cow::Owned(lat::LatConfig::from_tile_ids(
         &crate::map::rmg::tiles::TileIds::from_keys(&theater.rmg_tiles),
-    ));
+    )));
     state.slope_config = Some(lat::SlopeFixupConfig {
         ramp_base: 100,
         ramp_smooth: 500,
@@ -5073,4 +5047,44 @@ fn destroyable_cliff_origin_recovery_accepts_every_present_a_and_b_subtile() {
             }
         }
     }
+}
+
+#[test]
+fn large_map_production_diamond_lookup_and_path_cross_512() {
+    let mut map = make_map(Vec::new(), Vec::new(), Vec::new());
+    map.header.width = 500;
+    map.header.height = 500;
+    map.header.local_left = 2;
+    map.header.local_top = 4;
+    map.header.local_width = 496;
+    map.header.local_height = 492;
+    let mut cache = crate::map::tile_variant_selector::TileVariantSelectorCache::default();
+    let (grid, stats) = build_production_grid_without_theater(&map, &mut cache);
+    assert_eq!((grid.width(), grid.height()), (1000, 1000));
+    assert_eq!(grid.iter().count(), 499_500);
+    assert_eq!(stats.fill_calls, 499_500);
+    let first = grid.native_fixed_cell_index(700, 600).unwrap();
+    let second = grid.native_fixed_cell_index(188, 601).unwrap();
+    assert_ne!(
+        crate::sim::wave::WaveRecordedCell::real(700, 600).identity,
+        crate::sim::wave::WaveRecordedCell::real(188, 601).identity
+    );
+    assert_ne!(
+        first, second,
+        "a high coordinate must not alias the old 512 stride"
+    );
+    assert_eq!((grid.cells()[first].rx, grid.cells()[first].ry), (700, 600));
+    let path_grid = crate::sim::pathfinding::PathGrid::from_resolved_terrain(&grid);
+    let route = crate::sim::pathfinding::find_path(&path_grid, (700, 600), (740, 640)).unwrap();
+    assert_eq!(route.last(), Some(&(740, 640)));
+    map.header.width = 128;
+    map.header.height = 128;
+    let (retail, _) = build_production_grid_without_theater(&map, &mut cache);
+    assert_eq!(retail.cell_grid(), crate::map::cell_index::CellGrid::Retail);
+    assert_eq!(
+        retail.native_fixed_cell_index(712, 99),
+        retail.native_fixed_cell_index(200, 100)
+    );
+    assert!(retail.native_fixed_cell_index(200, 100).is_some());
+    assert_eq!((grid.cells()[first].rx, grid.cells()[first].ry), (700, 600));
 }

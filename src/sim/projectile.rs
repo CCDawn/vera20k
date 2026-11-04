@@ -361,10 +361,21 @@ pub struct ProjectileCollisionPolicy {
     pub subject_to_cliffs: bool,
     pub flak_scatter: bool,
     pub anti_air: bool,
+    /// `BulletType+294 Airburst=`: the Bullet AI homing/closing/fuse arms.
     pub airburst: bool,
+    /// `BulletClass::Explodes`'s airburst gate: native `Airburst=`, or
+    /// `Airburst || Splits` in a Phobos build. A manually constructed policy
+    /// that leaves it `None` falls back to [`Self::airburst`].
+    #[serde(default)]
+    pub explodes_airburst: Option<bool>,
     pub inaccurate: bool,
     /// BulletType +295: 48ACF0 multiplies live Rules gravity by binary64 0.5.
     pub floater: bool,
+    /// Phobos `[Projectile] Gravity=` (`BulletTypeExt::GetAdjustedGravity`):
+    /// the type's gravity bits, or `None` for the live Rules value.
+    #[cfg(feature = "phobos")]
+    #[serde(default)]
+    pub gravity: Option<crate::util::native_x87::NativeF64Bits>,
     /// BulletType +2C8, retained as exact binary64 bits for Eq/hash/save.
     pub elasticity_bits: u64,
     /// `BulletTypeClass::Arcing` (`+0x29B`): impact resolution
@@ -383,11 +394,33 @@ impl ProjectileCollisionPolicy {
         flak_scatter: false,
         anti_air: false,
         airburst: false,
+        explodes_airburst: None,
         inaccurate: false,
         floater: false,
+        #[cfg(feature = "phobos")]
+        gravity: None,
         elasticity_bits: 0x3fe8_0000_0000_0000,
         arcing: false,
     };
+
+    /// `0x468D80`'s airburst gate, with the pre-feature fallback.
+    pub const fn explodes_airburst(&self) -> bool {
+        match self.explodes_airburst {
+            Some(value) => value,
+            None => self.airburst,
+        }
+    }
+
+    /// Phobos `[Projectile] Gravity=` bits, or `None` on the stock path.
+    #[cfg(feature = "phobos")]
+    pub(crate) const fn gravity(&self) -> Option<crate::util::native_x87::NativeF64Bits> {
+        self.gravity
+    }
+
+    #[cfg(not(feature = "phobos"))]
+    pub(crate) const fn gravity(&self) -> Option<crate::util::native_x87::NativeF64Bits> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -637,11 +670,13 @@ pub(crate) fn projectile_slope_reflect_double(
 /// leaves the 512-cell map). So every cluster after the first lands around
 /// the impact, never around the previous cluster.
 pub fn projectile_next_cluster_coord(
+    grid: crate::map::cell_index::CellGrid,
     impact: ProjectileCoord,
     scenario_rng: &mut SimRng,
 ) -> ProjectileCoord {
     let distance = scenario_rng.next_range_i32_inclusive(0x100, 0x200);
     let (x, y) = crate::sim::combat::inviso_scatter::random_direction_coord(
+        grid,
         scenario_rng,
         impact.x,
         impact.y,
@@ -927,6 +962,19 @@ pub struct ProjectilePayload {
     installed_weapon: Option<InternedId>,
     /// Construct4664E6's byte argument, independent of installed Weapon.
     bright: bool,
+    /// Phobos `BulletExt::FirepowerMult`, the firer's firepower multiplier at
+    /// construction. `AirburstWeapon.ApplyFirepowerMult` scales child damage
+    /// with it, and airburst children carry it onward.
+    #[cfg(feature = "phobos")]
+    #[serde(default = "default_firepower_multiplier")]
+    firepower_multiplier: crate::util::native_x87::NativeF64Bits,
+    /// Phobos `BulletExt::Detonate`'s `pFiringHouse`: the House a simulated
+    /// detonation keeps when the shot's invoker Techno is already gone
+    /// (`WarheadTypeExt::DetonateAt`). Real bullets leave it unset and keep
+    /// [`crate::sim::projectile::Projectile::phobos_firer_house`].
+    #[cfg(feature = "phobos")]
+    #[serde(default)]
+    source_house: Option<InternedId>,
     /// `BulletClass+0x150`, 1/256 units: `BulletClass::Construct` writes
     /// [`Self::UNSCALED`] (`0x00466546`) and only a Prism master's supported
     /// shot writes another value (`BuildingClass::ProcessDelayedFire`,
@@ -935,6 +983,11 @@ pub struct ProjectilePayload {
     /// (`0x004697FC..0x0046980C`, not ported: dormant in retail, see
     /// [`SpecialDetonationAction::DirectRocker`]).
     damage_multiplier: i32,
+}
+
+#[cfg(feature = "phobos")]
+fn default_firepower_multiplier() -> crate::util::native_x87::NativeF64Bits {
+    crate::util::native_x87::NativeF64Bits::ONE
 }
 
 impl ProjectilePayload {
@@ -955,6 +1008,10 @@ impl ProjectilePayload {
             installed_weapon: None,
             bright,
             damage_multiplier: Self::UNSCALED,
+            #[cfg(feature = "phobos")]
+            firepower_multiplier: crate::util::native_x87::NativeF64Bits::ONE,
+            #[cfg(feature = "phobos")]
+            source_house: None,
         }
     }
 
@@ -988,6 +1045,36 @@ impl ProjectilePayload {
 
     pub fn damage_multiplier(&self) -> i32 {
         self.damage_multiplier
+    }
+
+    /// The firer's firepower multiplier captured at construction.
+    #[cfg(feature = "phobos")]
+    pub const fn firepower_multiplier(&self) -> crate::util::native_x87::NativeF64Bits {
+        self.firepower_multiplier
+    }
+
+    /// Carry another bullet's captured firepower multiplier, as Phobos's
+    /// airburst children do.
+    #[cfg(feature = "phobos")]
+    pub fn with_firepower_multiplier(
+        mut self,
+        firepower_multiplier: crate::util::native_x87::NativeF64Bits,
+    ) -> Self {
+        self.firepower_multiplier = firepower_multiplier;
+        self
+    }
+
+    /// The House a simulated detonation retains for its source-House
+    /// fallback (`BulletExt::Detonate`'s `pFiringHouse`).
+    #[cfg(feature = "phobos")]
+    pub fn source_house(&self) -> Option<InternedId> {
+        self.source_house
+    }
+
+    #[cfg(feature = "phobos")]
+    pub fn with_source_house(mut self, house: Option<InternedId>) -> Self {
+        self.source_house = house;
+        self
     }
 
     /// `BulletClass::DetonateAtCoord @ 0x004690B0` hands
@@ -1123,6 +1210,15 @@ pub struct Projectile {
     /// [`Simulation::construct_bullet_scheme`]: crate::sim::world::Simulation::construct_bullet_scheme
     #[serde(default)]
     firer_house: Option<InternedId>,
+    /// Phobos `BulletExt::FirerHouse`, set by `BulletExt::InitializeState`
+    /// (`0x466556`): the Owner Techno's House at construction, kept after the
+    /// owner expires. Independent of the palette-only `firer_house` above.
+    /// Written by [`Simulation::construct_bullet_scheme`].
+    ///
+    /// [`Simulation::construct_bullet_scheme`]: crate::sim::world::Simulation::construct_bullet_scheme
+    #[cfg(feature = "phobos")]
+    #[serde(default)]
+    phobos_firer_house: Option<InternedId>,
     /// Bullet `+0x158`: set at a `NUKE` impact (`0x00467F3C`), cleared when
     /// the wait ends (`0x0046676A`).
     #[serde(default)]
@@ -1339,6 +1435,13 @@ impl Projectile {
         self.firer_house
     }
 
+    /// Phobos `BulletExt::FirerHouse`: the owner's House retained at
+    /// construction, independent of the palette-only `firer_house`.
+    #[cfg(feature = "phobos")]
+    pub fn phobos_firer_house(&self) -> Option<InternedId> {
+        self.phobos_firer_house
+    }
+
     /// Waiting on its anim after a `NUKE` impact (`+0x158`); the draw skips
     /// such a bullet (`BulletClass::DrawSHPOrVoxel`, `0x004680F6`).
     pub fn awaiting_anim(&self) -> bool {
@@ -1386,13 +1489,13 @@ impl Projectile {
 
     /// The facts [`resolve_impact_coord`] reads, with the bullet at its
     /// committed Location.
-    fn impact_ladder_bullet(&self, impact_flag: bool) -> ImpactLadderBullet {
+    pub(crate) fn impact_ladder_bullet(&self, impact_flag: bool) -> ImpactLadderBullet {
         ImpactLadderBullet {
             location: self.position,
             reference: self.proximity_reference,
             impact_flag,
             inaccurate: self.collision.inaccurate,
-            airburst: self.collision.airburst,
+            airburst: self.collision.explodes_airburst(),
             arcing: self.collision.arcing,
             homing: self.tracks_target,
         }
@@ -1410,8 +1513,17 @@ pub enum ProjectileDetonationReason {
     /// straight to `DetonateAtCoord` (`0x0070D782`): one detonation, without
     /// the BulletClass cluster loop and its draws.
     DeathWeapon,
+    /// Phobos `BulletExt::Detonate` (an AttachEffect `ExpireWeapon`,
+    /// `RevengeWeapon` or `ReflectDamage` shot): the bullet is created at the
+    /// shot's coordinates and exploded at once, so it takes no cluster loop
+    /// but keeps its real impact coordinate.
+    AttachEffectShot,
     /// A `NUKE` impact's wait ended: its anim is gone (`0x00466771`).
     AnimEnded,
+    /// Phobos `ApplyCrit`'s `Crit.Warhead_FullDetonation` arm:
+    /// `WarheadTypeExt::DetonateAt` builds a bullet with no weapon type and
+    /// explodes it at the target (`Ext/WarheadType/Body.cpp:102..110`).
+    CritWarhead,
 }
 
 /// One deferred `BulletClass::Detonate` handoff for combat to apply.
@@ -1844,6 +1956,8 @@ impl ProjectileStore {
                 collision: ProjectileCollisionPolicy::NONE,
                 on_bridge: false,
                 firer_house: None,
+                #[cfg(feature = "phobos")]
+                phobos_firer_house: None,
                 awaiting_anim: false,
                 awaited_anim: None,
             },
@@ -1905,6 +2019,30 @@ impl ProjectileStore {
     pub(crate) fn set_firer_house(&mut self, id: u64, house: Option<InternedId>) {
         if let Some(projectile) = self.get_mut(id) {
             projectile.firer_house = house;
+        }
+    }
+
+    /// Phobos `BulletExt::FirerHouse` at bullet initialization.
+    #[cfg(feature = "phobos")]
+    pub(crate) fn set_phobos_firer_house(&mut self, id: u64, house: Option<InternedId>) {
+        if let Some(projectile) = self.get_mut(id) {
+            projectile.phobos_firer_house = house;
+        }
+    }
+
+    /// Phobos `BulletExt::InitializeState`'s `FirepowerMult`. A payload value
+    /// other than 1.0 came from FireAt's launch capture and is kept.
+    #[cfg(feature = "phobos")]
+    pub(crate) fn set_phobos_firepower_multiplier_if_default(
+        &mut self,
+        id: u64,
+        value: crate::util::native_x87::NativeF64Bits,
+    ) {
+        if let Some(projectile) = self.get_mut(id)
+            && projectile.payload.firepower_multiplier
+                == crate::util::native_x87::NativeF64Bits::ONE
+        {
+            projectile.payload.firepower_multiplier = value;
         }
     }
 
@@ -2222,6 +2360,7 @@ impl ProjectileStore {
                         projectile.velocity,
                         rules_gravity,
                         projectile.collision.floater,
+                        projectile.collision.gravity(),
                     );
                     let candidate = motion.candidate_coord();
                     ordinary_motion = Some(motion);
@@ -2584,19 +2723,24 @@ pub(crate) fn projectile_final_snap_admitted(
         || f64::from(distance) <= (projectile_velocity_magnitude(velocity) * 2.0).max(128.0)
 }
 
-/// Live Rules +16B8, with the Type +295 Floater override (4671B9/48ACF0).
+/// Live Rules +16B8 or the Phobos `[Projectile] Gravity=` bits, with the Type
+/// +295 Floater override (4671B9/48ACF0).
 pub fn projectile_gravity(
     rules_gravity: i32,
+    type_gravity: Option<crate::util::native_x87::NativeF64Bits>,
     floater: bool,
 ) -> crate::util::native_x87::NativeF64Bits {
     use crate::util::native_x87::{NativeF64Bits, X87Chop53};
-    let gravity = X87Chop53::load_i32(rules_gravity);
+    let gravity = match type_gravity {
+        Some(bits) => X87Chop53::load_f64(bits).expect("finite type gravity"),
+        None => X87Chop53::load_i32(rules_gravity),
+    };
     let gravity = if floater {
         X87Chop53::mul(gravity, X87Chop53::load_f64(NativeF64Bits::HALF).unwrap())
     } else {
         gravity
     };
-    X87Chop53::store_f64(gravity).expect("finite Rules gravity")
+    X87Chop53::store_f64(gravity).expect("finite projectile gravity")
 }
 
 /// Ordinary 46718F..467494: live gravity scratch, double coordinate sums,
@@ -2606,12 +2750,17 @@ fn ordinary_motion_candidate(
     velocity: ProjectileVelocity,
     rules_gravity: i32,
     floater: bool,
+    type_gravity: Option<crate::util::native_x87::NativeF64Bits>,
 ) -> ProjectileCollisionMotion {
     use crate::util::native_x87::X87Chop53;
     let mut motion = ProjectileCollisionMotion::from_coordinate(position, velocity);
-    // 4671B9/48ACF0 select live gravity, then 467415/467429
-    // store the subtraction only in the ordinary scratch.
-    let gravity = projectile_gravity(rules_gravity, floater);
+    // 4671B9/48ACF0 select live gravity, then 467415/467429 store the
+    // subtraction only in the ordinary scratch. Phobos
+    // `BulletClass_AI_ApplyGravity` replaces only the 4671B9 FILD: a Floater
+    // shell still drops that value at 4671C3 and calls 48ACF0 (Rules x 0.5),
+    // so its type `Gravity=` never reaches the flight step.
+    let type_gravity = type_gravity.filter(|_| !floater);
+    let gravity = projectile_gravity(rules_gravity, type_gravity, floater);
     motion.velocity[2] = X87Chop53::store_f64(X87Chop53::sub(
         X87Chop53::load_f64(motion.velocity[2]).expect("finite velocity"),
         X87Chop53::load_f64(gravity).expect("finite gravity"),
@@ -2653,6 +2802,7 @@ fn original_ordinary_repeated_live_gravity_preserves_both_coordinate_versions() 
                 velocity,
                 row["gravity_sequence"][frame].as_i64().unwrap() as i32,
                 row["floater"].as_bool().unwrap(),
+                None,
             );
             for (name, values) in [
                 ("bits", motion.velocity),
@@ -2956,6 +3106,29 @@ fn detonation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phobos `BulletClass_AI_ApplyGravity` (0x4671B9): a type `Gravity`
+    /// replaces the Rules integer in flight, but a Floater shell still takes
+    /// Rules x 0.5 from 0x48ACF0.
+    #[cfg(feature = "phobos")]
+    #[test]
+    fn phobos_type_gravity_drives_flight_except_for_a_floater() {
+        use crate::util::native_x87::NativeF64Bits;
+        let type_gravity = Some(NativeF64Bits::from_bits(12.0f64.to_bits()));
+        let fall = |floater| {
+            let velocity = ProjectileVelocity::from_native([NativeF64Bits::from_bits(0); 3]);
+            let motion = ordinary_motion_candidate(
+                ProjectileCoord::new(0, 0, 0),
+                velocity,
+                6,
+                floater,
+                type_gravity,
+            );
+            f64::from_bits(motion.velocity[2].bits())
+        };
+        assert_eq!(fall(false), -12.0);
+        assert_eq!(fall(true), -3.0);
+    }
 
     fn flat_32_by_32() -> ResolvedTerrainGrid {
         ResolvedTerrainGrid::from_cells(
@@ -3662,6 +3835,7 @@ mod tests {
                 .chain(draws.map(|(distance, raw)| {
                     let (x, y) =
                         crate::sim::combat::inviso_scatter::random_direction_coord_for_byte(
+                            crate::map::cell_index::CellGrid::Retail,
                             (raw.as_u64().unwrap() & 0xff) as u8,
                             impact.x,
                             impact.y,
@@ -3689,6 +3863,7 @@ mod tests {
         let _ = cluster_reference.next_range_u32_inclusive(256, 512);
         let _ = cluster_reference.next_u32();
         let coordinate = projectile_next_cluster_coord(
+            crate::map::cell_index::CellGrid::Retail,
             ProjectileCoord::new(20 * 256 + 128, 20 * 256 + 128, 77),
             &mut cluster_rng,
         );

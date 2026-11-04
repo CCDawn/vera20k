@@ -24,7 +24,9 @@ use super::{
 };
 use crate::app::AppState;
 use crate::app::frontend::shell_transition::ShellSlideKind;
-use crate::render::shell_text::{self, ShellAlign};
+use crate::render::batch::SpriteInstance;
+use crate::render::shell_paint::{self, ModalButton, PaintLabel};
+use crate::render::shell_text::{self, ShellAlign, ShellTextDraw};
 use crate::ui::multiplayer_setup::*;
 use crate::ui::shell::geom::RectPx;
 use crate::util::time::Instant;
@@ -150,8 +152,9 @@ pub(crate) fn render_multiplayer_setup(
     let font = &state.renderer.bit_font;
     let mut art =
         super::launcher_options::launcher_background_instances(atlas, width, height, scale);
-    // LAN BC/BD and WOL C2/C9 take the user's intentional RA2 art, as offline
-    // Skirmish does, instead of72CF40's Cooperative setup art.
+    // LAN 0xBB/BC/BD and WOL C2/C9 follow the persisted shell style, like
+    // offline Skirmish: 72CF40's Cooperative setup art under Original YR Style,
+    // the RA2 MNSCRN pair by default.
     if let Some(background) = atlas.lan_background(
         view.page().dialog.0,
         if scale.is_retail() { width } else { 800 },
@@ -213,28 +216,6 @@ pub(crate) fn render_multiplayer_setup(
         )
     };
     if !leaving && ui.notice.is_none() {
-        if let Some((completed, total)) = state
-            .frontend
-            .network_setup_protocol
-            .as_ref()
-            .and_then(|protocol| protocol.transfer_progress())
-        {
-            let caption = format!(
-                "Map transfer: {}%",
-                completed.saturating_mul(100) / total.max(1)
-            );
-            let rect = scale.derive_rect(layout.map_label, |mut rect| {
-                rect.y += 36;
-                rect
-            });
-            texts.push(text(
-                &caption,
-                rect,
-                ShellAlign::H_CENTER,
-                SHELL_LABEL_TEXT_RGB,
-                SHELL_CONTROL_TEXT_DEPTH,
-            ));
-        }
         for (key, rect) in layout
             .labels
             .iter()
@@ -248,34 +229,47 @@ pub(crate) fn render_multiplayer_setup(
                 SHELL_CONTROL_TEXT_DEPTH,
             ));
         }
-        if view.row_count > VISIBLE_SETUP_ROWS {
+        let page_rows = view.dialog.rows_per_page();
+        if view.row_count > page_rows {
+            // Ordinary MNBTTN buttons, as Game Options' OK; one with no page
+            // to go to is hidden.
+            let mut buttons = Vec::new();
             for (id, caption) in [(PREVIOUS_ROWS, "Previous"), (NEXT_ROWS, "Next")] {
+                if !view.enabled(id) {
+                    continue;
+                }
                 let rect = layout.control_rect(id).expect("roster navigation rect");
                 let pressed = ui.buttons.is_pressed(id);
-                push_right_panel_button_shp(
-                    &mut controls,
-                    atlas,
+                buttons.push(ModalButton {
                     rect,
-                    crate::ui::shell::button::ButtonVisual {
-                        pressed,
-                        highlighted: false,
-                    },
-                    false,
-                    SHELL_CONTROL_DEPTH,
-                );
+                    pressed,
+                    enabled: true,
+                });
                 texts.push(text(
                     caption,
-                    rect,
+                    crate::app::frontend::shell_pass::owner_draw_button_label_rect(rect, pressed),
                     ShellAlign::H_CENTER | ShellAlign::V_CENTER,
-                    super::text::button_label_color_for_disabled(!view.enabled(id)),
+                    SHELL_LABEL_TEXT_RGB,
                     SHELL_CONTROL_TEXT_DEPTH,
                 ));
             }
+            controls.extend(shell_paint::paint_modal_sprites(
+                None,
+                type3_button_frames(atlas),
+                layout.roster_page_label,
+                &buttons,
+                scale,
+                shell_paint::ModalDepths {
+                    background: SHELL_CONTROL_DEPTH,
+                    button: SHELL_CONTROL_DEPTH,
+                    text: SHELL_CONTROL_TEXT_DEPTH,
+                },
+            ));
             texts.push(text(
                 &format!(
-                    "Players {}–{} / {}",
+                    "Players {}-{} of {}",
                     view.first_row + 1,
-                    (view.first_row + VISIBLE_SETUP_ROWS).min(view.row_count),
+                    (view.first_row + page_rows).min(view.row_count),
                     view.row_count
                 ),
                 layout.roster_page_label,
@@ -355,63 +349,31 @@ pub(crate) fn render_multiplayer_setup(
                 }
             }
         }
-        for (index, key) in [
-            "GUI:ShortGame",
-            "GUI:MCVRepacks",
-            "GUI:CratesAppear",
-            "GUI:SuperWeaponsAllowed",
-            "GUI:BuildOffAlly",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let rect = layout.checkboxes[index];
-            paint_control(
+        // VERA's room keeps its options in Game Options; Difficulty stays.
+        if layout.game_options.is_none() {
+            push_option_controls(
                 &mut controls,
-                &atlas.control_chrome(),
-                ControlPaint::Checkbox {
-                    rect,
-                    checked: view.checks[index],
-                },
-                scale,
-            );
-            texts.push(text(
-                &localized_label(state, key, key),
-                crate::ui::skirmish_shell::checkbox_text_rect(rect, scale),
-                ShellAlign::V_CENTER,
-                SHELL_LABEL_TEXT_RGB,
+                &mut texts,
+                state,
+                &view,
+                &layout,
                 SHELL_CONTROL_TEXT_DEPTH,
-            ));
-        }
-        for bar in view.trackbars.iter().filter(|bar| bar.visible) {
-            let Some(rect) = layout.control_rect(bar.id) else {
-                continue;
-            };
-            paint_control(
-                &mut controls,
-                &atlas.control_chrome(),
-                ControlPaint::Trackbar {
-                    rect,
-                    thumb_left: bar.thumb_left(rect, scale),
-                    plaque: bar.id != DIFFICULTY,
-                    // A guest's are disabled windows (`0x005E30EB..0x005E30F4`).
-                    disabled: !view.enabled(bar.id),
-                },
-                scale,
             );
-            if bar.id != DIFFICULTY {
-                texts.push(text(
-                    &bar.range.stepped(bar.value).to_string(),
-                    crate::ui::shell::trackbar::value_text_rect(rect, scale),
-                    ShellAlign::H_CENTER | ShellAlign::V_CENTER,
-                    if view.enabled(bar.id) {
-                        SHELL_LABEL_TEXT_RGB
-                    } else {
-                        SHELL_DISABLED_TEXT_RGB_FROM_PACKED_0000009F
-                    },
-                    SHELL_CONTROL_TEXT_DEPTH,
-                ));
-            }
+        }
+        for bar in view
+            .trackbars
+            .iter()
+            .filter(|bar| bar.visible && !OPTION_TRACKBARS.contains(&bar.id))
+        {
+            push_trackbar(
+                &mut controls,
+                &mut texts,
+                state,
+                &view,
+                &layout,
+                bar,
+                SHELL_CONTROL_TEXT_DEPTH,
+            );
         }
         if let Some(description) = &view.cooperative_description {
             texts.push(text(
@@ -568,7 +530,10 @@ pub(crate) fn render_multiplayer_setup(
                 if let Some(spec) = view.page().button(button.id) {
                     texts.push(shell_text::draw_in_rect_scaled(
                         font,
-                        &localized_label(state, spec.csf_key, spec.csf_key),
+                        &view.dialog.button_label(button.id).map_or_else(
+                            || localized_label(state, spec.csf_key, spec.csf_key),
+                            str::to_owned,
+                        ),
                         button_text_rect(button.rect, pressed, scale),
                         super::text::button_label_color_for_disabled(!view.enabled(button.id)),
                         ShellAlign::H_CENTER | ShellAlign::V_CENTER,
@@ -649,6 +614,143 @@ pub(crate) fn render_multiplayer_setup(
                 }
             }
         }
+        // VERA's Game Options over the room, on the box art the online
+        // lobby's popups use: the box and OK first, then its controls.
+        if view.options_open
+            && let Some(popup) = layout.game_options
+        {
+            let pressed = ui.buttons.is_pressed(GAME_OPTIONS_OK);
+            let ok = PaintLabel {
+                text: localized_label(state, "GUI:OK", "GUI:OK").into(),
+                rect: crate::app::frontend::shell_pass::owner_draw_button_label_rect(
+                    popup.ok, pressed,
+                ),
+                align: ShellAlign::H_CENTER | ShellAlign::V_CENTER,
+                rgb: SHELL_LABEL_TEXT_RGB,
+                path_a_reveal: None,
+            };
+            let draw = shell_paint::paint_modal_shp(
+                font,
+                atlas
+                    .ra2_dialog_background
+                    .or_else(|| atlas.mode_two_dialog_background(None)),
+                type3_button_frames(atlas),
+                popup.dialog,
+                &[ModalButton {
+                    rect: popup.ok,
+                    pressed,
+                    enabled: true,
+                }],
+                &[ok],
+                scale,
+                super::wol_lobby::POPUP_DEPTHS,
+            );
+            overlay.controls.extend(draw.sprites);
+            overlay.texts.extend(draw.text);
+            push_option_controls(
+                &mut overlay.controls,
+                &mut overlay.texts,
+                state,
+                &view,
+                &layout,
+                super::wol_lobby::POPUP_DEPTHS.text,
+            );
+        }
+        // VERA asks a guest before downloading a map it does not have, then
+        // shows the download, on the art of VERA's other online-service boxes.
+        if view.map_offer_open
+            && let Some(offer) = ui.map_offer.as_ref()
+        {
+            use crate::ui::shell::geom::ShellScale;
+            let boxed = layout.map_offer;
+            let pressed = |id| ui.buttons.is_pressed(id);
+            let progress = offer
+                .downloading
+                .then(|| {
+                    state
+                        .frontend
+                        .network_setup_protocol
+                        .as_ref()
+                        .and_then(|protocol| protocol.transfer_progress())
+                })
+                .flatten()
+                .map(|(completed, total)| (u64::from(completed), u64::from(total)));
+            let body = match progress {
+                Some((completed, total)) => format!(
+                    "Downloading {}... {}%",
+                    offer.name,
+                    completed.min(total) * 100 / total.max(1)
+                ),
+                None if offer.downloading => format!("Downloading {}...", offer.name),
+                None => offer.message.clone(),
+            };
+            let button_label = |text: String, rect: RectPx, pressed: bool, rgb| PaintLabel {
+                text: text.into(),
+                rect: crate::app::frontend::shell_pass::owner_draw_button_label_rect(rect, pressed),
+                align: ShellAlign::H_CENTER | ShellAlign::V_CENTER,
+                rgb,
+                path_a_reveal: None,
+            };
+            let labels = [
+                PaintLabel {
+                    text: body.into(),
+                    rect: boxed.body,
+                    align: super::text::validation_modal_body_text_align(),
+                    rgb: SHELL_LABEL_TEXT_RGB,
+                    path_a_reveal: None,
+                },
+                button_label(
+                    "Download".to_owned(),
+                    boxed.ok,
+                    pressed(MAP_OFFER_DOWNLOAD),
+                    if offer.downloading {
+                        SHELL_DISABLED_TEXT_RGB_FROM_PACKED_0000009F
+                    } else {
+                        SHELL_LABEL_TEXT_RGB
+                    },
+                ),
+                button_label(
+                    localized_label(state, "GUI:Leave", "Leave"),
+                    boxed.cancel,
+                    pressed(MAP_OFFER_LEAVE),
+                    SHELL_LABEL_TEXT_RGB,
+                ),
+            ];
+            let draw = shell_paint::paint_modal_shp(
+                font,
+                atlas
+                    .ra2_dialog_background
+                    .or_else(|| atlas.mode_two_dialog_background(None)),
+                type3_button_frames(atlas),
+                boxed.dialog,
+                &[
+                    ModalButton {
+                        rect: boxed.ok,
+                        pressed: pressed(MAP_OFFER_DOWNLOAD),
+                        enabled: !offer.downloading,
+                    },
+                    ModalButton {
+                        rect: boxed.cancel,
+                        pressed: pressed(MAP_OFFER_LEAVE),
+                        enabled: true,
+                    },
+                ],
+                &labels,
+                ShellScale::RETAIL,
+                super::wol_lobby::POPUP_DEPTHS,
+            );
+            overlay.controls.extend(draw.sprites);
+            overlay.texts.extend(draw.text);
+            if let Some(progress) = progress {
+                super::modals::push_download_progress_bar(
+                    &mut overlay.controls,
+                    atlas,
+                    boxed.body,
+                    progress,
+                    super::wol_lobby::POPUP_DEPTHS.button,
+                );
+            }
+        }
     }
     if let Some(notice) = &ui.notice {
         // 5D3514 replaces the parent dialog with the shared empty shell backdrop.
@@ -682,8 +784,13 @@ pub(crate) fn render_multiplayer_setup(
         overlay.controls.extend(page.controls);
         overlay.texts.extend(page.texts);
     }
-    // Start Game Now's 0x130 over the locked C2/C9.
-    if let Some(verify) = crate::app::shell_network_setup::verify(state) {
+    // Start Game Now's 0x130 over the locked C2/C9; VERA's room waits a
+    // moment so a quick check does not flash it.
+    let verify = crate::app::shell_network_setup::verify(state);
+    if verify.is_some_and(|verify| !verify.shown(view.dialog.modern, now)) {
+        state.platform.window.request_redraw();
+    }
+    if let Some(verify) = verify.filter(|verify| verify.shown(view.dialog.modern, now)) {
         let paint = super::paint_wol_verify(
             state,
             verify,
@@ -716,4 +823,119 @@ pub(crate) fn render_multiplayer_setup(
     }
     state.platform.window.request_redraw();
     Ok(())
+}
+
+/// The game options, in the room or in VERA's Game Options popup: their
+/// labels, the five checkboxes and the trackbars of [`OPTION_TRACKBARS`].
+fn push_option_controls(
+    controls: &mut Vec<SpriteInstance>,
+    texts: &mut Vec<ShellTextDraw>,
+    state: &AppState,
+    view: &SetupView,
+    layout: &MultiplayerSetupLayout,
+    text_depth: f32,
+) {
+    let Some(atlas) = state.frontend.skirmish_shell_chrome.as_ref() else {
+        return;
+    };
+    let scale = layout.page.scale;
+    let text = |value: &str, rect: RectPx, align: ShellAlign| {
+        shell_text::draw_in_rect_scaled(
+            &state.renderer.bit_font,
+            value,
+            rect_to_text_rect(rect),
+            SHELL_LABEL_TEXT_RGB,
+            align,
+            [0.0; 2],
+            text_depth,
+            scale.factor(),
+        )
+    };
+    for (key, rect) in &layout.option_labels {
+        texts.push(text(
+            &localized_label(state, key, key),
+            *rect,
+            ShellAlign::NONE,
+        ));
+    }
+    for (index, key) in [
+        "GUI:ShortGame",
+        "GUI:MCVRepacks",
+        "GUI:CratesAppear",
+        "GUI:SuperWeaponsAllowed",
+        "GUI:BuildOffAlly",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rect = layout.checkboxes[index];
+        paint_control(
+            controls,
+            &atlas.control_chrome(),
+            ControlPaint::Checkbox {
+                rect,
+                checked: view.checks[index],
+            },
+            scale,
+        );
+        texts.push(text(
+            &localized_label(state, key, key),
+            crate::ui::skirmish_shell::checkbox_text_rect(rect, scale),
+            ShellAlign::V_CENTER,
+        ));
+    }
+    for bar in view
+        .trackbars
+        .iter()
+        .filter(|bar| bar.visible && OPTION_TRACKBARS.contains(&bar.id))
+    {
+        push_trackbar(controls, texts, state, view, layout, bar, text_depth);
+    }
+}
+
+/// One setup trackbar, with its value plaque unless it is Difficulty.
+fn push_trackbar(
+    controls: &mut Vec<SpriteInstance>,
+    texts: &mut Vec<ShellTextDraw>,
+    state: &AppState,
+    view: &SetupView,
+    layout: &MultiplayerSetupLayout,
+    bar: &SetupTrackbar,
+    text_depth: f32,
+) {
+    let (Some(atlas), Some(rect)) = (
+        state.frontend.skirmish_shell_chrome.as_ref(),
+        layout.control_rect(bar.id),
+    ) else {
+        return;
+    };
+    let scale = layout.page.scale;
+    paint_control(
+        controls,
+        &atlas.control_chrome(),
+        ControlPaint::Trackbar {
+            rect,
+            thumb_left: bar.thumb_left(rect, scale),
+            plaque: bar.id != DIFFICULTY,
+            // A guest's are disabled windows (`0x005E30EB..0x005E30F4`).
+            disabled: !view.enabled(bar.id),
+        },
+        scale,
+    );
+    if bar.id != DIFFICULTY {
+        texts.push(shell_text::draw_in_rect_scaled(
+            &state.renderer.bit_font,
+            &bar.range.stepped(bar.value).to_string(),
+            rect_to_text_rect(crate::ui::shell::trackbar::value_text_rect(rect, scale)),
+            if view.enabled(bar.id) {
+                SHELL_LABEL_TEXT_RGB
+            } else {
+                SHELL_DISABLED_TEXT_RGB_FROM_PACKED_0000009F
+            },
+            ShellAlign::H_CENTER | ShellAlign::V_CENTER,
+            [0.0; 2],
+            text_depth,
+            scale.factor(),
+        ));
+    }
 }

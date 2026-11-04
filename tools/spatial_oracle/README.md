@@ -15,7 +15,7 @@ setup.
 | Module | Provides | Importers |
 | --- | --- | ---: |
 | `map_queries` | Sparse cell-table state for the original map lookup, normalization and playfield bodies; `dwords`, `packed`, `TABLE`/`EMPTY_TABLE`/`GLOBAL_TABLE` | ~220 |
-| `building_body_rules` | BuildingType body readers over supplied INI lookups; `SP`, `INI`, `RULES`, `TYPE`, `Fixture` | ~170 |
+| `building_body_rules` | BuildingType body readers over supplied INI lookups; `--render-bounds` replays the four consumed ordered image-bound controls; `SP`, `INI`, `RULES`, `TYPE`, `Fixture` | ~170 |
 | `unit_source_scatter` | Source-aware Unit Scatter map and actor; `SCENARIO`, `CELLS`, `make_source_fixture` | ~40 |
 | `refinery_dock` | Refinery/depot dock fixture; `make_dock_fixture`, `cell`, `HOUSE`, `BLD` | ~35 |
 | `building_construction` | `JoinedFixture` and `joined_inputs`, the joined building world reused by building death, sale, repair, capture and factory output | ~30 |
@@ -35,3 +35,23 @@ python -m tools.spatial_oracle.<name> --check       # replay; the sidecar names 
 
 A harness stays only while a Rust test reads its output (AGENTS.md). Delete a
 producer and its corpus together once its last consumer is gone.
+
+## Fatal garrison evacuation
+
+`python -m tools.spatial_oracle.building_death_anims --garrison-fatal --check`
+replays `building_garrison_fatal.json`. Set `VERA20K_BUILDING_DEATH_ASSETS` to
+the existing joined building fixture's physical input directory and `RA2_DIR`
+to the retail install. The input directory contains RULESMD, fixed ARTMD,
+optional LANGRULE, MPBattleMD, Hills.map/Hills.mmx and the joined fixture's
+requested SHP files. The added civilian building image comes from the retail
+temperate archive through the existing MIX reader.
+
+The two controls use stock CAHSE01 with zero or one E1 occupant, seed 31 and
+Skirmish mode 5. Whole Building ReceiveDamage and the shared Techno death arm
+execute before SellBuilding and Infantry Scatter. The comparison stops at
+DestructionEffects entry; prior garrison membership is supplied. It records
+the two phases' Scenario words and the released infantry's destination and
+lifecycle flags. The production-reader Rust consumer is
+`sim::passenger::garrison_eject::tests::retail_fatal_debris_precedes_garrison_scatter`.
+This covers evacuation ordering and those outcomes, not a complete native
+death lifecycle or match. Use `--write` only to regenerate native goldens.

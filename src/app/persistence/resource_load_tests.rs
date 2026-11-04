@@ -80,9 +80,6 @@ fn bound_saved_world(
             &mut selector,
         )
     };
-    // Match the existing fresh-loader publication after its Fill pass. The
-    // saved-load candidate must later replace these retained theater values.
-    cache.complete_theater_registry_load(theater.rmg_tiles.clear_tile, theater.rmg_tiles.water_set);
     let roots = crate::map::resolved_terrain::scheduler_anim_roots(
         &rules,
         &overlay_registry,
@@ -93,6 +90,7 @@ fn bound_saved_world(
         &fixed_art,
         &overlay_registry,
         &roots,
+        &[],
         assets,
         theater.extension,
         &map.header.theater,
@@ -459,13 +457,14 @@ fn assert_incoming_resources(
     );
 }
 
-/// A later authored map's pre-pack Fill reads the process cache, even though
-/// loading the save itself does not run Fill. Exercise the same adoption and
-/// Fill owners with a zero range result to isolate the retail registry base.
-fn assert_next_fill_uses_saved_theater_registry(
+/// A later authored map's pre-pack Fill reads no process history: natively
+/// the save's theater registry would set its bases. Exercise the same
+/// adoption and Fill owners with a zero range result.
+fn assert_next_fill_reads_no_saved_theater(
     prepared: &PreparedSavedResources,
     process_cache: &TileVariantSelectorCache,
 ) {
+    assert_ne!(prepared.theater.rmg_tiles.water_set, Some(0));
     let mut adopted = process_cache.detached();
     adopted
         .adopt_prepared(prepared.tile_cache.detached())
@@ -473,15 +472,11 @@ fn assert_next_fill_uses_saved_theater_registry(
     let mut main = || panic!("Fill must not draw Main");
     let mut next_map = adopted.begin_load(&mut main);
     let mut first_variant = |_, _| 0;
-    assert_eq!(
-        next_map.draw_fill_tile_index(false, &mut first_variant),
-        i32::from(prepared.theater.rmg_tiles.clear_tile.unwrap()),
-        "next map Clear Fill must use the loaded theater registry",
-    );
+    assert_eq!(next_map.draw_fill_tile_index(false, &mut first_variant), 0);
     assert_eq!(
         next_map.draw_fill_tile_index(true, &mut first_variant),
-        i32::from(prepared.theater.rmg_tiles.water_set.unwrap()),
-        "next map Water Fill must use the loaded theater registry",
+        0,
+        "next map Water Fill must not read the loaded theater",
     );
 }
 
@@ -998,7 +993,7 @@ fn retail_saved_resources_prepare_cold() {
         .unwrap();
     assert_eq!(cold.scheme_normal_rgb, [1000; 3]);
     assert_incoming_resources(&cold, &incoming, &map);
-    assert_next_fill_uses_saved_theater_registry(&cold, &cold_cache);
+    assert_next_fill_reads_no_saved_theater(&cold, &cold_cache);
     assert_eq!(
         cold.world.simulation.main_rng().logical_state(),
         SimRng::from_native_state_hex_for_test(native["after"]["main"].as_str().unwrap())
@@ -1583,10 +1578,6 @@ fn retail_saved_resources_prepare_cross_map_and_roll_back_late_failure() {
         .selector()
         .initialized_table()
         .expect("fixture warmed process selector");
-    let retained_fill_bases = (
-        warm_cache.cached_clear_tile_base(),
-        warm_cache.cached_water_set_base(),
-    );
     let mut outgoing_lights = crate::app::presentation::lighting::MatchLighting::default();
     outgoing_lights.install(
         crate::map::lighting::CellLightGrid::new(),
@@ -1668,16 +1659,6 @@ fn retail_saved_resources_prepare_cross_map_and_roll_back_late_failure() {
         warm_cache.selector().initialized_table(),
         Some(retained_table)
     );
-    assert_eq!(cold_cache.cached_clear_tile_base(), 0);
-    assert_eq!(cold_cache.cached_water_set_base(), 0);
-    assert_eq!(
-        (
-            warm_cache.cached_clear_tile_base(),
-            warm_cache.cached_water_set_base(),
-        ),
-        retained_fill_bases,
-        "rejected preparation cannot publish the incoming registry",
-    );
     assert_eq!(outgoing.simulation.state_hash(), outgoing_hash);
     assert_eq!(outgoing.simulation.rng_state(), outgoing_rng);
     assert_eq!(
@@ -1697,7 +1678,7 @@ fn retail_saved_resources_prepare_cross_map_and_roll_back_late_failure() {
         "a different theater recreates the outgoing nonneutral schemes"
     );
     assert_incoming_resources(&prepared, &incoming, &map);
-    assert_next_fill_uses_saved_theater_registry(&prepared, &warm_cache);
+    assert_next_fill_reads_no_saved_theater(&prepared, &warm_cache);
     assert_eq!(
         prepared.world.simulation.rng_state().main,
         outgoing_rng.main

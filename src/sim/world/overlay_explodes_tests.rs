@@ -172,6 +172,7 @@ fn retail_exploding_overlay_clears_only_identity_and_recurses_with_the_original_
         impact,
         0,
         warhead,
+        true,
         (0, Some(house), warhead_ref),
         FrameEffects::default(),
     );
@@ -187,6 +188,7 @@ fn retail_exploding_overlay_clears_only_identity_and_recurses_with_the_original_
         impact,
         -1,
         warhead,
+        true,
         (0, Some(house), warhead_ref),
         FrameEffects::default(),
     );

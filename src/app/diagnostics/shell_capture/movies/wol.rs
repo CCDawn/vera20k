@@ -1,8 +1,8 @@
 //! Production WOL Custom Match checkpoints: Main Menu -> Internet -> Custom
-//! Match through the real `0x10E`/`0x10F`/`0xC4`/box handlers, with a
-//! controlled WOL service that answers the visit's own requests. Nothing
-//! here builds a page; the service events are decoded results, not a
-//! transport or backend. The accepted login WRITES the MultiPlayer handle:
+//! Match through the real `0x10E`/`0x10F`/`0xC4`/box handlers (a modern
+//! visit opens at `0x10F`), with a controlled WOL service that answers the
+//! visit's own requests. Nothing here builds a page; the service events are
+//! decoded results, not a transport or backend. The accepted login WRITES the MultiPlayer handle:
 //! use an isolated RA2_DIR.
 
 use super::*;
@@ -125,6 +125,13 @@ pub enum WolTarget {
     TestServiceLobby,
     /// Modern lobby presentation with sealed local fixture data, no credentials.
     ModernLobby,
+    /// The same, then Create Game: `0xC3` on Red Alert 2's box art.
+    ModernCreate,
+    /// The same, then OK: VERA's C2, whose Game Options toggles Crates.
+    ModernRoomOptions,
+    /// VERA's C2 opens two spectator rows past its players and the stand-in
+    /// guest moves to the first.
+    ModernSpectators,
     /// The same, then Create Game: C2 settled.
     TestServiceCreate,
     /// The same, then Join on the first game: C9 settled.
@@ -480,6 +487,9 @@ impl WolTarget {
                 self,
                 Self::TestServiceLobby
                     | Self::ModernLobby
+                    | Self::ModernCreate
+                    | Self::ModernRoomOptions
+                    | Self::ModernSpectators
                     | Self::ModernOptions
                     | Self::TestServiceCreate
                     | Self::TestServiceJoin
@@ -653,6 +663,9 @@ pub(crate) const WOL_CHECKPOINTS: &[(&str, WolTarget)] = &[
     ("wol-game-controls", WolTarget::GameControls),
     ("wol-test-service-lobby", WolTarget::TestServiceLobby),
     ("wol-modern-lobby", WolTarget::ModernLobby),
+    ("wol-modern-create", WolTarget::ModernCreate),
+    ("wol-modern-room-options", WolTarget::ModernRoomOptions),
+    ("wol-modern-spectators", WolTarget::ModernSpectators),
     ("wol-test-service-create", WolTarget::TestServiceCreate),
     ("wol-test-service-join", WolTarget::TestServiceJoin),
     ("wol-c2-guest-choices", WolTarget::GuestChoices),
@@ -953,7 +966,16 @@ impl WolCapture {
                     ),
                 );
                 self.event(frame, "0xE2 Internet");
-                self.phase = WolPhase::Welcome;
+                // The normal online visit has no welcome: Internet signs in.
+                self.phase = match self.target {
+                    WolTarget::ModernUsername => WolPhase::Login,
+                    WolTarget::ModernLobby
+                    | WolTarget::ModernCreate
+                    | WolTarget::ModernRoomOptions
+                    | WolTarget::ModernSpectators
+                    | WolTarget::ModernOptions => WolPhase::ServiceLogin,
+                    _ => WolPhase::Welcome,
+                };
             }
             WolPhase::Welcome
                 if rendered == PresentedShell::WolWelcome
@@ -1033,16 +1055,6 @@ impl WolCapture {
                     welcome_click(state, rect);
                     self.event(frame, format!("0x10E {mode_name} (Options test service)"));
                     self.phase = WolPhase::ServiceLogin;
-                    return Ok(());
-                }
-                if self.target == WolTarget::ModernUsername {
-                    let rect = App::wol_welcome_layout(state)
-                        .page
-                        .button_rect(crate::ui::wol_shell::CUSTOM_MATCH)
-                        .context("Custom Match")?;
-                    welcome_click(state, rect);
-                    self.event(frame, "Normal online username page requested");
-                    self.phase = WolPhase::Login;
                     return Ok(());
                 }
                 state
@@ -1241,7 +1253,7 @@ impl WolCapture {
                                 && !login.remember_enabled,
                             "modern username form retained password controls"
                         );
-                        self.event(frame, "Username typed; OK enabled without a password");
+                        self.event(frame, "Username typed; Login enabled without a password");
                         MoviesCapture::restore_neutral_pointer(state);
                         self.settle();
                         return Ok(());
@@ -1727,6 +1739,7 @@ impl WolCapture {
                         action: false,
                         ansi: false,
                         options: None,
+                        sent_at: None,
                     },
                 );
                 ensure!(
@@ -1981,7 +1994,11 @@ impl WolCapture {
                         && lobby.ui.lobby_rows.len()
                             == if matches!(
                                 self.target,
-                                WolTarget::ModernLobby | WolTarget::ModernOptions
+                                WolTarget::ModernLobby
+                                    | WolTarget::ModernCreate
+                                    | WolTarget::ModernRoomOptions
+                                    | WolTarget::ModernSpectators
+                                    | WolTarget::ModernOptions
                             ) {
                                 1
                             } else {
@@ -1993,7 +2010,8 @@ impl WolCapture {
                 );
                 self.event(frame, "0x113 settled from the test service");
                 if lobby.ui.is_modern() {
-                    // The one chat lobby is named nowhere: no list, no join line.
+                    // The one chat lobby is named nowhere: no list, no join line
+                    // (rows start with their time).
                     let joined = crate::assets::csf_file::format_csf(
                         &App::csf_label(state, "TXT_JOINED_S", "TXT_JOINED_S"),
                         &[crate::assets::csf_file::CsfArg::Str("")],
@@ -2003,10 +2021,55 @@ impl WolCapture {
                         layout.control_rect(lobby_ui::LOBBIES).is_none()
                             && !lobby.ui.enabled(lobby_ui::LOBBIES)
                             && !lobby.ui.chat.lines.iter().any(|line| {
-                                String::from_utf16_lossy(&line.text).starts_with(&joined)
+                                String::from_utf16_lossy(&line.text).contains(&joined)
                             }),
                         "the modern 0x113 names its chat lobby"
                     );
+                }
+                if self.target == WolTarget::ModernCreate {
+                    let layout = crate::app::shell_wol::lobby::layout(state);
+                    lobby_button(state, &layout, lobby_ui::CREATE)?;
+                    ensure!(
+                        Self::lobby(state)?
+                            .ui
+                            .popup
+                            .as_ref()
+                            .map(|popup| popup.dialog())
+                            == Some(lobby_ui::CREATE_DIALOG),
+                        "Create did not open 0xC3"
+                    );
+                    // VERA's Create Game offers its room's limits, from 30
+                    // people with spectators.
+                    ensure!(
+                        Self::lobby(state)?.ui.popup.as_ref().is_some_and(|popup| matches!(
+                            &popup.kind,
+                            lobby_ui::WolPopupKind::Create(create) if create.room.as_ref().map(|room| room.limits)
+                                == Some(crate::ui::room_limits::RoomLimits::default())
+                        )),
+                        "the modern 0xC3 has no Max players or Allow spectators"
+                    );
+                    self.event(frame, "0xC3 opened (modern)");
+                    // The help under Limit Screen Resolution, moved to the
+                    // clan row.
+                    let (width, height) = (
+                        state.renderer.gpu.config.width as i32,
+                        state.renderer.gpu.config.height as i32,
+                    );
+                    let create =
+                        crate::ui::shell::modal::wol_create_game_layout(width, height, true);
+                    set_window_pointer_to_rect_center(state, create.limit);
+                    App::handle_wol_mouse_move(state);
+                    ensure!(
+                        Self::lobby(state)?
+                            .ui
+                            .popup
+                            .as_ref()
+                            .and_then(|popup| popup.buttons.hovered)
+                            == Some(lobby_ui::CREATE_LIMIT),
+                        "Limit Screen Resolution has no help"
+                    );
+                    self.settle();
+                    return Ok(());
                 }
                 if self.target == WolTarget::ModernOptions {
                     let layout = crate::app::shell_wol::lobby::layout(state);
@@ -2029,6 +2092,8 @@ impl WolCapture {
                 if matches!(
                     self.target,
                     WolTarget::TestServiceCreate
+                        | WolTarget::ModernRoomOptions
+                        | WolTarget::ModernSpectators
                         | WolTarget::SetupPage
                         | WolTarget::GuestChoices
                         | WolTarget::GuestObserver
@@ -2045,7 +2110,8 @@ impl WolCapture {
                         state.renderer.gpu.config.width as i32,
                         state.renderer.gpu.config.height as i32,
                     );
-                    let create = crate::ui::shell::modal::wol_create_game_layout(width, height);
+                    let create =
+                        crate::ui::shell::modal::wol_create_game_layout(width, height, false);
                     if self.target.clan() {
                         // 0x78DF35: the clan box is enabled by the squad id.
                         ensure!(
@@ -2055,7 +2121,7 @@ impl WolCapture {
                         welcome_click(
                             state,
                             crate::ui::skirmish_shell::checkbox_icon_rect(
-                                create.clan,
+                                create.clan.context("0xC3 clan box")?,
                                 crate::ui::shell::geom::ShellScale::RETAIL,
                             ),
                         );
@@ -2158,6 +2224,7 @@ impl WolCapture {
                     WolTarget::GuestChoices
                         | WolTarget::GuestObserver
                         | WolTarget::GuestKick
+                        | WolTarget::ModernSpectators
                         | WolTarget::ScenariosMismatch
                         | WolTarget::MismatchOk
                         | WolTarget::ClanLockout
@@ -2165,6 +2232,25 @@ impl WolCapture {
                         | WolTarget::ClanChooseMap
                 ) {
                     return self.service_host(state, frame);
+                }
+                if self.target == WolTarget::ModernRoomOptions {
+                    use crate::ui::multiplayer_setup::GAME_OPTIONS;
+                    setup_button(state, GAME_OPTIONS)?;
+                    let crates = setup_view(state)?.checks[2];
+                    ensure!(setup_view(state)?.options_open, "Game Options did not open");
+                    let layout = crate::app::input::multiplayer_setup::layout(state);
+                    setup_click(
+                        state,
+                        crate::ui::skirmish_shell::checkbox_icon_rect(
+                            layout.checkboxes[2],
+                            layout.page.scale,
+                        ),
+                    );
+                    ensure!(
+                        setup_view(state)?.checks[2] != crates,
+                        "Crates did not toggle in Game Options"
+                    );
+                    self.event(frame, "C2 Game Options: Crates toggled");
                 }
                 MoviesCapture::restore_neutral_pointer(state);
                 crate::app::input::multiplayer_setup::cursor_moved(state);
@@ -2358,7 +2444,7 @@ impl WolCapture {
                     state.renderer.gpu.config.width as i32,
                     state.renderer.gpu.config.height as i32,
                 );
-                let ok = crate::ui::shell::modal::wol_create_game_layout(width, height).ok;
+                let ok = crate::ui::shell::modal::wol_create_game_layout(width, height, false).ok;
                 welcome_click(state, ok);
                 self.event(frame, "0xC3 OK over the backdrop");
                 self.phase = WolPhase::BuddySetup;
@@ -2749,6 +2835,7 @@ impl WolCapture {
                 action: false,
                 ansi: false,
                 options: None,
+                sent_at: None,
             },
         );
         ensure!(
@@ -3192,6 +3279,7 @@ impl WolCapture {
                             action,
                             ansi: false,
                             options: None,
+                            sent_at: None,
                         },
                     );
                 }
@@ -3227,6 +3315,7 @@ impl WolCapture {
                             action: false,
                             ansi: false,
                             options: None,
+                            sent_at: None,
                         },
                     );
                 };
@@ -3678,12 +3767,13 @@ impl WolCapture {
                 );
                 self.event(frame, "0xC3 opened");
                 if self.target != WolTarget::CreatePopup {
-                    let create = crate::ui::shell::modal::wol_create_game_layout(width, height);
+                    let create =
+                        crate::ui::shell::modal::wol_create_game_layout(width, height, false);
                     if self.target.clan_match() {
                         welcome_click(
                             state,
                             crate::ui::skirmish_shell::checkbox_icon_rect(
-                                create.clan,
+                                create.clan.context("0xC3 clan box")?,
                                 crate::ui::shell::geom::ShellScale::RETAIL,
                             ),
                         );
@@ -4586,10 +4676,11 @@ fn join_lobby(state: &mut AppState) {
 fn wol_setup_settled(state: &AppState, host: bool) -> bool {
     MoviesCapture::slide_settled(
         state,
-        ShellSlideKind::NetworkSetup(crate::ui::multiplayer_setup::SetupDialog {
+        ShellSlideKind::NetworkSetup(crate::app::shell_network_setup::setup_dialog(
+            state,
             host,
-            flavor: crate::ui::multiplayer_setup::SetupFlavor::Wol,
-        }),
+            crate::ui::multiplayer_setup::SetupFlavor::Wol,
+        )),
     ) && state
         .frontend
         .multiplayer_setup
@@ -5465,6 +5556,48 @@ impl WolCapture {
                     );
                     self.event(frame, json!({"guest plays again": {"row": 1}}));
                 }
+            }
+            WolTarget::ModernSpectators => {
+                // VERA's room keeps one spectator row open past its players:
+                // the guest who watches takes it and the next opens.
+                use crate::ui::multiplayer_setup::SetupColumn;
+                setup_requests(state);
+                let first = state.match_state.session.network_free_row(true);
+                let requests = choices(state, human.slot.clone(), true);
+                let (_, observer) = guest(state).context("guest")?;
+                let second = state.match_state.session.network_free_row(true);
+                ensure!(
+                    first.is_some()
+                        && observer.is_observer()
+                        && observer.raw_slot_index == first
+                        && second == first.map(|row| row + 1),
+                    "the guest takes the open spectator row {first:?}: \
+                     {observer:?}, then {second:?} {requests:?}"
+                );
+                // The room lists only who is in it: the host, then the
+                // spectator, whom the host's menu kicks. Nobody adds an AI
+                // while anyone watches.
+                let listed: Vec<_> = setup_view(state)?
+                    .combos
+                    .iter()
+                    .filter(|combo| {
+                        SetupColumn::decode(combo.id)
+                            .is_some_and(|(column, _)| column == SetupColumn::Player)
+                    })
+                    .map(|combo| {
+                        let values: Vec<_> =
+                            combo.choices.iter().map(|choice| choice.value).collect();
+                        (combo.row, values)
+                    })
+                    .collect();
+                ensure!(
+                    listed == [(0, vec![0]), (first.context("spectator row")?, vec![0, 2])],
+                    "the room lists {listed:?}"
+                );
+                self.event(
+                    frame,
+                    json!({"spectator rows": [first, second], "guest observes": first, "listed": [0, first]}),
+                );
             }
             WolTarget::ClanLockout | WolTarget::ClanNoStart | WolTarget::ClanChooseMap => {
                 return self.clan_room(state, frame);

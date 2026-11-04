@@ -1,6 +1,6 @@
 //! Production VERA lobby adapter. HTTPS results enter the existing WOL reducers;
 //! MatchSession remains the sole authority for accepted participants and options.
-//! The custom protocol is documented in services/lobby/protocol.md.
+//! The custom protocol is documented in docs/lobby-protocol.md.
 
 mod http;
 mod maps;
@@ -38,9 +38,32 @@ const DEFAULT_LOBBY_URL: &str = match option_env!("VERA20K_LOBBY_URL") {
     None => "https://lobby.vera20k.org",
 };
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-const STATS_INTERVAL: Duration = Duration::from_secs(30);
 const RELAY_TIMEOUT: Duration = Duration::from_secs(30);
 const EXIT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(90);
+/// Gameplay grants (timing confirmation, `relay_renewed`, match resume) are
+/// issued for 300 seconds (docs/lobby-protocol.md). Their
+/// `expires` is lobby wall time; a local clock running slow would renew after
+/// the relay already rejects the ticket, so renewal is timed from receipt.
+/// It uses frame_pacer::wall_clock_ms, which keeps counting through sleep;
+/// an `Instant` deadline would wait out the slept time with a dead ticket.
+const RELAY_GRANT_LIFETIME: Duration = Duration::from_secs(300);
+/// docs/lobby-protocol.md: renew at half-life. The relay refuses an expired ticket, so a
+/// lobby outage longer than this margin freezes the match. Retrying every 10 s
+/// spends 6 of renew_relay's 12 a minute (docs/lobby-protocol.md).
+const RELAY_RENEWAL_MARGIN: Duration = Duration::from_secs(150);
+const RELAY_RENEWAL_RETRY_MS: u32 = 10_000;
+
+/// The configured lobby's HTTPS origin: the build's, or `VERA20K_LOBBY_URL`
+/// for staging.
+#[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) fn lobby_base_url() -> Result<String> {
+    let base = std::env::var("VERA20K_LOBBY_URL").unwrap_or_else(|_| DEFAULT_LOBBY_URL.to_owned());
+    ensure!(
+        base.starts_with("https://") && !base[8..].chars().any(|ch| matches!(ch, '@' | '?' | '#')),
+        "the online lobby needs its configured HTTPS service"
+    );
+    Ok(base)
+}
 
 /// The departing visit's same HTTP/cleanup owner survives the menu teardown.
 /// Native WOL_Main77B532 releases WOLAPI786080 after logout785EA0. VERA's
@@ -177,7 +200,9 @@ impl OnlineCleanup {
                     operation,
                     failure,
                 } => match operation {
-                    "finish" => retired.service.finish_failed(id, failure, now),
+                    "finish" => {
+                        retired.service.finish_failed(id, failure, now);
+                    }
                     "leave" => retired.service.leave_failed(id, now),
                     "logout" => retired.service.logout_failed(id, now),
                     _ => {}
@@ -238,7 +263,6 @@ pub(super) struct LiveService {
     accepted_options: Option<Value>,
     start_preparation: Option<StartPreparation>,
     last_ready_request: Option<(u64, u64)>,
-    next_stats: Option<Instant>,
     pending_choices: Option<PendingChoices>,
     player_id: String,
     member_ids: BTreeMap<String, String>,
@@ -247,13 +271,19 @@ pub(super) struct LiveService {
     finishing: Option<RetryingCommand>,
     leaving: Option<RetryingCommand>,
     logging_out: Option<RetryingCommand>,
-    next_renewal_attempt: Option<Instant>,
+    /// Renewal deadlines on the low 32 bits of frame_pacer::wall_clock_ms.
+    next_renewal_attempt: Option<u32>,
+    /// Renewal deadline of the newest gameplay grant received.
+    relay_renewal_due: Option<u32>,
     maps: maps::Transfers,
     translations: Translations,
     /// A match an external launcher formed (docs/spawn.md): adopted bearer,
     /// no lobby pages, and `finish` carries the local result.
     spawned: bool,
     /// The spawned match's `finish` result (`ExternalMatchResult`).
+    /// VERA: the finish asks the lobby to give this player's game room back
+    /// (`back_to_room`), set from the visit when the match returns.
+    back_to_room: bool,
     finish_result: Option<&'static str>,
     /// docs/spawn.md: every opponent left before the local player did.
     finish_opponents_left: bool,
@@ -265,8 +295,16 @@ pub(super) struct LiveService {
 }
 
 /// Where players download a newer build (README "Download and play").
-const RELEASES_URL: &str = "https://github.com/YuriPlanet/vera20k/releases";
+pub(crate) const RELEASES_URL: &str = "https://github.com/YuriPlanet/vera20k/releases";
 
+/// The login box for a lobby that did not answer, instead of retail
+/// TXT_CANT_CONNECT's "Westwood Online".
+const CANT_CONNECT_TEXT: &str = "Could not connect to VERA20k Online. The service may be down, or check your internet connection.";
+
+/// The box when the lobby stops answering while the player is in it.
+const LOBBY_LOST_TEXT: &str = "Lost connection to VERA20k Online. The service may be down, or check your internet connection.";
+
+/// The lobby's own maintenance message when it gave a plain one.
 /// The lobby's own 426 reason when it gave a plain one, then where to get a
 /// newer build.
 fn update_required_text(message: Option<&str>) -> String {
@@ -445,6 +483,20 @@ struct PendingStart {
     relay_acknowledged: bool,
     probes_started: bool,
     latencies_reported: bool,
+    /// A returning player: the match started without this process, so its
+    /// barriers are over and these are the timing it agreed.
+    resume_pings: Option<Vec<i32>>,
+    /// The unanswered `relay_ready` or `latency_ready`.
+    report: Option<PendingReport>,
+}
+
+/// One admission report, resent under its request ID within the start window
+/// when the lobby answers 429, 5xx or nothing; the lobby replays a committed
+/// request ID (docs/lobby-protocol.md `POST /v1/commands`).
+struct PendingReport {
+    command: RetryingCommand,
+    operation: &'static str,
+    payload: Value,
 }
 
 impl LiveService {
@@ -472,16 +524,7 @@ impl LiveService {
         #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
         let base = match service_url {
             Some(url) => url.to_owned(),
-            None => {
-                let base = std::env::var("VERA20K_LOBBY_URL")
-                    .unwrap_or_else(|_| DEFAULT_LOBBY_URL.to_owned());
-                ensure!(
-                    base.starts_with("https://")
-                        && !base[8..].chars().any(|ch| matches!(ch, '@' | '?' | '#')),
-                    "the online lobby needs its configured HTTPS service"
-                );
-                base
-            }
+            None => lobby_base_url()?,
         };
         let (requests, input) = mpsc::channel();
         let (output, responses) = mpsc::channel();
@@ -513,7 +556,6 @@ impl LiveService {
             accepted_options: None,
             start_preparation: None,
             last_ready_request: None,
-            next_stats: None,
             pending_choices: None,
             player_id: String::new(),
             member_ids: BTreeMap::new(),
@@ -523,9 +565,11 @@ impl LiveService {
             leaving: None,
             logging_out: None,
             next_renewal_attempt: None,
+            relay_renewal_due: None,
             maps: Default::default(),
             translations: Translations::default(),
             spawned: false,
+            back_to_room: false,
             finish_result: None,
             finish_opponents_left: false,
             relay_timeout: RELAY_TIMEOUT,
@@ -580,15 +624,20 @@ impl LiveService {
             return;
         }
         self.next_renewal_attempt = None;
+        self.relay_renewal_due = None;
         self.finishing = Some(RetryingCommand::new(self.next_request, now));
         let payload = self.finish_payload(&match_id);
         self.command("finish", payload);
     }
 
-    /// The lobby's `finish` is exactly `{match_id}`; a spawned match adds
-    /// its local result for the launcher (docs/spawn.md).
+    /// The lobby's `finish` is `{match_id}`, with `back_to_room` when the
+    /// player returns to the room it kept; a spawned match adds its local
+    /// result for the launcher (docs/spawn.md).
     fn finish_payload(&self, match_id: &str) -> Value {
         let mut payload = json!({"match_id":match_id});
+        if self.back_to_room {
+            payload["back_to_room"] = json!(true);
+        }
         if self.spawned {
             payload["result"] = json!(self.finish_result.unwrap_or("quit"));
             payload["opponents_left"] = json!(self.finish_opponents_left);
@@ -607,18 +656,26 @@ impl LiveService {
         }
     }
 
-    fn finish_failed(&mut self, id: u64, failure: http::CommandFailure, now: Instant) {
+    /// True when the lobby refused `back_to_room` (a lobby from before rooms
+    /// came back): the finish retries without it and the room is not kept.
+    fn finish_failed(&mut self, id: u64, failure: http::CommandFailure, now: Instant) -> bool {
         if failure == http::CommandFailure::AlreadyFinished {
             self.finish_completed(id);
-            return;
+            return false;
         }
-        if let Some(finish) = self
+        let Some(finish) = self
             .finishing
             .as_mut()
             .filter(|finish| finish.request_id == id)
-        {
-            finish.failed(now);
+        else {
+            return false;
+        };
+        finish.failed(now);
+        let refused = self.back_to_room && matches!(failure, http::CommandFailure::Rejected(_));
+        if refused {
+            self.back_to_room = false;
         }
+        refused
     }
 
     fn begin_leave(&mut self, now: Instant) {
@@ -677,6 +734,93 @@ impl LiveService {
         self.logging_out = None;
         self.match_id = None;
         self.next_renewal_attempt = None;
+        self.relay_renewal_due = None;
+    }
+
+    /// A gameplay grant reached its UDP owner at `now_ms`.
+    fn relay_granted(&mut self, now_ms: u32) {
+        let renew_after = (RELAY_GRANT_LIFETIME - RELAY_RENEWAL_MARGIN).as_millis() as u32;
+        self.relay_renewal_due = Some(now_ms.wrapping_add(renew_after));
+        self.next_renewal_attempt = None;
+    }
+
+    fn poll_renewal(&mut self, now_ms: u32) {
+        if self.finishing.is_some() {
+            return;
+        }
+        let (Some(match_id), Some(due)) = (self.match_id.as_ref(), self.relay_renewal_due) else {
+            return;
+        };
+        // Short-lived grants renew before expiry. Retry a missing reply without
+        // replacing the live route or resetting the event cursor.
+        // Windows' timeGetTime wraps this 32-bit word every 49.7 days.
+        let reached = |deadline: u32| now_ms.wrapping_sub(deadline) as i32 >= 0;
+        if !reached(due) || self.next_renewal_attempt.is_some_and(|next| !reached(next)) {
+            return;
+        }
+        let match_id = match_id.clone();
+        self.next_renewal_attempt = Some(now_ms.wrapping_add(RELAY_RENEWAL_RETRY_MS));
+        self.command("renew_relay", json!({"match_id":match_id}));
+    }
+
+    fn send_report(&mut self, operation: &'static str, payload: Value, now: Instant) {
+        let id = self.command_with_id(operation, payload.clone());
+        if let Some(pending) = self.pending.as_mut() {
+            pending.report = Some(PendingReport {
+                command: RetryingCommand::new(id, now),
+                operation,
+                payload,
+            });
+        }
+    }
+
+    fn report_completed(&mut self, id: u64) {
+        if let Some(pending) = self.pending.as_mut()
+            && pending
+                .report
+                .as_ref()
+                .is_some_and(|report| report.command.request_id == id)
+        {
+            pending.report = None;
+        }
+    }
+
+    /// Whether the refused report will be resent: only a busy or unreachable
+    /// lobby is asked again, any other refusal stands.
+    fn report_failed(&mut self, id: u64, failure: http::CommandFailure, now: Instant) -> bool {
+        let Some(pending) = self.pending.as_mut() else {
+            return false;
+        };
+        let Some(report) = pending
+            .report
+            .as_mut()
+            .filter(|report| report.command.request_id == id)
+        else {
+            return false;
+        };
+        if failure == http::CommandFailure::Retryable {
+            report.command.failed(now);
+            return true;
+        }
+        pending.report = None;
+        false
+    }
+
+    fn poll_report(&mut self, now: Instant) {
+        if let Some((id, operation, payload)) = self
+            .pending
+            .as_mut()
+            .and_then(|pending| pending.report.as_mut())
+            .and_then(|report| {
+                Some((
+                    report.command.take_due(now)?,
+                    report.operation,
+                    report.payload.clone(),
+                ))
+            })
+        {
+            self.send_command(id, operation, payload);
+        }
     }
 
     fn admission_blocked(&self) -> bool {
@@ -775,8 +919,25 @@ pub(super) fn poll(state: &mut AppState) -> Option<Instant> {
         return cleanup_deadline.or_else(|| relay_pending.then(|| Instant::now() + POLL_INTERVAL));
     }
     if cleanup_deadline.is_some() {
-        // Welcome/menu navigation remains responsive. Keep this visit's
-        // existing service requests until the old bearer cleanup is retired.
+        // The old bearer's logout may retry for a while in an outage. Answer
+        // the requests that need no lobby, so the player reaches the login
+        // page and its connect wait rather than a blank screen; keep the rest
+        // queued until that cleanup is retired.
+        let requests = state
+            .frontend
+            .wol
+            .as_mut()
+            .map(|visit| visit.take_service_requests())
+            .unwrap_or_default();
+        let mut kept = Vec::new();
+        for request in requests {
+            if !answer_local_request(state, &request) {
+                kept.push(request);
+            }
+        }
+        if let Some(visit) = state.frontend.wol.as_mut() {
+            visit.requests.splice(0..0, kept);
+        }
         return cleanup_deadline;
     }
     if state
@@ -912,7 +1073,7 @@ pub(super) fn poll(state: &mut AppState) -> Option<Instant> {
             service.start_preparation = None;
             fail_start(
                 state,
-                "The final game settings could not be agreed. Accept the settings and try Start again.",
+                "The final game settings could not be agreed. Try Start again.",
             );
         }
         if poll_relay(state, &mut service).is_err() {
@@ -922,29 +1083,15 @@ pub(super) fn poll(state: &mut AppState) -> Option<Instant> {
         if !service.spawned && service.pending.is_none() && service.match_id.is_none() {
             maps::poll(state, &mut service);
         }
-        poll_renewal(state, &mut service);
+        if crate::app::lan_service::has_online_relay_route(state) {
+            service.poll_renewal(crate::app::match_runtime::frame_pacer::wall_clock_ms() as u32);
+        }
         if service.spawned {
             poll_spawned_exit(state, &mut service);
-        } else {
-            poll_stats(state, &mut service);
         }
     }
     put_service(state, service);
     Some(Instant::now() + POLL_INTERVAL)
-}
-
-/// The online welcome shows the lobby's public counts, refreshed while open.
-fn poll_stats(state: &AppState, service: &mut LiveService) {
-    let now = Instant::now();
-    let welcome = state
-        .frontend
-        .wol
-        .as_ref()
-        .is_some_and(|visit| matches!(visit.page, super::WolPage::Welcome));
-    if welcome && service.next_stats.is_none_or(|due| now >= due) {
-        let _ = service.requests.send(http::Request::Stats);
-        service.next_stats = Some(now + STATS_INTERVAL);
-    }
 }
 
 fn notice(state: &mut AppState, text: &str) {
@@ -1007,6 +1154,7 @@ impl super::WolVisit {
             return;
         }
         if let Some(service) = self.live_service.as_mut() {
+            service.back_to_room = self.back_to_room;
             service.begin_finish(now);
         } else if !self.requests.contains(&WolServiceRequest::MatchReturned) {
             //poll holds the SAME service across HTTP callbacks. Loading abort
@@ -1030,7 +1178,24 @@ pub(super) fn leave_visit(state: &mut AppState) {
     state.frontend.wol_account.password.clear();
 }
 
-fn request_service(state: &mut AppState, service: &mut LiveService, request: WolServiceRequest) {
+#[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+/// The game is closing: hand the online visit to the ordinary cleanup owner
+/// (finish, leave, logout and the relay departure), as Back does, and end
+/// the visit so nothing but that cleanup runs until exit.
+pub(crate) fn retire_visit_for_exit(state: &mut AppState) {
+    if state
+        .frontend
+        .wol
+        .as_ref()
+        .is_some_and(|visit| visit.provider == WolProvider::Online)
+    {
+        leave_visit(state);
+        state.frontend.wol = None;
+    }
+}
+
+/// Answer a request that needs no lobby; false for any other.
+fn answer_local_request(state: &mut AppState, request: &WolServiceRequest) -> bool {
     match request {
         WolServiceRequest::EnsureApi => {
             service_event(state, WolServiceEvent::Api(WolApiStatus::Available))
@@ -1055,6 +1220,19 @@ fn request_service(state: &mut AppState, service: &mut LiveService, request: Wol
             );
             service_event(state, WolServiceEvent::NetStatus(0x0004_012F));
         }
+        _ => return false,
+    }
+    true
+}
+
+fn request_service(state: &mut AppState, service: &mut LiveService, request: WolServiceRequest) {
+    if answer_local_request(state, &request) {
+        return;
+    }
+    match request {
+        WolServiceRequest::EnsureApi
+        | WolServiceRequest::ListCredentials
+        | WolServiceRequest::FetchServers { .. } => {}
         WolServiceRequest::Connect { nickname, .. } => {
             service.clear_cleanup();
             service.auth_attempt = service.auth_attempt.wrapping_add(1);
@@ -1084,7 +1262,14 @@ fn request_service(state: &mut AppState, service: &mut LiveService, request: Wol
             cancel_pending(state, service);
             service.begin_leave(Instant::now());
         }
-        WolServiceRequest::MatchReturned => service.begin_finish(Instant::now()),
+        WolServiceRequest::MatchReturned => {
+            service.back_to_room = state
+                .frontend
+                .wol
+                .as_ref()
+                .is_some_and(|visit| visit.back_to_room);
+            service.begin_finish(Instant::now());
+        }
         WolServiceRequest::Logout => {
             maps::cancel(state, service);
             cancel_pending(state, service);
@@ -1376,7 +1561,7 @@ fn poll_start_preparation(state: &mut AppState, service: &mut LiveService) -> Re
     if Instant::now() >= start.deadline {
         fail_start(
             state,
-            "Not every player accepted the final settings in time. Try Start again.",
+            "Not every player's game was ready in time. Try Start again.",
         );
         return Ok(());
     }
@@ -1426,6 +1611,9 @@ fn request_setup(
                 .clone();
             // Earlier full options can arrive before this queue drains. The
             // outgoing request, not that intervening UI echo, defines its ack.
+            // A guest who starts or stops watching changed nothing here: the
+            // host picks its row, or keeps it.
+            let switch = human.is_observer() != observer;
             human.raw_slot_index = Some(row);
             human.slot = slot.clone();
             human.set_observer(observer);
@@ -1434,19 +1622,24 @@ fn request_setup(
                 "choices",
                 json!({"row":row,"slot":slot,"observer":observer}),
             );
-            service.pending_choices = (!service
-                .accepted_options
-                .as_ref()
-                .is_some_and(|accepted| accepted_human_matches(accepted, &expected_human)))
+            service.pending_choices = (!switch
+                && !service
+                    .accepted_options
+                    .as_ref()
+                    .is_some_and(|accepted| accepted_human_matches(accepted, &expected_human)))
             .then_some(PendingChoices {
                 request_id,
                 expected_human,
                 deadline: Instant::now() + RELAY_TIMEOUT,
             });
         }
-        NetworkSetupRequest::Ready(ready) => {
-            let ready = ready && local_map_status(state, service) == 1;
-            if !ready {
+        NetworkSetupRequest::Ready(requested) => {
+            let ready = requested && local_map_status(state, service) == 1;
+            if requested && !ready {
+                // The guest's automatic Accept waits for the verified map
+                // instead of repeating this request every frame.
+                crate::app::shell_network_setup::refuse_local_acceptance(state)?;
+            } else if !ready {
                 let index = state
                     .match_state
                     .session
@@ -1495,7 +1688,7 @@ fn request_setup(
                 }
                 notice(
                     state,
-                    "Waiting for every player to accept the final game settings.",
+                    "Waiting for every player's game to confirm the final settings.",
                 );
             }
         }
@@ -1504,7 +1697,11 @@ fn request_setup(
             cancel_pending(state, service);
             service.begin_leave(Instant::now());
         }
-        NetworkSetupRequest::Kick { name } => service.command("kick", json!({"name":name})),
+        // Older lobbies take no keep_out, so only a host's own kick sends it.
+        NetworkSetupRequest::Kick { name, keep_out } if keep_out => {
+            service.command("kick", json!({"name":name,"keep_out":true}))
+        }
+        NetworkSetupRequest::Kick { name, .. } => service.command("kick", json!({"name":name})),
         NetworkSetupRequest::Advertise => {
             if let Some(channel) = super::lobby::republish_channel(state) {
                 service.command("advertise", json!({"channel":wire::Channel::from(channel)}));
@@ -1548,7 +1745,7 @@ fn apply_response(state: &mut AppState, service: &mut LiveService, response: htt
         | http::Response::MapPending { .. }) => {
             maps::response(state, service, response);
         }
-        http::Response::StartRejected { id } => {
+        http::Response::StartRejected { id, retryable } => {
             if !service
                 .start_preparation
                 .as_ref()
@@ -1559,13 +1756,18 @@ fn apply_response(state: &mut AppState, service: &mut LiveService, response: htt
             cancel_pending(state, service);
             fail_start(
                 state,
-                "The match could not start. Check every player's map, rules, version and readiness.",
+                if retryable {
+                    "The online lobby is busy or not responding. Try Start again."
+                } else {
+                    "The match could not start. Check every player's map, rules, version and readiness."
+                },
             );
         }
         http::Response::Authenticated {
             attempt,
             player_id,
             nickname,
+            motd,
         } if attempt == service.auth_attempt => {
             if validate_online_identity(&player_id, &nickname).is_err() {
                 state.frontend.wol_account.password.clear();
@@ -1575,16 +1777,25 @@ fn apply_response(state: &mut AppState, service: &mut LiveService, response: htt
             service.player_id = player_id;
             state.frontend.wol_account.nickname = nickname;
             state.frontend.wol_account.password.clear();
-            service_event(
-                state,
-                WolServiceEvent::Login(Ok(WolLoginAccepted {
-                    motd: "VERA20k Online".into(),
-                })),
-            );
+            let motd = motd
+                .filter(|motd| !motd.trim().is_empty())
+                .unwrap_or_else(|| super::service::vera_motd(state));
+            service_event(state, WolServiceEvent::Login(Ok(WolLoginAccepted { motd })));
         }
         http::Response::LoginFailed { attempt, code } if attempt == service.auth_attempt => {
             state.frontend.wol_account.password.clear();
             service_event(state, WolServiceEvent::Login(Err(code)));
+            // Code 0 is no answer or an unexpected one: TXT_CANT_CONNECT.
+            if code == 0 {
+                super::service::replace_open_box_body(state, CANT_CONNECT_TEXT);
+            }
+        }
+        http::Response::SignInRefused { attempt, message } if attempt == service.auth_attempt => {
+            state.frontend.wol_account.password.clear();
+            service_event(state, WolServiceEvent::Login(Err(0)));
+            if !super::service::replace_open_box_body(state, &message) {
+                notice(state, &message);
+            }
         }
         http::Response::UpgradeRequired { attempt, message } if attempt == service.auth_attempt => {
             state.frontend.wol_account.password.clear();
@@ -1608,7 +1819,6 @@ fn apply_response(state: &mut AppState, service: &mut LiveService, response: htt
                 channels: list.channels.into_iter().map(Into::into).collect(),
             },
         ),
-        http::Response::Stats(stats) => super::persona::lobby_stats(state, stats),
         http::Response::Event(event) => {
             if apply_event(state, service, &event.kind, event.payload).is_err() {
                 log::warn!(
@@ -1622,6 +1832,7 @@ fn apply_response(state: &mut AppState, service: &mut LiveService, response: htt
             "finish" => service.finish_completed(id),
             "leave" => service.leave_completed(id),
             "logout" => service.logout_completed(id),
+            "relay_ready" | "latency_ready" => service.report_completed(id),
             _ => {}
         },
         http::Response::CommandFailed {
@@ -1667,12 +1878,18 @@ fn apply_response(state: &mut AppState, service: &mut LiveService, response: htt
                 );
             }
             "ready" if service.last_ready_request == Some((id, service.revision)) => {
-                if let Some(index) = state
+                if failure != http::CommandFailure::Retryable {
+                    // The lobby refused these settings, usually because the
+                    // room has already moved on: the guest's automatic
+                    // Accept waits for the next ones.
+                    let _ = crate::app::shell_network_setup::refuse_local_acceptance(state);
+                } else if let Some(index) = state
                     .match_state
                     .session
                     .network_setup()
                     .map(|launch| launch.local_player_index)
                 {
+                    // A lost request: the automatic Accept sends it again.
                     let _ = crate::app::shell_network_setup::service_event(
                         state,
                         NetworkSetupEvent::PlayerReady {
@@ -1681,22 +1898,27 @@ fn apply_response(state: &mut AppState, service: &mut LiveService, response: htt
                         },
                     );
                 }
-                notice(
-                    state,
-                    "The room changed before acceptance. Review the settings and accept again.",
-                );
             }
             "finish" => {
                 let first_failure = service
                     .finishing
                     .as_ref()
                     .is_some_and(|finish| finish.request_id == id && finish.failures == 0);
-                service.finish_failed(id, failure, Instant::now());
-                if first_failure && failure != http::CommandFailure::AlreadyFinished {
+                if service.finish_failed(id, failure, Instant::now()) {
+                    // No room comes back: the waiting runner goes to the lobby.
+                    super::lobby::room_refused(state);
+                } else if first_failure && failure != http::CommandFailure::AlreadyFinished {
                     notice(
                         state,
                         "Reconnecting to finish the previous match before rematch.",
                     );
+                }
+            }
+            // The host's 5 s ping; an outage is reported once by the poll.
+            "ping" => {}
+            "relay_ready" | "latency_ready" => {
+                if !service.report_failed(id, failure, Instant::now()) {
+                    notice(state, "The online request was not accepted.");
                 }
             }
             _ => notice(state, "The online request was not accepted."),
@@ -1707,6 +1929,39 @@ fn apply_response(state: &mut AppState, service: &mut LiveService, response: htt
             }
         }
         http::Response::Failure(message) => notice(state, message),
+        http::Response::LobbyUnreachable => {
+            notice(state, "The online lobby is not responding. Retrying.")
+        }
+        http::Response::LobbyReachable => notice(state, "The online lobby is responding again."),
+        http::Response::LobbyLost => {
+            // A match keeps its relay through a lobby outage; this asks
+            // again after it.
+            if super::in_match(state) || crate::app::loading::pump::network_loading_active(state) {
+                return;
+            }
+            // The worker keeps the bearer and logs it out at the next
+            // sign-in, so the name is free again.
+            let _ = service.requests.send(http::Request::Abandon);
+            if !state
+                .frontend
+                .wol
+                .as_ref()
+                .is_some_and(|visit| visit.connected)
+            {
+                return;
+            }
+            maps::cancel(state, service);
+            cancel_pending(state, service);
+            // The native disconnect: a box over the lobby, or none where the
+            // runner has no lobby (Quick Match), which then gets one at the
+            // welcome.
+            service_event(state, WolServiceEvent::NetStatus(super::NET_STATUS_LOST));
+            if !super::lobby::replace_box_body(state, LOBBY_LOST_TEXT)
+                && !super::service::show_text_box(state, LOBBY_LOST_TEXT)
+            {
+                notice(state, LOBBY_LOST_TEXT);
+            }
+        }
         http::Response::Offline => {
             crate::app::loading::pump::cancel_network_loading(
                 state,
@@ -1733,7 +1988,8 @@ fn apply_response(state: &mut AppState, service: &mut LiveService, response: htt
         }
         http::Response::Authenticated { .. }
         | http::Response::LoginFailed { .. }
-        | http::Response::UpgradeRequired { .. } => {}
+        | http::Response::UpgradeRequired { .. }
+        | http::Response::SignInRefused { .. } => {}
     }
 }
 
@@ -1865,33 +2121,6 @@ pub(crate) fn decode_external_relay_grant(
     )
 }
 
-fn poll_renewal(state: &AppState, service: &mut LiveService) {
-    if service.finishing.is_some() {
-        return;
-    }
-    let Some(match_id) = service.match_id.as_ref() else {
-        return;
-    };
-    let Some(expires) = crate::app::lan_service::online_relay_expires(state) else {
-        return;
-    };
-    let unix_now = crate::util::time::SystemTime::now()
-        .duration_since(crate::util::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    let now = Instant::now();
-    // Short-lived grants renew before expiry. Retry a missing reply without
-    // replacing the live route or resetting the event cursor.
-    if unix_now.saturating_add(30) < expires
-        || service.next_renewal_attempt.is_some_and(|next| now < next)
-    {
-        return;
-    }
-    let match_id = match_id.clone();
-    service.next_renewal_attempt = Some(now + Duration::from_secs(10));
-    service.command("renew_relay", json!({"match_id":match_id}));
-}
-
 fn apply_event(
     state: &mut AppState,
     service: &mut LiveService,
@@ -1919,8 +2148,9 @@ fn apply_event(
                 grant.key,
                 grant.payload_key,
             )?;
+            service.relay_granted(crate::app::match_runtime::frame_pacer::wall_clock_ms() as u32);
         }
-        "joined" | "created" => {
+        "joined" | "created" | "room_reopened" => {
             let joined: wire::Joined = decode(payload)?;
             service.revision = 0;
             service.accepted_options = None;
@@ -1937,13 +2167,14 @@ fn apply_event(
                 .into_iter()
                 .map(|member| member.into_member(&local))
                 .collect();
-            let event = if kind == "created" {
-                WolServiceEvent::Created(Ok(members))
-            } else {
-                WolServiceEvent::Joined(Ok(super::lobby::WolJoined {
-                    channel: joined.channel.into(),
-                    members,
-                }))
+            let joined = super::lobby::WolJoined {
+                channel: joined.channel.into(),
+                members,
+            };
+            let event = match kind {
+                "created" => WolServiceEvent::Created(Ok(joined.members)),
+                "room_reopened" => WolServiceEvent::RoomReopened(joined),
+                _ => WolServiceEvent::Joined(Ok(joined)),
             };
             service_event(state, event);
         }
@@ -1970,6 +2201,12 @@ fn apply_event(
             service.pending_choices = None;
             maps::cancel(state, service);
             cancel_pending(state, service);
+            if let Some(visit) = state.frontend.wol.as_mut()
+                && visit.in_game
+            {
+                // The kept room closed during the match: nothing to return to.
+                visit.back_to_room = false;
+            }
             service_event(state, WolServiceEvent::ChannelLeft);
         }
         "member_joined" => {
@@ -2031,7 +2268,7 @@ fn apply_event(
                 service.start_preparation = None;
                 fail_start(
                     state,
-                    "The game settings changed while preparing Start. Accept the settings and try again.",
+                    "The game settings changed while starting. Try Start again.",
                 );
             }
             service.revision = p.revision;
@@ -2149,6 +2386,8 @@ fn apply_event(
                 private: bool,
                 #[serde(default)]
                 action: bool,
+                #[serde(default)]
+                sent_at: Option<u64>,
             }
             let p: Payload = decode(payload)?;
             service_event(
@@ -2160,6 +2399,7 @@ fn apply_event(
                     action: p.action,
                     ansi: false,
                     options: None,
+                    sent_at: p.sent_at,
                 },
             );
         }
@@ -2265,26 +2505,7 @@ fn apply_event(
                 grant.key,
                 grant.payload_key,
             )?;
-            crate::app::lan_service::apply_online_timing(state, &timing.pings)?;
-            let count = state
-                .match_state
-                .session
-                .network_setup()
-                .ok_or_else(|| anyhow!("missing setup"))?
-                .humans
-                .len();
-            for node in 1..count {
-                crate::app::shell_network_setup::service_event(
-                    state,
-                    NetworkSetupEvent::PeerConnected { node },
-                )?;
-            }
-            crate::app::shell_network_setup::service_event(
-                state,
-                NetworkSetupEvent::Negotiated { result: 0 },
-            )?;
-            service.match_id = Some(timing.match_id);
-            service.pending = None;
+            enter_timed_start(state, service, timing.match_id, &timing.pings)?;
         }
         "start_rejected" => {
             cancel_pending(state, service);
@@ -2296,6 +2517,38 @@ fn apply_event(
         "error" => notice(state, "The online service rejected the request."),
         _ => {}
     }
+    Ok(())
+}
+
+/// The agreed timing is known and the current grant is fresh: leave the online
+/// barriers for the loading that follows `Negotiated`.
+fn enter_timed_start(
+    state: &mut AppState,
+    service: &mut LiveService,
+    match_id: String,
+    pings: &[i32],
+) -> Result<()> {
+    service.relay_granted(crate::app::match_runtime::frame_pacer::wall_clock_ms() as u32);
+    crate::app::lan_service::apply_online_timing(state, pings)?;
+    let count = state
+        .match_state
+        .session
+        .network_setup()
+        .ok_or_else(|| anyhow!("missing setup"))?
+        .humans
+        .len();
+    for node in 1..count {
+        crate::app::shell_network_setup::service_event(
+            state,
+            NetworkSetupEvent::PeerConnected { node },
+        )?;
+    }
+    crate::app::shell_network_setup::service_event(
+        state,
+        NetworkSetupEvent::Negotiated { result: 0 },
+    )?;
+    service.match_id = Some(match_id);
+    service.pending = None;
     Ok(())
 }
 
@@ -2392,7 +2645,9 @@ fn begin_start(state: &mut AppState, service: &mut LiveService, start: wire::Sta
                 .collect(),
             seed: start.seed,
             address: start.relay.address,
+            gateway: None,
             grant,
+            resume_pings: None,
         },
     )
 }
@@ -2406,7 +2661,11 @@ struct RelayStart {
     users: Vec<(String, u32)>,
     seed: u32,
     address: SocketAddrV4,
+    /// A spawn launch's `[Relay] GatewayUrl`; the built-in lobby uses the compiled one.
+    gateway: Option<String>,
     grant: DecodedRelayGrant,
+    /// A spawn launch returning to a match under way: its agreed timing.
+    resume_pings: Option<Vec<i32>>,
 }
 
 /// The state right after `game_started`: the authenticated relay socket,
@@ -2438,6 +2697,7 @@ fn admit_relay_start(
         },
         connections,
     )?;
+    transport.set_relay_gateway(start.gateway);
     transport.enable_relay(start.address, &grant.ticket, grant.key, grant.payload_key)?;
     if let Some(roster) = &grant.federation {
         transport.set_federation_roster(roster)?;
@@ -2477,6 +2737,8 @@ fn admit_relay_start(
         relay_acknowledged: false,
         probes_started: false,
         latencies_reported: false,
+        resume_pings: start.resume_pings,
+        report: None,
     });
     Ok(())
 }
@@ -2509,10 +2771,16 @@ pub(crate) fn begin_spawned_match(
     service.spawned = true;
     service.relay_timeout = relay.admission_timeout;
     service.player_id = relay.player_id;
+    let (resume_pings, resume_cursor) = relay.resume.map_or((None, None), |resume| {
+        (Some(resume.pings), Some(resume.cursor))
+    });
     // The launcher's bearer replaces `/v1/sessions`; nothing else is opened.
     service
         .requests
-        .send(http::Request::AdoptSession { token: relay.token })
+        .send(http::Request::AdoptSession {
+            token: relay.token,
+            resume: resume_cursor.map(|cursor| (relay.match_id.clone(), cursor)),
+        })
         .map_err(|_| anyhow!("the match service worker stopped"))?;
     let users: Vec<_> = launch
         .humans
@@ -2540,7 +2808,9 @@ pub(crate) fn begin_spawned_match(
             users,
             seed,
             address: relay.address,
+            gateway: relay.gateway_url,
             grant: relay.grant,
+            resume_pings,
         },
     );
     // Keep this visit's own worker even on failure: no lobby worker may
@@ -2625,8 +2895,10 @@ fn poll_relay(state: &mut AppState, service: &mut LiveService) -> Result<()> {
         let now = crate::app::match_runtime::frame_pacer::frame_bucket(
             crate::app::match_runtime::frame_pacer::wall_clock_ms(),
         );
-        let report = transport.service(now);
-        ensure!(report.first_io_error.is_none(), "relay IO failed");
+        // Only the deadline fails admission. A receive error such as Windows'
+        // 10054 (ICMP port unreachable while the relay restarts) or a passing
+        // ENOBUFS/ENETUNREACH clears while the handshake keeps retrying.
+        transport.service(now);
         if transport.relay_ready() {
             let transport = pending.transport.take().expect("ready pending relay");
             crate::app::lan_service::install_online_transport(
@@ -2636,6 +2908,10 @@ fn poll_relay(state: &mut AppState, service: &mut LiveService) -> Result<()> {
             )?;
             pending.relay_acknowledged = true;
             let match_id = pending.match_id.clone();
+            if let Some(pings) = pending.resume_pings.take() {
+                crate::app::lan_service::mark_online_restore(state)?;
+                return enter_timed_start(state, service, match_id, &pings);
+            }
             commands.push(("relay_ready", json!({"match_id":match_id})));
         }
     }
@@ -2649,8 +2925,9 @@ fn poll_relay(state: &mut AppState, service: &mut LiveService) -> Result<()> {
         }
     }
     for (operation, payload) in commands {
-        service.command(operation, payload);
+        service.send_report(operation, payload, Instant::now());
     }
+    service.poll_report(Instant::now());
     Ok(())
 }
 
@@ -2723,7 +3000,6 @@ mod completion_tests {
             accepted_options: None,
             start_preparation: None,
             last_ready_request: None,
-            next_stats: None,
             pending_choices: None,
             player_id: String::new(),
             member_ids: BTreeMap::new(),
@@ -2733,9 +3009,11 @@ mod completion_tests {
             leaving: None,
             logging_out: None,
             next_renewal_attempt: None,
+            relay_renewal_due: None,
             maps: Default::default(),
             translations: Translations::default(),
             spawned: false,
+            back_to_room: false,
             finish_result: None,
             finish_opponents_left: false,
             relay_timeout: RELAY_TIMEOUT,
@@ -2776,7 +3054,7 @@ mod completion_tests {
 
     #[test]
     fn only_a_spawned_match_adds_its_result_to_finish() {
-        // services/lobby/protocol.md: the lobby rejects unknown fields.
+        // docs/lobby-protocol.md: the lobby rejects unknown fields.
         let (mut lobby, input, _output) = control_service(Some("lobby-match"));
         lobby.finish_result = Some("won");
         assert_eq!(
@@ -2805,6 +3083,80 @@ mod completion_tests {
     }
 
     #[test]
+    fn relay_renewal_is_timed_from_grant_receipt_at_half_life() {
+        // A slow local clock made the ticket's lobby-time expiry look distant,
+        // so renewal was requested only after the relay rejected the ticket.
+        // Half-life leaves a lobby outage 150 s before the ticket expires; the
+        // receipt clock's 32-bit word wraps in between.
+        let (mut service, input, _output) = control_service(Some("renew-match"));
+        let received = u32::MAX - 100_000;
+        service.relay_granted(received);
+        service.poll_renewal(received + 1_000);
+        service.poll_renewal(received.wrapping_add(149_999));
+        assert!(input.try_recv().is_err());
+        let due = received.wrapping_add(150_000);
+        service.poll_renewal(due);
+        let http::Request::Command {
+            operation, payload, ..
+        } = input.try_recv().unwrap()
+        else {
+            panic!("renewal command");
+        };
+        assert_eq!(
+            (operation, payload),
+            ("renew_relay", json!({"match_id":"renew-match"}))
+        );
+        // The reply's fresh grant moves the deadline half a lifetime on.
+        service.relay_granted(due + 1_000);
+        service.poll_renewal(due + 11_000);
+        assert!(input.try_recv().is_err());
+    }
+
+    #[test]
+    fn admission_reports_resend_within_the_start_window_after_a_busy_lobby() {
+        // One 429 or 503 to relay_ready used to fail the start at its deadline.
+        let (mut service, input, _output) = control_service(None);
+        let now = Instant::now();
+        service.pending = Some(PendingStart {
+            match_id: "m".into(),
+            host_name: "Host".into(),
+            transport: None,
+            deadline: now + RELAY_TIMEOUT,
+            relay_acknowledged: true,
+            probes_started: false,
+            latencies_reported: false,
+            resume_pings: None,
+            report: None,
+        });
+        let sent = || match input.try_recv() {
+            Ok(http::Request::Command {
+                id,
+                operation,
+                payload,
+            }) => Some((id, operation, payload)),
+            _ => None,
+        };
+        service.send_report("relay_ready", json!({"match_id":"m"}), now);
+        let first = sent().unwrap();
+        assert!(service.report_failed(first.0, http::CommandFailure::Retryable, now));
+        service.poll_report(now + Duration::from_millis(1999));
+        assert_eq!(sent(), None);
+        service.poll_report(now + Duration::from_secs(2));
+        assert_eq!(sent(), Some(first.clone()), "same request ID and payload");
+        service.report_completed(first.0);
+        service.poll_report(now + RELAY_TIMEOUT);
+        assert_eq!(sent(), None);
+
+        // A refusal for any other reason stands.
+        service.send_report("latency_ready", json!({"match_id":"m","pings":[]}), now);
+        let latency = sent().unwrap();
+        let rejected = http::CommandFailure::Rejected(0x8000_4005);
+        assert!(!service.report_failed(latency.0, rejected, now));
+        service.poll_report(now + RELAY_TIMEOUT);
+        assert_eq!(sent(), None);
+    }
+
+    #[test]
     fn spawned_session_binds_the_same_relay_roster_as_the_lobby_start() {
         // A guest at source 1: the lobby admits its own node first, then
         // canonicalizes the room roster before game_started binds it.
@@ -2827,7 +3179,7 @@ mod completion_tests {
         local_first.humans.reverse();
         local_first.local_player_index = 0;
         lobby
-            .accept_network_setup(local_first, false, None)
+            .accept_network_setup(local_first, false, None, false)
             .unwrap();
         lobby.canonicalize_online_roster(&names).unwrap();
         bind_relay_roster(&mut lobby, &names, 77).unwrap();
@@ -2885,7 +3237,10 @@ mod completion_tests {
         let mut expected_map = agreement;
         expected_map["status"] = json!(0);
         assert_eq!(next(), ("map_status", expected_map));
-        assert!(input.try_recv().is_err(), "guests must accept explicitly");
+        assert!(
+            input.try_recv().is_err(),
+            "a guest's readiness comes from its setup's Accept"
+        );
     }
 
     #[test]
@@ -2960,7 +3315,9 @@ mod completion_tests {
         launch.rebuild_house_roster();
         let mut session = MatchSession::default();
         session.enter_network(NetworkReturnContext::Wol);
-        session.accept_network_setup(launch, true, None).unwrap();
+        session
+            .accept_network_setup(launch, true, None, false)
+            .unwrap();
         session
     }
 
@@ -3004,7 +3361,9 @@ mod completion_tests {
         let random = !launch.local_slot().color_random;
         launch.local_slot_mut().color_random = random;
         launch.rebuild_house_roster();
-        session.accept_network_setup(launch, true, None).unwrap();
+        session
+            .accept_network_setup(launch, true, None, false)
+            .unwrap();
         assert!(!local_choices_match(&session, &accepted));
         let expected =
             serde_json::to_value(session.network_setup().unwrap().local_player()).unwrap();
@@ -3067,6 +3426,40 @@ mod completion_tests {
             input.try_recv().is_err(),
             "expired authority cannot issue finish"
         );
+    }
+
+    #[test]
+    fn a_match_from_a_kept_room_asks_for_the_room_back_on_finish() {
+        let (service, input, _output) = control_service(Some("room-match"));
+        let mut visit = super::super::WolVisit::open(false);
+        visit.provider = WolProvider::Online;
+        visit.back_to_room = true;
+        visit.live_service = Some(service);
+        let now = Instant::now();
+        visit.match_returned(now);
+        let sent = |input: &Receiver<http::Request>| {
+            let http::Request::Command {
+                id,
+                operation,
+                payload,
+            } = input.try_recv().unwrap()
+            else {
+                panic!("finish command");
+            };
+            assert_eq!(operation, "finish");
+            (id, payload)
+        };
+        let (id, payload) = sent(&input);
+        assert_eq!(
+            payload,
+            json!({"match_id":"room-match","back_to_room":true})
+        );
+        // A lobby from before rooms came back refuses the field: the room is
+        // not kept and the finish goes again without it.
+        let service = visit.live_service.as_mut().unwrap();
+        assert!(service.finish_failed(id, http::CommandFailure::Rejected(0x8000_4005), now));
+        service.poll_cleanup(now + Duration::from_secs(2));
+        assert_eq!(sent(&input).1, json!({"match_id":"room-match"}));
     }
 
     #[test]
@@ -3214,7 +3607,8 @@ mod completion_tests {
                 .send(http::Response::Authenticated {
                     attempt: 0,
                     player_id: "old-player".into(),
-                    nickname: "OldVisit".into()
+                    nickname: "OldVisit".into(),
+                    motd: None
                 })
                 .is_ok()
         );

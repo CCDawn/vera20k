@@ -389,7 +389,9 @@ impl BinkFile {
         Ok(&self.data[cur..end])
     }
 
-    /// Return all audio packets for frame `i`, one per track.
+    /// Return the audio packets for frame `i`: one per track that carries
+    /// audio. A slot under four bytes holds none and is skipped, as FFmpeg's
+    /// demuxer skips it (`libavformat/bink.c`, `read_packet`).
     pub fn audio_packets(&self, i: usize) -> Result<Vec<AudioPacket<'_>>, AssetError> {
         let entry = self
             .frame_index
@@ -419,18 +421,19 @@ impl BinkFile {
                 });
             }
             let bytes = &self.data[packet_start..packet_end];
-            #[cfg(test)]
-            let sample_count = if bytes.len() >= 4 {
-                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-            } else {
-                0
-            };
-            out.push(AudioPacket {
-                track_index,
+            // A slot under four bytes carries no audio: the frame is silent on
+            // this track. The decoder's own length guard stays for malformed
+            // packets, but this is a legal container state, not a failure.
+            if bytes.len() >= 4 {
                 #[cfg(test)]
-                sample_count,
-                bytes,
-            });
+                let sample_count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                out.push(AudioPacket {
+                    track_index,
+                    #[cfg(test)]
+                    sample_count,
+                    bytes,
+                });
+            }
             cur = packet_end;
         }
         Ok(out)
@@ -607,5 +610,29 @@ mod tests {
         assert_eq!(audios.len(), 1);
         assert_eq!(audios[0].bytes, &[1u8, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(audios[0].sample_count, 0x04030201);
+    }
+
+    #[test]
+    fn a_frame_with_an_empty_audio_slot_yields_no_packet() {
+        // 1 audio track, 1 frame whose audio slot records zero bytes: retail
+        // movies end with such frames and playback must treat them as silence.
+        let mut h = make_header_with_1_track();
+        let header_end = h.len();
+        let frame_offset = header_end + 4; // index table takes 4 bytes
+        let file_size = frame_offset + 8;
+        h[0x04..0x08].copy_from_slice(&((file_size - 8) as u32).to_le_bytes());
+        h[0x08..0x0C].copy_from_slice(&1u32.to_le_bytes()); // num_frames = 1
+        h[0x0C..0x10].copy_from_slice(&8u32.to_le_bytes()); // largest_frame = 8
+        h.extend_from_slice(&(frame_offset as u32).to_le_bytes());
+
+        h.extend_from_slice(&0u32.to_le_bytes()); // audio_size = 0
+        h.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // video bytes
+
+        let f = BinkFile::parse(Arc::from(h)).unwrap();
+        assert_eq!(f.video_packet(0).unwrap(), &[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert!(
+            f.audio_packets(0).unwrap().is_empty(),
+            "an empty audio slot is silence, not a packet"
+        );
     }
 }

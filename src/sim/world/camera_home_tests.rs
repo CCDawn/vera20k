@@ -2,7 +2,6 @@ use super::*;
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::sim::house_state::HouseState;
 use crate::sim::intern::InternedId;
-use crate::sim::production::ProductionCategory;
 
 fn fixture() -> (Simulation, RuleSet, OverlayTypeRegistry, [InternedId; 2]) {
     let (mut sim, rules, registry) = crate::sim::world::entry_test_fixture::fixture_with_rules(
@@ -83,11 +82,10 @@ fn home_uses_native_reverse_yard_primary_limbo_and_other_building_priorities() {
         Some(coord(&sim, first)),
         "no primary: earliest yard"
     );
-    sim.production
-        .set_primary_factory_for_test(houses[0], ProductionCategory::Building, second);
+    sim.production.set_primary_factory_for_test(second);
     assert_eq!(query(&sim, &rules), Some(coord(&sim, second)));
-    sim.production
-        .set_primary_factory_for_test(houses[0], ProductionCategory::Building, first);
+    sim.production.clear_primary_factory(second);
+    sim.production.set_primary_factory_for_test(first);
     assert_eq!(query(&sim, &rules), Some(coord(&sim, first)));
     sim.substrate
         .entities
@@ -265,8 +263,7 @@ fn home_primary_and_base_geometry_survive_real_snapshot_restore() {
     let (mut sim, rules, _, houses) = fixture();
     let first = spawn(&mut sim, &rules, "YARD", "Local", 15, 15);
     let second = spawn(&mut sim, &rules, "YARD", "Local", 19, 15);
-    sim.production
-        .set_primary_factory_for_test(houses[0], ProductionCategory::Building, second);
+    sim.production.set_primary_factory_for_test(second);
     sim.houses
         .get_mut(&houses[0])
         .unwrap()

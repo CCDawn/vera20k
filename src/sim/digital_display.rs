@@ -36,11 +36,8 @@ pub fn values_for_display(
             let mut maximum = object.strength;
             if entity.disguise.as_ref().is_some_and(|d| d.is_disguised())
                 && !viewer.is_some_and(|viewer| {
-                    crate::map::houses::is_allied_with(
-                        sim.house_alliances(),
-                        sim.interner().resolve(entity.owner()),
-                        sim.interner().resolve(viewer),
-                    )
+                    sim.house_alliances()
+                        .is_allied(sim.interner(), entity.owner(), viewer)
                 })
                 && object
                     .digital_display_health_fake_at_disguise()
@@ -69,7 +66,10 @@ pub fn values_for_display(
         DigitalInfoType::Ammo => (entity.ammo()?.current(), object.ammo),
         DigitalInfoType::MindControl => {
             let manager = entity.capture_manager.as_ref()?;
-            (manager.count(), manager.max_control())
+            let count = sim
+                .capture_effective_count(entity.stable_id(), rules)
+                .unwrap_or_else(|| manager.count());
+            (count, manager.max_control())
         }
         DigitalInfoType::Spawns => {
             let manager = entity.spawn_manager.as_ref()?;
@@ -136,7 +136,13 @@ pub fn values_for_display(
             )
         }
         DigitalInfoType::Rof => {
-            if !crate::sim::combat::combat_weapon::is_armed(entity, object) {
+            if !crate::sim::combat::combat_weapon::is_armed(
+                entity,
+                object,
+                sim.entities(),
+                rules,
+                sim.interner(),
+            ) {
                 return None;
             }
             (

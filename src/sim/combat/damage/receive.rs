@@ -30,6 +30,11 @@ fn defence_divides_unfloored(damage: i32, divisors: &DefenceDivisors) -> i32 {
             X::load_f64(divisors.unit_armor),
         ),
     ));
+    // Phobos 0x00701966 divides the stock result again by the active effects'
+    // armor product, as a C++ double divide and int cast.
+    if divisors.ae_armor != 1.0 {
+        damage = crate::sim::attach_effect::divide_i32(damage, divisors.ae_armor);
+    }
     if let Some(rank_armor) = divisors.rank_armor {
         damage = X::ftol_i32_low_masked(X::div(X::load_i32(damage), X::load_f64(rank_armor)));
     }
@@ -187,6 +192,36 @@ pub(crate) mod tests {
 
     const MAXD: i32 = 10000;
 
+    /// Phobos `TechnoClass_ReceiveDamage_ArmorMultiplier` (`0x00701966`)
+    /// divides the stock result by the AttachEffect armor product before the
+    /// STRONGER rank divide, with a C++ double divide and int cast.
+    #[test]
+    fn attach_effect_armor_divides_between_the_stock_and_rank_divides() {
+        let divided = |ae_armor, rank_armor| {
+            super::defence_divides(
+                100,
+                &DefenceDivisors {
+                    ae_armor,
+                    rank_armor,
+                    ..DefenceDivisors::default()
+                },
+            )
+        };
+        assert_eq!(divided(2.0, None), 50);
+        assert_eq!(divided(0.5, None), 200);
+        assert_eq!(
+            divided(2.0, Some(NativeF64Bits::from_bits(1.5_f64.to_bits()))),
+            33,
+            "the rank divide follows the effect divide"
+        );
+        assert_eq!(divided(1.0, None), 100, "identity");
+        assert_eq!(
+            divided(0.0, None),
+            1,
+            "an infinite quotient casts to INT_MIN and floors to 1"
+        );
+    }
+
     /// A TechnoType whose rank lists hold (or lack) `ability`.
     pub(crate) fn object_with_ability(
         ability: crate::rules::object_type::Ability,
@@ -333,6 +368,7 @@ pub(crate) mod tests {
             let divisors = DefenceDivisors {
                 house_type_armor: NativeF32Bits::from_bits(row.armor_mult_for_type),
                 unit_armor: NativeF64Bits::from_bits(input.armor_mult.unwrap_or(1.0_f64.to_bits())),
+                ae_armor: 1.0,
                 rank_armor: stronger.then(|| NativeF64Bits::from_bits(veteran_armor.to_bits())),
             };
             assert_eq!(

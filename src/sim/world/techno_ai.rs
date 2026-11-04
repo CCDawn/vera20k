@@ -351,7 +351,7 @@ impl Simulation {
         let occupancy = &self.substrate.occupancy;
         let entities = &self.substrate.entities;
         let interner = &self.interner;
-        let house_alliances = self.house_alliances.as_map();
+        let house_alliances = &self.house_alliances;
         let collision_world = super::projectile_collision::ProjectileCollisionWorld {
             terrain,
             dummy: &shared_cell_dummy,
@@ -552,9 +552,7 @@ impl Simulation {
         // An infantry corpse is no dying object: it keeps IsAlive at Health 0
         // and takes the ordinary visit below (`world::infantry_death`).
         if entity.death.is_dying() {
-            let type_ref = entity.type_ref();
-            let type_name = self.interner.resolve(type_ref);
-            let sequence_set = rules.animation_sequence(type_name);
+            let sequence_set = self.interner.animation_sequence(entity.type_ref(), rules);
             let finished = crate::sim::animation::tick_dying_animation(
                 self.substrate
                     .entities
@@ -742,6 +740,11 @@ fn techno_ai_shell(
     if category == EntityCategory::Infantry {
         sim.substrate.infantry_health_reset(id);
     }
+    // `TechnoClass_AI @ 0x6F9E50+0x5 -> TechnoExt::OnEarlyUpdate ->
+    // ApplyMindControlRangeLimit`, after the leaf's own steps and before the
+    // common Techno body's estimated-health recover.
+    #[cfg(feature = "phobos")]
+    sim.apply_mind_control_range_limit(id, rules, ctx.overlay_registry, ctx.effects);
     // Techno6F9F6E..9F precedes veterancy promotion, missions and acquisition for every
     // Techno category. object_ai_visit_one excludes the entry-active Tube leaf
     // before this common owner. Actual health and this retained estimate differ.
@@ -1275,9 +1278,11 @@ fn self_heal_step(
     let Some(entity) = substrate.entities.get(id) else {
         return;
     };
+    // As `rules.object(name)` answers; an id the interner never made names
+    // nothing.
     let Some(object) = interner
         .try_resolve(entity.type_ref())
-        .and_then(|type_id| rules.object(type_id))
+        .and_then(|_| interner.object_type(entity.type_ref(), rules))
     else {
         return;
     };
@@ -1370,7 +1375,6 @@ fn drop_unsensed_cloaked_target_step(
         return;
     };
     let owner = entity.owner();
-    let owner_str = sim.interner.resolve(owner).to_owned();
     let Some(target) = sim.substrate.entities.get(target_id) else {
         return;
     };
@@ -1382,11 +1386,10 @@ fn drop_unsensed_cloaked_target_step(
         return;
     }
     let target_cell = (target.position.rx(), target.position.ry());
-    if crate::map::houses::is_allied_with(
-        sim.house_alliances.as_map(),
-        &owner_str,
-        sim.interner.resolve(target.owner()),
-    ) {
+    if sim
+        .house_alliances
+        .is_allied(&sim.interner, owner, target.owner())
+    {
         return;
     }
     if sim
@@ -1477,6 +1480,10 @@ fn techno_common_steps(
     // Ares1004B434 updates attachments before1004B528 EMP recovery.
     #[cfg(feature = "ares")]
     sim.update_ares_attach_effects(id, rules);
+    // Phobos `TechnoExt::UpdateAttachEffects` (Body.Update.cpp:895): one AI
+    // phase and the animation check for every AttachEffect on this object.
+    #[cfg(feature = "phobos")]
+    sim.update_phobos_attach_effects_with(id, rules, effects, overlay_registry);
     #[cfg(feature = "ares")]
     sim.update_ares_operator_operability(id, rules, effects);
     // Installed6F9E50 ->1004B320 owns delayed Building reactivation before
@@ -1859,7 +1866,7 @@ fn allied_target_drop_step(sim: &mut Simulation, id: u64, rules: &RuleSet) {
         return;
     };
     if !combat_weapon::is_ally_by_object(
-        Some(sim.house_alliances.as_map()),
+        Some(&sim.house_alliances),
         &sim.interner,
         house,
         target.owner(),
@@ -1979,10 +1986,12 @@ fn techno_after_acquisition(
 /// blinking bracket at the caller's screen point instead
 /// (`0x0070F290..0x0070F659`); VERA draws nothing.
 ///
-/// RESIDUAL: GetVisualState(0, NULL) depends on the current house only for
-/// an `Invisible=`/`InvisibleInGame=` object (about ten retail buildings) on
-/// a hiding Cell: it is 0 for its owner and 5 for anyone else, so whether
-/// the anim exists, and the IDs after it, differ between peers, as natively.
+/// GetVisualState(0, NULL) depends on the current house only for an
+/// `Invisible=`/`InvisibleInGame=` object (the retail lamp posts) on a hiding
+/// Cell: natively 0 for its owner and 5 for anyone else, so peers disagreed
+/// on the anim and the IDs after it. A network game asks with no local owner
+/// ([`Simulation::shared_owned_by_current_house`], which records the owner's
+/// residual): no peer builds one.
 ///
 /// RESIDUAL: when BEHIND's art never bound, the spawn takes a native unique
 /// ID and fails each frame; native instead constructs a default-type Anim
@@ -2051,7 +2060,7 @@ fn screen_visual_character(
     use crate::sim::combat::combat_weapon::is_ally_by_object;
     let viewer = sim.session.current_house();
     let owner = entity.owner();
-    let allied = |a, b| is_ally_by_object(Some(sim.house_alliances.as_map()), &sim.interner, a, b);
+    let allied = |a, b| is_ally_by_object(Some(&sim.house_alliances), &sim.interner, a, b);
     let invisible = sim
         .interner
         .object_type(entity.type_ref(), rules)
@@ -2062,6 +2071,7 @@ fn screen_visual_character(
     entity.visual_character(
         rules.general.cloaking_stages,
         invisible,
+        sim.shared_owned_by_current_house(entity),
         crate::sim::cloak_disguise::VisualCharacterQuery::screen(
             true,
             viewer.is_some(),
@@ -2123,7 +2133,7 @@ fn healer_target_drop_step(sim: &mut Simulation, id: u64, rules: &RuleSet) {
         };
         sim.substrate.entities.get(target_id).is_some_and(|object| {
             combat_weapon::is_ally_by_object(
-                Some(sim.house_alliances.as_map()),
+                Some(&sim.house_alliances),
                 &sim.interner,
                 entity.owner(),
                 object.owner(),
@@ -2358,6 +2368,73 @@ mod tests {
     use crate::sim::movement::tube_movement::LowBridgeTubeMovementState;
     use crate::sim::snapshot::GameSnapshot;
 
+    /// Retail battle rules with the loader's anim roots bound on TEMPERATE,
+    /// as Techno AI needs them to construct BEHIND.
+    fn retail_rules_with_bound_anims() -> Option<RuleSet> {
+        let mut rules = crate::rules::retail_ini_fixture::retail_battle_rules()?.rules;
+        let (_, mut assets) = crate::rules::retail_ini_fixture::retail_assets()?;
+        crate::map::theater::load_theater(&mut assets, "TEMPERATE").unwrap();
+        // Use the loader's actual root list and physical SHP. A stand-in count
+        // concealed the missing Behind root and let this test pass without art.
+        let roots = crate::rules::effect_asset_catalog::tolerant_anim_class_roots(&rules);
+        rules.bind_anim_class_assets(&roots, &assets, "tem", "TEMPERATE");
+        Some(rules)
+    }
+
+    /// One hiding building's contribution entering or leaving `cell` on a
+    /// 32x32 map.
+    fn hide(sim: &mut Simulation, enter: bool, cell: (u16, u16)) {
+        let profile = crate::rules::object_type::BuildingHiddenOccupancyProfile {
+            can_hide_things: true,
+            occupy_height: 1,
+            ..Default::default()
+        };
+        let grid = &mut sim.substrate.hidden_occupation;
+        if enter {
+            grid.enter_building(cell, &"1x1".into(), profile, Some((32, 32)));
+        } else {
+            grid.exit_building(cell, &"1x1".into(), profile, Some((32, 32)));
+        }
+    }
+
+    /// The Behind indicator's GetVisualState (`0x00703860`) for a retail
+    /// `InvisibleInGame=` lamp the current house owns: 0 in skirmish, so the
+    /// hidden lamp takes the anim on its owner's machine alone, as natively;
+    /// a network game asks with no local owner, so no peer builds one.
+    #[test]
+    fn a_network_game_builds_no_behind_anim_for_the_local_players_lamp() {
+        use crate::sim::scenario_session::ScenarioGameMode;
+        let Some(rules) = retail_rules_with_bound_anims() else {
+            return;
+        };
+        let lamp_type = rules.object("INGALITE").unwrap();
+        assert!(lamp_type.invisible_in_game && lamp_type.can_be_hidden);
+        for (mode, takes_anim) in [
+            (ScenarioGameMode::from_legacy_nonzero(true), true),
+            (ScenarioGameMode::Lan, false),
+        ] {
+            let mut sim = Simulation::new();
+            sim.session.set_map_width_for_test(32);
+            sim.session.set_map_height_for_test(32);
+            sim.session.set_game_mode(mode);
+            let owner = sim.interner.intern("Americans");
+            sim.session.set_current_house_for_test(Some(owner));
+            sim.resolve_type_handles(&rules);
+            let lamp = sim
+                .spawn_object("INGALITE", "Americans", 10, 10, 0, &rules)
+                .expect("retail INGALITE spawns");
+            while sim.substrate.hidden_occupation.count(10, 10) != 0 {
+                hide(&mut sim, false, (10, 10));
+            }
+            hide(&mut sim, true, (10, 10));
+            hide(&mut sim, true, (10, 10));
+            behind_indicator_step(&mut sim, lamp, &rules);
+            let lamp = sim.substrate.entities.get(lamp).unwrap();
+            assert!(lamp.discovery.owned_by_current_house());
+            assert_eq!(lamp.behind_anim().is_some(), takes_anim, "{mode:?}");
+        }
+    }
+
     /// TechnoClass::AI's Behind indicator (`0x006FA24A..0x006FA30C`) on
     /// retail rules: a tank on a hiding Cell takes one attached BEHIND anim
     /// and keeps it, and UnInits it once the Cell stops hiding it; an
@@ -2366,20 +2443,10 @@ mod tests {
     /// `CanBeHidden=` true.
     #[test]
     fn a_tank_behind_a_building_takes_the_behind_anim_until_it_leaves() {
-        use crate::rules::object_type::BuildingHiddenOccupancyProfile;
-        let Some(fixture) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        let Some(rules) = retail_rules_with_bound_anims() else {
             return;
         };
-        let mut rules = fixture.rules;
         assert_eq!(rules.general.behind.as_deref(), Some("BEHIND"));
-        let Some((_, mut assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
-            return;
-        };
-        crate::map::theater::load_theater(&mut assets, "TEMPERATE").unwrap();
-        // Use the loader's actual root list and physical SHP. A stand-in count
-        // concealed the missing Behind root and let this test pass without art.
-        let roots = crate::rules::effect_asset_catalog::tolerant_anim_class_roots(&rules);
-        rules.bind_anim_class_assets(&roots, &assets, "tem", "TEMPERATE");
         assert_eq!(
             rules
                 .art()
@@ -2401,19 +2468,6 @@ mod tests {
         let tank = sim
             .spawn_object("MTNK", "Americans", 10, 10, 0, &rules)
             .expect("retail MTNK spawns");
-        let profile = BuildingHiddenOccupancyProfile {
-            can_hide_things: true,
-            occupy_height: 1,
-            ..Default::default()
-        };
-        let hide = |sim: &mut Simulation, enter: bool, cell: (u16, u16)| {
-            let grid = &mut sim.substrate.hidden_occupation;
-            if enter {
-                grid.enter_building(cell, &"1x1".into(), profile, Some((32, 32)));
-            } else {
-                grid.exit_building(cell, &"1x1".into(), profile, Some((32, 32)));
-            }
-        };
         let behind = |sim: &Simulation| sim.substrate.entities.get(tank).unwrap().behind_anim();
 
         behind_indicator_step(&mut sim, tank, &rules);
@@ -3286,6 +3340,7 @@ mod tests {
             recruitable_a: true,
             recruitable_b: true,
             group: -1,
+            follows: None,
             structure_upgrades: [None, None, None],
             structure_ai_sellable: false,
             structure_ai_repairable: false,

@@ -12,7 +12,8 @@ use super::Simulation;
 use crate::sim::game_entity::GameEntity;
 use crate::sim::overlay_grid::OverlayCell;
 use crate::sim::parallel;
-use crate::sim::state_hasher::{self, StateHasher};
+use crate::sim::state_hasher::digests;
+use crate::util::state_hasher::{self, StateHasher};
 
 #[cfg(test)]
 mod retained_cell_hash_tests {
@@ -620,6 +621,8 @@ impl Simulation {
         self.session.binary_frame().hash(hasher);
         self.planning.hash_state(hasher);
         self.hash_ion_blasts(hasher);
+        #[cfg(feature = "phobos")]
+        self.warhead_anim_runtime.hash_state(hasher);
         // ScenarioClass owns the sole saved/synchronized RNG. Main and MapGen
         // are process globals and are deliberately absent from this hash.
         self.scenario_rng.hash_state(hasher);
@@ -704,8 +707,8 @@ impl Simulation {
         // CellClass `0x1180` values once through their serialized authority.
         b"real-cell-bridge-flags-v2".hash(hasher);
         self.real_cell_bridge_flags_0x1180.hash(hasher);
-        b"dynamic-terrain-cells-v1".hash(hasher);
-        self.dynamic_terrain_cells.hash(hasher);
+        b"dynamic-terrain-cells-v2".hash(hasher);
+        self.dynamic_terrain_cells.hash_simulation(hasher);
         self.hash_overlay_grid(hasher);
         self.hash_crate_authority(hasher);
         self.hash_smudge_grid(hasher);
@@ -942,6 +945,11 @@ impl Simulation {
             projectile.collision().flak_scatter.hash(hasher);
             projectile.collision().anti_air.hash(hasher);
             projectile.collision().airburst.hash(hasher);
+            // Phobos `Splits=` can arm the airburst tail without `Airburst=`;
+            // stock bullets never differ, so their hash is unchanged.
+            if projectile.collision().explodes_airburst() != projectile.collision().airburst {
+                b"bullet-explodes-airburst-v1".hash(hasher);
+            }
             projectile.collision().inaccurate.hash(hasher);
             projectile.collision().floater.hash(hasher);
             projectile.collision().elasticity_bits.hash(hasher);
@@ -950,6 +958,22 @@ impl Simulation {
             if let Some(house) = projectile.firer_house() {
                 b"bullet-firer-scheme-v1".hash(hasher);
                 house.index().hash(hasher);
+            }
+            #[cfg(feature = "phobos")]
+            if let Some(house) = projectile.phobos_firer_house() {
+                b"phobos-bullet-firer-house-v1".hash(hasher);
+                house.index().hash(hasher);
+            }
+            #[cfg(feature = "phobos")]
+            if projectile.payload().firepower_multiplier()
+                != crate::util::native_x87::NativeF64Bits::ONE
+            {
+                b"phobos-bullet-firepower-mult-v1".hash(hasher);
+                projectile
+                    .payload()
+                    .firepower_multiplier()
+                    .bits()
+                    .hash(hasher);
             }
             if projectile.awaiting_anim() {
                 b"bullet-awaited-anim-v1".hash(hasher);
@@ -1453,7 +1477,7 @@ impl Simulation {
     fn entity_digests(&self, entities: &[&GameEntity]) -> Vec<u64> {
         let frame = self.session.binary_frame();
         let network = self.session.game_mode().is_network();
-        state_hasher::digests(entities, entities.len() >= 4096, |entity, hasher| {
+        digests(entities, entities.len() >= 4096, |entity, hasher| {
             hash_entity(entity, frame, hasher);
             if network {
                 entity.discovery.hash_network(hasher);
@@ -1632,9 +1656,17 @@ fn hash_entity(entity: &GameEntity, frame: u32, hasher: &mut StateHasher) {
     if entity.object_group() != -1 {
         // gamemd.exe TechnoClass::ComputeCRC70C270 reads +214 at70C280.
         // Replay state includes it; native MP checksum64DAB0 is separate and
-        // omits local control groups, as in the original executable.
+        // omits local control groups, as in the original executable. A
+        // network game's local group slot is deliberately absent: peers differ.
         b"techno-object-group-v1".hash(hasher);
         entity.object_group().hash(hasher);
+    }
+    if entity.unit_follower().is_some() || entity.is_unit_follower() {
+        // UnitClass::ComputeCRC744640 includes the +6C8 peer identity and
+        // independent +6D0 byte at744678..7446AB (gamemd.exe instructions).
+        b"unit-follower-v1".hash(hasher);
+        entity.unit_follower().hash(hasher);
+        entity.is_unit_follower().hash(hasher);
     }
     if entity.techno_ctor_random_word() != 0 {
         b"techno-constructor-v1".hash(hasher);
@@ -1677,6 +1709,9 @@ fn hash_entity(entity: &GameEntity, frame: u32, hasher: &mut StateHasher) {
             b"phobos-shield-v1".hash(hasher);
             shield.hash(hasher);
         }
+        entity
+            .wh_anim_remaining_creation_interval
+            .hash_state(hasher);
     }
     if entity.tracking_facts.naval_combatant() {
         // Retained across reload: later Remove_Tracking must use the same
@@ -1826,6 +1861,8 @@ fn hash_entity(entity: &GameEntity, frame: u32, hasher: &mut StateHasher) {
     entity.hash_emp_state(hasher);
     #[cfg(feature = "ares")]
     entity.hash_attach_effects(hasher);
+    #[cfg(feature = "phobos")]
+    entity.hash_phobos_attach_effects(hasher);
     // Infantry gameplay reads its class-owned Doing/Stage fields.
     // A restored presentation component is not a second state owner.
     if entity.category() != crate::map::entities::EntityCategory::Infantry
@@ -2339,11 +2376,9 @@ fn hash_entity(entity: &GameEntity, frame: u32, hasher: &mut StateHasher) {
     if !entity.turret_rotate_latch.is_armed() {
         b"turret-rotate-latch-v1".hash(hasher);
     }
-    // Techno+4F8 retains a future ordinary voice suppression which
-    // neither the mission nor the audio pending line reconstructs.
-    if entity.deploy_voice_suppressed() {
-        b"deploy-voice-suppression-v1".hash(hasher);
-    }
+    // Techno+4F8, the deploy-voice suppression, is left out: only voice
+    // playback reads it, and a deploy click clears it on the clicking
+    // client alone (ClickedMission -> VoiceDeploy708E00).
     // Retired slot: the entity homing model had no production creator
     // and is gone; its constant absent tag keeps pinned hashes stable.
     0u8.hash(hasher);
@@ -4687,6 +4722,43 @@ mod bridge161_hash_projection_tests {
 
 #[cfg(test)]
 mod prism_support_hash_tests {}
+
+#[cfg(test)]
+mod dynamic_terrain_hash_tests {
+    use crate::map::resolved_terrain::{ResolvedTerrainGrid, test_flat_cell};
+    use crate::sim::world::Simulation;
+
+    /// Each process builds its TMP variant table from its own first map's
+    /// draws, so two clients can draw a replaced cell with different
+    /// variants; the state hash must not see it, but does see its level.
+    #[test]
+    fn a_replaced_cells_variant_does_not_reach_the_state_hash() {
+        let hash = |edit: fn(&mut crate::map::resolved_terrain::ResolvedTerrainCell)| {
+            let mut sim = Simulation::new();
+            sim.install_resolved_terrain_for_new_map(ResolvedTerrainGrid::from_cells(
+                4,
+                4,
+                (0..4)
+                    .flat_map(|y| (0..4).map(move |x| test_flat_cell(x, y)))
+                    .collect(),
+            ));
+            let mut cell = test_flat_cell(1, 2);
+            edit(&mut cell);
+            sim.dynamic_terrain_cells_mut_for_test().record(&cell);
+            sim.state_hash()
+        };
+        let drawn = hash(|_| {});
+        assert_eq!(
+            hash(|cell| {
+                cell.variant = 3;
+                cell.render_offset_x = 30;
+                cell.radar_left = [1, 2, 3];
+            }),
+            drawn
+        );
+        assert_ne!(hash(|cell| cell.level = 4), drawn);
+    }
+}
 
 #[cfg(test)]
 #[path = "navigation_history_hash_tests.rs"]

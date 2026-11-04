@@ -768,9 +768,12 @@ impl IniFile {
         }
     }
 
-    /// Deterministic hash over native section occurrence and entry order.
+    /// Deterministic hash over native section occurrence and entry order,
+    /// the same on every platform
+    /// ([`StateHasher`](crate::util::state_hasher::StateHasher)): replays
+    /// carry a map's.
     pub fn content_hash(&self) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = crate::util::state_hasher::StateHasher::new();
         for section in &self.sections {
             section.name.hash(&mut hasher);
             for key in section.keys() {

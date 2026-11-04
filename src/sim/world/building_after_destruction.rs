@@ -130,7 +130,7 @@ impl Simulation {
             }
             grid.recalculate_runtime_cell(terrain, registry, cell);
             if navigation_installed {
-                self.publish_cell_and_assign_orphaned_zone(rules, cell, &blocked);
+                self.publish_cell_and_assign_orphaned_zone(rules, cell, Some(&blocked));
             }
             self.stop_all_targeting_cell(cell.0, cell.1, rules, Some(registry), effects);
         }

@@ -627,7 +627,8 @@ impl PaidSuperRecord {
             && if self.action == PaidSuperAction::Cancel {
                 self.cell == (0, 0)
             } else {
-                (0..512).contains(&self.cell.0) && (0..512).contains(&self.cell.1)
+                (0..crate::map::cell_index::MAX_CELL_SIDE as i16).contains(&self.cell.0)
+                    && (0..crate::map::cell_index::MAX_CELL_SIDE as i16).contains(&self.cell.1)
             }
     }
     pub fn encode(self) -> Option<CommandRecord> {
@@ -1559,6 +1560,11 @@ pub enum Command {
     /// with no selected IDs. Appended to preserve existing variant indices.
     /// Native hotkey535CC0/Tab6D07FE write directly, without an EventClass
     /// record or RNG; retain through local frame ingress for saves/replay.
+    /// No peer sees the write, so a network game stores it in the local
+    /// player's slot (`GameEntity::control_group`), not the +214 that
+    /// Recruit6EAA90 and WakeupGroup6E03B0 (trigger action 84) read: there a
+    /// player's regrouping no longer changes what that player's own teams
+    /// recruit or which group an action 84 wakes.
     AssignControlGroup { group: i32, entity_ids: Vec<u64> },
 }
 
@@ -1854,7 +1860,7 @@ mod tests {
             source: 3,
             destination: 4,
             sequence: u64::MAX,
-            cell: (511, 0),
+            cell: (1023, 0),
         };
         let record = paid.encode().unwrap();
         assert_eq!(PaidSuperRecord::decode(&record), Some(paid));
@@ -1877,7 +1883,7 @@ mod tests {
         assert!(PaidSuperRecord { source: -1, ..paid }.encode().is_none());
         assert!(
             PaidSuperRecord {
-                cell: (512, 0),
+                cell: (1024, 0),
                 ..paid
             }
             .encode()

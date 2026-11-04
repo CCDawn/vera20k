@@ -6,7 +6,6 @@
 //! render/, ui/, app/, audio/, or net/.
 
 use crate::map::authored_overlay::NativeOverlayMapShape;
-use crate::map::cell_index::canonical_cell_coord;
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::map::tiberium_cell::{GerminatedCell, spread_cell_germinate_without_randomization};
 use crate::rules::overlay_types::OverlayTypeRegistry;
@@ -32,9 +31,11 @@ pub struct GeneratedCellAttributesReceipt {
 /// Resolve one native fixed-stride lookup to an allocated real cell of the
 /// generated grid; `None` is a `Get_CellClass` miss (the shared dummy).
 fn resolve_real_cell(terrain: &ResolvedTerrainGrid, x: i16, y: i16) -> Option<(u16, u16)> {
-    terrain
-        .native_fixed_cell_index(x, y)
-        .and_then(|_| canonical_cell_coord(i32::from(x), i32::from(y)))
+    terrain.native_fixed_cell_index(x, y).and_then(|_| {
+        terrain
+            .cell_grid()
+            .canonical_coord(i32::from(x), i32::from(y))
+    })
 }
 
 /// Generated launch tail of `RandomMapGenerator::Generate @ 0x00598960`.

@@ -39,6 +39,9 @@ pub enum NetworkInterruption {
     QueueFull,
     #[error("network connection stopped responding")]
     ConnectionFailed,
+    /// VERA relay adaptation: the relay sent a record this build cannot read.
+    #[error("this online match needs a newer VERA20k")]
+    NewerClientRequired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -273,6 +276,7 @@ impl<'a> NetworkCommandQueues<'a> {
                     diagnostic_issue_tick,
                 },
                 true,
+                crate::sim::command_queue::DoListInsertion::Back,
             );
             assert!(
                 accepted,

@@ -166,10 +166,12 @@ mod tests {
                     occupied: None,
                     bunkered: None,
                     open_topped: None,
+                    ae_firepower: 1.0,
                 },
                 divisors: DefenceDivisors {
                     house_type_armor: category_armor(input),
                     unit_armor: f64_bits(&input["attacker_armor"]),
+                    ae_armor: 1.0,
                     rank_armor: stronger.then(|| f64_bits(&input["rules_veteran_armor"])),
                 },
                 warhead: (input["warhead_present"] == true).then_some(EstimateWarhead {

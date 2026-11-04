@@ -417,7 +417,11 @@ const MIN_DISTINCT_DECK_CELLS: usize = 6;
 // returns to the value above. Hash composition only: a temporary control
 // restoring the byte gave the previous value, with every tripwire above green.
 // Control removed. Previous: 0x57D9_C8C7_DA7A_FBD6.
-const BRIDGE_HARNESS_FINAL_HASH: u64 = 0x8934_6F95_0887_B80C;
+// The dynamic terrain cells now fold without their presentation-only tile
+// variant, render offset and radar colours (tag v2): hash composition only.
+// A temporary control restoring the v1 fold gave the previous value, with
+// every tripwire above green. Control removed. Previous: 0x8934_6F95_0887_B80C.
+const BRIDGE_HARNESS_FINAL_HASH: u64 = 0x0722_C90C_F923_6AA2;
 
 fn bridge_ini() -> IniFile {
     // One armed ground vehicle and one distant infantryman on a second house, so
@@ -603,6 +607,7 @@ fn unit(owner: &str, type_id: &str, cx: u16, cy: u16, cat: EntityCategory) -> Ma
         recruitable_a: true,
         recruitable_b: true,
         group: -1,
+        follows: None,
         structure_upgrades: [None, None, None],
         structure_ai_sellable: false,
         structure_ai_repairable: false,

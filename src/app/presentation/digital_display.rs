@@ -26,9 +26,9 @@ use crate::map::entities::EntityCategory;
 use crate::render::batch::SpriteInstance;
 use crate::render::bit_font::BitFont;
 use crate::render::selection_overlay::SelectionOverlay;
+use crate::rules::building_select_bracket::BuildingSelectBracketPosition;
 use crate::rules::digital_display::{
-    DigitalBuildingAnchor, DigitalDisplayType, DigitalInfoType, DigitalTextAlign,
-    DigitalVerticalAnchor,
+    DigitalDisplayType, DigitalInfoType, DigitalTextAlign, DigitalVerticalAnchor,
 };
 use crate::rules::ruleset::RuleSet;
 use crate::sim::game_entity::GameEntity;
@@ -120,22 +120,14 @@ pub(crate) fn digital_display_instances(
             }
         } else {
             let viewer = viewer.expect("non-observer viewer");
-            let owner_name = sim.interner().resolve(owner);
-            let allied = crate::map::houses::is_allied_with(
-                sim.house_alliances(),
-                owner_name,
-                sim.interner().resolve(viewer),
-            );
             // `CanTargetHouse(flags, Owner, CurrentPlayer)` tests the viewer.
-            let viewer_neutral = sim
-                .houses()
-                .get(&viewer)
-                .is_some_and(|house| house.multiplay_passive());
-            if !can_target_house(
+            if !crate::sim::combat::can_target_house(
                 display.visible_to_houses,
-                owner == viewer,
-                viewer_neutral,
-                allied,
+                owner,
+                viewer,
+                sim.houses(),
+                sim.house_alliances(),
+                sim.interner(),
             ) {
                 continue;
             }
@@ -208,8 +200,9 @@ pub(crate) fn digital_display_instances(
         }
         if is_building {
             match display.anchor_building {
-                DigitalBuildingAnchor::Top => position.1 -= 4.0,
-                DigitalBuildingAnchor::LeftTop | DigitalBuildingAnchor::LeftBottom => {
+                BuildingSelectBracketPosition::Top => position.1 -= 4.0,
+                BuildingSelectBracketPosition::LeftTop
+                | BuildingSelectBracketPosition::LeftBottom => {
                     position.0 -= 8.0;
                 }
                 _ => {}
@@ -256,31 +249,6 @@ pub(crate) fn digital_display_instances(
     out
 }
 
-/// Phobos `EnumFunctions::CanTargetHouse(flags, pThis->Owner, CurrentPlayer)`:
-/// All short-circuits, then owner, neutral, ally and enemy in that order.
-fn can_target_house(
-    flags: crate::rules::phobos_shields::AffectedHouse,
-    same_house: bool,
-    viewer_neutral: bool,
-    allied: bool,
-) -> bool {
-    use crate::rules::phobos_shields::AffectedHouse;
-    if flags == AffectedHouse::ALL {
-        return true;
-    }
-    if same_house {
-        return flags.contains(AffectedHouse::OWNER);
-    }
-    if viewer_neutral && flags.contains(AffectedHouse::NEUTRAL) {
-        return true;
-    }
-    if allied {
-        flags.contains(AffectedHouse::ALLIES)
-    } else {
-        flags.contains(AffectedHouse::ENEMIES)
-    }
-}
-
 fn screen_point(sim: &Simulation, entity: &GameEntity) -> (f32, f32) {
     let coord =
         crate::sim::movement::ground_pose::object_get_coords(entity, sim.resolved_terrain());
@@ -299,12 +267,12 @@ fn foot_bracket(sx: f32, sy: f32, is_infantry: bool, display: &DigitalDisplayTyp
 
 /// `TechnoExt::GetBuildingSelectBracketPosition`: project `Dimension2`
 /// (foundation edge plus ART Height), then apply the hexagon vertex.
-fn building_bracket(
+pub(crate) fn building_bracket(
     sim: &Simulation,
     entity: &GameEntity,
     object: &crate::rules::object_type::ObjectType,
     rules: &RuleSet,
-    anchor: DigitalBuildingAnchor,
+    anchor: BuildingSelectBracketPosition,
 ) -> (f32, f32) {
     let (sx, sy) = screen_point(sim, entity);
     let geometry = BuildingBarGeometry::new(rules, object);
@@ -315,23 +283,23 @@ fn building_bracket(
     let height_px = art_height * 12;
     let (mut x, mut y) = geometry.first_pip(sx, sy);
     match anchor {
-        DigitalBuildingAnchor::Top => {}
-        DigitalBuildingAnchor::LeftTop => {
+        BuildingSelectBracketPosition::Top => {}
+        BuildingSelectBracketPosition::LeftTop => {
             x -= (length_h * 4) as f32;
             y += (length_h * 2) as f32;
         }
-        DigitalBuildingAnchor::LeftBottom => {
+        BuildingSelectBracketPosition::LeftBottom => {
             x -= (length_h * 4) as f32;
             y += (length_h * 2 + height_px) as f32;
         }
-        DigitalBuildingAnchor::Bottom => {
+        BuildingSelectBracketPosition::Bottom => {
             y += (length_w * 2 + length_h * 2 + height_px) as f32;
         }
-        DigitalBuildingAnchor::RightBottom => {
+        BuildingSelectBracketPosition::RightBottom => {
             x += (length_w * 4) as f32;
             y += (length_w * 2 + height_px) as f32;
         }
-        DigitalBuildingAnchor::RightTop => {
+        BuildingSelectBracketPosition::RightTop => {
             x += (length_w * 4) as f32;
             y += (length_w * 2) as f32;
         }
@@ -590,7 +558,7 @@ mod tests {
             align: DigitalTextAlign::Right,
             anchor_horizontal: DigitalHorizontalAnchor::Right,
             anchor_vertical: DigitalVerticalAnchor::Top,
-            anchor_building: DigitalBuildingAnchor::Top,
+            anchor_building: BuildingSelectBracketPosition::Top,
             shape: None,
             palette: None,
             shape_spacing: None,
@@ -628,34 +596,6 @@ mod tests {
         display.value_as_timer = true;
         assert_eq!(timer_text(30), "0:30");
         assert_eq!(timer_text(3661), "1:01:01");
-    }
-
-    #[test]
-    fn house_visibility_follows_phobos_can_target_house_order() {
-        use crate::rules::phobos_shields::AffectedHouse;
-        assert!(can_target_house(AffectedHouse::ALL, false, false, false));
-        assert!(can_target_house(AffectedHouse::OWNER, true, false, false));
-        assert!(!can_target_house(AffectedHouse::OWNER, false, false, true));
-        assert!(can_target_house(AffectedHouse::NEUTRAL, false, true, false));
-        assert!(!can_target_house(
-            AffectedHouse::NEUTRAL,
-            false,
-            false,
-            false
-        ));
-        assert!(can_target_house(AffectedHouse::ALLIES, false, false, true));
-        assert!(!can_target_house(
-            AffectedHouse::ENEMIES,
-            false,
-            false,
-            true
-        ));
-        assert!(can_target_house(
-            AffectedHouse::ENEMIES,
-            false,
-            false,
-            false
-        ));
     }
 
     #[test]

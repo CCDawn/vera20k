@@ -567,7 +567,11 @@ mod tests {
                 vertical: false,
                 heading: Some(input["source_heading"].as_u64().unwrap() as u16),
                 arcing: kind.arcing,
-                gravity: super::super::projectile_gravity(rules.general.gravity, kind.floater),
+                gravity: super::super::projectile_gravity(
+                    rules.general.gravity,
+                    kind.gravity(),
+                    kind.floater,
+                ),
                 high_root: false,
                 voxel_downward: None,
                 building_pitch_height: None,

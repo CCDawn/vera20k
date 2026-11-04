@@ -76,7 +76,8 @@ const fn splash_art(yr_original_style: bool) -> SplashArt {
         RA2_SPLASH
     }
 }
-const MINIMUM_VISIBLE_TIME: Duration = Duration::from_millis(5000);
+/// How long the splash stays up at least: 6 s, the maintainer's choice.
+const MINIMUM_VISIBLE_TIME: Duration = Duration::from_millis(6000);
 const TEXT_COLOR: [u8; 4] = [255, 255, 255, 255];
 
 const COPYRIGHT_KEY: &str = "TXT_COPYRIGHT";
@@ -200,16 +201,16 @@ impl StartupSplashPresentation {
     }
 }
 
-/// Draw and present the splash. Returns whether it reached the screen: a
-/// surface with no frame to give this time leaves the hold unarmed for the
-/// next redraw.
+/// Draw and present the splash, or with `None` the black frame the startup
+/// logo starts from. Returns whether it reached the screen: a surface with no
+/// frame to give this time leaves the hold unarmed for the next redraw.
 pub(crate) fn render_and_present(
     gpu: &GpuContext,
     batch: &BatchRenderer,
     presenter: &ShellSurfacePresenter,
     depth: &wgpu::TextureView,
     fps_overlay: &crate::app::diagnostics::fps_overlay::FpsOverlay,
-    splash: &StartupSplashPresentation,
+    splash: Option<&StartupSplashPresentation>,
 ) -> Result<bool> {
     batch.update_camera(
         gpu,
@@ -259,17 +260,19 @@ pub(crate) fn render_and_present(
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        batch.draw_with_buffer_ui_passthrough(
-            &mut pass,
-            &splash.texture,
-            &splash.instance_buffer,
-            1,
-        );
+        if let Some(splash) = splash {
+            batch.draw_with_buffer_ui_passthrough(
+                &mut pass,
+                &splash.texture,
+                &splash.instance_buffer,
+                1,
+            );
+        }
     }
     presenter.encode_present(&mut encoder, &output.texture);
     fps_overlay.encode(gpu, batch, &mut encoder, &output.texture);
     gpu.queue.submit(std::iter::once(encoder.finish()));
-    output.present();
+    output.present(&gpu.queue);
     Ok(true)
 }
 
@@ -758,7 +761,7 @@ mod tests {
         assert!(hold.is_active(start));
         assert!(hold.is_active(start + MINIMUM_VISIBLE_TIME - Duration::from_millis(1)));
         // The hold is measured from the present, so initialization work that
-        // runs after it is spent inside the five seconds, not added to them.
+        // runs after it is spent inside the hold, not added to it.
         assert!(!hold.is_active(start + MINIMUM_VISIBLE_TIME));
         assert!(!hold.is_active(start + MINIMUM_VISIBLE_TIME + Duration::from_secs(1)));
     }

@@ -18,8 +18,9 @@ impl Simulation {
     /// coordinate is empty or Cell0,0's center (730930/730950 initializers).
     ///
     /// Native checks Limbo81, without adding health/alive/placement gates.
-    /// The caller supplies its existing cell query: triggers use the canonical
-    /// Dummy, while client-only H queries isolate its writes from simulation.
+    /// The caller supplies its existing cell query: triggers use
+    /// [`NativeCellQuery::for_local_input`], while client-only H queries
+    /// isolate its writes from simulation.
     pub fn home_camera_coordinate(
         &self,
         rules: &RuleSet,

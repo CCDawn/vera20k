@@ -88,7 +88,15 @@ fn custom_armor_selection_preserves_numeric_zero_and_secondary_first_order() {
                 &rules,
                 object,
                 &attacker_facts(actor, object),
-                Some(&target)
+                Some(&target),
+                |index| super::combat_weapon::get_weapon(
+                    actor,
+                    object,
+                    index,
+                    &sim.substrate.entities,
+                    &rules,
+                    &sim.interner
+                ),
             ),
             expected,
             "primary={primary}, secondary={secondary}",
@@ -175,10 +183,11 @@ fn custom_armor_positive_receive_and_estimate_share_the_effective_record() {
         &rules,
         &sim.interner,
         &sim.houses,
-        sim.house_alliances.as_map(),
+        &sim.house_alliances,
         false,
         0,
         sim.resolved_terrain.as_ref(),
+        None,
     )
     .unwrap();
     assert_eq!(resolved.outcome.hp_delta, 25);
@@ -196,7 +205,7 @@ fn custom_armor_threat_score_consumes_both_effectiveness_terms() {
             &rules,
             &sim.interner,
             sim.resolved_terrain.as_ref(),
-            Some(sim.house_alliances.as_map()),
+            Some(&sim.house_alliances),
             greatest_threat::ThreatCoefficients {
                 my_effectiveness: mine,
                 target_effectiveness: theirs,

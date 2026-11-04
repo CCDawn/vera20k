@@ -167,9 +167,11 @@ struct LogicRequest<'a> {
 }
 
 impl Simulation {
-    /// Mark the step the frame enters. Only tests observe it.
+    /// Mark the step the frame enters: it advances the world's revision, and
+    /// tests observe the step itself.
     #[inline]
     fn enter_frame_step(&mut self, step: FrameStep) {
+        self.note_revision();
         #[cfg(any(test, feature = "test-support"))]
         self.frame_step_trace.push(step);
         #[cfg(not(any(test, feature = "test-support")))]
@@ -548,6 +550,9 @@ impl Simulation {
             Err(cursor) => return Ok(FrameTailResult::OutcomeWait(cursor)),
         };
         self.issue_generated_frame_commands(generated);
+        // MainTick55DD9B -> PlanMgr637550 publishes Logic-generated plan
+        // events before Queue_AI's CRC and network exchange, even if it waits.
+        self.publish_planning_commands();
         #[cfg(any(test, feature = "test-support"))]
         if self.session.tick() > 0 {
             self.trace_house_ai_activation_order(HouseAiActivationOrderTestEvent::DefeatProcessed);
@@ -556,10 +561,11 @@ impl Simulation {
         // `Queue_AI_Multiplayer` computes and stores the sync checksum
         // (`0x00647684`, history `0x00B04474[Frame & 0xFF]`) before any
         // command transfer or dispatch; the single-player body never does.
+        // VERA appends money, health and trigger terms to the native fold.
         if self.session.game_mode().command_queue_route() == CommandQueueRoute::Multiplayer {
             self.frame_sync_checksum = Some(FrameSyncChecksum {
                 frame: self.session.binary_frame(),
-                checksum: self.compute_retail_multiplayer_checksum(),
+                checksum: self.compute_multiplayer_frame_checksum(),
             });
         }
 
@@ -692,6 +698,10 @@ impl Simulation {
             tick_ms,
             effects,
         } = inputs;
+        // MainTick55DE45 -> PlanMgr637550 publishes command-generated plans
+        // after Queue_AI, using any TIMING change it just applied. Native
+        // publishes before checking the terminal flags55DE4F..55DE71 too.
+        self.publish_planning_commands();
         // Main_Tick returns immediately on a terminal result. The wrapping
         // frame commit, pacing tail, and pending-delete drain are all skipped
         // on that same terminating call.

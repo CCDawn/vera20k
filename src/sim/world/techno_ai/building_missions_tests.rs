@@ -928,6 +928,8 @@ fn retail_building_mission_inputs() {
         .iter()
         .filter_map(|id| rules.object(id))
         .collect();
+    let entities = crate::sim::entity_store::EntityStore::new();
+    let interner = crate::sim::intern::test_interner();
     let armed = |obj: &crate::rules::object_type::ObjectType| {
         let entity = GameEntity::test_default_of_category(
             1,
@@ -937,7 +939,7 @@ fn retail_building_mission_inputs() {
             1,
             EntityCategory::Structure,
         );
-        combat_weapon::is_armed(&entity, obj)
+        combat_weapon::is_armed(&entity, obj, &entities, &rules, &interner)
     };
     let cleared: BTreeSet<&str> = buildings
         .iter()

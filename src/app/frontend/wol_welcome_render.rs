@@ -31,7 +31,7 @@ use crate::ui::shell::menu_page::{MenuPageButtonRect, MenuPageLayout, MenuPageSp
 use crate::ui::shell::slide::PanelArt;
 use crate::ui::wol_shell::{
     BOX_NO, BOX_OK, BOX_YES, StaticAlign, WAIT_CHECK_STATUS, WAIT_DISCONNECT, WOL_LOBBY_TITLE_KEY,
-    WolBoxButtons, WolTextCaption,
+    WolBoxButtons,
 };
 
 /// Icon and group-box children sit over the background, under the text.
@@ -486,10 +486,7 @@ pub(crate) fn render_wol_page(
         for (text, rect) in &layout.texts {
             let caption = match filled.iter().find(|(id, _)| Some(*id) == text.id) {
                 Some((_, value)) => value.as_str().into(),
-                None => match text.caption {
-                    WolTextCaption::Csf(key) => resolve_csf(state, key),
-                    WolTextCaption::Literal(value) => value.into(),
-                },
+                None => resolve_csf(state, text.key),
             };
             if caption.is_empty() {
                 continue;
@@ -606,9 +603,7 @@ pub(crate) fn render_wol_page(
     let lobby = state.frontend.wol.as_ref().and_then(|visit| visit.lobby());
     let lobby_children = match (&painted, children, lobby) {
         (Painted::Lobby(layout), true, Some(lobby)) => {
-            let base_names: [String; 8] = std::array::from_fn(|index| {
-                resolve_csf(state, &format!("TXT_LOB_{}", index + 1)).into_owned()
-            });
+            let base_names = crate::app::shell_wol::lobby::base_names(state);
             Some(
                 crate::app::frontend::skirmish_shell_render::paint_wol_lobby_children(
                     state,
@@ -632,8 +627,10 @@ pub(crate) fn render_wol_page(
             crate::app::frontend::skirmish_shell_render::paint_wol_lobby_popup(
                 state,
                 popup,
+                lobby.ui.is_modern(),
                 screen_w,
                 screen_h,
+                crate::app::shell_wol::lobby::popup_scale(state),
                 &status,
                 lobby.ui.caret_visible(crate::util::time::Instant::now()),
             ),

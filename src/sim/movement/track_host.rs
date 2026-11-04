@@ -1370,7 +1370,7 @@ impl Simulation {
         }
         // `0x00738A2F`: the navigation list may send it on.
         self.handle_navigation_list(id, rules, None, effects);
-        let Some(entity) = self.substrate.entities.get_mut(id) else {
+        let Some(entity) = self.substrate.entities.get(id) else {
             return saved_base_return;
         };
         let has_destination = entity.navigation.nav_com().is_some();
@@ -1388,8 +1388,15 @@ impl Simulation {
         // unarmed branch clears them before the final mission queue gate.
         // Original executable controls: harvest_attack_return.json plain_idle_*.
         let armed = !miner
-            && unit_type
-                .is_some_and(|object| crate::sim::combat::combat_weapon::is_armed(entity, object));
+            && unit_type.is_some_and(|object| {
+                crate::sim::combat::combat_weapon::is_armed(
+                    entity,
+                    object,
+                    &self.substrate.entities,
+                    rules,
+                    &self.interner,
+                )
+            });
         let deploys_into = unit_type
             .and_then(|object| object.deploys_into.as_deref())
             .and_then(|name| {

@@ -63,6 +63,7 @@ fn identical_source_and_houses_with_different_retained_threat_seed_hash_differen
         record.parent,
         record.zone_type,
         seed,
+        crate::map::cell_index::CellGrid::Retail,
     ));
     zones.replace_hierarchy(hierarchy);
     assert_ne!(

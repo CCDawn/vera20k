@@ -146,7 +146,7 @@ impl ParasiteState {
     }
 
     pub(crate) fn grapple_anim(&self) -> Option<u64> {
-        self.grapple.anim
+        self.grapple.anim()
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -304,7 +304,8 @@ fn weapon_zero<'r>(
     veterancy: u16,
 ) -> Option<&'r crate::rules::weapon_type::WeaponType> {
     super::combat_weapon::weapon_for_index(object, veterancy, 0)
-        .and_then(|(name, _)| rules.weapon(name))
+        .and_then(|record| record.weapon_id)
+        .and_then(|name| rules.weapon(name))
 }
 
 impl Simulation {
@@ -1237,6 +1238,7 @@ impl Simulation {
                 Self::construct_bullet_scheme(
                     &self.interner,
                     &self.substrate,
+                    &self.houses,
                     &mut self.projectiles,
                     bullet,
                     rules,

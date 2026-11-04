@@ -4717,10 +4717,11 @@ fn random_map_click(state: &mut AppState, point: (i32, i32), chooser: bool) {
 fn setup_settled(state: &AppState, host: bool) -> bool {
     MoviesCapture::slide_settled(
         state,
-        ShellSlideKind::NetworkSetup(crate::ui::multiplayer_setup::SetupDialog {
+        ShellSlideKind::NetworkSetup(crate::app::shell_network_setup::setup_dialog(
+            state,
             host,
-            flavor: crate::ui::multiplayer_setup::SetupFlavor::Lan,
-        }),
+            crate::ui::multiplayer_setup::SetupFlavor::Lan,
+        )),
     ) && state
         .frontend
         .multiplayer_setup
@@ -4738,6 +4739,24 @@ fn setup_click(state: &mut AppState, rect: RectPx) {
     setup_input::cursor_moved(state);
     setup_input::mouse(state, MouseButton::Left, true);
     setup_input::mouse(state, MouseButton::Left, false);
+}
+/// New, then OK in VERA's Create Game box, keeping the host's last limits.
+fn create_lan_game(state: &mut AppState) -> Result<()> {
+    lobby_button(state, crate::ui::lan_shell::CREATE)?;
+    if state
+        .frontend
+        .lan
+        .as_ref()
+        .is_some_and(|runtime| runtime.create.is_some())
+    {
+        let ok = crate::ui::shell::modal::lan_create_game_layout(
+            state.render_width() as i32,
+            state.render_height() as i32,
+        )
+        .ok;
+        lobby_click(state, ok);
+    }
+    Ok(())
 }
 fn lobby_button(state: &mut AppState, id: u16) -> Result<()> {
     let rect = lobby::layout(state)

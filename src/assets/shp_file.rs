@@ -128,6 +128,26 @@ impl ShpFile {
         Ok(frame_count)
     }
 
+    /// Read the declared canvas dimensions after validating the complete header
+    /// table, without decoding frame pixels or validating their data offsets.
+    pub fn canvas_size_from_bytes(data: &[u8]) -> Result<[u16; 2], AssetError> {
+        Self::frame_count_from_bytes(data)?;
+        Ok([read_u16_le(data, 2), read_u16_le(data, 4)])
+    }
+
+    /// `SHPStruct::GetFrameBounds @ 69E7E0` sign-extends the frame header's
+    /// four rectangle words. An invalid index returns the default rectangle:
+    /// CRT initializer `69E070` (table slot `814A40`) zeros `B077A0..B077AC`,
+    /// which the invalid-frame branch `69E829..69E852` copies to its result.
+    /// This validates the complete header table, leaving pixel data undecoded.
+    pub fn frame_bounds_from_bytes(data: &[u8], index: usize) -> Result<[i32; 4], AssetError> {
+        let count = Self::frame_count_from_bytes(data)?;
+        if index >= usize::from(count) {
+            return Ok([0; 4]);
+        }
+        Ok(Self::frame_rectangle_at(data, index).map(|word| i32::from(word as i16)))
+    }
+
     /// `SHPStruct::GetColor @ 0x0069E860` returns the frame header's raw RGB
     /// bytes without translating through a palette. An invalid frame index
     /// returns `(0,0,0)`, matching its initialized default result.
@@ -214,15 +234,24 @@ impl ShpFile {
             })
     }
 
+    /// Raw rectangle words; the caller validated that the header table holds `i`.
+    /// Pixel decoding uses their unsigned dimensions, while native bounds queries
+    /// interpret the same words as signed values.
+    fn frame_rectangle_at(data: &[u8], i: usize) -> [u16; 4] {
+        let hdr_offset: usize = 8 + i * 24;
+        [
+            read_u16_le(data, hdr_offset),
+            read_u16_le(data, hdr_offset + 2),
+            read_u16_le(data, hdr_offset + 4),
+            read_u16_le(data, hdr_offset + 6),
+        ]
+    }
+
     /// Frame `i`'s header and decoded pixels; the caller checked that the
     /// header table holds it.
     fn frame_at(data: &[u8], i: usize) -> Result<ShpFrame, AssetError> {
         let hdr_offset: usize = 8 + i * 24;
-
-        let frame_x: u16 = read_u16_le(data, hdr_offset);
-        let frame_y: u16 = read_u16_le(data, hdr_offset + 2);
-        let frame_width: u16 = read_u16_le(data, hdr_offset + 4);
-        let frame_height: u16 = read_u16_le(data, hdr_offset + 6);
+        let [frame_x, frame_y, frame_width, frame_height] = Self::frame_rectangle_at(data, i);
         let format: u8 = data[hdr_offset + 8];
         // Bytes 9-11: padding/reserved
         // Bytes 12-14: radar minimap colour (R, G, B); byte 15 unused

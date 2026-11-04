@@ -333,6 +333,7 @@ fn try_dispatch_building_survivor_smudge(
     let base_x = (cell_rx as i32) * 256 + 128;
     let base_y = (cell_ry as i32) * 256 + 128;
     let (off_x, off_y) = random_direction_coord(
+        terrain.cell_grid(),
         rng,
         base_x,
         base_y,
@@ -909,6 +910,7 @@ mod dispatch_tests {
             let mut expected_rng = SimRng::new(crater_seed);
             assert!(expected_rng.next_range_u32(100) >= 50);
             let _ = random_direction_coord(
+                crate::map::cell_index::CellGrid::Retail,
                 &mut expected_rng,
                 4 * 256 + 128,
                 4 * 256 + 128,

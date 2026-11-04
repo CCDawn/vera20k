@@ -5,9 +5,9 @@ use crate::app::AppState;
 use crate::app::shell_network_setup::maps::{self as shared_maps, GeneratedMapManifest};
 use crate::app::shell_network_setup::{accept_network_map_source, set_network_map_progress};
 use crate::map::source::{LoadedTransferAsset, TransferResource};
+use crate::util::time::{Duration, Instant};
 use anyhow::{Result, anyhow, ensure};
 use std::path::PathBuf;
-use crate::util::time::{Duration, Instant};
 const CHUNK: usize = 32768;
 
 #[derive(PartialEq, Eq)]
@@ -82,6 +82,13 @@ pub(super) struct Transfers {
     complete: bool,
     failed: bool,
     generated: Option<GeneratedMapManifest>,
+    /// The room and map of the lobby's latest `map_available`. The lobby's
+    /// map library sends it with the host's settings when it already holds
+    /// the map, before the host's upload has begun.
+    available: Option<(String, String, usize)>,
+    /// VERA: a guest's download of a map it does not have waits for the
+    /// player's answer to the room's missing-map offer.
+    asking: bool,
 }
 
 pub(super) fn received_options(
@@ -106,8 +113,11 @@ pub(super) fn cancel(state: &mut AppState, service: &mut LiveService) {
     service.maps.transfer = None;
     service.maps.generated = None;
     service.maps.next_resource = None;
+    service.maps.available = None;
     service.maps.failed = false;
     service.maps.complete = false;
+    service.maps.asking = false;
+    crate::app::shell_network_setup::close_missing_map_offer(state);
     set_network_map_progress(state, None);
 }
 pub(super) fn poll(state: &mut AppState, service: &mut LiveService) {
@@ -133,16 +143,28 @@ impl Transfers {
             })
     }
     fn fail(&mut self, state: &mut AppState) {
+        // Retried failures and the deadline are the connection, not the map.
+        let interrupted = self
+            .transfer
+            .as_ref()
+            .is_some_and(|transfer| transfer.retries > 0 || Instant::now() > transfer.deadline);
         if !self.failed {
             super::notice(
                 state,
-                "Map transfer or include verification failed. Rejoin after checking the map and its required include files.",
+                if interrupted {
+                    "The map transfer stopped because the connection to VERA20k Online kept failing. Rejoin the game to try again."
+                } else {
+                    "Map transfer or include verification failed. Rejoin after checking the map and its required include files."
+                },
             );
         }
         self.failed = true;
         self.complete = false;
         self.transfer = None;
         self.next_resource = None;
+        // The offer closes whether it still asks or shows the download.
+        self.asking = false;
+        crate::app::shell_network_setup::close_missing_map_offer(state);
         set_network_map_progress(state, None);
     }
     fn poll(&mut self, state: &mut AppState, service: &mut LiveService) -> Result<()> {
@@ -182,6 +204,10 @@ impl Transfers {
             "invalid map transfer identity"
         );
         if self.key.as_ref() != Some(&key) {
+            self.forget_other_available(&key);
+            // An offer for the previous map closes, asking or downloading.
+            self.asking = false;
+            crate::app::shell_network_setup::close_missing_map_offer(state);
             self.generation = self.generation.wrapping_add(1);
             self.transfer = None;
             self.complete = false;
@@ -198,6 +224,13 @@ impl Transfers {
         }
         if let Some(resource) = self.next_resource.take() {
             self.begin_resource(state, service, resource)?;
+        }
+        if self.asking {
+            if !crate::app::shell_network_setup::missing_map_download_agreed(state) {
+                return Ok(());
+            }
+            self.agreed_to_download();
+            set_network_map_progress(state, Some((0, metadata.byte_length.max(0) as u32)));
         }
         let Some(transfer) = self.transfer.as_mut() else {
             return Ok(());
@@ -287,7 +320,7 @@ impl Transfers {
                 .match_state
                 .session
                 .accept_verified_network_map_source(source, effective)?;
-            if !host {
+            if !host || self.lobby_holds(resource) {
                 return self.finish_resource(state, resource);
             }
         }
@@ -326,6 +359,56 @@ impl Transfers {
         }
         Ok(())
     }
+    /// Whether the lobby already has this room's map, so the host need not
+    /// upload it. Generated maps and their previews always come from the host.
+    fn lobby_holds(&self, resource: TransferResource) -> bool {
+        resource == TransferResource::Map
+            && self.key.as_ref().zip(self.available.as_ref()).is_some_and(
+                |(key, (room, digest, total))| {
+                    key.random.is_none()
+                        && &key.room == room
+                        && &key.digest == digest
+                        && key.total == *total
+                },
+            )
+    }
+    /// A `map_available` for an earlier map says nothing about `key`'s: after
+    /// L, another map, then L again, the lobby may not copy L this time, and
+    /// its guests would wait for an upload. One for `key` that came first stays.
+    fn forget_other_available(&mut self, key: &Key) {
+        if self
+            .available
+            .as_ref()
+            .is_some_and(|(room, digest, total)| {
+                (room, digest, *total) != (&key.room, &key.digest, key.total)
+            })
+        {
+            self.available = None;
+        }
+    }
+    /// A `map_available` for the host's own upload ends it: the lobby has
+    /// the map, so the rest need not be sent.
+    fn heard_available(
+        &mut self,
+        state: &mut AppState,
+        room: Option<String>,
+        digest: &str,
+        total: usize,
+    ) -> Result<()> {
+        self.available = room.map(|room| (room, digest.to_owned(), total));
+        let uploading = self
+            .transfer
+            .as_ref()
+            .filter(|transfer| matches!(transfer.direction, Direction::Upload))
+            .map(|transfer| transfer.resource);
+        match uploading {
+            Some(resource) if self.lobby_holds(resource) => {
+                set_network_map_progress(state, Some((total as u32, total as u32)));
+                self.finish_resource(state, resource)
+            }
+            _ => Ok(()),
+        }
+    }
     fn finish_resource(&mut self, state: &mut AppState, resource: TransferResource) -> Result<()> {
         self.transfer = None;
         if resource != TransferResource::Preview
@@ -348,6 +431,8 @@ impl Transfers {
             .to_owned();
         accept_network_map_source(state, source, effective)?;
         self.complete = true;
+        // The map arrived: the offer showing its download closes.
+        crate::app::shell_network_setup::close_missing_map_offer(state);
         Ok(())
     }
     fn accept_download(
@@ -406,7 +491,32 @@ impl Transfers {
                 self.accept_download(state, loaded, resource)?
             }
             http::Response::CachedMap { loaded: None, .. } => {
-                self.transfer.as_mut().unwrap().in_flight = false
+                self.transfer.as_mut().unwrap().in_flight = false;
+                // Quick Match and launcher-started games show no room to ask in.
+                let dialog = !crate::app::shell_network_setup::quick_match(state)
+                    && !crate::app::shell_network_setup::external(state);
+                if dialog && self.ask_before_download() {
+                    set_network_map_progress(state, None);
+                    let metadata = state
+                        .match_state
+                        .session
+                        .network_map_metadata()
+                        .expect("transfer metadata");
+                    // Only custom maps are kept (`keep_for_choose_map`).
+                    let kept = if metadata.official {
+                        ""
+                    } else {
+                        " It is saved in VERA20k's Maps folder."
+                    };
+                    let message = format!(
+                        "You don't have the map {} ({} players, {} KB). Download it to play in this game?{kept}",
+                        metadata.display_name,
+                        metadata.player_capacity,
+                        (metadata.byte_length.max(0) as u32).div_ceil(1024)
+                    );
+                    let name = metadata.display_name.clone();
+                    crate::app::shell_network_setup::offer_missing_map(state, name, message);
+                }
             }
             http::Response::MapUploaded { completed, .. } => {
                 let transfer = self.transfer.as_mut().unwrap();
@@ -470,11 +580,10 @@ impl Transfers {
                 transfer.retry_at = Instant::now() + Duration::from_secs(2);
             }
             http::Response::MapFailure { retryable, .. } => {
-                let transfer = self.transfer.as_mut().unwrap();
-                transfer.retries += 1;
-                ensure!(retryable && transfer.retries <= 3, "map transfer failed");
-                transfer.in_flight = false;
-                transfer.retry_at = Instant::now() + Duration::from_secs(2);
+                self.transfer
+                    .as_mut()
+                    .unwrap()
+                    .retry_after_failure(retryable)?;
             }
             _ => {}
         }
@@ -494,6 +603,12 @@ pub(super) fn available(
     digest: &str,
     total: usize,
 ) {
+    let room = super::super::lobby::current_channel(state).map(|channel| channel.name.clone());
+    let mut maps = std::mem::take(&mut service.maps);
+    if maps.heard_available(state, room, digest, total).is_err() {
+        maps.fail(state);
+    }
+    service.maps = maps;
     if service.maps.key.as_ref().is_some_and(|key| {
         key.digest == digest && key.total == total
             || key.random.as_ref().is_some_and(|r| {
@@ -509,9 +624,143 @@ pub(super) fn available(
     }
 }
 
+impl Transfers {
+    /// VERA asks first: a guest whose cache misses the room's map holds its
+    /// download until the player agrees. Seeds and generated previews are
+    /// not maps the player keeps, so they never ask.
+    fn ask_before_download(&mut self) -> bool {
+        let ask = self.key.as_ref().is_some_and(|key| key.random.is_none())
+            && self.transfer.as_ref().is_some_and(|transfer| {
+                transfer.resource == TransferResource::Map
+                    && matches!(transfer.direction, Direction::Download)
+            });
+        self.asking |= ask;
+        ask
+    }
+    /// The player agreed: the download starts now, with its full deadline.
+    fn agreed_to_download(&mut self) {
+        self.asking = false;
+        if let Some(transfer) = self.transfer.as_mut() {
+            let now = Instant::now();
+            transfer.retry_at = now;
+            transfer.deadline = now + Duration::from_secs(300);
+        }
+    }
+}
+
+impl Transfer {
+    /// A dropped connection retries, less often each time, until the
+    /// transfer's deadline rather than failing on a short drop.
+    fn retry_after_failure(&mut self, retryable: bool) -> Result<()> {
+        ensure!(retryable, "map transfer failed");
+        self.retries = self.retries.saturating_add(1);
+        self.in_flight = false;
+        self.retry_at = Instant::now() + Duration::from_secs((1 << self.retries.min(4)).min(15));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_map_the_lobby_already_holds_spares_only_that_rooms_upload() {
+        let digest = "a".repeat(64);
+        let mut maps = Transfers {
+            key: Some(Key {
+                room: "room".into(),
+                digest: digest.clone(),
+                total: 9,
+                effective_digest: "b".repeat(64),
+                random: None,
+            }),
+            ..Default::default()
+        };
+        assert!(!maps.lobby_holds(TransferResource::Map));
+        // Heard with the host's settings, before its upload began.
+        maps.available = Some(("room".into(), digest.clone(), 9));
+        assert!(maps.lobby_holds(TransferResource::Map));
+        assert!(!maps.lobby_holds(TransferResource::Preview));
+        maps.available = Some(("another room".into(), digest.clone(), 9));
+        assert!(!maps.lobby_holds(TransferResource::Map));
+        maps.available = Some(("room".into(), digest.clone(), 10));
+        assert!(!maps.lobby_holds(TransferResource::Map));
+        // Another map's settings drop it, so choosing this map again uploads
+        // unless the lobby says again that it holds it.
+        let key = maps.key.take().unwrap();
+        maps.available = Some(("room".into(), digest, 9));
+        maps.forget_other_available(&key);
+        maps.key = Some(key);
+        assert!(maps.lobby_holds(TransferResource::Map));
+        let other = Key {
+            room: "room".into(),
+            digest: "c".repeat(64),
+            total: 9,
+            effective_digest: "b".repeat(64),
+            random: None,
+        };
+        maps.forget_other_available(&other);
+        assert!(maps.available.is_none());
+    }
+    #[test]
+    fn a_guest_missing_the_map_waits_for_its_answer_before_downloading() {
+        let now = Instant::now();
+        let transfer = |resource| Transfer {
+            resource,
+            direction: Direction::Download,
+            bytes: Vec::new(),
+            offset: 0,
+            in_flight: false,
+            retry_at: now,
+            deadline: now,
+            retries: 0,
+            directory: PathBuf::new(),
+        };
+        let mut maps = Transfers {
+            key: Some(Key {
+                room: "room".into(),
+                digest: "a".repeat(64),
+                total: 9,
+                effective_digest: "b".repeat(64),
+                random: None,
+            }),
+            transfer: Some(transfer(TransferResource::Map)),
+            ..Default::default()
+        };
+        assert!(maps.ask_before_download());
+        assert!(maps.asking);
+        maps.agreed_to_download();
+        assert!(!maps.asking);
+        assert!(maps.transfer.as_ref().unwrap().deadline > now);
+        // A host's upload never asks.
+        maps.transfer.as_mut().unwrap().direction = Direction::Upload;
+        assert!(!maps.ask_before_download());
+        // Nor does a generated map's seed.
+        maps.transfer = Some(transfer(TransferResource::Seed));
+        assert!(!maps.ask_before_download());
+    }
+    #[test]
+    fn a_dropped_connection_keeps_a_map_transfer_retrying() {
+        let now = Instant::now();
+        let mut transfer = Transfer {
+            resource: TransferResource::Map,
+            direction: Direction::Download,
+            bytes: Vec::new(),
+            offset: 0,
+            in_flight: true,
+            retry_at: now,
+            deadline: now + Duration::from_secs(300),
+            retries: 0,
+            directory: PathBuf::new(),
+        };
+        for _ in 0..6 {
+            transfer.retry_after_failure(true).unwrap();
+        }
+        assert!(!transfer.in_flight);
+        assert!(transfer.retry_at <= Instant::now() + Duration::from_secs(15));
+        assert!(transfer.retry_after_failure(false).is_err());
+    }
     #[test]
     fn download_rejects_duplicate_offsets_and_changed_identity_without_appending() {
         let key = Key {

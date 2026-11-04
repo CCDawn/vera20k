@@ -1852,6 +1852,7 @@ fn tiberium_crate_with_the_drawn_type_one_clamps_to_type_zero_and_places_anyway(
     for _ in 0..count {
         let distance = probe.next_range_i32_inclusive(0, 0x300);
         let (x, y) = random_direction_coord(
+            crate::map::cell_index::CellGrid::Retail,
             &mut probe,
             base.x,
             base.y,

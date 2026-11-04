@@ -174,7 +174,10 @@ impl Simulation {
             return;
         }
         let location = crate::sim::movement::ground_pose::object_location(entity, Some(terrain));
-        let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+        let cells = crate::map::resolved_terrain::NativeCellQuery::for_local_input(
+            terrain,
+            self.session.game_mode().is_network(),
+        );
         if vision::point_is_shrouded(&self.fog, &cells, player, location)
             && let Some(entity) = self.substrate.entities.get_mut(id)
         {
@@ -1270,11 +1273,8 @@ impl Simulation {
                     && only_viewer
                         .or(self.session.current_house())
                         .is_some_and(|viewer| {
-                            crate::map::houses::is_allied_with(
-                                self.house_alliances.as_map(),
-                                self.interner.resolve(entity.owner()),
-                                self.interner.resolve(viewer),
-                            )
+                            self.house_alliances
+                                .is_allied(&self.interner, entity.owner(), viewer)
                         })
                 {
                     Some((reveal_fog, false))
@@ -1784,13 +1784,7 @@ impl Simulation {
             .iter()
             .copied()
             .filter(|&viewer| {
-                vision::reveal_admits(
-                    self.house_alliances.as_map(),
-                    owner,
-                    viewer,
-                    config,
-                    &self.interner,
-                )
+                vision::reveal_admits(&self.house_alliances, owner, viewer, config, &self.interner)
             })
             .collect();
         // Register each accepted map contribution before walking any cells.
@@ -1879,7 +1873,7 @@ impl Simulation {
                 continue;
             };
             if !vision::reveal_admits(
-                self.house_alliances.as_map(),
+                &self.house_alliances,
                 source.owner,
                 viewer,
                 config,
@@ -2062,17 +2056,17 @@ impl Simulation {
                 trace.border_scans.push((origin, radius));
             }
         });
-        let border = vision::sight_border_cells(origin, radius, inner);
         let cells = context
             .terrain()
             .or(resolved_terrain.as_ref())
             .map(crate::map::resolved_terrain::NativeCellQuery::canonical);
-        fog.refresh_sight_border_cells(viewer, &border, cells.as_ref());
+        fog.refresh_sight_border(viewer, origin, radius, inner, cells.as_ref());
         // Each refresh writes only its own cell's frame, so every frame
         // read after the whole border is the one its refresh stored.
         #[cfg(any(test, feature = "test-support"))]
         REVEAL_CALLS.with_borrow_mut(|trace| {
             if let Some(trace) = trace {
+                let border = vision::sight_border_cells(origin, radius, inner);
                 for &cell in &border {
                     trace.border_receivers.push(cell);
                     if cell.0 < fog.width() && cell.1 < fog.height() {
@@ -2402,7 +2396,7 @@ impl Simulation {
             && entity.category() == EntityCategory::Structure
             && entity.owner() != viewer
             && vision::reveal_admits(
-                self.house_alliances.as_map(),
+                &self.house_alliances,
                 entity.owner(),
                 viewer,
                 config,
@@ -2484,6 +2478,19 @@ impl Simulation {
             only_viewer.map_or_else(|| self.houses.order().to_vec(), |viewer| vec![viewer]);
         let clients = self.fog_clients_current_first();
         let config = self.sight_reveal_config(context.rules());
+        let network = self.session.game_mode().is_network();
+        // Map4ADEE0/4ADCD0 retain registration and viewer order. Scratch is
+        // local to this invocation: callbacks may reenter the same walk.
+        // Followups name viewers by their index in `viewers`.
+        enum Followup {
+            SightAndGap(usize),
+            AlliedSight(usize),
+            RevealToAll(usize),
+            /// Consecutive viewers that take only the gap callbacks.
+            Gaps(std::ops::Range<usize>),
+        }
+        let mut callback_viewers = Vec::with_capacity(viewers.len());
+        let mut followups: Vec<Followup> = Vec::with_capacity(viewers.len());
         for ordinal in 0..count {
             let Some(id) = self.substrate.entities.techno_registry_at(ordinal) else {
                 break;
@@ -2492,55 +2499,79 @@ impl Simulation {
             // Keep the branch chosen for THIS receiver across its callbacks
             // (4ADD4C..4ADDA1,4ADDE4..4ADE21). Reload the next receiver at
             // the next ordinal, not this object's eligibility mid-branch.
-            enum Followup {
-                SightAndGap,
-                AlliedSight,
-                RevealToAll,
-                Gap,
+            // Nothing writes while the branches are chosen, so the receiver
+            // is read once for all viewers.
+            callback_viewers.clear();
+            followups.clear();
+            let Some(entity) = self.substrate.entities.get(id) else {
+                continue;
+            };
+            let structure = entity.category() == EntityCategory::Structure;
+            if !Self::in_ally_bracket_walk(entity) || (skip_buildings && structure) {
+                continue;
             }
-            let mut callback_viewers = Vec::new();
-            let mut followups = Vec::new();
-            for &viewer in &viewers {
-                let Some(entity) = self.substrate.entities.get(id) else {
-                    break;
-                };
-                if !Self::in_ally_bracket_walk(entity)
-                    || (skip_buildings && entity.category() == EntityCategory::Structure)
-                {
-                    break;
-                }
-                let human = if self.session.game_mode().is_network() {
-                    entity.owner() == viewer
-                        && self
-                            .houses
-                            .get(&viewer)
-                            .is_some_and(|house| house.is_human())
-                } else {
-                    Some(viewer) == current && self.house_is_human_player(entity.owner())
-                };
-                if human && !self.techno_discovered_by_viewer(id, viewer) {
-                    continue;
-                }
-                let allied = !human && self.takes_allied_building_arm(entity, viewer, &config);
-                let followup = if human || allied {
-                    callback_viewers.push(viewer);
-                    if allied {
-                        Followup::AlliedSight
-                    } else {
-                        Followup::SightAndGap
+            // House50B6F0 and41B give the Human arm to one map at most: in
+            // LAN/WOL the owner's own when it is human, else the current
+            // player's when it counts the owner a human player.
+            let owner = entity.owner();
+            let human_viewer = if network {
+                Some(owner)
+                    .filter(|owner| self.houses.get(owner).is_some_and(|house| house.is_human()))
+            } else {
+                current.filter(|_| self.house_is_human_player(owner))
+            }
+            .and_then(|human| viewers.iter().position(|&viewer| viewer == human));
+            // An undiscovered receiver takes nothing on the Human map.
+            let human_viewer = human_viewer
+                .map(|index| (index, self.techno_discovered_by_viewer(id, viewers[index])));
+            if structure {
+                let mut reveal_to_all = None;
+                for (index, &viewer) in viewers.iter().enumerate() {
+                    let human = human_viewer.is_some_and(|(human, _)| human == index);
+                    if human_viewer == Some((index, false)) {
+                        continue;
                     }
-                } else if !release
-                    && clients.contains(&viewer)
-                    && entity.category() == EntityCategory::Structure
-                    && self
-                        .object_type(entity.type_ref(), context.rules())
-                        .is_some_and(|object| object.reveal_to_all)
-                {
-                    Followup::RevealToAll
-                } else {
-                    Followup::Gap
-                };
-                followups.push((viewer, followup));
+                    let allied = !human && self.takes_allied_building_arm(entity, viewer, &config);
+                    let followup = if human || allied {
+                        callback_viewers.push(viewer);
+                        if allied {
+                            Followup::AlliedSight(index)
+                        } else {
+                            Followup::SightAndGap(index)
+                        }
+                    } else if !release
+                        && clients.contains(&viewer)
+                        && *reveal_to_all.get_or_insert_with(|| {
+                            self.object_type(entity.type_ref(), context.rules())
+                                .is_some_and(|object| object.reveal_to_all)
+                        })
+                    {
+                        Followup::RevealToAll(index)
+                    } else {
+                        match followups.last_mut() {
+                            Some(Followup::Gaps(gaps)) if gaps.end == index => {
+                                gaps.end += 1;
+                                continue;
+                            }
+                            _ => Followup::Gaps(index..index + 1),
+                        }
+                    };
+                    followups.push(followup);
+                }
+            } else {
+                // Only a Building takes the allied-Building arm or4ADE68's
+                // RevealToAll, so every other map takes the gap callbacks.
+                match human_viewer {
+                    Some((index, discovered)) => {
+                        followups.push(Followup::Gaps(0..index));
+                        if discovered {
+                            callback_viewers.push(viewers[index]);
+                            followups.push(Followup::SightAndGap(index));
+                        }
+                        followups.push(Followup::Gaps(index + 1..viewers.len()));
+                    }
+                    None => followups.push(Followup::Gaps(0..viewers.len())),
+                }
             }
             // One UpdateReveal per native receiver, with each logical client's
             // source state installed before any RevealArea can reenter.
@@ -2565,29 +2596,35 @@ impl Simulation {
                     );
                 }
             }
-            for (viewer, followup) in followups {
+            for followup in followups.drain(..) {
                 match followup {
-                    Followup::SightAndGap | Followup::AlliedSight => {
+                    Followup::SightAndGap(index) | Followup::AlliedSight(index) => {
+                        let viewer = viewers[index];
                         if !release {
                             self.refresh_object_sight_border_on(id, Some(viewer), context);
                         }
-                        if matches!(followup, Followup::AlliedSight) {
-                            //4ADFBF/4ADE21 skip the gap callbacks.
-                            continue;
+                        //4ADFBF/4ADE21 skip the gap callbacks after allied sight.
+                        if matches!(followup, Followup::SightAndGap(_)) {
+                            self.refresh_map_callback_gap(id, viewer, !release, context.rules());
                         }
                     }
-                    Followup::RevealToAll => {
+                    Followup::RevealToAll(index) => {
                         //4ADE68 has no matching pre-release; each call counts
                         //again on this logical client's PlayerPtr map.
+                        let viewer = viewers[index];
                         self.reveal_sight_for_house(id, viewer, context);
                         self.refresh_object_sight_border_on(id, Some(viewer), context);
-                        continue;
                     }
-                    Followup::Gap => {}
+                    // Native rereads the TYPE after sight/border callbacks
+                    // before virtual418/414; shared gap ownership retains that
+                    // decision.
+                    Followup::Gaps(gaps) => self.refresh_map_callback_gaps(
+                        id,
+                        &viewers[gaps],
+                        !release,
+                        context.rules(),
+                    ),
                 }
-                // Native rereads the TYPE after sight/border callbacks before
-                // virtual418/414; shared gap ownership retains that decision.
-                self.refresh_map_callback_gap(id, viewer, !release, context.rules());
             }
         }
     }

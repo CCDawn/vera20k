@@ -393,6 +393,7 @@ fn map_entity(type_id: &str, category: EntityCategory, cell: (u16, u16)) -> MapE
         recruitable_a: true,
         recruitable_b: true,
         group: -1,
+        follows: None,
         structure_upgrades: [None, None, None],
         structure_ai_sellable: false,
         structure_ai_repairable: false,
@@ -2376,6 +2377,277 @@ fn generated_projection_validates_the_whole_table_before_any_mutation() {
     );
 }
 
+fn authored_retail_upgrade_scene(
+    upgrade_keys: &str,
+    weapon_sections: &str,
+) -> Option<(Simulation, RuleSet, u64)> {
+    // ReadScenarioBuildings44FD50 -> Unlimbo440871 -> GetWeapon4526F0.
+    // The map must admit a real upgrade; its selector alone cannot install one.
+    let map = IniFile::from_str(&format!(
+        "[GAPILL]\nPowersUpBuilding=GAPOWR\n{upgrade_keys}\n{weapon_sections}\n[Structures]\n\
+         0=Americans,GAPOWR,256,10,12,0,None,1,0,1,1,0,GAPILL,None,None,0,1\n",
+    ));
+    let retail = crate::rules::retail_ini_fixture::retail_battle_rules_with_map_patch(&map)?;
+    let rules = retail.rules;
+    let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x4526_F0);
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Skirmish);
+    sim.session
+        .set_current_house_for_test(sim.interner.get("Americans"));
+    // This bounded arena gives the opponent a tank, without a starting base.
+    sim.session.game_options_mut_for_test().short_game = false;
+    let placements = crate::map::entities::parse_map_entities(&map);
+    assert_eq!(sim.spawn_from_map(&placements, Some(&rules)), 2);
+    let host = sim.substrate.entities.get(1).unwrap();
+    assert!(host.building_upgrades().count() > 0);
+    assert!(
+        host.building_upgrades()
+            .types()
+            .contains(&sim.interner.get("GAPILL"))
+    );
+    assert!(!sim.substrate.entities.get(2).unwrap().is_object_alive());
+    let target = sim
+        .spawn_object("HTNK", "Russians", 14, 12, 0, &rules)
+        .unwrap();
+    sim.intern_rule_type_ids(&rules);
+    sim.resolve_type_handles(&rules);
+    Some((sim, rules, target))
+}
+
+#[test]
+fn authored_retail_upgrade_lends_its_weapon_and_fire_offset() {
+    let Some((mut sim, rules, target)) = authored_retail_upgrade_scene("", "") else {
+        return;
+    };
+    let host = sim.substrate.entities.get(1).unwrap();
+    assert_eq!(host.building_upgrades().count(), 1);
+    assert_eq!(
+        host.building_upgrades().types()[0],
+        sim.interner.get("GAPILL")
+    );
+    let object = rules
+        .object_in_category(
+            crate::rules::object_type::ObjectCategory::Building,
+            "GAPOWR",
+        )
+        .unwrap();
+    let weapon = crate::sim::combat::combat_weapon::get_weapon(
+        host,
+        object,
+        0,
+        &sim.substrate.entities,
+        &rules,
+        &sim.interner,
+    );
+    assert_eq!(weapon.map(|weapon| weapon.id.as_str()), Some("Vulcan2"));
+    assert!(crate::sim::combat::combat_weapon::is_armed(
+        host,
+        object,
+        &sim.substrate.entities,
+        &rules,
+        &sim.interner,
+    ));
+    // GetFLH6F3B28 reads the selected record's coordinates, not the host ART.
+    let source = crate::sim::combat::fire_coord::FireSource::of_entity(host);
+    let fire = crate::sim::combat::fire_coord::fire_coordinate(
+        &sim,
+        &rules,
+        &source,
+        object,
+        0,
+        0,
+        crate::rules::flh::Flh::default(),
+    );
+    assert_eq!(fire.coord.z - fire.source_z, 40);
+    // Mission_Attack44B2C6 queries the first upgrade's normal records at
+    // 712130. Vulcan2's constructor-default Burst=1 and absent Secondary
+    // refuse the special firing arm, although GetWeapon/IsArmed succeed.
+    assert_eq!(rules.weapon("Vulcan2").unwrap().burst, 1);
+    assert!(rules.object("GAPILL").unwrap().secondary().is_none());
+    let mut entered_attack = false;
+    for frame in 1..=360 {
+        sim.session.set_binary_frame_for_test(frame);
+        let output = sim
+            .advance_app_frame(
+                &[],
+                &rules,
+                None,
+                33,
+                crate::sim::world::TickLane::Ordinary,
+                FrameEffects::default(),
+            )
+            .unwrap();
+        assert!(output.tick.frame_committed);
+        assert!(
+            output
+                .fire_events
+                .iter()
+                .all(|event| event.attacker_id != 1),
+            "a single non-bursting upgrade must not reach FireAt"
+        );
+        let host = sim.substrate.entities.get(1).unwrap();
+        entered_attack |=
+            host.mission.current().known() == Some(crate::sim::mission::MissionType::Attack);
+        assert_eq!(host.rearm_timer.remaining(frame as i32), 0);
+    }
+    assert!(
+        entered_attack,
+        "the armed host must reach its Attack handler"
+    );
+    assert_eq!(
+        sim.substrate.entities.get(target).unwrap().health.current(),
+        rules.object("HTNK").unwrap().strength
+    );
+    // The upgrade loop always uses the normal record, including on an elite host.
+    sim.substrate
+        .entities
+        .get_mut(1)
+        .unwrap()
+        .veterancy
+        .set_elite();
+    let host = sim.substrate.entities.get(1).unwrap();
+    assert_eq!(
+        crate::sim::combat::combat_weapon::current_weapon(
+            host,
+            object,
+            &sim.substrate.entities,
+            &rules,
+            &sim.interner,
+        )
+        .map(|weapon| weapon.id.as_str()),
+        Some("Vulcan2"),
+    );
+    let record = crate::sim::combat::combat_weapon::get_weapon_record(
+        host,
+        object,
+        0,
+        &sim.substrate.entities,
+        &rules,
+        &sim.interner,
+    )
+    .unwrap();
+    assert_eq!(
+        [record.flh.forward, record.flh.lateral, record.flh.height],
+        [90, 0, 40]
+    );
+}
+
+#[test]
+fn authored_upgrade_attack_uses_fixed_slots_and_live_target() {
+    //44B2C6/712130: shared records or a bursting Secondary admit the fixed
+    //0->1 pair. A real level-two install leaves slot0 null and instead takes
+    //the ordinary single selected-weapon path. Each goes through real frames
+    //and the existing FireAt receiver, including the first shot's rearm.
+    //FireOnce clears the live target before the second call can reach it.
+    for (upgrade_keys, weapon_sections, expected, slot_zero_hole) in [
+        (
+            "Secondary=Vulcan2\n",
+            "",
+            &["Vulcan2", "Vulcan2"][..],
+            false,
+        ),
+        (
+            "Secondary=105mm\n",
+            "[105mm]\nBurst=2\n",
+            &["Vulcan2", "105mm"][..],
+            false,
+        ),
+        (
+            "PowersUpToLevel=2\nSecondary=Vulcan2\n",
+            "",
+            &["Vulcan2"][..],
+            true,
+        ),
+        (
+            "Secondary=Vulcan2\n",
+            "[Vulcan2]\nFireOnce=yes\n",
+            &["Vulcan2"][..],
+            false,
+        ),
+        ("", "[Vulcan2]\nBurst=2\n", &["Vulcan2"][..], false),
+    ] {
+        let Some((mut sim, rules, target)) =
+            authored_retail_upgrade_scene(upgrade_keys, weapon_sections)
+        else {
+            return;
+        };
+        assert_eq!(
+            sim.substrate
+                .entities
+                .get(1)
+                .unwrap()
+                .building_upgrades()
+                .types()[0]
+                .is_none(),
+            slot_zero_hole,
+        );
+        let mut fired = false;
+        for frame in 1..=360 {
+            sim.session.set_binary_frame_for_test(frame);
+            let output = sim
+                .advance_app_frame(
+                    &[],
+                    &rules,
+                    None,
+                    33,
+                    crate::sim::world::TickLane::Ordinary,
+                    FrameEffects::default(),
+                )
+                .unwrap();
+            let shots: Vec<_> = output
+                .fire_events
+                .iter()
+                .filter(|event| event.attacker_id == 1)
+                .collect();
+            if shots.is_empty() {
+                continue;
+            }
+            assert_eq!(
+                shots
+                    .iter()
+                    .map(|event| sim.interner.resolve(event.weapon_id))
+                    .collect::<Vec<_>>(),
+                expected,
+                "{upgrade_keys}",
+            );
+            assert!(
+                shots
+                    .iter()
+                    .all(|event| event.target == crate::sim::combat::TargetKind::Entity(target))
+            );
+            assert_eq!(shots[0].fire_coord.z, 40);
+            if rules.object("GAPILL").unwrap().secondary().is_none() {
+                //712130's Primary.Burst arm still calls the empty second
+                //weapon; FireAt's null-weapon return must keep TarCom.
+                assert_eq!(
+                    sim.substrate
+                        .entities
+                        .get(1)
+                        .unwrap()
+                        .attack_target
+                        .target(),
+                    Some(crate::sim::combat::TargetKind::Entity(target)),
+                );
+            }
+            assert!(
+                sim.substrate
+                    .entities
+                    .get(1)
+                    .unwrap()
+                    .rearm_timer
+                    .remaining(frame as i32)
+                    > 0
+            );
+            fired = true;
+            break;
+        }
+        assert!(
+            fired,
+            "the admitted upgrade must reach its firing arm: {upgrade_keys}"
+        );
+    }
+}
+
 #[test]
 fn techno_constructor_authored_upgrades_consume_temporaries_with_native_ids() {
     let seed = 0xC701_0005;
@@ -2801,6 +3073,61 @@ fn a_building_s_ai_repair_byte_follows_its_map_line_or_its_computer_owner() {
             "game mode {game_mode_nonzero}, {owner}, field {field}"
         );
     }
+}
+
+/// The real map reader's Unit line reaches the shared component installer,
+/// which attaches the type's `AttachEffect.AttachTypes` list: each catalog
+/// name once, paired with its index's `DurationOverrides`/`Delays` and the
+/// documented defaults for an absent list.
+#[cfg(feature = "phobos")]
+#[test]
+fn map_spawn_attaches_the_type_attach_effect_list() {
+    use crate::map::entities::parse_map_entities;
+
+    let rules = RuleSet::from_ini(&IniFile::from_str(
+        "[AttachEffectTypes]\n0=ARMOR\n1=SPEEDUP\n\n\
+         [ARMOR]\nDuration=40\n\n\
+         [SPEEDUP]\nDuration=60\n\n\
+         [VehicleTypes]\n0=MTNK\n\n\
+         [MTNK]\nName=Apocalypse\nStrength=300\nSpeed=6\n\
+         AttachEffect.AttachTypes=ARMOR,SPEEDUP,MISSING\n\
+         AttachEffect.DurationOverrides=12,0\n\
+         AttachEffect.Delays=5,7\n\
+         AttachEffect.InitialDelays=3\n",
+    ))
+    .expect("attach effect rules");
+    let placements = parse_map_entities(&IniFile::from_str(
+        "[Units]\n0=Americans,MTNK,256,30,40,0,Guard,None\n",
+    ));
+    assert_eq!(placements.len(), 1, "the map reader keeps the Unit line");
+
+    let mut sim = Simulation::with_seed(0xAE6);
+    install_american_house(&mut sim);
+    assert_eq!(sim.spawn_from_map(&placements, Some(&rules)), 1);
+    let entity = sim
+        .substrate
+        .entities
+        .values()
+        .next()
+        .expect("spawned unit");
+    let instances = entity.phobos_attach_effects().instances();
+    assert_eq!(instances.len(), 2, "only catalog names attach");
+    assert_eq!(instances[0].type_index, 0, "ARMOR keeps its list index");
+    assert_eq!(
+        instances[0].remaining(),
+        12,
+        "index 0 takes its DurationOverrides entry"
+    );
+    assert_eq!(instances[1].type_index, 1, "SPEEDUP keeps its list index");
+    assert_eq!(
+        instances[1].remaining(),
+        60,
+        "a zero override keeps the type's Duration"
+    );
+    assert!(
+        !instances[0].is_active(true),
+        "InitialDelays=3 holds the effect inactive until its first AI frames"
+    );
 }
 
 #[path = "country_veterancy_tests.rs"]

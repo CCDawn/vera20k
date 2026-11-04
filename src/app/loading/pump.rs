@@ -301,10 +301,17 @@ pub(crate) struct LoadingRequest {
 }
 
 impl LoadingRequest {
-    pub(crate) fn replay(startup: &crate::sim::replay::ReplayStartup) -> Self {
+    pub(crate) fn replay(
+        startup: &crate::sim::replay::ReplayStartup,
+        map_beside: Option<&str>,
+    ) -> Self {
+        let mut session = startup.launch_session().clone();
+        if let Some(map) = map_beside {
+            session.selected_map_file = Some(map.to_owned());
+        }
         Self {
             startup: LoadingStartup::Replay {
-                session: startup.launch_session().clone(),
+                session,
                 game_mode: startup.game_mode(),
                 native_id_prefix: startup
                     .native_id_prefix()
@@ -677,6 +684,7 @@ impl LoadingSession {
             native,
             job,
             next_frame: NextLoadingFrame::Later,
+            install_after_ms: None,
         }
     }
 
@@ -938,9 +946,22 @@ pub(crate) struct LoadingSession {
     /// nothing else reaches the screen until the loading screen's first
     /// repaint. Generic sessions start at their first frame.
     next_frame: NextLoadingFrame,
+    /// VERA-only: once every player has loaded, a network match keeps its
+    /// loading screen up until this wall-clock time
+    /// ([`NETWORK_LOADED_HOLD_MS`]) before installing the scenario.
+    install_after_ms: Option<u64>,
 }
 
+/// How long a network match's loading screen stays up after every player
+/// has loaded. Presentation only: the match starts from the same state.
+const NETWORK_LOADED_HOLD_MS: u64 = 2_000;
+
 impl LoadingSession {
+    /// Whether the loaded screen still holds at `now_ms`.
+    fn holds_loaded_screen(&self, now_ms: u64) -> bool {
+        self.install_after_ms.is_some_and(|after| now_ms < after)
+    }
+
     fn retire(mut self, assets: &mut crate::app::process_assets::ProcessAssets) {
         #[cfg(feature = "ares")]
         if let LoadingStage::Prepared(prepared) = &mut self.stage {
@@ -1026,6 +1047,7 @@ impl LoadingSession {
             },
             native,
             job: LoadingJob::new(),
+            install_after_ms: None,
         }
     }
 }
@@ -1239,6 +1261,17 @@ pub(crate) fn cancel_network_loading(state: &mut AppState, text: &str) -> bool {
         LoadingFailurePolicy::RetryNetworkShell,
         anyhow::anyhow!(text.to_owned()),
     );
+    // The failure has reopened the lobby. Native returns without a word;
+    // VERA's lobbies say why the load stopped.
+    if !state.frontend.native_shell_ui && !state.frontend.external_launch {
+        crate::app::shell_lan::append_chat(
+            state,
+            crate::ui::lan_shell::LanChatLine {
+                text: text.encode_utf16().collect(),
+                color: u32::MAX,
+            },
+        );
+    }
     true
 }
 
@@ -1907,6 +1940,7 @@ fn pump_loading_after_present(
                     shared_cell_dummy,
                     tile_variant_selector_cache,
                     &mut progress.sink,
+                    state.persistence.options_profile.house_color_strength,
                 )
                 .map(Some)
             } else {
@@ -1930,6 +1964,7 @@ fn pump_loading_after_present(
                     shared_cell_dummy,
                     tile_variant_selector_cache,
                     progress: &mut progress.sink,
+                    house_color_strength: state.persistence.options_profile.house_color_strength,
                 })?;
                 if result.is_none() {
                     continuing = Some(load);
@@ -1973,6 +2008,7 @@ fn pump_loading_after_present(
                 native,
                 job,
                 next_frame: NextLoadingFrame::Later,
+                install_after_ms: None,
             });
             LoadingPump::Pending
         }
@@ -1985,10 +2021,15 @@ fn pump_loading_after_present(
                     native,
                     job,
                     next_frame: NextLoadingFrame::Later,
+                    install_after_ms: None,
                 });
                 return Ok(LoadingPump::Pending);
             }
-            if matches!(result.scenario.startup, LoadingStartup::Network(_)) {
+            // VERA adaptation: a returning process has nobody to wait for, the
+            // others left their own loading long ago and report nothing more.
+            if matches!(result.scenario.startup, LoadingStartup::Network(_))
+                && !crate::app::lan_service::online_restore(state)
+            {
                 let native = native.expect("network load retains its source progress rows");
                 let now = (crate::app::match_runtime::frame_pacer::wall_clock_ms() >> 4) as i32;
                 let wait =
@@ -2005,6 +2046,7 @@ fn pump_loading_after_present(
                         native: Some(native),
                         job,
                         next_frame: NextLoadingFrame::Later,
+                        install_after_ms: None,
                     },
                     observer,
                 );
@@ -2093,6 +2135,7 @@ fn pump_map_construction(
             shared_cell_dummy,
             tile_variant_selector_cache,
             progress: &mut progress.sink,
+            house_color_strength: state.persistence.options_profile.house_color_strength,
         })
     })();
     match step {
@@ -2372,6 +2415,12 @@ fn poll_network_load_wait(
             unreachable!()
         };
         session.stage = LoadingStage::ReadyToInstall { result };
+        // Captures keep their timing; players see the full bar a moment.
+        if state.platform.capture_client_size.is_none() {
+            session.install_after_ms = Some(
+                crate::app::match_runtime::frame_pacer::wall_clock_ms() + NETWORK_LOADED_HOLD_MS,
+            );
+        }
         return finish_network_load(state, session, observer);
     }
     if poll == NetworkLoadPoll::TimedOut {
@@ -2399,6 +2448,10 @@ fn finish_network_load(
     let Some(session) = service_network_loading_boundary(state, session) else {
         return Ok(LoadingPump::Pending);
     };
+    if session.holds_loaded_screen(crate::app::match_runtime::frame_pacer::wall_clock_ms()) {
+        state.frontend.loading_session = Some(session);
+        return Ok(LoadingPump::Pending);
+    }
     if let Some(observer) = observer
         && let Some(view) = session.network_observation(
             "ready_to_install",
@@ -2455,6 +2508,7 @@ fn prepare_loading_session(
         mut native,
         mut job,
         next_frame,
+        install_after_ms,
     } = session;
     let stage = match stage {
         stage @ (LoadingStage::ConstructingScenario(_)
@@ -2558,6 +2612,7 @@ fn prepare_loading_session(
         native,
         job,
         next_frame,
+        install_after_ms,
     })
 }
 
@@ -3215,6 +3270,15 @@ fn apply_network_loading_disconnects(
     indices: &[usize],
 ) -> Vec<crate::app::match_runtime::network_match::ConnectionDestroyed> {
     use crate::app::match_runtime::network_match::{ConnectionError, destroy_connection};
+    // VERA online adaptation: the relay certificate fixes an online match's
+    // sources, and the relay departs a player who never becomes ready in the
+    // first frame for every client. A local disconnect would leave this
+    // client's roster short of that certificate.
+    if session.network_return_context()
+        == Some(crate::app::match_runtime::session::NetworkReturnContext::Wol)
+    {
+        return Vec::new();
+    }
     let Some(sim) = result.scenario.simulation.as_mut() else {
         // No House array to consult: the connections still drop.
         for &index in indices {
@@ -3287,50 +3351,44 @@ pub(crate) fn next_native_loading_frame(state: &AppState) -> Option<NextLoadingF
 /// The retained B7 browser is not painted or mutated, so failure can redraw it.
 /// The dialog paints no pointer; the window's own stays as the frame owner
 /// last set it, hidden wherever mouse.sha loaded.
-pub(crate) fn present_saved_game_loading(state: &mut AppState) {
+pub(crate) fn present_saved_game_loading(state: &mut AppState) -> anyhow::Result<bool> {
     if !crate::app::App::ensure_skirmish_shell_chrome(state) {
-        log::warn!("Saved-game loading dialog has no shell chrome");
-        return;
+        anyhow::bail!("Saved-game loading dialog has no shell chrome");
     }
-    let result = (|| -> anyhow::Result<()> {
-        let Some(output) = state
-            .renderer
-            .gpu
-            .acquire_frame()
-            .map_err(|error| anyhow::anyhow!("saved-game loading surface: {error}"))?
-        else {
-            return Ok(());
-        };
-        let mut encoder =
-            state
-                .renderer
-                .gpu
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Saved Game Loading"),
-                });
-        crate::app::frontend::skirmish_shell_render::render_saved_game_loading(
-            state,
-            &mut encoder,
-            &output.texture,
-        )?;
-        state.renderer.fps_overlay.encode(
-            &state.renderer.gpu,
-            &state.renderer.batch_renderer,
-            &mut encoder,
-            &output.texture,
-        );
+    let Some(output) = state
+        .renderer
+        .gpu
+        .acquire_frame()
+        .map_err(|error| anyhow::anyhow!("saved-game loading surface: {error}"))?
+    else {
+        return Ok(false);
+    };
+    let mut encoder =
         state
             .renderer
             .gpu
-            .queue
-            .submit(std::iter::once(encoder.finish()));
-        output.present();
-        Ok(())
-    })();
-    if let Err(error) = result {
-        log::warn!("Saved-game loading dialog presentation failed: {error:#}");
-    }
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Saved Game Loading"),
+            });
+    crate::app::frontend::skirmish_shell_render::render_saved_game_loading(
+        state,
+        &mut encoder,
+        &output.texture,
+    )?;
+    state.renderer.fps_overlay.encode(
+        &state.renderer.gpu,
+        &state.renderer.batch_renderer,
+        &mut encoder,
+        &output.texture,
+    );
+    state
+        .renderer
+        .gpu
+        .queue
+        .submit(std::iter::once(encoder.finish()));
+    output.present(&state.renderer.gpu.queue);
+    Ok(true)
 }
 
 /// After the load gamemd switches to the game mode and shows black until

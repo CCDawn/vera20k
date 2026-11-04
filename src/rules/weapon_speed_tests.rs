@@ -121,7 +121,8 @@ fn full_process_speed_uses_prior_gravity_across_absent_sections_and_owner_handof
                     weapon.speed,
                     projectile.map(|projectile| LaunchSpeedProjectile {
                         rot: projectile.rot,
-                        floater: projectile.floater
+                        floater: projectile.floater,
+                        gravity: projectile.gravity()
                     }),
                     rules.general.gravity,
                     500

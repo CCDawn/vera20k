@@ -310,11 +310,25 @@ impl Simulation {
                     .map(|value| value.map(str::to_owned))
                     .unwrap_or_else(|| rules.general.engineer_infantry.clone());
             }
-            ares_techno_crew_type(scenario_rng, rules, entity, object, house, interner)
+            ares_techno_crew_type(
+                scenario_rng,
+                rules,
+                entity,
+                object,
+                house,
+                interner,
+                &substrate.entities,
+            )
         }
         #[cfg(not(feature = "ares"))]
         {
-            let armed = crate::sim::combat::combat_weapon::is_armed(entity, object);
+            let armed = crate::sim::combat::combat_weapon::is_armed(
+                entity,
+                object,
+                &substrate.entities,
+                rules,
+                interner,
+            );
             if !captured && scenario_rng.next_range_u32_inclusive(0, 99) < 25 && yard {
                 return rules.general.engineer_infantry.clone();
             }
@@ -503,14 +517,10 @@ impl Simulation {
             sim.scatter_crew(rules, registry, id, effects);
 
             // `HouseClass::IsAlliedWith(object) @ 0x004F9AF0` on the building owner.
-            let owner_name = sim.interner.resolve(owner);
             let enemy_planter = c4_source.filter(|&planter| {
                 sim.substrate.entities.get(planter).is_some_and(|planter| {
-                    !crate::map::houses::is_allied_with(
-                        sim.house_alliances.as_map(),
-                        owner_name,
-                        sim.interner.resolve(planter.owner()),
-                    )
+                    !sim.house_alliances
+                        .is_allied(&sim.interner, owner, planter.owner())
                 })
             });
             let mission = if enemy_planter.is_some() {
@@ -750,7 +760,13 @@ impl Simulation {
             return;
         }
         let owner = entity.owner();
-        let armed = crate::sim::combat::combat_weapon::is_armed(entity, object);
+        let armed = crate::sim::combat::combat_weapon::is_armed(
+            entity,
+            object,
+            &self.substrate.entities,
+            rules,
+            &self.interner,
+        );
         let on_bridge = entity.on_bridge();
         let position = entity.position;
         let Some(side) = self.houses.get(&owner).map(|house| house.side_index()) else {
@@ -1420,6 +1436,7 @@ fn ares_techno_crew_type(
     object: &crate::rules::object_type::ObjectType,
     house: &crate::sim::house_state::HouseState,
     interner: &StringInterner,
+    entities: &crate::sim::entity_store::EntityStore,
 ) -> Option<String> {
     if !object.crewed {
         return None;
@@ -1441,7 +1458,9 @@ fn ares_techno_crew_type(
     let chance = object.crew_rules().technician_chance().unwrap_or_else(|| {
         if entity.category().is_foot() {
             0
-        } else if crate::sim::combat::combat_weapon::is_armed(entity, object) {
+        } else if crate::sim::combat::combat_weapon::is_armed(
+            entity, object, entities, rules, interner,
+        ) {
             15
         } else {
             0

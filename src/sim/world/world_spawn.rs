@@ -386,8 +386,20 @@ impl Simulation {
         self.begin_phobos_map_objects();
         let result = self.with_object_placement_scope(|sim| {
             let mut count: u32 = 0;
+            let mut follows = Vec::new();
+            let mut unit_reader_finished = false;
 
             for (entity_index, map_ent) in entities.iter().enumerate() {
+                // Full_Init687AA7 completes UnitReadINI743664 before entering
+                // Aircraft41B110. Generated rows preconsume construction and
+                // do not run this authored Unit reader a second time.
+                if generated_inits.is_none()
+                    && !unit_reader_finished
+                    && map_ent.category != EntityCategory::Unit
+                {
+                    sim.link_authored_unit_followers(&follows);
+                    unit_reader_finished = true;
+                }
                 let Some(owner) = sim.map_entity_owner_before_constructor(
                     map_ent,
                     rules,
@@ -539,6 +551,15 @@ impl Simulation {
                     .author_recruitable(map_ent.recruitable_a, map_ent.recruitable_b);
                 // gamemd.exe Unit7434CA/Aircraft41B33D/Infantry51FD89, before Unlimbo.
                 ge.assign_object_group(map_ent.group);
+                // UnitReadINI74351B..743575 appends before Unlimbo. A failed
+                // placement deletes its Unit but retains this vector entry,
+                // shifting later Unit-array pairings in the final pass.
+                if generated_inits.is_none()
+                    && map_ent.category == EntityCategory::Unit
+                    && let Some(index) = map_ent.follows
+                {
+                    follows.push(index);
+                }
 
                 Self::install_techno_components(&mut sim.interner, &sim.session, &sim.houses,
                     &mut ge,
@@ -636,12 +657,49 @@ impl Simulation {
                 }
             }
 
+            if generated_inits.is_none() && !unit_reader_finished {
+                sim.link_authored_unit_followers(&follows);
+            }
             log::info!("Spawned {} entities", count);
             Ok(count)
         });
         #[cfg(feature = "phobos")]
         self.finish_phobos_map_objects();
         result
+    }
+
+    /// UnitClass::ReadINI743664..7436AA (original gamemd instructions): pair
+    /// initialized operands with the surviving Unit array, not with map keys
+    /// or successful rows. There are no callbacks inside this post-read pass.
+    fn link_authored_unit_followers(&mut self, follows: &[i32]) {
+        let units: Vec<_> = self.substrate.entities.unit_registry_ids().collect();
+        for (&id, &index) in units.iter().zip(follows) {
+            let peer = usize::try_from(index)
+                .ok()
+                .and_then(|index| units.get(index))
+                .copied();
+            self.substrate
+                .entities
+                .get_mut(id)
+                .unwrap()
+                .set_unit_follower(peer);
+            if let Some(peer) = peer {
+                self.substrate
+                    .entities
+                    .get_mut(peer)
+                    .unwrap()
+                    .set_is_unit_follower(true);
+            }
+        }
+        if follows.len() < units.len() {
+            // Native indexes uninitialized backing memory for a short line;
+            // keep the unmatched constructor state and report that boundary.
+            log::warn!(
+                "UnitReadINI743664 has {} Units but only {} initialized FOLLOWS operands; unmatched native reads are unsupported",
+                units.len(),
+                follows.len()
+            );
+        }
     }
 
     fn map_entity_owner_before_constructor(
@@ -656,9 +714,15 @@ impl Simulation {
             // Only BuildingReadINI44F8CB..44F8DB compares the current House
             // in nonzero modes, before resolving Type or entering its ctor.
             // Native controls: input_oracle/campaign_house_names.
+            // VERA network adaptation: PlayerPtr differs per client, so a map
+            // owner naming a human ("<human player>" in LAN, a WOL handle)
+            // dropped the structure on that human's peer alone. A network game
+            // keeps it on every peer, answering as if there were no local
+            // player, as HasOccurred53 does. No retail map gives a human one.
             let owner = Self::scenario_house_named(&self.houses, &map_ent.owner)?;
             if map_ent.category == EntityCategory::Structure
                 && self.session.game_mode_nonzero()
+                && !self.session.game_mode().is_network()
                 && self.session.current_house() == Some(owner)
             {
                 return None;
@@ -2373,11 +2437,43 @@ impl Simulation {
     /// type can stand at its origin turns to the type's `DeployFacing=` or,
     /// already facing it, becomes that building. False when it refuses.
     ///
-    /// Not carried over to the building: the unit's Group (`+0x214`,
-    /// `0x007397C6`; VERA's control groups live in the app), its AttachedTag
+    /// Not carried over to the building: the unit's AttachedTag
     /// (`+0x34`, `0x007399EE`), its looping sound handles (`+0x4DC..+0x4F4`,
     /// `0x00739971`), `DiscoveredBy(owner)` (vt+0x198, `0x00739848`) and the
     /// turret facing a `+0x16CA`/`+0x16C4` type starts at (`0x007397FB`).
+    /// Phobos `TechnoExt::SyncInvulnerability` (`Techno/Body.cpp:156`): a
+    /// deploy or undeploy conversion carries an active curtain to the new
+    /// object when the source type's `KeptOnDeploy` (else its global) allows
+    /// it. The copied state keeps the timer, kind and tint stage;
+    /// `IronTintTimer` restarts, as Phobos copies only those fields.
+    #[cfg(feature = "phobos")]
+    fn curtain_to_carry(
+        &self,
+        from: u64,
+        rules: &RuleSet,
+    ) -> Option<crate::sim::superweapon::invulnerability::InvulnerabilityState> {
+        use crate::sim::superweapon::invulnerability::InvulnKind;
+        let source = self.substrate.entities.get(from)?;
+        let frame = self.session.binary_frame() as i32;
+        let state = source
+            .invulnerability
+            .as_ref()
+            .filter(|state| state.is_active(frame))?;
+        let object = self.interner.object_type(source.type_ref(), rules)?;
+        let globals = rules.invulnerability_globals();
+        let (kept, fallback) = match state.kind() {
+            InvulnKind::IronCurtain => (
+                object.phobos_invulnerability.iron_curtain.kept_on_deploy,
+                globals.iron_curtain.kept_on_deploy,
+            ),
+            InvulnKind::ForceShield => (
+                object.phobos_invulnerability.force_shield.kept_on_deploy,
+                globals.force_shield.kept_on_deploy,
+            ),
+        };
+        kept.unwrap_or(fallback).then(|| state.synced())
+    }
+
     pub(crate) fn deploy_mcv(
         &mut self,
         stable_id: u64,
@@ -2428,7 +2524,7 @@ impl Simulation {
                 (
                     entity.selection.is_selected(),
                     entity.veterancy.clone(),
-                    entity.object_group(),
+                    entity.object_group_copy(),
                     entity.attack_target.target(),
                 ),
                 // Native rounds FacingClass::Current, including wrap at 0xff80.
@@ -2642,6 +2738,10 @@ impl Simulation {
         // slot initialization. Otherwise full-health animations consume IDs/RNG
         // here and ActuallyPlaced suppresses the real completion callback.
         converted_health.apply(&mut destination);
+        #[cfg(feature = "phobos")]
+        {
+            destination.invulnerability = self.curtain_to_carry(stable_id, rules);
+        }
         // RESIDUAL: native Selects the placed building (vt+0x14C,
         // `0x007399D4`) after its Unlimbo with the voice latch cleared
         // (`0x007399BD`) and before the MCV's tag moves over (`0x007399F8`),
@@ -2719,7 +2819,7 @@ impl Simulation {
         }
         // gamemd.exe UnitClass::Deploy7393C0 copies Techno+214 at7397CC.
         if let Some(building) = self.substrate.entities.get_mut(new_sid) {
-            building.assign_object_group(source_group);
+            building.assign_object_group_copy(source_group);
         }
         // 0x007397D2..0x007397DE: the unit's veterancy (`+0x150`); the rank
         // cache (`+0x13C`) stays the building's own.
@@ -2880,8 +2980,7 @@ impl Simulation {
     /// class setter `vt+0x480(archive, 1)` and `Queue_Mission(Move, 0)`
     /// (`0x0044A091..0x0044A0AE`), and the listed attackers target the unit
     /// (`0x0044A146..0x0044A167`). The building's UnInit comes last. Not
-    /// carried over: its Group (`+0x214`, `0x0044A04C`; VERA's control groups
-    /// live in the app), AttachedTag (`+0x34`, `0x0044A0B4`) and looping sound
+    /// carried over: its AttachedTag (`+0x34`, `0x0044A0B4`) and looping sound
     /// handles (`+0x4DC..+0x4F4`). A refused Unit Unlimbo refunds the cached
     /// building value to its current owner and retains the limbo constructor
     /// (`0x0044A16B..0x0044A176`).
@@ -2929,7 +3028,7 @@ impl Simulation {
                     health,
                     building.archive_target(),
                     building.veterancy.clone(),
-                    building.object_group(),
+                    building.object_group_copy(),
                 ))
             })
         else {
@@ -2955,6 +3054,12 @@ impl Simulation {
                 super::UninitContext::new(rules, overlay_registry).with_effects(frame_effects),
             );
             return;
+        };
+        #[cfg(feature = "phobos")]
+        let unit = {
+            let mut unit = unit;
+            unit.invulnerability = self.curtain_to_carry(sid, rules);
+            unit
         };
         let (new_sid, position) = self.store_with_constructor_managers(unit, rules, frame_effects);
         // Selling449E74/449E80 caches the building's refund before its Limbo
@@ -3027,7 +3132,7 @@ impl Simulation {
                 unit.selection.select();
             }
             // gamemd.exe BuildingClass::Mission_Selling copies +214 at44A052.
-            unit.assign_object_group(source_group);
+            unit.assign_object_group_copy(source_group);
             // The VeterancyClass (`+0x150`); the rank cache (`+0x13C`) stays
             // the unit's own.
             unit.veterancy.inherit(&veterancy);

@@ -296,7 +296,7 @@ impl LiveRoundFlow {
             frame,
             "Second actual authenticated lobby admitted; ordinary Back clicked for final logout",
         );
-        self.phase = RoundPhase::ExitWelcome;
+        self.phase = RoundPhase::ExitSignIn;
         Ok(())
     }
 }

@@ -273,6 +273,8 @@ fn failed_reanchor_on_guard_lifts_the_stock_unit_and_survives_save() {
             .same_identity(&control_dummy)
     );
     sim.scenario_rng = crate::sim::rng::SimRng::new(0);
+    // Player load clears planning tokens (6370B0 / 70BF79).
+    sim.reset_planning_after_player_load();
     for id in sim.substrate.entities.keys_sorted() {
         sim.substrate.restore_move_sound_state_after_load(id);
     }

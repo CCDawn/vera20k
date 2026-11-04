@@ -24,6 +24,15 @@ impl Fixture {
         let coil = sim
             .spawn_object("TESLA", "Americans", 12, 12, 0, &rules)
             .unwrap();
+        // The arena's GameMode 0 makes human Americans a controlled campaign
+        // House, whose power scan admits only discovered buildings (508CC7).
+        // Supply that discovered coil; the admission is tested separately.
+        sim.substrate
+            .entities
+            .get_mut(coil)
+            .unwrap()
+            .discovery
+            .set_discovered_by_current_house_for_test(true);
         let troopers = std::array::from_fn(|i| {
             sim.spawn_object("SHK", "Americans", 11, 12 + i as u16, 0, &rules)
                 .unwrap()
@@ -178,7 +187,7 @@ fn retail_electric_assault_enables_the_coils_overpowered_weapon() {
         &f.sim,
         &f.sim.interner,
         f.sim.resolved_terrain.as_ref(),
-        Some(f.sim.house_alliances.as_map()),
+        Some(&f.sim.house_alliances),
     )
     .unwrap();
     assert_eq!(

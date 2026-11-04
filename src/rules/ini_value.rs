@@ -656,7 +656,11 @@ impl IniSection {
     /// `<none>` clear the value; absent, empty and rejected reads retain it.
     /// Source: Phobos b90ab4bc, Utilities/TemplateDef.h:1878..1892,
     /// Utilities/Template.h (`allowNone=false`) and Phobos.h (`readLength`).
-    /// `read_string_with` retains the ordered passes in a projected section.
+    /// `none`/`<none>` are exactly what `INIClass::IsBlank` accepts (YRpp
+    /// `CCINIClass.h`: case-insensitive equality with those two literals, the
+    /// tokens the type factories also answer null for); empty text never
+    /// reaches it because `ReadString` returns zero. `read_string_with`
+    /// retains the ordered passes in a projected section.
     pub(crate) fn read_phobos_nullable_with<T>(
         &self,
         key: &str,
@@ -708,6 +712,28 @@ impl IniSection {
         self.read_phobos_nullable_with(key, current, parse_ares_int)
     }
 
+    /// Phobos `Valueable<ColorStruct>` (`INI_EX::Read3Bytes`, then
+    /// `Parser<BYTE,3>` at `src/Utilities/TemplateDef.h`): a comma-separated
+    /// `R,G,B` needs all three channels inside `0..=255`. Absent, empty and
+    /// rejected text keep the current color.
+    #[cfg(feature = "phobos")]
+    pub(crate) fn read_phobos_color(&self, key: &str, current: [u8; 3]) -> [u8; 3] {
+        self.read_string_with(key, 2048, current, |current, raw| {
+            parse_phobos_color(raw).unwrap_or(current)
+        })
+    }
+
+    /// Phobos `Nullable<ColorStruct>`: the clearing tokens of
+    /// [`Self::read_phobos_nullable_with`], then [`parse_phobos_color`].
+    #[cfg(feature = "phobos")]
+    pub(crate) fn read_phobos_nullable_color(
+        &self,
+        key: &str,
+        current: Option<[u8; 3]>,
+    ) -> Option<[u8; 3]> {
+        self.read_phobos_nullable_with(key, current, parse_phobos_color)
+    }
+
     pub fn read_phobos_nullable_bool(&self, key: &str, current: Option<bool>) -> Option<bool> {
         self.read_phobos_nullable_with(key, current, read_bool_decision)
     }
@@ -725,6 +751,19 @@ impl IniSection {
     pub fn read_phobos_double(&self, key: &str, current: f64) -> f64 {
         self.read_string_with(key, 2048, current, |current, raw| {
             parse_phobos_double(raw).unwrap_or(current)
+        })
+    }
+
+    /// Phobos `read<Leptons>` (`Utilities/TemplateDef.h`): `ReadDouble` in
+    /// cells, then `Game::F2I(cells * Unsorted::LeptonsPerCell)`. The
+    /// `Valueable<Leptons>` field keeps its current leptons on a failed read.
+    pub fn read_phobos_leptons(&self, key: &str, current: i32) -> i32 {
+        self.read_string_with(key, 2048, current, |current, raw| {
+            parse_phobos_double(raw).map_or(current, |cells| {
+                crate::util::native_x87::X87Chop53::ftol_f64_low_masked(
+                    cells * f64::from(crate::util::lepton::LEPTONS_PER_CELL_I32),
+                )
+            })
         })
     }
 
@@ -1790,7 +1829,7 @@ fn parse_ares_double_bits(value: &str) -> Option<NativeF64Bits> {
 }
 
 /// The single Ares Parser<int> core, also used by compound int/bool readers.
-fn parse_ares_int(value: &str) -> Option<i32> {
+pub(crate) fn parse_ares_int(value: &str) -> Option<i32> {
     if let Some(decimal) = value.strip_prefix('$') {
         scan_decimal_i32(&mut decimal.as_bytes())
     } else if value
@@ -1802,6 +1841,17 @@ fn parse_ares_int(value: &str) -> Option<i32> {
     } else {
         scan_decimal_i32(&mut value.as_bytes())
     }
+}
+
+/// Phobos `Parser<BYTE,3>::Parse`: three comma-separated channels, each
+/// converted with the `BYTE` scan that rejects values above 255. All three
+/// must convert; otherwise no color is produced.
+#[cfg(feature = "phobos")]
+fn parse_phobos_color(value: &str) -> Option<[u8; 3]> {
+    let mut channels = [0i32; 3];
+    (scan_int_fields(value, &mut channels) == 3
+        && channels.iter().all(|channel| (0..=255).contains(channel)))
+    .then(|| channels.map(|channel| channel as u8))
 }
 
 /// `MultiParser<int>::Parse(pValue, outValue, count)`: for each slot skip the

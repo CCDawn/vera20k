@@ -181,6 +181,11 @@ fn assert_shp_light(
             camera: [screen.0 - 400.0, screen.1 - 300.0],
             render_size: [800, 600],
             zoom: 1.0,
+            building_viewport: crate::app::presentation::render::tactical_world_viewport(
+                [screen.0 - 400.0, screen.1 - 300.0],
+                [0, 0, 800, 600],
+                None,
+            ),
             axis: crate::render::batch::DepthAxis {
                 origin_y: 0.0,
                 world_height: 10_000.0,

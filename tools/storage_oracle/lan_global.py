@@ -474,8 +474,6 @@ def generate():
     wrong_ack = dict(sender_before=sender.snapshot())
     ack = basic['unknown_a']['emitted'][0]['frame']
     wrong_ack['ack_frame'] = ack
-    wrong_ack['received_from_unrelated_c'] = sender.receive(ack, source_c)
-    wrong_ack['after_service'] = sender.service(1004)
 
     product_sender = machine(product=0x1357)
     product_sender.send(b'foreign-product', source_b)

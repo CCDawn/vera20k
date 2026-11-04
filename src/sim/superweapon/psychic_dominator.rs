@@ -319,9 +319,11 @@ fn mind_control_area(
             crate::sim::projectile::ProjectileCoord::new(x, y, z),
             general.dominator_damage,
             warhead,
+            true,
             (crate::sim::combat::RAD_NO_ATTACKER, storm_house, warhead_id),
             frame_effects,
-        );
+        )
+        .bridge_state_changed;
     }
 
     let Some(owner) = sim.psychic_dominator.owner else {

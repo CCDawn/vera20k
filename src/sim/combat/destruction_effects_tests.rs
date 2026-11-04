@@ -231,6 +231,7 @@ fn a_destroyed_building_explodes_per_foundation_cell_then_plays_its_destroy_anim
         let mut expected = Vec::new();
         for (rx, ry) in crate::sim::crew_survival::foundation_cells(10, 20, &"2x2".into()) {
             let (x, y) = super::super::inviso_scatter::random_direction_coord(
+                crate::map::cell_index::CellGrid::Retail,
                 &mut replay,
                 i32::from(rx) * 256 + 0x80,
                 i32::from(ry) * 256 + 0x80,
@@ -853,6 +854,7 @@ fn a_killed_building_draws_its_death_anims_before_its_survivors() {
         let mut expected = Vec::new();
         for &(rx, ry) in &cells {
             let (x, y) = super::super::inviso_scatter::random_direction_coord(
+                crate::map::cell_index::CellGrid::Retail,
                 &mut replay,
                 i32::from(rx) * 256 + 0x80,
                 i32::from(ry) * 256 + 0x80,

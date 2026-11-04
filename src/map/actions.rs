@@ -263,7 +263,9 @@ fn materialize_waypoint_index(param_type: Option<&str>, token_8: Option<&str>) -
 /// TAction8 binds the retained Rules.DropZoneAnim; TAction41 resolves its
 /// numeric AnimType through the same native registry as runtime construction
 /// (6E2357). TAction58 roots the two find-only meteor literals (6E2D11/1D).
-/// All use the existing scheduler closure at load and restoration.
+/// Loading binds them tolerantly, as native never fails a scenario on anim
+/// art (`AnimTypeClass::ReadINI` 0x00427D00); bound names join the scheduler
+/// closure that saved resources rebind.
 pub fn trigger_anim_class_roots(rules: &RuleSet, actions: &ActionMap) -> Vec<String> {
     actions
         .values()
@@ -501,5 +503,45 @@ mod tests {
             sim.trigger_drop_zone_flare(&rules, 1),
             "the retail asset closure admits the production constructor"
         );
+    }
+
+    #[test]
+    fn retail_map_whose_action_41_names_unbindable_art_still_loads() {
+        // Retail GAWEAP_3's LoopEnd passes its frames, so VERA cannot bind it.
+        // Native never fails a scenario on anim art; neither may the load.
+        use crate::skirmish_launch::{AiDifficulty, LaunchCountry};
+        let Some((root, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        let Some(retail) =
+            crate::rules::retail_ini_fixture::retail_battle_rules_for_map("XMP03T4.MAP")
+        else {
+            return;
+        };
+        let index = retail
+            .rules
+            .anim_type_art_read_states()
+            .iter()
+            .position(|(name, _)| name == "GAWEAP_3")
+            .unwrap();
+        let stock = assets.resolve_ref("XMP03T4.MAP").unwrap();
+        let mut map = std::str::from_utf8(&stock.bytes).unwrap().to_owned();
+        for (section, row) in [
+            ("[Triggers]", "QA41=<none>,<none>,QA41,0,1,1,1,0".to_owned()),
+            ("[Events]", "QA41=1,13,0,0".to_owned()),
+            ("[Actions]", format!("QA41=1,41,0,{index},0,0,0,0,A")),
+            ("[Tags]", "QA41_TAG=0,QA41,QA41".to_owned()),
+        ] {
+            map = map.replacen(section, &format!("{section}\n{row}"), 1);
+        }
+        let directory = crate::map::source::test_support::TestDirectory::new("action41-art");
+        directory.write("action41.map", map.as_bytes());
+        let path = directory.path().join("action41.map");
+        let name = path.to_str().unwrap();
+        let launch = crate::headless_scenario::battle_session(
+            name,
+            &[(LaunchCountry::Russia, AiDifficulty::Easy)],
+        );
+        crate::headless_scenario::load_session(&root, name, 41, launch).unwrap();
     }
 }

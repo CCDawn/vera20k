@@ -303,10 +303,16 @@ impl SubtitleTrack {
 
     /// `0x006C9C60` after BinkDoFrame of the one-based Bink `frame`.
     pub(crate) fn advance(&mut self, frame: u32) {
+        self.advance_with(frame, |_| {});
+    }
+
+    /// `0x006C9C96`: radar movies deliver every due cue to their HUD callback.
+    pub(crate) fn advance_with(&mut self, frame: u32, mut on_cue: impl FnMut(&Subtitle)) {
         let now = frame.wrapping_mul(self.ticks_per_frame);
         while self.cues.get(self.next).is_some_and(|cue| cue.time <= now) {
             self.shown = Some(self.next);
             self.next += 1;
+            on_cue(&self.cues[self.next - 1]);
         }
         if self
             .shown()
@@ -399,6 +405,48 @@ mod tests {
         // Hidden once time + duration has passed, before any later cue.
         track.advance(11);
         assert!(track.shown().is_none());
+    }
+
+    #[test]
+    fn callbacks_deliver_preload_and_catchup_cues_once() {
+        let cue = |time, text: &str| Subtitle {
+            time,
+            duration: 4,
+            text: Some(text.to_owned()),
+            ..Subtitle::default()
+        };
+        let mut track = SubtitleTrack::new(
+            vec![cue(0, "first"), cue(8, "second"), cue(8, "third")],
+            15,
+            1,
+        )
+        .unwrap();
+        let mut delivered = Vec::new();
+        track.advance_with(1, |cue| delivered.push(cue.text.clone().unwrap()));
+        track.advance_with(1, |cue| delivered.push(cue.text.clone().unwrap()));
+        assert_eq!(delivered, ["first"]);
+        track.advance_with(3, |cue| delivered.push(cue.text.clone().unwrap()));
+        assert_eq!(delivered, ["first", "second", "third"]);
+        assert!(
+            track.shown().is_none(),
+            "expired video overlays still deliver HUD cues"
+        );
+        track.advance_with(3, |_| panic!("same frame must not repost"));
+    }
+
+    #[test]
+    fn replay_starts_a_fresh_callback_cursor_and_no_cues_stay_disabled() {
+        let bytes = file("BeginMovie RADAR\n<Time=00:00:00:00, Text=\"test\">\nEndMovie");
+        for _ in 0..2 {
+            let mut track =
+                SubtitleTrack::new(movie_subtitles(&bytes, "RADAR").unwrap(), 15, 1).unwrap();
+            let mut delivered = 0;
+            track.advance_with(1, |_| delivered += 1);
+            track.advance_with(2, |_| delivered += 1);
+            assert_eq!(delivered, 1);
+        }
+        assert!(movie_subtitles(&bytes, "NO_SUBTITLES").is_none());
+        assert!(movie_subtitles(&file(""), "RADAR").is_none());
     }
 
     #[test]

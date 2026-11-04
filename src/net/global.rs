@@ -337,28 +337,30 @@ impl GlobalChannel {
             normalized_source.set_port(source_port_override);
         }
         if frame[2] == 2 {
-            // Original53FCF9..53FD2F deliberately does not compare source.
-            // The online adaptation has authenticated source identities:
-            // another admitted member cannot acknowledge this destination.
+            // Original53FCF9..53FD2F deliberately does not compare source, so
+            // any LAN host could cancel a direct lobby, GO or map message by
+            // guessing its sequence. VERA adaptation: a direct message needs
+            // an ACK from its destination's address; any host still answers
+            // a broadcast. The online adaptation has authenticated source
+            // identities: another admitted member cannot acknowledge this
+            // destination, and nothing acknowledges a broadcast.
             let strict = self.config.acknowledgments == GlobalAcknowledgments::AuthenticatedSource;
             let matched = self
                 .send
-                .acknowledge(incoming_sequence, strict, |destination| {
-                    if !strict {
-                        return true;
+                .acknowledge(incoming_sequence, strict, |destination| match destination {
+                    GlobalDestination::Direct { endpoint, .. } if !strict => {
+                        endpoint.ip() == source.ip()
                     }
-                    match destination {
-                        GlobalDestination::Direct {
-                            mut endpoint,
-                            port_override,
-                        } => {
-                            if port_override != 0 {
-                                endpoint.set_port(port_override);
-                            }
-                            endpoint == normalized_source
+                    GlobalDestination::Direct {
+                        mut endpoint,
+                        port_override,
+                    } => {
+                        if port_override != 0 {
+                            endpoint.set_port(port_override);
                         }
-                        GlobalDestination::Broadcast { .. } => false,
+                        endpoint == normalized_source
                     }
+                    GlobalDestination::Broadcast { .. } => !strict,
                 });
             if strict && !matched {
                 return Err(GlobalReceiveError::UnmatchedAcknowledgment);

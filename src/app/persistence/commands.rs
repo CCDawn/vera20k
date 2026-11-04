@@ -389,15 +389,78 @@ pub(crate) fn quickload(state: &mut AppState) {
             return;
         }
     };
-    load_save_file(state, &path);
+    request_saved_game_load(state, path);
 }
 
-/// Load a save file by path. Used by both quickload and the save/load panel.
-#[cfg(feature = "dev-overlays")]
-pub(crate) fn load_save_file(state: &mut AppState, path: &std::path::Path) {
-    if let Err(error) = try_load_save_file(state, path) {
-        log_prepared_load_error(path, &error);
+pub(crate) struct PendingSavedGameLoad {
+    path: PathBuf,
+    presented: bool,
+}
+
+impl PendingSavedGameLoad {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            presented: false,
+        }
     }
+
+    fn advance(&mut self, present: impl FnOnce() -> bool) -> Option<&Path> {
+        if !self.presented {
+            self.presented = present();
+            return None;
+        }
+        Some(self.path.as_path())
+    }
+}
+
+/// LoadOptions559D60 shows F0 before LoadGame67E440. Returning after that
+/// frame gives the browser a paint opportunity before synchronous restoration.
+pub(crate) fn request_saved_game_load(state: &mut AppState, path: PathBuf) {
+    if state.persistence.pending_load.is_none() {
+        state.persistence.pending_load = Some(PendingSavedGameLoad::new(path));
+        state.platform.window.request_redraw();
+    }
+}
+
+/// Called before ordinary frame service; the retained browser owns failure UI.
+pub(crate) fn pump_saved_game_load(state: &mut AppState) -> Option<bool> {
+    let mut pending = state.persistence.pending_load.take()?;
+    let Some(path) = pending.advance(|| {
+        match crate::app::loading::pump::present_saved_game_loading(state) {
+            Ok(presented) => presented,
+            Err(error) => {
+                // Like missing native progress artwork, presentation failure
+                // must not make an otherwise loadable save inaccessible.
+                log::warn!("Saved-game loading dialog presentation failed: {error:#}");
+                true
+            }
+        }
+    }) else {
+        let presented = pending.presented;
+        state.persistence.pending_load = Some(pending);
+        state.platform.window.request_redraw();
+        return Some(presented);
+    };
+    let from_menu = state.frontend.screen == crate::ui::game_screen::GameScreen::MainMenu;
+    let from_browser = state
+        .match_state
+        .match_presentation
+        .saved_game_browser
+        .is_some();
+    let result = restore_save_file(state, path);
+    if from_menu {
+        crate::app::App::finish_load_saved_game_from_menu(state, path, result);
+    } else if from_browser {
+        crate::app::App::finish_saved_game_load(state, path, result);
+    } else if let Err(error) = result {
+        #[cfg(feature = "dev-overlays")]
+        log_prepared_load_error(path, &error);
+        #[cfg(not(feature = "dev-overlays"))]
+        log::warn!("Load: {}: {error}", path.display());
+    }
+    state.platform.window.request_redraw();
+    Some(false)
 }
 
 /// Both browser routes prepare the saved world's own resources, then publish
@@ -407,13 +470,27 @@ pub(crate) fn try_load_save_file(
     state: &mut AppState,
     path: &Path,
 ) -> Result<(), crate::app::persistence::PreparedLoadError> {
+    if let Err(error) = crate::app::loading::pump::present_saved_game_loading(state) {
+        log::warn!("Saved-game loading dialog presentation failed: {error:#}");
+    }
+    restore_save_file(state, path)
+}
+
+fn restore_save_file(
+    state: &mut AppState,
+    path: &Path,
+) -> Result<(), crate::app::persistence::PreparedLoadError> {
+    // A network game offers no load; one peer swapping its world mid-match
+    // would leave the others' lockstep.
+    if state.match_state.live_network.is_some() {
+        return Err(crate::app::persistence::PreparedLoadError::NetworkMatch);
+    }
     // UI559DBC->69BB40->5BF450 precedes the lower load, including failure.
     let wall_ms = crate::app::match_runtime::frame_pacer::wall_clock_ms();
     crate::app::radar_movie::retire(state, wall_ms);
     crate::app::chrono_screen::retire(state, wall_ms);
     use crate::app::persistence::{PreparedLoadError, PreparedSavedGame, SavedGamePreparationView};
     let from_menu = state.frontend.screen == crate::ui::game_screen::GameScreen::MainMenu;
-    crate::app::loading::pump::present_saved_game_loading(state);
     let Some(mut assets) = state.process_assets.lease_for_loading() else {
         return Err(PreparedLoadError::Resources(
             "retail assets are unavailable".into(),
@@ -488,7 +565,9 @@ fn log_prepared_load_error(
         PreparedLoadError::ReadFile(source) => {
             log::warn!("Load: could not read {}: {source}", path.display())
         }
-        PreparedLoadError::MissingRules => log::warn!("Load: {error}"),
+        PreparedLoadError::MissingRules | PreparedLoadError::NetworkMatch => {
+            log::warn!("Load: {error}")
+        }
         #[cfg(test)]
         PreparedLoadError::MissingCurrentSimulation
         | PreparedLoadError::MissingMapHash
@@ -550,6 +629,27 @@ mod save_name_tests {
         let bytes = GameSnapshot::save_validated(&sim, 1, 2, &raw_description, 3);
         let header = GameSnapshot::read_header(&bytes).expect("current VERA header");
         assert_eq!(header.description, raw_description);
+    }
+}
+
+#[cfg(test)]
+mod pending_load_tests {
+    use super::PendingSavedGameLoad;
+    use std::path::PathBuf;
+
+    #[test]
+    fn restoration_waits_for_a_presented_loading_frame() {
+        for path in ["menu-save.bin", "in-game-save.sav"] {
+            let mut pending = PendingSavedGameLoad::new(PathBuf::from(path));
+            // A lost/minimized surface must retry the loading frame first.
+            assert!(pending.advance(|| false).is_none());
+            // Successful presentation still returns to the event loop.
+            assert!(pending.advance(|| true).is_none());
+            assert_eq!(
+                pending.advance(|| panic!("loading frame was already presented")),
+                Some(std::path::Path::new(path))
+            );
+        }
     }
 }
 

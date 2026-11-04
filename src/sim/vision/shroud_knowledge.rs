@@ -2,7 +2,7 @@
 //! projection. Original487630/487690/4876F0,6FB170/6FB470 and578100.
 //! Native counter arithmetic wraps; pending is not equivalent to current sight.
 use crate::sim::intern::InternedId;
-use crate::sim::state_hasher::hash_records;
+use crate::util::state_hasher::hash_records;
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 

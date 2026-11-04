@@ -454,6 +454,7 @@ impl AreaScene {
                 impact,
                 damage,
                 warhead,
+                true,
                 origin,
             );
         } else {
@@ -464,6 +465,7 @@ impl AreaScene {
                 impact,
                 damage,
                 warhead,
+                true,
                 origin,
                 FrameEffects::default(),
             );

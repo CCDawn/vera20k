@@ -196,6 +196,7 @@ pub(super) fn advance(
     super::foot_speed::owner_current_speed_from_native_fraction(
         speed,
         entity.foot_speed.native_applied_fraction(),
+        entity.phobos_speed_multiplier(),
     )
 }
 
@@ -485,6 +486,7 @@ mod tests {
             let speed = super::super::foot_speed::owner_current_speed_from_native_fraction(
                 SimFixed::from_num(type_speed * 15),
                 owner.native_applied_fraction(),
+                1.0,
             );
             assert_eq!(
                 crate::sim::movement::track_process::invocation_budget(

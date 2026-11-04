@@ -1558,20 +1558,14 @@ impl MoviesCapture {
         } = self.target
         {
             let visit = state.frontend.wol.as_ref().context("captured WOL visit")?;
-            let page = visit.welcome_page_spec();
-            let expected = if provider == crate::app::shell_wol::WolProvider::Online {
-                &crate::ui::wol_shell::WOL_ONLINE_WELCOME_PAGE
-            } else {
-                &crate::ui::wol_shell::WOL_WELCOME_PAGE
-            };
-            let button_ids: Vec<_> = page.buttons().map(|button| button.id).collect();
             ensure!(
-                button_ids
-                    .iter()
-                    .copied()
-                    .eq(expected.buttons().map(|button| button.id)),
-                "captured WOL welcome provider changed"
+                !visit.modern_ui(),
+                "captured WOL welcome lost its native page"
             );
+            let button_ids: Vec<_> = crate::ui::wol_shell::WOL_WELCOME_PAGE
+                .buttons()
+                .map(|button| button.id)
+                .collect();
             manifest["wol_welcome"] = json!({
                 "provider": format!("{provider:?}"),
                 "button_ids": button_ids

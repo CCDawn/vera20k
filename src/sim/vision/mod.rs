@@ -62,8 +62,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::map::houses::{HouseAllianceMap, is_allied_with};
+use crate::map::houses::HouseAllianceMap;
 use crate::sim::entity_store::EntityStore;
+use crate::sim::house_diplomacy::HouseAlliances;
 use crate::sim::intern::{InternedId, StringInterner};
 use crate::sim::movement::ground_pose;
 use crate::sim::pathfinding::PathGrid;
@@ -206,6 +207,9 @@ pub struct OwnerVisibility {
     ground_flags: Vec<u8>,
     shroud_knowledge: Vec<ShroudKnowledge>,
     map_cell_edge_cache: Vec<MapCellEdgeCache>,
+    /// Packed ground/fog inputs for Tactical6D8700; rebuilt after loading.
+    #[serde(skip)]
+    edge_inputs_cache: std::sync::OnceLock<Vec<u16>>,
     dummy_visibility: DummyVisibility,
     /// The cells the per-frame passes must visit; never saved or hashed.
     #[serde(skip)]
@@ -266,6 +270,7 @@ impl OwnerVisibility {
             ground_flags: vec![0; len],
             shroud_knowledge: vec![ShroudKnowledge::default(); len],
             map_cell_edge_cache: vec![MapCellEdgeCache::default(); len],
+            edge_inputs_cache: std::sync::OnceLock::new(),
             dummy_visibility: DummyVisibility::default(),
             // Every zeroed cell already matches its default knowledge.
             tracked: TrackedCells {
@@ -528,7 +533,7 @@ impl OwnerVisibility {
     pub(crate) fn hash_cells(&self, hasher: &mut impl std::hash::Hasher) {
         use std::hash::Hash;
         self.cells.hash(hasher);
-        crate::sim::state_hasher::hash_records(
+        crate::util::state_hasher::hash_records(
             &self.shroud_knowledge,
             hasher,
             ShroudKnowledge::hash_record,
@@ -644,7 +649,7 @@ pub(crate) struct GapGeneratorSource {
 /// ([`FogState::fire_view`]).
 #[derive(Clone, Copy)]
 pub(crate) struct FireFog<'a> {
-    pub(crate) alliances: &'a HouseAllianceMap,
+    pub(crate) alliances: &'a HouseAlliances,
     sensors_by_house: &'a BTreeMap<InternedId, Vec<i16>>,
     width: u16,
     height: u16,
@@ -694,6 +699,11 @@ pub struct FogState {
     width: u16,
     height: u16,
     by_owner: Planes,
+    /// Pure geometry only; keyed by every argument and never saved/hashed.
+    #[serde(skip)]
+    border_geometry: BorderGeometry,
+    #[serde(skip)]
+    gap_geometry: GapGeometry,
     /// A derived per-viewer active contribution index. Its serialized
     /// `latched` bit indicates that this viewer's cell counts are still held;
     /// this logical client's native +250/+254/+260 authority is
@@ -1601,7 +1611,7 @@ impl FogState {
     }
 
     /// What a fire check reads of this fog and the houses' ally graph.
-    pub(crate) fn fire_view<'a>(&'a self, alliances: &'a HouseAllianceMap) -> FireFog<'a> {
+    pub(crate) fn fire_view<'a>(&'a self, alliances: &'a HouseAlliances) -> FireFog<'a> {
         FireFog {
             alliances,
             sensors_by_house: &self.sensors_by_house,
@@ -2569,6 +2579,13 @@ pub(crate) fn sight_border_cells(
         .collect()
 }
 
+/// One Map567DA0 disc, in its original spiral order (duplicates included).
+#[derive(Debug, Clone, Default)]
+struct BorderGeometry {
+    inputs: Option<((u16, u16, i32), i32, i32)>,
+    cells: Vec<(u16, u16)>,
+}
+
 /// Reveal spiral table extracted from the original engine.
 /// Each (dx, dy) is a cell offset from the revealing unit's position.
 /// Entries are ordered in expanding rings by sight radius.
@@ -2909,14 +2926,13 @@ fn reveal_candidates(
 /// of its index, `0x00567AC1..0x00567ADB`) is mapped too, allied or not;
 /// VERA keeps no radar-spy bits.
 pub(crate) fn reveal_admits(
-    alliances: &HouseAllianceMap,
+    alliances: &HouseAlliances,
     owner: InternedId,
     viewer: InternedId,
     config: &VisionConfig,
     interner: &StringInterner,
 ) -> bool {
-    viewer == owner
-        || ally_reveal_test(alliances, owner, config, interner)(interner.resolve(viewer))
+    viewer == owner || (config.ally_reveal && alliances.is_allied(interner, owner, viewer))
 }
 
 /// [`reveal_admits`]'s allied arm for one `owner`, to ask of many viewers by
@@ -3002,7 +3018,7 @@ pub fn apply_spy_sat(
 #[cfg(any(test, feature = "test-support"))]
 pub fn apply_gap_generators(
     fog: &mut FogState,
-    alliances: &HouseAllianceMap,
+    alliances: &HouseAlliances,
     gap_generators: &[(InternedId, u16, u16, i32)],
     interner: &StringInterner,
 ) {
@@ -3023,7 +3039,7 @@ pub fn apply_gap_generators(
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn apply_gap_generator_sources(
     fog: &mut FogState,
-    alliances: &HouseAllianceMap,
+    alliances: &HouseAlliances,
     gap_generators: &[GapGeneratorSource],
     interner: &StringInterner,
 ) {
@@ -3042,7 +3058,7 @@ pub(crate) fn apply_gap_generator_sources(
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn apply_gap_generator_sources_with_spy_sat(
     fog: &mut FogState,
-    alliances: &HouseAllianceMap,
+    alliances: &HouseAlliances,
     gap_generators: &[GapGeneratorSource],
     interner: &StringInterner,
     spy_sat_active_owners: &std::collections::BTreeSet<InternedId>,
@@ -3099,6 +3115,24 @@ fn gap_footprint(generator: GapGeneratorSource, width: usize, height: usize) -> 
     cells
 }
 
+/// CreateGap6FB170/DestroyGap6FB470 share geometry, not cell state or gates.
+#[derive(Debug, Clone, Default)]
+struct GapGeometry {
+    inputs: Option<(u16, u16, i32, usize, usize)>,
+    cells: Vec<usize>,
+}
+
+impl GapGeometry {
+    fn cells(&mut self, source: GapGeneratorSource, width: usize, height: usize) -> &[usize] {
+        let inputs = (source.rx, source.ry, source.radius, width, height);
+        if self.inputs != Some(inputs) {
+            self.cells = gap_footprint(source, width, height);
+            self.inputs = Some(inputs);
+        }
+        &self.cells
+    }
+}
+
 /// One admitted CreateGap6FB170/DestroyGap6FB470 event. Building owns +269;
 /// this owner writes hostile +134 receipts or friendly signed Cell+13C counts.
 /// The current alliance/defeat gate selects the leaf independently for each
@@ -3108,7 +3142,7 @@ fn gap_footprint(generator: GapGeneratorSource, width: usize, height: usize) -> 
 /// outside the rectangular map retain the existing bounded mapping.
 pub(crate) fn publish_gap_generator_event(
     fog: &mut FogState,
-    alliances: &HouseAllianceMap,
+    alliances: &HouseAlliances,
     viewer: InternedId,
     source: GapGeneratorSource,
     active: bool,
@@ -3123,21 +3157,16 @@ pub(crate) fn publish_gap_generator_event(
     let height = usize::from(fog.height);
     if let Some(vis) = fog.by_owner.get_mut(&viewer) {
         let receipts = fog.gap_sources.entry(viewer).or_default();
-        let friendly = viewer_defeated
-            || is_allied_with(
-                alliances,
-                interner.resolve(source.owner),
-                interner.resolve(viewer),
-            );
+        let friendly = viewer_defeated || alliances.is_allied(interner, source.owner, viewer);
         if friendly {
-            for index in gap_footprint(source, width, height) {
+            for &index in fog.gap_geometry.cells(source, width, height) {
                 vis.count_friendly_gap_cell(index, active);
             }
             return;
         }
         if active {
             if receipts.insert(source) {
-                for index in gap_footprint(source, width, height) {
+                for &index in fog.gap_geometry.cells(source, width, height) {
                     vis.add_gap_cell(index);
                 }
             }
@@ -3159,7 +3188,7 @@ pub(crate) fn publish_gap_generator_event(
                 .collect();
             for old in removed {
                 receipts.remove(&old);
-                for index in gap_footprint(old, width, height) {
+                for &index in fog.gap_geometry.cells(old, width, height) {
                     vis.remove_gap_cell(index, spy_sat_active_owners.contains(&viewer));
                 }
             }

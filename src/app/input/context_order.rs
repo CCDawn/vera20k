@@ -98,6 +98,9 @@ pub(crate) enum AttackAction {
     /// Move (1) over an object: an Aircraft's own Cell action under it
     /// (`0x00417D7C`), which its ClickedAction sends to Foot's Move arm.
     Move,
+    /// GuardArea (0x1A): a player's negative-damage Infantry turns Attack on
+    /// a Cell into this action (Infantry51F838..51F85B).
+    GuardArea,
     /// AttackSupport (0x3B): a player's healing Unit's Attack on a Cell
     /// (`0x007404FD..0x00740522`). SetCursorFromAction (`0x004AAE90`) has no
     /// case for it, so it shows the arrow (row 0), and Foot's ClickedAction_Cell
@@ -301,10 +304,19 @@ pub(crate) fn attack_action(
         return action;
     };
     let human = sim.house_is_human_player(actor.owner());
-    let armed = crate::sim::combat::combat_weapon::is_armed(actor, kind);
+    let armed = crate::sim::combat::combat_weapon::is_armed(
+        actor,
+        kind,
+        sim.entities(),
+        rules,
+        sim.interner(),
+    );
     let infiltrator = actor.category() == EntityCategory::Infantry && kind.infiltrate;
-    let healing_unit = actor.category() == EntityCategory::Unit
-        && human
+    let healing_weapon = human
+        && matches!(
+            actor.category(),
+            EntityCategory::Unit | EntityCategory::Infantry
+        )
         && crate::sim::combat::combat_weapon::weapon_damage_value(
             actor,
             kind,
@@ -312,12 +324,23 @@ pub(crate) fn attack_action(
             rules,
             sim.interner(),
         ) < 0;
+    let healing_unit = actor.category() == EntityCategory::Unit && healing_weapon;
     // UnitClass::What_Action_OnCell 0x007404FD..0x00740522: a player's Unit
     // whose GetWeaponDamageValue(-1) (0x006F3970) is negative, an IFV with an
     // Engineer, turns Foot's Attack on a Cell into AttackSupport (0x3B), which
     // every later Unit rung returns unchanged (0x0074072B..0x0074075F).
     if action == AttackAction::Attack && healing_unit && matches!(target, TargetKind::Cell(..)) {
         action = AttackAction::AttackSupport;
+    }
+    // gamemd.exe InfantryClass::What_Action_OnCell 0x0051F838..0x0051F85B:
+    // the same negative GetWeaponDamageValue(-1) instead answers GuardArea,
+    // before the deploy-fire rungs. Object healing has its own class ladder.
+    if action == AttackAction::Attack
+        && actor.category() == EntityCategory::Infantry
+        && healing_weapon
+        && matches!(target, TargetKind::Cell(..))
+    {
+        action = AttackAction::GuardArea;
     }
     // UnitClass::What_Action_OnObject's healer arm (0x0073FD7C)
     // asks Is_Ally_ByObject (0x004F9A90), which refuses a Terrain object's
@@ -516,11 +539,23 @@ pub(super) fn base_action(
     let Some(actor) = sim.entities().get(actor_id) else {
         return AttackAction::None;
     };
+    // gamemd.exe TechnoClass::What_Action_OnCell @0x00700600 (700609)
+    // and What_Action_OnObject @0x006FFEC0 (6FFEC9) refuse berserk before
+    // modifier and weapon checks. The class wrappers own action 0's fallback.
+    if actor.berserk.is_active() {
+        return AttackAction::None;
+    }
     let Some(kind) = sim.interner().object_type(actor.type_ref(), rules) else {
         return AttackAction::None;
     };
     let human = sim.house_is_human_player(actor.owner());
-    let armed = crate::sim::combat::combat_weapon::is_armed(actor, kind);
+    let armed = crate::sim::combat::combat_weapon::is_armed(
+        actor,
+        kind,
+        sim.entities(),
+        rules,
+        sim.interner(),
+    );
     let infiltrator = actor.category() == EntityCategory::Infantry && kind.infiltrate;
     let admitted = match target {
         TargetKind::Entity(target_id) => {
@@ -548,19 +583,15 @@ pub(super) fn base_action(
     };
     // An object being warped out (vt+0x1D4) answers before the attack rung:
     // 0 on a Cell (`0x00700731`; warping in too, `0x00700743`), and over an
-    // object the tail's Select, else 0. A berserk one answers 0 before that
-    // (`0x006FFEC9`). The class tails below still run on the answer; none
-    // turns its 0 into NoMove, as the object is not controllable (vt+0xA0,
-    // `0x00700C40`), but a Building's Cell tail still answers its rally.
+    // object the tail's Select, else 0. The class tails below still run on
+    // the answer; none turns its 0 into NoMove, as the object is not
+    // controllable (vt+0xA0, `0x00700C40`), but a Building's Cell tail still
+    // answers its rally.
     let warping =
         actor.is_warped_out() || (actor.is_warping_in() && matches!(target, TargetKind::Cell(..)));
     let mut action = if warping {
         match *target {
-            TargetKind::Entity(target_id)
-                if !actor.berserk.is_active() && selects(target_id, false) =>
-            {
-                AttackAction::Select
-            }
+            TargetKind::Entity(target_id) if selects(target_id, false) => AttackAction::Select,
             _ => AttackAction::None,
         }
     } else if admitted
@@ -790,7 +821,13 @@ pub(crate) fn armed_action(
             sim.interner(),
         )
         .is_some(),
-        TargetKind::Entity(_) => crate::sim::combat::combat_weapon::is_armed(actor, object),
+        TargetKind::Entity(_) => crate::sim::combat::combat_weapon::is_armed(
+            actor,
+            object,
+            sim.entities(),
+            rules,
+            sim.interner(),
+        ),
     };
     armed.then(|| attack_action(sim, rules, actor_id, target, forced, overlay_registry))
 }
@@ -871,7 +908,14 @@ pub(crate) fn resolved_unit_in_range(
             None => return false,
         },
     };
-    crate::sim::combat::mapless_in_range(actor, target, weapon, rules, sim.interner())
+    crate::sim::combat::mapless_in_range(
+        actor,
+        target,
+        weapon,
+        rules,
+        sim.interner(),
+        Some(sim.entities()),
+    )
 }
 
 /// Resolved attack receiver batch. These are ephemeral input decisions;
@@ -1078,6 +1122,21 @@ fn attack_branch_orders(
             | AttackAction::AttackSupport => consumed_attack_action = true,
             AttackAction::Rally => unreachable!("rally remains with its existing receiver"),
             AttackAction::Select => select_fallback = true,
+            AttackAction::GuardArea => {
+                consumed_attack_action = true;
+                // gamemd.exe FootClass::ClickedAction_Cell 0x004D7E35..0x004D7E8B:
+                // an armed Infantry's admitted GuardArea sends mission 11 with
+                // the clicked Cell as target and no destination. ClickedMission
+                // 0x006FFC09..0x006FFC23 only promotes Move/Attack, not AreaGuard.
+                if matches!(attack_target, TargetKind::Cell(..))
+                    && guard_area_admitted(sim, rules, id, None)
+                {
+                    queued.push(Command::Guard {
+                        entity_id: id,
+                        target: Some(attack_target),
+                    });
+                }
+            }
             AttackAction::Attack => {
                 consumed_attack_action = true;
                 let payload = match attack_target {
@@ -1667,7 +1726,7 @@ pub(super) fn guard_area_admitted(
                 && actor.category() != EntityCategory::Aircraft
                 && sim.entities().get(target_id).is_some_and(|target| {
                     crate::map::houses::is_allied_with(
-                        sim.house_alliances(),
+                        sim.house_alliances().as_map(),
                         sim.interner().resolve(actor.owner()),
                         sim.interner().resolve(target.owner()),
                     )
@@ -1893,6 +1952,7 @@ fn object_attack_click_command(
         AttackAction::Select
         | AttackAction::None
         | AttackAction::Rally
+        | AttackAction::GuardArea
         | AttackAction::AttackSupport => return None,
     }
     match infantry_attack_action(sim, rules, attacker_id, target_id) {
@@ -1949,6 +2009,7 @@ impl From<AttackAction> for ReleaseAction {
             | AttackAction::NoMove
             | AttackAction::Rally
             | AttackAction::Move
+            | AttackAction::GuardArea
             | AttackAction::AttackSupport => Self::Other,
         }
     }
@@ -2152,6 +2213,7 @@ pub(crate) fn try_queue_context_order(
                 hover_object_at_point(
                     crate::app::input::entity_pick::PresentedWorld {
                         sim,
+                        rules: Some(&resources.rules),
                         interpolation: &state.match_state.match_presentation.interpolation,
                         translucent_viewer,
                     },
@@ -2505,9 +2567,9 @@ pub(crate) fn try_queue_context_order(
         {
             // Each selected object's What_Action on the Cell reaches its
             // unforced Attack rung on its own (0x004AE750's object loop);
-            // its tail is the forced shot's (Attack, or a healing Unit's
-            // AttackSupport), and any other answer keeps the object on its
-            // Move rungs below. Foot's shroud wrapper
+            // its tail is the forced shot's (Attack, a healing Unit's
+            // AttackSupport, or Infantry's GuardArea). Other answers keep the
+            // object on its Move rungs below. Foot's shroud wrapper
             // (0x004DDE64..0x004DDEBE) takes a Foot's Attack back over a
             // shrouded Cell; the Building wrapper keeps it.
             let rung: Vec<u64> = selected_ids
@@ -2534,7 +2596,11 @@ pub(crate) fn try_queue_context_order(
                                 true,
                                 Some(&resources.overlay_registry),
                             ),
-                            Some(AttackAction::Attack | AttackAction::AttackSupport)
+                            Some(
+                                AttackAction::Attack
+                                    | AttackAction::AttackSupport
+                                    | AttackAction::GuardArea
+                            )
                         )
                 })
                 .collect();
@@ -3919,9 +3985,24 @@ pub(super) fn infantry_attack_action(
             },
         );
     }
-    // Infantry51EAD2..51EB21: anything but a C4-able building keeps Attack
-    // and returns before the tail below.
+    // Infantry51EAD2..51EB21: anything the airstrike arm accepts keeps Attack
+    // and returns before the tail below. Phobos
+    // `TechnoClass_WhatAction_AllowAirstrike` (`0x51EAE0`) replaces the
+    // building-only `CanC4` test: `AllowAirstrike` decides, defaulting to
+    // `CanC4` for a building and to targetable for every other kind, while
+    // `InvisibleInGame` still refuses a building.
     if weapon.mig_attack_cursor {
+        #[cfg(feature = "phobos")]
+        let air_strike = target.is_some_and(|target| {
+            sim.interner()
+                .object_type(target.type_ref(), rules)
+                .is_some_and(|object| {
+                    let building = target.category() == EntityCategory::Structure;
+                    object.allows_airstrike(building)
+                        && !(building && object.invisible_in_game)
+                })
+        });
+        #[cfg(not(feature = "phobos"))]
         let air_strike = target.is_some_and(|target| {
             target.category() == EntityCategory::Structure
                 && sim
@@ -8532,3 +8613,7 @@ mod engineer_special_entry_tests;
 #[cfg(test)]
 #[path = "foot_unarmed_ctrl_tests.rs"]
 mod foot_unarmed_ctrl_tests;
+
+#[cfg(test)]
+#[path = "infantry_healer_cell_tests.rs"]
+mod infantry_healer_cell_tests;

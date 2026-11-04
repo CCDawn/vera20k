@@ -207,11 +207,24 @@ impl InteriorCells {
     /// Whether `cell` and its eight neighbours are allocated.
     pub(crate) fn contains(&self, (x, y): (u16, u16)) -> bool {
         let index = usize::from(y) * usize::from(self.width) + usize::from(x);
-        x < self.width
-            && self
-                .bits
-                .get(index / 64)
-                .is_some_and(|word| word >> (index % 64) & 1 != 0)
+        x < self.width && self.contains_index(index)
+    }
+
+    /// The index of the cell one `(dx, dy)` step from the cell with storage
+    /// `index` when that cell is interior: the real cell a lookup of the
+    /// neighbour's coordinate finds. `None` for any other cell.
+    pub(crate) fn neighbour_index(&self, index: usize, (dx, dy): (i32, i32)) -> Option<usize> {
+        debug_assert!(dx.abs() <= 1 && dy.abs() <= 1, "a neighbour's step");
+        let step = dy as isize * self.width as isize + dx as isize;
+        self.contains_index(index)
+            .then(|| index.checked_add_signed(step))
+            .flatten()
+    }
+
+    fn contains_index(&self, index: usize) -> bool {
+        self.bits
+            .get(index / 64)
+            .is_some_and(|word| word >> (index % 64) & 1 != 0)
     }
 }
 
@@ -231,7 +244,7 @@ impl ResolvedTerrainGrid {
     pub(super) fn is_regular(&self) -> bool {
         *self.allocation_caches.regular.get_or_init(|| {
             let width = usize::from(self.width);
-            width < 512
+            width < usize::from(self.cell_grid().side())
                 && self.cells.iter().enumerate().all(|(index, cell)| {
                     usize::from(cell.rx) == index % width && usize::from(cell.ry) == index / width
                 })

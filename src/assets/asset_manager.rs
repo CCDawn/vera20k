@@ -1201,16 +1201,7 @@ impl AssetManager {
             path = if crate::util::file_system::exists(&exact) {
                 exact
             } else {
-                crate::util::file_system::read_dir(&path)
-                    .ok()?
-                    .filter_map(Result::ok)
-                    .map(|entry| entry.path())
-                    .find(|candidate| {
-                        candidate
-                            .file_name()
-                            .and_then(OsStr::to_str)
-                            .is_some_and(|name| name.eq_ignore_ascii_case(component))
-                    })?
+                crate::util::case_insensitive_path::find(&path, component)?
             };
         }
         crate::util::file_system::read(&path).ok()
@@ -1354,7 +1345,9 @@ impl AssetManager {
         let directory = relative_directory
             .map(|relative| self.ra2_dir.join(relative))
             .unwrap_or_else(|| self.ra2_dir.clone());
-        let entries = match crate::util::file_system::read_dir(&directory) {
+        // Init_Mix_Files' CD search (`0x0047AF70`, FindFirstFileA at
+        // `0x0047AFCF`/`0x0047B08A`) registers each match as it is listed.
+        let entries = match crate::util::case_insensitive_path::native_listing(&directory) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(WildcardMount::default());
@@ -1363,12 +1356,7 @@ impl AssetManager {
         };
 
         let mut result = WildcardMount::default();
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => continue,
-            };
-            let path = entry.path();
+        for path in entries {
             if !retail_enumerated_file(&path) {
                 continue;
             }
@@ -1601,7 +1589,12 @@ impl AssetManager {
                 continue;
             };
             let key = file_name.to_ascii_lowercase();
-            if files.contains_key(&key) {
+            // Two spellings of one name exist only on a case-sensitive file
+            // system: keep the first in byte order, not in directory order.
+            if files
+                .get(&key)
+                .is_some_and(|kept: &LooseAsset| kept.path.file_name() <= path.file_name())
+            {
                 continue;
             }
 
@@ -2066,6 +2059,21 @@ mod tests {
         );
     }
 
+    /// A case-sensitive file system can hold two spellings of one loose file;
+    /// the catalog keeps the first in byte order whatever the directory order.
+    #[test]
+    fn two_spellings_of_a_loose_file_keep_the_first_in_byte_order() {
+        let dir = TestDirectory::new("loose-spellings");
+        for name in ["rulesmd.ini", "RulesMD.ini", "RULESMD.INI"] {
+            std::fs::write(dir.path().join(name), name).expect("loose spelling");
+        }
+        if std::fs::read_dir(dir.path()).unwrap().count() < 3 {
+            return; // A case-insensitive file system holds one spelling.
+        }
+        let manager = empty_manager(dir.path());
+        assert_eq!(manager.get_ref("rulesmd.ini"), Some(&b"RULESMD.INI"[..]));
+    }
+
     #[test]
     fn loose_payloads_are_lazy_stable_and_do_not_lock_writable_files() {
         let dir = TestDirectory::new("mutable-loose");
@@ -2157,32 +2165,22 @@ mod tests {
     }
 
     #[test]
-    fn cd_map_wildcard_uses_md_family_and_preserves_enumeration_order() {
+    fn cd_map_wildcard_uses_md_family_in_native_name_order() {
         let directory = TestDirectory::new("cd-map-media");
         directory.write_mix("MAPSMD01.MIX", "one.bin", b"one");
         directory.write_mix("mapsmd03.mix", "three.bin", b"three");
         directory.write_mix("MAPS01.MIX", "base.bin", b"base");
-
-        let expected: Vec<String> = std::fs::read_dir(directory.path())
-            .expect("enumerate expected order")
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let file_name = entry.file_name().into_string().ok()?;
-                mix_wildcard_family_matches(&file_name, "mapsmd").then_some(file_name)
-            })
-            .collect();
+        directory.write_mix("mapsmd02.mix", "two.bin", b"two");
 
         let mut manager = empty_manager(directory.path());
         manager
             .mount_native_map_media(MediaArchiveMode::CdWildcard)
             .expect("CD wildcard map media");
 
-        assert_eq!(manager.loaded_archive_names(), expected);
-        assert!(
-            manager
-                .loaded_archive_names()
-                .iter()
-                .all(|name| name.to_ascii_lowercase().starts_with("mapsmd"))
+        // APFS lists these 01, 03, 02.
+        assert_eq!(
+            manager.loaded_archive_names(),
+            ["MAPSMD01.MIX", "mapsmd02.mix", "mapsmd03.mix"]
         );
     }
 
@@ -2193,19 +2191,13 @@ mod tests {
         directory.write_mix("MOVMD03.MIX", "md-three.bin", b"three");
         directory.write_mix("MOVMD04.MIX", "md-four.bin", b"four");
 
-        let expected: Vec<String> = std::fs::read_dir(directory.path())
-            .expect("enumerate expected order")
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let file_name = entry.file_name().into_string().ok()?;
-                mix_wildcard_family_matches(&file_name, "movmd").then_some(file_name)
-            })
-            .collect();
-
         let mut manager = empty_manager(directory.path());
         manager
             .mount_native_movie_media(MediaArchiveMode::CdWildcard)
             .expect("CD wildcard movie media");
+
+        // In native name order, which APFS reverses here.
+        let expected = ["MOVMD03.MIX", "MOVMD04.MIX"];
 
         assert_eq!(manager.loaded_archive_names(), expected);
     }

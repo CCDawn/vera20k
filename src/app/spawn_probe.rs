@@ -4,7 +4,8 @@
 //! spawn.ini launch on this installation will be checked against: the build
 //! version and multiplayer rules digest the multiplayer agreement compares,
 //! the client map's physical SHA-256 and effective digest, and the country
-//! and colour indices spawn.ini fields address. Every value comes from the
+//! and colour indices spawn.ini fields address, and the campaigns a
+//! single-player launch may start. Every value comes from the
 //! owner the match itself uses: [`agreement::version`], the process
 //! [`ProcessAssets`] rules digest for the Battle mode, and
 //! [`crate::map::source::load_network_map_ini`] for the map, so two
@@ -18,11 +19,17 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::app::frontend::cncnet_spawn::{
-    max_spawn_color_index, max_spawn_country_index, spawn_battle_mode,
+    max_spawn_color_index, max_spawn_country_index, spawn_battle_mode, spawn_modes,
 };
 use crate::app::process_assets::ProcessAssets;
 use crate::app::shell_network_setup::agreement;
 use crate::assets::asset_manager::{AssetManager, MediaArchiveMode};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ProbeGameMode {
+    pub id: i32,
+    pub rules_digest: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ProbeReport {
@@ -33,6 +40,9 @@ pub(crate) struct ProbeReport {
     /// The multiplayer rules agreement for spawn Battle launches
     /// (`MPBattleMD.ini`). `ExpectedRulesDigest`.
     pub rules_digest: String,
+    /// `GameMode=` values and each one's agreement: the digest covers the mode's
+    /// INI, so `ExpectedRulesDigest` must come from the row the launch selects.
+    pub game_modes: Vec<ProbeGameMode>,
     pub map: Option<ProbeMap>,
     /// `Side=` values: Country array indices this build admits.
     pub countries: Vec<IndexedName>,
@@ -41,7 +51,39 @@ pub(crate) struct ProbeReport {
     /// Start waypoints the map authors (`[SpawnLocations]` 0..N-1); null
     /// without `map`.
     pub max_start_waypoints: Option<i32>,
+    /// The campaign catalog (`BATTLEMD.INI [Battles]`), in list order.
+    pub campaigns: Vec<ProbeCampaign>,
 }
+
+/// One `[Battles]` campaign of the game data, as the campaign startup reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ProbeCampaign {
+    pub id: String,
+    /// The first mission's file name: spawn.ini `Scenario` with `IsSinglePlayer`.
+    pub scenario: String,
+    /// That mission's `MISSIONMD.INI UIName` through the game's string
+    /// table; empty when the mission has no name.
+    pub name: String,
+    /// `Description=` through the string table, or as written when it names
+    /// no label; empty when absent.
+    pub description: String,
+    /// `DebugOnly=yes`: the retail campaign menu does not offer it.
+    pub debug_only: bool,
+    /// The missions a won campaign passes through, as victory continues it:
+    /// `scenario`, then the `MAPSELMD.INI` choice after each mission, until a
+    /// mission is `OneTimeOnly`/`EndOfGame` or names no next stage.
+    pub missions: Vec<ProbeMission>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ProbeMission {
+    pub scenario: String,
+    /// As [`ProbeCampaign::name`].
+    pub name: String,
+}
+
+/// More than any campaign chain; bounds a malformed MAPSELMD loop.
+const MAX_CAMPAIGN_MISSIONS: usize = 64;
 
 /// The parts of [`ProbeReport::version`], for display; clients may play
 /// together when `version` and `rules_digest` (and the map) are equal.
@@ -154,6 +196,18 @@ pub(crate) fn probe(
         .multiplayer_rules_digest(&spawn_battle_mode().override_file)
         .map_err(anyhow::Error::msg)
         .context("could not digest the multiplayer rules")?;
+    let game_modes = spawn_modes()
+        .map(|mode| {
+            process
+                .multiplayer_rules_digest(&mode.override_file)
+                .map(|rules_digest| ProbeGameMode {
+                    id: mode.id,
+                    rules_digest,
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::msg)
+        .context("could not digest the multiplayer rules")?;
     // The Session Country array and PrepareSession's Country bodies, as the
     // shell reads them before a multiplayer start; the digested sources do
     // not change.
@@ -187,15 +241,142 @@ pub(crate) fn probe(
             )
         })
         .transpose()?;
+    process.refresh_campaigns_if_available();
+    // MapSelect keys its stages by the player's side; a campaign's side is
+    // the one whose stages hold its first mission.
+    let sides: Vec<String> = startup_rules
+        .as_ref()
+        .map(|rules| {
+            (0..=u8::MAX)
+                .map_while(|index| rules.side_name(crate::rules::ruleset::SideIdx(index)))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let campaigns = campaign_catalog(root, &process, &sides)?;
     Ok(ProbeReport {
         version: agreement::version(),
         build_identity: build_identity(),
         rules_digest,
+        game_modes,
         max_start_waypoints: map.as_ref().map(|map| map.start_waypoints),
         map: map.map(|map| map.map),
         countries,
         colors,
+        campaigns,
     })
+}
+
+/// The process campaign registry with each entry's presentation fields: the
+/// same `BATTLEMD.INI` selection, `MISSIONMD.INI` and `ra2md.csf` the
+/// campaign startup and loading screen use.
+fn campaign_catalog(
+    root: &Path,
+    process: &ProcessAssets,
+    sides: &[String],
+) -> Result<Vec<ProbeCampaign>> {
+    let Some(registry) = process.campaigns() else {
+        return Ok(Vec::new());
+    };
+    let assets = process.manager().context("retail sources missing")?;
+    let csf = crate::app::loading::init::load_csf(assets)?;
+    let select = |name| crate::rules::retail_sources::select_ini(assets, name).ok();
+    let battles = select("BATTLEMD.INI");
+    let missions = select("MISSIONMD.INI");
+    let mapsel = select("MAPSELMD.INI");
+    Ok(registry
+        .iter()
+        .map(|campaign| {
+            let section = battles.as_ref().and_then(|b| b.ini.section(campaign.id()));
+            let description = section
+                .map(|s| s.read_string("Description", "", 128))
+                .unwrap_or_default();
+            let mission_name = |scenario: &str| {
+                missions.as_ref().map_or_else(String::new, |missions| {
+                    let mut names =
+                        crate::rules::campaign_loading::CampaignScenarioNames::default();
+                    names.apply_ini(&missions.ini, scenario, &csf);
+                    String::from_utf16_lossy(names.name_units())
+                })
+            };
+            let chain = mission_chain(
+                root,
+                assets,
+                mapsel.as_ref().map(|m| &m.ini),
+                sides,
+                campaign.scenario(),
+            )
+            .into_iter()
+            .map(|scenario| ProbeMission {
+                name: mission_name(&scenario),
+                scenario,
+            })
+            .collect();
+            ProbeCampaign {
+                id: campaign.id().to_owned(),
+                scenario: campaign.scenario().to_owned(),
+                name: mission_name(campaign.scenario()),
+                missions: chain,
+                description: csf
+                    .get(&description)
+                    .map_or(description.clone(), str::to_owned),
+                debug_only: section.is_some_and(|s| s.read_bool("DebugOnly", false)),
+            }
+        })
+        .collect())
+}
+
+/// Victory's continuation from `first` (`take_campaign_victory`): stop after a
+/// `OneTimeOnly` or `EndOfGame` mission, else follow MapSelect's pick. The
+/// probe has no running match, so `Global0`'s `AltNextScenario` is not taken.
+fn mission_chain(
+    root: &Path,
+    assets: &AssetManager,
+    mapsel: Option<&crate::rules::ini_parser::IniFile>,
+    sides: &[String],
+    first: &str,
+) -> Vec<String> {
+    use crate::app::campaign_victory::{MapSelectPick, map_select, map_select_stage_of};
+    let side = mapsel.and_then(|mapsel| {
+        sides
+            .iter()
+            .find(|side| map_select_stage_of(mapsel, side, first).is_some())
+    });
+    let mut stage = side
+        .and_then(|side| mapsel.and_then(|mapsel| map_select_stage_of(mapsel, side, first)))
+        .unwrap_or(0);
+    let mut chain = Vec::new();
+    let mut current = first.to_ascii_uppercase();
+    while chain.len() < MAX_CAMPAIGN_MISSIONS && !chain.contains(&current) {
+        chain.push(current.clone());
+        let Ok(map) =
+            crate::map::source::load_map_ini_by_name_or_path_with_assets(root, &current, assets)
+        else {
+            break;
+        };
+        let basic = crate::map::basic::parse_basic_section(&map.ini);
+        if basic.one_time_only.unwrap_or(false) || basic.end_of_game.unwrap_or(false) {
+            break;
+        }
+        let skip = basic.skip_map_select.unwrap_or(false);
+        let next = basic.next_scenario.unwrap_or_default();
+        match map_select(
+            mapsel,
+            side.map(String::as_str),
+            &current,
+            skip.then_some((stage, next.as_str())),
+        ) {
+            MapSelectPick::Next {
+                scenario,
+                stage: picked,
+            } if !scenario.is_empty() => {
+                stage = picked;
+                current = scenario.to_ascii_uppercase();
+            }
+            _ => break,
+        }
+    }
+    chain
 }
 
 /// Each `Color=` priority this build admits and the `[Colors]` entry it
@@ -315,6 +496,10 @@ mod tests {
             version: "v".into(),
             build_identity: build_identity(),
             rules_digest: "r".into(),
+            game_modes: vec![ProbeGameMode {
+                id: 1,
+                rules_digest: "r".into(),
+            }],
             map: Some(ProbeMap {
                 file: "spawnmap.ini".into(),
                 byte_length: 3,
@@ -327,6 +512,17 @@ mod tests {
             }],
             colors: Vec::new(),
             max_start_waypoints: Some(4),
+            campaigns: vec![ProbeCampaign {
+                id: "ALL1".into(),
+                scenario: "ALL01UMD.MAP".into(),
+                name: "Allied 01".into(),
+                description: "Allied campaign".into(),
+                debug_only: false,
+                missions: vec![ProbeMission {
+                    scenario: "ALL01UMD.MAP".into(),
+                    name: "Allied 01".into(),
+                }],
+            }],
         };
         let value = serde_json::to_value(&report).unwrap();
         let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
@@ -335,8 +531,10 @@ mod tests {
             keys,
             [
                 "build_identity",
+                "campaigns",
                 "colors",
                 "countries",
+                "game_modes",
                 "map",
                 "max_start_waypoints",
                 "rules_digest",
@@ -351,6 +549,12 @@ mod tests {
         assert_eq!(
             value["countries"][0],
             serde_json::json!({"index":0,"name":"Americans"})
+        );
+        assert_eq!(
+            value["campaigns"][0],
+            serde_json::json!({"id":"ALL1","scenario":"ALL01UMD.MAP","name":"Allied 01",
+                "description":"Allied campaign","debug_only":false,
+                "missions":[{"scenario":"ALL01UMD.MAP","name":"Allied 01"}]})
         );
         assert_eq!(
             value["build_identity"]["package_version"],

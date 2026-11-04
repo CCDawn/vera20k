@@ -123,6 +123,7 @@ pub(crate) fn fly_map_edge(
         return (pushed, true);
     }
     let (x, y) = crate::sim::combat::inviso_scatter::random_direction_coord(
+        crate::map::cell_index::CellGrid::for_map_size(edge.width, edge.height),
         rng,
         pushed.x,
         pushed.y,

@@ -14,8 +14,9 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 
 pub(crate) fn layout(state: &AppState) -> MultiplayerSetupLayout {
     let (w, h) = shell_layout::shell_screen_size(state);
+    let dialog = crate::app::shell_network_setup::dialog(state);
     let mut layout = MultiplayerSetupLayout::new(
-        crate::app::shell_network_setup::dialog(state),
+        dialog,
         w as i32,
         h as i32,
         shell_layout::fills_window(state),
@@ -24,7 +25,7 @@ pub(crate) fn layout(state: &AppState) -> MultiplayerSetupLayout {
         .match_state
         .session
         .network_setup_capacity()
-        .is_some_and(|rows| rows > 8)
+        .is_some_and(|rows| rows > dialog.rows_per_page() as i32)
     {
         layout.arrange_extended_rows();
     }
@@ -115,7 +116,9 @@ pub(crate) fn ime_chat_rect(state: &AppState) -> Option<crate::ui::shell::geom::
         .frontend
         .multiplayer_setup
         .as_ref()
-        .filter(|ui| routed && ui.focused_control == CHAT)
+        .filter(|ui| {
+            routed && ui.focused_control == CHAT && !ui.options_open && ui.map_offer.is_none()
+        })
         .map(|_| layout(state).chat)
 }
 
@@ -150,7 +153,25 @@ pub(crate) fn key_press(state: &mut AppState, code: Option<KeyCode>, text: Optio
     };
     // NewEdit consumes all keyboard input while chat has focus. Escape is
     // inert; Enter appends CRLF before shared5EDD00/5DE360 submission.
-    let action = if ui.focused_control == CHAT {
+    // VERA's Game Options popup takes the keys first and closes on Escape
+    // or Enter.
+    let action = if let Some(offer) = &ui.map_offer {
+        match code {
+            // Keys meant for the chat just before it opened do not answer it.
+            _ if !offer.takes_keys(Instant::now()) => None,
+            Some(KeyCode::Enter | KeyCode::NumpadEnter) if !offer.downloading => {
+                Some(SetupAction::MapOffer { download: true })
+            }
+            Some(KeyCode::Escape) => Some(SetupAction::MapOffer { download: false }),
+            _ => None,
+        }
+    } else if ui.options_open {
+        matches!(
+            code,
+            Some(KeyCode::Escape | KeyCode::Enter | KeyCode::NumpadEnter)
+        )
+        .then_some(SetupAction::GameOptions { open: false })
+    } else if ui.focused_control == CHAT {
         let key = match code {
             Some(KeyCode::Backspace) => Some(LanEditKey::Backspace),
             Some(KeyCode::Delete) => Some(LanEditKey::Delete),
@@ -383,6 +404,10 @@ pub(crate) fn mouse(state: &mut AppState, button: MouseButton, pressed: bool) {
                 PAGE => Some(SetupAction::Page),
                 PREVIOUS_ROWS => Some(SetupAction::RosterPage { forward: false }),
                 NEXT_ROWS => Some(SetupAction::RosterPage { forward: true }),
+                GAME_OPTIONS => Some(SetupAction::GameOptions { open: true }),
+                GAME_OPTIONS_OK => Some(SetupAction::GameOptions { open: false }),
+                MAP_OFFER_DOWNLOAD => Some(SetupAction::MapOffer { download: true }),
+                MAP_OFFER_LEAVE => Some(SetupAction::MapOffer { download: false }),
                 _ => None,
             };
         }

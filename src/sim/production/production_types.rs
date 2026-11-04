@@ -3,7 +3,7 @@
 //! Shared types used across production sub-modules: queue items, build options,
 //! placement previews, and the central `ProductionState` struct.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +28,7 @@ pub struct ProductionFactoryVisit {
 }
 
 /// One queued item formatted for UI rendering.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct QueueItemView {
     pub type_id: InternedId,
     pub display_name: String,
@@ -41,7 +41,7 @@ pub struct QueueItemView {
 }
 
 /// One completed building waiting for placement.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReadyBuildingView {
     pub type_id: InternedId,
     pub display_name: String,
@@ -257,7 +257,7 @@ impl ProductionCategory {
 }
 
 /// One build option exposed to UI.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BuildOption {
     pub type_id: InternedId,
     pub display_name: String,
@@ -289,11 +289,12 @@ impl BuildOption {
 /// Player production state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductionState {
-    // Building+3D3 belongs to each retained building. Manual selection448160
-    // clears matching non-limbo peers, so a limbo peer can retain its flag
-    // alongside the chosen on-map factory. This is the sole primary-state
+    // Building+3D3, one byte per retained building. Building448070/448160
+    // group peers by the raw Factory value and Naval, not by sidebar queue,
+    // and clear only matching non-limbo peers, so a limbo peer can keep its
+    // flag beside the chosen on-map factory. This is the sole primary-state
     // owner; the House FactoryClass queue slots remain in `factories`.
-    active_producer_by_owner: BTreeMap<InternedId, BTreeMap<ProductionCategory, BTreeSet<u64>>>,
+    primary_factories: BTreeSet<u64>,
     /// The monotonic temporal stamp the next accepted enqueue takes.
     next_enqueue_order: u64,
     /// Per-(house, category) factory registry — the authoritative production state
@@ -337,110 +338,45 @@ impl ProductionState {
         &mut self.factories
     }
 
-    // Native primary is per Factory RTTI/Naval, so both building sidebar tabs
-    // use the same BuildingType primary. No second primary on the Defense tab.
-    fn primary_category(category: ProductionCategory) -> ProductionCategory {
-        if category == ProductionCategory::Defense {
-            ProductionCategory::Building
-        } else {
-            category
-        }
-    }
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn primary_factory_ids(
-        &self,
-        owner: InternedId,
-        category: ProductionCategory,
-    ) -> impl Iterator<Item = u64> + '_ {
-        self.active_producer_by_owner
-            .get(&owner)
-            .and_then(|categories| categories.get(&Self::primary_category(category)))
-            .into_iter()
-            .flat_map(|ids| ids.iter().copied())
-    }
-    pub(super) fn set_primary_factory(
-        &mut self,
-        owner: InternedId,
-        category: ProductionCategory,
-        id: u64,
-    ) {
-        self.active_producer_by_owner
-            .entry(owner)
-            .or_default()
-            .entry(Self::primary_category(category))
-            .or_default()
-            .insert(id);
+    /// Set the native primary byte. Building448070/448160 own which peers
+    /// clear first; this store keeps no group of its own.
+    pub(super) fn set_primary_factory(&mut self, id: u64) {
+        self.primary_factories.insert(id);
     }
     /// Clear the native primary byte without choosing a replacement. Unlimbo
     /// and ChangeOwner write it; destruction removes its retained identity.
     /// Limbo preserves the byte, while FindFactory filters the limbo object.
     pub(crate) fn clear_primary_factory(&mut self, id: u64) {
-        for categories in self.active_producer_by_owner.values_mut() {
-            categories.retain(|_, ids| {
-                ids.remove(&id);
-                !ids.is_empty()
-            });
-        }
-        self.active_producer_by_owner
-            .retain(|_, categories| !categories.is_empty());
+        self.primary_factories.remove(&id);
     }
     /// Whether this retained building has its native primary flag
     /// (`TechnoClass+0x3D3`). Limbo preserves that flag; production eligibility
     /// and display admission remain with their respective consumers.
     pub fn is_primary_factory(&self, id: u64) -> bool {
-        self.active_producer_by_owner
-            .values()
-            .any(|categories| categories.values().any(|ids| ids.contains(&id)))
+        self.primary_factories.contains(&id)
     }
-    pub(crate) fn retain_primary_factory_links(&mut self, live: &std::collections::BTreeSet<u64>) {
-        for categories in self.active_producer_by_owner.values_mut() {
-            categories.retain(|_, ids| {
-                ids.retain(|id| live.contains(id));
-                !ids.is_empty()
-            });
-        }
-        self.active_producer_by_owner
-            .retain(|_, categories| !categories.is_empty());
+    pub(crate) fn retain_primary_factory_links(&mut self, live: &BTreeSet<u64>) {
+        self.primary_factories.retain(|id| live.contains(id));
     }
-    /// Keep the established singleton hash while retaining every primary
-    /// flag in the native limbo-peer case. Neither field storage nor the
-    /// category index is exposed to the simulation hash consumer.
+    /// Every retained primary flag, in id order; no flag folds nothing.
     pub(crate) fn hash_primary_factories(&self, hasher: &mut impl std::hash::Hasher) {
         use std::hash::Hash;
-        for (owner, categories) in &self.active_producer_by_owner {
-            owner.hash(hasher);
-            for (category, ids) in categories {
-                category.hash(hasher);
-                if ids.len() != 1 {
-                    b"retained-primary-factory-set-v1".hash(hasher);
-                    (ids.len() as u64).hash(hasher);
-                }
-                for id in ids {
-                    id.hash(hasher);
-                }
-            }
+        for id in &self.primary_factories {
+            id.hash(hasher);
         }
     }
+    /// Fixtures outside this module set one byte; they clear any other
+    /// flag they placed themselves.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn set_primary_factory_for_test(
-        &mut self,
-        owner: InternedId,
-        category: ProductionCategory,
-        id: u64,
-    ) {
-        // Existing fixtures install one chosen primary. Native histories
-        // inside production tests use the owner's additive setter instead.
-        if let Some(categories) = self.active_producer_by_owner.get_mut(&owner) {
-            categories.remove(&Self::primary_category(category));
-        }
-        self.set_primary_factory(owner, category, id);
+    pub(crate) fn set_primary_factory_for_test(&mut self, id: u64) {
+        self.set_primary_factory(id);
     }
 }
 
 impl Default for ProductionState {
     fn default() -> Self {
         Self {
-            active_producer_by_owner: BTreeMap::new(),
+            primary_factories: BTreeSet::new(),
             next_enqueue_order: 1,
             factories: FactoryRegistry::default(),
         }

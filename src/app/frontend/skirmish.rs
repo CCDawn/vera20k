@@ -1334,6 +1334,7 @@ mod tests {
                 group: -1,
                 recruitable_a: true,
                 recruitable_b: true,
+                follows: None,
                 structure_upgrades: [None, None, None],
                 structure_ai_sellable: false,
                 structure_ai_repairable: false,

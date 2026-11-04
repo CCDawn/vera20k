@@ -514,7 +514,7 @@ impl SmudgeGrid {
 /// slot; an x outside 0..512 is excluded because the 512-wide stride would
 /// alias it onto another row's slot.
 fn origin_in_bounds(terrain: &ResolvedTerrainGrid, origin: (i16, i16)) -> bool {
-    (0..512).contains(&origin.0)
+    (0..terrain.cell_grid().side() as i16).contains(&origin.0)
         && terrain
             .native_fixed_cell_index(origin.0, origin.1)
             .is_some()

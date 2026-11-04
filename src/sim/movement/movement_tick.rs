@@ -269,21 +269,22 @@ impl FootPathRequest {
         .map(|(path, _)| path)
     }
 
-    /// FootFindPath4D3920's success tail: the found route becomes the
-    /// Foot+5E0 direction queue, and 4D4003 records the current Cell as its
-    /// reference. Foot timer/latch/retry state has its own lifetime.
+    /// FootFindPath4D3920's found-route copy at4D3E82: publish the Foot+5E0
+    /// direction queue before follower callbacks. Its caller records the
+    /// live current Cell reference only afterwards, at4D4003. Foot
+    /// timer/latch/retry state has its own lifetime.
     ///
     /// Every Foot reads only that queue.
     pub(super) fn install_route(
         &self,
         actor: &mut crate::sim::game_entity::GameEntity,
-        path: Vec<(u16, u16)>,
+        path: &[(u16, u16)],
     ) {
         let current = (actor.position.rx(), actor.position.ry());
         actor
             .navigation
             .path_replay_mut()
-            .install(current, &path, 1);
+            .install_directions(current, path, 1);
     }
 }
 

@@ -23,7 +23,7 @@ fn eligible_air_target(sim: &Simulation, rules: &RuleSet, aegis: u64) -> Option<
         LineOfFireInputs {
             overlay_grid: sim.overlay_grid.as_ref(),
             overlay_registry: None,
-            alliances: Some(sim.house_alliances.as_map()),
+            alliances: Some(&sim.house_alliances),
         },
         Some(sim),
         None,
@@ -768,7 +768,7 @@ fn distributed_collection_flat_entry_clears_but_class_early_return_preserves() {
         target: Some(TargetKind::Entity(victim)),
         score: 7,
     };
-    let actor = sim.substrate.entities.get_mut(cow).unwrap();
+    let actor = sim.substrate.entities.get(cow).unwrap();
     // Retail ENGINEER is armed by Primary=DefuseKit (and has secondary
     // VirtualScanner), so it correctly reaches the base scan. COW supplies
     // the actual51E288..51E2C4 early return without altering weapon tuning.
@@ -781,8 +781,15 @@ fn distributed_collection_flat_entry_clears_but_class_early_return_preserves() {
         actor.category(),
         crate::map::entities::EntityCategory::Infantry
     );
-    assert!(!crate::sim::combat::combat_weapon::is_armed(actor, kind));
+    assert!(!crate::sim::combat::combat_weapon::is_armed(
+        actor,
+        kind,
+        &sim.substrate.entities,
+        &rules,
+        &sim.interner
+    ));
     assert!(!kind.infiltrate && !kind.vehicle_thief);
+    let actor = sim.substrate.entities.get_mut(cow).unwrap();
     actor.replace_distributed_fire_candidates(vec![retained]);
     actor.remember_distributed_fire_target(TargetKind::Entity(victim));
     let outcome = crate::sim::combat::combat_targeting::greatest_threat_for_entity(

@@ -13,7 +13,6 @@ use super::{SimSoundEvent, Simulation, SimulationWallRuntimeHost};
 use crate::map::entities::EntityCategory;
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::rules::ruleset::RuleSet;
-use crate::sim::cell_rect::canonical_cell_coord;
 use crate::sim::combat;
 use crate::sim::command::{
     ArchiveRecord, BUILDING_OFF_LINE_OPCODE, BUILDING_ON_LINE_OPCODE, BuildingOnLineRecord,
@@ -344,7 +343,7 @@ impl Simulation {
                 target_rx,
                 target_ry,
             } => {
-                if target_rx >= 512 || target_ry >= 512 {
+                if target_rx >= self.cell_grid().side() || target_ry >= self.cell_grid().side() {
                     return None;
                 }
                 return SpecialPlaceRecord {
@@ -374,6 +373,11 @@ impl Simulation {
             }
             _ => return None,
         };
+        // As for SpecialPlace above, a target lies in this map's cell array.
+        let side = self.cell_grid().side();
+        if action != PaidSuperAction::Cancel && (cell.0 >= side || cell.1 >= side) {
+            return None;
+        }
         PaidSuperRecord {
             house_id: header.house_id(),
             frame: header.frame_stamp(),
@@ -403,7 +407,9 @@ impl Simulation {
                 .get(rules.super_weapon_order.get(usize::try_from(index).ok()?)?)
         };
         if let Some(event) = SpecialPlaceRecord::decode(record) {
-            if !(0..512).contains(&event.cell.0) || !(0..512).contains(&event.cell.1) {
+            if !(0..self.cell_grid().side() as i16).contains(&event.cell.0)
+                || !(0..self.cell_grid().side() as i16).contains(&event.cell.1)
+            {
                 return None;
             }
             return Some((
@@ -416,6 +422,12 @@ impl Simulation {
             ));
         }
         let event = PaidSuperRecord::decode(record)?;
+        let side = self.cell_grid().side() as i16;
+        if event.action != PaidSuperAction::Cancel
+            && (!(0..side).contains(&event.cell.0) || !(0..side).contains(&event.cell.1))
+        {
+            return None;
+        }
         let selection = crate::sim::superweapon::PaidSuperWeaponSelection {
             source: type_id(event.source)?,
             destination: type_id(event.destination)?,
@@ -1317,12 +1329,15 @@ impl Simulation {
         y: i16,
     ) -> Option<(u16, u16, crate::sim::overlay_grid::OverlayCell)> {
         // EventClass rejects only the exact packed null CellStruct. Every
-        // other signed pair is resolved by MapClass' fixed 512-wide linear
-        // cell array, so out-of-range components may alias a canonical slot.
+        // other signed pair is resolved by the map's linear cell array (512
+        // wide on retail-size maps), so out-of-range components may alias a
+        // canonical slot.
         if (x, y) == (0, 0) {
             return None;
         }
-        let (rx, ry) = canonical_cell_coord(i32::from(x), i32::from(y))?;
+        let (rx, ry) = self
+            .cell_grid()
+            .canonical_coord(i32::from(x), i32::from(y))?;
         let grid = self.overlay_grid.as_ref()?;
         if rx >= grid.width() || ry >= grid.height() {
             return None;
@@ -2312,8 +2327,13 @@ impl Simulation {
                     self.quit_requested = true;
                 } else {
                     // A remote sender never reaches Execute (0x0064C91B):
-                    // the app runs DestroyConnection(house, 0) for it
-                    // (0x0064C9B1).
+                    // DestroyConnection(house, 0) runs for it (0x0064C9B1).
+                    // Its WOL tournament tail (0x005DA8F7..0x005DA90F) kills
+                    // the leaver's House here, where replays run it too; the
+                    // app runs the connection and message work.
+                    if self.session.wol_tournament_game() {
+                        self.flag_house_to_die(owner);
+                    }
                     self.departed_owners.push(owner);
                 }
                 true
@@ -2881,7 +2901,7 @@ impl Simulation {
             entity.disguise_hides_house_from(
                 house,
                 Some(&self.fog),
-                Some(self.house_alliances.as_map()),
+                Some(&self.house_alliances),
                 &self.interner,
             )
         }) {
@@ -2986,6 +3006,22 @@ impl Simulation {
     /// so any member answers as `[0]` would; they differ only if a selected
     /// object changed owner and stayed selected.
     ///
+    /// VERA-only: a network game (LAN or online) raises no Selected event.
+    /// Selection is client-local: no EventClass event carries it (the input
+    /// Select is frame ingress, never sent), and the game's own Selects
+    /// follow the local selected byte (crew, parasite and planning
+    /// reselects). Native raises event 33 here with no session test, and
+    /// `TagClass::RaiseEvent @ 0x006E53A0`, `TriggerClass::RegisterEvent @
+    /// 0x007264C0` and `TEventClass::HasOccurred @ 0x0071E940` (event 33
+    /// needs only the raised kind and a clear map-editor byte) add none, so
+    /// in a native network game only the selecting client springs the
+    /// trigger. `0x006FBFE2` is the program's only immediate push of 33.
+    /// Residual: trigger, a tag with event 33 on an object in a network game;
+    /// effect, its trigger never springs online, where native springs it on
+    /// the selecting client alone (a desync unless its actions are local
+    /// text or sound); frequency, rare, a map authoring Selected-by-player
+    /// triggers for multiplayer; downstream risk, only that trigger's actions.
+    ///
     /// [`LifecycleOutput::ObjectSelected`]: super::LifecycleOutput::ObjectSelected
     /// [`LifecycleOutput::FollowReleased`]: super::LifecycleOutput::FollowReleased
     fn object_select(
@@ -3026,7 +3062,9 @@ impl Simulation {
         }
         // Selection has already changed when the synchronous Tag actions run.
         // They may change ownership, remove the Tag, or retire the object.
-        self.dispatch_object_tag_event(stable_id, 33, Some(stable_id), None, context);
+        if !self.session.game_mode().is_network() {
+            self.dispatch_object_tag_event(stable_id, 33, Some(stable_id), None, context);
+        }
         true
     }
 
@@ -3299,7 +3337,7 @@ impl Simulation {
         };
         if substrate.entities.get(actor_id).is_some_and(|actor| {
             combat::combat_weapon::is_ally_by_object(
-                Some(house_alliances.as_map()),
+                Some(house_alliances),
                 interner,
                 player,
                 actor.owner(),
@@ -3614,6 +3652,58 @@ mod tests {
         // Offline receivers stay native: MEGAMISSION has no sender gate.
         let mut sim = world(ScenarioGameMode::Skirmish);
         assert!(sim.apply_command("British", &move_order, Some(&rules)));
+    }
+
+    /// `TechnoClass::Select @ 0x006FBFA0` raises event 33 (`0x006FBFE4`) for
+    /// a client-local selection. A network game raises none, so the clients
+    /// keep one trigger state; offline Selects still spring the trigger.
+    #[test]
+    fn network_match_selection_raises_no_selected_tag_event() {
+        use crate::sim::house_state::HouseState;
+        use crate::sim::scenario_session::ScenarioGameMode;
+        let rules = amcv_move_rules();
+        let map = crate::map::map_file::MapFile::from_bytes(
+            b"[Map]\nSize=0,0,32,32\nLocalSize=0,0,32,32\n\
+              [IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n\
+              [Triggers]\nSEL=Americans,<none>,Sel,0,1,1,1,0\n\
+              [Events]\nSEL=1,33,0,0\n\
+              [Actions]\nSEL=1,28,0,9,0,0,0,0,A\n\
+              [Tags]\nSEL_TAG=0,Sel,SEL\n",
+        )
+        .unwrap();
+        let global_after_select = |mode| {
+            let mut sim = Simulation::new();
+            let owner = sim.intern("Americans");
+            sim.houses
+                .register(HouseState::new(owner, 0, None, true, 0, 10));
+            sim.session.set_game_mode(mode);
+            spawn_rule_backed_unit(&mut sim, 42, "AMCV", &rules);
+            sim.initialize_trigger_definitions(
+                &map,
+                &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
+                None,
+                None,
+                None,
+            );
+            sim.classify_map_triggers(&rules);
+            sim.attach_object_trigger_tag(42, Some("SEL_TAG"));
+            let select = Command::Select {
+                entity_ids: vec![42],
+                additive: false,
+            };
+            assert!(sim.apply_command("Americans", &select, Some(&rules)));
+            assert!(
+                sim.substrate
+                    .entities
+                    .get(42)
+                    .unwrap()
+                    .selection
+                    .is_selected()
+            );
+            sim.global_variables()[9]
+        };
+        assert!(!global_after_select(ScenarioGameMode::Lan));
+        assert!(global_after_select(ScenarioGameMode::Skirmish));
     }
 
     #[test]

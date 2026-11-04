@@ -300,11 +300,7 @@ pub(crate) fn start(
     for index in 0..sim.houses.order().len() {
         let house = sim.houses.order()[index];
         if let Some(owner) = owner
-            && crate::map::houses::is_allied_with(
-                sim.house_alliances.as_map(),
-                sim.interner.resolve(owner),
-                sim.interner.resolve(house),
-            )
+            && sim.house_alliances.is_allied(&sim.interner, owner, house)
         {
             continue;
         }
@@ -676,6 +672,7 @@ pub(super) fn ground_strike(
             land,
             coordinate,
             coordinate,
+            false,
         ) {
             crate::sim::world::damage_consequences::admit_explosion_effect(sim, rules, effect);
         }
@@ -702,9 +699,11 @@ pub(super) fn ground_strike(
             coordinate,
             general.lightning_damage,
             warhead,
+            true,
             (crate::sim::combat::RAD_NO_ATTACKER, house, warhead_ref),
             frame_effects,
-        );
+        )
+        .bridge_state_changed;
     } else {
         log::warn!(
             "Lightning warhead '{}' not found in rules",

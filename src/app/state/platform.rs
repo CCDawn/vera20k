@@ -88,6 +88,9 @@ pub(crate) struct PlatformState {
     pub(crate) window_hidden: bool,
     /// Local wall-clock admission state. Never serialized or read by the sim.
     pub(crate) frame_pacer: LocalFramePacer,
+    /// Whether the next visible pass must draw, or may only service the
+    /// match because the presented picture still stands. Presentation-only.
+    pub(crate) redraw_gate: crate::app::match_runtime::redraw_gate::RedrawGate,
     /// Loaded GameConfig — missing config.toml falls back to the executable
     /// root; `None` only when config loading or executable-root discovery
     /// fails. Set once at process start from `GameConfig::load()`; not
@@ -102,6 +105,9 @@ pub(crate) struct PlatformState {
     /// thread, so the choice is re-asserted over the next passes until the
     /// window is really there. Presentation-only, never serialized.
     pub(crate) recenter_windowed: bool,
+    /// Whether `options_profile.window_placement` moved since VERA.INI was
+    /// last written, so leaving the game writes it once. Presentation-only.
+    pub(crate) window_placement_unsaved: bool,
 }
 
 impl PlatformState {
@@ -126,9 +132,11 @@ impl PlatformState {
             pause_on_focus_loss,
             window_hidden: false,
             frame_pacer: LocalFramePacer::new(),
+            redraw_gate: crate::app::match_runtime::redraw_gate::RedrawGate::from_environment(),
             game_config,
             capture_client_size,
             recenter_windowed: false,
+            window_placement_unsaved: false,
         }
     }
 
@@ -140,5 +148,14 @@ impl PlatformState {
     /// [`Self::window_active`] alone.
     pub(crate) fn focus_freeze_configured(&self) -> bool {
         self.pause_on_focus_loss && !self.window_active
+    }
+
+    /// Whether the game owns the pointer and draws mouse.shp for it: the
+    /// pointer is over the client area of the active window. Over an inactive
+    /// window the system draws its own arrow there (macOS applies a window's
+    /// cursor only while it is key), so mouse.shp beside it would be a second
+    /// cursor. Presentation-only.
+    pub(crate) fn owns_pointer(&self) -> bool {
+        self.pointer_in_client && self.window_active
     }
 }

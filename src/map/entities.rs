@@ -111,6 +111,11 @@ pub struct MapEntity {
     /// Infantry51FD89 column10. Optional CRT atoi, no clamp; absent retains
     /// Techno constructor6F2D0F -1. Structures have no Group column.
     pub group: i32,
+    /// UnitReadINI74351B/743528: optional CRT atoi at column11. It is
+    /// appended before Unlimbo and resolved by Unit-array ordinal after the
+    /// entire Unit reader. Missing data has no initialized native operand;
+    /// it must not be silently treated as the explicit -1 no-link value.
+    pub follows: Option<i32>,
     /// Authored `[Structures]` upgrade type names for native slots 0..2.
     /// Slots beyond the line's declared upgrade count and unresolved `None`/
     /// `-1` entries remain empty. Non-structure categories always hold three
@@ -273,6 +278,7 @@ fn parse_infantry_section(section: &IniSection, entities: &mut Vec<MapEntity>) {
             recruitable_a: recruitment_flag(fields.get(12).copied()),
             recruitable_b: recruitment_flag(fields.get(13).copied()),
             group: fields.get(10).map_or(-1, |value| crt_atoi(value)),
+            follows: None,
             structure_upgrades: [None, None, None],
             structure_ai_sellable: false,
             structure_ai_repairable: false,
@@ -391,6 +397,11 @@ fn parse_common_fields(fields: &[&str], category: EntityCategory, key: &str) -> 
             -1
         } else {
             fields.get(9).map_or(-1, |value| crt_atoi(value))
+        },
+        follows: if category == EntityCategory::Unit {
+            fields.get(11).map(|value| crt_atoi(value))
+        } else {
+            None
         },
         structure_upgrades: [None, None, None],
         structure_ai_sellable: false,

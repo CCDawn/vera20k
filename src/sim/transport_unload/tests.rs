@@ -1088,6 +1088,8 @@ fn retail_hover_transport_fallback_assignment_survives_save_and_continues() {
                 .same_identity(&control_dummy)
         );
         fx.sim.scenario_rng = crate::sim::rng::SimRng::new(0);
+        // Player load clears planning tokens (6370B0 / 70BF79).
+        fx.sim.reset_planning_after_player_load();
         for id in fx.sim.substrate.entities.keys_sorted() {
             fx.sim.substrate.restore_move_sound_state_after_load(id);
         }
@@ -2386,9 +2388,11 @@ fn retail_bfrt_ejects_while_turning_and_resumes_after_save() {
         &fx.rules,
     );
     assert!(restored.rebuild_dynamic_navigation(&fx.rules));
-    // Native ScenarioLoad resets the Scenario RNG to Seed(0). Apply that
-    // same load prior to the uninterrupted control before comparing futures.
+    // Native ScenarioLoad resets the Scenario RNG to Seed(0), and player load
+    // clears planning tokens (6370B0 / 70BF79). Apply that same load prior to
+    // the uninterrupted control before comparing futures.
     fx.sim.scenario_rng = crate::sim::rng::SimRng::new(0);
+    fx.sim.reset_planning_after_player_load();
     // Foot Load also clears the move-sound countdown, including idle Feet.
     for id in fx.sim.substrate.entities.keys_sorted() {
         fx.sim.substrate.restore_move_sound_state_after_load(id);

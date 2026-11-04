@@ -591,6 +591,7 @@ impl Simulation {
             crate::sim::movement::target_cell_coord(origin.0, origin.1, Some(&native_cells))
         };
         let (x, y) = crate::sim::combat::inviso_scatter::random_direction_coord(
+            self.cell_grid(),
             &mut self.scenario_rng,
             base.x,
             base.y,
@@ -1268,9 +1269,10 @@ mod tests {
             for (index, zone) in overrides.iter().enumerate() {
                 let x = zone["xy"][0].as_u64().unwrap() as usize;
                 let y = zone["xy"][1].as_u64().unwrap() as usize;
-                base.zone_ids_mut_for_test()[y * 17 + x] = index as u16 + 1;
+                base.zone_ids_mut_for_test()[y * 17 + x] =
+                    index as crate::sim::pathfinding::zone_map::ZoneId + 1;
                 base.raw_zone_ids_by_row_mut_for_test()[row][index + 1] =
-                    zone["group"].as_u64().unwrap() as u16;
+                    zone["group"].as_u64().unwrap() as crate::sim::pathfinding::zone_map::ZoneId;
             }
         }
         sim.zone_grid = Some(zones);

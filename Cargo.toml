@@ -1,6 +1,6 @@
 [package]
 name = "vera20k"
-version = "0.2.3"
+version = "0.2.5"
 edition = "2024"
 description = "Vera20k Engine — a from-scratch Rust engine for Red Alert 2: Yuri's Revenge"
 autobins = false
@@ -44,6 +44,9 @@ wasm = ["vera20k-core/wasm", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "de
 wasm-net = ["wasm", "vera20k-core/wasm-net"]
 # Browser LAN play over WebRTC; the gateway only coordinates the handshake.
 wasm-lan = ["wasm-net", "vera20k-core/wasm-lan"]
+# Browser simulation work on a Web Worker pool. It needs shared Wasm memory, so
+# tools/wasm/build.py --threads builds it with a pinned nightly and its own std.
+wasm-threads = ["wasm", "vera20k-core/wasm-threads", "dep:wasm-bindgen-rayon"]
 # Development builds carry the Ctrl+Shift dev chord. The release workflow builds
 # with `--no-default-features`, so shipped binaries do not.
 default = ["dev-overlays"]
@@ -56,6 +59,9 @@ phobos = ["vera20k-core/phobos"]
 npatch = ["vera20k-core/npatch"]
 # VERA20K's own first-party extension capability; VeraX-gated chains read it.
 verax = ["vera20k-core/verax"]
+# Optional NPBUG bug-fix extension; neither default nor shipping builds enable
+# it.
+npbug = ["vera20k-core/npbug"]
 # The Ctrl+Shift dev chord: renderer-native diagnostic overlays (grid, heightmap,
 # pathgrid, foot path, fog), the debug pause and quicksave/quickload. Captures
 # rely on it (literal Ctrl+Shift+M/N quicksave/quickload).
@@ -78,7 +84,7 @@ getrandom = { version = "=0.3.4" }
 sha1 = { version = "=0.10.6", optional = true }
 
 # --- GPU rendering ---
-wgpu = "29.0.4"
+wgpu = "30.0.1"
 # winit 0.30 is the latest stable. 0.31 is still in beta.
 # Uses the ApplicationHandler trait pattern (deferred window creation).
 # The supported no-title CSD keeps Wayland borders/buttons and window title
@@ -122,15 +128,30 @@ image = { version = "0.25", default-features = false, features = ["png", "ico"] 
 rodio = { version = "0.22", default-features = false, features = ["playback"] }
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
-ureq = { version = "3.5", default-features = false, features = ["rustls", "json"] }
+# platform-verifier: the updater trusts the system's certificates first
+# (src/app/updater/fetch.rs); the lobby's agents keep ureq's webpki roots.
+ureq = { version = "3.5", default-features = false, features = ["rustls", "json", "platform-verifier"] }
+# The lobby's event stream (src/app/shell_wol/live_service/http/stream.rs), over
+# the same rustls, ring provider and webpki roots as the lobby's ureq agents.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "ring"] }
+webpki-roots = "1.0"
+# Ed25519 for the updater's signed release manifest (src/app/updater). Already
+# compiled for ureq's rustls, so it adds no crate.
+ring = "0.17"
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
-web-sys = { version = "0.3", optional = true, features = ["Window", "Document", "HtmlCanvasElement", "Element", "HtmlElement", "AudioBuffer", "AudioBufferSourceNode", "AudioContext", "AudioDestinationNode", "AudioNode", "AudioScheduledSourceNode", "BaseAudioContext"] }
+web-sys = { version = "0.3", optional = true, features = ["Window", "Document", "HtmlCanvasElement", "Element", "HtmlElement", "AudioBuffer", "AudioBufferSourceNode", "AudioContext", "AudioDestinationNode", "AudioNode", "AudioScheduledSourceNode", "BaseAudioContext", "CompositionEvent", "CssStyleDeclaration", "DomRect", "Event", "EventTarget", "FocusEvent", "HtmlTextAreaElement", "KeyboardEvent", "KeyboardEventInit", "Node", "UiEvent"] }
 console_log = { version = "1", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
+# Starts rayon's pool on Web Workers. `no-bundler` fits the plain `--target web`
+# package; the crate also turns on rayon's `web_spin_lock`.
+wasm-bindgen-rayon = { version = "1.3", optional = true, features = ["no-bundler"] }
+# Browser WebGL2 fallback for pages without WebGPU; desktop backends are unchanged.
+wgpu = { version = "30.0.1", features = ["webgl"] }
 
 [target.'cfg(unix)'.dependencies]
 # Continuing presentation uptime across saved-game process restarts. The
@@ -145,7 +166,7 @@ libc = "0.2"
 # default features are off because they enable every AppKit framework class.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSAlert", "NSApplication", "NSButton", "NSControl", "NSImage", "NSOpenPanel", "NSPanel", "NSResponder", "NSSavePanel", "NSView", "NSWindow"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSAlert", "NSApplication", "NSButton", "NSControl", "NSCursor", "NSImage", "NSOpenPanel", "NSPanel", "NSResponder", "NSSavePanel", "NSView", "NSWindow"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSData", "NSLocale", "NSString", "NSURL"] }
 
 # --- Windows program icon and version details ---
@@ -160,6 +181,9 @@ winresource = { version = "0.1.34", default-features = false }
 [dev-dependencies]
 # Client tests use core's test fixtures and helpers.
 vera20k-core = { path = "src", features = ["test-support"] }
+# wgpu's own naga, with the GLSL ES writer its WebGL2 backend uses, so the
+# browser fallback's shaders are translated in ordinary test runs.
+naga = { version = "30.0.1", features = ["wgsl-in", "glsl-out"] }
 
 # Dependencies both crates use, declared once so they cannot drift apart.
 [workspace.dependencies]

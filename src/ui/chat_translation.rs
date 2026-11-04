@@ -1,7 +1,7 @@
 //! VERA's opt-in chat translation; gamemd has none. A player picks the
 //! language received chat is translated into with `/translate` in a WOL chat
 //! edit, saved as `[VERA] TranslateChat=`. Lines that need it go to the lobby's
-//! `POST /v1/translate` (`services/lobby/protocol.md`) and the reply is shown
+//! `POST /v1/translate` (`docs/lobby-protocol.md`) and the reply is shown
 //! under the original, which always stays visible.
 
 /// A language received chat can be translated into. GAME.FNT draws Latin-1,

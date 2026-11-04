@@ -155,6 +155,7 @@ impl PreparedSavedGame {
             view.rules_owner.fixed_art(),
             &overlay_registry,
             saved.scheduler_anim_roots(),
+            &[],
             assets,
             theater.extension,
             &theater_name,
@@ -195,6 +196,7 @@ impl PreparedSavedGame {
             view.rules_owner.fixed_art(),
             &overlay_registry,
             saved.scheduler_anim_roots(),
+            &[],
             assets,
             theater.extension,
             &theater_name,
@@ -268,14 +270,6 @@ impl PreparedSavedGame {
                 rules.general.cliff_back_impassability,
                 tile_cache.selector(),
             )?;
-        // MouseLoad reads a different theater through 545150 (5BE647), which
-        // republishes ClearTile/WaterSet at 545D27/545E17 for a later map's
-        // Fill; the same theater keeps the values its own load published.
-        // Like the fresh loader's, this reaches the process cache on commit.
-        tile_cache.complete_theater_registry_load(
-            theater.rmg_tiles.clear_tile,
-            theater.rmg_tiles.water_set,
-        );
         let local_view = PreparedSavedLocalView::new(saved_view, &world.simulation, rules)?;
         crate::app::presentation::lighting::validate_saved_lighting(&lighting, &world.simulation)?;
         // Load685120 ->53AB50 calls the canonical selector after restoring

@@ -56,7 +56,7 @@ pub(super) fn current_target_disposition(
             if entities.get(id).is_some_and(|target| {
                 interner
                     .object_type(target.type_ref(), rules)
-                    .is_some_and(|object| is_armed(target, object))
+                    .is_some_and(|object| is_armed(target, object, entities, rules, interner))
             }) =>
         {
             ExistingTargetDisposition::OtherArmedTarget
@@ -103,7 +103,13 @@ pub(super) fn candidate_admitted(
             .is_some_and(|(_, is_base_defense)| !is_base_defense)
         || !candidate.base_defense_response.recruitable_a
         || !candidate.base_defense_response.recruitable_b
-        || !is_armed(candidate, candidate_object)
+        || !is_armed(
+            candidate,
+            candidate_object,
+            &sim.substrate.entities,
+            rules,
+            &sim.interner,
+        )
         || (!sim.session.game_mode_nonzero()
             && !crate::sim::mission::control::current_control(rules, &candidate.mission)
                 .is_some_and(|entry| entry.recruitable))
@@ -116,7 +122,7 @@ pub(super) fn candidate_admitted(
         world: sim,
         rules,
         overlay_registry: None,
-        fog: Some(sim.fog.fire_view(sim.house_alliances.as_map())),
+        fog: Some(sim.fog.fire_view(&sim.house_alliances)),
         firer: candidate,
         obj: candidate_object,
         target: Some(TargetKind::Entity(attacker_id)),

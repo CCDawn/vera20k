@@ -1380,6 +1380,191 @@ fn a_busy_factory_exit_pushes_its_neighbours_away_from_the_head() {
     }
 }
 
+/// Guard449929..449940 calls the same ClearBib449540 owner as Unload.
+/// The retail factory keeps StupidGuard; a legal map override admits the
+/// status-0 idle entry, then clears the occupied head on its next visit.
+#[test]
+fn retail_factory_guard_clears_its_exit_after_idle_entry() {
+    use crate::sim::mission::MissionType;
+    for authored in [false, true] {
+        let patch = if authored {
+            "[GAWEAP]\nHasStupidGuardMode=no\n"
+        } else {
+            ""
+        };
+        let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules_with_map_patch(
+            &IniFile::from_str(patch),
+        ) else {
+            return;
+        };
+        let rules = retail.rules;
+        let factory_type = rules.object("GAWEAP").unwrap();
+        assert!(factory_type.weapons_factory);
+        assert_eq!(factory_type.has_stupid_guard_mode, !authored);
+        assert!(factory_type.primary().is_none());
+        let mut sim = crate::sim::arena_fixture::rival_arena_with_size(&rules, 0x0044_993B, 48);
+        sim.intern_rule_type_ids(&rules);
+        sim.resolve_type_handles(&rules);
+        let factory = sim
+            .spawn_object("GAWEAP", "Americans", 15, 15, 0, &rules)
+            .unwrap();
+        // Finished Unlimbo queues Guard; the Update's existing ready-byte
+        // owner commences it before the first mission dispatch.
+        super::ready_commence(&sim.session, &mut sim.substrate, factory, false);
+        let actor = sim.substrate.entities.get(factory).unwrap();
+        let head = factory_exit_track_coordinate(
+            ground_pose::position_world_coord(&actor.position),
+            factory_type,
+        );
+        assert_eq!(
+            actor.mission.current(),
+            MissionId::from_known(MissionType::Guard)
+        );
+        assert_eq!(actor.mission.handler_state(), 0);
+        let cell = ((head.x / 256) as u16, (head.y / 256) as u16);
+        let blocker = sim
+            .spawn_object("HTNK", "Americans", cell.0, cell.1, 0, &rules)
+            .unwrap();
+        let east = sim
+            .spawn_object("HTNK", "Americans", cell.0 + 1, cell.1, 0, &rules)
+            .unwrap();
+        let before_rng = sim.scenario_rng.native_state_hex();
+        let mut bridge_changed = false;
+        super::dispatch(
+            &mut sim,
+            factory,
+            &rules,
+            ObjectAiCtx::default(),
+            &mut bridge_changed,
+        );
+        assert!(
+            sim.substrate
+                .entities
+                .get(blocker)
+                .unwrap()
+                .navigation
+                .nav_com()
+                .is_none(),
+            "status0 must not fall through to ClearBib"
+        );
+        let actor = sim.substrate.entities.get(factory).unwrap();
+        assert_eq!(actor.mission.handler_state(), u32::from(authored));
+        let delay = actor.mission.dispatch_timer().delay();
+        assert!(delay > 0);
+        if !authored {
+            assert_eq!(
+                sim.scenario_rng.native_state_hex(),
+                before_rng,
+                "StupidGuard takes no mission jitter or Scatter draw"
+            );
+        }
+        // Advance to the dispatch timer's actual due frame, without forcing
+        // status1 or bypassing the mission dispatcher on the second visit.
+        sim.session.set_binary_frame_for_test(delay as u32);
+        super::dispatch(
+            &mut sim,
+            factory,
+            &rules,
+            ObjectAiCtx::default(),
+            &mut bridge_changed,
+        );
+        for id in [blocker, east] {
+            let unit = sim.substrate.entities.get(id).unwrap();
+            if authored {
+                assert!(
+                    unit.navigation.nav_com().is_some(),
+                    "Guard must scatter the blocked factory head and its neighbour"
+                );
+                if id == east {
+                    // The head receives null-coordinate Scatter, which only
+                    // sets its destination; the neighbour queues Move too.
+                    assert_eq!(
+                        unit.mission.queued(),
+                        MissionId::from_known(MissionType::Move)
+                    );
+                }
+            } else {
+                assert!(
+                    unit.navigation.nav_com().is_none(),
+                    "retail StupidGuard leaves the bib alone"
+                );
+            }
+        }
+        assert_eq!(
+            sim.substrate
+                .entities
+                .get(factory)
+                .unwrap()
+                .mission
+                .handler_state(),
+            u32::from(authored)
+        );
+        if authored {
+            // Consume the real Scatter destinations through ordinary frames,
+            // including the null-head receiver that queues no Move itself.
+            // Human ownership keeps automatic AI Hunt orders from replacing
+            // these destinations while the clearance is being observed.
+            sim.session.set_game_mode(
+                crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+            );
+            sim.session
+                .set_current_house_for_test(sim.interner.get("Americans"));
+            sim.session.game_options_mut_for_test().short_game = false;
+            sim.spawn_object("NAPOWR", "Russians", 3, 3, 0, &rules)
+                .unwrap();
+            let starts = [(blocker, cell), (east, (cell.0 + 1, cell.1))];
+            let finished = |sim: &Simulation| {
+                starts.iter().all(|&(id, old_cell)| {
+                    let unit = sim.substrate.entities.get(id).unwrap();
+                    (unit.position.rx(), unit.position.ry()) != old_cell
+                        && unit.navigation.nav_com().is_none()
+                })
+            };
+            for _ in 0..180 {
+                let output = sim
+                    .advance_app_frame(
+                        &[],
+                        &rules,
+                        Some(rules.overlay_registry()),
+                        33,
+                        crate::sim::world::TickLane::Ordinary,
+                        crate::sim::world::FrameEffects::empty(),
+                    )
+                    .unwrap();
+                assert!(
+                    output.tick.frame_committed,
+                    "the clearance scene must advance an ordinary simulation frame"
+                );
+                if finished(&sim) {
+                    break;
+                }
+            }
+            assert!(
+                finished(&sim),
+                "the guarding factory's real Scatter must move both tanks clear and finish their navigation: frame={} tick={} units={:?}",
+                sim.session.binary_frame(),
+                sim.session.tick(),
+                starts
+                    .iter()
+                    .map(|&(id, old_cell)| {
+                        let unit = sim.substrate.entities.get(id).unwrap();
+                        (
+                            id,
+                            old_cell,
+                            (unit.position.rx(), unit.position.ry()),
+                            unit.navigation.nav_com(),
+                            unit.mission.current(),
+                            unit.mission.queued(),
+                            unit.radio_contacts.slot(0),
+                            unit.locomotor.as_ref().map(|loco| loco.active_kind()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
 /// Mission_Unload state 2 for a Teleport product (`0x0044DFAD..0x0044E163`):
 /// the retail Chrono Miner takes a Drive piggyback over its Teleport and
 /// leaves the bay on track 0x42, as a Drive product does
@@ -1741,4 +1926,108 @@ fn a_factory_product_reconnects_to_its_ordered_transport_after_clearance() {
             .passengers(),
         &[product]
     );
+}
+
+/// #3593, a VERA deviation from gamemd: a factory captured while its door is
+/// still opening keeps Unload, so the product drives out for the new owner
+/// instead of staying in the bay forever.
+#[test]
+fn a_factory_captured_while_its_door_opens_still_lets_the_product_out() {
+    use crate::sim::mission::MissionType;
+    use crate::sim::world::FrameEffects;
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = retail.rules;
+    for capture_after in [1usize, 20] {
+        let mut sim = crate::sim::arena_fixture::rival_arena_with_size(&rules, 0x0044_8260, 48);
+        sim.intern_rule_type_ids(&rules);
+        sim.resolve_type_handles(&rules);
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        sim.session
+            .set_current_house_for_test(sim.interner.get("Americans"));
+        sim.session.game_options_mut_for_test().short_game = false;
+        let grid = sim
+            .path_grid_snapshot()
+            .map(|grid| (*grid).clone())
+            .unwrap();
+        let factory = sim
+            .spawn_object("GAWEAP", "Russians", 20, 20, 0, &rules)
+            .unwrap();
+        // A plant each keeps both houses in the game.
+        sim.spawn_object("NAPOWR", "Russians", 14, 30, 0, &rules)
+            .unwrap();
+        sim.spawn_object("GAPOWR", "Americans", 34, 30, 0, &rules)
+            .unwrap();
+        let tank = sim
+            .construct_object_limbo_at_height(
+                "HTNK",
+                "Russians",
+                0,
+                0,
+                0,
+                0,
+                &rules,
+                FrameEffects::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            crate::sim::production::exit_produced_object(
+                &mut sim,
+                &rules,
+                factory,
+                tank,
+                (0, 0),
+                None,
+                FrameEffects::default(),
+            ),
+            crate::sim::ai_base_building::BuildingExit::Placed
+        ));
+        let tick = |sim: &mut Simulation| {
+            let commands = sim.take_due_commands();
+            sim.advance_tick(&commands, Some(&rules), Some(&grid), None, 33);
+        };
+        for _ in 0..capture_after {
+            tick(&mut sim);
+        }
+        let producer = sim.substrate.entities.get(factory).unwrap();
+        assert_eq!(
+            producer.mission.current().known(),
+            Some(MissionType::Unload)
+        );
+        assert!(
+            producer.mission.handler_state() <= 2,
+            "the capture lands before the product starts driving"
+        );
+        let americans = sim.interner.get("Americans").unwrap();
+        sim.change_owner_with_rules(factory, americans, &rules, None, FrameEffects::default());
+        let left = (0..600).any(|_| {
+            tick(&mut sim);
+            let unit = sim.substrate.entities.get(tank).unwrap();
+            sim.substrate.occupancy.first_building_on_layer(
+                unit.position.rx(),
+                unit.position.ry(),
+                crate::sim::movement::locomotor::MovementLayer::Ground,
+            ) != Some(factory)
+        });
+        assert!(
+            left,
+            "captured after {capture_after} frames, the tank stayed in the bay"
+        );
+        let finished = (0..300).any(|_| {
+            tick(&mut sim);
+            sim.substrate
+                .entities
+                .get(factory)
+                .unwrap()
+                .mission
+                .current()
+                .known()
+                != Some(MissionType::Unload)
+        });
+        assert!(finished, "the captured factory never finished unloading");
+        assert_eq!(sim.substrate.entities.get(tank).unwrap().owner(), americans);
+    }
 }

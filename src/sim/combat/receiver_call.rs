@@ -244,7 +244,15 @@ pub(super) fn apply_building_receive_prelude(
         return BuildingReceivePrelude::Continue;
     };
 
-    if event.attacker_id == event.target_id && !target_type.damage_self {
+    // `0x00442262` returns zero for disallowed self damage. Phobos
+    // `BuildingClass_ReceiveDamage_DamageSelf @ 0x0044224F` skips that return
+    // when the warhead's AllowDamageOnSelf admits the firer.
+    if event.attacker_id == event.target_id
+        && !target_type.damage_self
+        && !rules
+            .warhead(interner.resolve(event.warhead_ref))
+            .is_some_and(|warhead| rules.allow_damage_on_self_for(warhead))
+    {
         return BuildingReceivePrelude::ReturnZero;
     }
     if event.attacker_id == RAD_NO_ATTACKER || target_type.is_1x1_with_undeploy() {
@@ -295,6 +303,7 @@ pub(crate) fn receiver_divisors(
     rules: &RuleSet,
     interner: &StringInterner,
     houses: &crate::sim::houses::Houses,
+    ae_armor: f64,
 ) -> damage::DefenceDivisors {
     let house_type_armor = houses.get(&target.owner()).map_or(1.0, |house| {
         target_type.map_or(1.0, |object| {
@@ -317,6 +326,7 @@ pub(crate) fn receiver_divisors(
             house_type_armor.to_bits(),
         ),
         unit_armor: target.crate_multipliers.armor(),
+        ae_armor,
         rank_armor,
     }
 }
@@ -330,10 +340,13 @@ pub(super) fn resolve_receive_damage(
     rules: &RuleSet,
     interner: &StringInterner,
     houses: &crate::sim::houses::Houses,
-    alliances: &HouseAllianceMap,
+    alliances: &HouseAlliances,
     scenario_no_damage: bool,
     current_tick: u64,
     terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
+    // The Phobos receiver armor factor for a hit that reaches the divide;
+    // `None` uses the cached unrestricted product.
+    ae_armor: Option<f64>,
 ) -> Option<ResolvedReceiveDamage> {
     resolve_receive_damage_with_input(
         event,
@@ -347,6 +360,7 @@ pub(super) fn resolve_receive_damage(
         terrain,
         event.damage,
         false,
+        ae_armor,
     )
 }
 
@@ -359,12 +373,13 @@ pub(super) fn resolve_receive_damage_with_input(
     rules: &RuleSet,
     interner: &StringInterner,
     houses: &crate::sim::houses::Houses,
-    alliances: &HouseAllianceMap,
+    alliances: &HouseAlliances,
     scenario_no_damage: bool,
     current_tick: u64,
     terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
     receiver_input: i32,
     skip_low_damage_check: bool,
+    ae_armor: Option<f64>,
 ) -> Option<ResolvedReceiveDamage> {
     let distance_leptons = event.distance_leptons;
     let receiver_flags = event.receiver_flags;
@@ -423,13 +438,7 @@ pub(super) fn resolve_receive_damage_with_input(
     // result is Techno's original-sign snapshot for the IC/FS gate; the Phobos
     // shield stage may have replaced it with the surviving damage.
 
-    let allied = |asker: InternedId, other: InternedId| {
-        crate::map::houses::is_allied_with(
-            alliances,
-            interner.resolve(asker),
-            interner.resolve(other),
-        )
-    };
+    let allied = |asker: InternedId, other: InternedId| alliances.is_allied(interner, asker, other);
     let attacker_is_allied = source_house.is_some_and(|owner| allied(owner, target.owner()));
     let source_house_is_allied = source_house.is_some_and(|owner| allied(target.owner(), owner));
     // Installed Ares TechnoClass_ReceiveDamage_Abilities1004A950, at1004AA5F:
@@ -507,7 +516,14 @@ pub(super) fn resolve_receive_damage_with_input(
     // `HouseClass::GetArmorMultForType @ 0x0050BD30` on the target's owner:
     // its HouseType's per-category float. The difficulty and country
     // `Armor=` product (`House+0x1A0`) is never read here.
-    let divisors = receiver_divisors(target, target_type, rules, interner, houses);
+    let divisors = receiver_divisors(
+        target,
+        target_type,
+        rules,
+        interner,
+        houses,
+        ae_armor.unwrap_or_else(|| target.phobos_armor_multiplier()),
+    );
     // `arg6` stays on the ordered call: its Unit-class consumer is the crew
     // block, which the concrete death reads from the killing event.
     let outcome = damage::receive::receive_damage(
@@ -562,7 +578,7 @@ pub(crate) fn wave_post_object_damage(
     rules: &RuleSet,
     interner: &StringInterner,
     houses: &crate::sim::houses::Houses,
-    alliances: &HouseAllianceMap,
+    alliances: &HouseAlliances,
     scenario_no_damage: bool,
     current_tick: u64,
     terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
@@ -591,6 +607,7 @@ pub(crate) fn wave_post_object_damage(
             terrain,
             remaining,
             remaining == 0,
+            None,
         ),
         None => resolve_receive_damage(
             &event,
@@ -602,6 +619,7 @@ pub(crate) fn wave_post_object_damage(
             scenario_no_damage,
             current_tick,
             terrain,
+            None,
         ),
     };
     match shield_remaining {
@@ -719,7 +737,12 @@ mod house_damage_tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
 
-    fn receive(extra: &str, live_attacker: bool, explicit_house: bool) -> i32 {
+    fn receive(
+        extra: &str,
+        live_attacker: bool,
+        explicit_house: bool,
+        ae_armor: Option<f64>,
+    ) -> i32 {
         let ini = crate::sim::arena_fixture::clear_ground_ini(&format!(
             "[Countries]\n0=Americans\n1=Russians\n[VehicleTypes]\n0=TARGET\n\
              [TARGET]\nStrength=1000\nArmor=light\n[Warheads]\n0=HIT\n\
@@ -748,30 +771,40 @@ mod house_damage_tests {
             &rules,
             &sim.interner,
             &sim.houses,
-            sim.house_alliances.as_map(),
+            &sim.house_alliances,
             false,
             0,
             sim.resolved_terrain(),
+            ae_armor,
         )
         .unwrap()
         .outcome
         .hp_delta
     }
 
+    /// The receiver's extra Phobos armor divide consumes the factor its
+    /// caller rolled; the base packet is 10 through a 100% warhead.
+    #[test]
+    fn receiver_armor_override_replaces_the_cached_effect_product() {
+        assert_eq!(receive("", false, false, None), 10);
+        assert_eq!(receive("", false, false, Some(2.0)), 5);
+        assert_eq!(receive("", false, false, Some(0.5)), 20);
+    }
+
     #[test]
     fn house_only_animation_damage_obeys_allies_and_owner_override() {
         let blocked = if cfg!(feature = "ares") { 0 } else { 10 };
-        assert_eq!(receive("AffectsAllies=no\n", false, true), blocked);
+        assert_eq!(receive("AffectsAllies=no\n", false, true, None), blocked);
         assert_eq!(
-            receive("AffectsAllies=no\nAffectsOwner=yes\n", false, true),
+            receive("AffectsAllies=no\nAffectsOwner=yes\n", false, true, None),
             10
         );
         assert_eq!(
-            receive("AffectsAllies=yes\nAffectsOwner=no\n", false, true),
+            receive("AffectsAllies=yes\nAffectsOwner=no\n", false, true, None),
             blocked
         );
         assert_eq!(
-            receive("AffectsAllies=no\nAffectsEnemies=no\n", false, false),
+            receive("AffectsAllies=no\nAffectsEnemies=no\n", false, false, None),
             10
         );
     }
@@ -779,9 +812,9 @@ mod house_damage_tests {
     #[test]
     #[cfg(feature = "ares")]
     fn live_attacker_house_precedes_explicit_house_for_ares_damage_admission() {
-        assert_eq!(receive("AffectsAllies=no\n", true, true), 10);
+        assert_eq!(receive("AffectsAllies=no\n", true, true, None), 10);
         assert_eq!(
-            receive("AffectsAllies=yes\nAffectsEnemies=no\n", true, true),
+            receive("AffectsAllies=yes\nAffectsEnemies=no\n", true, true, None),
             if cfg!(feature = "ares") { 0 } else { 10 },
         );
     }

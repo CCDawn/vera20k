@@ -252,6 +252,7 @@ impl ResolvedTerrainGrid {
                 width: 0,
                 height: 0,
                 cells: Vec::new(),
+                level_span: LevelSpan::of([]),
                 land_speed_costs: land_speed_cost_profiles(None),
                 overlay_passability: Vec::new(),
                 native_tmp_draw_heights: HashMap::new(),
@@ -389,10 +390,12 @@ impl ResolvedTerrainGrid {
                     ),
                 );
                 for (dx, dy) in offsets {
-                    let Some(cell) = crate::map::cell_index::canonical_cell_coord(
-                        i32::from(x.wrapping_add(dx)),
-                        i32::from(y.wrapping_add(dy)),
-                    ) else {
+                    let Some(cell) = crate::map::cell_index::CellGrid::for_extent(width, height)
+                        .canonical_coord(
+                            i32::from(x.wrapping_add(dx)),
+                            i32::from(y.wrapping_add(dy)),
+                        )
+                    else {
                         continue;
                     };
                     if cell.0 >= width || cell.1 >= height {
@@ -873,9 +876,10 @@ impl ResolvedTerrainGrid {
             debug_assert_eq!(cliff_back_eligibility.len(), cells.len());
             let resolved_cell_count = cells.len();
             let fixed_stride_index = |x: i32, y: i32| {
-                let native_index = crate::map::cell_index::cell_linear_index(x, y)?;
-                let canonical_x = (native_index % crate::map::cell_index::CELL_ROW_STRIDE) as usize;
-                let canonical_y = (native_index / crate::map::cell_index::CELL_ROW_STRIDE) as usize;
+                let grid = crate::map::cell_index::CellGrid::for_extent(width, height);
+                let (canonical_x, canonical_y) = grid.canonical_coord(x, y)?;
+                let (canonical_x, canonical_y) =
+                    (usize::from(canonical_x), usize::from(canonical_y));
                 if canonical_x >= usize::from(width) || canonical_y >= usize::from(height) {
                     return None;
                 }
@@ -963,6 +967,7 @@ impl ResolvedTerrainGrid {
         let mut grid = Self {
             width,
             height,
+            level_span: LevelSpan::of(cells.iter().map(|cell| cell.level)),
             cells,
             land_speed_costs: land_speed_cost_profiles(None),
             overlay_passability: Vec::new(),

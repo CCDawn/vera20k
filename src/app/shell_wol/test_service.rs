@@ -201,7 +201,7 @@ fn guest_answer(state: &mut AppState, request: &NetworkSetupRequest) {
                 }
             }
         }
-        (WolTestGuest::Joined, NetworkSetupRequest::Kick { name }) if name == GUEST => {
+        (WolTestGuest::Joined, NetworkSetupRequest::Kick { name, .. }) if name == GUEST => {
             state.frontend.wol_test_guest = WolTestGuest::Kicked;
             let Some(channel) = super::lobby::current_channel(state) else {
                 return;
@@ -374,9 +374,10 @@ fn answer(state: &mut AppState, request: WolServiceRequest) {
             service_event(state, WolServiceEvent::NetStatus(SERVER_STATUS_READY));
             WolServiceEvent::ServerList(Ok(servers()))
         }
-        WolServiceRequest::Connect { .. } => {
-            WolServiceEvent::Login(Ok(WolLoginAccepted { motd: MOTD.into() }))
-        }
+        // VERA's own message of the day, then this service's.
+        WolServiceRequest::Connect { .. } => WolServiceEvent::Login(Ok(WolLoginAccepted {
+            motd: format!("{}\n{MOTD}", super::service::vera_motd(state)),
+        })),
         WolServiceRequest::ListChannels { kind, .. } => WolServiceEvent::Channels {
             kind,
             channels: if kind == GAME_CHANNEL {
@@ -552,6 +553,7 @@ fn lobby_greeting(state: &mut AppState) {
         action: false,
         ansi: false,
         options: None,
+        sent_at: None,
     };
     for event in [
         WolServiceEvent::Ladder(vec![tanya_ladder()]),
@@ -751,6 +753,7 @@ fn match_requested(state: &mut AppState) {
         action: false,
         ansi: true,
         options,
+        sent_at: None,
     };
     let players = format!("{local},0,0,0,0,0,0,0,{GUEST},1,0,0,0,0,0,0");
     for event in [

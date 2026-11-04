@@ -520,6 +520,7 @@ impl Simulation {
             ProjectileCoord::new(at.x, at.y, at.z),
             rules.bridge_rules.strength,
             warhead,
+            true,
             (
                 source.unwrap_or(crate::sim::combat::RAD_NO_ATTACKER),
                 None,
@@ -527,6 +528,7 @@ impl Simulation {
             ),
             effects,
         )
+        .bridge_state_changed
     }
 
     /// `0x0051A738..0x0051A75E`: the land of the NavCom's cell

@@ -16,7 +16,7 @@ mod sequenced;
 mod startup;
 mod timing;
 pub use sequenced::{
-    CommandDeliveryTrace, MultiplayerPauseStatus, SequencedError, SequencedTiming,
+    CommandDeliveryTrace, MatchSpeedChange, MultiplayerPauseStatus, SequencedError, SequencedTiming,
 };
 pub use startup::{StartupAgreement, StartupError};
 
@@ -259,6 +259,36 @@ impl LiveCommandSession {
         self.sequenced.is_some()
     }
 
+    /// Remote Houses whose connection the relay ended in frames dispatched so
+    /// far; their shared EVENT_REMOVEPLAYER already ran in that frame.
+    pub fn take_lost_houses(&mut self) -> Vec<i8> {
+        self.sequenced
+            .as_mut()
+            .map_or_else(Vec::new, |session| session.take_lost())
+    }
+
+    /// The relay's rate changes in frames dispatched so far.
+    pub fn take_speed_changes(&mut self) -> Vec<MatchSpeedChange> {
+        self.sequenced
+            .as_mut()
+            .map_or_else(Vec::new, |session| session.take_speed_changes())
+    }
+
+    /// A hidden window's frames may be throttled by its system, so it never
+    /// reports falling behind the relay's clock.
+    pub fn set_presentation_hidden(&mut self, hidden: bool) {
+        if let Some(session) = &mut self.sequenced {
+            session.set_presentation_hidden(hidden);
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn mark_sequenced_started_for_test(&mut self) {
+        if let Some(session) = &mut self.sequenced {
+            session.mark_started_for_test();
+        }
+    }
+
     /// Replay records this immutable admission cadence once at startup. Solo
     /// online Local input and relay commits both dispatch each frame; ordinary
     /// LAN retains its configured native send cadence.
@@ -282,8 +312,10 @@ impl LiveCommandSession {
             .map_or(0, |session| session.frontier())
     }
 
-    pub fn fixed_frames_per_second(&self) -> Option<u16> {
-        self.sequenced.as_ref().map(|session| session.fps)
+    /// The relay's current frame rate: the match's own, or slower while a
+    /// player's PC cannot keep up. The simulation keeps the match's own.
+    pub fn relay_frames_per_second(&self) -> Option<u16> {
+        self.sequenced.as_ref().map(|session| session.pace_fps)
     }
 
     /// App-only pacing observation. Availability and canonical dispatch remain
@@ -324,6 +356,28 @@ impl LiveCommandSession {
         if let Some(session) = self.sequenced.as_mut() {
             session.keep_running_for_exit();
         }
+    }
+
+    /// This process replaces one that left a match under way (Networking.md).
+    pub fn begin_match_restore(&mut self) {
+        if let Some(session) = self.sequenced.as_mut() {
+            session.begin_restore();
+        }
+    }
+
+    /// Still replaying a match this process rejoined; local input has no place
+    /// in it yet.
+    pub fn restoring_match(&self) -> bool {
+        self.sequenced
+            .as_ref()
+            .is_some_and(|session| session.restoring())
+    }
+
+    /// Whether a confirmed UI exit's EXIT waits for the relay to sequence it.
+    pub fn exit_requested(&self) -> bool {
+        self.sequenced
+            .as_ref()
+            .is_some_and(|session| session.exit_requested())
     }
 
     pub fn recovery_status(

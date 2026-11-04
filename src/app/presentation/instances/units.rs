@@ -487,7 +487,7 @@ pub(crate) fn build_unit_instances(
             local_owner.as_deref(),
             local_owner_id,
             sim.fog(),
-            sim.house_alliances(),
+            sim.house_alliances().as_map(),
             ignore_visibility,
             sim.session().binary_frame(),
             house_color_to_remap_row(hc),
@@ -1898,7 +1898,7 @@ fn composite_draw_bounds(
             // Draw anchors are integer pixels in the native cached blit.
             bounds[0] += anchor[0] as i32;
             bounds[1] += anchor[1] as i32;
-            crate::render::vxl_raster::union_native_voxel_draw_bounds(&mut native, bounds);
+            crate::util::rect::union_native_draw_bounds(&mut native, bounds);
         } else {
             all_native = false;
         }

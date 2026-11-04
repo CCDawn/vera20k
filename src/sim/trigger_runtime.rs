@@ -18,6 +18,7 @@ use crate::rules::ini_parser::is_native_none_type_name;
 use crate::rules::ini_value::{crt_atoi, truncate_native_bytes};
 use crate::sim::rng::SimRng;
 use crate::sim::scenario_session::ScenarioSession;
+use crate::util::state_hasher::hash_indices;
 use crate::sim::timer::CdTimer;
 use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::{FrameEffects, SimSoundEvent, Simulation};
@@ -89,7 +90,8 @@ pub enum TriggerEffect {
     },
     /// Execute115's named TechnoType cameo pulse, on the native frame clock.
     FlashSidebarCameo {
-        type_id: crate::sim::intern::InternedId,
+        category: crate::sim::production::ProductionCategory,
+        type_index: i32,
         duration: i32,
         frame: i32,
     },
@@ -643,7 +645,7 @@ struct LiveTrigger {
     enabled: bool,
     pending: bool,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct LiveTag {
     type_index: usize,
     ///6E4F44 prepends instances, reversing definition-construction order.
@@ -655,6 +657,18 @@ struct LiveTag {
     attached_cell: (i16, i16),
     pending: bool,
     dispatch_guard: bool,
+}
+// The derived fold, but with the trigger list as 64-bit words on every
+// target ([`hash_indices`]).
+impl Hash for LiveTag {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        self.type_index.hash(hasher);
+        hash_indices(&self.triggers, hasher);
+        self.refs.hash(hasher);
+        self.attached_cell.hash(hasher);
+        self.pending.hash(hasher);
+        self.dispatch_guard.hash(hasher);
+    }
 }
 /// Team IDs and Techno stable IDs belong to separate identity domains.
 #[derive(
@@ -810,17 +824,22 @@ impl TriggerRuntime {
     pub(crate) fn hash_state(&self, hasher: &mut impl Hasher) {
         // Definition ordinals, timers, active registration order, attachments
         // and the deferred queue affect later actions and are all retained.
-        // Observers never participate in this fold.
+        // Observers never participate in this fold. Index lists fold as
+        // 64-bit words on every target ([`hash_indices`]).
         self.globals_set.hash(hasher);
         self.locals_set.hash(hasher);
         self.definitions.hash(hasher);
         self.tags.hash(hasher);
         self.triggers.hash(hasher);
-        self.tag_order.hash(hasher);
-        self.trigger_order.hash(hasher);
-        self.logic_tags.hash(hasher);
-        self.map_tags.hash(hasher);
-        self.house_tags.hash(hasher);
+        hash_indices(&self.tag_order, hasher);
+        hash_indices(&self.trigger_order, hasher);
+        hash_indices(&self.logic_tags, hasher);
+        hash_indices(&self.map_tags, hasher);
+        self.house_tags.len().hash(hasher);
+        for (house, tags) in &self.house_tags {
+            house.hash(hasher);
+            hash_indices(tags, hasher);
+        }
         self.attachments.hash(hasher);
         self.cell_tags.hash(hasher);
         self.dirty.hash(hasher);
@@ -828,6 +847,38 @@ impl TriggerRuntime {
         self.map_cursor.hash(hasher);
         self.definitions_prepared.hash(hasher);
         self.classified.hash(hasher);
+    }
+
+    /// VERA-only match-checksum terms
+    /// ([`Simulation::compute_multiplayer_frame_checksum`]): each set
+    /// Scenario global, then each set local (high bit set), then each live
+    /// trigger in registration order with what `TriggerClass::ComputeCRC @
+    /// 0x00726790` folds (type, Destroyed `+0x30`, Enabled, the timer's
+    /// remaining time, the occurred-event bits), then each live Tag with
+    /// what `TagClass::ComputeCRC @ 0x006E56E0` folds (type, Destroyed).
+    /// `ScenarioClass::ComputeCRC @ 0x0068B940` folds no variable; VERA adds
+    /// them because actions write them and events poll them.
+    pub(crate) fn fold_match_checksum(
+        &self,
+        frame: i32,
+        checksum: &mut crate::sim::multiplayer_checksum::RetailChecksumAccumulator,
+    ) {
+        for &index in &self.globals_set {
+            checksum.fold_value(index);
+        }
+        for &index in &self.locals_set {
+            checksum.fold_value(index | 0x8000_0000);
+        }
+        for trigger in self.trigger_order.iter().filter_map(|&i| self.trigger(i)) {
+            checksum.fold_value(trigger.type_index as u32);
+            checksum.fold_value(u32::from(trigger.pending) | u32::from(trigger.enabled) << 1);
+            checksum.fold_value(trigger.timer.remaining(frame) as u32);
+            checksum.fold_value(trigger.completed);
+        }
+        for tag in self.tag_order.iter().filter_map(|&i| self.tag(i)) {
+            checksum.fold_value(tag.type_index as u32);
+            checksum.fold_value(u32::from(tag.pending));
+        }
     }
     fn tag(&self, index: usize) -> Option<&LiveTag> {
         self.tags.get(index)?.as_ref()
@@ -903,6 +954,13 @@ struct TagEventInput {
     source: Option<u64>,
     cell: (i16, i16),
     force: bool,
+}
+
+/// The two native TeamClass event23 broadcasts use opposite array walks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TeamTagOrder {
+    Forward,
+    Reverse,
 }
 
 /// Spring7265C0 resolves its authored House per action, preserving the incoming
@@ -1642,7 +1700,14 @@ impl Simulation {
                 let Some(actor) = input.actor.and_then(|id| self.substrate.entities.get(id)) else {
                     return false;
                 };
-                let displayed = actor.disguise_house(true, self.session.current_house(), false);
+                // VERA network adaptation: an undisguised agent falls back
+                // to PlayerPtr, which differs per client and now feeds the
+                // match checksum, so a network game compares the worn
+                // identity alone.
+                let viewer = (!self.session.game_mode().is_network())
+                    .then(|| self.session.current_house())
+                    .flatten();
+                let displayed = actor.disguise_house(true, viewer, false);
                 let selected = u16::try_from(condition.value).ok().and_then(|country| {
                     self.house_by_country_index(crate::rules::ruleset::CountryIdx(country), rules)
                 });
@@ -1673,9 +1738,10 @@ impl Simulation {
                             self.interner.resolve(kind),
                         )
                         .is_some()
-                    && rules.type_array_index(
+                    && self.interner.type_array_index(
+                        kind,
                         crate::rules::object_type::ObjectCategory::Infantry,
-                        self.interner.resolve(kind),
+                        rules,
                     ) == Some(condition.value);
                 if matched {
                     *persistence = true;
@@ -2214,37 +2280,63 @@ impl Simulation {
         self.publish_trigger_effects(effects);
     }
 
-    /// Recalc6EA49F..6EA4D2 walks the current Tag array backwards before
-    /// destroying an empty, previously-full leaving Team. No own RNG draws,
-    /// timers or detach: ordinary Register/Reset/actions own those effects.
+    /// Retail gamemd.exe: TeamClass::Recalc6EA49F..6EA4D2 walks the Tag
+    /// array backwards; TeamClass::AI6E92D0..6E9320 walks forwards and
+    /// revisits the slot after a successful raise (6E9312). Both broadcast
+    /// before destroying the empty leaving Team. No own RNG draws, timers
+    /// or detach: ordinary Register/Reset/actions own those effects.
+    ///
+    /// A true one-shot raise destroys a Trigger, so its revisits end. Residual:
+    /// Rust revisits a repeating Tag only when the raise shifted another Tag
+    /// into the slot. Natively that revisit never ends while one of its
+    /// Triggers keeps occurring, and it can first spring a sibling Trigger
+    /// that Rust drops.
     pub(crate) fn raise_team_left_map_tags(
         &mut self,
+        order: TeamTagOrder,
         rules: &crate::rules::ruleset::RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         frame_effects: FrameEffects<'_>,
     ) {
-        let count = self.trigger_runtime.tag_order.len();
+        let mut ordinal = match order {
+            TeamTagOrder::Forward => Some(0),
+            TeamTagOrder::Reverse => self.trigger_runtime.tag_order.len().checked_sub(1),
+        };
         let mut effects = Vec::new();
-        for ordinal in (0..count).rev() {
-            // As with House tag traversal, shrinking callbacks can leave a
-            // stale native slot beyond the new count; Rust skips that slot.
-            let Some(&tag) = self.trigger_runtime.tag_order.get(ordinal) else {
-                continue;
-            };
-            if self.dispatch_live_tag_event(
-                tag,
-                TagEventInput {
-                    kind: 23,
-                    ..Default::default()
-                },
-                &mut effects,
-                rules,
-                registry,
-                frame_effects,
-            ) && self.trigger_runtime.tag_order.is_empty()
-            {
+        while let Some(slot) = ordinal {
+            if let Some(&tag) = self.trigger_runtime.tag_order.get(slot) {
+                let repeating = self.trigger_runtime.tag(tag).is_some_and(|live| {
+                    self.trigger_runtime.definitions.tag_types[live.type_index].repeat == 2
+                });
+                let raised = self.dispatch_live_tag_event(
+                    tag,
+                    TagEventInput {
+                        kind: 23,
+                        ..Default::default()
+                    },
+                    &mut effects,
+                    rules,
+                    registry,
+                    frame_effects,
+                );
+                if raised && self.trigger_runtime.tag_order.is_empty() {
+                    break;
+                }
+                if raised
+                    && order == TeamTagOrder::Forward
+                    && (!repeating || self.trigger_runtime.tag_order.get(slot) != Some(&tag))
+                {
+                    continue;
+                }
+            } else if order == TeamTagOrder::Forward {
                 break;
             }
+            // Reverse traversal retains its original count. Shrinking
+            // callbacks can leave stale native slots; safe storage skips them.
+            ordinal = match order {
+                TeamTagOrder::Forward => slot.checked_add(1),
+                TeamTagOrder::Reverse => slot.checked_sub(1),
+            };
         }
         self.publish_trigger_effects(effects);
     }
@@ -3660,7 +3752,7 @@ impl Simulation {
                 }
                 return found;
             }
-            81..=83 => {
+            81..=84 => {
                 use crate::map::entities::EntityCategory;
                 use crate::sim::mission::{MissionId, MissionType};
 
@@ -3671,8 +3763,11 @@ impl Simulation {
                 //81 walks Techno by live Trigger identity and deliberately
                 //does NOT test Health or Limbo. 82/83 walk Foot and compare
                 //the incoming House, not the scalar or retained House.
+                //84's active Execute6DDCEC..6DDD74 (WakeupGroup6E03B0)
+                //walks every Techno category and matches raw signed Group,
+                //without a House or Tag gate, before Queue(Guard,false).
                 let mut ordinal = 0;
-                while let Some(id) = if action.kind == 81 {
+                while let Some(id) = if matches!(action.kind, 81 | 84) {
                     self.substrate.entities.techno_registry_at(ordinal)
                 } else {
                     self.substrate.entities.foot_registry_at(ordinal)
@@ -3696,7 +3791,13 @@ impl Simulation {
                             } else {
                                 entity.health.current() > 0
                                     && !entity.lifecycle.in_limbo()
-                                    && if action.kind == 82 {
+                                    && if action.kind == 84 {
+                                        entity.object_group() == value.unwrap_or(0)
+                                            && matches!(
+                                                mission,
+                                                Some(MissionType::Sleep | MissionType::Harmless)
+                                            )
+                                    } else if action.kind == 82 {
                                         mission == Some(MissionType::Sleep)
                                             && Some(entity.owner()) != context.incoming_house
                                     } else {
@@ -4228,20 +4329,19 @@ impl Simulation {
                 //out of deterministic simulation; the UI owns actual admission.
             }
             115 => {
-                //6E4150 scans the common TechnoType array A8EB04 in reverse,
-                //with byte-exact names, then6AC5F0 dispatches its own class.
-                //Retail SOV01 uses the unique SAPC identity; duplicate names
-                //across type classes retain the rules owner's existing order.
-                let Some(object) = rules
-                    .all_objects()
-                    .filter(|object| object.id == action.inline_type_name())
-                    .last()
-                else {
+                // TAction::FlashCameo6E4150, original instructions: reverse
+                // exact-name search of the global constructor chronology.
+                // Sidebar6AC5F0 consumes that selected type's class/index;
+                // retain those facts instead of resolving its name again.
+                let Some(object) = rules.native_techno_type_exact(action.inline_type_name()) else {
                     return false;
                 };
-                let type_id = self.interner.intern(&object.id);
+                let Some(type_index) = rules.type_array_index(object.category, &object.id) else {
+                    return true;
+                };
                 effects.push(TriggerEffect::FlashSidebarCameo {
-                    type_id,
+                    category: crate::sim::production::category_for_object(object),
+                    type_index,
                     duration: value.unwrap_or(0),
                     frame: self.session.binary_frame() as i32,
                 });
@@ -4447,7 +4547,12 @@ impl Simulation {
                 let (Some(index), Some(waypoint)) = (value, action.waypoint_index) else {
                     return false;
                 };
-                return self.trigger_play_anim_at_waypoint(rules, index, waypoint as i32);
+                return self.trigger_play_anim_at_waypoint(
+                    rules,
+                    index,
+                    waypoint as i32,
+                    frame_effects,
+                );
             }
             58 => {
                 let (Some(intensity), Some(waypoint)) = (value, action.waypoint_index) else {
@@ -4654,10 +4759,12 @@ impl Simulation {
                 // of the incoming House/value. Resolve coordinates before
                 // the frame hash, including House50DF30's Dummy effects.
                 let coord = {
-                    let cells = self
-                        .resolved_terrain
-                        .as_ref()
-                        .map(crate::map::resolved_terrain::NativeCellQuery::canonical);
+                    let network = self.session.game_mode().is_network();
+                    let cells = self.resolved_terrain.as_ref().map(|terrain| {
+                        crate::map::resolved_terrain::NativeCellQuery::for_local_input(
+                            terrain, network,
+                        )
+                    });
                     self.home_camera_coordinate(rules, cells.as_ref())
                 };
                 effects.push(TriggerEffect::HomeCamera { coord });
@@ -5249,6 +5356,9 @@ mod house_notification_tests;
 #[path = "trigger_runtime_house_attacked_tests.rs"]
 mod house_attacked_tests;
 
+#[cfg(test)]
+#[path = "trigger_runtime_group_wakeup_tests.rs"]
+mod group_wakeup_tests;
 #[cfg(test)]
 #[path = "trigger_runtime_wakeup_tests.rs"]
 mod wakeup_tests;

@@ -6,6 +6,7 @@
 //! F12 owner tree: options persistence lives here beside the save repository.
 
 pub(crate) mod commands;
+pub(crate) mod intro_play;
 pub(crate) mod options;
 pub(crate) mod options_profile;
 #[cfg(feature = "phobos")]
@@ -16,9 +17,9 @@ pub(crate) mod rules_profile;
 pub(crate) mod wol_profile;
 pub(crate) use resource_load::{PreparedSavedGame, SavedGamePreparationView};
 
-use std::path::{Path, PathBuf};
 #[cfg(any(feature = "dev-overlays", test))]
 use crate::util::time::SystemTime;
+use std::path::{Path, PathBuf};
 
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::rules::overlay_types::OverlayTypeRegistry;
@@ -38,6 +39,8 @@ pub(crate) struct PersistenceState {
     /// MainTick55DBCD's process-global ABCE08. It is deliberately outside
     /// the saved Scenario and survives a same-mission restart.
     initial_campaign_save_attempted: bool,
+    /// The one UI load awaiting its loading frame and subsequent redraw.
+    pub(crate) pending_load: Option<commands::PendingSavedGameLoad>,
     /// The process-lifetime retail Options/Video/Audio profile. UI, window,
     /// render, and audio state are projections of this single retained value.
     pub(crate) options_profile: options_profile::RetailOptionsProfile,
@@ -48,6 +51,7 @@ impl PersistenceState {
     pub(crate) fn new(options_profile: options_profile::RetailOptionsProfile) -> Self {
         Self {
             initial_campaign_save_attempted: false,
+            pending_load: None,
             options_profile,
             repository: SaveRepository::new(),
         }
@@ -93,6 +97,8 @@ impl PersistenceState {
 pub(crate) enum PreparedLoadError {
     #[error("could not read save file: {0}")]
     ReadFile(#[source] std::io::Error),
+    #[error("a network match cannot load a saved game")]
+    NetworkMatch,
     // The four `#[cfg(test)]` variants belong to the headless same-content
     // fixture route; saved-resource preparation rebuilds those inputs.
     #[cfg(test)]
@@ -298,6 +304,9 @@ impl PreparedLoad {
         // that state without touching the running match's retained identity.
         simulation.bind_shared_cell_dummy(crate::map::resolved_terrain::SharedCellDummy::fresh());
         simulation.reconstruct_cellclass_dummy_for_map_resize();
+        // InfantryLoad521A0C -> TechnoNoInit6F4335 resets the transition
+        // clock. This user-file seam is separate from internal continuations.
+        simulation.restart_cloak_progress_after_player_load();
         simulation.restore_after_snapshot_load()?;
         crate::sim::production::validate_restored_factory_state(&simulation, rules)?;
         simulation.rebuild_caches_after_load(terrain_template, terrain_speed_config, rules);
@@ -532,7 +541,9 @@ impl SaveRepository {
 
     fn validate_existing_save(&self, path: &Path) -> Result<(), SaveWriteError> {
         let previous = self.read(path).map_err(SaveWriteError::write_file)?;
-        GameSnapshot::read_header(&previous).map_err(|error| {
+        // SaveGame67CF42 replaces the slot; an old VERA body's load layout
+        // must not prevent replacement of its recognizable product metadata.
+        GameSnapshot::read_metadata(&previous).map_err(|error| {
             SaveWriteError::write_file(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
         })?;
         Ok(())
@@ -933,6 +944,7 @@ mod tests {
         in_game_menu: crate::ui::pause_menu::InGameMenuState,
     }
 
+    mod cloak_restore_tests;
     mod factory_restore_tests;
     mod infantry_death_restore_tests;
     mod rule_cache_restore_tests;

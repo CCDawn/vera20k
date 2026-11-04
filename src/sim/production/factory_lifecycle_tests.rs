@@ -1795,11 +1795,11 @@ fn prerequisite_loss_events_preserve_player_copies_cleanup_and_snapshot_replay()
     assert_eq!(restored.state_hash(), sim.state_hash(), "saved loss state");
 
     let header = ReplayHeader {
-        version: 1,
+        version: crate::sim::replay::REPLAY_VERSION,
         tick_hz: 15,
         seed: sim.session.seed(),
         pixel_conversion_bounds: sim.session.pixel_conversion_bounds(),
-        map_name: "factory-loss".into(),
+        map_name: sim.session.map_name().to_owned(),
         rules_hash: rules.simulation_config_hash(),
     };
     let mut resources = SimResources::empty();
@@ -3766,15 +3766,25 @@ fn secret_lab_fallback_capture_paid_queue_snapshot_and_loss_share_the_existing_o
     // Native Begin_Production takes already-admitted events and checks the
     // build limit, so the pre-capture gate belongs to the sidebar/Select owner.
     assert!(
-        !super::production_tech::build_option_for_owner(&sim, &rules, "Americans", "E1")
-            .unwrap()
-            .enabled
+        !super::production_tech::build_option_for_owner(
+            &sim,
+            &rules,
+            sim.interner.get("Americans"),
+            "E1"
+        )
+        .unwrap()
+        .enabled
     );
     sim.change_owner_with_rules(lab, owner, &rules, None, FrameEffects::default());
     assert!(
-        super::production_tech::build_option_for_owner(&sim, &rules, "Americans", "E1")
-            .unwrap()
-            .enabled
+        super::production_tech::build_option_for_owner(
+            &sim,
+            &rules,
+            sim.interner.get("Americans"),
+            "E1"
+        )
+        .unwrap()
+        .enabled
     );
     assert_eq!(sim.houses[&owner].base_projection().secret_labs(), [lab]);
     assert!(
@@ -3838,9 +3848,14 @@ fn secret_lab_fallback_capture_paid_queue_snapshot_and_loss_share_the_existing_o
         product
     );
     assert!(
-        super::production_tech::build_option_for_owner(&restored, &rules, "Americans", "E1")
-            .unwrap()
-            .enabled
+        super::production_tech::build_option_for_owner(
+            &restored,
+            &rules,
+            restored.interner.get("Americans"),
+            "E1"
+        )
+        .unwrap()
+        .enabled
     );
     let credits = restored.houses[&owner].economy().credits();
     let spent = restored.houses[&owner].economy().spent_credits();
@@ -3865,9 +3880,14 @@ fn secret_lab_fallback_capture_paid_queue_snapshot_and_loss_share_the_existing_o
         Some(fallback)
     );
     assert!(
-        !super::production_tech::build_option_for_owner(&restored, &rules, "Americans", "E1")
-            .unwrap()
-            .enabled
+        !super::production_tech::build_option_for_owner(
+            &restored,
+            &rules,
+            restored.interner.get("Americans"),
+            "E1"
+        )
+        .unwrap()
+        .enabled
     );
     // The loss recheck reaches ordinary strip cancellation. Both duplicate
     // requests are removed and the held identity is destroyed, not delivered.

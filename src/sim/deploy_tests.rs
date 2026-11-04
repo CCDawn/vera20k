@@ -220,72 +220,94 @@ fn deploy_then_undeploy_returns_the_mcv_to_its_original_cell() {
     // A yard needs its Buildup SHP to undeploy (`Sell_Back @ 0x00447110`)
     // and converts back only in a multiplayer game (`0x00449D08`).
     rules.set_buildup_control_for_test("GACNST", [0, 29, 1]);
-    let mut sim = deploy_sim(&rules);
-    sim.session
-        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
-    add_house(&mut sim, "Americans", true);
+    // Deploy (0x007397C6..0x007397CC) and Selling (0x0044A04C..0x0044A052)
+    // copy Group+214; a network game's local key slot travels with it.
+    for mode in [
+        crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        crate::sim::scenario_session::ScenarioGameMode::Lan,
+    ] {
+        let mut sim = deploy_sim(&rules);
+        sim.session.set_game_mode(mode);
+        add_house(&mut sim, "Americans", true);
 
-    let start = (20u16, 22u16);
-    let mcv = sim
-        .spawn_object("AMCV", "Americans", start.0, start.1, 128, &rules)
-        .expect("spawn MCV");
-    sim.substrate
-        .entities
-        .get_mut(mcv)
-        .unwrap()
-        .assign_object_group(3);
-    assert!(
-        sim.deploy_mcv(
-            mcv,
-            &rules,
-            None,
-            crate::sim::world::FrameEffects::default()
-        ),
-        "clear ConYard footprint should deploy"
-    );
-    sim.flush_pending_delete();
-    // A yard still playing its build-up cannot undeploy, so let it settle.
-    tick_n(&mut sim, &rules, 60);
+        let start = (20u16, 22u16);
+        let mcv = sim
+            .spawn_object("AMCV", "Americans", start.0, start.1, 128, &rules)
+            .expect("spawn MCV");
+        // (+214, the group the local player's keys see)
+        let expected = if mode.is_network() {
+            sim.session.install_network_timing(10);
+            let owner = sim.interner.get("Americans");
+            sim.session.set_current_house_for_test(owner);
+            let assign = Command::AssignControlGroup {
+                group: 3,
+                entity_ids: vec![mcv],
+            };
+            assert!(sim.apply_command("Americans", &assign, Some(&rules)));
+            (-1, 3)
+        } else {
+            sim.substrate
+                .entities
+                .get_mut(mcv)
+                .unwrap()
+                .assign_object_group(3);
+            (3, 3)
+        };
+        let groups =
+            |e: &crate::sim::game_entity::GameEntity| (e.object_group(), e.control_group());
+        assert!(
+            sim.deploy_mcv(
+                mcv,
+                &rules,
+                None,
+                crate::sim::world::FrameEffects::default()
+            ),
+            "clear ConYard footprint should deploy"
+        );
+        sim.flush_pending_delete();
+        // A yard still playing its build-up cannot undeploy, so let it settle.
+        tick_n(&mut sim, &rules, 60);
 
-    let gacnst_id = sim.interner.get("GACNST").expect("GACNST interned");
-    let yard = sim
-        .substrate
-        .entities
-        .values()
-        .find(|e| e.type_ref() == gacnst_id)
-        .map(|e| e.stable_id())
-        .expect("ConYard should exist after deploy");
+        let gacnst_id = sim.interner.get("GACNST").expect("GACNST interned");
+        let yard = sim
+            .substrate
+            .entities
+            .values()
+            .find(|e| e.type_ref() == gacnst_id)
+            .map(|e| e.stable_id())
+            .expect("ConYard should exist after deploy");
 
-    assert_eq!(sim.entities().get(yard).unwrap().object_group(), 3);
+        assert_eq!(groups(sim.entities().get(yard).unwrap()), expected);
 
-    assert!(
-        sim.apply_command(
-            "Americans",
-            &Command::UndeployBuilding { entity_id: yard },
-            Some(&rules),
-        ),
-        "the yard we just deployed should undeploy"
-    );
-    // Undeploy runs the build-up animation in reverse and only spawns the
-    // vehicle when it finishes, so the cell under test does not exist yet.
-    tick_n(&mut sim, &rules, 40);
-    sim.flush_pending_delete();
+        assert!(
+            sim.apply_command(
+                "Americans",
+                &Command::UndeployBuilding { entity_id: yard },
+                Some(&rules),
+            ),
+            "the yard we just deployed should undeploy"
+        );
+        // Undeploy runs the build-up animation in reverse and only spawns the
+        // vehicle when it finishes, so the cell under test does not exist yet.
+        tick_n(&mut sim, &rules, 40);
+        sim.flush_pending_delete();
 
-    let amcv_id = sim.interner.get("AMCV").expect("AMCV interned");
-    let landed = sim
-        .substrate
-        .entities
-        .values()
-        .find(|e| e.type_ref() == amcv_id)
-        .map(|e| {
-            assert_eq!(e.object_group(), 3);
-            (e.position.rx(), e.position.ry())
-        })
-        .expect("MCV should exist again after undeploy");
-    assert_eq!(
-        landed, start,
-        "deploy/undeploy must round-trip; drifting here compounds every cycle"
-    );
+        let amcv_id = sim.interner.get("AMCV").expect("AMCV interned");
+        let landed = sim
+            .substrate
+            .entities
+            .values()
+            .find(|e| e.type_ref() == amcv_id)
+            .map(|e| {
+                assert_eq!(groups(e), expected);
+                (e.position.rx(), e.position.ry())
+            })
+            .expect("MCV should exist again after undeploy");
+        assert_eq!(
+            landed, start,
+            "deploy/undeploy must round-trip; drifting here compounds every cycle"
+        );
+    }
 }
 
 /// A computer house's MCV deploys into a yard that builds up before it opens:

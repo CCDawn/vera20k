@@ -539,11 +539,7 @@ pub(super) fn can_acquire_target(sim: &Simulation, id: u64, rules: &RuleSet) -> 
     {
         return false;
     }
-    if entity
-        .capture_manager
-        .as_ref()
-        .is_some_and(|manager| manager.is_full())
-    {
+    if sim.capture_manager_is_full(entity.stable_id(), rules) {
         return false;
     }
     if entity.category() == EntityCategory::Infantry
@@ -552,7 +548,7 @@ pub(super) fn can_acquire_target(sim: &Simulation, id: u64, rules: &RuleSet) -> 
     {
         return false;
     }
-    combat_weapon::is_armed(entity, obj)
+    combat_weapon::is_armed(entity, obj, &sim.substrate.entities, rules, &sim.interner)
 }
 
 fn fire_subject<'a>(
@@ -569,7 +565,7 @@ fn fire_subject<'a>(
         world: sim,
         rules,
         overlay_registry,
-        fog: Some(sim.fog.fire_view(sim.house_alliances.as_map())),
+        fog: Some(sim.fog.fire_view(&sim.house_alliances)),
         firer,
         obj,
         target,
@@ -619,7 +615,7 @@ pub(super) fn select_weapon(
         sim,
         &sim.interner,
         cells.as_ref(),
-        Some(sim.house_alliances.as_map()),
+        Some(&sim.house_alliances),
     )
     .unwrap_or(0)
 }
@@ -909,7 +905,7 @@ impl Simulation {
             crate::sim::combat::line_of_fire::LineOfFireInputs {
                 overlay_grid: self.overlay_grid.as_ref(),
                 overlay_registry,
-                alliances: Some(self.house_alliances.as_map()),
+                alliances: Some(&self.house_alliances),
             },
             Some(self),
             scan_coord,
@@ -1046,7 +1042,7 @@ mod tests {
                 world: &sim,
                 rules,
                 overlay_registry: Some(&registry),
-                fog: Some(sim.fog.fire_view(sim.house_alliances.as_map())),
+                fog: Some(sim.fog.fire_view(&sim.house_alliances)),
                 firer: actor,
                 obj: rules.object("E1").unwrap(),
                 target: Some(TargetKind::Entity(victim)),

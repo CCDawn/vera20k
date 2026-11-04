@@ -63,8 +63,7 @@ fn busy_factory_exit_world() -> Option<(Simulation, RuleSet, InternedId)> {
         .unwrap()
         .base_projection_mut()
         .replace_buildings_for_test(vec![1, 3, 2]);
-    sim.production
-        .set_primary_factory_for_test(owner, ProductionCategory::Vehicle, 1);
+    sim.production.set_primary_factory_for_test(1);
     busy_factory_exit_mission(&mut sim, 1, crate::sim::mission::MissionType::Unload);
     for (id, archive) in [(1, (8, 8)), (2, (12, 24)), (3, (24, 14))] {
         sim.substrate
@@ -222,12 +221,7 @@ fn busy_factory_exit_player_uses_house_order_without_moving_primary() {
     ));
     assert_busy_factory_exit_receiver(&sim, &rules, product, 3);
     assert_eq!(sim.scenario_rng.logical_state(), rng);
-    assert_eq!(
-        sim.production
-            .primary_factory_ids(owner, ProductionCategory::Vehicle)
-            .next(),
-        Some(1)
-    );
+    assert!(sim.production.is_primary_factory(1));
     assert!(sim.production.factories().is_empty());
     assert!(!sim.object_placement_scope_active());
 }
@@ -279,12 +273,7 @@ fn busy_factory_exit_skips_attached_different_type_and_non_guard_buildings() {
         "any non-null +524 excludes that candidate without changing its factory"
     );
     assert!(sim.production.factories().building_factory(5).is_none());
-    assert_eq!(
-        sim.production
-            .primary_factory_ids(owner, ProductionCategory::Vehicle)
-            .next(),
-        Some(1)
-    );
+    assert!(sim.production.is_primary_factory(1));
 }
 
 #[test]
@@ -367,12 +356,7 @@ fn busy_factory_exit_restores_building_attachment_after_success() {
     assert!(sim.production.factories().building_factory(3).is_none());
     assert_eq!(sim.houses[&owner].economy().credits(), credits);
     assert_eq!(sim.next_stable_object_id(), next_id);
-    assert_eq!(
-        sim.production
-            .primary_factory_ids(owner, ProductionCategory::Vehicle)
-            .next(),
-        Some(1)
-    );
+    assert!(sim.production.is_primary_factory(1));
     assert!(!sim.object_placement_scope_active());
 }
 
@@ -753,11 +737,8 @@ fn busy_factory_exit_original_rows_compare_receiver_archive_restoration_and_rng(
             .unwrap()
             .base_projection_mut()
             .replace_buildings_for_test(order);
-        sim.production.set_primary_factory_for_test(
-            owner,
-            ProductionCategory::Vehicle,
-            labels["source"],
-        );
+        sim.production
+            .set_primary_factory_for_test(labels["source"]);
         let source_attached = before["producers"]["source"]["attachment"] != "0x0";
         assert_eq!(source_attached, input["source_attachment"] == "Building");
         let product = busy_factory_exit_product(&mut sim, &rules, owner, source_attached);
@@ -907,12 +888,7 @@ fn busy_factory_exit_original_rows_compare_receiver_archive_restoration_and_rng(
         );
         assert_eq!(sim.houses[&owner].economy().credits(), credits);
         assert_eq!(sim.next_stable_object_id(), next_id);
-        assert_eq!(
-            sim.production
-                .primary_factory_ids(owner, ProductionCategory::Vehicle)
-                .next(),
-            Some(labels["source"])
-        );
+        assert!(sim.production.is_primary_factory(labels["source"]));
         for (label, id) in &labels {
             let entity = sim.substrate.entities.get(*id).unwrap();
             let native = &after["producers"][label];
@@ -2564,8 +2540,13 @@ fn a_held_build_at_its_build_limit_resumes_on_produce() {
         queue_view_for_owner(&sim, &rules, "Americans")[0].state,
         BuildQueueState::Paused
     );
-    let option = super::production_tech::build_option_for_owner(&sim, &rules, "Americans", "AMCV")
-        .expect("the type stays listed");
+    let option = super::production_tech::build_option_for_owner(
+        &sim,
+        &rules,
+        sim.interner.get("Americans"),
+        "AMCV",
+    )
+    .expect("the type stays listed");
     assert_eq!(
         option.reason,
         Some(super::BuildDisabledReason::AtBuildLimit)

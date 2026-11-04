@@ -9,17 +9,20 @@
 //! both (`wgpu_hal=error`); the longest matching prefix wins. A `/text` suffix
 //! keeps only messages containing `text`.
 
+use crate::util::time::{SystemTime, UNIX_EPOCH};
 use std::backtrace::Backtrace;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::util::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
 
 use log::{LevelFilter, Log, Metadata, Record};
 
 static EXCEPTION_DUMP_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The file [`init_file_logger`] opened, for messages that point the player
+/// at it.
+static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
 
 #[cfg(feature = "telemetry")]
 #[path = "logging_telemetry.rs"]
@@ -38,6 +41,7 @@ pub fn init_file_logger(name: &str) -> io::Result<PathBuf> {
 
     let mut log_path = log_dir;
     log_path.push(format!("{name}.log"));
+    roll_over_large_log(&log_path, LOG_ROLL_OVER_BYTES);
 
     let file = OpenOptions::new()
         .create(true)
@@ -49,7 +53,27 @@ pub fn init_file_logger(name: &str) -> io::Result<PathBuf> {
     install("info,wgpu_hal=error", Destination::File(Mutex::new(file)))
         .map_err(|error| io::Error::other(error.to_string()))?;
 
+    let _ = LOG_FILE.set(log_path.clone());
     Ok(log_path)
+}
+
+/// A log past this size at start-up becomes `<name>.log.1` and a new one
+/// starts, so the folder holds at most about twice this.
+const LOG_ROLL_OVER_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Move a log larger than `limit` to `<file>.1`, replacing the older copy.
+/// A failure keeps appending to the old file rather than stopping start-up.
+fn roll_over_large_log(log_path: &Path, limit: u64) {
+    if fs::metadata(log_path).is_ok_and(|meta| meta.len() > limit) {
+        let mut previous = log_path.as_os_str().to_owned();
+        previous.push(".1");
+        let _ = fs::rename(log_path, previous);
+    }
+}
+
+/// The log file [`init_file_logger`] opened; None when the log goes to stderr.
+pub fn log_file() -> Option<&'static Path> {
+    LOG_FILE.get().map(PathBuf::as_path)
 }
 
 /// Install a logger that writes to stderr, filtered by `RUST_LOG` or else
@@ -182,12 +206,16 @@ impl Filter {
                     .is_none_or(|prefix| target.starts_with(prefix))
             })
             .map_or(LevelFilter::Off, |&(_, level)| level);
-        // ureq TRACE includes unredacted HTTP wire data. This logger owns
+        // ureq and tungstenite TRACE include unredacted HTTP and WebSocket
+        // wire data (the lobby stream's bearer and frames). This logger owns
         // every destination (including telemetry); RUST_LOG must never expose
         // account passwords, bearer tokens or relay grants. Keep diagnostic
         // errors without accepting dependency wire/debug logs.
         // https://docs.rs/ureq/3.5.0/ureq/#unversioned
-        if matches!(target.split("::").next(), Some("ureq" | "ureq_proto")) {
+        if matches!(
+            target.split("::").next(),
+            Some("ureq" | "ureq_proto" | "tungstenite")
+        ) {
             level.min(LevelFilter::Info)
         } else {
             level
@@ -236,8 +264,12 @@ fn utc_timestamp(time: SystemTime) -> String {
 /// file when one is available. Each outermost panic creates or replaces
 /// retail's `except.txt` report in the current working directory; recursive
 /// hook entry is suppressed. The default stderr hook is preserved so terminal
-/// users still see output.
-pub fn install_panic_hook(log_path: Option<&Path>) {
+/// users still see output. `notify` runs last, once all of that is written,
+/// so a player without a terminal can be told; it must not panic.
+pub fn install_panic_hook(
+    log_path: Option<&Path>,
+    notify: Option<fn(&std::panic::PanicHookInfo<'_>)>,
+) {
     let prev_hook = std::panic::take_hook();
     let log_path = log_path.map(Path::to_owned);
 
@@ -264,6 +296,10 @@ pub fn install_panic_hook(log_path: Option<&Path>) {
 
         // Preserve default stderr output for terminal users.
         prev_hook(info);
+
+        if let Some(notify) = notify {
+            notify(info);
+        }
     }));
 }
 
@@ -318,7 +354,26 @@ mod tests {
 
     use log::LevelFilter;
 
-    use super::{Filter, claim_exception_dump, utc_timestamp};
+    use super::{Filter, claim_exception_dump, roll_over_large_log, utc_timestamp};
+
+    #[test]
+    fn a_log_past_the_limit_moves_aside_and_a_small_one_stays() {
+        let dir = std::env::temp_dir().join(format!("vera20k-log-roll-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("ra2.log");
+        let previous = dir.join("ra2.log.1");
+        std::fs::write(&previous, b"oldest").unwrap();
+
+        std::fs::write(&log, [0u8; 8]).unwrap();
+        roll_over_large_log(&log, 8);
+        assert!(log.exists(), "a log at the limit keeps growing");
+
+        std::fs::write(&log, [0u8; 9]).unwrap();
+        roll_over_large_log(&log, 8);
+        assert!(!log.exists());
+        assert_eq!(std::fs::read(&previous).unwrap().len(), 9);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn rust_log_directives_pick_the_longest_matching_target() {
@@ -356,9 +411,13 @@ mod tests {
 
     #[test]
     fn http_wire_logging_cannot_expose_credentials_even_with_explicit_trace() {
-        let filter = Filter::parse("trace,ureq=trace,ureq_proto::client=trace");
+        let filter = Filter::parse("trace,ureq=trace,ureq_proto::client=trace,tungstenite=trace");
         assert_eq!(filter.level_for("ureq::request"), LevelFilter::Info);
         assert_eq!(filter.level_for("ureq_proto::client"), LevelFilter::Info);
+        assert_eq!(
+            filter.level_for("tungstenite::handshake::client"),
+            LevelFilter::Info
+        );
         assert_eq!(filter.level_for("vera20k::app"), LevelFilter::Trace);
         assert_eq!(Filter::parse("off").level_for("ureq"), LevelFilter::Off);
     }

@@ -74,22 +74,30 @@ pub(super) fn launch(
     let [x, y, z] = super::deck_coords(sim, cell);
     let impact = ProjectileCoord::new(x, y, z);
     let warhead_ref = sim.interner.intern(&warhead.id);
-    world_receiver::apply_area_damage(
+    let receipt = world_receiver::apply_area_damage(
         sim,
         rules,
         overlays,
         impact,
         settings.damage,
         warhead,
+        true,
         (source, Some(owner), warhead_ref),
         effects,
     );
     // Ares selects its damage animation and flash after DamageArea (which
     // may synchronously destroy the source or change the target's land).
     let land = detonation_anim::land_at(sim, impact);
-    if let Some(effect) =
-        detonation_anim::effect(sim, rules, warhead, settings.damage, land, impact, impact)
-    {
+    if let Some(effect) = detonation_anim::effect(
+        sim,
+        rules,
+        warhead,
+        settings.damage,
+        land,
+        impact,
+        impact,
+        receipt.crit_active,
+    ) {
         crate::sim::world::damage_consequences::admit_explosion_effect(sim, rules, effect);
     }
     sim.combat_light_requests.emit(CombatLightRequest::Impact {

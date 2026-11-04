@@ -339,14 +339,24 @@ pub(crate) fn fire_coordinate(
     let aim_facing16 = base.fire_facing;
     let art = base.art;
 
-    // GetFLH6F3B28 selects the stored WeaponStruct, not a fresh ART read.
-    // GetWeapon70E140 qualifies its elite record only when nonnull.
-    let use_elite = usize::try_from(weapon_index)
-        .is_ok_and(|index| super::combat_weapon::uses_elite_weapon(obj, snap.veterancy, index));
+    // GetFLH6F3B28 reads virtual GetWeapon's complete record, including an
+    // installed upgrade's normal FLH (Building4526F0), at this query point.
     let flh = if weapon_index < 0 {
         obj.alternate_fire_flh((-i64::from(weapon_index) - 1) as usize)
     } else {
-        obj.weapon_flh(weapon_index, use_elite)
+        let record = if let Some(entity) = world.substrate.entities.get(snap.stable_id) {
+            super::combat_weapon::get_weapon_record(
+                entity,
+                obj,
+                weapon_index,
+                &world.substrate.entities,
+                rules,
+                &world.interner,
+            )
+        } else {
+            super::combat_weapon::weapon_for_index(obj, snap.veterancy, weapon_index)
+        };
+        record.map_or_else(Flh::default, |record| record.flh)
     };
     let flh = Flh {
         forward: flh.forward.wrapping_add(base_coords.forward),

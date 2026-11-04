@@ -310,8 +310,11 @@ fn unknown_sources_duplicates_full_queue_and_blocked_fifo_match_original() {
     );
 }
 
+/// Native retires a direct send on an ACK from any host. A LAN host other
+/// than the destination can no longer cancel the message; its destination's
+/// ACK still retires it with one response sample.
 #[test]
-fn ack_from_unrelated_source_retires_send_and_updates_one_response_history() {
+fn ack_from_unrelated_source_leaves_the_direct_send_queued() {
     let data = corpus();
     let mut sender = channel(8, 8);
     sender.send(
@@ -323,18 +326,21 @@ fn ack_from_unrelated_source_retires_send_and_updates_one_response_history() {
     sender.service(1000, &mut |_, _| {});
     let expected = &data["wrong_source_ack"];
     assert_state(&sender, &expected["sender_before"]);
-    assert_eq!(
-        receive(
-            &mut sender,
-            endpoint(&data["endpoints"]["c"]),
-            0,
-            &bytes(&expected["ack_frame"]),
-            1000,
-            &expected["received_from_unrelated_c"]
-        ),
-        GlobalReceiveOutcome::Acknowledgment
-    );
-    service(&mut sender, 1004, &expected["after_service"]);
+    let ack = bytes(&expected["ack_frame"]);
+    for (source, now, queued) in [("c", 1000, 1), ("b", 1004, 0)] {
+        assert_eq!(
+            sender.receive(
+                endpoint(&data["endpoints"][source]),
+                0,
+                &ack,
+                now,
+                &mut |_, _| {}
+            ),
+            Ok(GlobalReceiveOutcome::Acknowledgment)
+        );
+        sender.service(now, &mut |_, _| {});
+        assert_eq!(sender.queued_send_count(), queued);
+    }
     assert_eq!(sender.mean_response_time(), 4);
 }
 
@@ -353,7 +359,7 @@ fn response_reset_preserves_global_delivery_sequence_and_receive_dedup() {
     ));
     sender.service(1000, &mut |_, _| {});
     sender
-        .receive(source, 0, &ack, 1004, &mut |_, _| {})
+        .receive(destination, 0, &ack, 1004, &mut |_, _| {})
         .unwrap();
     sender.service(1004, &mut |_, _| {});
     assert_eq!(sender.mean_response_time(), 4);
@@ -387,7 +393,7 @@ fn response_reset_preserves_global_delivery_sequence_and_receive_dedup() {
     assert_eq!(retried, first_send);
     ack[4..8].copy_from_slice(&1_u32.to_le_bytes());
     sender
-        .receive(source, 0, &ack, 1011, &mut |_, _| {})
+        .receive(destination, 0, &ack, 1011, &mut |_, _| {})
         .unwrap();
     sender.service(1011, &mut |_, _| {
         panic!("ACKed global message retransmitted")
@@ -601,7 +607,7 @@ fn cancellation_matches_native_host_and_override_without_dropping_completed_send
     service(&mut sender, 1000, &expected["sent"]);
     receive(
         &mut sender,
-        endpoint(&data["endpoints"]["c"]),
+        b,
         0,
         &bytes(&data["wrong_source_ack"]["ack_frame"]),
         1000,

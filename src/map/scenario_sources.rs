@@ -183,31 +183,59 @@ fn append_loose_yrm_records(
     records: &mut Vec<SkirmishScenarioRecord>,
     ra2_dir: &Path,
 ) -> Result<()> {
-    for (path, file_name) in loose_files_with_extension(ra2_dir, "yrm")? {
-        let Some(ini) = read_map_ini_for_metadata(&path) else {
-            continue;
-        };
-        records.push(SkirmishScenarioRecord::concrete_from_ini(
-            records.len(),
-            SkirmishScenarioSource::LooseYrm(file_name),
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default(),
-            &ini,
-        ));
+    let mut files = loose_files_with_extension(ra2_dir, "yrm")?;
+    // VERA's downloaded maps follow; a game-folder file of the same name is
+    // the one a lookup finds (`source::local_map_path`).
+    if let Some(downloaded) = crate::map::source::downloaded_maps_dir()
+        && crate::util::file_system::exists(downloaded)
+    {
+        // An unreadable Maps folder lists nothing, not a failed scan.
+        let kept = loose_files_with_extension(downloaded, "yrm").unwrap_or_else(|error| {
+            log::warn!("Could not list {}: {error}", downloaded.display());
+            Vec::new()
+        });
+        for (path, file_name) in kept {
+            if !files
+                .iter()
+                .any(|(_, name)| name.eq_ignore_ascii_case(&file_name))
+            {
+                files.push((path, file_name));
+            }
+        }
+    }
+    for (path, file_name) in files {
+        if let Some(record) = loose_yrm_record(&path, file_name, records.len()) {
+            records.push(record);
+        }
     }
     Ok(())
+}
+
+/// The Choose Map row of one loose `.yrm` file, from its own `[Basic]`;
+/// `None` when it does not read as a map.
+pub fn loose_yrm_record(
+    path: &Path,
+    file_name: String,
+    ordinal: usize,
+) -> Option<SkirmishScenarioRecord> {
+    let ini = read_map_ini_for_metadata(path)?;
+    Some(SkirmishScenarioRecord::concrete_from_ini(
+        ordinal,
+        SkirmishScenarioSource::LooseYrm(file_name),
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default(),
+        &ini,
+    ))
 }
 
 fn loose_files_with_extension(ra2_dir: &Path, extension: &str) -> Result<Vec<(PathBuf, String)>> {
     let mut files = Vec::new();
 
-    for entry in crate::util::file_system::read_dir(ra2_dir)? {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let path = entry.path();
+    // `SessionClass::ScanMultiplayerMapFiles` (`0x00699980`) lists with
+    // FindFirstFileA (`0x00699AE6`, `0x00699C5D`, `0x0069A007`) and registers
+    // each YRO as it is listed.
+    for path in crate::util::case_insensitive_path::native_listing(ra2_dir)? {
         if !retail_enumerated_file(&path) {
             continue;
         }
@@ -616,5 +644,25 @@ mod tests {
         );
         assert_eq!(manager.registered_archive_names(), ["COLLIDE.YRO"]);
         assert_eq!(manager.get_ref("YROONLY.BIN"), Some(&b"retained"[..]));
+    }
+
+    #[test]
+    fn yro_packs_register_in_native_name_order() {
+        // The first pack by name wins an entry both carry. APFS lists these
+        // two the other way round.
+        let directory = TestDirectory::new("yro-name-order");
+        let pack = |body: &[u8]| make_new_format_mix_bytes(&[("SHARED.BIN", body)]);
+        directory.write("SECOND.YRO", &pack(b"second"));
+        directory.write("First.yro", &pack(b"first"));
+
+        let mut manager = AssetManager::from_loose_root_for_test(directory.path());
+        append_loose_yro_records(&mut Vec::new(), directory.path(), &mut manager, None)
+            .expect("scan loose YRO");
+
+        assert_eq!(
+            manager.registered_archive_names(),
+            ["First.yro", "SECOND.YRO"]
+        );
+        assert_eq!(manager.get_ref("SHARED.BIN"), Some(&b"first"[..]));
     }
 }

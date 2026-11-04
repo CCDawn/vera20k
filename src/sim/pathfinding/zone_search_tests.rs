@@ -538,7 +538,7 @@ fn tube_hierarchy_gate_uses_raw_invalid_labels_and_goal_bridge_flag() {
     {
         let base = zones.base_topology_mut();
         base.zone_ids = vec![2, 3, 2, 3];
-        base.raw_zone_ids_by_row[row] = vec![0, 0, 1, u16::MAX];
+        base.raw_zone_ids_by_row[row] = vec![0, 0, 1, (u16::MAX as ZoneId)];
     }
     {
         let map = zones.map_mut(MovementZone::Normal).unwrap();
@@ -570,7 +570,7 @@ fn tube_hierarchy_gate_uses_raw_invalid_labels_and_goal_bridge_flag() {
     );
     assert_eq!(
         zones.get_zone_id_native(&terrain, (1, 0), MovementZone::Normal, false),
-        Some(u32::from(u16::MAX))
+        Some(u32::from(u16::MAX as ZoneId))
     );
     assert_eq!(
         zones
@@ -711,7 +711,7 @@ fn tube_hierarchy_dword_zone_query_matches_original_executable() {
                 }
             }
             base.raw_zone_ids_by_row[MovementZone::Normal.matrix_row().unwrap()] =
-                vec![0, case["raw"].as_u64().unwrap() as u16, 3];
+                vec![0, case["raw"].as_u64().unwrap() as ZoneId, 3];
         }
         dummy.stamp_coord(1234, -2345);
         assert_eq!(

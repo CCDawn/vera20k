@@ -293,7 +293,13 @@ fn decide_base_zone_repair(
     let row0 = &base.raw_zone_ids_by_row[0];
     // Native reads the retained row even for cluster0.56CAF4 normally stores
     // FFFF there, but the selectors themselves do not substitute the sentinel.
-    let mapped = |cluster: ZoneId| row0.get(cluster as usize).copied().unwrap_or(u16::MAX);
+    let mapped = |cluster: ZoneId| {
+        row0.get(cluster as usize)
+            .copied()
+            .unwrap_or(super::zone_map::raw_zone_invalid(
+                crate::map::cell_index::CellGrid::for_extent(width, height),
+            ))
+    };
     let mut previous_cluster = ZONE_INVALID;
     let mut transitions = 0u8;
     for &(neighbor_type, cluster) in &neighbors {

@@ -145,6 +145,7 @@ fn audio_runtime(with_device: bool) -> AppAudioRuntime {
     });
     AppAudioRuntime {
         master_groups: Default::default(),
+        restore_muted: false,
         theme: Default::default(),
         service_clock: Default::default(),
         music_player: None,
@@ -300,7 +301,7 @@ fn history(
     );
     assert!(!object.can_be_occupied && !object.explodes);
     assert!(!crate::map::houses::is_allied_with(
-        sim.house_alliances(),
+        sim.house_alliances().as_map(),
         sim.resolve(neutral),
         &local
     ));

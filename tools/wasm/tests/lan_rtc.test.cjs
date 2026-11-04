@@ -6,7 +6,8 @@ const test = require('node:test');
 
 // Values created inside the script's realm compare structurally.
 const plain = value => JSON.parse(JSON.stringify(value));
-const settle = () => new Promise(resolve => setImmediate(resolve));
+const turn = () => new Promise(resolve => setImmediate(resolve));
+const settle = async () => { for (let i = 0; i < 8; i++) await turn(); };
 
 function fixture() {
   const sockets = [], peers = [], timers = new Map();
@@ -19,6 +20,8 @@ function fixture() {
     opened() { this.readyState = Socket.OPEN; this.onopen(); }
     signal(message) { this.onmessage({data: JSON.stringify(message)}); }
   }
+  // As in Chromium, an operation on a closed connection rejects, and one still
+  // in flight when the connection closes never settles.
   class PeerConnection {
     constructor(config) { this.config = config; this.candidates = []; peers.push(this); }
     createDataChannel(label, options) {
@@ -26,11 +29,17 @@ function fixture() {
         send(bytes) { this.sent.push([...bytes]); }};
       return this.channel;
     }
-    async createOffer() { return {type: 'offer', sdp: 'offer'}; }
-    async createAnswer() { return {type: 'answer', sdp: 'answer'}; }
-    async setLocalDescription(description) { this.localDescription = {...description, toJSON: () => description}; }
-    async setRemoteDescription(description) { this.remoteDescription = description; }
-    async addIceCandidate(candidate) { this.candidates.push(candidate); }
+    operation(complete) {
+      if (this.closed) return Promise.reject(new Error('InvalidStateError'));
+      return new Promise(resolve => setImmediate(() => { if (!this.closed) resolve(complete()); }));
+    }
+    createOffer() { return this.operation(() => ({type: 'offer', sdp: 'offer'})); }
+    createAnswer() { return this.operation(() => ({type: 'answer', sdp: 'answer'})); }
+    setLocalDescription(description) {
+      return this.operation(() => { this.localDescription = {...description, toJSON: () => description}; });
+    }
+    setRemoteDescription(description) { return this.operation(() => { this.remoteDescription = description; }); }
+    addIceCandidate(candidate) { return this.operation(() => { this.candidates.push(candidate); }); }
     close() { this.closed = true; }
   }
   const api = vm.createContext({
@@ -113,4 +122,24 @@ test('a reconnect keeps its virtual address and live channels', async () => {
   assert.equal(peers[0].closed, undefined);
   sockets[1].signal({type: 'welcome', address: THIRD, peers: [], iceServers: []});
   assert.equal(peers[0].closed, true);
+});
+
+test('a peer that leaves mid-handshake cannot stall other peers or its own return', async () => {
+  const {api, sockets} = fixture();
+  api.veraLanOpen('wss://wss.vera20k.com', 1234, 2048);
+  sockets[0].opened();
+  sockets[0].signal({type: 'welcome', address: THIRD, peers: [HOST, GUEST], iceServers: []});
+  const offer = from => sockets[0].signal({type: 'signal', from, data: {description: {type: 'offer', sdp: 'offer'}}});
+  const answered = () => sockets[0].sent.filter(message => message.data.description?.type === 'answer').map(message => message.to);
+  offer(HOST);
+  // The host leaves while its offer is being applied, abandoning that operation.
+  await null;
+  sockets[0].signal({type: 'leave', peer: HOST});
+  offer(GUEST);
+  await settle();
+  assert.deepEqual(answered(), [GUEST]);
+  sockets[0].signal({type: 'join', peer: HOST});
+  offer(HOST);
+  await settle();
+  assert.deepEqual(answered(), [GUEST, HOST]);
 });

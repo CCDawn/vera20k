@@ -735,6 +735,14 @@ pub enum LifecycleOutput {
         category: crate::sim::production::ProductionCategory,
         construction_order: u64,
     },
+    /// StripAI6A8E48 -> SetSidebarTabObject734250 publishes the actual held
+    /// Building on each consumed changed+complete edge. The local sidebar
+    /// owns this reference's history; Factory owns the object's readiness.
+    ProductionBuildingReady {
+        owner: InternedId,
+        category: crate::sim::production::ProductionCategory,
+        stable_id: u64,
+    },
     /// Local HouseAbandon4FAB74 enters Sidebar6ABAD0. Its private strip
     /// owner determines whether the cursor prefix precedes settlement (no
     /// link) or follows the first linked FactoryAbandon/destructor.
@@ -742,6 +750,9 @@ pub enum LifecycleOutput {
         owner: InternedId,
         category: crate::sim::production::ProductionCategory,
         construction_order: u64,
+        /// StripAbandon6ABBB6 clears only an actual held Building reference.
+        /// None means the nonnull/Building gate skipped the helper entirely.
+        held_building: Option<u64>,
     },
     /// Strip6ABBDF clears every matching link after the linked destructor,
     /// before the House cursor prefix and successor Begin. Queued-only
@@ -1800,6 +1811,22 @@ impl Simulation {
                 .checked_shl(ordinal as u32)
                 .expect("admitted network human count fits the30-player discovery mask"),
         )
+    }
+
+    /// `+0x41A` as a decision every peer shares reads it: VisualCharacter's
+    /// (`0x00703860`) answer for an `Invisible=` object in the cloak tick,
+    /// GetFireError and the Behind indicator. VERA network adaptation, as
+    /// HasOccurred53's: PlayerPtr differs per client, so in a network game no
+    /// shared decision sees the current house own the object. Drawing reads
+    /// the actual byte.
+    /// RESIDUAL: online, an invisible object's owner gets what other players
+    /// natively got. A player's hidden `InvisibleInGame=` lamp post takes no
+    /// BEHIND anim, and the owner's force-fire on it, unsensed, is Cant; only
+    /// maps that give a player a lamp post reach these. An owned `Invisible=`
+    /// cloaker (no retail type) finishes cloaking at once and never finishes
+    /// uncloaking.
+    pub(crate) fn shared_owned_by_current_house(&self, entity: &GameEntity) -> bool {
+        !self.session.game_mode().is_network() && entity.discovery.owned_by_current_house()
     }
 
     /// Retained discovery for a specified logical map, rather than this
@@ -4030,6 +4057,19 @@ impl Simulation {
             .release_foot_air_tracker_before_limbo(stable_id);
         #[cfg(feature = "ares")]
         self.limbo_ares_attach_effects(stable_id, context.rules());
+        // Phobos `TechnoClass_Limbo_Wrapper` replaces the Limbo entry
+        // (vtable + the Foot/Building call sites) and runs its
+        // DiscardOn=Entry pass before calling the original body. Its work
+        // therefore precedes the hooks inside that body; the Ares extension's
+        // relative position is unobserved and kept as the AttachEffect branch
+        // had it.
+        #[cfg(feature = "phobos")]
+        self.limbo_phobos_attach_effects(
+            stable_id,
+            context.rules(),
+            context.registry(),
+            context.effects(),
+        );
         // Techno Remove6F6AC9 ->1004B140/1004B1A9 flushes even a repeated
         // Limbo, before the base's alive/InLimbo and sight-release branches.
         #[cfg(feature = "ares")]
@@ -4276,7 +4316,7 @@ impl Simulation {
         let allied_with = |sim: &Self, contact: u64| {
             sim.substrate.entities.get(contact).is_some_and(|contact| {
                 crate::sim::combat::combat_weapon::is_ally_by_object(
-                    Some(sim.house_alliances.as_map()),
+                    Some(&sim.house_alliances),
                     &sim.interner,
                     owner,
                     contact.owner(),
@@ -4659,14 +4699,7 @@ impl Simulation {
     /// VERA-only: feeds the expiry-listener index (`ExpiryListeners`) so the
     /// `0x007258D0` broadcast skips entities; the listener's fields are the truth.
     pub(super) fn entity_expiry_holds(listener: &GameEntity, mut name: impl FnMut(u64)) -> bool {
-        if let Some(anim) = listener.parachute_animation() {
-            name(anim);
-        }
-        if let Some(anim) = listener.emp_sparkle() {
-            name(anim);
-        }
-        #[cfg(feature = "ares")]
-        listener.attached_effect_anims().for_each(&mut name);
+        listener.held_anims().for_each(&mut name);
         for target in [
             listener.attack_target.target(),
             listener.suspended_attack_target.target(),
@@ -4703,6 +4736,7 @@ impl Simulation {
             .filter_map(|target| target.object_id())
             .for_each(&mut name);
         [
+            listener.unit_follower(),
             listener.passenger_role.inside_transport_id(),
             listener.pending_entry(),
             listener.spawn_owner_id.owner(),
@@ -4721,12 +4755,6 @@ impl Simulation {
         .into_iter()
         .flatten()
         .for_each(&mut name);
-        listener
-            .parasite
-            .class()
-            .and_then(|class| class.grapple_anim())
-            .into_iter()
-            .for_each(&mut name);
         listener.mega_mission.referenced_ids().for_each(&mut name);
         listener.distributed_fire_references().for_each(&mut name);
         // The SpawnManager, CaptureManager and TemporalClass forwards act on
@@ -5582,9 +5610,11 @@ impl Simulation {
         if !self.substrate.anims.contains_key(expired_id) {
             return;
         }
-        let holders = self
-            .expiry_listeners
-            .entities_reached_by(&mut self.substrate.entities, expired_id);
+        // VERA-only: each callback below clears only its own entity's fields
+        // that name the Anim (`GameEntity::held_anims`) and draws nothing, so
+        // visiting just the entities the anim-holder index finds, ascending,
+        // changes exactly what visiting every entity would.
+        let holders = self.substrate.entities.take_anim_holders(expired_id);
         for owner in holders {
             if let Some(entity) = self.substrate.entities.get_mut(owner) {
                 // Techno's Anim callback710455 reaches Object5F6DA0.
@@ -6047,6 +6077,15 @@ impl Simulation {
                     context.rules(),
                     context.effects(),
                 );
+                // UnitClass::PointerExpired7446E0 runs the full Foot forward
+                // first, then clears matching +6C8 at7446FF for either control
+                // value. It leaves the independent +6D0 byte alone (gamemd).
+                if let Some(entity) = self.substrate.entities.get_mut_if(listener_id, |entity| {
+                    entity.category() == EntityCategory::Unit
+                        && entity.unit_follower() == Some(expired_id)
+                }) {
+                    entity.set_unit_follower(None);
+                }
                 #[cfg(any(test, feature = "test-support"))]
                 if let Some(before) = passed_over {
                     assert_eq!(
@@ -6809,9 +6848,10 @@ impl Simulation {
         if kind == Some(ObjectKind::Anim) {
             self.notify_anim_pointer_expired(stable_id);
             self.substrate.clear_damage_fire_anim_reference(stable_id);
-            self.conceal_anim(stable_id);
+            self.substrate.release_last_anim_owner_flag(stable_id);
             self.substrate.release_anim_owner_reference(stable_id);
             self.substrate.clear_building_anim_reference(stable_id);
+            self.conceal_anim(stable_id);
         }
         // The native Object field+34 disappears with storage. This is not
         // SetTag(nullptr): the shared Tag owner preserves its native counter.

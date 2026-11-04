@@ -380,6 +380,19 @@ impl FootPathQueue {
         path: &[(u16, u16)],
         first_destination: usize,
     ) {
+        self.install_directions(reference, path, first_destination);
+        self.rebase((reference.0 as i16, reference.1 as i16));
+    }
+
+    /// Find_Path's direction copy (`0x004D3E82..0x004D3EA1`) precedes
+    /// follower callbacks; its separate reference write is at `0x004D4003`.
+    /// Keep the previous reference until that continuation publishes it.
+    pub(crate) fn install_directions(
+        &mut self,
+        reference: (u16, u16),
+        path: &[(u16, u16)],
+        first_destination: usize,
+    ) {
         let mut from = (reference.0 as i16, reference.1 as i16);
         self.directions.clear();
         for &destination in path
@@ -391,7 +404,6 @@ impl FootPathQueue {
             from = (destination.0 as i16, destination.1 as i16);
         }
         self.cursor = 0;
-        self.reference_cell = Some((reference.0 as i16, reference.1 as i16));
     }
 
     /// Fresh acceptance (`0x004B4618`/`0x006A3C47`): `endpoint` becomes the
@@ -955,7 +967,7 @@ mod tests {
 
 /// The direction word of one route step; a non-adjacent step is the tube
 /// direction.
-fn direction_from_step(from: (i16, i16), to: (u16, u16)) -> u8 {
+pub(crate) fn direction_from_step(from: (i16, i16), to: (u16, u16)) -> u8 {
     let dx = i32::from(to.0 as i16) - i32::from(from.0);
     let dy = i32::from(to.1 as i16) - i32::from(from.1);
     crate::util::direction::direction_from_delta(dx, dy)

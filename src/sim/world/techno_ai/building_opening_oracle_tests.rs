@@ -533,7 +533,7 @@ fn stock_opening_matches_original_building_and_same_pass_anim_visits() {
 #[test]
 fn place_selects_the_original_house_order_and_primary_factory() {
     use crate::sim::mission::authority::{commence_entity_mission, queue_entity_mission_deferred};
-    use crate::sim::production::{ProductionCategory, find_factory, initialize_factory_primary};
+    use crate::sim::production::{find_factory, initialize_factory_primary};
 
     let corpus = corpus();
     let controls = &corpus["factory_controls"];
@@ -591,11 +591,7 @@ fn place_selects_the_original_house_order_and_primary_factory() {
                 _ => {}
             }
             if row["primary"][index] == 1 {
-                sim.production.set_primary_factory_for_test(
-                    owner,
-                    ProductionCategory::Building,
-                    id,
-                );
+                sim.production.set_primary_factory_for_test(id);
             }
         }
         let expected = row["order"]
@@ -619,28 +615,24 @@ fn place_selects_the_original_house_order_and_primary_factory() {
             row["name"]
         );
     }
-    let (mut sim, rules, owner, ids) = fixture(false);
+    let (mut sim, rules, _, ids) = fixture(false);
     for (index, row) in controls["set_primary"]
         .as_array()
         .unwrap()
         .iter()
         .enumerate()
     {
-        let before = sim
-            .production
-            .primary_factory_ids(owner, ProductionCategory::Building)
-            .next();
+        // 0x00448142..0x00448150 returns whether this building's own
+        // +3D3 changed.
+        let before = sim.production.is_primary_factory(ids[index]);
         initialize_factory_primary(&mut sim, &rules, ids[index]);
-        let after = sim
-            .production
-            .primary_factory_ids(owner, ProductionCategory::Building)
-            .next();
+        let after = sim.production.is_primary_factory(ids[index]);
         assert_eq!(
             u8::from(before != after),
             row["changed"].as_u64().unwrap() as u8
         );
         assert_eq!(
-            json!(ids.map(|id| u8::from(after == Some(id)))),
+            json!(ids.map(|id| u8::from(sim.production.is_primary_factory(id)))),
             row["primary"]
         );
     }

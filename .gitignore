@@ -66,8 +66,18 @@ Thumbs.db
 !/docs/phobos-superweapon-sidebar.md
 !/docs/phobos-prone-speed.md
 !/docs/phobos-building-type-selectable.md
+!/docs/phobos-allow-damage-on-self.md
+!/docs/phobos-projectile-gravity.md
+!/docs/phobos-decloak-damaged-targets.md
+!/docs/phobos-airstrike-flare.md
+!/docs/phobos-attach-effect.md
+!/docs/phobos-critical-hit.md
+!/docs/phobos-selection-flash.md
+!/docs/phobos-locomotor-aliases.md
+!/docs/ares-promotion-sounds.md
 !/docs/npatch.md
 !/docs/verax.md
+!/docs/npbug.md
 !/docs/ares-generic-warhead.md
 !/docs/ares-hunter-seeker.md
 !/docs/ini-roots.md
@@ -80,6 +90,8 @@ Thumbs.db
 !/docs/ares-superweapon-money.md
 !/docs/ares-building-palettes.md
 !/docs/ini-directives.md
+!/docs/ini-commander-personalities.md
+!/docs/ini-end-game-screens.md
 !/docs/script-action-56.md
 !/docs/ar/
 !/docs/de/
@@ -94,6 +106,8 @@ Thumbs.db
 .mcp.json
 # Cloudflare CLI cache: holds the account ID and email wherever `cf` runs.
 .cloudflare/
+# Private keys, such as the update signing key (.github/release/downloads.md).
+*.pem
 /.claude/*
 !/.claude/skills/
 /.claude/skills/ghidra-up/

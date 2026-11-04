@@ -15,7 +15,6 @@ use exit_reentry::ExitReentry;
 enum RoundPhase {
     LanEntry,
     Main,
-    Welcome,
     Login,
     Lobby,
     Create,
@@ -31,7 +30,7 @@ enum RoundPhase {
     Results,
     Returning,
     ExitFault,
-    ExitWelcome,
+    ExitSignIn,
     MainReturn,
     Finished,
 }
@@ -612,7 +611,7 @@ impl LiveRoundFlow {
                         if online {
                             self.phase = RoundPhase::Lobby;
                         } else {
-                            lobby_button(state, crate::ui::lan_shell::CREATE)?;
+                            create_lan_game(state)?;
                         }
                         self.record(frame,"Host profile Back returned to lobby; ordinary Create repeats the same profile");
                         return Ok(());
@@ -626,7 +625,7 @@ impl LiveRoundFlow {
                                     .button_rect(wol_lobby::BACK)
                                     .context("profile lobby Back")?,
                             );
-                            self.phase = RoundPhase::ExitWelcome;
+                            self.phase = RoundPhase::ExitSignIn;
                         } else {
                             lobby_button(state, crate::ui::lan_shell::BACK)?;
                             MoviesCapture::restore_neutral_pointer(state);
@@ -687,18 +686,6 @@ impl LiveRoundFlow {
                     crate::ui::main_menu_shell::MainMenuControlId::WwOnline0x684,
                 )?;
                 self.record(frame, "Multiplayer Internet selected");
-                self.phase = RoundPhase::Welcome;
-            }
-            RoundPhase::Welcome
-                if rendered == PresentedShell::WolWelcome
-                    && MoviesCapture::slide_settled(state, ShellSlideKind::WolWelcome) =>
-            {
-                let rect = App::wol_welcome_layout(state)
-                    .page
-                    .button_rect(crate::ui::wol_shell::CUSTOM_MATCH)
-                    .context("Custom Match button")?;
-                click(state, rect);
-                self.record(frame, "Custom Match selected");
                 self.phase = RoundPhase::Login;
             }
             RoundPhase::Login
@@ -772,6 +759,7 @@ impl LiveRoundFlow {
                     let layout = crate::ui::shell::modal::wol_create_game_layout(
                         size.width as i32,
                         size.height as i32,
+                        true,
                     );
                     click(state, layout.ok);
                     self.record(frame, "Create Game confirmed");
@@ -951,7 +939,12 @@ impl LiveRoundFlow {
                     .network_setup_protocol
                     .as_ref()
                     .is_some_and(|protocol| protocol.start_in_progress());
-                if ready && !starting && core.start_matches(state, self.online_config().start) {
+                let start = self.online_config().start;
+                if ready
+                    && !starting
+                    && core.start_matches(state, start)
+                    && core.choices_made(state, start.is_some())
+                {
                     setup_button(state, crate::ui::multiplayer_setup::START)?;
                     self.record(
                         frame,
@@ -963,11 +956,13 @@ impl LiveRoundFlow {
                 if self.online_config().start.is_some() && !core.start_selection_admitted(state) {
                     return Ok(());
                 }
+                // The guest's game accepts the received map and options by
+                // itself, and again after each echoed choice, so the run only
+                // makes its choices and stays in editable setup until Start.
                 let country_was_selected = core.country_selected;
                 core.select_country(state)?;
                 if !country_was_selected && core.country_selected {
-                    // Let the real host options echo this normal control edit
-                    // before any Accept can acknowledge it.
+                    // One normal control edit per frame.
                     return Ok(());
                 }
                 if core.select_start(state, self.online_config().start)? {
@@ -975,25 +970,6 @@ impl LiveRoundFlow {
                         frame,
                         "Configured authored start selected through the local Start combo",
                     );
-                    return Ok(());
-                }
-                if state
-                    .match_state
-                    .session
-                    .network_setup()
-                    .is_some_and(|launch| {
-                        launch.humans.len() == self.round_players()
-                            && launch
-                                .humans
-                                .iter()
-                                .all(|human| human.raw_slot_index.is_some())
-                    })
-                    && state.match_state.session.network_start_seed().is_some()
-                    && core.start_matches(state, self.online_config().start)
-                    && setup::view(state).is_some_and(|view| view.accept_enabled)
-                {
-                    setup_button(state, crate::ui::multiplayer_setup::ACCEPT)?;
-                    self.record(frame, "Received map and options; Accept clicked");
                 }
             }
             RoundPhase::Loading | RoundPhase::HostReady | RoundPhase::GuestSetup
@@ -1353,7 +1329,7 @@ impl LiveRoundFlow {
                         .context("WOL lobby Back button")?;
                     click(state, rect);
                     self.record(frame, "Presented authenticated lobby reached after startup failure; normal Back clicked");
-                    self.phase = RoundPhase::ExitWelcome;
+                    self.phase = RoundPhase::ExitSignIn;
                 } else if core.failure.is_some() {
                     self.phase = RoundPhase::Finished;
                 } else if self.rounds.len() == 2 {
@@ -1372,7 +1348,7 @@ impl LiveRoundFlow {
                             .button_rect(wol_lobby::BACK)
                             .context("WOL lobby Back button")?;
                         click(state, rect);
-                        self.phase = RoundPhase::ExitWelcome;
+                        self.phase = RoundPhase::ExitSignIn;
                     } else {
                         lobby_button(state, crate::ui::lan_shell::BACK)?;
                         MoviesCapture::restore_neutral_pointer(state);
@@ -1404,22 +1380,19 @@ impl LiveRoundFlow {
                         frame,
                         "Scoped HTTPS block acknowledged; actual lobby Back clicked",
                     );
-                    self.phase = RoundPhase::ExitWelcome;
+                    self.phase = RoundPhase::ExitSignIn;
                 }
             }
-            RoundPhase::ExitWelcome
-                if rendered == PresentedShell::WolWelcome
-                    && MoviesCapture::slide_settled(state, ShellSlideKind::WolWelcome) =>
+            RoundPhase::ExitSignIn
+                if rendered == PresentedShell::WolLogin
+                    && MoviesCapture::slide_settled(state, ShellSlideKind::WolLogin) =>
             {
-                let rect = App::wol_welcome_layout(state)
+                let rect = crate::app::shell_wol::login_layout(state)
                     .page
-                    .button_rect(crate::ui::wol_shell::MAIN_MENU)
-                    .context("WOL welcome Main Menu button")?;
+                    .button_rect(crate::ui::wol_login::BACK)
+                    .context("WOL sign-in Back button")?;
                 click(state, rect);
-                self.record(
-                    frame,
-                    "WOL welcome Main Menu clicked through ordinary input",
-                );
+                self.record(frame, "WOL sign-in Back clicked through ordinary input");
                 self.phase = RoundPhase::MainReturn;
             }
             RoundPhase::MainReturn
@@ -1581,10 +1554,11 @@ pub(super) fn online_lobby_settled(state: &AppState) -> bool {
 pub(super) fn online_setup_settled(state: &AppState, host: bool) -> bool {
     MoviesCapture::slide_settled(
         state,
-        ShellSlideKind::NetworkSetup(crate::ui::multiplayer_setup::SetupDialog {
+        ShellSlideKind::NetworkSetup(crate::app::shell_network_setup::setup_dialog(
+            state,
             host,
-            flavor: crate::ui::multiplayer_setup::SetupFlavor::Wol,
-        }),
+            crate::ui::multiplayer_setup::SetupFlavor::Wol,
+        )),
     ) && state
         .frontend
         .multiplayer_setup

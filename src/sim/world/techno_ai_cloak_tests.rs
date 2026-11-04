@@ -1138,3 +1138,68 @@ fn a_dive_breaks_contact_zero_only_with_a_house_its_owner_is_not_allied_with() {
         );
     }
 }
+
+/// Phobos ORs `AE.Cloakable` into the live Techno flag and `AE.ForceDecloak`
+/// into the two cloak decisions (`Hooks.Cloak.cpp`): the effect can install
+/// the runtime for a type without `Cloakable=`, and a forced decloak vetoes
+/// the ready check while requesting the decloak.
+#[cfg(feature = "phobos")]
+#[test]
+fn attach_effect_cloakable_and_force_decloak_move_the_gates() {
+    let rules = RuleSet::from_ini(&IniFile::from_str(
+        "[General]\nCloakingStages=9\nCloakDelay=.02\n\
+         [VehicleTypes]\n0=TANK\n1=SUB\n\
+         [TANK]\nStrength=600\nSpeed=4\nAttachEffect.AttachTypes=AE_CLOAK\n\
+         [SUB]\nStrength=600\nSpeed=4\nCloakable=yes\nCloakingSpeed=1\n\
+         AttachEffect.AttachTypes=AE_FORCE\n\
+         [AttachEffectTypes]\n0=AE_CLOAK\n1=AE_FORCE\n\
+         [AE_CLOAK]\nDuration=-1\nCloakable=yes\n\
+         [AE_FORCE]\nDuration=-1\nForceDecloak=yes\n",
+    ))
+    .expect("cloak effect rules");
+    let mut sim = Simulation::with_seed(0xC10A_C0DE);
+    sim.fog.set_width_for_test(64);
+    sim.fog.set_height_for_test(64);
+    sim.playfield_bounds = Some(PlayfieldBounds::from_normalized_local_size(
+        64, 2, 2, 56, 52,
+    ));
+    let bounds = sim.playfield_bounds.unwrap();
+    let (rx, ry) = (8u16..56)
+        .flat_map(|ry| (8u16..56).map(move |rx| (rx, ry)))
+        .find(|&(rx, ry)| bounds.contains_height_aware_packed(rx.into(), ry.into(), 0, 0))
+        .expect("interior mode-one cell");
+
+    let tank = sim
+        .spawn_object_at_height("TANK", "Soviet", rx, ry, 0, 0, &rules)
+        .unwrap();
+    sim.update_phobos_attach_effects(tank, &rules);
+    tick_stock_cloak_producer(
+        &mut sim,
+        tank,
+        &rules,
+        None,
+        crate::sim::world::FrameEffects::default(),
+    );
+    assert!(
+        sim.substrate.entities.get(tank).unwrap().cloak.is_some(),
+        "AE Cloakable installs the runtime for a non-Cloakable type"
+    );
+    let facts = stock_cloak_tick_facts(&sim, tank, &rules, None).expect("tank facts");
+    assert!(facts.can_auto_cloak);
+    assert!(!facts.should_uncloak);
+
+    let sub = sim
+        .spawn_object_at_height("SUB", "Soviet", rx + 2, ry, 0, 0, &rules)
+        .unwrap();
+    sim.update_phobos_attach_effects(sub, &rules);
+    tick_stock_cloak_producer(
+        &mut sim,
+        sub,
+        &rules,
+        None,
+        crate::sim::world::FrameEffects::default(),
+    );
+    let facts = stock_cloak_tick_facts(&sim, sub, &rules, None).expect("sub facts");
+    assert!(!facts.can_auto_cloak, "ForceDecloak vetoes the ready check");
+    assert!(facts.should_uncloak, "ForceDecloak requests the decloak");
+}

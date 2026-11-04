@@ -74,7 +74,7 @@
       negotiated: true, id: 0, ordered: false, maxRetransmits: 0,
     });
     channel.binaryType = 'arraybuffer';
-    const peer = {pc, channel, candidates: []};
+    const peer = {pc, channel, candidates: [], negotiation: Promise.resolve()};
     const current = () => session?.peers.get(address) === peer;
     const lost = () => {
       if (!current()) return;
@@ -104,20 +104,29 @@
     for (const candidate of peer.candidates.splice(0)) await peer.pc.addIceCandidate(candidate);
   }
 
-  async function negotiate(from, data) {
+  async function apply(from, peer, data) {
     const type = data.description?.type;
     if (type === 'offer') {
-      const peer = createPeer(from);
       await accept(peer, data.description);
       await peer.pc.setLocalDescription(await peer.pc.createAnswer());
-      signal({type: 'signal', to: from, data: {description: peer.pc.localDescription.toJSON()}});
-      return;
-    }
-    const peer = session.peers.get(from);
-    if (!peer) return;
-    if (type === 'answer') await accept(peer, data.description);
+      if (session?.peers.get(from) === peer) {
+        signal({type: 'signal', to: from, data: {description: peer.pc.localDescription.toJSON()}});
+      }
+    } else if (type === 'answer') await accept(peer, data.description);
     else if (data.candidate && !peer.pc.remoteDescription) peer.candidates.push(data.candidate);
     else if (data.candidate) await peer.pc.addIceCandidate(data.candidate);
+  }
+
+  // Each connection applies its descriptions and candidates in order, so
+  // candidates never race their pair's descriptions. A closed connection
+  // abandons operations in flight without settling them, so a peer that
+  // leaves mid-handshake may stall only its own dropped connection's queue.
+  function negotiate(from, data) {
+    const peer = data.description?.type === 'offer' ? createPeer(from) : session.peers.get(from);
+    if (!peer) return;
+    peer.negotiation = peer.negotiation
+      .then(() => apply(from, peer, data))
+      .catch(() => {}); // A broken pair ends; protocol timeouts decide.
   }
 
   function receiveSignal(text) {
@@ -144,11 +153,7 @@
       session.members.delete(message.peer >>> 0);
       if (!connected(message.peer >>> 0)) dropPeer(message.peer >>> 0);
     } else if (message.type === 'signal' && message.data) {
-      // Serialized so candidates never race their pair's descriptions.
-      const from = message.from >>> 0;
-      session.negotiation = session.negotiation
-        .then(() => negotiate(from, message.data))
-        .catch(() => {}); // A broken pair ends; protocol timeouts decide.
+      negotiate(message.from >>> 0, message.data);
     }
   }
 
@@ -197,7 +202,7 @@
     if (!session) {
       session = {
         url: url.href, ws: null, address: 0, members: new Set(), peers: new Map(),
-        retries: new Map(), iceServers: [], negotiation: Promise.resolve(),
+        retries: new Map(), iceServers: [],
         retryTimer: undefined, connectTimer: undefined, retryDelay: 250,
       };
       connect();

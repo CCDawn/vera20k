@@ -7,10 +7,10 @@ use std::marker::PhantomData;
 use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
 use serde::ser::{Serialize, SerializeMap, Serializer};
 
-/// Cells per side of gamemd's fixed cell array.
-const SIDE: usize = crate::map::cell_index::CELL_ROW_STRIDE as usize;
-/// Slots per strip: eight columns of the array.
-const STRIP_SLOTS: usize = 8 * SIDE;
+/// Cells per side of gamemd's fixed cell array, the dense side a map starts with.
+const RETAIL_SIDE: usize = crate::map::cell_index::CELL_ROW_STRIDE as usize;
+/// Cells per side of the largest cell array a map can select.
+const SIDE: usize = crate::map::cell_index::MAX_CELL_SIDE as usize;
 
 /// A `BTreeMap<(u16, u16), V>` with O(1) lookups: each native cell has a
 /// dense slot.
@@ -21,10 +21,14 @@ const STRIP_SLOTS: usize = 8 * SIDE;
 /// are x-major (`x * 512 + y`), so key order is storage order, and a bitset
 /// of filled slots lets iteration skip empty runs. Storage comes in strips of
 /// eight columns, allocated on their first insert, so a small map pays for
-/// the columns it uses. Keys outside the native array, which no real cell
-/// produces, keep a sorted map of their own.
+/// the columns it uses. The dense side is the retail 512 until a key of an
+/// extended map's larger array arrives, which relays it out once at 1024, so
+/// retail maps keep their footprint. Keys outside the largest array, which no
+/// real cell produces, keep a sorted map of their own.
 #[derive(Clone)]
 pub(crate) struct CellMap<V> {
+    /// Dense cells per side: [`RETAIL_SIDE`], or [`SIDE`] once grown.
+    side: usize,
     strips: Vec<Option<Box<[Option<V>]>>>,
     /// One bit per slot, set while the slot holds a value.
     filled: Vec<u64>,
@@ -35,6 +39,7 @@ pub(crate) struct CellMap<V> {
 impl<V> Default for CellMap<V> {
     fn default() -> Self {
         Self {
+            side: RETAIL_SIDE,
             strips: Vec::new(),
             filled: Vec::new(),
             filled_count: 0,
@@ -43,13 +48,9 @@ impl<V> Default for CellMap<V> {
     }
 }
 
-fn slot_of((x, y): (u16, u16)) -> Option<usize> {
-    let (x, y) = (usize::from(x), usize::from(y));
-    (x < SIDE && y < SIDE).then_some(x * SIDE + y)
-}
-
-fn key_of(slot: usize) -> (u16, u16) {
-    ((slot / SIDE) as u16, (slot % SIDE) as u16)
+/// Whether `key` lies in the largest dense array rather than `outside`.
+fn is_dense((x, y): (u16, u16)) -> bool {
+    usize::from(x) < SIDE && usize::from(y) < SIDE
 }
 
 /// Merge two key-ordered entry streams into one.
@@ -75,26 +76,66 @@ impl<V> CellMap<V> {
         self.filled_count + self.outside.len()
     }
 
+    /// Slots per strip: eight columns of the dense array.
+    fn strip_slots(&self) -> usize {
+        8 * self.side
+    }
+
+    /// The dense slot of `key`; `None` when it lies outside the current side.
+    fn slot_of(&self, (x, y): (u16, u16)) -> Option<usize> {
+        let (x, y) = (usize::from(x), usize::from(y));
+        (x < self.side && y < self.side).then_some(x * self.side + y)
+    }
+
+    fn key_of(&self, slot: usize) -> (u16, u16) {
+        ((slot / self.side) as u16, (slot % self.side) as u16)
+    }
+
     fn slot(&self, slot: usize) -> Option<&Option<V>> {
-        let strip = self.strips.get(slot / STRIP_SLOTS)?.as_deref()?;
-        Some(&strip[slot % STRIP_SLOTS])
+        let strip = self.strips.get(slot / self.strip_slots())?.as_deref()?;
+        Some(&strip[slot % self.strip_slots()])
     }
 
     fn slot_mut(&mut self, slot: usize) -> Option<&mut Option<V>> {
-        let strip = self.strips.get_mut(slot / STRIP_SLOTS)?.as_deref_mut()?;
-        Some(&mut strip[slot % STRIP_SLOTS])
+        let strip_slots = self.strip_slots();
+        let strip = self.strips.get_mut(slot / strip_slots)?.as_deref_mut()?;
+        Some(&mut strip[slot % strip_slots])
+    }
+
+    /// Relay the dense storage out at the largest side. Runs once, on the
+    /// first key of an extended map's array beyond the retail side.
+    fn grow(&mut self) {
+        let old_side = std::mem::replace(&mut self.side, SIDE);
+        let old_strips = std::mem::take(&mut self.strips);
+        self.filled = Vec::new();
+        self.filled_count = 0;
+        for (strip, slots) in old_strips.into_iter().enumerate() {
+            for (offset, value) in slots
+                .into_iter()
+                .flat_map(|slots| slots.into_vec())
+                .enumerate()
+            {
+                if let Some(value) = value {
+                    let slot = strip * 8 * old_side + offset;
+                    let key = ((slot / old_side) as u16, (slot % old_side) as u16);
+                    self.get_or_insert_with(key, || value);
+                }
+            }
+        }
     }
 
     pub(crate) fn get(&self, key: &(u16, u16)) -> Option<&V> {
-        match slot_of(*key) {
+        match self.slot_of(*key) {
             Some(slot) => self.slot(slot)?.as_ref(),
+            None if is_dense(*key) => None,
             None => self.outside.get(key),
         }
     }
 
     pub(crate) fn get_mut(&mut self, key: &(u16, u16)) -> Option<&mut V> {
-        match slot_of(*key) {
+        match self.slot_of(*key) {
             Some(slot) => self.slot_mut(slot)?.as_mut(),
+            None if is_dense(*key) => None,
             None => self.outside.get_mut(key),
         }
     }
@@ -105,16 +146,21 @@ impl<V> CellMap<V> {
         key: (u16, u16),
         make: impl FnOnce() -> V,
     ) -> &mut V {
-        let Some(slot) = slot_of(key) else {
+        if !is_dense(key) {
             return self.outside.entry(key).or_insert_with(make);
-        };
-        if self.strips.is_empty() {
-            self.strips.resize_with(SIDE * SIDE / STRIP_SLOTS, || None);
-            self.filled = vec![0; SIDE * SIDE / 64];
         }
-        let strip = self.strips[slot / STRIP_SLOTS]
-            .get_or_insert_with(|| (0..STRIP_SLOTS).map(|_| None).collect());
-        let value = &mut strip[slot % STRIP_SLOTS];
+        if self.slot_of(key).is_none() {
+            self.grow();
+        }
+        let slot = self.slot_of(key).expect("grown side holds every dense key");
+        let strip_slots = self.strip_slots();
+        if self.strips.is_empty() {
+            self.strips.resize_with(self.side / 8, || None);
+            self.filled = vec![0; self.side * self.side / 64];
+        }
+        let strip = self.strips[slot / strip_slots]
+            .get_or_insert_with(|| (0..strip_slots).map(|_| None).collect());
+        let value = &mut strip[slot % strip_slots];
         let was_filled = value.is_some();
         let value = value.get_or_insert_with(make);
         if !was_filled {
@@ -126,17 +172,17 @@ impl<V> CellMap<V> {
 
     pub(crate) fn insert(&mut self, key: (u16, u16), value: V) -> Option<V> {
         let previous = self.remove(&key);
-        if slot_of(key).is_some() {
-            self.get_or_insert_with(key, || value);
-        } else {
-            self.outside.insert(key, value);
-        }
+        self.get_or_insert_with(key, || value);
         previous
     }
 
     pub(crate) fn remove(&mut self, key: &(u16, u16)) -> Option<V> {
-        let Some(slot) = slot_of(*key) else {
-            return self.outside.remove(key);
+        let Some(slot) = self.slot_of(*key) else {
+            return if is_dense(*key) {
+                None
+            } else {
+                self.outside.remove(key)
+            };
         };
         let value = self.slot_mut(slot)?.take()?;
         self.filled[slot / 64] &= !(1 << (slot % 64));
@@ -153,7 +199,7 @@ impl<V> CellMap<V> {
             .flat_map(|(word, &bits)| SetBits(bits).map(move |bit| word * 64 + bit))
             .map(|slot| {
                 let value = self.slot(slot).and_then(Option::as_ref);
-                (key_of(slot), value.expect("filled slot"))
+                (self.key_of(slot), value.expect("filled slot"))
             });
         merge_by_key(
             inside,
@@ -163,17 +209,19 @@ impl<V> CellMap<V> {
 
     /// Mutable entries in ascending `(x, y)` order.
     fn iter_mut(&mut self) -> impl Iterator<Item = ((u16, u16), &mut V)> + '_ {
+        let (side, strip_slots) = (self.side, self.strip_slots());
         let inside = self
             .strips
             .iter_mut()
             .enumerate()
             .filter_map(|(strip, slots)| Some((strip, slots.as_deref_mut()?)))
-            .flat_map(|(strip, slots)| {
+            .flat_map(move |(strip, slots)| {
                 slots
                     .iter_mut()
                     .enumerate()
                     .filter_map(move |(offset, value)| {
-                        let key = key_of(strip * STRIP_SLOTS + offset);
+                        let slot = strip * strip_slots + offset;
+                        let key = ((slot / side) as u16, (slot % side) as u16);
                         value.as_mut().map(|value| (key, value))
                     })
             });
@@ -262,15 +310,17 @@ mod tests {
 
     /// One coordinate: the array's first and last index, the first index
     /// outside it, the largest key, a run across the first strip boundary
-    /// (x = 8) and a run across the array's edge.
+    /// (x = 8) and runs across the retail side, where an extended key grows
+    /// the map, and across the largest array's edge.
     fn coordinate(n: u64) -> u16 {
-        match n % 6 {
+        match n % 7 {
             0 => 0,
-            1 => 511,
-            2 => 512,
+            1 => (super::SIDE - 1) as u16,
+            2 => super::SIDE as u16,
             3 => u16::MAX,
-            4 => (n / 6 % 16) as u16,
-            _ => 500 + (n / 6 % 24) as u16,
+            4 => (n / 7 % 16) as u16,
+            5 => (super::RETAIL_SIDE as u16 - 12) + (n / 7 % 24) as u16,
+            _ => (super::SIDE as u16 - 12) + (n / 7 % 24) as u16,
         }
     }
 
@@ -343,6 +393,30 @@ mod tests {
         assert_eq!(
             crate::util::save_codec::serialize(&cells).unwrap(),
             crate::util::save_codec::serialize(&BTreeMap::<(u16, u16), u32>::new()).unwrap()
+        );
+    }
+
+    #[test]
+    fn retail_keys_keep_the_retail_side_until_an_extended_key_arrives() {
+        let mut cells: CellMap<u32> = CellMap::new();
+        cells.insert((511, 3), 1);
+        cells.insert((2, 511), 2);
+        cells.insert((u16::MAX, 0), 3);
+        assert_eq!(cells.side, super::RETAIL_SIDE);
+
+        cells.insert((600, 1), 4);
+        assert_eq!(cells.side, super::SIDE);
+        assert_eq!(
+            cells
+                .iter()
+                .map(|(key, &value)| (key, value))
+                .collect::<Vec<_>>(),
+            [
+                ((2, 511), 2),
+                ((511, 3), 1),
+                ((600, 1), 4),
+                ((u16::MAX, 0), 3)
+            ]
         );
     }
 

@@ -34,7 +34,10 @@ impl ZoneBatchHost for BatchTrace<'_, '_> {
         self.recalcs.push(actual);
         ZoneBatchHost::recalc_at(self.live, coord)
     }
-    fn fine_zone(&self, coord: CellCoord) -> Result<u16, String> {
+    fn fine_zone(
+        &self,
+        coord: CellCoord,
+    ) -> Result<crate::sim::pathfinding::zone_map::ZoneId, String> {
         ZoneBatchHost::fine_zone(self.live, coord)
     }
     fn patch_hierarchy(&mut self, coord: CellCoord) -> Result<(), String> {
@@ -69,7 +72,7 @@ fn bridge_batch_simulation(case: &serde_json::Value) -> Simulation {
             .as_array()
             .unwrap()
             .iter()
-            .map(|v| v.as_u64().unwrap() as u16)
+            .map(|v| v.as_u64().unwrap() as crate::sim::pathfinding::zone_map::ZoneId)
             .collect();
     }
     crate::map::resolved_terrain::install_bridge_batch_test_catalog(
@@ -204,7 +207,8 @@ fn live_bridge_batch_matches_original_order_recalc_cache_and_hierarchy() {
                     base.levels_mut_for_test()[i] = value.as_u64().unwrap() as u8;
                 }
                 if let Some(value) = change.get("base_id") {
-                    base.zone_ids_mut_for_test()[i] = value.as_u64().unwrap() as u16;
+                    base.zone_ids_mut_for_test()[i] =
+                        value.as_u64().unwrap() as crate::sim::pathfinding::zone_map::ZoneId;
                 }
                 if change["clear_level0"] == true {
                     let (_, hierarchy) = zones.base_and_hierarchy_mut();
@@ -525,7 +529,11 @@ fn live_bridge_batch_recovers_rust_append_capacity_without_replacing_base_connec
     let (_, hierarchy) = zones.base_and_hierarchy_mut();
     let fine = &mut hierarchy.levels_mut()[0];
     while let Ok(id) = u16::try_from(fine.record_slot_count()) {
-        assert!(fine.append_record(ZoneRecord::new(id, 0, 0)));
+        assert!(fine.append_record(ZoneRecord::new(
+            id as crate::sim::pathfinding::zone_map::ZoneId,
+            0,
+            0
+        )));
     }
     assert_eq!(fine.record_slot_count(), usize::from(u16::MAX) + 1);
     let rules = RuleSet::from_ini(&IniFile::from_str("")).unwrap();

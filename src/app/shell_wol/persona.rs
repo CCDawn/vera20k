@@ -3,8 +3,8 @@
 //! sink, the locale page `0xFE`, the auto-login query `0x112` and Quick
 //! Match's postmatch add-buddy query `0x122`.
 
-use std::path::Path;
 use crate::util::time::Instant;
+use std::path::Path;
 
 use super::service::{self, WolServiceRequest};
 use super::{WolPage, WolProvider};
@@ -98,24 +98,8 @@ pub(super) fn fill_welcome(state: &mut AppState) {
         profile_texts(state, &nickname, &persona)
     };
     if let Some(visit) = state.frontend.wol.as_mut() {
-        // The online page's lobby counts arrive on their own and stay.
-        visit
-            .welcome_texts
-            .retain(|(id, _)| crate::ui::wol_shell::LOBBY_STATS_IDS.contains(id));
-        visit.welcome_texts.extend(texts);
+        visit.welcome_texts = texts;
     }
-}
-
-/// `GET /v1/stats` answered: the online welcome's counts.
-pub(super) fn lobby_stats(state: &mut AppState, stats: crate::ui::wol_shell::WolLobbyStats) {
-    let Some(visit) = state.frontend.wol.as_mut() else {
-        return;
-    };
-    visit
-        .welcome_texts
-        .retain(|(id, _)| !crate::ui::wol_shell::LOBBY_STATS_IDS.contains(id));
-    visit.welcome_texts.extend(stats.texts());
-    state.platform.window.request_redraw();
 }
 
 /// `0x0077A9F0`'s texts by control id: the heading (`GUI:UserProfileLabel`,

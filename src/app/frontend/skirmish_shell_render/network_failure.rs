@@ -6,7 +6,7 @@ use super::in_game_shell::{
 };
 use super::text::localized_label;
 use crate::app::AppState;
-use crate::app::match_runtime::network_failure::{DIALOG, labels};
+use crate::app::match_runtime::network_failure::{DIALOG, labels, vera_body};
 use crate::ui::shell::geom::ShellScale;
 
 pub(crate) fn render_network_failure(
@@ -17,7 +17,7 @@ pub(crate) fn render_network_failure(
     let (width, height) = (state.render_width(), state.render_height());
     let (body, button) = labels(state);
     let labels = crate::ui::skirmish_shell::SkirmishValidationModalState::new(
-        localized_label(state, body.0, body.1),
+        vera_body(state).unwrap_or_else(|| localized_label(state, body.0, body.1)),
         localized_label(state, button.0, button.1),
     );
     let modal = crate::ui::shell::modal::body_ok_layout(width as i32, height as i32);

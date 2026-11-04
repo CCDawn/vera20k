@@ -23,7 +23,7 @@ pub(crate) use pause_menu::render_pause_menu_shell;
 mod saved_games;
 pub(crate) use saved_games::{family_saved_game_overlays, render_saved_game_shell};
 mod launcher_options;
-pub(crate) use launcher_options::render_launcher_options;
+pub(crate) use launcher_options::{render_launcher_options, zoom_label};
 mod modals;
 mod network_failure;
 pub(crate) use modals::render_saved_game_loading;
@@ -347,8 +347,9 @@ fn build_skirmish_shell_instances(
 
     push_lower_strip_instance(&mut instances, atlas, layout);
 
-    // The RA2 skirmish skin shares the common shell's art and SHELL.PAL.
-    if let Some(background) = generic_shell_background_entry(atlas, layout) {
+    // Dialog 0x102 selects its background by the persisted shell style. YR's
+    // small shape is shared with RA2 but its context palette is not.
+    if let Some(background) = offline_setup_background_entry(atlas, layout) {
         let (x, y) = layout
             .scale
             .dialog_origin_or((layout.screen.x, layout.screen.y));
@@ -549,13 +550,13 @@ fn render_skirmish_shell_with_atlas(
         .map(|_| body_ok_layout(state.render_width() as i32, state.render_height() as i32));
     // `ShellMessageBox__Run` draws the empty backdrop before its box
     // (`0x005D3514`): while a box is up the dialog behind does not show.
-    let eject_prompt = state
+    let message_box = state
         .frontend
         .skirmish_shell_state
         .choose_map_modal
         .as_ref()
-        .and_then(|modal| modal.eject_prompt);
-    let message_box_up = validation_layout.is_some() || eject_prompt.is_some();
+        .and_then(|modal| modal.message_box);
+    let message_box_up = validation_layout.is_some() || message_box.is_some();
     let action = SkirmishShellAction::None;
 
     let Some(atlas) = atlas else {
@@ -707,8 +708,14 @@ fn render_skirmish_shell_with_atlas(
                 validation_ok_pressed,
             );
         }
-        if let Some(prompt) = eject_prompt {
-            push_eject_box_instances(&mut instances, atlas, layout.screen, prompt);
+        if let Some(prompt) = message_box {
+            push_choose_map_prompt_instances(
+                &mut instances,
+                atlas,
+                layout.screen,
+                prompt,
+                crate::app::map_library::download_progress(state),
+            );
         }
         instances
     } else {
@@ -787,23 +794,23 @@ fn render_skirmish_shell_with_atlas(
                     setup_layout,
                     sliding,
                 );
-                shell_draws.extend(crate::render::shell_paint::paint_labels_at_depth(
+                shell_draws.extend(paint_map_dialog_statics(
                     &state.renderer.bit_font,
                     &setup_statics,
-                    SHELL_DROPDOWN_TEXT_DEPTH - 0.00008,
+                    setup_layout.scale,
                 ));
             }
         } else if !leaving {
             push_choose_map_modal_text_draws(&mut shell_draws, state, choose_map_layout, sliding);
-            shell_draws.extend(crate::render::shell_paint::paint_labels_at_depth(
+            shell_draws.extend(paint_map_dialog_statics(
                 &state.renderer.bit_font,
                 &chooser_statics,
-                SHELL_DROPDOWN_TEXT_DEPTH - 0.00008,
+                choose_map_layout.scale,
             ));
         }
     }
-    if let Some(prompt) = eject_prompt {
-        text::push_choose_map_eject_prompt_text(&mut shell_draws, state, &prompt);
+    if let Some(prompt) = message_box {
+        text::push_choose_map_prompt_text(&mut shell_draws, state, &prompt);
     }
     if let Some(validation_layout) = validation_layout.as_ref() {
         push_validation_modal_text_draws(
@@ -1041,11 +1048,93 @@ fn clear_shell_target(
     });
 }
 
+fn paint_map_dialog_statics(
+    font: &BitFont,
+    labels: &[crate::render::shell_paint::PaintLabel<'_>],
+    scale: crate::ui::shell::geom::ShellScale,
+) -> Vec<ShellTextDraw> {
+    crate::render::shell_paint::paint_labels_at_depth_scaled(
+        font,
+        labels,
+        SHELL_DROPDOWN_TEXT_DEPTH - 0.00008,
+        scale.factor(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ui::shell::geom::ShellScale;
     use crate::ui::skirmish_shell::{compute_fixed_800_layout, compute_layout};
+
+    #[test]
+    fn map_dialog_statics_keep_page_scale_and_clipping() {
+        use crate::ui::shell::static_reveal::{Kind1RevealWindow, StaticPaint};
+        use crate::ui::skirmish_shell::{
+            compute_responsive_choose_map_modal_layout, compute_responsive_random_map_setup_layout,
+        };
+
+        let font = crate::render::bit_font::tests::make_test_font(
+            &[('字' as u16, 12), (u16::from(b'A'), 6)],
+            4,
+        );
+        let draw = |width, height, random, sample: &str| {
+            let (title, help, scale) = if random {
+                let layout = compute_responsive_random_map_setup_layout(width, height);
+                (layout.title, layout.status_help, layout.scale)
+            } else {
+                let layout = compute_responsive_choose_map_modal_layout(width, height);
+                (layout.title, layout.status_help, layout.scale)
+            };
+            let shown = StaticPaint {
+                text: sample,
+                window: Kind1RevealWindow {
+                    count: u32::MAX,
+                    range: 0,
+                },
+            };
+            let draws = paint_map_dialog_statics(
+                &font,
+                &[
+                    text::static_label(shown, title, ShellAlign::H_CENTER),
+                    text::static_label(shown, help, ShellAlign::NONE),
+                ],
+                scale,
+            );
+            (draws, [title, help], scale.factor())
+        };
+        for (random, sample) in [true, false].into_iter().flat_map(|random| {
+            ["字".repeat(90), "A ".repeat(100)].map(|sample| (random, sample))
+        }) {
+            let base = draw(800, 600, random, &sample).0;
+            assert!(base.iter().all(|draw| !draw.instances.is_empty()));
+            for (width, height) in [(800, 600), (1200, 900), (1600, 1200)] {
+                let (fitted, rects, factor) = draw(width, height, random, &sample);
+                for ((original, scaled), rect) in base.iter().zip(&fitted).zip(rects) {
+                    assert_eq!(scaled.instances.len(), original.instances.len());
+                    assert_eq!(
+                        [
+                            scaled.scissor.x,
+                            scaled.scissor.y,
+                            scaled.scissor.w,
+                            scaled.scissor.h,
+                        ],
+                        [rect.x as u32, rect.y as u32, rect.w as u32, rect.h as u32],
+                    );
+                    for (a, b) in original.instances.iter().zip(&scaled.instances) {
+                        assert_eq!(b.size, a.size.map(|v| v * factor));
+                        assert_eq!(b.position, a.position.map(|v| v * factor));
+                        assert_eq!(b.depth, a.depth);
+                    }
+                }
+                let help = &fitted[1];
+                assert!(
+                    (help.instances[0].position[1] - rects[1].y as f32).abs() <= 0.5
+                );
+                assert!(help.scissor.y + help.scissor.h <= height);
+            }
+        }
+    }
 
     fn test_entry(width: f32, height: f32) -> SkirmishShellChromeEntry {
         SkirmishShellChromeEntry {
@@ -1943,6 +2032,7 @@ mod connection;
 pub(crate) use connection::{connection_shell_drawable, render_connection_shell};
 
 mod list;
+pub(crate) use list::paint_list;
 
 mod sound;
 pub(crate) use sound::render_sound_shell;

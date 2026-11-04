@@ -159,7 +159,7 @@ impl Simulation {
                     CrushTarget::from_entity(victim, self.session.binary_frame()),
                     |owner| {
                         crate::sim::combat::combat_weapon::is_ally_by_object(
-                            Some(self.house_alliances.as_map()),
+                            Some(&self.house_alliances),
                             &self.interner,
                             actor.owner(),
                             owner,
@@ -254,7 +254,7 @@ impl Simulation {
             self,
             &self.interner,
             self.resolved_terrain.as_ref(),
-            Some(self.house_alliances.as_map()),
+            Some(&self.house_alliances),
         )
     }
 
@@ -534,7 +534,7 @@ impl Simulation {
         let los = combat::line_of_fire::LineOfFireInputs {
             overlay_grid: self.overlay_grid.as_ref(),
             overlay_registry: registry,
-            alliances: Some(self.house_alliances.as_map()),
+            alliances: Some(&self.house_alliances),
         };
         let can_fire = match (weapon, identity) {
             //0x006F7242: In_Range answers false ahead of any map query when
@@ -548,6 +548,7 @@ impl Simulation {
                 &self.interner,
                 terrain,
                 &los,
+                Some(&self.substrate.entities),
             )
             .ok_or("Approach CanFireAt coordinate failed")?,
             (Some(_), None) => combat::can_fire_at_target_in_query(
@@ -557,7 +558,7 @@ impl Simulation {
                 id,
                 &target,
                 &cells,
-                Some(self.house_alliances.as_map()),
+                Some(&self.house_alliances),
                 &los,
                 Some(&target),
             ),
@@ -1133,7 +1134,7 @@ impl Simulation {
                 &combat::line_of_fire::LineOfFireInputs {
                     overlay_grid: self.overlay_grid.as_ref(),
                     overlay_registry: registry,
-                    alliances: Some(self.house_alliances.as_map()),
+                    alliances: Some(&self.house_alliances),
                 },
             )
         });

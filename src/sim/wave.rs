@@ -7,7 +7,6 @@
 use std::collections::BTreeMap;
 use std::hash::Hash;
 
-use crate::map::cell_index::CELL_ROW_STRIDE;
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::sim::cell_rect::{CellRef, get_cellclass_fallback};
 use crate::sim::combat::TargetKind;
@@ -30,7 +29,7 @@ const MAX_TRACKING_DISTANCE_LEPTONS: i32 = 2172;
 /// Stable serialization of a native CellClass pointer retained by WaveClass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum WaveCellIdentity {
-    Real { fixed_stride_index: u32 },
+    Real { cell: (u16, u16) },
     SharedDummy,
 }
 
@@ -43,9 +42,7 @@ impl WaveRecordedCell {
     #[cfg(any(test, feature = "test-support"))]
     pub const fn real(rx: u16, ry: u16) -> Self {
         Self {
-            identity: WaveCellIdentity::Real {
-                fixed_stride_index: ry as u32 * CELL_ROW_STRIDE as u32 + rx as u32,
-            },
+            identity: WaveCellIdentity::Real { cell: (rx, ry) },
         }
     }
 
@@ -58,9 +55,7 @@ impl WaveRecordedCell {
 
     pub fn current_cell(self, terrain: Option<&ResolvedTerrainGrid>) -> WaveCellView {
         match self.identity {
-            WaveCellIdentity::Real { fixed_stride_index } => {
-                let rx = (fixed_stride_index % CELL_ROW_STRIDE as u32) as u16;
-                let ry = (fixed_stride_index / CELL_ROW_STRIDE as u32) as u16;
+            WaveCellIdentity::Real { cell: (rx, ry) } => {
                 let cell = terrain.and_then(|grid| grid.cell(rx, ry));
                 WaveCellView {
                     rx: i32::from(rx),
@@ -630,8 +625,7 @@ impl Wave {
         // the dummy even when its pointer is already present in the vector.
         let identity = match get_cellclass_fallback(terrain, cell.0, cell.1) {
             CellRef::Real(real) => WaveCellIdentity::Real {
-                fixed_stride_index: u32::from(real.ry) * CELL_ROW_STRIDE as u32
-                    + u32::from(real.rx),
+                cell: (real.rx, real.ry),
             },
             CellRef::Dummy { .. } => WaveCellIdentity::SharedDummy,
         };

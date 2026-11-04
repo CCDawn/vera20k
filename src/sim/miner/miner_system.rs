@@ -683,10 +683,7 @@ fn harvest_ore_tick(
     let Some(bale) = CargoBale::from_reduction(reduction, rules) else {
         return false;
     };
-    snap.miner.cargo.extend(std::iter::repeat_n(
-        bale,
-        usize::from(reduction.removed_amount),
-    ));
+    snap.miner.add_bales(bale, reduction.removed_amount);
     arm_stage(&mut sim.substrate, id, now, load_rate(rules));
     true
 }

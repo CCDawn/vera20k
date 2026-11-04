@@ -17,6 +17,7 @@ use super::production_tech::{
     factory_category_for_building, production_category_for_object, strip_keeps,
 };
 use super::production_types::ProductionCategory;
+use crate::map::entities::EntityCategory;
 use crate::rules::object_type::ObjectCategory;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::ai_unit_choice::UnitChoiceKind;
@@ -40,6 +41,7 @@ struct HouseFactoryAbandonment {
     owner: InternedId,
     category: ProductionCategory,
     construction_order: u64,
+    held_building: Option<u64>,
 }
 
 impl HouseFactoryAbandonment {
@@ -49,6 +51,16 @@ impl HouseFactoryAbandonment {
             owner,
             category,
             construction_order: factory.construction_order(),
+            // StripAbandon6ABB69..6ABBB6 reads the actual held object's
+            // RTTI before abandonment can destroy it, then clears734270.
+            held_building: factory.object.and_then(|object| object.entity_id).filter(
+                |&stable_id| {
+                    sim.substrate
+                        .entities
+                        .get(stable_id)
+                        .is_some_and(|entity| entity.category() == EntityCategory::Structure)
+                },
+            ),
         })
     }
 
@@ -63,6 +75,7 @@ impl HouseFactoryAbandonment {
                     owner: self.owner,
                     category: self.category,
                     construction_order: self.construction_order,
+                    held_building: self.held_building,
                 },
             );
         }
@@ -721,7 +734,6 @@ pub(super) fn start_next_queued(
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
 pub(super) fn active_entity_id(
     sim: &Simulation,
     owner_id: InternedId,
@@ -868,8 +880,8 @@ pub(super) fn record_last_built(
             ObjectCategory::Building => None,
         })
         .map(str::to_owned);
-    let type_index = rules
-        .type_array_index(category, interner.resolve(type_id))
+    let type_index = interner
+        .type_array_index(type_id, category, rules)
         .expect("a produced object belongs to its class Type registry");
     if let Some(house) = houses.get_mut(&owner) {
         house.record_built_type(category, type_index);
@@ -980,8 +992,8 @@ pub(super) fn ready_object(
 }
 
 /// Read-only identity of a completed building held by the existing House
-/// factory owner. Input uses the same ready-object lookup as placement; no
-/// app-side ready flag or copy of the factory is retained.
+/// factory owner. Placement shares this object-readiness authority; local
+/// sidebar tab references retain their separate publication/clear history.
 pub fn ready_building_entity_for_owner(
     sim: &Simulation,
     rules: &RuleSet,
@@ -1380,7 +1392,6 @@ pub fn validate_restored_factory_state(
     sim: &Simulation,
     rules: &RuleSet,
 ) -> Result<(), FactoryRestoreError> {
-    use crate::map::entities::EntityCategory;
     use std::collections::BTreeSet;
 
     let fail = |owner, reason| FactoryRestoreError { owner, reason };

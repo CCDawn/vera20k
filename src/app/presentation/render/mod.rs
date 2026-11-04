@@ -31,6 +31,8 @@ mod building_bracket_gpu_tests;
 mod building_shadow_gpu_tests;
 #[cfg(test)]
 mod building_slot_native_gpu_tests;
+#[cfg(test)]
+mod building_viewport_bounds_tests;
 mod draw_passes;
 #[cfg(test)]
 mod magnetic_wave_gpu_tests;
@@ -67,6 +69,7 @@ use crate::app::input::commands::preferred_local_owner_name;
 use crate::render::batch::InstanceBufferPool;
 use crate::ui::sidebar::SidebarView;
 
+pub(crate) use build_instances::tactical_world_viewport;
 use build_instances::{DebugInstances, SidebarInstances, UiInstances, WorldInstances};
 
 /// Exact sidebar-related instance counts emitted by the production render path.
@@ -165,6 +168,7 @@ pub(crate) fn render_game(
     state: &mut AppState,
     encoder: &mut wgpu::CommandEncoder,
     times: GameRenderTimes,
+    cadence: crate::app::presentation::tactical_composite::CompositeCadence,
 ) -> Result<GameRenderOutput> {
     // Phase accounting for the dashboard's render breakdown. One clock read per
     // phase boundary; the spans are handed back on `GameRenderOutput` and never
@@ -340,9 +344,34 @@ pub(crate) fn render_game(
     #[cfg(feature = "telemetry-dashboard")]
     let after_shroud = render_started.map(|_| Instant::now());
 
+    // One tactical composite per Main_Tick (`tactical_composite`): the
+    // effects below step `steps` times, and every draw shows the last one,
+    // with the lines that read the clock held at that composite's time.
+    let chrono_holds = state
+        .match_state
+        .match_presentation
+        .chrono_screen
+        .overrides_tactical_draw();
+    let tactical_composite = &mut state.match_state.match_presentation.tactical_composite;
+    let steps = tactical_composite.begin_draw(cadence, times.radar_ms, chrono_holds);
+    let clock_ms = tactical_composite.clock_ms();
+    // Ares DisplayCredits ages its labels in the same composite, unless the
+    // chrono screen's 4F4480 interception suppresses it.
+    #[cfg(feature = "ares")]
+    if !chrono_holds {
+        let credits = state
+            .match_state
+            .match_presentation
+            .flying_credits
+            .get_mut();
+        for _ in 0..steps {
+            credits.step();
+        }
+    }
+
     // Phase 4: Update minimap + build UI instances (selection, health, placement).
     build_instances::update_minimap(state, &local_owner);
-    let ui = build_instances::build_ui_instances(state, times.radar_ms as u32);
+    let ui = build_instances::build_ui_instances(state, clock_ms as u32);
     #[cfg(feature = "telemetry-dashboard")]
     let after_ui = render_started.map(|_| Instant::now());
 
@@ -497,11 +526,15 @@ pub(crate) fn render_game(
         &mut match_presentation.superweapon_range_pulse,
         &match_presentation.house_color_map,
         viewport,
-        times.radar_ms,
+        clock_ms,
+        steps,
     );
-    // EBolt4C2830 moves each owned bolt to its Unit's FLH before drawing it;
-    // the owner reads take no Main draw, so they run ahead of the borrow.
-    if let Some(runtime) = state.match_state.sim_runtime.as_ref() {
+    // EBolt4C2830 moves each owned bolt to its Unit's FLH before drawing it,
+    // once per composite; the owner reads take no Main draw, so they run
+    // ahead of the borrow.
+    if steps > 0
+        && let Some(runtime) = state.match_state.sim_runtime.as_ref()
+    {
         let sim = runtime.view().simulation();
         let rules = &runtime.resources.rules;
         let interpolation = &state.match_state.match_presentation.interpolation;
@@ -559,65 +592,73 @@ pub(crate) fn render_game(
                 )
             })
     };
-    let bolt_lines = {
+    // Each composite runs Tactical's order: LaserDraw550240 (6D4669) and
+    // EBolt (6D466E) request process Main, then the Airstrike shades follow
+    // with the action stores (6D48F1), then LineTrail556D40 (6D4673) and the
+    // radiation beams. A draw that owes no composite steps none of them.
+    let frame_rate = presentation.detail.borrow().frame_rate();
+    for _ in 0..steps {
         presentation.lasers.composite(&mut main);
         presentation
             .electric_bolts
             .composite(viewport, palette, &mut main, |birth| {
                 !effect_hidden(birth.to.x, birth.to.y)
-            })
-    };
-    // Tactical6D48F1 follows Laser/Bolt Main requests and interleaves the
-    // opaque action stores with each owning Airstrike designation. Uploads
-    // consume these resolved commands and cannot take further random draws.
+            });
+        presentation
+            .airstrike_shades
+            .step(&ui.tactical_line_calls, &main);
+        presentation.line_trails.composite(
+            |id| {
+                let sim = sim?;
+                let bullet = sim.projectiles().get(id)?;
+                Some(
+                    presentation
+                        .interpolation
+                        .sample_point(
+                            crate::app::presentation::interpolation::PointKind::Bullet,
+                            id,
+                            crate::app::presentation::interpolation::PointPose::bullet(bullet),
+                            sim.session().binary_frame(),
+                        )
+                        .projectile_coord(),
+                )
+            },
+            |owner, coord| {
+                if !translucent_fog || sandbox {
+                    return true;
+                }
+                let Some(sim) = sim else {
+                    return true;
+                };
+                if let Some(bullet) = owner.and_then(|id| sim.projectiles().get(id)) {
+                    return !crate::app::presentation::instances::translucent_fog_conceals_bullet(
+                        sim,
+                        bullet,
+                        [coord.x, coord.y, coord.z],
+                        local_owner.as_deref(),
+                        viewer,
+                        sim.session().game_options().fog_of_war,
+                    );
+                }
+                !effect_hidden(coord.x, coord.y)
+            },
+        );
+        presentation
+            .radiation_beams
+            .composite(frame_rate, viewport, |birth| {
+                !effect_hidden(birth.to.x, birth.to.y)
+            });
+    }
+    let bolt_lines = presentation.electric_bolts.shown(viewport.camera);
+    // Uploads consume these resolved commands and cannot take further random draws.
     let tactical_draws = crate::app::presentation::airstrike_lines::composite(
         &ui.tactical_line_calls,
-        times.radar_ms as u32,
-        &main,
+        clock_ms as u32,
+        &presentation.airstrike_shades,
         viewport,
     );
-    let segments = presentation.line_trails.composite(
-        |id| {
-            let sim = sim?;
-            let bullet = sim.projectiles().get(id)?;
-            Some(
-                presentation
-                    .interpolation
-                    .sample_point(
-                        crate::app::presentation::interpolation::PointKind::Bullet,
-                        id,
-                        crate::app::presentation::interpolation::PointPose::bullet(bullet),
-                        sim.session().binary_frame(),
-                    )
-                    .projectile_coord(),
-            )
-        },
-        |owner, coord| {
-            if !translucent_fog || sandbox {
-                return true;
-            }
-            let Some(sim) = sim else {
-                return true;
-            };
-            if let Some(bullet) = owner.and_then(|id| sim.projectiles().get(id)) {
-                return !crate::app::presentation::instances::translucent_fog_conceals_bullet(
-                    sim,
-                    bullet,
-                    [coord.x, coord.y, coord.z],
-                    local_owner.as_deref(),
-                    viewer,
-                    sim.session().game_options().fog_of_war,
-                );
-            }
-            !effect_hidden(coord.x, coord.y)
-        },
-    );
-    let frame_rate = presentation.detail.borrow().frame_rate();
-    presentation
-        .radiation_beams
-        .composite(frame_rate, viewport, |birth| {
-            !effect_hidden(birth.to.x, birth.to.y)
-        });
+    let segments = presentation.line_trails.shown();
+    let beam_draws = presentation.radiation_beams.shown(viewport.camera);
     let shroud = presentation.shroud_buffer.as_ref();
     let mut alpha = |point: [i32; 2]| {
         if sandbox {
@@ -651,8 +692,8 @@ pub(crate) fn render_game(
             .copied()
             .map(crate::render::surface_line::SurfaceDraw::Line),
         segments,
-        presentation.radiation_beams.draws(),
-        &radials,
+        beam_draws,
+        &radials.draws,
         viewport,
         |color| {
             if matches!(color, crate::render::laser::LaserDrawColor::House(_)) {
@@ -833,9 +874,12 @@ fn upload_to_gpu(
             Vec::new()
         } else {
             let (width, height) = crate::app::input::camera::tactical_viewport_size(state);
-            presentation.flying_credits.borrow_mut().build_instances(
+            presentation.flying_credits.borrow().build_instances(
                 &state.renderer.bit_font,
-                [state.match_state.input.camera_x, state.match_state.input.camera_y],
+                [
+                    state.match_state.input.camera_x,
+                    state.match_state.input.camera_y,
+                ],
                 state.match_state.input.zoom_level,
                 [width, height],
             )

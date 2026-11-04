@@ -186,9 +186,11 @@ impl Simulation {
                 ),
                 rules.general.ion_cannon_damage,
                 warhead,
+                true,
                 (RAD_NO_ATTACKER, None, wh),
                 effects,
-            );
+            )
+            .bridge_state_changed;
         }
         bridge_changed |= world_receiver::apply_area_damage(
             self,
@@ -197,9 +199,11 @@ impl Simulation {
             impact,
             rules.general.ion_cannon_damage,
             warhead,
+            true,
             (RAD_NO_ATTACKER, None, wh),
             effects,
-        );
+        )
+        .bridge_state_changed;
         self.combat_light_requests.emit(CombatLightRequest::Impact {
             target_id: None,
             damage: rules.general.ion_cannon_damage,

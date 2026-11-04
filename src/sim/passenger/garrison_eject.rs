@@ -363,72 +363,6 @@ fn eject_garrison_passengers_at_edges(
     ejected
 }
 
-/// A `CanBeOccupied` building destroyed in combat with live occupants —
-/// gamemd routes this through `BuildingClass::SellBuilding @ 0x00457DE0`, the
-/// same occupant-eject helper used by sell. The world fatal prelude consumes
-/// this plan synchronously, before the nested death weapon and carrier UnInit.
-pub struct DestroyedGarrisonBuilding {
-    pub building_id: u64,
-    pub rx: u16,
-    pub ry: u16,
-    pub foundation_w: u16,
-    pub foundation_h: u16,
-}
-
-/// Eject garrison occupants from a building destroyed in combat.
-///
-/// Native Building ReceiveDamage442625..44263B calls SellBuilding(0,0).
-/// As in its living callers, that body never transfers passenger ownership.
-/// Destruction callers use
-/// the null no-exit branch: if no edge coordinate is accepted, occupants are
-/// removed rather than parachuted or placed inside the foundation. The caller
-/// invokes this while the building is still resolvable, before building UnInit,
-/// so its occupant loop remains independent of true Cargo teardown.
-///
-/// Returns the count of occupants successfully ejected (excludes those killed
-/// when no edge cell can be used).
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) fn eject_destruction_garrison(
-    sim: &mut Simulation,
-    rules: &RuleSet,
-    event: &DestroyedGarrisonBuilding,
-) -> usize {
-    eject_destruction_garrison_with_context(sim, rules, event, UninitContext::with_rules(rules))
-}
-
-pub(crate) fn eject_destruction_garrison_with_context(
-    sim: &mut Simulation,
-    rules: &RuleSet,
-    event: &DestroyedGarrisonBuilding,
-    uninit_context: UninitContext<'_>,
-) -> usize {
-    let Some(building) = sim.substrate.entities.get_mut(event.building_id) else {
-        return 0;
-    };
-    building.passenger_role.occupants_mut().reset_fire_index();
-
-    let ejected = eject_garrison_passengers_at_edges(
-        sim,
-        rules,
-        event.building_id,
-        event.rx,
-        event.ry,
-        event.foundation_w,
-        event.foundation_h,
-        GarrisonEjectMode::Release,
-        uninit_context,
-    );
-    // SellBuilding4581B8..4581D6 clears after its synchronous live-vector
-    // loop. True Cargo remains independent through every callback.
-    if let Some(building) = sim.substrate.entities.get_mut(event.building_id) {
-        building.passenger_role.occupants_mut().clear();
-    }
-    // SellBuilding4581D6 refreshes after its occupant loop. Native458732
-    // is instead the refresh in KillOccupants4585C0's closing tail.
-    sim.refresh_spatial_threat(event.building_id, rules, uninit_context.terrain());
-    ejected
-}
-
 /// KillOccupants4585C0(NULL): reset +69C, UnInit the live vector last
 /// first, then clear it and refresh threat. This is separate from Cargo
 /// KillPassengers707CB0 (which books kills and walks the Cargo head).
@@ -454,8 +388,11 @@ pub(crate) fn kill_building_occupants(
     sim.refresh_spatial_threat(building_id, context.rules(), context.terrain());
 }
 
-/// The one SellBuilding457DE0 owner for living garrisons: sale (0,1),
-/// red-health/Unload/Action111 (0,0), and AllToHunt (1,0).
+/// The one SellBuilding457DE0 owner: sale (0,1), red-health/Unload/Action111
+/// (0,0), AllToHunt (1,0), and a destroyed `CanBeOccupied` building's
+/// Building44263B (0,0), after Techno's death weapon and before
+/// DestructionEffects. It never transfers passenger ownership; if no edge
+/// cell is accepted, an occupant is removed rather than placed inside.
 /// Empty-garrison ownership reconciliation stays with its callers.
 pub(crate) fn sell_building_occupants(
     sim: &mut Simulation,
@@ -1145,15 +1082,17 @@ pub(crate) mod tests {
             insert_hidden_passenger_with_subcell(&mut sim, 13, building_id, "Neutral", Some(2));
         let rng_before = sim.scenario_rng.state();
 
-        let event = DestroyedGarrisonBuilding {
-            building_id,
-            rx: 10,
-            ry: 10,
-            foundation_w: 2,
-            foundation_h: 2,
-        };
-
-        assert_eq!(eject_destruction_garrison(&mut sim, &rules, &event), 3);
+        assert_eq!(
+            sell_building_occupants(
+                &mut sim,
+                &rules,
+                None,
+                building_id,
+                GarrisonEjectMode::Release,
+                FrameEffects::default(),
+            ),
+            3
+        );
         assert_eq!(
             sim.scenario_rng.state(),
             rng_before,
@@ -1234,14 +1173,17 @@ pub(crate) mod tests {
                 )
             })
             .collect();
-        let event = DestroyedGarrisonBuilding {
-            building_id,
-            rx: 10,
-            ry: 10,
-            foundation_w: 2,
-            foundation_h: 2,
-        };
-        assert_eq!(eject_destruction_garrison(&mut sim, &rules, &event), 3);
+        assert_eq!(
+            sell_building_occupants(
+                &mut sim,
+                &rules,
+                None,
+                building_id,
+                GarrisonEjectMode::Release,
+                FrameEffects::default(),
+            ),
+            3
+        );
         for id in ids {
             let position = sim.substrate.entities.get(id).unwrap().position;
             assert_eq!(
@@ -1256,6 +1198,135 @@ pub(crate) mod tests {
         }
     }
 
+    /// Native442230 ->701900 ->457DE0 ->51D0D0, stopped before4415F0.
+    /// The production receiver continues through destruction/UnInit; only
+    /// the two native RNG phases and surviving occupant state are compared.
+    #[test]
+    fn retail_fatal_debris_precedes_garrison_scatter() {
+        use crate::sim::components::NavTargetRef;
+        use crate::sim::rng::SimRng;
+        use serde_json::json;
+
+        let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+            return;
+        };
+        let rules = retail.rules;
+        let corpus = crate::test_fixture::json("tools/spatial_oracle/building_garrison_fatal.json");
+        let input = &corpus["input"];
+        let type_name = input["building_type"].as_str().unwrap();
+        assert_eq!(type_name, "CAHSE01");
+        let building_type = rules.object(type_name).unwrap();
+        assert!(building_type.can_be_occupied && !building_type.explodes);
+        assert!(building_type.debris_types.is_empty() && building_type.debris_anims.is_empty());
+        assert_eq!(json!(building_type.strength), input["strength"]);
+        assert_eq!(json!(building_type.min_debris), input["min_debris"]);
+        assert_eq!(json!(building_type.max_debris), input["max_debris"]);
+        assert_eq!(
+            json!(rules.general.metallic_debris),
+            input["metallic_debris"]
+        );
+        assert_eq!(json!(rules.bridge_warheads.c4_name), input["warhead"]);
+        let seed = input["seed"].as_u64().unwrap();
+        let x = input["origin_cell"][0].as_u64().unwrap() as u16;
+        let y = input["origin_cell"][1].as_u64().unwrap() as u16;
+        let rows = corpus["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for (count, row) in rows.iter().enumerate() {
+            assert_eq!(row["occupants"], json!(count));
+            let mut sim = crate::sim::arena_fixture::rival_arena(&rules, seed);
+            sim.session
+                .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Skirmish);
+            sim.session.set_binary_frame_for_test(0);
+            let owner = sim.interner.get("Americans").unwrap();
+            sim.session.set_current_house_for_test(Some(owner));
+            let building = sim
+                .spawn_object(type_name, "Americans", x, y, 0, &rules)
+                .expect("stock civilian house on clear ground");
+            let mut occupants = Vec::new();
+            for _ in 0..count {
+                let id = sim
+                    .spawn_object("E1", "Americans", x - 2, y - 1, 0, &rules)
+                    .expect("stock GI beside the house");
+                assert!(crate::sim::passenger::add_garrison_occupant(
+                    &mut sim,
+                    &rules,
+                    id,
+                    building,
+                    None,
+                    FrameEffects::default(),
+                ));
+                occupants.push(id);
+            }
+            sim.scenario_rng = SimRng::new(seed);
+            sim.main_rng = SimRng::new(seed).into();
+            sim.mapgen_rng = SimRng::new(seed);
+            let warhead = sim.interner.intern(&rules.bridge_warheads.c4_name);
+            // Building Update440345's lethal C4 receiver bypasses the health
+            // threshold which would eject occupants on an earlier nonfatal hit.
+            let hit = crate::sim::combat::EntityDamageEvent::direct_receiver(
+                building,
+                building_type.strength,
+                0,
+                crate::sim::combat::RAD_NO_ATTACKER,
+                None,
+                warhead,
+                crate::sim::combat::ReceiverCallFlags {
+                    ignore_defenses: true,
+                    arg6: false,
+                },
+            );
+            let (_, draws) = crate::sim::rng::trace_draws(|| {
+                sim.commit_direct_damage_receiver(&rules, None, hit, FrameEffects::default());
+            });
+            let phase = |caller: &str| {
+                draws
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, draw)| draw["callers"].as_str().unwrap().contains(caller))
+                    .map(|(index, draw)| (index, draw["value"].clone()))
+                    .collect::<Vec<_>>()
+            };
+            let debris = phase("throw_debris_for_death");
+            let garrison = phase("sell_building_occupants");
+            assert_eq!(
+                json!(debris.iter().map(|(_, value)| value).collect::<Vec<_>>()),
+                row["debris_raw_words"],
+                "{count} occupants: native Techno debris draws"
+            );
+            assert_eq!(
+                json!(garrison.iter().map(|(_, value)| value).collect::<Vec<_>>()),
+                row["garrison_raw_words"],
+                "{count} occupants: native garrison draws"
+            );
+            if count > 0 {
+                assert!(
+                    debris.last().unwrap().0 < garrison.first().unwrap().0,
+                    "garrison draws follow every Techno death debris draw"
+                );
+            }
+            let released: Vec<_> = occupants
+                .iter()
+                .map(|&id| {
+                    let survivor = sim.substrate.entities.get(id).unwrap();
+                    assert!(
+                        survivor.is_alive(),
+                        "the ejected GI survives carrier UnInit"
+                    );
+                    let nav_com = survivor.navigation.nav_com().map(|target| match target {
+                        NavTargetRef::Cell { rx, ry } => [rx, ry],
+                        NavTargetRef::Object { .. } => panic!("ejected GI scatters to a cell"),
+                    });
+                    json!({
+                        "nav_com": nav_com,
+                        "limbo": survivor.lifecycle.in_limbo(),
+                        "alive": survivor.lifecycle.object_alive(),
+                    })
+                })
+                .collect();
+            assert_eq!(json!(released), row["released"], "{count} occupants");
+        }
+    }
+
     #[test]
     fn garrison_destruction_detaches_occupants_before_building_uninit() {
         let rules = garrison_edge_rules();
@@ -1263,15 +1334,17 @@ pub(crate) mod tests {
         let building_id = 60;
         let passenger_id = 61;
         insert_captured_player_owned_garrison(&mut sim, &rules, building_id, passenger_id);
-        let event = DestroyedGarrisonBuilding {
-            building_id,
-            rx: 10,
-            ry: 10,
-            foundation_w: 2,
-            foundation_h: 2,
-        };
-
-        assert_eq!(eject_destruction_garrison(&mut sim, &rules, &event), 1);
+        assert_eq!(
+            sell_building_occupants(
+                &mut sim,
+                &rules,
+                None,
+                building_id,
+                GarrisonEjectMode::Release,
+                FrameEffects::default(),
+            ),
+            1
+        );
         assert!(
             sim.substrate
                 .entities
@@ -1356,15 +1429,17 @@ pub(crate) mod tests {
         let mut expected_rng = sim.scenario_rng.clone();
         let _ = expected_rng.next_range_u32_inclusive(0, 4);
 
-        let event = DestroyedGarrisonBuilding {
-            building_id,
-            rx: 10,
-            ry: 10,
-            foundation_w: 2,
-            foundation_h: 2,
-        };
-
-        assert_eq!(eject_destruction_garrison(&mut sim, &rules, &event), 1);
+        assert_eq!(
+            sell_building_occupants(
+                &mut sim,
+                &rules,
+                None,
+                building_id,
+                GarrisonEjectMode::Release,
+                FrameEffects::default(),
+            ),
+            1
+        );
         assert_eq!(
             sim.scenario_rng.state(),
             expected_rng.state(),
@@ -1398,15 +1473,17 @@ pub(crate) mod tests {
         block_all_garrison_exit_cells(&mut sim, &rules, 10, 10, 2, 2);
         let rng_before = sim.scenario_rng.state();
 
-        let event = DestroyedGarrisonBuilding {
-            building_id,
-            rx: 10,
-            ry: 10,
-            foundation_w: 2,
-            foundation_h: 2,
-        };
-
-        assert_eq!(eject_destruction_garrison(&mut sim, &rules, &event), 0);
+        assert_eq!(
+            sell_building_occupants(
+                &mut sim,
+                &rules,
+                None,
+                building_id,
+                GarrisonEjectMode::Release,
+                FrameEffects::default(),
+            ),
+            0
+        );
         assert_eq!(sim.scenario_rng.state(), rng_before);
 
         let passenger = sim

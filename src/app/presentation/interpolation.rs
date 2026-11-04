@@ -609,7 +609,8 @@ pub(crate) fn screen_position(state: &AppState, entity: &GameEntity) -> (f32, f3
     (x, y)
 }
 
-/// Once per presented frame; snapshots are rebuilt only when Logic advances.
+/// Once per presented frame and after each catch-up frame before the next;
+/// snapshots are rebuilt only when Logic advances.
 /// Hidden-window skipped intervals and map loads snap instead of long lerps.
 pub(crate) fn prepare(state: &mut AppState, exact_capture: bool) {
     if state.frontend.screen != crate::ui::game_screen::GameScreen::InGame {
@@ -1102,6 +1103,7 @@ mod tests {
         cache.observe(&sim, 32, Some(32.), false);
         let source = PresentedWorld {
             sim: &sim,
+            rules: None,
             interpolation: &cache,
             translucent_viewer: None,
         };

@@ -465,6 +465,7 @@ fn stock_shock_repairs_the_live_prism_terrain_child_before_limbo() {
             tree_coord,
             shock.damage,
             warhead,
+            true,
             (shock_source, Some(owner), warhead_ref),
             FrameEffects::default(),
         );

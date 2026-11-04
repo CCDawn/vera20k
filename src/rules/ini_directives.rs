@@ -39,6 +39,9 @@
 //! claim. The raw byte parser and deserializer never load other files:
 //! expansion is an opted-in source-selection step, selected by compile
 //! features for gameplay and available to read-only probes for both dialects.
+//! Copies are charged against one aggregate expanded-text budget per root load
+//! before they are made, so a small document cannot grow its retained store by
+//! inheriting one parent into many children.
 
 use super::IniFile;
 use std::collections::HashSet;
@@ -52,6 +55,16 @@ const ARES_INCLUDE_NAME_CAPACITY: usize = 0x80;
 // Extension safety policy: native has no depth limit, and depth alone cannot
 // bound a wide/repeated DAG.
 const MAX_INCLUDE_REFERENCES: usize = 1024;
+// Extension safety policy: `$Inherits` repeats a parent's entries once per
+// child, so a shallow, acyclic document can still expand a small parent into an
+// arbitrarily large store. Copies are bounded by the text the composed document
+// itself holds, which is what a legitimately wide inheritance can afford,
+// clamped so small documents still get room and large ones never license more
+// than the same 32 MiB the include loader allows. Independent of the depth and
+// cycle limits.
+const MAX_INHERITED_TEXT_RATIO: usize = 64;
+const MIN_INHERITED_TEXT_BYTES: usize = 1024 * 1024;
+const MAX_INHERITED_TEXT_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IncludeDialect {
@@ -129,6 +142,8 @@ pub enum DiagnosticKind {
     InheritanceCycle,
     InheritanceDepthLimit,
     InheritanceParentMissing,
+    /// Inheritance copies would exceed the aggregate expanded-text budget.
+    InheritanceWorkLimit,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -199,6 +214,11 @@ struct Traversal<'a> {
     included: HashSet<String>,
     diagnostics: Vec<DirectiveDiagnostic>,
     include_references: usize,
+    /// Key and value bytes copied into children by inheritance so far.
+    inherited_text_bytes: usize,
+    /// What those copies may aggregate to. Includes never charge it, so it is
+    /// set from the composed document after include expansion.
+    text_budget: usize,
 }
 
 impl Traversal<'_> {
@@ -262,6 +282,28 @@ impl Traversal<'_> {
         self.path.pop();
         self.identities.pop();
     }
+
+    /// Reserve the text a pending copy would add before that copy is made. One
+    /// parent may feed many children, so this is charged per copy, and only for
+    /// entries the child does not already author. Exhaustion always fails rather
+    /// than publishing a partially inherited store, as the include-reference
+    /// limit does.
+    fn reserve_inherited_text(&mut self, bytes: usize) -> Result<(), DirectiveDiagnostic> {
+        let retained = self.inherited_text_bytes.saturating_add(bytes);
+        let budget = self.text_budget;
+        if retained > budget {
+            return Err(DirectiveDiagnostic {
+                kind: DiagnosticKind::InheritanceWorkLimit,
+                source_name: self.source.to_owned(),
+                reference_chain: self.path.clone(),
+                message: format!(
+                    "Maximum expanded inheritance text {budget} bytes exceeded: {retained} bytes"
+                ),
+            });
+        }
+        self.inherited_text_bytes = retained;
+        Ok(())
+    }
 }
 
 /// Logical identities are independent of the host OS/cwd. Lookup still belongs
@@ -279,6 +321,27 @@ pub(crate) fn include_identity(name: &str) -> String {
         }
     }
     parts.join("/").to_ascii_lowercase()
+}
+
+/// Aggregate text this composed document may add by copying inherited entries:
+/// a multiple of its own stored text, so legitimately wide inheritance stays
+/// compatible, clamped at both ends. Includes bound their physical reads at the
+/// loader; inheritance instead repeats a parent once per child.
+fn inherited_text_budget(ini: &IniFile) -> usize {
+    let authored: usize = ini
+        .sections
+        .iter()
+        .map(|section| {
+            section
+                .key_order
+                .iter()
+                .map(|key| key.len() + section.entries[key].len())
+                .sum::<usize>()
+        })
+        .sum();
+    authored
+        .saturating_mul(MAX_INHERITED_TEXT_RATIO)
+        .clamp(MIN_INHERITED_TEXT_BYTES, MAX_INHERITED_TEXT_BYTES)
 }
 
 fn select_include_dialect(ini: &IniFile, options: DirectiveOptions) -> Option<IncludeDialect> {
@@ -329,6 +392,10 @@ pub fn process_directives(
         included: HashSet::new(),
         diagnostics: Vec::new(),
         include_references: 0,
+        inherited_text_bytes: 0,
+        // Includes never charge it, so the budget follows the composed
+        // document once include expansion has finished.
+        text_budget: 0,
     };
     let mut ini = ini;
     if let Some(dialect) = dialect {
@@ -340,6 +407,7 @@ pub fn process_directives(
         ini = expand_includes(ini, dialect, &mut load, &mut traversal)?;
         traversal.exit();
     }
+    traversal.text_budget = inherited_text_budget(&ini);
     let mut completed = HashSet::new();
     // Preserve the host's physical section occurrences, first-section lookup
     // and native parsing. A document without directives is byte-parser exact.
@@ -491,13 +559,29 @@ fn inherit(
         // Copy only after a parent completes. Never copy a cyclic/depth-cut
         // parent's partially resolved branch. The first parent supplying a
         // key wins; child-authored values always win, even for later parents.
-        let parent = ini.section(&parent).unwrap().clone();
+        // Charge the copy before making it: a parent shared by many children
+        // repeats this text once per child. Only keys the child does not author
+        // are copied, and directive keys never are.
         let index = ini.section_position(name).unwrap();
-        let child = &mut ini.sections[index];
-        for key in &parent.key_order {
-            if !matches!(key.as_str(), INHERITS | PHOBOS | ARES) && !child.is_present(key) {
-                child.set(key, &parent.entries[key]);
+        let (keys, copied) = {
+            let parent = ini.section(&parent).unwrap();
+            let child = &ini.sections[index];
+            let mut keys = Vec::new();
+            let mut copied = 0;
+            for key in &parent.key_order {
+                if matches!(key.as_str(), INHERITS | PHOBOS | ARES) || child.is_present(key) {
+                    continue;
+                }
+                copied += key.len() + parent.entries[key].len();
+                keys.push(key.clone());
             }
+            (keys, copied)
+        };
+        traversal.reserve_inherited_text(copied)?;
+        let parent = ini.section(&parent).unwrap().clone();
+        let child = &mut ini.sections[index];
+        for key in keys {
+            child.set(&key, &parent.entries[&key]);
         }
     }
     if success {

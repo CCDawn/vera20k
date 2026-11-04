@@ -127,6 +127,9 @@ pub(crate) enum NetworkSetupEvent {
     },
 }
 
+/// A LAN guest's room closed because its host left or stopped answering.
+pub(crate) const HOST_LEFT_TEXT: &str = "The host left the game, so the room closed.";
+
 pub(crate) fn service_event(state: &mut AppState, event: NetworkSetupEvent) -> anyhow::Result<()> {
     // The route stays NetworkSetup until the match returns, but GO's handoff
     // drops the setup protocol: later setup packets have no receiver.
@@ -278,6 +281,16 @@ pub(crate) fn service_event(state: &mut AppState, event: NetworkSetupEvent) -> a
                 super::cooperative::guest_left(state)?;
                 state.platform.window.request_redraw();
                 return Ok(());
+            }
+            // A VERA room's host moves its open spectator row after a leave;
+            // online the part sink's options carry it.
+            if dialog.host && state.match_state.session.network_several_observers() {
+                state
+                    .frontend
+                    .network_setup_protocol
+                    .as_mut()
+                    .expect("setup owns protocol")
+                    .republish_setup();
             }
             // Original5E10F2..5E1114 plays Rules+6BC only after endpoint
             // admission/removal while membershipAC0264>=2. This adapter is
@@ -865,6 +878,10 @@ pub(crate) fn service_event(state: &mut AppState, event: NetworkSetupEvent) -> a
                     .frontend
                     .multiplayer_shell_runtime
                     .clear_network_cooperative_partners();
+            }
+            // Native leaves without a word; VERA says why the room closed.
+            if !state.frontend.native_shell_ui {
+                crate::app::shell_lan::report_error(state, HOST_LEFT_TEXT);
             }
             App::leave_shell_dialog(
                 state,
@@ -1472,6 +1489,7 @@ fn choices_material(a: &SkirmishLocalSlot, b: &SkirmishLocalSlot) -> bool {
 }
 
 pub(crate) fn poll(state: &mut AppState) -> Option<Instant> {
+    auto_accept(state);
     let pings = super::wol::poll(state);
     let go = poll_go(state);
     let offer = poll_preview_offer(state);
@@ -1480,6 +1498,52 @@ pub(crate) fn poll(state: &mut AppState) -> Option<Instant> {
     let direct = (super::external(state) && !super::dialog(state).wol())
         .then(|| Instant::now() + std::time::Duration::from_millis(16));
     pings.into_iter().chain(go).chain(offer).chain(direct).min()
+}
+
+/// VERA's game room (`SetupDialog::modern`) presses Accept for a guest
+/// whenever the player could, so nobody readies up by hand: after joining,
+/// after every host change, and for the final settings Start publishes.
+/// Quick Match and external launches have no setup dialog.
+fn auto_accept(state: &mut AppState) {
+    let dialog = super::dialog(state);
+    if !dialog.modern
+        || dialog.host
+        || super::quick_match(state)
+        || super::external(state)
+        || state
+            .frontend
+            .network_setup_protocol
+            .as_ref()
+            .is_none_or(|protocol| protocol.locked)
+        || !super::view::accept_enabled(state)
+    {
+        return;
+    }
+    if let Err(error) = super::actions::accept(state) {
+        log::warn!("automatic Accept refused: {error:#}");
+    }
+    state.platform.window.request_redraw();
+}
+
+/// The service could not take the local acceptance. It stays withdrawn
+/// until the room changes (a new revision or a verified map makes Accept
+/// eligible again), so the automatic Accept never repeats a refused request.
+pub(crate) fn refuse_local_acceptance(state: &mut AppState) -> anyhow::Result<()> {
+    let index = state
+        .match_state
+        .session
+        .network_setup()
+        .ok_or_else(|| anyhow::anyhow!("no admitted setup"))?
+        .local_player_index;
+    state
+        .match_state
+        .session
+        .set_network_player_ready(index, false)?;
+    if let Some(protocol) = state.frontend.network_setup_protocol.as_mut() {
+        protocol.accept_eligible = false;
+    }
+    state.platform.window.request_redraw();
+    Ok(())
 }
 
 /// Fewer than every guest answered within 1800 buckets: the host gives up

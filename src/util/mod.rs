@@ -41,6 +41,8 @@ pub mod save_codec;
 pub(crate) mod sha1;
 pub mod sha256;
 pub mod single_instance;
+// Portable state hashing; `rules` and `sim` both fold identities through it.
+pub(crate) mod state_hasher;
 pub mod version;
 // pub mod color;
 
@@ -53,3 +55,5 @@ pub mod native_affine;
 // Platform services retain the standard-library types on native targets.
 pub mod time;
 pub mod file_system;
+
+pub mod debug_checks;

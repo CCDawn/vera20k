@@ -64,6 +64,14 @@ Strength=250
 - The default depth limit is 64 reference edges below the active root, a VERA
   safety bound because native has none. It is checked before the next Include
   read. Completed inheritance parents may be reused without descending.
+- Inheritance copies are also charged against an aggregate expanded-text budget,
+  checked before each copy and only for entries the child does not author: 64
+  times the composed document's own key and value text, at least 1 MiB and at
+  most 32 MiB. The depth and cycle limits cannot bound one parent inherited by
+  many children; the multiple leaves room for a legitimately wide fan-out while
+  a small document cannot license a large store. Exceeding the budget always
+  fails the load instead of publishing a partially inherited store, as the 1024
+  include-reference limit does. Retail content is far below it.
 - Logical Include identities normalize slash direction, dot segments and ASCII
   casing independently of host OS/cwd. File lookup stays with the existing VFS.
   All Include references use that same resource root, not the including file's
@@ -75,7 +83,9 @@ This deliberately does not transplant mono's UTF-8 parser or change vanilla YR
 lexing to match a different extension dialect. In particular an empty directive
 section discarded by the native parser cannot override another parsed section.
 The depth limit bounds active recursion, not total graph size or repeated-DAG
-expansion work. Opaque resource aliases are not a filesystem/symlink sandbox.
+expansion work; the include-reference limit, the 32 MiB included-source budget
+and the expanded-text budget bound that work instead.
+Opaque resource aliases are not a filesystem/symlink sandbox.
 Optional layers retain their existing error policy: an unavailable or failed
 `langrule.ini`, `soundmd.ini` or `evamd.ini` is skipped with a warning, so a
 fatal Phobos include error inside one of those optional files does not abort

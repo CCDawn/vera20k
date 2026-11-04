@@ -209,17 +209,10 @@ pub(crate) fn art_key_screen_width(state: &AppState) -> u32 {
 /// Westwood Online welcome `0x10E`.
 pub(crate) fn wol_welcome_layout(state: &AppState) -> crate::ui::wol_shell::WolWelcomeLayout {
     let (width, height) = shell_screen_size(state);
-    let spec = state
-        .frontend
-        .wol
-        .as_ref()
-        .map_or(&crate::ui::wol_shell::WOL_WELCOME_PAGE, |visit| {
-            visit.welcome_page_spec()
-        });
     if fills_window(state) {
-        crate::ui::wol_shell::compute_responsive_layout(width, height, spec)
+        crate::ui::wol_shell::compute_responsive_layout(width, height)
     } else {
-        crate::ui::wol_shell::compute_layout(width, height, spec)
+        crate::ui::wol_shell::compute_layout(width, height)
     }
 }
 

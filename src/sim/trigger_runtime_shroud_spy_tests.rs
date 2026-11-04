@@ -157,6 +157,42 @@ fn spy_house_event_reads_forced_display_owner_and_first_country_house() {
     }
 }
 
+/// The native `fallback_player` row: an undisguised agent matches through
+/// PlayerPtr's Country, so only that client's trigger state would change.
+/// Network games skip the fallback; that state now feeds the match checksum.
+#[test]
+fn network_spy_house_event_has_no_current_player_fallback() {
+    let (mut sim, rules, _, houses) = fixture();
+    let actor = sim
+        .spawn_object("SPY", "House0", 15, 15, 0, &rules)
+        .unwrap();
+    let live = install(&mut sim, &rules, "1,53,0,7");
+    let disguise = sim.substrate.entities.get_mut(actor).unwrap();
+    disguise.disguise.as_mut().unwrap().acquire(0, None, None);
+    sim.session.set_current_house_for_test(Some(houses[1]));
+    let mut occurs = |sim: &mut Simulation| {
+        let input = TagEventInput {
+            kind: 53,
+            actor: Some(actor),
+            ..Default::default()
+        };
+        sim.has_occurred(0, input, None, &mut false, &rules, live)
+    };
+    assert!(occurs(&mut sim));
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Lan);
+    assert!(!occurs(&mut sim));
+    // A live trigger's own state is a match-checksum term.
+    let fold = |runtime: &TriggerRuntime| {
+        let mut checksum = crate::sim::multiplayer_checksum::RetailChecksumAccumulator::new();
+        runtime.fold_match_checksum(0, &mut checksum);
+        checksum.value()
+    };
+    let before = fold(&sim.trigger_runtime);
+    sim.trigger_runtime.triggers[live].as_mut().unwrap().enabled ^= true;
+    assert_ne!(fold(&sim.trigger_runtime), before);
+}
+
 #[test]
 fn agent_arrival_keeps_the_cached_tag_for_linked_house_then_type_events() {
     let (mut sim, rules, registry, houses) = fixture();
@@ -349,6 +385,29 @@ fn retail_spy_house_entry_survives_restore_and_reaches_the_message_consumer() {
     }
     assert_eq!(histories[0], histories[1]);
     assert_eq!(sim.trigger_runtime, loaded.trigger_runtime);
+}
+
+/// The forced type's PlayerPtr-side fallback (event 54, MakeupKit copies)
+/// would answer each client's own side; a network game answers the worn type
+/// alone, whichever House is local.
+#[test]
+fn network_forced_disguise_type_has_no_current_player_fallback() {
+    let (mut sim, rules, _, houses) = fixture();
+    let actor = sim
+        .spawn_object("SPY", "House0", 15, 15, 0, &rules)
+        .unwrap();
+    without_stored_disguise(&mut sim, actor);
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Lan);
+    let answers = [(houses[1], 0), (houses[2], 1)].map(|(local, side)| {
+        sim.houses
+            .get_mut(&local)
+            .unwrap()
+            .set_side_index_for_test(side);
+        sim.session.set_current_house_for_test(Some(local));
+        sim.forced_disguise_type(actor, &rules)
+    });
+    assert_eq!(answers, [None, None]);
 }
 
 #[test]

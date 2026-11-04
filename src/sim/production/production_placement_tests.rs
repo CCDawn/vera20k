@@ -3296,13 +3296,8 @@ fn cycle_active_producer_rotates_matching_factories() {
         ProductionCategory::Vehicle,
     ));
     assert_eq!(
-        sim.production
-            .primary_factory_ids(
-                sim.interner.intern("Americans"),
-                ProductionCategory::Vehicle
-            )
-            .next(),
-        Some(3)
+        [3, 5, 9].map(|id| sim.production.is_primary_factory(id)),
+        [true, false, false]
     );
     assert!(cycle_active_producer_for_owner_category(
         &mut sim,
@@ -3311,13 +3306,8 @@ fn cycle_active_producer_rotates_matching_factories() {
         ProductionCategory::Vehicle,
     ));
     assert_eq!(
-        sim.production
-            .primary_factory_ids(
-                sim.interner.intern("Americans"),
-                ProductionCategory::Vehicle
-            )
-            .next(),
-        Some(5)
+        [3, 5, 9].map(|id| sim.production.is_primary_factory(id)),
+        [false, true, false]
     );
 }
 
@@ -3330,8 +3320,7 @@ fn blocked_active_war_factory_does_not_spawn_from_second_factory() {
     spawn_structure(&mut sim, &rules, 1, "Americans", "GAWEAP", 10, 10);
     spawn_structure(&mut sim, &rules, 2, "Americans", "GAWEAP", 30, 30);
     let americans = sim.interner.intern("Americans");
-    sim.production
-        .set_primary_factory_for_test(americans, ProductionCategory::Vehicle, 1);
+    sim.production.set_primary_factory_for_test(1);
 
     grid.set_blocked(12, 11, true);
     sim.install_fixture_path_grid(Some(&grid));
@@ -3381,8 +3370,7 @@ fn spawn_routing_prefers_active_producer_when_available() {
     spawn_structure(&mut sim, &rules, 3, "Americans", "GAWEAP", 10, 10);
     spawn_structure(&mut sim, &rules, 5, "Americans", "GAWEAP", 30, 30);
     let americans = sim.interner.intern("Americans");
-    sim.production
-        .set_primary_factory_for_test(americans, ProductionCategory::Vehicle, 5);
+    sim.production.set_primary_factory_for_test(5);
 
     let producer = super::find_factory(
         &sim,

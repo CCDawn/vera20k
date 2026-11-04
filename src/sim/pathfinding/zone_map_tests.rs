@@ -153,7 +153,8 @@ fn gsi_04_01_nonbridge_getzoneid_uses_padded_square_clamps_and_raw_rows() {
         base.raw_zone_ids_by_row[MovementZone::Normal.matrix_row().unwrap()][0] = 41;
         base.raw_zone_ids_by_row[MovementZone::Normal.matrix_row().unwrap()][2] = 42;
         base.raw_zone_ids_by_row[MovementZone::Crusher.matrix_row().unwrap()][2] = 1;
-        base.raw_zone_ids_by_row[MovementZone::Destroyer.matrix_row().unwrap()][2] = u16::MAX;
+        base.raw_zone_ids_by_row[MovementZone::Destroyer.matrix_row().unwrap()][2] =
+            u16::MAX as ZoneId;
         base.raw_zone_ids_by_row[MovementZone::Amphibious.matrix_row().unwrap()][2] = 73;
     }
 
@@ -195,7 +196,7 @@ fn gsi_04_01_nonbridge_getzoneid_uses_padded_square_clamps_and_raw_rows() {
     );
     assert_eq!(
         zones.get_zone_id_nonbridge_native((0, 0), MovementZone::Destroyer),
-        Some(u16::MAX),
+        Some(u16::MAX as ZoneId),
         "raw 0xffff is not flattened"
     );
     assert_eq!(
@@ -494,7 +495,7 @@ fn base_repair_fixture(
     let zone_count = clusters.iter().copied().max().unwrap_or(0);
     for row in &mut base.raw_zone_ids_by_row {
         row.resize(zone_count as usize + 1, 1);
-        row[0] = u16::MAX;
+        row[0] = u16::MAX as ZoneId;
         for cluster in 1..=zone_count {
             row[cluster as usize] = cluster + 1;
         }
@@ -776,7 +777,7 @@ fn gsi_04_06_fallback_rebuilds_base_without_resetting_hierarchy_high_water() {
         }
         base.movement_classes[index(2, 2)] = zone_class::GROUND;
         base.zone_ids[index(2, 2)] = 1;
-        base.raw_zone_ids_by_row[0][0] = u16::MAX;
+        base.raw_zone_ids_by_row[0][0] = u16::MAX as ZoneId;
         base.raw_zone_ids_by_row[0][1] = 2;
         base.raw_zone_ids_by_row[0][2] = 3;
 

@@ -25,23 +25,33 @@ on:
       - 'src/assets/mix_archive.rs'
       - 'src/map/source**'
       - 'src/sim/mod.rs'
+      - 'src/sim/parallel.rs'
       - 'src/sim/parallel_web.rs'
       - 'src/render/frame_readback.rs'
       - 'src/render/gpu.rs'
       - 'src/render/sprite_atlas*.rs'
       - 'src/render/unit_atlas.rs'
+      - 'src/ui/main_menu_dialogs/options.rs'
       - 'src/app/mod.rs'
       - 'src/app/cncnet.rs'
       - 'src/app/frame.rs'
       - 'src/app/frontend/launch.rs'
+      - 'src/app/frontend/main_menu_shell_render.rs'
+      - 'src/app/frontend/shell_transition.rs'
+      - 'src/app/frontend/state.rs'
       - 'src/app/handler.rs'
+      - 'src/app/in_game.rs'
       - 'src/app/initialize.rs'
+      - 'src/app/shell_main_menu.rs'
       - 'src/app/shell_random_map.rs'
       - 'src/app/shell_wol.rs'
       - 'src/app/spawn_probe.rs'
+      - 'src/app/input/ime.rs'
       - 'src/app/input/keyboard.rs'
       - 'src/app/lan_service**'
       - 'src/app/loading/**'
+      - 'src/app/map_library.rs'
+      - 'src/app/match_diagnostics.rs'
       - 'src/app/match_runtime/frame_pacer.rs'
       - 'src/app/persistence/**'
       - 'src/app/shell_wol/**'
@@ -59,14 +69,15 @@ jobs:
         mode: [single-player, network, lan]
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.12'
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: stable
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: '. -> target/owned-worktrees'
           # Pull requests read main's cache without evicting the long-lived ones.
@@ -86,7 +97,7 @@ jobs:
           else
             python3 tools/wasm/build.py
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: github.event_name != 'pull_request'
         with:
           name: ${{ matrix.mode == 'lan' && 'vera20k-wasm-lan' || matrix.mode == 'network' && 'vera20k-wasm-net' || 'vera20k-wasm' }}

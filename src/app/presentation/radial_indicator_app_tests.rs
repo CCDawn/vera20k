@@ -73,7 +73,9 @@ fn query(sim: &Simulation, rules: &RuleSet, ids: &[u64], ms: u64) -> Vec<RadialI
             zoom: 1.,
         },
         ms,
-    );
+        1,
+    )
+    .draws;
     assert_eq!(
         before,
         (
@@ -113,7 +115,9 @@ fn target_query(
             zoom: 1.0,
         },
         0,
+        1,
     )
+    .draws
 }
 
 #[test]
@@ -524,7 +528,9 @@ fn targeting_a_missing_cell_cannot_change_the_simulation_dummy() {
                 zoom: 1.0,
             },
             0,
-        );
+            1,
+        )
+        .draws;
         assert!(!draws.is_empty());
         assert_eq!(dummy.snapshot(), before_dummy);
         assert_eq!(sim.state_hash(), before_hash);
@@ -748,7 +754,9 @@ fn placement_query(
             zoom: 1.0,
         },
         0,
+        1,
     )
+    .draws
 }
 
 #[cfg(feature = "phobos")]

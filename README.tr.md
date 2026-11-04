@@ -49,6 +49,8 @@ Windows, macOS veya Linux yükleyicisini
 [sürümler sayfasından](https://github.com/YuriPlanet/vera20k/releases) indirin. Yükleyici,
 Yuri's Revenge kopyanızı bulur ve VERA20K'yi yeni bir klasöre kurar.
 
+Ses ve kontroller için **Options**, VERA'ya özgü özellikler için **Vera Options** menüsünü kullanın.
+
 Tek oyunculu YR çatışmalarını veya senaryolarını bir CnCNet istemcisinden başlatmak için
 [çevrimdışı istemci kurulumuna](integrations/cncnet/README.md) bakın.
 
@@ -65,29 +67,6 @@ Bakımcılar inceleme, entegrasyon ve birleştirme konusunda yardımcı olur. Ka
 size atfedilir.
 
 Tartışmalar [Discord](https://discord.gg/kmjRUn5m5F) üzerinden ve QQ grubunda (1097193563) yürür.
-
-## Ayarlar
-
-Ses ve kontroller için **Options**, VERA'ya özgü özellikler için **Vera Options** menüsünü kullanın.
-Oyuncu tercihleri, klavye kısayolları ve lobi seçimleri `VERA.INI` dosyasına kaydedilir:
-
-- **Windows yükleyicisi:** `vera20k.exe` ile aynı klasörde.
-- **macOS:** `~/Library/Application Support/VERA20k/VERA.INI`.
-- **Linux:** `~/.local/share/VERA20k/VERA.INI` veya XDG veri klasörünüzde.
-
-`config.toml` oyun klasörünü belirler ve farklı bir ayar klasörü seçilmesine olanak tanır.
-
-**Vera Options** içinden **Mouse Wheel Zoom** seçeneğini açın veya `VERA.INI` dosyasında
-`[VERA] MouseWheelZoom=yes` ayarlayın (varsayılan `no`).
-
-`VERA.INI` yoksa VERA dosyayı oluşturur ve mevcut tercihleri bir kez içe aktarır.
-Eski ayarlar yoksa dosya başlangıçta boştur; ayarlar kaydedilene kadar VERA yerleşik varsayılanları
-kullanır. Orijinal `RA2MD.INI` ve `KeyboardMD.ini` dosyaları yalnızca içe aktarma için okunur,
-asla üzerlerine yazılmaz.
-
-Aynı klasördeki `VERARULES.INI`, isteğe bağlı oynanış değişikliklerini içerir. Başlangıçta yorum
-satırı hâline getirilmiş örnekler içerir ve görev ve harita kurallarına öncelik tanır. Bunları
-düzenlemek ve geçersiz kılmak için [kişisel kurallar](docs/personal-rules.md) bölümüne bakın.
 
 ## Mimari
 
@@ -132,8 +111,10 @@ ile oyun testleri kullanarak kontrol ediyor. Ajanlar [AGENTS.md](AGENTS.md) dosy
 
 ## Özelleştirme
 
+Harita kapasitesi derleme bayrağı olmadan otomatik seçilir: `Size` genişliği ile yüksekliğinin toplamı en fazla 1024 olabilir. 512 dahil eski adresleme korunur; daha büyük haritalar genişletilmiş ızgarayı kullanır. Üretici, kayıt sürümleri ve doğrulama sınırları: [büyük haritalar](README.md#large-maps).
+
 VERA20K varsayılan olarak orijinal oyun gibi oynanır. Ares gibi modlardan gelen eklentiler dahil
-her yeni özellik, şu yollardan biriyle açılana kadar kapalı kalmalıdır:
+diğer her yeni özellik, şu yollardan biriyle açılana kadar kapalı kalmalıdır:
 
 - **Bir VERA oyuncu seçeneği**: **Options → Vera Options** altında bulunur ve `VERA.INI` dosyasının `[VERA]` bölümüne kaydedilir.
 - **Bir derleme seçeneği**: örneğin desteklenen [Ares eklentileri](docs/ares.md) için `--features ares`.

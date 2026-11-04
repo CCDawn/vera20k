@@ -232,6 +232,11 @@ impl Scene {
                 camera: vera_camera(),
                 render_size: SIZE,
                 zoom: 1.,
+                building_viewport: crate::app::presentation::render::tactical_world_viewport(
+                    vera_camera(),
+                    CLIP,
+                    None,
+                ),
                 axis: DepthAxis::NONE,
                 local_owner: Some(OWNER),
                 ignore_visibility: true,

@@ -289,8 +289,8 @@ fn the_launch_matches_native() {
             match event[0].as_str().unwrap() {
                 "cell" => looked = (int(&event[1][0]) as i16, int(&event[1][1]) as i16),
                 "area_damage" => {
-                    // No source, MutateExplosionWarhead=, affectsTiberium 0
-                    // (module RESIDUAL), the Super's house.
+                    // No source, MutateExplosionWarhead=, affectsTiberium 0,
+                    // the Super's house.
                     assert_eq!(int(&event[3]), 0);
                     assert_eq!(event[4], true);
                     assert_eq!(int(&event[5]), 0);

@@ -146,6 +146,9 @@ pub struct LaunchSpeedProjectile {
     pub rot: i32,
     /// `BulletTypeClass+0x295` `Floater=`.
     pub floater: bool,
+    /// Phobos `[Projectile] Gravity=`, unset on the stock path
+    /// (`BulletTypeExt::GetAdjustedGravity`).
+    pub gravity: Option<NativeF64Bits>,
 }
 
 /// `WeaponTypeClass::GetSpeed @ 0x00773070`: the speed a shot is launched
@@ -166,6 +169,10 @@ pub fn weapon_launch_speed(
 ) -> i32 {
     let Some(projectile) = projectile.filter(|projectile| projectile.rot == 0) else {
         return weapon_speed;
+    };
+    let gravity = match projectile.gravity {
+        Some(bits) => crate::util::native_ballistics::BallisticGravity::Value(bits),
+        None => crate::util::native_ballistics::BallisticGravity::Rules(gravity),
     };
     crate::util::native_ballistics::ballistic_launch_speed(distance, gravity, projectile.floater)
 }
@@ -806,7 +813,7 @@ mod tests {
                 radial_index: row["radial_index"].as_i64().unwrap() as i32,
                 body_heading: row["hull"].as_u64().unwrap() as u16,
                 arcing: row["arcing"].as_bool().unwrap(),
-                gravity: super::super::projectile_gravity(6, false),
+                gravity: super::super::projectile_gravity(6, None, false),
                 high_root: false,
                 voxel_downward: None,
                 building_pitch_height: None,
@@ -932,6 +939,7 @@ mod tests {
                     arcing,
                     gravity: super::super::projectile_gravity(
                         6,
+                        None,
                         row["floater"].as_bool().unwrap_or(false),
                     ),
                     high_root: high_arc_root(
@@ -985,6 +993,25 @@ mod tests {
         crate::test_fixture::json("tools/projectile_oracle/fireat_speed.json")
     }
 
+    /// Phobos `WeaponTypeClass_GetSpeed_ApplyGravity` 0x773087: a type
+    /// `Gravity` feeds the same square-root arm, while the type value equal to
+    /// the Rules value reproduces the stock result.
+    #[cfg(feature = "phobos")]
+    #[test]
+    fn phobos_type_gravity_changes_the_derived_launch_speed() {
+        let projectile = |gravity| LaunchSpeedProjectile {
+            rot: 0,
+            floater: false,
+            gravity,
+        };
+        let bits = |value: f64| NativeF64Bits::from_bits(value.to_bits());
+        let stock = weapon_launch_speed(102, Some(projectile(None)), 6, 500);
+        let same = weapon_launch_speed(102, Some(projectile(Some(bits(6.0)))), 6, 500);
+        assert_eq!(same, stock);
+        let heavy = weapon_launch_speed(102, Some(projectile(Some(bits(12.0)))), 6, 500);
+        assert!(heavy > stock, "{heavy} vs {stock}");
+    }
+
     /// `tools/projectile_oracle/fireat_speed.json`: `WeaponTypeClass::GetSpeed`
     /// on the original instructions over ROT, Floater, gravity (negative and
     /// zero included) and distance (negative, zero and the signed32 maximum),
@@ -1004,6 +1031,7 @@ mod tests {
                     .then(|| LaunchSpeedProjectile {
                         rot: int("rot"),
                         floater: int("floater") != 0,
+                        gravity: None,
                     });
             assert_eq!(
                 weapon_launch_speed(int("speed"), projectile, int("gravity"), int("distance")),
@@ -1075,6 +1103,7 @@ mod tests {
                 Some(LaunchSpeedProjectile {
                     rot: int("rot"),
                     floater: false,
+                    gravity: None,
                 }),
                 int("gravity"),
                 distance,

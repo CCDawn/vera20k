@@ -26,10 +26,23 @@ JSON conversion, following redirects or replaying requests. It preserves the
 upstream status and body. CORS permits only `VERA_WEB_ORIGIN`, GET/POST and the
 Authorization/Content-Type headers. Ambient cookies are not forwarded.
 
+The lobby keys its per-network limits on the requesting address, which for
+proxied requests is the gateway's. To give each browser player its own limits,
+set `VERA_GATEWAY_KEY` to the lobby Worker's `GATEWAY_KEY` secret, a random string
+of at least 32 characters (`openssl rand -hex 32`). The gateway then sends that key
+and the player's address (the socket peer, or `VERA_CLIENT_IP_HEADER`) with each
+`/v1/*` request; the lobby ignores an address named without the key. Unset, every
+browser player shares the gateway's address and limits.
+
 The browser's `WS_PROXY_URL` is compiled into its `wasm-net` build, defaulting to
-`wss://wss.vera20k.com`. This is a client setting, separate from the server's UDP
-target. Deploy a TLS reverse proxy at that origin and forward `/game/*` with
-WebSocket Upgrade and `/v1/*` to this process. Preserve the browser Origin header;
+`wss://wss.vera20k.com`. An external launch overrides it for its match with
+`[Relay] GatewayUrl` in `spawn.ini`. This is a client setting, separate from the
+server's UDP target, so a gateway must forward to the relay of the grants its
+clients hold. Deploy a TLS reverse proxy at that origin and forward `/game/*` with
+WebSocket Upgrade and `/v1/*` to this process. Set `VERA_CLIENT_IP_HEADER` to the
+header that proxy writes with the browser's address (for example
+`cf-connecting-ip`, or `x-forwarded-for`, whose last entry is used); never set it
+when clients can reach the gateway directly. Preserve the browser Origin header;
 allow at least 70 seconds before an idle WebSocket timeout. The Node server binds
 `127.0.0.1:8788` by default (`HOST` and `PORT` can override it). It serves no static
 game files. The static site and gateway may be hosted separately.
@@ -37,13 +50,17 @@ game files. The static site and gateway may be hosted separately.
 LAN signaling is off by default. `VERA_LAN_SIGNAL=1` enables `/lan/signal` for
 `wasm-lan` builds: it groups browsers by public address, assigns virtual IPv4s
 and forwards WebRTC descriptions and candidates within the group; game datagrams
-never pass through it. Behind a reverse proxy, set `VERA_CLIENT_IP_HEADER` to the
-header that proxy writes (for example `cf-connecting-ip`, or `x-forwarded-for`,
-whose last entry is used) and route `/lan/*` WebSocket Upgrades here; never set it
-when clients can reach the gateway directly. `VERA_LAN_STUN` optionally lists
+never pass through it. Behind a reverse proxy, route `/lan/*` WebSocket Upgrades
+here; groups use the address from `VERA_CLIENT_IP_HEADER`. `VERA_LAN_STUN` optionally lists
 comma-separated `stun:` URLs for networks that hide host candidates; TURN is
 rejected. Limits are in `signal.mjs`: 256 connections, 16 members per group,
-16 KiB messages and 64 messages per second per connection.
+16 KiB messages and 64 incoming messages/Pings per second per connection.
+JSON, Ping and Pong writes check queued output against 256 KiB per recipient
+and 1 MiB across signaling connections, including a frame-header allowance.
+A write that exceeds either budget retires its recipient through ordinary
+member cleanup. A refused welcome never announces a join. A departed browser's
+virtual address is held for two minutes, until its peers have dropped it; only
+a signaling reconnect that asks for it back gets it.
 
 Local development can use `VERA_WEB_ORIGIN=http://localhost:8000`. An HTTP lobby
 requires both `VERA_ALLOW_LOCAL_HTTP=1` and a loopback lobby origin, for example
@@ -59,11 +76,23 @@ they do not authenticate arbitrary non-browser clients.
 Transport limits are defined together in `server.mjs`: 256 WebSockets, 128 pending
 HTTP exchanges, 64 KiB request and 1 MiB response bodies, 2048-byte messages,
 256 queued UDP packets / 256 KiB, and 1 MiB pending WS output. Each connection
-permits 2048 combined incoming/outgoing datagrams per second, under a 16384/second
-aggregate limit. Messages also have bounded fragmentation and buffering. Overflow
-closes that transport; only the original game protocol decides recovery. HTTP
-responses use stream backpressure and a 12-second absolute request deadline.
-Socket shutdown releases queues and the UDP port. The 30-second WS Ping/Pong
+may pass up to 2048 combined incoming/outgoing datagrams per second from a
+16384/second aggregate shared max-min fairly: each one-second window reserves for
+every connection what it attempted in the previous window, up to an equal share,
+and traffic past a reservation uses only unreserved budget. A datagram over budget
+or behind a full queue is dropped, as UDP would lose it; the connection stays open
+and only the original game protocol decides recovery. Text, empty or oversized
+messages close the transport. Messages also have bounded fragmentation and
+buffering. HTTP responses use stream backpressure and a 12-second absolute request
+deadline.
+Socket shutdown releases queues and the UDP port.
+Pong replies to a client's Pings have a separate fair allowance of 64 per second
+per connection and 1024 per second shared across game connections; a Ping past it
+closes that transport through normal cleanup. Pongs and the gateway's own heartbeat
+Pings must also fit the 1 MiB WS output queue, including a frame-header allowance,
+or the slow transport closes. The heartbeat is not charged to the shared allowance,
+so other connections cannot spend a quiet player's heartbeat, and control frames
+never spend game-datagram credit. The 30-second WS Ping/Pong
 heartbeat never changes game readiness, tickets or Leave semantics.
 
 The pinned `ws` version includes the upstream fixes for

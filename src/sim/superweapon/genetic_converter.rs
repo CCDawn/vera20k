@@ -38,10 +38,6 @@
 //! - The EVA line is skipped natively while `0x00A8B538` is set
 //!   (`HouseClass::MPlayer_Defeated @ 0x004FC205`), on every client after the
 //!   local player's multiplayer defeat; VERA always plays it.
-//! - Apply_area_damage gets affectsTiberium 0 here (`0x006CD8FE`); the shared
-//!   [`apply_area_damage`] passes 1, as its other callers do (`0x00423E7D`,
-//!   `0x0053A5BE`, `0x0053B157`, `0x006632BD`). Dormant: retail
-//!   `MutateExplosion` has no `Tiberium=` (production reader).
 //! - A null `IonBlast=` or warhead reaches AnimClass or the receivers as a
 //!   null type natively; VERA builds or damages nothing. Retail sets RING1,
 //!   Mutate and MutateExplosion.
@@ -151,6 +147,8 @@ pub(crate) fn launch(
             MUTATE_EXPLOSION_DAMAGE,
             origin,
         ));
+        // SuperClass::Launch6CC390 passes affectsTiberium=false at6CD8FE,
+        // independently of WH.Tiberium (original gamemd.exe).
         apply_area_damage(
             sim,
             rules,
@@ -158,6 +156,7 @@ pub(crate) fn launch(
             crate::sim::projectile::ProjectileCoord::new(x, y, z),
             MUTATE_EXPLOSION_DAMAGE,
             warhead,
+            false,
             origin,
             frame_effects,
         );

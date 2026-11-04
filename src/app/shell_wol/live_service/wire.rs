@@ -1,5 +1,5 @@
 //! VERA HTTPS lobby payloads. These project the existing shell/session owners;
-//! they do not create a second gameplay state. See services/lobby/protocol.md.
+//! they do not create a second gameplay state. See docs/lobby-protocol.md.
 
 use serde::{Deserialize, Serialize};
 
@@ -217,6 +217,9 @@ pub(super) struct Session {
     pub nickname: String,
     pub token: String,
     pub expires_at: u64,
+    // The operator's welcome, when one is set; the game's own otherwise.
+    #[serde(default)]
+    pub motd: Option<String>,
 }
 
 #[derive(Deserialize)]

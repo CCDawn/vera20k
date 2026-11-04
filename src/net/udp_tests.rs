@@ -324,8 +324,15 @@ fn relay_uses_existing_reliable_owner_across_a_lost_and_duplicated_datagram() {
     assert_eq!(first.global().queued_send_count(), 0);
 }
 
-#[test]
-fn relay_retirement_keeps_the_original_route_until_a_retried_leave_is_acknowledged() {
+/// An admitted relay route whose startup agreement the relay accepted, so
+/// retirement retains it for an explicit Leave.
+fn ordered_relay() -> (
+    UdpSocket,
+    vera20k_relay_protocol::RelayServer,
+    LanUdpTransport,
+    [u8; vera20k_relay_protocol::TICKET_LEN],
+    [u8; 32],
+) {
     use vera20k_relay_protocol::{MAX_DATAGRAM, RelayServer, SecretKey, Ticket, derive_packet_key};
 
     let socket = raw_peer();
@@ -334,7 +341,6 @@ fn relay_retirement_keeps_the_original_route_until_a_retried_leave_is_acknowledg
     let key = SecretKey::new([42; 32]);
     let mut server = RelayServer::new(key.clone(), 1);
     let mut wire = transport();
-    let primary = wire.primary_addr().unwrap();
     let ticket = Ticket {
         room: [11; 16],
         source: 0,
@@ -366,7 +372,7 @@ fn relay_retirement_keeps_the_original_route_until_a_retried_leave_is_acknowledg
     socket.set_nonblocking(false).unwrap();
     let cert = OrderingCertificate {
         room: [11; 16],
-        sources_mask: 1,
+        sources_mask: 3,
         tick_hz: 45,
         expires: 2000,
     }
@@ -383,6 +389,15 @@ fn relay_retirement_keeps_the_original_route_until_a_retried_leave_is_acknowledg
     {
         socket.send_to(&output.bytes, output.endpoint).unwrap();
     }
+    (socket, server, wire, ticket, packet_key)
+}
+
+#[test]
+fn relay_retirement_keeps_the_original_route_until_a_retried_leave_is_acknowledged() {
+    let (socket, mut server, mut wire, ticket, packet_key) = ordered_relay();
+    let address = ipv4_addr(&socket).unwrap();
+    let primary = wire.primary_addr().unwrap();
+    let mut bytes = [0; vera20k_relay_protocol::MAX_DATAGRAM + 1];
     wire.retire_relay();
     assert!(wire.relay_retirement_pending());
     assert_eq!(
@@ -433,6 +448,31 @@ fn relay_retirement_keeps_the_original_route_until_a_retried_leave_is_acknowledg
     }
     assert_eq!(wire.relay_source(), None);
     assert_eq!(wire.primary_addr().unwrap(), primary);
+}
+
+#[test]
+fn unacknowledged_relay_leave_releases_the_route_after_bounded_attempts() {
+    // The relay went down: no Leave attempt is acknowledged.
+    let (socket, _server, mut wire, ticket, packet_key) = ordered_relay();
+    let mut bytes = [0; vera20k_relay_protocol::MAX_DATAGRAM + 1];
+    wire.retire_relay();
+    let attempts = u32::from(RELAY_LEAVE_ATTEMPTS);
+    for attempt in 0..attempts {
+        assert!(wire.relay_retirement_pending());
+        wire.service(attempt * 16);
+        socket.recv_from(&mut bytes).unwrap();
+    }
+    wire.service(attempts * 16 - 1);
+    assert!(
+        wire.relay_retirement_pending(),
+        "the last attempt keeps its full retry interval"
+    );
+    wire.service(attempts * 16);
+    assert!(!wire.relay_retirement_pending());
+    assert_eq!(wire.relay_source(), None);
+    let address = ipv4_addr(&socket).unwrap();
+    wire.enable_relay(address, &ticket, packet_key, [17; 32])
+        .unwrap();
 }
 
 #[test]
@@ -539,8 +579,67 @@ fn would_block_retires_raw_attempt_while_reliable_owner_can_retry() {
     assert_eq!(connections.queued_send_count(1), Some(1));
 }
 
+/// A destination that always fails (a dead peer, or a forged source an ACK
+/// answers) loses its head after a bounded number of attempts instead of
+/// stalling every later send, and failing sends cannot grow the FIFO forever.
 #[test]
-fn raw_fifos_grow_beyond_native_pool_and_clear_independently_of_reliability() {
+fn failing_destination_cannot_jam_or_grow_the_send_fifo() {
+    let mut queue = UdpSendQueue::default();
+    let mut report = UdpServiceReport::default();
+    let dead = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 4321);
+    let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4321);
+    let delivered = std::cell::Cell::new(0);
+    let mut send = |_: &[u8], endpoint: SocketAddrV4| {
+        if endpoint == dead {
+            Err(io::ErrorKind::HostUnreachable.into())
+        } else {
+            delivered.set(delivered.get() + 1);
+            Ok(0)
+        }
+    };
+    queue.send(
+        dead,
+        b"ack",
+        None,
+        UdpChannel::Primary,
+        &mut report,
+        &mut send,
+    );
+    for _ in 0..MAX_HEAD_ATTEMPTS {
+        queue.send(
+            peer,
+            b"frame",
+            None,
+            UdpChannel::Primary,
+            &mut report,
+            &mut send,
+        );
+    }
+    assert_eq!(
+        delivered.get(),
+        1,
+        "the peer's datagrams follow the retired head"
+    );
+    for _ in 0..2 * MAX_PENDING_DATAGRAMS {
+        queue.service(UdpChannel::Primary, &mut report, &mut send);
+    }
+    assert!(queue.pending.is_empty());
+    assert_eq!(delivered.get(), usize::from(MAX_HEAD_ATTEMPTS));
+    for _ in 0..2 * MAX_PENDING_DATAGRAMS {
+        queue.send(
+            dead,
+            b"ack",
+            None,
+            UdpChannel::Primary,
+            &mut report,
+            &mut send,
+        );
+    }
+    assert!(queue.pending.len() <= MAX_PENDING_DATAGRAMS);
+}
+
+#[test]
+fn raw_fifos_retire_failing_heads_and_clear_independently_of_reliability() {
     let mut transport = transport();
     let endpoint = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4321);
     transport.connections_mut().add_peer(1, endpoint).unwrap();
@@ -568,7 +667,9 @@ fn raw_fifos_grow_beyond_native_pool_and_clear_independently_of_reliability() {
         &mut report,
         &mut |_, _| Err(io::ErrorKind::PermissionDenied.into()),
     );
-    assert_eq!(transport.lock().primary_send.pending.len(), 130);
+    // Each send attempts the head once; every eighth failure retires one.
+    let retained = 130 - 130 / usize::from(MAX_HEAD_ATTEMPTS);
+    assert_eq!(transport.lock().primary_send.pending.len(), retained);
     assert_eq!(transport.lock().alternate_send.pending.len(), 1);
     let mut alternate = Vec::new();
     transport
@@ -579,7 +680,7 @@ fn raw_fifos_grow_beyond_native_pool_and_clear_independently_of_reliability() {
             Ok(bytes.len())
         });
     assert_eq!(alternate, datagram(b"alternate"));
-    assert_eq!(transport.lock().primary_send.pending.len(), 130);
+    assert_eq!(transport.lock().primary_send.pending.len(), retained);
     transport.lock().alternate_send.send(
         endpoint,
         b"discard",

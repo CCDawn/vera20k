@@ -11,6 +11,7 @@ oracle families index their own fixtures and producers.
 | Observe match data or explicitly enable offline trainer/event tools | [Telemetry dashboard and debug build](telemetry-dashboard/README.md) |
 | Give a new worktree its ignored `ini/` and `config.toml`, or a clone its `config.toml`; report what the game, retail tests and oracles still need | `python -m tools.prepare_checkout` |
 | Run all Python tool and source-skill tests | `python -m tools.run_tests` (below) |
+| Play the latest stable and newest dev build's relay client code against a relay change (CI only) | `.github/workflows/relay-compat.yml`, `tools/relay_compat.py` |
 | Inspect process audio definitions, sample sources and retention evidence | [Process audio catalog owner](audio_catalog_owner.md), `asset sound` |
 | Wait for builds; test, check, lint or build the current checkout; preserve A/B binaries | `python -m tools.cargo_run` (below) |
 | Compile and test one optional capability (`ares`, `phobos`, `npatch`, diagnostic builds), or all of them | [capabilities](../docs/capabilities.md), `python -m tools.capability_tests` |
@@ -22,6 +23,7 @@ oracle families index their own fixtures and producers.
 | Inspect exact retail INI values through production sources and readers | [INI lookup](ini_lookup.md), `asset ini-get` |
 | Select media archives without ambient argument parsing | [media policy](media_policy.md) |
 | Inspect/extract/render assets | [asset browser](asset_browser/README.md), `asset` binary |
+| Convert RA3's end-game art into `[EndGameScreens]` pictures: banners unclipped, score pages filled | `python -m tools.end_game_cards --sources <dir> --out <dir>` |
 | Reproduce FireAt-tail launch goldens | [projectile fixture family](projectile_oracle/README.md) |
 | Reproduce native projectile launch, timer, collision and arc-domain goldens | [projectile comparisons](projectile_oracle/README.md); shared [slope initializer](native_slope.py) |
 | Reproduce palette, scanline, brightness and Ground/Level goldens | [checked palette oracle](palette_oracle/README.md) |

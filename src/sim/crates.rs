@@ -567,7 +567,7 @@ enum CrateMarkCellRef {
 fn resolve_crate_mark_cell(sim: &Simulation, cell: (i16, i16)) -> CrateMarkCellRef {
     let x = i32::from(cell.0);
     let y = i32::from(cell.1);
-    if let Some((rx, ry)) = crate::map::cell_index::canonical_cell_coord(x, y)
+    if let Some((rx, ry)) = sim.cell_grid().canonical_coord(x, y)
         && sim
             .resolved_terrain
             .as_ref()
@@ -627,7 +627,7 @@ fn crate_surface_at(sim: &Simulation, cell: (u16, u16)) -> CrateSurface {
 }
 
 fn crate_surface_at_packed(sim: &Simulation, cell: (i32, i32)) -> CrateSurface {
-    let Some((rx, ry)) = crate::map::cell_index::canonical_cell_coord(cell.0, cell.1) else {
+    let Some((rx, ry)) = sim.cell_grid().canonical_coord(cell.0, cell.1) else {
         return CrateSurface::Land;
     };
     crate_surface_at(sim, (rx, ry))

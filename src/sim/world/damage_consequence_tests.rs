@@ -119,6 +119,9 @@ fn advance_lethal_shot(sim: &mut Simulation, rules: &RuleSet, attacker: u64, vic
     panic!("the command must produce a lethal shot");
 }
 
+// Phobos `ROF.RandomDelay` (`0x006FD0B5`) redraws the full-rearm jitter, so
+// this stock golden only holds without the capability.
+#[cfg(not(feature = "phobos"))]
 #[test]
 fn ordinary_lethal_fire_commits_debris_animations_and_sparks_once() {
     let rules = consequence_rules();

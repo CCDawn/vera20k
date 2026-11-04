@@ -39,6 +39,11 @@ pub(super) struct PlanningState {
     /// start) do not expand. Clear between calls; neither saved nor hashed.
     #[serde(skip)]
     select_expanding: bool,
+    // AC4B48: PlanMgr's independent event copies, made inline by 6385C0 at
+    // 638633..6386B5 (the identical 6375B0 has no callers), published by 637550.
+    // Detach/capture changes the path, never these already-generated orders.
+    // Internal checkpoints retain them; player loads reset the whole planner.
+    pending_publication: Vec<CommandRecord>,
 }
 
 impl<'de> Deserialize<'de> for PlanningState {
@@ -50,6 +55,7 @@ impl<'de> Deserialize<'de> for PlanningState {
             paths: BTreeMap<u64, PlanningPath>,
             token_order: Vec<u64>,
             house_charges: [i32; 32],
+            pending_publication: Vec<CommandRecord>,
         }
         let stored = StoredPlanningState::deserialize(deserializer)?;
         if crate::util::save_codec::layout::describing() {
@@ -65,6 +71,7 @@ impl<'de> Deserialize<'de> for PlanningState {
             registered_tokens: BTreeSet::new(),
             house_charges: stored.house_charges,
             select_expanding: false,
+            pending_publication: stored.pending_publication,
         };
         state.restore_index().map_err(serde::de::Error::custom)?;
         Ok(state)
@@ -231,6 +238,16 @@ impl PlanningState {
     /// The location index is derived from authoritative nodes. Reject broken
     /// graph references before restored plans can reach connect/consume.
     fn restore_index(&mut self) -> Result<(), &'static str> {
+        for record in &self.pending_publication {
+            let mut ordinary = record.clone();
+            ordinary.payload_mut()[22] = 0;
+            if record.opcode() != 4
+                || record.payload()[22] != 2
+                || MegaMissionRecord::decode(&ordinary).is_none()
+            {
+                return Err("invalid pending planning order");
+            }
+        }
         self.registered_tokens = self.token_order.iter().copied().collect();
         if self.registered_tokens.len() != self.token_order.len()
             || self
@@ -301,10 +318,18 @@ impl PlanningState {
             && self.paths.is_empty()
             && self.token_order.is_empty()
             && self.house_charges.iter().all(|charge| *charge == 0)
+            && self.pending_publication.is_empty()
         {
             return;
         }
         b"planning-v1".hash(hasher);
+        if !self.pending_publication.is_empty() {
+            b"pending-publication".hash(hasher);
+            self.pending_publication.len().hash(hasher);
+            for record in &self.pending_publication {
+                record.as_bytes().hash(hasher);
+            }
+        }
         self.next_node.hash(hasher);
         self.nodes.len().hash(hasher);
         for node in self.nodes.values() {
@@ -454,6 +479,16 @@ impl Simulation {
     }
 
     pub(crate) fn validate_planning_references(&self) -> Result<(), &'static str> {
+        let validate_house = |record: &CommandRecord| {
+            let issuer = usize::try_from(record.house_id())
+                .ok()
+                .and_then(|index| self.houses.order().get(index))
+                .ok_or("missing planning order house")?;
+            self.houses
+                .contains_key(issuer)
+                .then_some(())
+                .ok_or("missing planning order house")
+        };
         for actor in &self.planning.token_order {
             self.substrate
                 .entities
@@ -481,14 +516,11 @@ impl Simulation {
                             .map(|order| &order.record)
                     }),
             ) {
-                let issuer = usize::try_from(record.house_id())
-                    .ok()
-                    .and_then(|index| self.houses.order().get(index))
-                    .ok_or("missing planning order house")?;
-                if !self.houses.contains_key(issuer) {
-                    return Err("missing planning order house");
-                }
+                validate_house(record)?;
             }
+        }
+        for record in &self.planning.pending_publication {
+            validate_house(record)?;
         }
         Ok(())
     }
@@ -706,11 +738,8 @@ impl Simulation {
         }
         let allied = |actor: u64| {
             self.substrate.entities.get(actor).is_some_and(|entity| {
-                crate::map::houses::is_allied_with(
-                    self.house_alliances.as_map(),
-                    self.interner.resolve(entity.owner()),
-                    self.interner.resolve(viewer),
-                )
+                self.house_alliances
+                    .is_allied(&self.interner, entity.owner(), viewer)
             })
         };
         let record_coord = |record: &CommandRecord| {
@@ -1746,11 +1775,6 @@ impl Simulation {
             &crate::sim::mission::authority::LiveReadyInputProvider { rules },
         );
         record.payload_mut()[22] = 2;
-        record.set_issue_header(
-            4,
-            i32::from(record.house_id()),
-            self.session.binary_frame().wrapping_add(1) as i32,
-        );
         let path = self.planning.paths.get_mut(&actor).unwrap();
         let keep_member = path.loop_start == Some(0);
         path.consume();
@@ -1764,13 +1788,39 @@ impl Simulation {
         if !keep_member {
             self.planning.remove_member(node_id, actor);
         }
-        // 637550 ->652230: deferred publication stamps frame+1. Reverse
-        // pending traversal plus ring prepend restores generation order.
-        self.queue_command(CommandEnvelope::synchronized(
-            record,
-            self.session.tick().saturating_add(2),
-        ));
+        // `0x00638633..0x006386B5` copies the consumed order into AC4B48.
+        // Publication must read timing later; another event in this DoList
+        // can change it.
+        self.planning.pending_publication.push(record);
         true
+    }
+
+    /// Runs the post-DoList publication rung for a component fixture that
+    /// applies plan commands without advancing a frame.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn publish_planning_commands_for_test(&mut self) {
+        self.publish_planning_commands();
+    }
+
+    /// PlanMgr637550 -> EventClass::Add652230 (gamemd.exe instructions):
+    /// reverse pending traversal and ring prepend retain generation order
+    /// ahead of existing DoList events. Stamp only the independent copy.
+    pub(super) fn publish_planning_commands(&mut self) {
+        let frame = self.session.generated_event_frame() as i32;
+        while let Some(mut record) = self.planning.pending_publication.pop() {
+            record.set_frame_stamp(frame);
+            self.admit_queued_command(
+                super::queued_command::QueuedCommand::from_envelope(CommandEnvelope::synchronized(
+                    record,
+                    self.session.tick().saturating_add(2),
+                )),
+                // Shared simulation events regenerate at these same rungs
+                // during replay. Logging them as input would move publication
+                // to frame ingress and lose the native DoList order.
+                false,
+                crate::sim::command_queue::DoListInsertion::Front,
+            );
+        }
     }
 }
 

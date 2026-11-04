@@ -202,7 +202,8 @@ fn admit_attacker_fire<'r>(
     // Weapon selection, none of which asks legality (GetFireError below, or
     // the building's own visit, does): a delayed building shot resolves the
     // slot it saved while arming, a building's Mission_Attack shot the weapon
-    // its visit selected ([`super::BuildingShot::Mission`]), and everything
+    // its visit requested (the selected index, or an upgrade's fixed 0/1;
+    // [`super::BuildingShot::Mission`]), and everything
     // else runs the native selection ladder (`What_Weapon_Should_I_Use`
     // `0x006F3330`). Each index resolves through GetWeapon
     // ([`combat_weapon::resolve_weapon_index`]), so an occupied building fires
@@ -245,7 +246,7 @@ fn admit_attacker_fire<'r>(
             world,
             &world.interner,
             world.resolved_terrain.as_ref(),
-            fog_enabled.then_some(world.house_alliances.as_map()),
+            fog_enabled.then_some(&world.house_alliances),
         ) else {
             out.remove_attack.push(snap.stable_id);
             return None;
@@ -254,7 +255,7 @@ fn admit_attacker_fire<'r>(
     };
 
     let infantry_fire = snap.category == EntityCategory::Infantry;
-    let sequences = rules.animation_sequence(world.interner.resolve(snap.type_id));
+    let sequences = world.interner.animation_sequence(snap.type_id, rules);
     let firing_at_entry = infantry_fire
         && world
             .substrate
@@ -293,7 +294,7 @@ fn admit_attacker_fire<'r>(
                 world,
                 rules,
                 overlay_registry,
-                fog: fog_enabled.then(|| world.fog.fire_view(world.house_alliances.as_map())),
+                fog: fog_enabled.then(|| world.fog.fire_view(&world.house_alliances)),
                 firer,
                 obj,
                 target: Some(snap.target),
@@ -531,13 +532,13 @@ fn admit_attacker_fire<'r>(
             world,
             &world.interner,
             world.resolved_terrain.as_ref(),
-            fog_enabled.then_some(world.house_alliances.as_map()),
+            fog_enabled.then_some(&world.house_alliances),
         )?;
         let code = fire_error_world::FireSubject {
             world,
             rules,
             overlay_registry,
-            fog: fog_enabled.then(|| world.fog.fire_view(world.house_alliances.as_map())),
+            fog: fog_enabled.then(|| world.fog.fire_view(&world.house_alliances)),
             firer: actor,
             obj,
             target,
@@ -764,7 +765,7 @@ pub(super) fn retaliation_reaches(
         world,
         rules,
         overlay_registry,
-        fog: Some(world.fog.fire_view(world.house_alliances.as_map())),
+        fog: Some(world.fog.fire_view(&world.house_alliances)),
         firer: victim,
         obj: victim_type,
         target: Some(TargetKind::Entity(source_id)),
@@ -874,6 +875,7 @@ fn fireat_launch_aim(
             .map(|projectile| LaunchSpeedProjectile {
                 rot: projectile.rot,
                 floater: projectile.floater,
+                gravity: projectile.gravity(),
             })
     };
     let speed = weapon_launch_speed(
@@ -899,33 +901,56 @@ fn fireat_launch_aim(
 /// A passenger of an `OpenTopped=` transport (retail: `[BFRT]`) fires with
 /// `+0x82` set (`PerCellProcess 0x0051A45E`/`0x0073A75D` ->
 /// `SetInOpenTransport 0x00710470`), which takes the open-topped stage.
-fn fireat_damage(
+fn fire_damage_stages(
     world: &Simulation,
     rules: &RuleSet,
     snap: &AttackerSnapshot,
     obj: &ObjectType,
-    weapon: &crate::rules::weapon_type::WeaponType,
     is_garrison: bool,
-) -> i32 {
+) -> damage::attacker::FireDamageStages {
+    firepower_stages(
+        world.substrate.entities.get(snap.stable_id),
+        &world.houses,
+        rules,
+        Some(obj),
+        self::veterancy::rank_from_u16(snap.veterancy),
+        is_garrison,
+    )
+}
+
+/// The firepower stages shared by FireAt's damage build and Phobos'
+/// Bullet-init capture. `obj` is absent only when the bullet-init caller
+/// cannot resolve the owner's type, which skips the rank stage.
+fn firepower_stages(
+    firer: Option<&crate::sim::game_entity::GameEntity>,
+    houses: &crate::sim::houses::Houses,
+    rules: &RuleSet,
+    obj: Option<&ObjectType>,
+    rank: self::veterancy::VeterancyRank,
+    is_garrison: bool,
+) -> damage::attacker::FireDamageStages {
     use crate::util::native_x87::{NativeF32Bits, NativeF64Bits};
-    let firer = world.substrate.entities.get(snap.stable_id);
     let f32_bits = |value: f32| NativeF32Bits::from_bits(value.to_bits());
     let multipliers = &rules.garrison_rules;
-    let stages = damage::attacker::FireDamageStages {
+    damage::attacker::FireDamageStages {
         house_firepower: firer
-            .and_then(|firer| world.houses.get(&firer.owner()))
+            .and_then(|firer| houses.get(&firer.owner()))
             .map_or(NativeF64Bits::ONE, |house| house.firepower_bias()),
         unit_firepower: firer.map_or(NativeF64Bits::ONE, |firer| {
             firer.crate_multipliers.firepower()
         }),
-        rank_firepower: self::veterancy::has_weapon_ability(
-            self::veterancy::rank_from_u16(snap.veterancy),
-            obj,
-            crate::rules::object_type::Ability::Firepower,
-        )
-        .then(|| NativeF64Bits::from_bits(rules.general.veteran_combat.to_bits())),
+        rank_firepower: obj
+            .filter(|obj| {
+                self::veterancy::has_weapon_ability(
+                    rank,
+                    obj,
+                    crate::rules::object_type::Ability::Firepower,
+                )
+            })
+            .map(|_| NativeF64Bits::from_bits(rules.general.veteran_combat.to_bits())),
         // `vt+0x400`: BuildingClass `0x00458DD0`, CanBeOccupied &&
-        // CanOccupyFire && an occupant; false for every other class.
+        // CanOccupyFire && an occupant for FireAt; Phobos' Bullet-init
+        // helper applies the same type flags without requiring an occupant.
         occupied: is_garrison.then(|| f32_bits(multipliers.occupy_damage_multiplier)),
         // `+0x2E4` on a non-building: a unit installed in a Tank Bunker.
         bunkered: firer
@@ -935,12 +960,87 @@ fn fireat_damage(
         open_topped: firer
             .filter(|firer| firer.passenger_role.in_open_transport())
             .map(|_| f32_bits(multipliers.open_topped_damage_multiplier)),
-    };
+        #[cfg(feature = "phobos")]
+        ae_firepower: firer.map_or(1.0, |firer| firer.phobos_stat_multipliers().firepower),
+        #[cfg(not(feature = "phobos"))]
+        ae_firepower: 1.0,
+    }
+}
+
+#[cfg(test)]
+fn fireat_damage(
+    world: &Simulation,
+    rules: &RuleSet,
+    snap: &AttackerSnapshot,
+    obj: &ObjectType,
+    weapon: &crate::rules::weapon_type::WeaponType,
+    is_garrison: bool,
+) -> i32 {
+    let stages = fire_damage_stages(world, rules, snap, obj, is_garrison);
     damage::attacker::fire_damage(
         weapon.damage,
         weapon.is_sonic || weapon.use_fire_particles,
         &stages,
     )
+}
+
+/// Phobos `BulletExt`'s construction-time `TechnoExt::GetCurrentFirepowerMultiplier`:
+/// unit (Techno+160, including Ares attachment), House, veteran FIREPOWER,
+/// then the occupied/bunker/open-topped stages, in the hook's order.
+#[cfg(feature = "phobos")]
+pub(crate) fn phobos_firepower_multiplier(
+    stages: &damage::attacker::FireDamageStages,
+) -> crate::util::native_x87::NativeF64Bits {
+    use crate::util::native_x87::MaskedX87Chop53 as X;
+    let mut value = X::load_f64(stages.unit_firepower);
+    value = X::mul(value, X::load_f64(stages.house_firepower));
+    value = X::mul(
+        value,
+        X::load_f64(crate::util::native_x87::NativeF64Bits::from_bits(
+            stages.ae_firepower.to_bits(),
+        )),
+    );
+    if let Some(rank) = stages.rank_firepower {
+        value = X::mul(value, X::load_f64(rank));
+    }
+    for multiplier in [stages.occupied, stages.bunkered, stages.open_topped]
+        .into_iter()
+        .flatten()
+    {
+        value = X::mul(value, X::load_f32(multiplier));
+    }
+    X::store_f64_masked_chop(value)
+}
+
+/// Phobos `BulletExt::InitializeState` (`0x466556`) through
+/// `TechnoExt::GetCurrentFirepowerMultiplier`: the multiplier a newly
+/// constructed Bullet captures from its Owner Techno. FireAt overwrites the
+/// payload at launch, so its already-set value wins.
+#[cfg(feature = "phobos")]
+pub(crate) fn bullet_init_firepower_multiplier(
+    interner: &crate::sim::intern::StringInterner,
+    substrate: &crate::sim::world::ObjectSubstrate,
+    houses: &crate::sim::houses::Houses,
+    rules: &RuleSet,
+    source_id: u64,
+) -> Option<crate::util::native_x87::NativeF64Bits> {
+    let firer = substrate.entities.get(source_id)?;
+    let object = interner.object_type(firer.type_ref(), rules);
+    // Phobos' helper applies the occupancy multiplier from the building
+    // type's flags, not from whether an occupant is present.
+    let occupied = firer.category() == EntityCategory::Structure
+        && object.is_some_and(|object| {
+            object.can_be_occupied && object.can_occupy_fire && object.max_number_occupants > 0
+        });
+    let stages = firepower_stages(
+        Some(firer),
+        houses,
+        rules,
+        object,
+        firer.veterancy.rank_kind(),
+        occupied,
+    );
+    Some(phobos_firepower_multiplier(&stages))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1158,11 +1258,18 @@ pub(crate) fn snapshot_get_rof(
                 .map_or(crate::util::native_x87::NativeF64Bits::ONE, |house| {
                     house.rof_bias()
                 }),
+            ae_rof: firer.map_or(1.0, |entity| entity.phobos_rof_multiplier()),
             #[cfg(feature = "ares")]
             attached_rof: Some(
                 firer.map_or(crate::util::native_x87::NativeF64Bits::ONE, |entity| {
                     entity.attached_rof_multiplier()
                 }),
+            ),
+            #[cfg(feature = "phobos")]
+            rof_random_delay: Some(
+                rof_weapon
+                    .and_then(|weapon| weapon.rof_random_delay)
+                    .unwrap_or(rules.general.rof_random_delay),
             ),
             rof_ability: self::veterancy::has_weapon_ability(
                 self::veterancy::rank_from_u16(snap.veterancy),
@@ -1238,6 +1345,11 @@ pub(super) fn emit_admitted_fire(
             return None;
         }
     }
+    // Phobos TechnoClass_FireAt_BeforeTruelyFire (0x6FDDC0): an admitted shot
+    // counts towards DiscardOn.Firing.Count, including the branches below
+    // that launch no bullet.
+    #[cfg(feature = "phobos")]
+    world.record_phobos_attach_firing(snap.stable_id, rules);
     if weapon.suicide {
         // Techno6FDDC0..6FDE0E: the local packet is type Strength, not
         // current Health or weapon Damage. The real self receiver completes
@@ -1406,7 +1518,12 @@ pub(super) fn emit_admitted_fire(
         .get(snap.stable_id)
         .map_or(0, |entity| entity.prism_support_count.count());
     let warhead = selected.warhead;
-    let base_damage = fireat_damage(world, rules, snap, obj, weapon, is_garrison);
+    let damage_stages = fire_damage_stages(world, rules, snap, obj, is_garrison);
+    let base_damage = damage::attacker::fire_damage(
+        weapon.damage,
+        weapon.is_sonic || weapon.use_fire_particles,
+        &damage_stages,
+    );
     // FireAt6FE460..6FE4EF constructs a retained DiskLaser before GetROF,
     // advances the burst, stores the unhalved rearm, then calls Fire4A71A0
     // and returns NULL. Disk AI owns the later range/crash gate, discharge
@@ -1684,6 +1801,7 @@ pub(super) fn emit_admitted_fire(
             arcing: ballistic,
             gravity: crate::sim::projectile::projectile_gravity(
                 rules.general.gravity,
+                collision.gravity(),
                 collision.floater,
             ),
             high_root: high_arc_root(weapon.lobber, raw_source, current_target_coord),
@@ -1718,6 +1836,9 @@ pub(super) fn emit_admitted_fire(
             )
             .with_installed_weapon(Some(world.interner.intern(selected.weapon_id)))
             .with_damage_multiplier(damage_multiplier);
+            #[cfg(feature = "phobos")]
+            let payload =
+                payload.with_firepower_multiplier(phobos_firepower_multiplier(&damage_stages));
             // `BulletClass::Fire` (`0x006FF014`) at the launch source.
             super::admit_fired_bullet(
                 world,
@@ -1978,7 +2099,7 @@ pub(super) fn emit_admitted_fire(
         effects,
     );
     // Concrete class FireAt suffixes follow the base tail, including
-    // LimboLaunch. Infantry's Ares reload hook and Unit's firing counter /
+    // LimboLaunch. Ares reload / Infantry panic and Unit's firing counter /
     // Scalable work stay here for ordinary and direct mission FireAt callers.
     #[cfg(feature = "ares")]
     if snap.category == EntityCategory::Infantry
@@ -1995,6 +2116,24 @@ pub(super) fn emit_admitted_fire(
         // after a returned Bullet, start the shared reload clock. The
         // Weapon Ammo<=0 arm consumes nothing and does not restart it.
         entity.start_reloading_ammo(live_type, binary_frame as i32);
+    }
+    // Installed Ares 51DF8C returns 0, so this panic follows its reload.
+    if snap.category == EntityCategory::Infantry
+        && let Some(entity) = world.substrate.entities.get_mut(snap.stable_id)
+        && let Some(live_type) = world.interner.object_type(entity.type_ref(), rules)
+        && crate::sim::infantry::apply_empty_magazine_panic(live_type, entity)
+        && matches!(
+            entity.mission.effective().known(),
+            Some(crate::sim::mission::MissionType::Attack | crate::sim::mission::MissionType::Hunt)
+        )
+    {
+        // InfantryClass::FireAt @0x0051DF60, retail gamemd.exe:
+        //51DFB4..51DFD6 queues Guard(false) after the fear write. No immediate
+        // Commence, target clear, RNG draw, timer write or detach belongs here.
+        crate::sim::mission::authority::queue_entity_mission_deferred(
+            entity,
+            crate::sim::mission::MissionId::from_known(crate::sim::mission::MissionType::Guard),
+        );
     }
     if snap.category == EntityCategory::Unit {
         // UnitFireAt7413D3..741401: only a nonnull base Bullet return
@@ -3208,7 +3347,8 @@ fn infantry_fire_frame(
 /// `TechnoClass::EstimateDamage @ 0x006FDB80` for `attacker_id` shooting
 /// `target_id` with `weapon` (see [`damage::estimate`]): the target house's
 /// category multiplier for the attacker's type, the attacker's
-/// `ArmorMultiplier`, the attacker's FIREPOWER and the target's STRONGER ranks.
+/// `ArmorMultiplier`, the attacker's FIREPOWER, the target's AttachEffect
+/// armor product and the target's STRONGER ranks.
 ///
 /// House+188 comes from the shared SetDifficulty owner, as in FireAt's
 /// damage build; Techno+160 is the attacker's live firepower_multiplier.
@@ -3262,10 +3402,24 @@ pub(crate) fn estimated_damage_on(
             occupied: None,
             bunkered: None,
             open_topped: None,
+            #[cfg(feature = "phobos")]
+            ae_firepower: attacker.phobos_stat_multipliers().firepower,
+            #[cfg(not(feature = "phobos"))]
+            ae_firepower: 1.0,
         },
         divisors: damage::DefenceDivisors {
             house_type_armor: NativeF32Bits::from_bits(house_type_armor.to_bits()),
             unit_armor: attacker.crate_multipliers.armor(),
+            // Phobos 0x006FDC87 divides by `CalculateArmorMultipliers(pTarget,
+            // warhead, pThis->Owner)`: the target's effects, not the firer's.
+            // RESIDUAL: this read-only estimate uses the cached unrestricted
+            // product. Native also folds each active effect with a restricted
+            // `ArmorMultiplier` (chance, house and warhead gates) and draws one
+            // `RandomDouble` per such effect off its delay timer (`realHit`
+            // false: no timer or HitAnim). A target carrying one is estimated
+            // without it, and every target-scan estimate on it skips those
+            // Scenario draws, shifting the stream.
+            ae_armor: target.phobos_armor_multiplier(),
             rank_armor,
         },
         warhead: warhead.map(|warhead| damage::estimate::EstimateWarhead {

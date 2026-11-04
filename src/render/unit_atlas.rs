@@ -1608,7 +1608,7 @@ impl UnitModel {
                 let turret = part(turret).ok()?;
                 let barrel = part(barrel).ok()?;
                 for part in [turret, barrel].into_iter().flatten() {
-                    vxl_raster::union_native_voxel_draw_bounds(&mut bounds, part);
+                    crate::util::rect::union_native_draw_bounds(&mut bounds, part);
                 }
                 bounds
             }

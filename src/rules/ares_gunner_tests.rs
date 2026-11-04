@@ -49,8 +49,8 @@ fn extended_ifv_selects_weapon_model_and_normal_elite_muzzle() {
         source.veterancy = rank;
         assert_eq!(
             crate::sim::combat::combat_weapon::weapon_for_index(object, rank, 18)
-                .unwrap()
-                .0,
+                .and_then(|record| record.weapon_id)
+                .unwrap(),
             name
         );
         let fire = crate::sim::combat::fire_coord::fire_coordinate(

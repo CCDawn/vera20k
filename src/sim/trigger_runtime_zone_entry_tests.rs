@@ -133,7 +133,10 @@ fn separate_zone(sim: &mut Simulation, cell: (u16, u16)) {
     let zones = sim.zone_grid.as_mut().unwrap();
     let index = y as usize * 33 + x as usize;
     let topology = zones.base_topology_mut_for_test();
-    let cluster = u16::try_from(topology.raw_zone_ids_by_row()[0].len()).unwrap();
+    let cluster = crate::sim::pathfinding::zone_map::ZoneId::try_from(
+        topology.raw_zone_ids_by_row()[0].len(),
+    )
+    .unwrap();
     topology.zone_ids_mut_for_test()[index] = cluster;
     for row in topology.raw_zone_ids_by_row_mut_for_test() {
         row.push(1234);

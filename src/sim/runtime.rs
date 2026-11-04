@@ -105,8 +105,8 @@ impl<'a> SimView<'a> {
     }
 
     /// The houses' ally graph, which fog and visibility questions ask.
-    pub fn house_alliances(&self) -> &'a crate::map::houses::HouseAllianceMap {
-        self.simulation.house_alliances.as_map()
+    pub fn house_alliances(&self) -> &'a crate::sim::house_diplomacy::HouseAlliances {
+        &self.simulation.house_alliances
     }
 
     pub fn houses(&self) -> &'a crate::sim::houses::Houses {
@@ -172,18 +172,25 @@ impl SimRuntime {
     /// One Ordinary-lane frame for side binaries (parity-digest, sim-bench):
     /// the same bound-resource transaction as `advance_frame`, with the
     /// crate-private frame output discarded so no internal type goes public.
+    /// Returns the multiplayer sync checksum a multiplayer-route frame stored
+    /// (a frame whose checksum fails fails the frame), `None` on other routes.
     pub fn advance_frame_for_tooling(
         &mut self,
         commands: &[crate::sim::command::CommandEnvelope],
         tick_ms: u32,
-    ) -> Result<(), crate::sim::world::FrameAdvanceError> {
+    ) -> Result<Option<u32>, crate::sim::world::FrameAdvanceError> {
         self.advance_frame(
             commands,
             tick_ms,
             crate::sim::world::TickLane::Ordinary,
             crate::sim::world::FrameEffects::default(),
         )
-        .map(|_| ())
+        .map(|output| {
+            output
+                .multiplayer_checksum
+                .and_then(|sync| sync.checksum.ok())
+                .map(|frame| frame.value)
+        })
     }
 
     /// The production frame transaction: advance one lane-tagged frame using
@@ -510,6 +517,7 @@ mod tests {
             recruitable_a: true,
             recruitable_b: true,
             group: -1,
+            follows: None,
             structure_upgrades: [None, None, None],
             structure_ai_sellable: false,
             structure_ai_repairable: false,

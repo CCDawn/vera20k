@@ -459,14 +459,18 @@ impl NativeScene {
             entity.radio_contacts.clear_all();
         }
         for id in [unit, second] {
-            let entity = sim.substrate.entities.get_mut(id).unwrap();
+            let entity = sim.substrate.entities.get(id).unwrap();
             assert_eq!(
                 crate::sim::combat::combat_weapon::is_armed(
                     entity,
-                    rules.object("PreparedTank").unwrap()
+                    rules.object("PreparedTank").unwrap(),
+                    &sim.substrate.entities,
+                    &rules,
+                    &sim.interner,
                 ),
                 !unarmed
             );
+            let entity = sim.substrate.entities.get_mut(id).unwrap();
             entity.body_facing = crate::sim::movement::facing_class::FacingClass::new(
                 int(&inputs["unit"]["facing"]) as u16,
                 int(&inputs["unit"]["rot"]),

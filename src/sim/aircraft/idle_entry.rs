@@ -404,7 +404,13 @@ fn enter_idle_mode_with(
             .cargo()
             .is_some_and(|cargo| cargo.count() != 0),
         human: sim.owner_is_human(entity.owner()),
-        armed: crate::sim::combat::combat_weapon::is_armed(entity, object),
+        armed: crate::sim::combat::combat_weapon::is_armed(
+            entity,
+            object,
+            &sim.substrate.entities,
+            rules,
+            &sim.interner,
+        ),
         weapon: crate::sim::combat::combat_weapon::primary_for_tier(
             object,
             entity.veterancy.rank(),

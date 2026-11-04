@@ -108,6 +108,7 @@ pub fn led_target_coordinate(
         .map(|projectile| LaunchSpeedProjectile {
             rot: projectile.rot,
             floater: projectile.floater,
+            gravity: projectile.gravity(),
         });
     lead_aim(
         target_coord,

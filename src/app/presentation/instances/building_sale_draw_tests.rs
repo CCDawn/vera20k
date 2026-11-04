@@ -161,6 +161,11 @@ fn retail_gate_make_body_uses_native_gate_and_selling_reflections() {
             camera: [-1000.0, -1000.0],
             render_size: [5000, 5000],
             zoom: 1.0,
+            building_viewport: crate::app::presentation::render::tactical_world_viewport(
+                [-1000.0; 2],
+                [0, 0, 5000, 5000],
+                None,
+            ),
             axis: DepthAxis::NONE,
             local_owner: None,
             ignore_visibility: true,

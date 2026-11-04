@@ -229,11 +229,14 @@ fn brute_smash_emits_debris(elite: bool, expected: SmashDebrisExpectation) {
                     );
                     // The frame may already visit the newborn Bounce body.
                     // Check its live Inviso target region, not an invented
-                    // inverse trajectory or an exact constructor golden.
+                    // inverse trajectory or an exact constructor golden:
+                    // Object.Location (Unlimbo7494E9 keeps the input until
+                    // Flight74A949) stays in the target's cell, and the
+                    // Bounce body starts above it.
                     let coord = piece.world_coord();
                     assert_eq!(coord.x.div_euclid(256), target_coord.x.div_euclid(256));
                     assert_eq!(coord.y.div_euclid(256), target_coord.y.div_euclid(256));
-                    assert!(coord.z > target_coord.z);
+                    assert!(piece.bounce().position_leptons().z > target_coord.z);
                 }
             } else {
                 assert!(
@@ -896,6 +899,9 @@ fn compare_native_smashing_tail(retired: bool, typed: bool) {
 /// The ordinary tail keeps constructor RNG, IDs and live coordinates; a
 /// retired Bullet keeps storage but runs no detonation tail or cluster RNG; the
 /// authored typed tail keeps RNG, IDs and the complete Bounce state.
+// Vanilla goldens: Phobos skips the Inviso scatter (`0x469AC1` ->
+// `0x469AF0`) and scatters each animation itself, which shifts the stream.
+#[cfg(not(feature = "phobos"))]
 #[test]
 fn original_smashing_tails_match_native_for_ordinary_retired_and_typed_bullets() {
     for (retired, typed) in [(false, false), (true, false), (false, true)] {

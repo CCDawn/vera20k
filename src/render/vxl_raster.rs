@@ -884,35 +884,6 @@ pub fn native_draw_bounds_from_extents(minimum: [f32; 2], maximum: [f32; 2]) -> 
     Some(result)
 }
 
-/// Ordered dirty-rectangle update from cached VXL blit 0x70755D..0x707678.
-/// Rectangles are x/y/width/height in one shared pixel coordinate frame.
-/// Expanding a maximum edge adds one; expanding only a minimum edge does
-/// not. An empty accumulator is replaced. This is not a normal AABB union.
-pub fn union_native_voxel_draw_bounds(accumulated: &mut Option<[i32; 4]>, next: [i32; 4]) {
-    let Some(mut current) = *accumulated else {
-        *accumulated = Some(next);
-        return;
-    };
-    if current[2] <= 0 || current[3] <= 0 {
-        *accumulated = Some(next);
-        return;
-    }
-    if next[2] <= 0 || next[3] <= 0 {
-        return;
-    }
-    for axis in 0..2 {
-        if next[axis] < current[axis] {
-            current[axis + 2] += current[axis] - next[axis];
-            current[axis] = next[axis];
-        }
-        let next_end = next[axis] + next[axis + 2];
-        if next_end > current[axis] + current[axis + 2] {
-            current[axis + 2] = next_end - current[axis] + 1;
-        }
-    }
-    *accumulated = Some(current);
-}
-
 /// Precompute per-limb transforms, voxel grids, lighting pages, and footprints.
 ///
 /// This is Phase 1 of the VXL render pipeline. It builds the combined
@@ -1437,30 +1408,6 @@ mod tests {
                 Some(expected),
                 "extents {min_x},{min_y}..{max_x},{max_y}"
             );
-        }
-    }
-
-    #[test]
-    fn native_draw_union_matches_executed_cached_blit_block() {
-        // Execute original 70755D..707678 with old rectangle at B1CFC0 and
-        // signed cached x/y, unsigned w/h. These are native outputs, not a
-        // mathematical AABB-union oracle. The +1 maximum edge is deliberate.
-        let vectors = [
-            ([5, 6, 10, 12], [6, 7, 2, 3], [5, 6, 10, 12]),
-            ([5, 6, 10, 12], [5, 6, 10, 12], [5, 6, 10, 12]),
-            ([5, 6, 10, 12], [1, 2, 8, 8], [1, 2, 14, 16]),
-            ([5, 6, 10, 12], [12, 16, 10, 10], [5, 6, 18, 21]),
-            ([5, 6, 10, 12], [1, 2, 30, 40], [1, 2, 31, 41]),
-            ([5, 6, 10, 12], [15, 18, 0, 0], [5, 6, 10, 12]),
-            ([5, 6, 0, 12], [15, 18, 0, 0], [15, 18, 0, 0]),
-            ([-20, -10, 8, 6], [-12, -4, 4, 4], [-20, -10, 13, 11]),
-            ([0, 0, 0, 0], [124, 123, 20, 30], [124, 123, 20, 30]),
-            ([124, 123, 20, 30], [124, 123, 20, 30], [124, 123, 20, 30]),
-        ];
-        for (initial, next, expected) in vectors {
-            let mut accumulated = Some(initial);
-            union_native_voxel_draw_bounds(&mut accumulated, next);
-            assert_eq!(accumulated, Some(expected), "{initial:?} then {next:?}");
         }
     }
 

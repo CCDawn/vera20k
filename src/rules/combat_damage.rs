@@ -28,6 +28,11 @@ pub struct CombatDamageDefaults {
     /// RulesCtor665675=100; ReadCombatDamage66BBDE..66BBF5 reads signed
     /// AmmoCrateDamage with its current default, without clamping.
     pub ammo_crate_damage: i32,
+    /// RulesClass::Constructor @ 0x00665650 (665CE8/665D5C)=100;
+    /// ReadCombatDamage @ 0x0066BBB0 (66BC37..66BC51)
+    /// retains the signed Rules+568 value without a clamp. AnimStart424E9B
+    /// passes it to AreaDamage after removing the selected resource cell.
+    pub tiberium_explosion_damage: i32,
     /// Signed post-Verses cap used by ApplyWarheadDamage. The executable's
     /// constructor default is 1000; stock rulesmd.ini overrides it to 10000.
     pub max_damage: i32,
@@ -144,6 +149,7 @@ impl CombatDamageDefaults {
     pub fn from_ini_section(section: &IniSection) -> Self {
         Self {
             ammo_crate_damage: section.read_int("AmmoCrateDamage", 100),
+            tiberium_explosion_damage: section.read_int("TiberiumExplosionDamage", 100),
             max_damage: section.read_int("MaxDamage", 1000),
             collapse_chance: section.read_int("CollapseChance", 100),
             ballistic_scatter: section.read_range("BallisticScatter", 0x100),
@@ -178,6 +184,7 @@ impl Default for CombatDamageDefaults {
     fn default() -> Self {
         Self {
             ammo_crate_damage: 100,
+            tiberium_explosion_damage: 100,
             max_damage: 1000,
             collapse_chance: 100,
             ballistic_scatter: 0x100,

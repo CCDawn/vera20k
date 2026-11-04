@@ -932,8 +932,8 @@ mod map_wall_owner_candidate_tests {
         );
         sim.lighting_sources_mut_for_test().discard_pending();
 
-        // Actual BeforeDeathEffects callback must publish disable before a
-        // later global operation; the frame transaction must retain both.
+        // The building's fatal callback must publish disable before a later
+        // global operation; the frame transaction must retain both.
         fatal_lamp_stage(&mut sim, &rules, 41);
         sim.session_mut_for_test()
             .lighting_mut()
@@ -1187,7 +1187,7 @@ mod map_wall_owner_candidate_tests {
     fn fatal_lamp_stage(sim: &mut Simulation, rules: &RuleSet, id: u64) {
         sim.apply_fatal_lifecycle_stage(
             rules,
-            crate::sim::combat::FatalLifecycleStage::BeforeDeathEffects { attacker: None },
+            crate::sim::combat::FatalLifecycleStage::BeforeBuildingDestruction,
             id,
             EntityCategory::Structure,
             crate::sim::world::UninitContext::with_rules(rules),
@@ -1514,6 +1514,8 @@ pub struct PresentationLoadAssets {
     /// keeps the process InitGame art.
     pub(crate) outcome_banner_side_art:
         Option<crate::app::presentation::outcome_banner::OutcomeBannerArt>,
+    /// The local country's `[EndGameScreens]` card for the in-game banner.
+    pub(crate) end_game_banner: Option<crate::app::presentation::outcome_banner::EndGameBanner>,
     pub(crate) software_cursor: Option<crate::app::presentation::render::SoftwareCursor>,
     /// Overlay ID → type name mapping (from rules.ini [OverlayTypes]).
     pub overlay_names: BTreeMap<u8, String>,
@@ -1847,6 +1849,7 @@ pub(crate) struct RandomMapEntityProjection {
     high: bool,
     mission: Option<crate::rules::mission_data::MissionType>,
     recruitable: (bool, bool),
+    follows: Option<i32>,
     structure_upgrades: [Option<String>; 3],
 }
 
@@ -1914,8 +1917,8 @@ impl MapLoadInitial {
     ///
     /// It is a second sequencing of the generated arm of `load_map_from_initial`,
     /// which cannot run here because it takes the GPU context, and it leaves
-    /// out more than rendering: the Team AI registry, the shared cell dummy's
-    /// Resize reconstruction and the theater registry publication. `final_rng` and `post_map_output` are what this sequence
+    /// out more than rendering: the Team AI registry and the shared cell dummy's
+    /// Resize reconstruction. `final_rng` and `post_map_output` are what this sequence
     /// yields, which the tests compare between two launch routes; they are not
     /// certified equal to a match load's.
     pub(crate) fn into_random_map_launch_snapshot(
@@ -1991,6 +1994,7 @@ impl MapLoadInitial {
                     high: entity.high,
                     mission: entity.mission,
                     recruitable: (entity.recruitable_a, entity.recruitable_b),
+                    follows: entity.follows,
                     structure_upgrades: entity.structure_upgrades.clone(),
                 })
                 .collect(),
@@ -2134,15 +2138,11 @@ impl MapLoadInitial {
             || theater_ext_for(&map_data.header.theater),
             |td| td.extension,
         );
-        let mut scheduler_roots = scheduler_anim_roots(
+        let scheduler_roots = scheduler_anim_roots(
             &rules,
             &overlay_registry,
             resolved_terrain.tile_animations(),
         );
-        scheduler_roots.extend(crate::map::actions::trigger_anim_class_roots(
-            &rules,
-            &map_data.actions,
-        ));
         rules
             .bind_scheduler_anim_assets(
                 &scheduler_roots,
@@ -2163,6 +2163,12 @@ impl MapLoadInitial {
         );
         crate::rules::effect_asset_catalog::log_unbound_combat_explosion_roots(
             unbound_explosion_roots,
+        );
+        rules.bind_anim_class_assets(
+            &crate::map::actions::trigger_anim_class_roots(&rules, &map_data.actions),
+            asset_manager,
+            theater_ext,
+            &map_data.header.theater,
         );
         rules.bind_effect_assets(asset_manager, theater_ext, &map_data.header.theater);
         rules.bind_building_buildup_assets(asset_manager, &map_data.header.theater);
@@ -2729,6 +2735,7 @@ pub(crate) fn load_map_from_initial(
     shared_cell_dummy: crate::map::resolved_terrain::SharedCellDummy,
     tile_variant_selector_cache: &mut crate::map::tile_variant_selector::TileVariantSelectorCache,
     progress: &mut dyn crate::app::loading::pump::LoadingProgressSink,
+    house_color_strength: u8,
 ) -> Result<MapLoadResult> {
     let mut job = FreshMapLoadJob::new(
         initial,
@@ -2751,6 +2758,7 @@ pub(crate) fn load_map_from_initial(
             shared_cell_dummy: shared_cell_dummy.clone(),
             tile_variant_selector_cache,
             progress,
+            house_color_strength,
         })? {
             return Ok(result);
         }
@@ -2985,6 +2993,12 @@ fn load_map_first_step(
                         .map_err(anyhow::Error::msg)?,
                     };
                     let mut rules = loaded_rules;
+                    // VERA's presentation strength applies before any colour
+                    // table is derived: the sprite atlas bakes its house remap
+                    // from this table, and the voxel ramp texture uploads it.
+                    rules
+                        .house_color_ramps
+                        .set_strength(services.house_color_strength);
                     crate::app::loading::init_helpers::bind_rules_art_metadata(
                         &mut rules,
                         &fixed_art_ini,
@@ -3242,22 +3256,26 @@ fn load_map_first_step(
                             // Bind the complete scheduler closure only after theater Tile##Anim rows
                             // have resolved, but before any atlas or AnimClass construction. Missing
                             // tile art is a load error rather than a silently invisible map feature.
-                            let mut roots = scheduler_anim_roots(
+                            let roots = scheduler_anim_roots(
                                 &rules,
                                 &overlay_registry,
                                 resolved_terrain
                                     .as_ref()
                                     .map_or(&[], |terrain| terrain.tile_animations()),
                             );
-                            roots.extend(crate::map::actions::trigger_anim_class_roots(
-                                &rules,
-                                &map_data.actions,
-                            ));
+                            let mut authored_anim_roots =
+                                crate::map::actions::trigger_anim_class_roots(
+                                    &rules,
+                                    &map_data.actions,
+                                );
+                            authored_anim_roots
+                                .extend(team_ai_registry.script_anim_class_roots(&rules));
                             crate::app::loading::init_helpers::bind_rules_asset_closure(
                                 &mut rules,
                                 &fixed_art_ini,
                                 &overlay_registry,
                                 &roots,
+                                &authored_anim_roots,
                                 services.asset_manager,
                                 theater_ext,
                                 &map_data.header.theater,
@@ -3306,17 +3324,6 @@ fn load_map_first_step(
                                             .replay_staged_generated_construction_trace(trace)
                                     })
                                     .transpose()?;
-                                    // Native Fill snapshots prior process-global ClearTile/WaterSet values
-                                    // before the current theater registry reload. Rust loads assets earlier,
-                                    // so defer publishing current results until materialization is complete.
-                                    if let Some(theater) = theater_result.as_ref() {
-                                        services
-                                            .tile_variant_selector_cache
-                                            .complete_theater_registry_load(
-                                                theater.rmg_tiles.clear_tile,
-                                                theater.rmg_tiles.water_set,
-                                            );
-                                    }
                                     log::info!(
                                         "Map terrain load: {} Scenario Fill cursor advances; TMP variant table {} this load, {} raw Main draws",
                                         map_fill_scenario_advances,
@@ -4390,7 +4397,8 @@ mod random_map_retail_tests {
         let dir = std::env::temp_dir().join(format!("vera20k-rmg-retail-{tag}"));
         crate::util::file_system::create_dir_all(&dir).expect("scratch dir");
         let name = format!("{tag}.sed");
-        crate::util::file_system::write(dir.join(&name), options.to_sed_bytes()).expect("write .SED");
+        crate::util::file_system::write(dir.join(&name), options.to_sed_bytes())
+            .expect("write .SED");
         (dir, name)
     }
 

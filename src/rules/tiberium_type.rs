@@ -3,7 +3,10 @@
 //! `[Tiberiums]` defines the native `TiberiumClass` order. Simulation code uses
 //! this data as the bridge from overlay cells to per-type growth/spread state.
 
-use crate::rules::ini_parser::{IniFile, IniSection};
+#[cfg(any(test, feature = "test-support"))]
+use crate::rules::ini_parser::IniFile;
+use crate::rules::ini_parser::IniSection;
+use crate::rules::native_processing::ProcessedRulesLayers;
 
 /// Native tiberium density byte range is 0..=11.
 pub const TIBERIUM_DENSITY_LEVELS: u8 = 12;
@@ -23,9 +26,13 @@ pub struct TiberiumType {
     pub id: TiberiumTypeId,
     pub section: String,
     pub display_name: Option<String>,
-    /// `[TiberiumType] Color=` selector for the ConvertClass installed on a
-    /// CellAnim created over this resource.
-    pub color: Option<String>,
+    /// TiberiumClass::ReadINI @ 0x00721A50 (721B20), ReadColor474A90:
+    /// retained runtime ColorScheme
+    /// ordinal, not a name resolved against a later Colors catalog.
+    color_scheme: i32,
+    /// TiberiumRead721B40..721C1E's ordered, duplicate-preserving nonnull
+    /// AnimType428B80 answers, used by AnimStart424DCC.
+    debris: Vec<String>,
     /// `Image=` selector: 1 = TIB, 2 = GEM, 3 = TIB2, 4 = TIB3.
     pub image: u8,
     /// Credit value per harvested density unit.
@@ -51,22 +58,27 @@ pub struct TiberiumTypeRegistry {
 }
 
 impl TiberiumTypeRegistry {
+    /// Fixture compatibility through the same ordered reader/factory owner.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn from_ini(ini: &IniFile) -> Self {
-        let Some(section) = ini.section("Tiberiums") else {
-            return Self::default();
-        };
+        let processed = crate::rules::native_processing::RulesLayerStack::new(ini.clone())
+            .process()
+            .expect("fixture Tiberium rules must process");
+        Self::from_processed_rules(&processed)
+    }
 
+    pub(crate) fn from_processed_rules(processed: &ProcessedRulesLayers) -> Self {
         let mut types = Vec::new();
-        for name in section.registry_ids() {
-            let Some(type_section) = ini.section(name) else {
-                continue;
-            };
-            let Some(id) = u8::try_from(types.len()).ok().map(TiberiumTypeId) else {
+        for (index, (name, section, color, debris)) in processed.tiberium_read_states().enumerate()
+        {
+            let Some(id) = u8::try_from(index).ok().map(TiberiumTypeId) else {
                 break;
             };
-            types.push(TiberiumType::from_ini_section(id, name, type_section));
+            let mut ty = TiberiumType::from_ini_section(id, name, section);
+            ty.color_scheme = color;
+            ty.debris = debris.to_vec();
+            types.push(ty);
         }
-
         Self { types }
     }
 
@@ -96,6 +108,16 @@ impl TiberiumTypeRegistry {
 }
 
 impl TiberiumType {
+    /// The retained native runtime scheme ordinal. Palette entries pair the
+    /// shade1 and shade53 schemes, so their shared entry index is this / 2.
+    pub fn color_scheme(&self) -> i32 {
+        self.color_scheme
+    }
+
+    pub fn debris(&self) -> &[String] {
+        &self.debris
+    }
+
     /// `TiberiumClass::ReadINI @ 0x00721A50`: every read passes the current
     /// field, which starts at the constructor's value.
     fn from_ini_section(id: TiberiumTypeId, section_name: &str, section: &IniSection) -> Self {
@@ -109,8 +131,9 @@ impl TiberiumType {
             section: section_name.to_string(),
             // AbstractTypeClass `Name=`, ReadString 0x31 (`0x00410AA0`).
             display_name: section.read_name("Name", 0x31).map(str::to_string),
-            // `0x00721B35`: ReadString 0x20, then the color scheme lookup.
-            color: section.read_name("Color", 0x20).map(str::to_string),
+            // Filled from the admitted, retained reader above.
+            color_scheme: 0,
+            debris: Vec::new(),
             image,
             value: section.read_int("Value", 0),
             // ReadInt stores its signed result directly, without a clamp
@@ -190,6 +213,9 @@ mod tests {
     fn parses_tiberiums_order_and_per_type_growth_spread_fields() {
         let ini = IniFile::from_str(
             "\
+[Colors]
+NeonGreen=104,241,195
+
 [Tiberiums]
 0=Riparius
 1=Cruentus
@@ -238,7 +264,7 @@ SpreadPercentage=.06
         assert_eq!(registry.len(), 4);
         let riparius = registry.get(TiberiumTypeId(0)).expect("Riparius");
         assert_eq!(riparius.section, "Riparius");
-        assert_eq!(riparius.color.as_deref(), Some("NeonGreen"));
+        assert_eq!(riparius.color_scheme(), 1);
         assert_eq!(riparius.image, 1);
         assert_eq!(riparius.value, 25);
         assert_eq!(riparius.growth, 2200);

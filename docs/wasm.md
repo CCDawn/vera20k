@@ -34,6 +34,9 @@ WS_PROXY_URL=wss://gateway.example.com python3 tools/wasm/build.py --network
 
 `--network` selects `--features wasm-net`. `WS_PROXY_URL` is compiled into that
 build and defaults to `wss://wss.vera20k.com`; changing it requires rebuilding.
+A `-SPAWN` launch can name its own gateway with `[Relay] GatewayUrl`, which takes
+precedence for that match's relay traffic. The built-in lobby and LAN signaling
+always use the compiled origin.
 Supply a complete origin without a path, query, fragment or credentials. Only
 loopback development addresses may use `ws://`, for example
 `WS_PROXY_URL=ws://localhost:8788`. Desktop and single-player browser builds do
@@ -61,22 +64,53 @@ python3 -m tools.cargo_run -- rustc -p vera20k --lib \
 python3 -m http.server 8000 --bind 127.0.0.1 --directory target/wasm-dist
 ```
 
-Open `http://localhost:8000` in a browser with WebGPU. WebGPU requires a secure
-context (HTTPS or localhost). Select an extracted retail Yuri's Revenge resource
-folder, then click Start. No game resources are included in the package. The
-single-player package uploads none; online play can share the selected map through
-the existing map-transfer protocol, while other retail assets stay local. Audio is
-prepared in that click to satisfy browser autoplay policy. Resource bytes are
-held in memory, so large installations need substantial browser memory.
+Open `http://localhost:8000` in a browser with WebGPU or WebGL2. The page
+requires a secure context (HTTPS or localhost). Select an extracted retail
+Yuri's Revenge resource folder, then click Start. No game resources are included
+in the package. The single-player package uploads none; online play can share
+the selected map through the existing map-transfer protocol, while other retail
+assets stay local. Audio is prepared in that click to satisfy browser autoplay
+policy. Resource bytes are held in memory, so large installations need
+substantial browser memory.
 
 The host restores and queues settings/save writes in IndexedDB for this origin.
 The page shows storage failures and pending writes. Engine writes complete in
 memory before the asynchronous storage transaction completes; wait for the
-saved status before closing. Clearing site data removes these copies. Imported
-retail resources are not persisted; they are read again on every visit. Where the
+saved status before closing. Clearing site data removes these copies. Persistence
+callbacks report only `/saves/`, which is what `restore_user_file` accepts. A host
+that wants replays registers `set_replay_callback((name, bytes) => ...)` before
+starting; it receives each segment a match or in-scenario load closes, and the
+engine keeps no copy. Without that callback, as on the supplied page, replays are
+discarded. Imported retail resources are not persisted; they are read again on every visit. Where the
 browser has the File System Access API (Chrome, Edge), the launcher keeps a read
 handle to the chosen folder in a separate `vera20k-wasm-launcher` database and
 offers one-click Continue on the next visit; other browsers ask for the folder again.
+
+## Multi-threaded build (experimental)
+
+`--threads` runs simulation work on a Rayon pool of Web Workers. It combines
+with `--network` and `--lan`, and needs a pinned nightly, because the standard
+library has to be rebuilt with Wasm atomics. Desktop and default browser builds
+stay on stable.
+
+```sh
+rustup toolchain install nightly-2026-10-15 --profile minimal --component rust-src --target wasm32-unknown-unknown
+python3 tools/wasm/build.py --threads
+python3 tools/wasm/serve.py
+```
+
+Shared memory requires cross-origin isolation, so the page must be served with
+`Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp`. `serve.py` sends both; a plain
+`http.server` does not, and the host page then reports the missing headers when the pool fails to start.
+Other hosts must send them too and await `initThreadPool(workers)` after
+`init()`; without that call the package runs simulation work serially.
+
+Rendering, audio and input stay on the main thread, which spins while the pool
+works. It runs no engine code during that time, because waiting on a contended
+lock traps there. Results do not depend on the pool size. A panic on a worker
+aborts that worker and leaves the main thread spinning, so the tab freezes
+instead of reporting `engine-error`.
 
 ## Compatibility boundary
 
@@ -94,6 +128,13 @@ the desktop implementations. A browser build without `wasm` is rejected.
 - GPU acquisition yields through the existing initialization jobs. Rendering
   uses an offscreen sRGB frame and a canvas presentation pass. Browser texture
   uploads do not block waiting for GPU completion.
+- Without a WebGPU adapter the browser build falls back to WebGL2. WebGL2 has
+  no storage buffers, compute, fragment atomics or reinterpreting texture views,
+  so the renderers that use them select render-target equivalents there
+  (`render::webgl`, `gpu::webgl_fallback`); every other device keeps its path.
+  A native test translates its shaders to GLSL ES 3.00, and
+  `VERA20K_TEST_WEBGL_FALLBACK=1` runs the GPU goldens through its passes on
+  a native device.
 - The browser entry supplies a canvas, status callback and storage callbacks;
   the existing App retains startup and match lifecycle ownership.
 
@@ -106,7 +147,9 @@ entry points. Browser LAN discovery and direct UDP connections are not supported
 Random map generation and synchronous GPU screenshot/capture are also unavailable
 in this single-threaded preview. Existing installed maps remain the target.
 Shifted punctuation shortcuts on non-US keyboard layouts
-are not fully mapped. Large atlas work and synchronous save preparation can
+are not fully mapped. Chat edits take input-method text through a hidden textarea
+that the engine adds to the page while one is active (`src/web/ime.rs`), so a host
+page needs no markup for it. Large atlas work and synchronous save preparation can
 still hold the browser event loop; runtime/performance validation is outstanding.
 
 ## Checks
@@ -177,8 +220,20 @@ A `start_spawn` launch skips the result-screen Continue button and campaign
 continuation. It freezes its result, completes the existing network finish/leave
 cleanup, delivers `match-ended`, and immediately requests engine shutdown;
 `engine-exited` follows. The old `spawn:finished:<json>` status notification is
-retained once for existing result consumers, but does **not** admit another
-launch. Both entry points now require a new page/instance for another engine.
+retained once for existing result consumers.
+
+Once `engine-exited` has returned, the same page may call `start_spawn` again:
+import the next launch's files with `import_spawn_file`, call `prepare_audio` and
+pass a new canvas. The imported retail files stay, so `import_file` is refused
+and changing the game folder needs a new page; `restore_user_file` and `probe`
+work between launches, and each launch rereads the settings. The output
+`AudioContext` also stays, so a later launch needs no new user gesture. A launch's
+files under `/spawn` are removed when it exits. `can_start_spawn()` says whether
+another launch can start. It stays false while a game runs, after `start_game`
+and after a panic, which all need a new page/instance. Linear memory never
+shrinks, so a host may also want a new page once `memory.buffer.byteLength`
+nears the 4 GiB limit.
+
 Calling Start from a lifecycle callback is rejected. Callback exceptions do
 not prevent shutdown; returned Promises are not awaited by Rust.
 
@@ -187,5 +242,5 @@ After `engine-exited`, an engine that had started also sends the status
 pending IndexedDB writes and then tries to close the tab, keeping a warning
 visible if storage failed. A hosting website may instead return to its own
 lobby once storage completes. Reloading discards imported retail bytes. Browser audio
-pumping stops on engine exit; stopping winit alone would leave WebAudio alive.
+pumping pauses on engine exit; stopping winit alone would leave WebAudio alive.
 Desktop startup, scores, process exit codes and result-file writes are unchanged.

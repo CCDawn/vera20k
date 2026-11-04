@@ -729,8 +729,10 @@ fn track_c0_set(order: MaskedX87Ordering) -> bool {
 
 /// Process_Drive_Track speed prefix: Drive4B0F74..4B1218 / Ship6A0644..6A08E0.
 /// Exact PC53/chop arithmetic feeds the same frame's movement budget.
-/// Linked-member propagation remains outside this numeric owner; no stock
-/// producer of that linked chain has been established.
+/// RESIDUAL: authored FOLLOWS chains (UnitReadINI 0x743270) now link Units,
+/// but an Accelerates head does not yet force its followers' speed fraction
+/// (Drive 0x4B1218..0x4B125D, Ship 0x6A08F0..0x6A091F), so a linked convoy
+/// can spread out; only FOLLOWS maps with an Accelerates head reach it.
 ///
 /// `distance` is called exactly once only after Accelerates/selector/Passive
 /// gates. The native distance owner is a pure ground/Cell query. Live mutable

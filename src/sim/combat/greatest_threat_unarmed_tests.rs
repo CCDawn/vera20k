@@ -70,7 +70,13 @@ fn unarmed_vehicle_thief_hunt_picks_the_enemy_vehicle_over_closer_infantry() {
         .unwrap();
     let actor = sim.substrate.entities.get(thief).unwrap();
     let object = rules.object("THIEFMAN").unwrap();
-    assert!(!is_armed(actor, object));
+    assert!(!is_armed(
+        actor,
+        object,
+        &sim.substrate.entities,
+        &rules,
+        &sim.interner
+    ));
     // Hunt pushes mask 0; the Infantry override rewrites the thief's mask to
     // 0x10 (`0x0051E288..0x0051E2C4`), so the flags word holds only the Unit
     // bit and the closer enemy infantry falls at the class gate 6F821A. The
@@ -208,7 +214,13 @@ fn an_armed_scanner_keeps_its_pick() {
         .unwrap();
     let actor = sim.substrate.entities.get(gunman).unwrap();
     let object = rules.object("GUNMAN").unwrap();
-    assert!(is_armed(actor, object));
+    assert!(is_armed(
+        actor,
+        object,
+        &sim.substrate.entities,
+        &rules,
+        &sim.interner
+    ));
     assert_eq!(
         pick(
             &mut sim,
@@ -246,7 +258,13 @@ fn unarmed_computer_engineer_returns_its_house_lost_building() {
         .set_for_test(1);
     let actor = sim.substrate.entities.get(engineer).unwrap();
     let object = rules.object("ENGINEER").unwrap();
-    assert!(!is_armed(actor, object));
+    assert!(!is_armed(
+        actor,
+        object,
+        &sim.substrate.entities,
+        &rules,
+        &sim.interner
+    ));
     sim.houses
         .get_mut(&owner)
         .unwrap()

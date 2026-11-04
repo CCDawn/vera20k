@@ -109,7 +109,7 @@ impl Simulation {
                 .zip(target_owner)
                 .is_some_and(|(source, target)| {
                     crate::sim::combat::combat_weapon::is_ally_by_object(
-                        Some(self.house_alliances.as_map()),
+                        Some(&self.house_alliances),
                         &self.interner,
                         source,
                         target,
@@ -138,23 +138,17 @@ impl Simulation {
             return;
         }
         let owner = self
-            .ares_nonrandom_house_kind(
+            .house_kind(
                 settings.kill_driver().owner(),
                 None,
                 source_owner,
                 source_owner,
                 target_owner,
                 rules,
+                None,
             )
             .or_else(|| {
-                self.ares_nonrandom_house_kind(
-                    HouseSelector::Special,
-                    None,
-                    None,
-                    None,
-                    None,
-                    rules,
-                )
+                self.house_kind(HouseSelector::Special, None, None, None, None, rules, None)
             });
         if let Some(owner) = owner {
             self.ares_replace_driver(

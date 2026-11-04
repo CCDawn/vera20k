@@ -759,7 +759,13 @@ impl OpeningCapture {
                     && !actor.lifecycle.in_limbo()
                     && actor.category() != crate::map::entities::EntityCategory::Structure
                     && !object.resource_gatherer
-                    && crate::sim::combat::combat_weapon::is_armed(actor, object))
+                    && crate::sim::combat::combat_weapon::is_armed(
+                        actor,
+                        object,
+                        sim.entities(),
+                        rules,
+                        sim.interner(),
+                    ))
                 .then_some(id)
             })
             .collect();

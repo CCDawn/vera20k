@@ -59,12 +59,16 @@ pub(super) fn adjusted_speed(
 pub(crate) fn owner_current_speed_from_native_fraction(
     adjusted_speed_per_second: SimFixed,
     current_speed_fraction: NativeF64Bits,
+    ae_speed_multiplier: f64,
 ) -> i32 {
     let adjusted_type_speed = (adjusted_speed_per_second / SimFixed::from_num(15)).to_num::<i32>();
-    X::ftol_i32_low_masked(X::mul(
+    let speed = X::ftol_i32_low_masked(X::mul(
         X::load_i32(adjusted_type_speed),
         X::load_f64(current_speed_fraction),
-    ))
+    ));
+    // Phobos FootClass_GetMovementSpeed_SpeedMultiplier (0x4DB218, 6 bytes
+    // replaced): the final int times the active effects' product, cast by C++.
+    crate::sim::attach_effect::scale_i32(speed, ae_speed_multiplier)
 }
 
 /// Fixed-input adapter for older component fixtures; production reads the
@@ -77,6 +81,7 @@ pub(crate) fn owner_current_speed_from_fraction(
     owner_current_speed_from_native_fraction(
         adjusted_speed_per_second,
         NativeF64Bits::from_bits(current_speed_fraction.to_num::<f64>().to_bits()),
+        1.0,
     )
 }
 
@@ -126,6 +131,7 @@ pub fn owner_current_speed(
     owner_current_speed_from_native_fraction(
         adjusted_speed(entity, object, veteran_speed, houses),
         entity.foot_speed.native_applied_fraction(),
+        entity.phobos_speed_multiplier(),
     )
 }
 
@@ -146,6 +152,25 @@ impl crate::sim::world::Simulation {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// Phobos `FootClass_GetMovementSpeed_SpeedMultiplier` (`0x4DB218`): the
+    /// final getter int times the active effects' product, with C++
+    /// truncation toward zero.
+    #[test]
+    fn attach_effect_speed_multiplier_scales_the_final_getter() {
+        let adjusted = SimFixed::from_num(30 * 15);
+        let fraction = NativeF64Bits::ONE;
+        let speed =
+            |multiplier| owner_current_speed_from_native_fraction(adjusted, fraction, multiplier);
+        assert_eq!(speed(1.0), 30, "identity");
+        assert_eq!(speed(1.5), 45);
+        assert_eq!(speed(0.55), 16, "16.5 truncates toward zero");
+        assert_eq!(speed(0.0), 0);
+        assert_eq!(speed(-1.0), -30);
+        assert_eq!(speed(f64::NAN), i32::MIN, "C++'s out-of-range/NaN int cast");
+    }
+
     /// Physical Battle rules in authored legal ground/water arenas. Actual
     /// construction, Move and full frames supply the complete braking history.
     #[test]
@@ -370,6 +395,7 @@ mod tests {
             let mut speed = owner_current_speed_from_native_fraction(
                 SimFixed::from_num(type_speed * 15),
                 owner.native_applied_fraction(),
+                1.0,
             );
             if input["flag_owner"].as_i64().unwrap() != -1 {
                 speed /= 2;

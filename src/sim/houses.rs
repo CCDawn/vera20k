@@ -19,18 +19,28 @@ use crate::sim::intern::InternedId;
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "SavedHouses")]
 pub struct Houses {
+    /// Derived from the loaded map and rebuilt before post-load gameplay.
+    #[serde(skip)]
+    cell_grid: crate::map::cell_index::CellGrid,
     states: BTreeMap<InternedId, HouseState>,
     /// Registration order. Holds each key of `states` exactly once.
     order: Vec<InternedId>,
 }
 
 impl Houses {
+    pub(crate) fn configure_cell_grid(&mut self, grid: crate::map::cell_index::CellGrid) {
+        self.cell_grid = grid;
+        for house in self.states.values_mut() {
+            house.configure_spatial_threat_grid(grid);
+        }
+    }
     /// Append a constructed House to the array under its own name.
     ///
     /// Panics when a House of that name is already registered: scenario
     /// construction admits distinct House names only.
     #[track_caller]
-    pub fn register(&mut self, house: HouseState) -> &mut HouseState {
+    pub fn register(&mut self, mut house: HouseState) -> &mut HouseState {
+        house.configure_spatial_threat_grid(self.cell_grid);
         let name = house.name();
         match self.states.entry(name) {
             btree_map::Entry::Vacant(slot) => {
@@ -232,6 +242,7 @@ impl TryFrom<SavedHouses> for Houses {
         Ok(Self {
             states: saved.states,
             order: saved.order,
+            cell_grid: Default::default(),
         })
     }
 }

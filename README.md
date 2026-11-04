@@ -52,6 +52,8 @@ Download the installer for Windows, macOS or Linux from the
 [releases page](https://github.com/YuriPlanet/vera20k/releases). It finds your copy of
 Yuri's Revenge and sets up VERA20K in a new folder.
 
+Use **Options** for sound and controls, and **Vera Options** for VERA-specific features.
+
 To launch single-player YR skirmishes or campaigns from a CnCNet client, see the
 [offline client setup](integrations/cncnet/README.md).
 
@@ -67,28 +69,6 @@ Maintainers will help with review, integration and merging. You'll keep full cre
 contribution.
 
 Discussion is on [Discord](https://discord.gg/kmjRUn5m5F) and in the QQ group (1097193563).
-
-## Settings
-
-Use **Options** for sound and controls, and **Vera Options** for VERA-specific features.
-Player preferences, keyboard shortcuts and lobby choices are saved in `VERA.INI`:
-
-- **Windows installer:** beside `vera20k.exe`.
-- **macOS:** `~/Library/Application Support/VERA20k/VERA.INI`.
-- **Linux:** `~/.local/share/VERA20k/VERA.INI`, or your XDG data folder.
-
-`config.toml` sets the game folder and can select another settings folder.
-
-Enable **Mouse Wheel Zoom** in **Vera Options**, or set `[VERA] MouseWheelZoom=yes`
-in `VERA.INI` (default `no`).
-
-If `VERA.INI` is missing, VERA creates it and imports existing preferences once. With no
-old settings, it starts empty and VERA uses built-in defaults until settings are saved.
-The original `RA2MD.INI` and `KeyboardMD.ini` are only read for import, never overwritten.
-
-`VERARULES.INI`, in the same folder, contains optional gameplay changes. It starts with
-commented examples and leaves mission/map rules in control. See [personal rules](docs/personal-rules.md)
-for editing and overriding them.
 
 ## Architecture
 
@@ -128,6 +108,20 @@ cp config.toml.example config.toml
 cargo run --release --bin vera20k
 ```
 
+### Large maps
+
+Desktop builds support map `Size` width + height up to 1024 without a feature flag.
+A map whose sum is at most 512 keeps retail 512-stride cell addressing; larger
+maps automatically select 1024-stride addressing. This is a bounded VERA extension.
+Generate a literal 500×500 map with 30 starts using
+`python -m tools.scale_map large500.map --size 500 --starts 30`.
+Retail overlay packs keep their 512×512 layout; extended packs use 1024×1024.
+Both map sizes use the same executable and versioned save machinery. Stored-layout
+changes are checked by the existing snapshot version guard; this change does not
+provide a migration for saves from the earlier 16-bit navigation layout.
+Basic loading, movement and MCV deployment are checked separately from 30-player,
+long-game and large-unit-count performance, which remain unvalidated.
+
 ## How we work
 
 Most of the code is written by AI coding agents. They use Ghidra to study the original
@@ -136,8 +130,9 @@ and playtesting. Agents follow [AGENTS.md](AGENTS.md).
 
 ## Customization
 
-VERA20K plays like the original game by default. Every new feature, including extensions from
-mods such as Ares, must stay off until it is turned on with one of:
+VERA20K plays like the original game by default. Map capacity is selected automatically as
+described above. Other new features, including extensions from mods such as Ares, stay off
+until they are turned on with one of:
 
 - **A VERA player option**, in **Options → Vera Options**, saved under `[VERA]` in `VERA.INI`.
 - **A build option**, such as `--features ares` for the supported [Ares extensions](docs/ares.md).
@@ -173,6 +168,7 @@ with or endorsed by Electronic Arts.
 
 - [Build and run](#build-and-run): requirements and building from source.
 - [INI profiles](docs/ini-roots.md): choosing rules, art and AI files.
+- [End-game screens](docs/ini-end-game-screens.md): the verdict card, its theme and the score page's own art.
 - [Ares](docs/ares.md), [Phobos](docs/phobos.md), [NPatch](docs/npatch.md) and [VeraX](docs/verax.md): extension support and limitations.
 - [Engine overview](docs/index.md): code layout and how the engine fits together.
 - [Developer tools](tools/README.md): builds, tests and asset inspection.

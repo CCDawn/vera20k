@@ -43,6 +43,8 @@ VERA20K 由玩家打造、为玩家而做，项目的方向由玩家说了算。
 
 从[发布页面](https://github.com/YuriPlanet/vera20k/releases)下载适用于 Windows、macOS 或 Linux 的安装程序。它会找到你的《尤里的复仇》，并把 VERA20K 安装到一个新文件夹。
 
+声音和操作设置请使用 **Options**，VERA 专属功能请使用 **Vera Options**。
+
 如需通过 CnCNet 客户端启动 YR 单人遭遇战或战役，请参阅[离线客户端设置](integrations/cncnet/README.md)。
 
 ## 参与贡献
@@ -55,26 +57,6 @@ VERA20K 由玩家打造、为玩家而做，项目的方向由玩家说了算。
 维护者会协助审查、集成和合并。你的贡献会完整保留你的署名。
 
 讨论在 [Discord](https://discord.gg/kmjRUn5m5F) 和 QQ 群（1097193563）进行。
-
-## 设置
-
-声音和操作设置请使用 **Options**，VERA 专属功能请使用 **Vera Options**。
-玩家偏好、键盘快捷键和大厅选项保存在 `VERA.INI` 中：
-
-- **Windows 安装版：** 与 `vera20k.exe` 位于同一目录。
-- **macOS：** `~/Library/Application Support/VERA20k/VERA.INI`。
-- **Linux：** `~/.local/share/VERA20k/VERA.INI`，或你的 XDG 数据目录。
-
-`config.toml` 用于指定游戏目录，也可用来选择另一个设置目录。
-
-在 **Vera Options** 中启用 **Mouse Wheel Zoom**，或在 `VERA.INI` 中设置 `[VERA] MouseWheelZoom=yes`（默认为 `no`）。
-
-如果 `VERA.INI` 不存在，VERA 会创建该文件，并导入一次现有偏好。如果没有旧设置，
-该文件初始为空，VERA 会使用内置默认值，直到设置被保存。
-原有的 `RA2MD.INI` 和 `KeyboardMD.ini` 只用于读取并导入，绝不会被覆盖。
-
-`VERARULES.INI` 位于同一文件夹，用于可选的游戏规则调整。初始内容是已注释的示例，任务和地图规则仍优先生效。
-有关编辑和覆盖这些规则的方法，请参阅[个人规则](docs/personal-rules.md)。
 
 ## 架构
 
@@ -125,7 +107,9 @@ VERA20K 的开发者都是你们的朋友。我们希望把庞大的中国红警
 
 ## 自定义
 
-默认情况下，VERA20K 的玩法与原版游戏一致。每项新功能（包括 Ares 等模组的扩展）都必须默认关闭，
+大地图容量会自动选择，无需编译开关：`Size` 的宽与高之和最多为 1024；不超过 512 时保留原有寻址，超过时使用扩展网格。生成命令、存档版本与验证范围见[大地图说明](README.md#large-maps)。
+
+默认情况下，VERA20K 的玩法与原版游戏一致。其他新功能（包括 Ares 等模组的扩展）都必须默认关闭，
 只能通过以下方式之一开启：
 
 - **VERA 玩家选项**，位于 **Options → Vera Options**，保存在 `VERA.INI` 的 `[VERA]` 节下。

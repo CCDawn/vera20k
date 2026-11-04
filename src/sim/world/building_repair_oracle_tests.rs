@@ -69,6 +69,64 @@ fn oracle_rules_with_sounds(root: IniFile) -> RuleSet {
     )
 }
 
+#[test]
+fn repair_click_retains_the_retail_cue_after_an_unknown_map_override() {
+    // ToggleRepair446FF0 consumes Rules+70C; its reader66AD24..66AD56
+    // retains the registered startup cue when this legal map read fails.
+    let Some(fixture) = crate::rules::retail_ini_fixture::retail_battle_rules_with_map_patch(
+        &IniFile::from_str("[AudioVisual]\nGenericClick=UnknownRepairClick\n"),
+    ) else {
+        return;
+    };
+    let rules = fixture.rules;
+    let strength = rules.object("GAPOWR").unwrap().strength;
+    let mut sim = Simulation::new();
+    let owner = sim.interner.intern("Americans");
+    sim.session.set_current_house_for_test(Some(owner));
+    sim.houses
+        .register(HouseState::new(owner, 0, None, true, 1000, 10));
+    let kind = sim.interner.intern("GAPOWR");
+    sim.substrate
+        .entities
+        .insert(GameEntity::new_at_frame_zero_for_test(
+            1,
+            12,
+            12,
+            0,
+            0,
+            owner,
+            Health::new(strength / 2),
+            kind,
+            EntityCategory::Structure,
+            0,
+            5,
+            false,
+        ));
+    for control in [RepairControl::Start, RepairControl::Stop] {
+        sim.sound_events.clear_for_test();
+        assert!(production::toggle_repair(&mut sim, &rules, 1, control));
+        let clicks: Vec<_> = sim
+            .sound_events
+            .iter()
+            .filter_map(|event| match event {
+                SimSoundEvent::VocAt {
+                    sound_id,
+                    audible_to,
+                    rx,
+                    ry,
+                    ..
+                } => {
+                    assert_eq!(*audible_to, Some([owner, owner]));
+                    assert_eq!((*rx, *ry), (12, 12));
+                    Some(sound_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(clicks, ["MenuClick"]);
+    }
+}
+
 fn corpus() -> &'static Value {
     crate::test_fixture::json("tools/spatial_oracle/building_repair.json")
 }

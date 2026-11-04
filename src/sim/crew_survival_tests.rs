@@ -1497,7 +1497,8 @@ fn retail_ifv_death_arm_follows_its_passengers_slot() {
         .filter(|id| {
             let ifv_mode = rules.object(id).unwrap().ifv_mode;
             let numbered = crate::sim::combat::combat_weapon::weapon_for_index(fv, 0, ifv_mode)
-                .and_then(|(weapon_id, _)| rules.weapon(weapon_id));
+                .and_then(|record| record.weapon_id)
+                .and_then(|weapon_id| rules.weapon(weapon_id));
             crate::sim::combat::death_arm_explodes(fv, 0, numbered)
         })
         .map(String::as_str)
@@ -1505,7 +1506,8 @@ fn retail_ifv_death_arm_follows_its_passengers_slot() {
     exploding.sort_unstable();
     assert_eq!(exploding, ["CIVAN", "IVAN", "TERROR"]);
     let slot0 = crate::sim::combat::combat_weapon::weapon_for_index(fv, 0, 0)
-        .and_then(|(weapon_id, _)| rules.weapon(weapon_id));
+        .and_then(|record| record.weapon_id)
+        .and_then(|weapon_id| rules.weapon(weapon_id));
     assert!(!crate::sim::combat::death_arm_explodes(fv, 0, slot0));
 }
 
@@ -2655,7 +2657,7 @@ fn ares_fatal_aircraft_parachutes_crew_and_honors_explicit_no_crash() {
     assert_eq!(escaped.len(), 1);
     let pilot = sim.entities().get(escaped[0]).unwrap();
     assert_eq!(sim.interner.resolve(pilot.type_ref()), "CREW");
-    assert!(pilot.is_object_alive() && pilot.is_parachuted());
+    assert!(pilot.is_object_alive() && pilot.is_falling_down());
     assert_eq!(pilot.health.current(), 50);
     assert!(
         sim.entities()

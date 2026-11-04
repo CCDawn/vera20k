@@ -643,6 +643,73 @@ fn ini_directives_raw_parse_and_restore_never_open_files_or_expand_again() {
 }
 
 #[test]
+fn ini_directives_inheritance_rejects_high_fan_out_before_copying() {
+    // One parent, every child at depth one and acyclic: neither the depth nor
+    // the cycle limit can bound this repeated copy, so only the aggregate
+    // expanded-text budget can. Values stay under the 511-byte physical line
+    // limit so the parser stores them whole.
+    let value = "v".repeat(256);
+    let keys: Vec<String> = (0..256).map(|index| format!("Key{index:03}")).collect();
+    let per_child: usize = keys.iter().map(|key| key.len() + value.len()).sum();
+    let parent: String = keys.iter().map(|key| format!("{key}={value}\n")).collect();
+    let section = |index: usize| format!("[Child{index}]\n$Inherits=Base\n");
+    // Children that fit in the budget this document's own text licenses.
+    let budget = inherited_text_budget(&IniFile::from_str(&format!(
+        "[Base]\n{parent}{}",
+        section(0)
+    )));
+    let children = budget / per_child;
+    assert!(children > 1, "the fixture must allow a wide fan-out");
+    let mut root = format!("[Base]\n{parent}");
+    for index in 0..children {
+        root.push_str(&section(index));
+    }
+    let within = expand(&root, &[]);
+    assert!(within.diagnostics.is_empty());
+    for index in [0, children - 1] {
+        assert_eq!(
+            text(&within.ini, &format!("Child{index}"), &keys[255]).as_deref(),
+            Some(value.as_str())
+        );
+    }
+    // One more copy of the same parent crosses it.
+    root.push_str(&section(children));
+    let error = process_directives(
+        IniFile::from_str(&root),
+        "root.ini",
+        |_| panic!("no include"),
+        DirectiveOptions::default(),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.kind, DiagnosticKind::InheritanceWorkLimit);
+    assert_eq!(error.reference_chain, [format!("Child{children}")]);
+}
+
+#[test]
+fn ini_directives_inheritance_fan_out_within_budget_copies_missing_keys() {
+    // Charging is per copied entry, not per parent visit: 32 children reuse one
+    // completed parent, each keeps its own authored `Own`, and each still
+    // receives the remaining keys.
+    let mut root = String::from("[Base]\nShared=a\nExtra=b\n");
+    for index in 0..32 {
+        root.push_str(&format!("[Child{index}]\n$Inherits=Base\nOwn={index}\n"));
+    }
+    let result = expand(&root, &[]);
+    assert!(result.diagnostics.is_empty());
+    for index in [0, 31] {
+        let name = format!("Child{index}");
+        let own = index.to_string();
+        assert_eq!(text(&result.ini, &name, "Shared").as_deref(), Some("a"));
+        assert_eq!(text(&result.ini, &name, "Extra").as_deref(), Some("b"));
+        assert_eq!(
+            text(&result.ini, &name, "Own").as_deref(),
+            Some(own.as_str())
+        );
+    }
+}
+
+#[test]
 fn ini_directives_production_selection_obeys_build_capability() {
     use crate::map::source::test_support::TestDirectory;
     use crate::rules::retail_sources::select_ini;

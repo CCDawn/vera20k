@@ -24,6 +24,10 @@ pub(super) struct ReceiverHealthCommit {
     /// TechnoClass's own tail: only the Foot, Infantry and Unit receivers'
     /// tails follow, and they read the result, not `*damage`.
     pub(super) psychedelic: bool,
+    /// `*pDamage` after Object's body (`0x00701DF8`), when Techno reached it:
+    /// what Phobos' `0x701E18` hook reflects and counts.
+    #[cfg(feature = "phobos")]
+    pub(super) object_packet: Option<i32>,
 }
 
 /// World access for the one Object5F5390 port. Observation-only callers use
@@ -175,15 +179,11 @@ pub(super) fn commit_receiver_health(
     let attacker_owner = event.source_house.or(live_source_owner);
     let hostile_source = |target: &GameEntity,
                           source_owner: Option<InternedId>,
-                          alliances: &HouseAllianceMap,
+                          alliances: &HouseAlliances,
                           interner: &StringInterner| {
         attacker_id != RAD_NO_ATTACKER
             && source_owner.is_some_and(|source_owner| {
-                !crate::map::houses::is_allied_with(
-                    alliances,
-                    interner.resolve(target.owner()),
-                    interner.resolve(source_owner),
-                )
+                !alliances.is_allied(interner, target.owner(), source_owner)
             })
     };
     if let Some(value) = receive_outcome.psychedelic_value {
@@ -205,7 +205,7 @@ pub(super) fn commit_receiver_health(
                 hostile_source(
                     target,
                     attacker_owner,
-                    world.house_alliances.as_map(),
+                    &world.house_alliances,
                     &world.interner,
                 ),
             )),
@@ -216,6 +216,8 @@ pub(super) fn commit_receiver_health(
             uncloak_after_damage: false,
             house_threat_delta: None,
             psychedelic: true,
+            #[cfg(feature = "phobos")]
+            object_packet: None,
         });
     }
     let (strength, building_no_c4) = {
@@ -289,7 +291,7 @@ pub(super) fn commit_receiver_health(
         if execute_world_callbacks {
             update_anger_nodes(
                 &mut world.houses,
-                world.house_alliances.as_map(),
+                &world.house_alliances,
                 &world.interner,
                 victim_owner,
                 source_owner,
@@ -341,7 +343,7 @@ pub(super) fn commit_receiver_health(
         let hostile = hostile_source(
             target,
             attacker_owner,
-            world.house_alliances.as_map(),
+            &world.house_alliances,
             &world.interner,
         );
         latch_hostile_hit = survivor && hostile;
@@ -396,6 +398,8 @@ pub(super) fn commit_receiver_health(
         uncloak_after_damage,
         house_threat_delta,
         psychedelic: false,
+        #[cfg(feature = "phobos")]
+        object_packet: reached_survivor_postlude.then_some(final_packet),
     })
 }
 

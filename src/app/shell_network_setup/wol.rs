@@ -64,10 +64,7 @@ impl App {
                 .clone(),
         };
         launch.rebuild_house_roster();
-        let dialog = SetupDialog {
-            host: false,
-            flavor: SetupFlavor::Wol,
-        };
+        let dialog = super::setup_dialog(state, false, SetupFlavor::Wol);
         if let Err(error) = install_setup(
             state,
             launch,
@@ -182,6 +179,9 @@ pub(crate) fn user_joined(state: &mut AppState, name: String) -> anyhow::Result<
             .is_some_and(|protocol| protocol.locked);
     let row = if !session.host() {
         Some(None)
+    } else if session.network_room_full() {
+        // VERA's room is at its host's Max players.
+        None
     } else if session.network_no_open_player_row() {
         session.network_free_row(true).map(Some)
     } else {
@@ -194,7 +194,13 @@ pub(crate) fn user_joined(state: &mut AppState, name: String) -> anyhow::Result<
             .and_then(|rules| rules.general.player_joined_sound())
             .map(str::to_owned);
         App::play_shell_ui_sound_by_id(state, sound.as_deref());
-        queue(state, NetworkSetupRequest::Kick { name });
+        queue(
+            state,
+            NetworkSetupRequest::Kick {
+                name,
+                keep_out: false,
+            },
+        );
         return Ok(());
     };
     let mut human = crate::skirmish_launch::SkirmishHumanSlot {
@@ -707,6 +713,8 @@ pub(super) fn verify_connected(state: &mut AppState, node: usize) -> anyhow::Res
 /// (`0x00794F30..0x00794F44`), leaves the game channel (API+0x24 at
 /// `0x007955F1`) and starts the match; 2 opens `0xD0` with
 /// `TXT_SCENARIOS_DO_NOT_MATCH` over `0x130` first; 1 and 2 abort.
+/// VERA's own room (not the original-style one) stays joined instead, so
+/// its players come back to it after the match.
 pub(super) fn negotiated(state: &mut AppState, result: u8) -> anyhow::Result<()> {
     let verify = verify_mut(state)?;
     anyhow::ensure!(verify.mismatch.is_none(), "the mismatch box is up");
@@ -729,9 +737,21 @@ pub(super) fn negotiated(state: &mut AppState, result: u8) -> anyhow::Result<()>
                 super::commit_start(state, seed);
                 return Ok(());
             }
-            protocol.requests.push(NetworkSetupRequest::Leave);
+            let quick_match = super::quick_match(state);
+            let back_to_room = super::dialog(state).modern && !quick_match;
+            let protocol = state
+                .frontend
+                .network_setup_protocol
+                .as_mut()
+                .expect("setup owns protocol");
+            if !back_to_room {
+                protocol.requests.push(NetworkSetupRequest::Leave);
+            }
+            if let Some(visit) = state.frontend.wol.as_mut() {
+                visit.back_to_room = back_to_room;
+            }
             state.frontend.skirmish_preview_texture = None;
-            if super::quick_match(state) {
+            if quick_match {
                 // 0x130 closes without a slide and no setup dialog exists.
                 crate::app::shell_wol::quick_match::start_leave(state);
                 super::commit_start(state, seed);

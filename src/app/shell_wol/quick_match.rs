@@ -19,8 +19,8 @@
 //! with [`super::lobby::Runner::QuickMatch`]; its joins, creates and sinks
 //! run there with the native mode 1-3 branches. The game channel's nodes
 //! and the start are the network setup's, without C2/C9
-//! ([`crate::app::shell_network_setup`]). Quick Co-op (mode 2) is a later
-//! chain: the welcome keeps refusing it.
+//! ([`crate::app::shell_network_setup`]). Quick Co-op (mode 2) runs the
+//! same runner; [`mode_active`] names where the two differ.
 
 use crate::util::time::{Duration, Instant};
 
@@ -652,7 +652,9 @@ fn matchbot_text(
         start(state, &text[6..]);
         return;
     }
-    if starts_with(text, "need") {
+    // Five bytes, the space included (`0x007A1987`): a bare "need" or
+    // "needs" is an unknown command.
+    if starts_with(text, "need ") {
         log::info!("WOL matchbot: {text}");
         return;
     }

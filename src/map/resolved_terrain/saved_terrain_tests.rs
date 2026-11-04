@@ -78,7 +78,7 @@ fn saved_terrain_rejects_malformed_planes_coordinates_and_references() {
     bad["tube_native_ids"] = serde_json::json!([42]);
     corruptions.push(bad);
     let mut bad = good.clone();
-    bad["width"] = serde_json::json!(513);
+    bad["width"] = serde_json::json!(1025);
     corruptions.push(bad);
     let mut bad = good;
     bad["tile_animations"] = serde_json::json!([{

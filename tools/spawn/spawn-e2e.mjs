@@ -12,18 +12,18 @@
 // Both write one directory per player (DIR/p0, DIR/p1, ...) holding spawn.ini,
 // the map as spawnmap.ini and a config.toml pointing at RETAIL with settings
 // kept in that directory. `relay` then serves the match API subset the
-// spawned client uses, signing relay grants with the lobby's own codec
-// (services/lobby/service.js); it is a test mock, never a deployment.
+// spawned client uses, signing relay grants in the lobby's format
+// (relay_grant.mjs); it is a test mock, never a deployment.
 import { randomBytes, randomUUID } from 'node:crypto';
 import { copyFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { base64url, relayGrant } from '../../services/lobby/service.js';
+import { base64url, relayGrant } from './relay_grant.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const LAUNCH_HZ = [60, 45, 30, 20, 15, 12, 10];
-// services/lobby/service.js: BOOTSTRAP_GRANT_SECONDS and GRANT_SECONDS.
+// docs/lobby-protocol.md: initial and renewed ticket lifetimes.
 const BOOTSTRAP_GRANT_SECONDS = 120;
 const GRANT_SECONDS = 300;
 

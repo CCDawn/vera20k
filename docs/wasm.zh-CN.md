@@ -41,9 +41,23 @@ python3 -m tools.cargo_run -- rustc -p vera20k --lib \
 python3 -m http.server 8000 --bind 127.0.0.1 --directory target/wasm-dist
 ```
 
-在支持 WebGPU 的浏览器中打开 `http://localhost:8000`。WebGPU 要求安全上下文，即 HTTPS 或 localhost。选择已解压的《尤里的复仇》零售资源目录，然后点击 Start。构建包不包含游戏资源。单机版不会上传资源；联机时可以通过现有地图传输协议分享所选地图，其他零售资源仍留在本地。点击 Start 时会准备音频，以满足浏览器自动播放策略。资源字节保存在内存中，因此较大的游戏安装目录需要较多浏览器内存。
+在支持 WebGPU 或 WebGL2 的浏览器中打开 `http://localhost:8000`。页面要求安全上下文，即 HTTPS 或 localhost。选择已解压的《尤里的复仇》零售资源目录，然后点击 Start。构建包不包含游戏资源。单机版不会上传资源；联机时可以通过现有地图传输协议分享所选地图，其他零售资源仍留在本地。点击 Start 时会准备音频，以满足浏览器自动播放策略。资源字节保存在内存中，因此较大的游戏安装目录需要较多浏览器内存。
 
-宿主页面通过当前 origin 的 IndexedDB 恢复设置和存档，并排队保存后续写入。页面会显示存储失败和待写入状态。引擎先完成内存写入，异步存储事务随后才会完成；关闭页面前应等待已保存状态。清除站点数据会删除这些副本。导入的零售资源不会持久化，每次访问都会重新读取。在支持 File System Access API 的浏览器（Chrome、Edge）中，启动页会在单独的 `vera20k-wasm-launcher` 数据库中保存所选文件夹的读取句柄，下次访问时可一键继续；其它浏览器需要再次选择文件夹。
+宿主页面通过当前 origin 的 IndexedDB 恢复设置和存档，并排队保存后续写入。页面会显示存储失败和待写入状态。引擎先完成内存写入，异步存储事务随后才会完成；关闭页面前应等待已保存状态。清除站点数据会删除这些副本。持久化回调只上报 `/saves/` 下的文件，也就是 `restore_user_file` 接受的范围。需要录像的宿主在启动前注册 `set_replay_callback((name, bytes) => ...)`，对局结束或局内读档时会收到关闭的录像段，引擎不保留副本。未注册时录像会被丢弃，自带页面就是如此。导入的零售资源不会持久化，每次访问都会重新读取。在支持 File System Access API 的浏览器（Chrome、Edge）中，启动页会在单独的 `vera20k-wasm-launcher` 数据库中保存所选文件夹的读取句柄，下次访问时可一键继续；其它浏览器需要再次选择文件夹。
+
+## 多线程构建（实验性）
+
+`--threads` 让模拟工作运行在由 Web Worker 组成的 Rayon 线程池上，可以和 `--network`、`--lan` 同时使用。它需要固定版本的 nightly，因为标准库要带 Wasm atomics 重新编译。桌面版和默认浏览器包仍使用 stable。
+
+```sh
+rustup toolchain install nightly-2026-10-15 --profile minimal --component rust-src --target wasm32-unknown-unknown
+python3 tools/wasm/build.py --threads
+python3 tools/wasm/serve.py
+```
+
+共享内存要求跨源隔离，所以页面必须带上 `Cross-Origin-Opener-Policy: same-origin` 和 `Cross-Origin-Embedder-Policy: require-corp` 响应头。`serve.py` 会发送这两个头；普通的 `http.server` 不会，此时宿主页面会提示缺少响应头。其他宿主同样要发送它们，并在 `init()` 之后等待 `initThreadPool(workers)` 完成；不调用时，这个包会串行执行模拟工作。
+
+渲染、音频和输入留在主线程，线程池工作时主线程自旋等待。这段时间主线程不运行引擎代码，因为在主线程等待有竞争的锁会 trap。结果不依赖线程池大小。Worker 上的 panic 会中止该 Worker，主线程会一直自旋，所以页面会卡死，而不是上报 `engine-error`。
 
 ## 兼容边界
 
@@ -53,11 +67,12 @@ python3 -m http.server 8000 --bind 127.0.0.1 --directory target/wasm-dist
 - `util::file_system` 在桌面端重新导出标准文件操作。浏览器导入资源位于 `/retail`，存档位于 `/saves`，配置位于 `/saves/profile`；MIX 归档共享导入字节，不使用内存映射。
 - 浏览器通过现有并行工作接口串行执行工作。桌面端仍选择原生 Rayon 和工作线程路径。
 - GPU 获取通过现有初始化任务让出执行。渲染使用离屏 sRGB 帧和 canvas 呈现 pass。浏览器纹理上传不会阻塞等待 GPU 完成。
+- 没有可用的 WebGPU 适配器时，浏览器构建回退到 WebGL2。WebGL2 没有存储缓冲、计算着色器、片元原子操作和重解释格式的纹理视图，因此用到这些能力的渲染器只在该设备上改用等价的渲染目标实现（`render::webgl`、`gpu::webgl_fallback`）；其他设备的路径不变。原生测试会把这些着色器翻译为 GLSL ES 3.00，设置 `VERA20K_TEST_WEBGL_FALLBACK=1` 可在原生设备上让 GPU 基准测试走回退路径。
 - 浏览器入口提供 canvas、状态回调和存储回调；现有 App 继续负责启动和对局生命周期。
 
 只有同时启用 `wasm-net` 和浏览器目标，才会启用 Fetch、WS socket 和延后的联机加载等待。桌面构建（包括启用 `wasm-net` 的构建）仍使用原生 UDP、阻塞 HTTPS 和线程调度。仅启用 `wasm` 的单机包仍会在网络入口明确返回不支持错误。浏览器不支持 LAN 发现和直接 UDP 连接。
 
-此单线程预览版也不支持随机地图生成和同步 GPU 截图／捕获，仍以已有安装地图为目标。非美式键盘布局中需要 Shift 的标点快捷键尚未完全映射。大型图集工作和同步存档准备仍可能阻塞浏览器事件循环；运行和性能验证尚待完成。
+此单线程预览版也不支持随机地图生成和同步 GPU 截图／捕获，仍以已有安装地图为目标。非美式键盘布局中需要 Shift 的标点快捷键尚未完全映射。聊天框通过引擎在激活时加到页面上的隐藏 textarea 接收输入法文字（`src/web/ime.rs`），宿主页面无需为此添加标记。大型图集工作和同步存档准备仍可能阻塞浏览器事件循环；运行和性能验证尚待完成。
 
 ## 检查
 
@@ -96,13 +111,22 @@ finish/leave 收尾完成后发送 `match-ended`，随即请求退出引擎，�
 `engine-exited`。普通菜单启动仍保留结算和返回菜单流程。未开始对局的启动
 失败不生成虚假的对局结束事件。
 
-旧的 `spawn:finished:<json>` 状态通知保留一次，但不再允许同一引擎连续启动。
-下一次启动需要新页面/实例；回调内再次启动会被拒绝。JS 回调抛错不阻止退出，
-Rust 不等待回调返回的 Promise。
+旧的 `spawn:finished:<json>` 状态通知保留一次。
+
+`engine-exited` 回调返回后，同一页面可以再次调用 `start_spawn`：先用
+`import_spawn_file` 导入下一局的文件，调用 `prepare_audio`，并传入新的画布。
+已导入的游戏资源会保留，所以 `import_file` 仍被拒绝，更换游戏目录需要新页面；
+`restore_user_file` 和 `probe` 在两局之间可用，每局都会重新读取设置。输出用的
+`AudioContext` 也会保留，所以后续启动不需要新的用户手势。一局在 `/spawn` 下的
+文件在退出时删除。`can_start_spawn()` 表示能否再次启动；对局运行中、`start_game`
+之后和 panic 之后都为 false，这些情况需要新页面/实例。线性内存不会缩小，宿主可在
+`memory.buffer.byteLength` 接近 4 GiB 上限时改用新页面。
+
+回调内再次启动会被拒绝。JS 回调抛错不阻止退出，Rust 不等待回调返回的 Promise。
 
 已启动的引擎在 `engine-exited` 之后还会发送状态 `Exited`。示例宿主据此隐藏
 游戏、等待 IndexedDB 写入完成后尝试关闭标签页，保存失败时保留警告；网站宿主
 可在保存完成后返回自己的大厅。重新加载后需重新选择游戏资源。引擎退出也
-会停止 WebAudio。桌面原生启动、结算、退出码和结果文件逻辑保持不变。
+会暂停 WebAudio。桌面原生启动、结算、退出码和结果文件逻辑保持不变。
 
 完整字段和接入示例见 [英文说明](wasm.md#lifecycle-callbacks)。

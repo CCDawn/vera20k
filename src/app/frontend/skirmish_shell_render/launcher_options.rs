@@ -13,14 +13,14 @@ use crate::ui::main_menu_dialogs::options::shell::{
     LauncherLabelAlign, LauncherOptionsLayout, LauncherStatusHelp,
 };
 use crate::ui::main_menu_dialogs::options::{
-    LauncherCheckboxId, LauncherComboId, LauncherTrackbarId, OptionsDialogState, Zoom,
+    LauncherCheckboxId, LauncherComboId, OptionsDialogState, Zoom,
 };
 use crate::ui::shell::geom::{RectPx, ShellScale};
 use crate::util::time::Instant;
 
 /// A Zoom row: the zoom and the battle's size in game pixels in this window,
 /// what `App::sync_zoom_pass` will give the match.
-fn zoom_label(zoom: Zoom, (width, height): (u32, u32), original_shape: bool) -> String {
+pub(crate) fn zoom_label(zoom: Zoom, (width, height): (u32, u32), original_shape: bool) -> String {
     use crate::render::upscale_pass::{FrameShape, ZoomGeometry};
     let shape = if original_shape {
         FrameShape::Original
@@ -187,13 +187,10 @@ fn build_text(
         ));
     }
     for &(id, rect) in &layout.trackbars {
-        if matches!(
-            id,
-            LauncherTrackbarId::Score | LauncherTrackbarId::Sound | LauncherTrackbarId::Voice
-        ) {
+        if id.plaque_reserve() > 0 {
             out.push(text_draw(
                 font,
-                &dialog.trackbar_position(id).to_string(),
+                &dialog.trackbar_plaque_text(id),
                 crate::ui::shell::trackbar::value_text_rect(rect, scale),
                 ShellAlign::H_CENTER | ShellAlign::V_CENTER,
                 if dialog.trackbar_enabled(id) {

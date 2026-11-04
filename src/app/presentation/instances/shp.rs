@@ -41,6 +41,8 @@ pub(crate) struct ShpInputs<'a> {
     pub camera: [f32; 2],
     pub render_size: [u32; 2],
     pub zoom: f32,
+    /// Unzoomed world-surface camera/clip, from the shared tactical viewport.
+    pub building_viewport: crate::app::presentation::target_lines::TacticalViewport,
     pub axis: DepthAxis,
     pub local_owner: Option<&'a str>,
     pub ignore_visibility: bool,
@@ -94,6 +96,16 @@ pub(crate) fn build_shp_instances(
     };
     let presentation = &state.match_state.match_presentation;
     let local_owner = crate::app::input::commands::preferred_local_owner_name(state);
+    let camera = [
+        state.match_state.input.camera_x,
+        state.match_state.input.camera_y,
+    ];
+    let (x, y, width, height) = crate::app::input::camera::tactical_viewport_px(state);
+    let building_viewport = crate::app::presentation::render::tactical_world_viewport(
+        camera,
+        [x, y, width, height],
+        state.renderer.world_zoom_pass.as_ref(),
+    );
     build_shp_instances_from_inputs(
         &ShpInputs {
             runtime,
@@ -102,12 +114,10 @@ pub(crate) fn build_shp_instances(
             unit_atlas: presentation.unit_atlas.as_ref(),
             barrel_image_pitches: &presentation.barrel_image_pitches,
             interpolation: &presentation.interpolation,
-            camera: [
-                state.match_state.input.camera_x,
-                state.match_state.input.camera_y,
-            ],
+            camera,
             render_size: [state.render_width(), state.render_height()],
             zoom: state.match_state.input.zoom_level,
+            building_viewport,
             axis: depth_axis(state),
             local_owner: local_owner.as_deref(),
             ignore_visibility: state.match_state.sandbox_full_visibility,
@@ -168,8 +178,7 @@ pub(crate) fn build_shp_instances_from_inputs(
         // virtual rather than the plain object coordinate; everything below this
         // point — body, bib, anims, turret, and the row they sort on — wants that
         // lifted anchor. See `locomotor_visual::BUILDING_ART_LIFT_PX`. The screen
-        // cull reads only that anchor, and the admission work below only reads,
-        // so an object off the screen skips it.
+        // bounds use this same anchor, before any turret pitch cache is touched.
         // One fresh sample for this read-only entity draw. Reuse it for the
         // anchor, infantry direction and building gun instead of reading the
         // complete pose again for each field. Never retain it across draws.
@@ -185,7 +194,31 @@ pub(crate) fn build_shp_instances_from_inputs(
                 (x, y - render_pose.visual_lift)
             }
         };
-        if !in_view(sx, sy, 200.0, 200.0, cam_x, cam_y, sw, sh, 200.0) {
+        let type_bounds = (entity.category() == EntityCategory::Structure)
+            .then(|| {
+                atlas.and_then(|atlas| {
+                    atlas.building_type_bounds(sim.interner().resolve(entity.type_ref()))
+                })
+            })
+            .flatten();
+        let visible = if let Some([left, top, width, height]) = type_bounds {
+            // Building455C20 translates Type465570 by its render point.
+            // DrawIfVisible43CF49..43CF78 tests four strict edges, without
+            // a positive-area guard: a known empty point can be admitted.
+            let view = input.building_viewport;
+            let [clip_x, clip_y, clip_width, clip_height] = view.clip.map(|v| v as f32);
+            let left = sx - view.camera[0] as f32 + left as f32;
+            let top = sy - view.camera[1] as f32 + top as f32;
+            clip_x < left + width as f32
+                && clip_y < top + height as f32
+                && clip_x + clip_width > left
+                && clip_y + clip_height > top
+        } else {
+            // Non-Buildings and an atlas that has not prepared this type keep
+            // their existing broad gate; missing metadata is not an empty box.
+            in_view(sx, sy, 200.0, 200.0, cam_x, cam_y, sw, sh, 200.0)
+        };
+        if !visible {
             continue;
         }
         // Common visibility, passenger, limbo, and DrawState admission is shared below.
@@ -251,7 +284,7 @@ pub(crate) fn build_shp_instances_from_inputs(
             local_owner,
             local_owner_id,
             sim.fog(),
-            sim.house_alliances(),
+            sim.house_alliances().as_map(),
             ignore_visibility,
             sim.session().binary_frame(),
             super::units::house_color_to_remap_row(hc),
@@ -1419,8 +1452,14 @@ fn emit_building_bib(
 /// This entry is independent of the parent's body admission and viewport:
 /// a slot offset can put an animation on screen while its parent is outside.
 /// The existing slot palette/frame/light owner is shared by every building.
+///
+/// `camera` and `projection_viewport` are the Display traversal's; only the
+/// slots its encounter can consume ([`super::overlays::slot_anim_admissible`])
+/// are prepared, and a building with none is skipped before its own work.
 pub(crate) fn build_building_anim_instances(
     state: &AppState,
+    camera: [f32; 2],
+    projection_viewport: [f32; 2],
     objects: &mut Vec<PlannedObjectInstance>,
     order: &NativeDisplayOrder,
 ) {
@@ -1456,14 +1495,16 @@ pub(crate) fn build_building_anim_instances(
         state.render_width() as f32 / zoom,
         state.render_height() as f32 / zoom,
     ];
-    for building in sim.entities().values() {
-        if building.category() != EntityCategory::Structure
-            || building
+    let slot_admitted =
+        |anim| super::overlays::slot_anim_admissible(sim, anim, camera, projection_viewport);
+    for building in sim.entities().values_of_category(EntityCategory::Structure) {
+        if slot_anims_hidden_by_sale(building)
+            || !building
                 .building_art
                 .anim_slots()
                 .iter()
-                .all(Option::is_none)
-            || slot_anims_hidden_by_sale(building)
+                .flatten()
+                .any(|&anim| slot_admitted(anim))
         {
             continue;
         }
@@ -1526,6 +1567,7 @@ pub(crate) fn build_building_anim_instances(
             sim,
             local_owner_id,
             building,
+            &slot_admitted,
             &|id| anim_colour_word(state, sim, cells.as_ref(), &shrouded, id),
             axis.origin_y,
             axis.world_height,
@@ -1577,6 +1619,7 @@ fn emit_building_anims(
     sim: &crate::sim::world::Simulation,
     local_owner_id: Option<crate::sim::intern::InternedId>,
     building: &crate::sim::game_entity::GameEntity,
+    slot_admitted: &dyn Fn(u64) -> bool,
     anim_word: &dyn Fn(u64) -> u16,
     origin_y: f32,
     world_height: f32,
@@ -1584,11 +1627,10 @@ fn emit_building_anims(
     draw_state: DrawState,
     detail_level: i32,
 ) {
-    let rules_image: String = rules
+    let rules_image: &str = rules
         .and_then(|r| r.object(building_type))
-        .map(|o| o.image.clone())
-        .unwrap_or_else(|| building_type.to_string());
-    let art_entry = match art_reg.resolve_metadata_entry(building_type, &rules_image) {
+        .map_or(building_type, |o| o.image.as_str());
+    let art_entry = match art_reg.resolve_metadata_entry(building_type, rules_image) {
         Some(e) => e,
         None => return,
     };
@@ -1597,6 +1639,9 @@ fn emit_building_anims(
         else {
             continue;
         };
+        if !slot_admitted(anim_id) {
+            continue;
+        }
         let Some(instance) = sim.anim(anim_id) else {
             continue;
         };
@@ -1676,7 +1721,7 @@ fn emit_building_anims(
             world_height,
         );
 
-        let config = art_reg.anim_runtime_config(anim_name);
+        let config = Some(runtime_config);
         // Building mark 0043F9A6..0043FA68 supplies explicit selected Convert/top
         // only when ShouldUseCellDrawer, at the light UpdateAnimation keeps
         // armed (`lighting::building_anim_light`).
@@ -1708,13 +1753,13 @@ fn emit_building_anims(
         // Preserve the existing body's color-word path. The shared pass
         // builder clears it independently for the later shadow.
         let policy = BlitPolicy::z_read(SpriteEncoding::Plain);
-        // AnimClass::Draw's tint hook (`0x00423420`) ORs the custom shield
-        // tint into the building anim's colour word independently of the
-        // ShouldUseCellDrawer intensity arm.
-        let shield_word = rules.map_or(0, |rules| {
-            crate::app::presentation::lighting::shield_tint(building, sim, rules).0
+        // AnimClass::Draw's tint hook (`0x00423420`) ORs the owner's custom
+        // tint (shield and AttachEffect) into the building anim's colour word
+        // independently of the ShouldUseCellDrawer intensity arm.
+        let custom_word = rules.map_or(0, |rules| {
+            crate::app::presentation::lighting::custom_tint(building, sim, rules).0
         });
-        let palette_light = palette_light.with_colour_word(anim_word(anim_id) | shield_word);
+        let palette_light = palette_light.with_colour_word(anim_word(anim_id) | custom_word);
         // DrawIt422CA0 -> 4AED70 retains the Anim's Convert selector. Reducing
         // it to alpha loses the indexed palette/A lookup and packed RGB565
         // blend (spatial_oracle/building_anim_translucency). The inherited
@@ -1768,10 +1813,7 @@ fn emit_building_anims(
                         // also rides the Z term (native `YDrawOffset + ZAdjust - 2`).
                         z_adjust: lifted_z_adjust(
                             lift_px,
-                            z_adjust_px
-                                + art_reg
-                                    .anim_runtime_config(anim_name)
-                                    .map_or(0, |c| c.y_draw_offset),
+                            z_adjust_px + runtime_config.y_draw_offset,
                         ),
                         z_gradient: pack_z_gradient(ZGradient::Vertical, false),
                         ..Default::default()

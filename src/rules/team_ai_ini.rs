@@ -298,6 +298,24 @@ impl TeamAiIniRegistry {
                 .any(|diagnostic| diagnostic.source() == TeamAiDefinitionSource::FixedAimd)
     }
 
+    /// Script action 51 (`0x006EF610`) constructs the AnimType its argument's
+    /// low 16 bits index. Loading binds these names tolerantly: native loads
+    /// each image in `AnimTypeClass::ReadINI` (`0x00427D00`) or on demand
+    /// (`0x00428C30`) and never fails the scenario, so art VERA cannot bind
+    /// (retail `GAWEAP_3`'s LoopEnd passes its frames) must not fail the map.
+    /// Bound names join the scheduler closure that saved resources rebind.
+    pub fn script_anim_class_roots(&self, rules: &crate::rules::ruleset::RuleSet) -> Vec<String> {
+        self.scripts
+            .iter()
+            .flat_map(|script| &script.actions)
+            .filter(|action| action.action_id == 51)
+            .filter_map(|action| rules.anim_type_name_by_index(action.argument & 0xffff))
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     pub(crate) fn fixed_resolution_view(&self) -> Self {
         Self {
             team_types: self.fixed_definitions.team_types.clone(),

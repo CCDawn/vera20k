@@ -82,6 +82,18 @@ pub(crate) struct WolLoginAccepted {
     pub(crate) motd: String,
 }
 
+/// The game's own message of the day for an accepted login, used when the
+/// lobby sends no operator welcome: a welcome, and how to page with the chat's
+/// `TXT_PAGE_COMMAND`, since the online screens have no Page button.
+pub(super) fn vera_motd(state: &AppState) -> String {
+    let page = App::csf_label(state, "TXT_PAGE_COMMAND", "TXT_PAGE_COMMAND");
+    format!(
+        "Welcome to VERA20K Online!\n\
+         Create a game or join one, and chat with everyone here.\n\
+         To send a private message, type {page} <name> <message>."
+    )
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum WolServiceRequest {
     /// `WOL__EnsureWolapiObject` `0x00786390`.
@@ -250,6 +262,9 @@ pub(crate) enum WolServiceEvent {
     /// The chat sink's OnJoin `0x007A5890` for this user: the joined
     /// channel with its users, or the result code.
     Joined(Result<super::lobby::WolJoined, u32>),
+    /// VERA: the match ended and the lobby gave back the game room this
+    /// player stayed in (`room_reopened`), owner first.
+    RoomReopened(super::lobby::WolJoined),
     /// OnJoin for another user of the current channel.
     UserJoined(WolMember),
     /// OnPart of another user (by name).
@@ -315,6 +330,9 @@ pub(crate) enum WolServiceEvent {
         action: bool,
         ansi: bool,
         options: Option<Box<crate::app::shell_network_setup::HostOptions>>,
+        /// When VERA20K Online's lobby sent it (Unix seconds); a notice's
+        /// is when it was set.
+        sent_at: Option<u64>,
     },
     /// The find sink `0x007A9970`: the channel the located user is in, or
     /// the result code.
@@ -896,6 +914,7 @@ pub(crate) fn service_event(state: &mut AppState, event: WolServiceEvent) {
             action,
             ansi,
             options,
+            sent_at,
         } => {
             super::lobby::message_received(
                 state,
@@ -906,6 +925,7 @@ pub(crate) fn service_event(state: &mut AppState, event: WolServiceEvent) {
                     action,
                     ansi,
                     options,
+                    sent_at,
                 },
             );
             return;
@@ -971,6 +991,7 @@ pub(crate) fn service_event(state: &mut AppState, event: WolServiceEvent) {
         }
         event @ (WolServiceEvent::Channels { .. }
         | WolServiceEvent::Joined(_)
+        | WolServiceEvent::RoomReopened(_)
         | WolServiceEvent::UserJoined(_)
         | WolServiceEvent::UserLeft(_)
         | WolServiceEvent::ChannelLeft
@@ -1022,6 +1043,27 @@ pub(super) fn message_box_text(state: &AppState, body: String, yes_no: bool) -> 
 
 /// A live-service refusal whose reason no CSF label carries: the box its
 /// failure opened shows `body` instead. False when no box is open.
+/// A VERA-specific box over the WOL welcome, which returns to it. False
+/// outside the welcome.
+pub(super) fn show_text_box(state: &mut AppState, body: &str) -> bool {
+    if state.frontend.shell_route != crate::app::shell_route::ShellRoute::Wol {
+        return false;
+    }
+    let message = message_box_text(state, body.to_owned(), false);
+    let dialog = message.dialog();
+    let Some(visit) = state.frontend.wol.as_mut() else {
+        return false;
+    };
+    visit.status_help = None;
+    visit.page = WolPage::Message {
+        message,
+        then: WolBoxThen::Welcome,
+    };
+    state.frontend.shell_controller.reset_to(dialog, false);
+    state.platform.window.request_redraw();
+    true
+}
+
 pub(super) fn replace_open_box_body(state: &mut AppState, body: &str) -> bool {
     match state.frontend.wol.as_mut().map(|visit| &mut visit.page) {
         Some(WolPage::Message { message, .. }) => {
@@ -1374,8 +1416,14 @@ fn poll_deadline(state: &mut AppState) -> Option<Instant> {
         return Some(deadline);
     }
     let step = match std::mem::take(&mut visit.awaiting) {
-        // 0x007866E4: no box from the wait itself.
-        Awaiting::Connect { .. } => visit.connect_failed(),
+        // 0x007866E4: no box from the wait itself. A sign-in still queued
+        // behind an old logout must not start after the wait gave up.
+        Awaiting::Connect { .. } => {
+            visit
+                .requests
+                .retain(|request| !matches!(request, WolServiceRequest::Connect { .. }));
+            visit.connect_failed()
+        }
         _ => WolStep::LocaleDecided,
     };
     apply(state, step);

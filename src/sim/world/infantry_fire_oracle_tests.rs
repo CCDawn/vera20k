@@ -980,6 +980,11 @@ fn original_single_listener_expiry_clears_pending_shot_and_shortens_passive_time
 
 #[test]
 fn original_whole_ai_shot_dynamic_logic_damage_and_deferred_lifetimes_match_native() {
+    // Stock oracle; Phobos `ROF.RandomDelay` (`0x006FD0B5`) redraws the rearm
+    // jitter.
+    if cfg!(feature = "phobos") {
+        return;
+    }
     let Some(rules) = emission_rules() else {
         return;
     };

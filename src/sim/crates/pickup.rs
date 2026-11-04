@@ -308,7 +308,7 @@ pub(crate) fn multiplayer_eligible_slot(
                 // Installed Firepower1@1005F940 returns481D52 directly,
                 //bypassing stock Is_Armed just as Speed1 bypasses Aircraft.
                 && (crate::rules::ARES_ENABLED || object.is_some_and(|object| {
-                    crate::sim::combat::combat_weapon::is_armed(actor, object)
+                    crate::sim::combat::combat_weapon::is_armed(actor, object, &sim.substrate.entities, rules, &sim.interner)
                 }))
         }
         // `0x00481C91`: a Techno actor whose type is not `Trainable=`, or

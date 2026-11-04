@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::app::AppState;
 use crate::app::movie_playback::MoviePlayback;
+use crate::app::movie_subtitles::{self, SubtitleTrack};
 use crate::audio::arbiter::HandleOwner;
 use crate::audio::sfx::SpatialGain;
 use crate::render::bink_movie::BinkMovieSurface;
@@ -80,6 +81,7 @@ pub(crate) fn playback_active(state: &AppState) -> bool {
 
 struct QueuedMovie {
     surface: Option<BinkMovieSurface>,
+    subtitles: Option<SubtitleTrack>,
     pause_simulation: bool,
 }
 
@@ -166,6 +168,18 @@ pub(crate) fn enqueue(state: &mut AppState, index: i32, pause_simulation: bool) 
         .options_profile
         .movie_progress
         .note_played(stem);
+    enqueue_file(state, stem, pause_simulation);
+}
+
+/// The tail of [`enqueue`], for a caller that already knows the clip's file
+/// name: resolve the media, resolve the cues, append to the FIFO. Everything
+/// after admission — the IncomingTransmission prelude, the housing, the movie
+/// audio, the HUD cue rows and the closing — is [`service`]'s, so a clip added
+/// here plays exactly the way a campaign transmission does.
+///
+/// Returns whether the clip was admitted. `false` means it is missing or
+/// undecodable; the caller decides what to do with the failed request.
+pub(crate) fn enqueue_file(state: &mut AppState, stem: &str, pause_simulation: bool) -> bool {
     let file_name = format!("{stem}.BIK");
     let Some((bytes, source)) = state.process_assets.manager().and_then(|assets| {
         assets
@@ -173,7 +187,7 @@ pub(crate) fn enqueue(state: &mut AppState, index: i32, pause_simulation: bool) 
             .map(|(bytes, source)| (Arc::<[u8]>::from(bytes), source.to_string()))
     }) else {
         log::info!("Radar movie {file_name} is not installed");
-        return;
+        return false;
     };
     match BinkMovieSurface::from_bytes(
         &state.renderer.gpu,
@@ -184,6 +198,14 @@ pub(crate) fn enqueue(state: &mut AppState, index: i32, pause_simulation: bool) 
         wgpu::FilterMode::Nearest,
     ) {
         Ok(surface) => {
+            // BinkMovie_Open 0x00432750 resolves cues when the clip is admitted.
+            let header = &surface.file().header;
+            let subtitles = state
+                .process_assets
+                .manager()
+                .and_then(|assets| assets.get_ref(movie_subtitles::SUBTITLE_FILE))
+                .and_then(|file| movie_subtitles::movie_subtitles(file, stem))
+                .and_then(|cues| SubtitleTrack::new(cues, header.fps_num, header.fps_den));
             log::info!(
                 "Radar movie admitted: {file_name}, source={}, pause={pause_simulation}",
                 surface.source_archive()
@@ -195,11 +217,28 @@ pub(crate) fn enqueue(state: &mut AppState, index: i32, pause_simulation: bool) 
                 .queue
                 .push_back(QueuedMovie {
                     surface: Some(surface),
+                    subtitles,
                     pause_simulation,
                 });
+            true
         }
-        Err(error) => log::warn!("Radar movie {file_name} decode unavailable: {error}"),
+        Err(error) => {
+            log::warn!("Radar movie {file_name} decode unavailable: {error}");
+            false
+        }
     }
+}
+
+/// Whether the retail aperture still owes the player a clip: one is queued or
+/// running. A caller that adds its own clips waits for this to clear so it
+/// never stacks behind a transmission.
+pub(crate) fn has_pending(state: &AppState) -> bool {
+    !state
+        .match_state
+        .match_presentation
+        .radar_movies
+        .queue
+        .is_empty()
 }
 
 /// Reconcile117's pause with an open modal. The existing clock is idempotent;
@@ -348,10 +387,8 @@ pub(crate) fn service(state: &mut AppState, wall_ms: u64) {
             .surface
             .take()
             .expect("unstarted head owns video");
-        // RESIDUAL: BinkMovie_Open 0x00432750 also looks radar clips up in
-        // subtitlemd.txt and 0x00433270 would copy their text into the radar
-        // rect; no retail file is known to cue a radar clip, and VERA draws
-        // subtitles over full-screen movies only.
+        // Radar's 0x005BF360 callback posts HUD rows instead of a movie overlay.
+        // Its cue cursor stays with the FIFO head and advances only while active.
         let playback = MoviePlayback::new(surface, state.audio.movie_mixer(), voice_volume, None);
         state.match_state.match_presentation.radar_movies.playing = Some(playback);
     }
@@ -374,6 +411,7 @@ pub(crate) fn service(state: &mut AppState, wall_ms: u64) {
         }
     };
     let surface = playback.surface();
+    let movie_frame = surface.next_frame() as u32;
     state
         .match_state
         .match_presentation
@@ -385,6 +423,25 @@ pub(crate) fn service(state: &mut AppState, wall_ms: u64) {
             surface.rgba(),
             [surface.width(), surface.height()],
         );
+    let mut due = Vec::new();
+    if active
+        && let Some(subtitles) = state
+            .match_state
+            .match_presentation
+            .radar_movies
+            .queue
+            .front_mut()
+            .and_then(|movie| movie.subtitles.as_mut())
+    {
+        subtitles.advance_with(movie_frame, |cue| {
+            if let Some(text) = cue.text.as_ref() {
+                due.push((text.clone(), cue.duration));
+            }
+        });
+    }
+    for (text, duration) in due {
+        crate::app::input::messages::post_movie_subtitle(state, &text, duration);
+    }
     if completed {
         let (has_next, service) = state
             .match_state
@@ -504,6 +561,7 @@ mod tests {
                     .iter()
                     .map(|pause| QueuedMovie {
                         surface: None,
+                        subtitles: None,
                         pause_simulation: pause.as_bool().unwrap(),
                     }),
             );

@@ -24,8 +24,20 @@ use crate::render::native_surface_format::{ACTIVE_RETAIL_RGB565_PRESENTATION, RG
 use crate::render::shell_paint::{MOVIE_DEPTH, TEXT_DEPTH};
 use crate::render::shell_text::{ScissorRect, ShellAlign, ShellTextDraw, TextRect};
 
+/// `Init_Game` `0x0052C5E2..0x0052C5EE`: the logo Play_Movie plays on every
+/// launch, before the startup splash (name `0x825F20`).
+pub(crate) const STARTUP_LOGO_MOVIE: &str = "EA_WWLOGO";
+/// `0x0052CB50` (called at `0x0052CA65`): the intro Play_Movie plays while
+/// WinMain's `[Intro] Play=` bit `[0xA8E960] & 4` is set (name `0x82618C`).
+pub(crate) const STARTUP_INTRO_MOVIE: &str = "A00_F00E";
+
 /// The continuation owned by Play_Movie's caller.
 pub(crate) enum MovieReturn {
+    /// `Init_Game` presents the startup splash next (`0x0052C5F3`).
+    StartupLogo,
+    /// `0x0052CB50` draws the empty shell backdrop next; the main menu's
+    /// first paint follows.
+    StartupIntro,
     /// State `0xD` (Sneak Peeks) sets state 4: Movies & Credits `0x101`.
     MoviesAndCredits,
     /// State `0xE` stays in place: the movie list `0x129` reopens.

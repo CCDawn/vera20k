@@ -355,6 +355,34 @@ pub struct PhobosOreGathering {
     pub frames_per_dir: Vec<i32>,
 }
 
+/// `Owner=`, `RequiredHouses=` and `ForbiddenHouses=` as House-type masks
+/// ([`crate::rules::ruleset::RuleSet::house_type_mask`]). The masks depend
+/// on the Country registry, so the Rules build and each registry refresh
+/// derive them again (`RuleSet::project_house_masks`); the token lists are
+/// written only when a type is read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HouseMasks {
+    owner: u32,
+    required: u32,
+    forbidden: u32,
+}
+
+impl HouseMasks {
+    pub(crate) fn derive(object: &ObjectType, rules: &crate::rules::ruleset::RuleSet) -> Self {
+        Self {
+            owner: rules.house_type_mask(&object.owner),
+            required: if object.required_houses.is_empty()
+                && !object.required_houses_explicitly_empty
+            {
+                u32::MAX
+            } else {
+                rules.house_type_mask(&object.required_houses)
+            },
+            forbidden: rules.house_type_mask(&object.forbidden_houses),
+        }
+    }
+}
+
 /// A game object definition parsed from a rules.ini section.
 ///
 /// Fields use sensible defaults when the INI key is absent, matching
@@ -478,19 +506,9 @@ pub struct ObjectType {
     /// qualifying member of the highest rating (`TeamClass::Fetch_A_Leader @
     /// 0x006EC3D0`).
     pub leadership_rating: i32,
-    /// `MyEffectivenessCoefficient=` (`TechnoTypeClass+0x2C8`, read at
-    /// `0x0071556B`). `None` means the key is absent, in which case native
-    /// passes `[General] MyEffectivenessCoefficientDefault` (`RulesClass+0x1040`)
-    /// as the read default — so the resolution happens where the value is used.
-    pub my_effectiveness_coefficient: Option<f64>,
-    /// `TargetEffectivenessCoefficient=` (`TechnoTypeClass+0x2D0`, `0x007155D8`).
-    pub target_effectiveness_coefficient: Option<f64>,
-    /// `TargetSpecialThreatCoefficient=` (`TechnoTypeClass+0x2D8`, `0x0071563F`).
-    pub target_special_threat_coefficient: Option<f64>,
-    /// `TargetStrengthCoefficient=` (`TechnoTypeClass+0x2E0`, `0x007156A6`).
-    pub target_strength_coefficient: Option<f64>,
-    /// `TargetDistanceCoefficient=` (`TechnoTypeClass+0x2E8`, `0x0071570C`).
-    pub target_distance_coefficient: Option<f64>,
+    /// Final retained TechnoType+2C8..2E8, published by the ordered reader
+    /// (original ReadINI71551E..715720), never resolved at score time.
+    threat_coefficients: super::threat_coefficients::ThreatCoefficients,
     /// TechnoType+2F0: exact-case `ThreatAvoidanceCoefficient`, ReadDouble
     /// 712452..712473 (5283D0), constructor positive-zero. FootUnlimbo copies
     /// this to its own retained+530 after placement succeeds (4D72EA..4D72F4).
@@ -511,6 +529,23 @@ pub struct ObjectType {
     /// techno uses its category's `[AudioVisual]` default list.
     #[cfg(feature = "phobos")]
     digital_display_types: Vec<String>,
+    /// Phobos `AttachEffect.AttachTypes`: authored `[AttachEffectTypes]`
+    /// names, in list order.
+    #[cfg(feature = "phobos")]
+    attach_effect_attach_types: Vec<String>,
+    /// `AttachEffect.DurationOverrides`, paired with `attach_types` by index.
+    #[cfg(feature = "phobos")]
+    attach_effect_duration_overrides: Vec<i32>,
+    /// `AttachEffect.Delays`: re-creation delay after a natural end.
+    #[cfg(feature = "phobos")]
+    attach_effect_delays: Vec<i32>,
+    /// `AttachEffect.InitialDelays`: first attachment delay.
+    #[cfg(feature = "phobos")]
+    attach_effect_initial_delays: Vec<i32>,
+    /// `AttachEffect.RecreationDelays`: delay after a full removal; negative
+    /// forbids re-creation.
+    #[cfg(feature = "phobos")]
+    attach_effect_recreation_delays: Vec<i32>,
     /// Phobos `TechnoTypeExt::DigitalDisplay_Disable`.
     #[cfg(feature = "phobos")]
     digital_display_disable: bool,
@@ -518,6 +553,12 @@ pub struct ObjectType {
     /// inherits `[AudioVisual] DigitalDisplay.Health.FakeAtDisguise`.
     #[cfg(feature = "phobos")]
     digital_display_health_fake_at_disguise: Option<bool>,
+    /// Phobos `TechnoTypeExt::OpenTopped_UseTransportRangeModifiers`
+    /// (`OpenTopped.UseTransportRangeModifiers=`); `None` inherits
+    /// `[General]`. A passenger inside an `OpenTopped` transport with this
+    /// set folds the transport's range modifiers instead of its own.
+    #[cfg(feature = "phobos")]
+    open_topped_use_transport_range_modifiers: Option<bool>,
     /// Phobos `BuildingTypeExt::PlacementPreview` (`PlacementPreview=`),
     /// default true. The preview also needs the rules global and the client
     /// switch.
@@ -601,6 +642,17 @@ pub struct ObjectType {
     /// retail rule; `rules::phobos_fly_wobble` owns the resolution.
     #[cfg(feature = "phobos")]
     pub(crate) fly_no_wobbles: Option<bool>,
+    /// Phobos `TechnoTypeExt::LaserTargetColor` (`Nullable<int>`): the
+    /// `[ColorAdd]` index whose word tints a building this type's airstrike
+    /// targets. Unset takes `[AudioVisual] LaserTargetColor`
+    /// (`Simulation::airstrike_laser_target_color`).
+    #[cfg(feature = "phobos")]
+    pub(crate) laser_target_color: Option<i32>,
+    /// Phobos `TechnoTypeExt::AirstrikeLineColor` (`Nullable<ColorStruct>`):
+    /// the RGB this type's airstrike beam and target dot use. Unset takes
+    /// `[AudioVisual] AirstrikeLineColor` (`Simulation::airstrike_line_color`).
+    #[cfg(feature = "phobos")]
+    pub(crate) airstrike_line_color: Option<[u8; 3]>,
     /// TechnoType+7FC, read from the current Image section of fixed ARTMD.
     /// The ordered processor owns its retained default (constructor0).
     voxel_shadow_index: i32,
@@ -644,6 +696,8 @@ pub struct ObjectType {
     /// Countries explicitly forbidden from building this (ForbiddenHouses= in rules.ini).
     /// Inverse of Owner — if the player's country is in this list, they cannot build.
     pub forbidden_houses: Vec<String>,
+    /// The three lists above as House-type masks ([`HouseMasks`]).
+    house_masks: HouseMasks,
     /// Signed `TechnoTypeClass+0x6D0` side filter used only by native AI base
     /// planning selectors ([`Self::planned_for_side`]). The constructor seed
     /// is `-1` (all sides).
@@ -731,6 +785,21 @@ pub struct ObjectType {
     /// Negative values shift the bar UP (above taller sprites). Default 0.
     /// Parsed from `PixelSelectionBracketDelta` in rules.ini.
     pub pixel_selection_bracket_delta: i32,
+    /// Phobos `TechnoTypeExt` insignia block (`Insignia*`, `InsigniaType*`,
+    /// `Insignia.ShowEnemy`), accumulated over every reached Rules pass by
+    /// the ordered TechnoType reader.
+    #[cfg(feature = "phobos")]
+    pub phobos_insignia: crate::rules::insignia_type::PhobosInsignia,
+    /// Phobos `Passengers.BySize` (`Valueable<bool>`, default yes): the
+    /// passenger-count key `DrawInsignia` indexes `Insignia.PassengersN`
+    /// with. Its other consumer, the NoQueueUpToEnter admission rewrite, is
+    /// not ported.
+    #[cfg(feature = "phobos")]
+    pub phobos_passengers_by_size: bool,
+    /// Phobos `TechnoTypeExt` Iron Curtain / Force Shield overrides
+    /// (`IronCurtain.*`, `ForceShield.*`).
+    #[cfg(feature = "phobos")]
+    pub phobos_invulnerability: crate::rules::invulnerability_rules::PhobosInvulnerability,
     /// Rules LeptonMindControlOffset: Type+3DC ctor710D28=70, read714145.
     pub lepton_mind_control_offset: i32,
     /// Sidebar/build tab grouping for structures.
@@ -1099,6 +1168,18 @@ pub struct ObjectType {
     pub veteran_abilities: AbilityFlags,
     /// The full native `EliteAbilities=` byte array (`TechnoTypeClass+0x2AE`).
     pub elite_abilities: AbilityFlags,
+    /// Phobos `TechnoTypeExt::ImmuneToCrit` (`ImmuneToCrit=`), default false.
+    #[cfg(feature = "phobos")]
+    pub(crate) immune_to_crit: bool,
+    /// Phobos `TechnoTypeExt::VeteranCritChance`; `None` inherits
+    /// `[General] VeteranCritChance`. Read only when the firer's
+    /// `CRITCHANCE` rank ability holds.
+    #[cfg(feature = "phobos")]
+    pub(crate) veteran_crit_chance: Option<f64>,
+    /// The five Phobos rank abilities read from the same
+    /// `VeteranAbilities=`/`EliteAbilities=` lists as the stock array.
+    #[cfg(feature = "phobos")]
+    pub(crate) phobos_abilities: crate::rules::phobos_crit::PhobosAbilityFlags,
     /// `SelfHealing=` (`TechnoTypeClass+0xD14`, `ReadBool` at `0x00714AE8`).
     /// A type with this set heals at every rank; otherwise the `SELF_HEAL`
     /// ability gates the same pulse (`FUN_0070BE80`).
@@ -1557,6 +1638,27 @@ pub struct ObjectType {
     /// `0x0071395E`); FreeUnit prefers it to the global one. No stock type
     /// authors it.
     pub mind_cleared_sound: Option<String>,
+    /// Phobos `MindControlRangeLimit=` (`Valueable<Leptons>`): a controlled
+    /// unit farther than this planar distance from its controller is freed.
+    /// The constructor's `Leptons` value is 0, which disables the check.
+    #[cfg(feature = "phobos")]
+    pub mind_control_range_limit: i32,
+    /// Phobos `MindControl.IgnoreSize=` (`Nullable<bool>`); `None` inherits
+    /// `[General] MindControl.IgnoreSize` (constructor true).
+    #[cfg(feature = "phobos")]
+    pub mind_control_ignore_size: Option<bool>,
+    /// Phobos `MindControlSize=` (`Valueable<int>`, constructor 1): the
+    /// control slots this type consumes while controlled.
+    #[cfg(feature = "phobos")]
+    pub mind_control_size: i32,
+    /// Phobos `MindControlLink.VisibleToHouse=` (`Nullable<AffectedHouse>`);
+    /// `None` inherits `[General] MindControlLink.VisibleToHouse` (All).
+    #[cfg(feature = "phobos")]
+    pub mind_control_link_visible_to_house: Option<crate::rules::phobos_shields::AffectedHouse>,
+    /// Phobos `MultiMindControl.ReleaseVictim=` (`Nullable<bool>`); `None`
+    /// inherits `[General] MultiMindControl.ReleaseVictim` (constructor false).
+    #[cfg(feature = "phobos")]
+    pub multi_mind_control_release_victim: Option<bool>,
     /// PsychicDamage immunity. Buildings default true natively.
     pub immune_to_psionic_weapons: bool,
     /// Poison-warhead immunity.
@@ -1891,6 +1993,10 @@ pub struct ObjectType {
     /// Same shape and same storage relationship: slot 0 is
     /// [`Self::elite_primary`], slot 1 is [`Self::elite_secondary`].
     pub elite_weapon_list: Vec<Option<String>>,
+    /// Derived: the weapons `weapon_list`, `elite_weapon_list`,
+    /// `occupy_weapon` and `elite_occupy_weapon` name, as the RuleSet that
+    /// built the type resolved them (`RuleSet::resolve_type_weapons`).
+    resolved_weapons: crate::rules::ruleset::TypeWeapons,
     /// Retained WeaponStruct and transport-port coordinates, projected from
     /// the ordered type reader rather than reconstructed from the final Image.
     weapon_offsets: crate::rules::weapon_offsets::WeaponOffsets,
@@ -2058,6 +2164,12 @@ pub struct ObjectType {
     /// AMMOCRAT (Ammo Crate).
     pub can_c4: bool,
 
+    /// Phobos `AllowAirstrike=`: whether an `Airstrike=` warhead may designate
+    /// this type. Unset keeps the vanilla rule at each call site — buildings
+    /// follow `CanC4`, every other kind is targetable.
+    #[cfg(feature = "phobos")]
+    pub allow_airstrike: Option<bool>,
+
     /// BuildingTypeClass `EligibleForDelayKill` (`+0x1551`). Native default
     /// false; only eligible buildings can convert a fatal result to PostMortem.
     pub eligible_for_delay_kill: bool,
@@ -2174,6 +2286,13 @@ pub struct ObjectType {
     /// [`ArtRegistry::can_be_hidden`](crate::rules::art_data::ArtRegistry::can_be_hidden).
     /// Gates the Behind indicator (`TechnoClass::AI_Update @ 0x006FA2A2`).
     pub can_be_hidden: bool,
+
+    /// ART `SiloDamage=` of the type's metadata section
+    /// ([`ArtRegistry::resolve_metadata_entry`](crate::rules::art_data::ArtRegistry::resolve_metadata_entry)
+    /// for its ID and Image), which a Building's storage update reads every
+    /// frame (`UpdateAnimation @ 0x00450CBD`). Derived from the installed ART:
+    /// `RuleSet` projects it whenever it installs one; no ART answers false.
+    silo_damage: bool,
 
     /// Last nonempty Palette request from the reached TechnoType ReadINI
     /// passes. This is binding metadata, not proof that its asset loaded:
@@ -2411,6 +2530,38 @@ fn native_minutes_to_ticks(value: f64) -> u32 {
 }
 
 impl ObjectType {
+    pub(crate) fn threat_coefficients(&self) -> super::threat_coefficients::ThreatCoefficients {
+        self.threat_coefficients
+    }
+
+    pub(crate) fn project_threat_coefficients(
+        &mut self,
+        coefficients: super::threat_coefficients::ThreatCoefficients,
+    ) {
+        self.threat_coefficients = coefficients;
+    }
+
+    /// Phobos `AllowAirstrike` as the cursor and `CanFire` tests read it: an
+    /// explicit value wins, a building otherwise follows `CanC4`, and every
+    /// other kind is targetable by default.
+    #[cfg(feature = "phobos")]
+    pub fn allows_airstrike(&self, is_building: bool) -> bool {
+        self.allow_airstrike
+            .unwrap_or(if is_building { self.can_c4 } else { true })
+    }
+
+    /// The weapon-choice reading of `AllowAirstrike`. Its vanilla default also
+    /// refuses a building that is both a resource destination and a resource
+    /// gatherer (`0x6F3477`), which the cursor test above does not apply.
+    #[cfg(feature = "phobos")]
+    pub fn allows_airstrike_weapon(&self, is_building: bool) -> bool {
+        self.allow_airstrike.unwrap_or(if is_building {
+            self.can_c4 && (!self.resource_destination || !self.resource_gatherer)
+        } else {
+            true
+        })
+    }
+
     pub(crate) fn bind_weapon_offsets(
         &mut self,
         offsets: &crate::rules::weapon_offsets::WeaponOffsets,
@@ -2855,16 +3006,76 @@ impl ObjectType {
         self.shield_type.as_deref()
     }
 
+    /// Phobos `TechnoTypeExt::ImmuneToCrit`.
+    #[cfg(feature = "phobos")]
+    pub fn immune_to_crit(&self) -> bool {
+        self.immune_to_crit
+    }
+
+    /// Phobos `TechnoTypeExt::VeteranCritChance`; `None` inherits
+    /// `[General] VeteranCritChance`.
+    #[cfg(feature = "phobos")]
+    pub fn veteran_crit_chance(&self) -> Option<f64> {
+        self.veteran_crit_chance
+    }
+
+    /// Phobos extension rank abilities (`ReadAdditionalAbilities`).
+    #[cfg(feature = "phobos")]
+    pub fn phobos_abilities(&self) -> &crate::rules::phobos_crit::PhobosAbilityFlags {
+        &self.phobos_abilities
+    }
+
     /// Phobos `DigitalDisplayTypes=`, in authored list order.
     #[cfg(feature = "phobos")]
     pub fn digital_display_types(&self) -> &[String] {
         &self.digital_display_types
     }
 
+    /// Phobos `AttachEffect.AttachTypes`, in authored list order.
+    #[cfg(feature = "phobos")]
+    pub fn attach_effect_attach_types(&self) -> &[String] {
+        &self.attach_effect_attach_types
+    }
+
+    /// Phobos `AttachEffect.DurationOverrides`, paired by index with
+    /// [`Self::attach_effect_attach_types`]; the last value covers the rest.
+    #[cfg(feature = "phobos")]
+    pub fn attach_effect_duration_overrides(&self) -> &[i32] {
+        &self.attach_effect_duration_overrides
+    }
+
+    /// Phobos `AttachEffect.Delays`, paired by index with
+    /// [`Self::attach_effect_attach_types`].
+    #[cfg(feature = "phobos")]
+    pub fn attach_effect_delays(&self) -> &[i32] {
+        &self.attach_effect_delays
+    }
+
+    /// Phobos `AttachEffect.InitialDelays`, paired by index with
+    /// [`Self::attach_effect_attach_types`].
+    #[cfg(feature = "phobos")]
+    pub fn attach_effect_initial_delays(&self) -> &[i32] {
+        &self.attach_effect_initial_delays
+    }
+
+    /// Phobos `AttachEffect.RecreationDelays`, paired by index with
+    /// [`Self::attach_effect_attach_types`].
+    #[cfg(feature = "phobos")]
+    pub fn attach_effect_recreation_delays(&self) -> &[i32] {
+        &self.attach_effect_recreation_delays
+    }
+
     /// Phobos `DigitalDisplay.Disable=`.
     #[cfg(feature = "phobos")]
     pub fn digital_display_disable(&self) -> bool {
         self.digital_display_disable
+    }
+
+    /// Phobos `TechnoTypeExt::OpenTopped_UseTransportRangeModifiers`;
+    /// `None` inherits `[General] OpenTopped.UseTransportRangeModifiers`.
+    #[cfg(feature = "phobos")]
+    pub fn open_topped_use_transport_range_modifiers(&self) -> Option<bool> {
+        self.open_topped_use_transport_range_modifiers
     }
 
     /// Phobos `DigitalDisplay.Health.FakeAtDisguise=`, `None` when inheriting.
@@ -2948,6 +3159,18 @@ impl ObjectType {
     #[cfg(feature = "phobos")]
     pub(crate) const fn fly_no_wobbles(&self) -> Option<bool> {
         self.fly_no_wobbles
+    }
+
+    /// Phobos `TechnoTypeExt::LaserTargetColor`, unset when the key is absent.
+    #[cfg(feature = "phobos")]
+    pub(crate) const fn laser_target_color(&self) -> Option<i32> {
+        self.laser_target_color
+    }
+
+    /// Phobos `TechnoTypeExt::AirstrikeLineColor`, unset when the key is absent.
+    #[cfg(feature = "phobos")]
+    pub(crate) const fn airstrike_line_color(&self) -> Option<[u8; 3]> {
+        self.airstrike_line_color
     }
 
     pub const fn building_light(&self) -> crate::rules::building_light::BuildingLightRules {
@@ -3447,15 +3670,73 @@ impl ObjectType {
         }
     }
 
+    /// `Owner=` (`+0x6CC`) as a House-type mask: `Get_Ownable @ 0x00711EC0`
+    /// answers it outside `DoubleOwned=`.
+    pub(crate) fn owner_mask(&self, rules: &crate::rules::ruleset::RuleSet) -> u32 {
+        self.house_masks(rules).owner
+    }
+
     /// ReadOwners4750D0 / Type reader714531: absent/empty ReadString keeps
     /// the constructor's -1 (711633), but nonempty comma-only input writes0.
     /// CanBuild4F79E4 and FirstBuildable505230 both test this raw mask.
     pub(crate) fn required_houses_mask(&self, rules: &crate::rules::ruleset::RuleSet) -> u32 {
-        if self.required_houses.is_empty() && !self.required_houses_explicitly_empty {
-            u32::MAX
-        } else {
-            rules.house_type_mask(&self.required_houses)
-        }
+        self.house_masks(rules).required
+    }
+
+    /// `ForbiddenHouses=` as a House-type mask (CanBuild4F7A7D).
+    pub(crate) fn forbidden_houses_mask(&self, rules: &crate::rules::ruleset::RuleSet) -> u32 {
+        self.house_masks(rules).forbidden
+    }
+
+    /// The masks [`crate::rules::ruleset::RuleSet`] projected; debug builds
+    /// compare them with a fresh read of the lists against `rules`.
+    fn house_masks(&self, rules: &crate::rules::ruleset::RuleSet) -> HouseMasks {
+        debug_assert!(
+            !crate::util::debug_checks::live_read_check_enabled()
+                || self.house_masks == HouseMasks::derive(self, rules),
+            "{}: house masks projected against another Country registry",
+            self.id
+        );
+        self.house_masks
+    }
+
+    /// Store masks derived against the current Country registry.
+    pub(crate) fn project_house_masks(&mut self, masks: HouseMasks) {
+        self.house_masks = masks;
+    }
+
+    /// The type's weapon records as its RuleSet resolved them; reads go
+    /// through `RuleSet::resolved_weapon`, which checks the resolving set.
+    #[inline]
+    pub(crate) fn resolved_weapons(&self) -> &crate::rules::ruleset::TypeWeapons {
+        &self.resolved_weapons
+    }
+
+    /// Store the weapon records resolved against the current weapons.
+    pub(crate) fn project_resolved_weapons(&mut self, weapons: crate::rules::ruleset::TypeWeapons) {
+        self.resolved_weapons = weapons;
+    }
+
+    /// The ART `SiloDamage=` [`crate::rules::ruleset::RuleSet`] projected;
+    /// debug builds compare it with a fresh resolution against `rules`' ART.
+    pub(crate) fn silo_damage(&self, rules: &crate::rules::ruleset::RuleSet) -> bool {
+        debug_assert!(
+            !crate::util::debug_checks::live_read_check_enabled()
+                || self.silo_damage == self.art_silo_damage(rules.art()),
+            "{}: SiloDamage projected from another ART",
+            self.id
+        );
+        self.silo_damage
+    }
+
+    /// Store the type's `SiloDamage=` resolved in `art`.
+    pub(crate) fn project_silo_damage(&mut self, art: &crate::rules::art_data::ArtRegistry) {
+        self.silo_damage = self.art_silo_damage(art);
+    }
+
+    fn art_silo_damage(&self, art: &crate::rules::art_data::ArtRegistry) -> bool {
+        art.resolve_metadata_entry(&self.id, &self.image)
+            .is_some_and(|entry| entry.silo_damage)
     }
 
     /// The AI base planning side filter: `AIBasePlanningSide=` (`+0x6D0`) is
@@ -3550,14 +3831,6 @@ impl ObjectType {
             };
         // `IsGattling=` gates the Stage loop read beside it (`0x0071407E`).
         let is_gattling = section.read_bool("IsGattling", false);
-        // The targeting coefficients (`0x0071556B..0x0071570C`) read with a
-        // `[General]` default resolved where the value is used; `None` marks
-        // an absent key.
-        let present_double = |key: &str| {
-            section
-                .is_present(key)
-                .then(|| section.read_double(key, 0.0))
-        };
         // `GuardRange=` and `AirRangeBonus=` are ReadRange whole leptons
         // (`0x007122B3`, `0x007147A9`), kept here as cells; `None` marks an
         // absent key.
@@ -3597,6 +3870,12 @@ impl ObjectType {
             section.read_list("EliteAbilities", 0x80),
             AbilityFlags::default(),
         );
+        // Phobos `ReadAdditionalAbilities` parses the same two keys for its
+        // five extension tokens, independently of the stock array above.
+        #[cfg(feature = "phobos")]
+        let mut phobos_abilities = crate::rules::phobos_crit::PhobosAbilityFlags::default();
+        #[cfg(feature = "phobos")]
+        phobos_abilities.read_pass(section);
 
         // `TechnoTypeClass::ReadINI @ 0x00712587..0x007125DF` reads the debris
         // span in a fixed order and then clamps it twice:
@@ -3668,11 +3947,7 @@ impl ObjectType {
             special_threat_value: section.read_double("SpecialThreatValue", 0.0),
             threat_posed: section.read_int("ThreatPosed", 0),
             leadership_rating: section.read_int("LeadershipRating", 5),
-            my_effectiveness_coefficient: present_double("MyEffectivenessCoefficient"),
-            target_effectiveness_coefficient: present_double("TargetEffectivenessCoefficient"),
-            target_special_threat_coefficient: present_double("TargetSpecialThreatCoefficient"),
-            target_strength_coefficient: present_double("TargetStrengthCoefficient"),
-            target_distance_coefficient: present_double("TargetDistanceCoefficient"),
+            threat_coefficients: Default::default(),
             threat_avoidance_coefficient: section.read_double_bits(
                 "ThreatAvoidanceCoefficient",
                 crate::util::native_x87::NativeF64Bits::POSITIVE_ZERO,
@@ -3699,10 +3974,39 @@ impl ObjectType {
                 })
                 .unwrap_or_default(),
             #[cfg(feature = "phobos")]
+            attach_effect_attach_types: section
+                .read_list("AttachEffect.AttachTypes", 0x800)
+                .map(|tokens| {
+                    tokens
+                        .into_iter()
+                        .map(|token| token.trim().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            #[cfg(feature = "phobos")]
+            attach_effect_duration_overrides: section
+                .read_int_list("AttachEffect.DurationOverrides")
+                .unwrap_or_default(),
+            #[cfg(feature = "phobos")]
+            attach_effect_delays: section
+                .read_int_list("AttachEffect.Delays")
+                .unwrap_or_default(),
+            #[cfg(feature = "phobos")]
+            attach_effect_initial_delays: section
+                .read_int_list("AttachEffect.InitialDelays")
+                .unwrap_or_default(),
+            #[cfg(feature = "phobos")]
+            attach_effect_recreation_delays: section
+                .read_int_list("AttachEffect.RecreationDelays")
+                .unwrap_or_default(),
+            #[cfg(feature = "phobos")]
             digital_display_disable: section.read_bool("DigitalDisplay.Disable", false),
             #[cfg(feature = "phobos")]
             digital_display_health_fake_at_disguise: section
                 .read_phobos_nullable_bool("DigitalDisplay.Health.FakeAtDisguise", None),
+            #[cfg(feature = "phobos")]
+            open_topped_use_transport_range_modifiers: section
+                .read_phobos_nullable_bool("OpenTopped.UseTransportRangeModifiers", None),
             #[cfg(feature = "phobos")]
             placement_preview: category == ObjectCategory::Building
                 && section.read_bool("PlacementPreview", true),
@@ -3783,6 +4087,10 @@ impl ObjectType {
             } else {
                 None
             },
+            #[cfg(feature = "phobos")]
+            laser_target_color: section.read_phobos_nullable_int("LaserTargetColor", None),
+            #[cfg(feature = "phobos")]
+            airstrike_line_color: section.read_phobos_nullable_color("AirstrikeLineColor", None),
             voxel_shadow_index: 0,
             pitch_speed: section.read_double_bits(
                 "PitchSpeed",
@@ -3841,6 +4149,7 @@ impl ObjectType {
             double_owned: section.read_bool("DoubleOwned", false),
             required_houses,
             required_houses_explicitly_empty,
+            house_masks: HouseMasks::default(),
             forbidden_houses,
             // gamemd-derived: `TechnoTypeClass__Constructor @ 0x00710FF0`
             // seeds +0x6D0 to -1; `TechnoTypeClass::ReadINI` around 0x007149FB
@@ -3883,6 +4192,15 @@ impl ObjectType {
             // Pass processing projects the shared reader; ART binding does not.
             foundation: crate::rules::foundation::Foundation::default(),
             pixel_selection_bracket_delta: section.read_int("PixelSelectionBracketDelta", 0),
+            // Constructor default; the ordered retained TechnoType reader
+            // accumulates these keys over every reached pass.
+            #[cfg(feature = "phobos")]
+            phobos_insignia: crate::rules::insignia_type::PhobosInsignia::default(),
+            #[cfg(feature = "phobos")]
+            phobos_passengers_by_size: section.read_ares_bool("Passengers.BySize", true),
+            #[cfg(feature = "phobos")]
+            phobos_invulnerability:
+                crate::rules::invulnerability_rules::PhobosInvulnerability::parse(section),
             // Replaced by the ordered retained Type reader in RuleSet.
             lepton_mind_control_offset: DEFAULT_LEPTON_MIND_CONTROL_OFFSET,
             build_cat: section
@@ -4034,6 +4352,12 @@ impl ObjectType {
             explodes: section.read_bool("Explodes", false),
             veteran_abilities,
             elite_abilities,
+            #[cfg(feature = "phobos")]
+            immune_to_crit: section.read_bool("ImmuneToCrit", false),
+            #[cfg(feature = "phobos")]
+            veteran_crit_chance: section.read_phobos_nullable_double("VeteranCritChance", None),
+            #[cfg(feature = "phobos")]
+            phobos_abilities,
             self_healing: section.read_bool("SelfHealing", false),
             // Constructor null; only the ordered Process owner reads it.
             death_weapon: None,
@@ -4248,6 +4572,22 @@ impl ObjectType {
                 .read_name("MindClearedSound", 0x80)
                 .map(str::to_owned)
                 .filter(|sound| !sound.is_empty() && !sound.eq_ignore_ascii_case("none")),
+            #[cfg(feature = "phobos")]
+            mind_control_range_limit: section.read_phobos_leptons("MindControlRangeLimit", 0),
+            #[cfg(feature = "phobos")]
+            mind_control_ignore_size: section
+                .read_phobos_nullable_bool("MindControl.IgnoreSize", None),
+            #[cfg(feature = "phobos")]
+            mind_control_size: section.read_ares_int("MindControlSize", 1),
+            #[cfg(feature = "phobos")]
+            mind_control_link_visible_to_house: section.read_phobos_nullable_with(
+                "MindControlLink.VisibleToHouse",
+                None,
+                crate::rules::phobos_shields::AffectedHouse::parse,
+            ),
+            #[cfg(feature = "phobos")]
+            multi_mind_control_release_victim: section
+                .read_phobos_nullable_bool("MultiMindControl.ReleaseVictim", None),
             immune_to_psionic_weapons: section.read_bool(
                 "ImmuneToPsionicWeapons",
                 category == ObjectCategory::Building,
@@ -4375,6 +4715,7 @@ impl ObjectType {
             // per-pass weapon block and RuleSet publishes its arrays.
             weapon_list: vec![None; WEAPON_SLOT_COUNT],
             elite_weapon_list: vec![None; WEAPON_SLOT_COUNT],
+            resolved_weapons: Default::default(),
             weapon_offsets: Default::default(),
             weapon_count: 0,
             naval_targeting: section.read_int("NavalTargeting", 0),
@@ -4434,6 +4775,8 @@ impl ObjectType {
             sabotage_cursor: section.read_bool("SabotageCursor", false),
             c4: category != ObjectCategory::Infantry && section.read_bool("C4", false),
             can_c4: section.read_bool("CanC4", category == ObjectCategory::Building),
+            #[cfg(feature = "phobos")]
+            allow_airstrike: section.read_bool_value("AllowAirstrike"),
             eligible_for_delay_kill: section.read_bool("EligibleForDelayKill", false),
             invisible: section.read_bool("Invisible", false),
             legal_target: section.read_bool("LegalTarget", true),
@@ -4473,6 +4816,7 @@ impl ObjectType {
             is_selectable_combatant: section.read_bool("IsSelectableCombatant", false),
             // The constructor's value; ART supplies the key (`project_art_data`).
             can_be_hidden: true,
+            silo_damage: false,
             custom_palette: None,
             reveal_to_all: section.read_bool("RevealToAll", false),
 

@@ -193,14 +193,8 @@ impl Simulation {
             .entities
             .get(id)
             .ok_or("retired Do_Action receiver")?;
-        let object = self
-            .object_type(actor.type_ref(), rules)
+        let facts = DoActionType::of(&self.interner, actor.type_ref(), rules)
             .ok_or("Do_Action requires the Infantry type")?;
-        let facts = DoActionType {
-            type_id: &object.id,
-            movement_zone: object.movement_zone,
-            crawls: object.crawls,
-        };
         self.apply_infantry_do_action(id, requested, force, &facts, rules, effects)
     }
 
@@ -242,7 +236,7 @@ impl Simulation {
         id: u64,
         requested: i32,
         force: bool,
-        facts: &DoActionType<'_>,
+        facts: &DoActionType,
         rules: &RuleSet,
         effects: FrameEffects<'_>,
     ) -> Result<bool, String> {
@@ -258,7 +252,7 @@ impl Simulation {
         // Raw WetDie20/21 and Guard1 have native records even though the
         // presentation vocabulary has no corresponding SequenceKind.
         let kind = action_kind(requested);
-        let sequences = rules.animation_sequence(facts.type_id);
+        let sequences = rules.animation_sequence_by_handle(facts.handle);
         // The type's native records (Type `+0xE3C`), signed as the reader
         // stores them; a type without them answers from its draw layout.
         let record = |action: i32| sequences.and_then(|set| set.infantry_action(action));
@@ -331,14 +325,12 @@ impl Simulation {
                 };
             }
             let old_water_state = actor.mission_leaf.as_infantry().unwrap().water_state();
-            let sound_id =
-                rules
-                    .object(facts.type_id)
-                    .and_then(|object| match (old_water_state, on_land) {
-                        (0, true) => object.leave_water_sound.as_ref(),
-                        (1, false) => object.enter_water_sound.as_ref(),
-                        _ => None,
-                    });
+            let object = rules.object_by_handle(facts.handle);
+            let sound_id = match (old_water_state, on_land) {
+                (0, true) => object.leave_water_sound.as_ref(),
+                (1, false) => object.enter_water_sound.as_ref(),
+                _ => None,
+            };
             if let Some(sound_id) = sound_id {
                 //51D842..51D8B3: PlayAt7509E0 uses Location and context0.
                 // Queue the original request before the6E8 store/admission;
@@ -493,6 +485,17 @@ impl Simulation {
                 .set_foot_firing_sequence(0);
             self.infantry_do_action(id, requested, false, rules, effects)?;
         }
+        // InfantryClass::AI @0x0051BAB0, retail gamemd.exe instructions:
+        //51BE3E..51BE52 latches Team+82 from the retained playfield byte+3D5.
+        // A fresh bounds query would discard ordinary movement's hysteresis.
+        if self
+            .substrate
+            .entities
+            .get(id)
+            .is_some_and(|actor| actor.in_playfield())
+        {
+            self.team_script_vm.mark_member_team_leaving_map(id);
+        }
         // InfantryClass::AI51BEC0 calls TryThiefVehicleCapture5202F0 before
         // the second Ready/Commence. Success returns before Fear/Fire/Doing.
         let capture = self.infantry_try_thief_capture(id, rules, registry, effects)?;
@@ -559,7 +562,7 @@ impl Simulation {
         let actor_type = actor.type_ref();
         let complete = if doing != -1 {
             let stage = actor.native_stage().value();
-            let sequences = rules.animation_sequence(self.interner.resolve(actor.type_ref()));
+            let sequences = self.interner.animation_sequence(actor.type_ref(), rules);
             let count = match sequences.and_then(|set| set.infantry_action(doing)) {
                 Some(record) => record.frames_per_facing,
                 None => action_kind(doing)
@@ -591,8 +594,9 @@ impl Simulation {
                 action if takes_default_arm(action) => {
                     // `0x00520CE6..0x00520D16`: a completed action (not -1) turns
                     // the body to its record's facing hint first.
-                    if let Some(facing) = rules
-                        .animation_sequence(self.interner.resolve(actor_type))
+                    if let Some(facing) = self
+                        .interner
+                        .animation_sequence(actor_type, rules)
                         .and_then(|set| set.infantry_action(action))
                         .and_then(|record| {
                             crate::rules::infantry_sequence::completion_facing(record.facing_hint)
@@ -699,8 +703,9 @@ impl Simulation {
         if sounds.peek().is_none() {
             return;
         }
-        let count = rules
-            .animation_sequence(self.interner.resolve(actor.type_ref()))
+        let count = self
+            .interner
+            .animation_sequence(actor.type_ref(), rules)
             .and_then(|set| set.infantry_action(doing))
             .map_or(0, |record| record.frames_per_facing);
         let frame = actor.native_stage().value() % count.max(1);
@@ -1133,12 +1138,31 @@ impl crate::sim::world::ObjectSubstrate {
 }
 
 /// The type facts `Do_Action` reads besides its sequence records.
-pub(super) struct DoActionType<'a> {
-    pub(super) type_id: &'a str,
+pub(super) struct DoActionType {
+    /// The type, whose sequence records and water sounds `Do_Action` reads.
+    pub(super) handle: crate::rules::ruleset::TypeHandle,
     /// Type `+0x5B4`.
     pub(super) movement_zone: MovementZone,
     /// `Crawls=`, Type `+0xEBD`.
     pub(super) crawls: bool,
+}
+
+impl DoActionType {
+    /// The facts of the type `type_ref` names, which the receiver's object
+    /// type lookup answers.
+    pub(super) fn of(
+        interner: &crate::sim::intern::StringInterner,
+        type_ref: crate::sim::intern::InternedId,
+        rules: &RuleSet,
+    ) -> Option<Self> {
+        let handle = interner.type_handle(type_ref, rules)?;
+        let object = rules.object_by_handle(handle);
+        Some(Self {
+            handle,
+            movement_zone: object.movement_zone,
+            crawls: object.crawls,
+        })
+    }
 }
 
 #[cfg(test)]

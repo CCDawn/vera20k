@@ -276,7 +276,8 @@ impl GameEntity {
 /// built before a map reader sets veterancy, as for the CaptureManager).
 pub(crate) fn init_temporal(object_type: &ObjectType, rules: &RuleSet) -> TemporalState {
     let temporal = crate::sim::combat::combat_weapon::weapon_for_index(object_type, 0, 0)
-        .and_then(|(weapon_name, _)| rules.weapon(weapon_name))
+        .and_then(|record| record.weapon_id)
+        .and_then(|weapon_name| rules.weapon(weapon_name))
         .and_then(|weapon| weapon.warhead.as_deref())
         .and_then(|warhead| rules.warhead(warhead))
         .is_some_and(|warhead| warhead.temporal);
@@ -679,11 +680,30 @@ impl Simulation {
         };
         let facts = crate::sim::combat::combat_weapon::attacker_facts(entity, object);
         let index = crate::sim::combat::combat_weapon::what_weapon_should_i_use(
-            rules, object, &facts, None,
+            rules,
+            object,
+            &facts,
+            None,
+            |index| {
+                crate::sim::combat::combat_weapon::get_weapon(
+                    entity,
+                    object,
+                    index,
+                    &self.substrate.entities,
+                    rules,
+                    &self.interner,
+                )
+            },
         );
-        crate::sim::combat::combat_weapon::weapon_for_index(object, entity.veterancy.rank(), index)
-            .and_then(|(weapon, _)| rules.weapon(weapon))
-            .map_or(0, |weapon| weapon.damage)
+        crate::sim::combat::combat_weapon::get_weapon(
+            entity,
+            object,
+            index,
+            &self.substrate.entities,
+            rules,
+            &self.interner,
+        )
+        .map_or(0, |weapon| weapon.damage)
     }
 
     /// `TechnoClass+0x82` InOpenTransport: inside an `OpenTopped=` transport.

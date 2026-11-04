@@ -390,6 +390,11 @@ impl App {
 
     fn return_from_fullscreen_movie(state: &mut AppState, return_to: MovieReturn) {
         match return_to {
+            // The frame loop presents the splash, then starts the pending
+            // intro, then paints the shell (`App::render_frame`).
+            MovieReturn::StartupLogo | MovieReturn::StartupIntro => {
+                state.platform.window.request_redraw();
+            }
             MovieReturn::MoviesAndCredits => Self::open_movies_credits_page(state),
             MovieReturn::MovieList => Self::open_movie_list(state),
             MovieReturn::CampaignStart(request) => {

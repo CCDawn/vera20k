@@ -6,9 +6,11 @@
 //! normally from the recorded header and consumes both record kinds at their
 //! original scheduler rungs.
 //!
-//! [`ReplayLog`] is the Rust command/hash recording. Version 3 retains the
-//! resolved authored Battle startup for standalone verification through the
-//! normal loader and frame owner. It is separate from [`NativeReplay`]. Production
+//! [`ReplayLog`] is the Rust command/hash recording. Version 4 regenerates
+//! shared PlanMgr events at their native publication rungs instead of importing
+//! them as frame input. It retains the resolved authored startup, Cooperative
+//! aside, for standalone verification through the normal loader and frame owner.
+//! It is separate from [`NativeReplay`]. Production
 //! does not record or play native streams yet; only tests build
 //! [`NativeReplay`], which is kept for native recording playback.
 
@@ -711,6 +713,8 @@ pub enum ScenarioServiceInput {
 
 impl ScenarioServiceInput {
     pub fn apply(self, sim: &mut Simulation) -> Vec<crate::sim::trigger_runtime::TriggerEffect> {
+        // These write the world outside a frame step.
+        sim.note_revision();
         match self {
             Self::Pause => sim.session.pause_scenario(0),
             Self::Resume => sim.session.resume_scenario(),
@@ -746,7 +750,7 @@ pub struct ReplayLog {
     pub initial_scenario_services: Vec<ScenarioServiceInput>,
 }
 
-pub const REPLAY_VERSION: u32 = 3;
+pub const REPLAY_VERSION: u32 = 4;
 
 /// The resolved launch and draw-free initial cursor projection contain no
 /// service session, ticket, network endpoint, authentication key or password.
@@ -770,6 +774,10 @@ pub struct ReplayStartup {
 }
 
 impl ReplayStartup {
+    pub fn map_sha256(&self) -> &str {
+        &self.map_sha256
+    }
+
     pub fn launch_session(&self) -> &crate::skirmish_launch::SkirmishLaunchSession {
         &self.launch
     }
@@ -807,13 +815,14 @@ impl ReplayStartup {
             "standalone replay requires the normal App's batched paths"
         );
         anyhow::ensure!(
-            launch.mode.class == crate::skirmish_modes::MpModeClass::Battle,
-            "standalone replay currently supports authored Battle launches"
+            launch.mode.class != crate::skirmish_modes::MpModeClass::Cooperative,
+            "standalone replay does not support Cooperative launches"
         );
         let map_name = launch
             .selected_map_file
             .as_deref()
             .context("replay launch map")?;
+        let map_name = crate::map::source::portable_map_name(map_name);
         crate::map::source::validate_network_map_name(map_name)?;
         anyhow::ensure!(
             map_name == sim.session().map_name(),
@@ -840,6 +849,8 @@ impl ReplayStartup {
         );
         crate::sim::scenario_bootstrap::MatchLaunchDescriptor::from_resolved(launch.clone())
             .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let mut launch = launch.clone();
+        launch.selected_map_file = Some(map_name.to_owned());
         Ok(Self {
             version: 2,
             native_id_prefix: Some(
@@ -850,7 +861,7 @@ impl ReplayStartup {
             map_hash,
             map_payload_len,
             map_sha256: map_sha256.to_owned(),
-            launch: launch.clone(),
+            launch,
             session: sim.session().clone(),
             scenario_rng: sim.scenario_rng().clone(),
             main_rng: sim.main_rng().checkpoint(),
@@ -884,7 +895,7 @@ impl ReplayStartup {
         );
         crate::map::source::validate_network_map_name(&header.map_name)?;
         anyhow::ensure!(
-            self.launch.mode.class == crate::skirmish_modes::MpModeClass::Battle,
+            self.launch.mode.class != crate::skirmish_modes::MpModeClass::Cooperative,
             "unsupported replay launch mode"
         );
         anyhow::ensure!(
@@ -907,9 +918,10 @@ impl ReplayLog {
     /// Validate the immutable startup before a CLI or rendered loader opens
     /// assets. Diagnostic-only segments cannot silently become new matches.
     pub fn standalone_startup(&self) -> Result<&ReplayStartup> {
-        let startup = self.startup.as_deref().context(
-            "diagnostic log has no standalone startup; record a fresh authored Battle match",
-        )?;
+        let startup = self
+            .startup
+            .as_deref()
+            .context("diagnostic log has no standalone startup; record a fresh authored match")?;
         startup.validate_header(&self.header)?;
         anyhow::ensure!(
             self.ticks.iter().any(|tick| tick.state_hash.is_some()),
@@ -1102,15 +1114,13 @@ impl ReplayPlayback {
             replay.header.rules_hash
         );
         anyhow::ensure!(
-            (1..=REPLAY_VERSION).contains(&replay.header.version),
+            replay.header.version == REPLAY_VERSION,
             "unsupported replay version"
         );
-        if replay.header.version == REPLAY_VERSION {
-            anyhow::ensure!(
-                runtime.simulation.session().map_name() == replay.header.map_name,
-                "replay map name mismatch"
-            );
-        }
+        anyhow::ensure!(
+            runtime.simulation.session().map_name() == replay.header.map_name,
+            "replay map name mismatch"
+        );
         if let Some(startup) = replay.startup.as_deref() {
             startup.validate_header(&replay.header)?;
             anyhow::ensure!(
@@ -1256,15 +1266,20 @@ impl ReplayPlayback {
 
 impl ReplayRunner {
     /// Reconstruct with the same authored loader and playback cursor as the client.
-    pub fn verify(retail_dir: &Path, replay: &ReplayLog) -> Result<ReplayVerification> {
+    pub fn verify(
+        retail_dir: &Path,
+        replay: &ReplayLog,
+        map_beside: Option<&str>,
+    ) -> Result<ReplayVerification> {
         let startup = replay.standalone_startup()?;
-        let launch = crate::sim::scenario_bootstrap::MatchLaunchDescriptor::from_resolved(
-            startup.launch.clone(),
-        )
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let map_file = map_beside.unwrap_or(&replay.header.map_name);
+        let mut session = startup.launch.clone();
+        session.selected_map_file = Some(map_file.to_owned());
+        let launch = crate::sim::scenario_bootstrap::MatchLaunchDescriptor::from_resolved(session)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         let mut loaded = crate::headless_scenario::load_with_launch_and_ini(
             retail_dir,
-            &replay.header.map_name,
+            map_file,
             startup.seed(),
             launch,
             &Default::default(),
@@ -1449,6 +1464,17 @@ mod tests {
     #[test]
     #[ignore = "slow; authored retail Battle load and standalone replay reconstruction"]
     fn authored_ai_match_reconstructs_and_checks_actual_command_hashes() {
+        authored_match_reconstructs(crate::skirmish_launch::BATTLE_MODE_ID);
+    }
+
+    /// A class other than Battle, with its own mode INI, through the same owner.
+    #[test]
+    #[ignore = "slow; authored retail FreeForAll load and standalone replay reconstruction"]
+    fn authored_free_for_all_match_reconstructs() {
+        authored_match_reconstructs(2);
+    }
+
+    fn authored_match_reconstructs(mode_id: i32) {
         use crate::sim::world::{FrameEffects, TickLane};
         let root = std::path::PathBuf::from(std::env::var_os("RA2_DIR").expect("retail RA2_DIR"));
         let mut launch = crate::headless_scenario::battle_session(
@@ -1459,6 +1485,7 @@ mod tests {
             )],
         );
         launch.humans[0].name = "ReplayGuest".to_owned();
+        launch.mode = crate::skirmish_launch::SkirmishLaunchMode::stock(mode_id).unwrap();
         let assets = crate::assets::asset_manager::AssetManager::new(
             &root,
             crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
@@ -1651,14 +1678,25 @@ mod tests {
                 .to_string()
                 .contains("native-ID startup prefix")
         );
-        let verified = ReplayRunner::verify(&root, &decoded).unwrap();
+        let verified = ReplayRunner::verify(&root, &decoded, None).unwrap();
         assert_eq!(verified.checked_hashes, 33);
         assert_eq!(verified.final_tick, 32);
         assert_eq!(verified.final_state_hash, scene.sim().state_hash());
+        // A -SPAWN replay's map exists only beside the replay file.
+        let beside =
+            std::env::temp_dir().join(format!("vera20k-replay-{}-{mode_id}", std::process::id()));
+        std::fs::create_dir_all(&beside).unwrap();
+        let map = beside.join("XMP03T4.MAP");
+        std::fs::write(&map, assets.get("XMP03T4.MAP").unwrap()).unwrap();
+        let verified = ReplayRunner::verify(&root, &decoded, map.to_str());
+        // Remove the map this test wrote, then its now-empty directory.
+        std::fs::remove_file(&map).unwrap();
+        std::fs::remove_dir(&beside).unwrap();
+        assert_eq!(verified.unwrap().final_state_hash, scene.sim().state_hash());
         let mut corrupted = decoded;
         corrupted.ticks[10].state_hash = Some(1);
         assert!(
-            ReplayRunner::verify(&root, &corrupted)
+            ReplayRunner::verify(&root, &corrupted, None)
                 .unwrap_err()
                 .to_string()
                 .contains("state hash mismatch")
@@ -1676,7 +1714,7 @@ mod tests {
             pixel_conversion_bounds: Default::default(),
         });
         assert!(
-            ReplayRunner::verify(Path::new("absent-retail"), &replay)
+            ReplayRunner::verify(Path::new("absent-retail"), &replay, None)
                 .unwrap_err()
                 .to_string()
                 .contains("no standalone startup")
@@ -2160,10 +2198,10 @@ mod tests {
             .encode();
             let mut live = SimRuntime::from_simulation(world(frame));
             let mut replay = ReplayLog::new(ReplayHeader {
-                version: 1,
+                version: REPLAY_VERSION,
                 tick_hz: 15,
                 seed: 73,
-                map_name: "frameinfo".into(),
+                map_name: live.simulation.session().map_name().to_owned(),
                 rules_hash: 0,
                 pixel_conversion_bounds: live.simulation.session().pixel_conversion_bounds(),
             });

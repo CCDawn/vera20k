@@ -1119,6 +1119,66 @@ fn reservation_mask(reservation_arg: i32) -> u32 {
 #[path = "cell_rect_clamp_tests.rs"]
 mod clamp_tests;
 
+/// YRpp `CellSpreadEnumerator` (`Helpers/Enumerators.h`): cell offsets from
+/// the center outward, ring by ring, clamped to its `Max` of 0x100. Ring 1 is
+/// `(0,0), (-1,-1), (0,-1), (1,-1), (-1,0), (1,0), (-1,1), (0,1), (1,1)`.
+pub fn cell_spread_offsets(spread: usize) -> Vec<(i16, i16)> {
+    /// `CellSpreadEnumerator::Max`.
+    const MAX_SPREAD: usize = 0x100;
+    let spread = spread.min(MAX_SPREAD);
+    let mut curspread: usize = 0;
+    let mut current = (0i16, 0i16);
+    let mut has_two = true;
+    let mut had_two = true;
+    let mut cells = Vec::with_capacity(spread * 4 + 1);
+    loop {
+        if curspread > spread {
+            return cells;
+        }
+        cells.push(current);
+        if current == (0, 0) || (current.0 == 1 && current.1 == curspread as i16) {
+            curspread += 1;
+            current = (-1, -(curspread as i16));
+            has_two = true;
+            had_two = true;
+            continue;
+        }
+        if has_two {
+            current.0 += 1;
+            has_two = current.0 == 0;
+            continue;
+        }
+        if current.0 < 0 {
+            current.0 = -current.0;
+            has_two = had_two;
+            continue;
+        }
+        current.1 += 1;
+        let change_sign = current.1 > 0;
+        if change_sign {
+            current.1 = -current.1;
+        }
+        current.0 = (curspread as i16 + current.1)
+            .wrapping_mul(-2)
+            .wrapping_sub(1);
+        let diff = current.0 - current.1;
+        has_two = diff >= 0;
+        had_two = has_two;
+        if diff == -1 {
+            current.0 += 1;
+        } else if diff < 0 {
+            current.0 = current
+                .1
+                .wrapping_neg()
+                .wrapping_div(2)
+                .wrapping_sub(curspread as i16);
+        }
+        if change_sign {
+            current.1 = -current.1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1835,7 +1895,8 @@ mod tests {
         assert_eq!(terrain.dummy_cell_requested_coord(), (1, 0));
         zone_grid
             .base_topology_mut_for_test()
-            .raw_zone_ids_by_row_mut_for_test()[row][3] = u16::MAX;
+            .raw_zone_ids_by_row_mut_for_test()[row][3] =
+            u16::MAX as crate::sim::pathfinding::zone_map::ZoneId;
         assert!(!check(77, &zone_grid), "raw 0xffff stays distinct");
         assert_eq!(
             terrain.dummy_cell_requested_coord(),
@@ -1872,7 +1933,8 @@ mod tests {
         assert!(!check(&terrain, &zone_grid, 92, true));
         zone_grid
             .base_topology_mut_for_test()
-            .raw_zone_ids_by_row_mut_for_test()[row][cluster] = u16::MAX;
+            .raw_zone_ids_by_row_mut_for_test()[row][cluster] =
+            u16::MAX as crate::sim::pathfinding::zone_map::ZoneId;
         assert!(check(&terrain, &zone_grid, 0xFFFF, true));
         terrain.cells_mut_for_test()[0].bridge_facts.raw_flags = BRIDGE_FLAG_STRUCTURAL;
         assert_eq!(

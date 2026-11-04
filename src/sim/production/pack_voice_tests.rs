@@ -94,3 +94,28 @@ fn deploy_voice_suppression_roundtrips_independently_of_the_audio_latch() {
         "restored authority is independent"
     );
 }
+
+/// A deploy click runs VoiceDeploy (`0x00708E00`) on the clicking client
+/// only, clearing its Techno+4F8; the state hash must not tell the clients
+/// apart.
+#[test]
+fn a_clients_own_deploy_click_does_not_reach_the_state_hash() {
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = retail.rules;
+    let client = |clicked: bool| {
+        let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x708E00);
+        let miner = sim
+            .spawn_object("SMIN", "Americans", 10, 10, 0, &rules)
+            .expect("SMIN spawns");
+        let entity = sim.substrate.entities.get_mut(miner).unwrap();
+        entity.suppress_deploy_voice.suppress();
+        if clicked {
+            let _ = sim.deploy_voice_request(&rules, miner, true);
+            assert!(!sim.entities().get(miner).unwrap().deploy_voice_suppressed());
+        }
+        sim
+    };
+    assert_eq!(client(true).state_hash(), client(false).state_hash());
+}

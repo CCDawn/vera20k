@@ -5,33 +5,40 @@
 //!
 //! Normal TaskForce and Full hover-transport chains share construction,
 //! membership, cargo, placement and scalar cleanup owners. Droppod uses the
-//! existing paradrop carrier/flight/departure owners; Full storage fill remains
-//! a separate mechanism and refuses explicitly. Team
+//! existing paradrop carrier/flight/departure owners. Full mineral storage uses
+//! the existing miner hold; other four-slot float storage refuses explicitly. Team
 //! retention of an off-map Dummy Cell identity remains a TeamTarget residual.
 
 use super::{TeamScriptAction, TeamTarget, TeamTypeHouse};
 use crate::map::entities::EntityCategory;
 use crate::rules::locomotor_type::MovementZone;
+use crate::rules::object_type::ObjectCategory;
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
+use crate::rules::tiberium_type::TiberiumTypeId;
 use crate::sim::components::DriveCoord;
 use crate::sim::find_nearby_cell::{NearbyArgs, NearbyFootprint, PassabilityArgs};
 use crate::sim::intern::InternedId;
+use crate::sim::miner::{CargoBale, MinerKind, miner_kind_for_object};
 use crate::sim::mission::MissionType;
 use crate::sim::movement::infantry_entry::{EntryQueryMode, InfantryEntryArgs};
 use crate::sim::movement::teleport_movement::ChronoWarp;
+use crate::sim::tiberium::resource_type_for_tiberium_image;
 use crate::sim::world::{FrameEffects, PlacementEvidence, Simulation, UninitContext};
 
 impl Simulation {
     /// GetHouse6F2070: fixed Country attachment, otherwise the native
-    /// Scenario1180 start-slot mapping used by Player@A..H510ED0. Country
+    /// Scenario1180 start-slot mapping used by Player@A..H510ED0 (VERA
+    /// extends this to A..AD). Country
     /// resolution uses House array order502D30, never sorted owner names.
     fn team_type_house(&self, team_type: InternedId, rules: &RuleSet) -> Option<InternedId> {
         match self.team_script_vm.team_type_ini.get(&team_type)?.house? {
             TeamTypeHouse::Country(country) => self.house_by_country_index(country, rules),
-            TeamTypeHouse::PlayerAt(slot) => {
-                self.house_by_trigger_selector(0x117B + i32::from(slot), rules)
-            }
+            TeamTypeHouse::PlayerAt(slot) => self.house_by_trigger_selector(
+                crate::rules::native_processing::HOUSE_TYPE_PLAYER_AT_SELECTORS.start
+                    + i32::from(slot),
+                rules,
+            ),
         }
     }
 
@@ -240,11 +247,9 @@ impl Simulation {
             .current_house()
             .filter(|&current| {
                 placed
-                    && crate::map::houses::is_allied_with(
-                        self.house_alliances.as_map(),
-                        self.interner.resolve(owner),
-                        self.interner.resolve(current),
-                    )
+                    && self
+                        .house_alliances
+                        .is_allied(&self.interner, owner, current)
             })
             .map(|_| origin);
         //65DB9C returns true regardless of PlaceMembers' result. Ordinary
@@ -489,11 +494,8 @@ impl Simulation {
             self.session
                 .current_house()
                 .filter(|&current| {
-                    crate::map::houses::is_allied_with(
-                        self.house_alliances.as_map(),
-                        self.interner.resolve(owner),
-                        self.interner.resolve(current),
-                    )
+                    self.house_alliances
+                        .is_allied(&self.interner, owner, current)
                 })
                 .map(|_| origin)
         });
@@ -695,12 +697,19 @@ impl Simulation {
             .get(&definition.task_force_id)?
             .entries
             .clone();
-        // Full65DE53..65DE80 fills StorageClass before veterancy and
-        // AddMember. The selected ALL01 types must pass the production
-        // scenario reader's Storage0 boundary; the mineral/bale migration
-        // does not represent
-        // this arbitrary four-slot float fill. Preserve an explicit boundary
-        // instead of inventing a second storage owner for other Full teams.
+        let full_cargo = metadata
+            .full
+            .then(|| {
+                let slot = TiberiumTypeId(0);
+                let ty = rules.tiberium_types.get(slot)?;
+                CargoBale::of_type(slot, resource_type_for_tiberium_image(ty.image), rules)
+            })
+            .flatten();
+        // CreateMembers65DE53..65DE80 fills literal Storage slot0 before
+        // veterancy/AddMember. Miner owns represented whole-bale storage;
+        // retain an explicit Rust representation boundary for other positive
+        // Storage types, oversized capacities or a missing slot descriptor.
+        // These refusals are not native admission rules.
         if metadata.full
             && entries.iter().any(|entry| {
                 entry.count > 0
@@ -709,11 +718,20 @@ impl Simulation {
                             entry.member_type.category,
                             self.interner.resolve(entry.member_type.id),
                         )
-                        .is_some_and(|object| object.storage > 0)
+                        .is_some_and(|object| {
+                            object.storage > 0
+                                && (entry.member_type.category != ObjectCategory::Vehicle
+                                    || !matches!(
+                                        miner_kind_for_object(object),
+                                        Some(MinerKind::War | MinerKind::Chrono)
+                                    )
+                                    || u16::try_from(object.storage).is_err()
+                                    || full_cargo.is_none())
+                        })
             })
         {
             log::warn!(
-                "TeamType {} Full StorageClass fill is unported",
+                "TeamType {} Full StorageClass fill exceeds the represented miner hold",
                 self.interner.resolve(team_type)
             );
             return None;
@@ -756,10 +774,21 @@ impl Simulation {
         let mut transports = Vec::new();
         for entry in entries {
             let type_name = self.interner.resolve(entry.member_type.id).to_string();
+            let Some(object) = rules.object_in_category(entry.member_type.category, &type_name)
+            else {
+                continue;
+            };
+            let full_storage = if metadata.full {
+                object.storage.max(0)
+            } else {
+                0
+            };
             for _ in 0..entry.count {
+                // CreateMembers65DE36 calls the retained TaskForce Type's
+                // CreateObject virtual, shared with the existing typed ctor.
                 let member = self.with_object_placement_scope(|sim| {
-                    sim.construct_object_limbo_at_height(
-                        &type_name,
+                    sim.construct_resolved_object_limbo_at_height(
+                        object,
                         &owner_name,
                         0,
                         0,
@@ -777,6 +806,20 @@ impl Simulation {
                     .entities
                     .get_mut(member)
                     .expect("constructed member");
+                // CreateMembers65DE7B calls StorageClass::AddAmount6C9690
+                // after the concrete ctor zeroes storage, before veterancy.
+                // Positive u16 capacities are exact in the native f32 slot.
+                if full_storage > 0 {
+                    entity
+                        .miner
+                        .as_mut()
+                        .expect("Full storage preflight admitted a miner")
+                        .add_bales(
+                            full_cargo.expect("Full storage preflight resolved slot0"),
+                            u16::try_from(full_storage)
+                                .expect("Full storage preflight bounded capacity"),
+                        );
+                }
                 match metadata.veteran_level {
                     0 => entity.veterancy.set_rookie(),
                     2 => entity.veterancy.set_veteran(),

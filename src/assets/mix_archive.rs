@@ -313,7 +313,16 @@ impl MixArchive {
                 len,
             });
         }
-        #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+        // WASI has no memory maps (memmap2's stub refuses every map), so the
+        // headless wasm determinism run reads each archive whole.
+        #[cfg(target_os = "wasi")]
+        {
+            Self::from_data(MixData::from_owned(std::fs::read(path)?))
+        }
+        #[cfg(not(any(
+            all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"),
+            target_os = "wasi"
+        )))]
         {
             let file = File::open(path)?;
             let data = unsafe { memmap2::MmapOptions::new().map(&file)? };

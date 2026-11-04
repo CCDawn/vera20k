@@ -52,7 +52,17 @@ impl ZoneQueryCell {
 mod bridge_repair_zones;
 
 /// Zone ID: 0 = impassable/unassigned, 1+ = valid zone.
-pub type ZoneId = u16;
+// In-memory IDs can address a large hierarchy. Native word interpretation
+// remains selected by each map; snapshot layout versions describe this storage.
+pub type ZoneId = u32;
+
+pub(crate) fn raw_zone_invalid(grid: crate::map::cell_index::CellGrid) -> ZoneId {
+    if grid.is_extended() {
+        ZoneId::MAX
+    } else {
+        u32::from(u16::MAX)
+    }
+}
 
 /// Sentinel for impassable or unassigned cells.
 pub const ZONE_INVALID: ZoneId = 0;
@@ -101,7 +111,7 @@ impl ZoneMap {
     /// Highest assigned zone ID. Native-derived maps reserve label 1, so this
     /// can be greater than the number of publicly passable components.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn zone_count(&self) -> u16 {
+    pub(crate) fn zone_count(&self) -> ZoneId {
         self.zone_ids.iter().copied().max().unwrap_or(ZONE_INVALID)
     }
 
@@ -238,7 +248,7 @@ impl<'de> serde::Deserialize<'de> for ZoneGrid {
                     .raw_zone_ids_by_row
                     .iter()
                     .any(|row| row.len() != labels)
-                || base.zone_ids.iter().any(|id| usize::from(*id) >= labels)
+                || base.zone_ids.iter().any(|id| *id as usize >= labels)
             {
                 return Err(serde::de::Error::custom(
                     "saved navigation raw rows do not cover base IDs",
@@ -360,7 +370,7 @@ impl ZoneGrid {
             }
         }
 
-        let mut hasher = crate::sim::state_hasher::StateHasher::new();
+        let mut hasher = crate::util::state_hasher::StateHasher::new();
         self.base_topology
             .native_bridge_source_size
             .hash(&mut hasher);
@@ -919,7 +929,13 @@ impl ZoneGrid {
                 .ok_or("583820 requires the native hierarchy node")?;
             // The native load sign-extends the stored short, whereas its
             // requested zone argument is the zero-extended path identifier.
-            if i32::from(found as i16) == i32::from(zone) {
+            if if crate::map::cell_index::CellGrid::for_extent(self.width, self.height)
+                .is_extended()
+            {
+                found == zone
+            } else {
+                i64::from(found as i16) == i64::from(zone)
+            } {
                 return Ok(candidate);
             }
         }
@@ -1022,8 +1038,15 @@ impl ZoneGrid {
             let raw = self.base_topology.raw_zone_ids_by_row[row]
                 .get(cluster as usize)
                 .copied()
-                .unwrap_or(u16::MAX);
-            let projected = if raw > 1 && raw != u16::MAX {
+                .unwrap_or(raw_zone_invalid(
+                    crate::map::cell_index::CellGrid::for_extent(self.width, self.height),
+                ));
+            let projected = if raw > 1
+                && raw
+                    != raw_zone_invalid(crate::map::cell_index::CellGrid::for_extent(
+                        self.width,
+                        self.height,
+                    )) {
                 raw
             } else {
                 ZONE_INVALID

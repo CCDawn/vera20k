@@ -150,9 +150,11 @@ pub fn approx_sqrt_f32(squared_distance: i32) -> f32 {
 /// The original computes this with `FYL2X` (`ln(2) * log2(x)`). Its low bits
 /// are largely irrelevant because `approx_sqrt` immediately narrows the result
 /// to single precision, but the last bit is not proven identical to the
-/// hardware instruction — see the FP contract report.
+/// hardware instruction — see the FP contract report. Host `ln`s disagree in
+/// that bit (`ln(3)` among them), so every client takes libm's, keeping the
+/// generated map the same on every target.
 pub fn ln(value: TruncF64) -> TruncF64 {
-    TruncF64::from_f64(value.to_f64().ln())
+    TruncF64::from_f64(libm::log(value.to_f64()))
 }
 
 /// Normally distributed draws, matching the original's Box-Muller helper.
@@ -317,6 +319,16 @@ mod tests {
             );
             assert!(approx > 0.0, "sqrt({value}) must stay positive");
         }
+    }
+
+    #[test]
+    fn ln_is_the_same_on_every_target() {
+        // ln(3): Apple's libm gives 1.0986122886681098, libm one bit below;
+        // every client must take the same one.
+        assert_eq!(
+            ln(TruncF64::from_f64(3.0)).to_f64().to_bits(),
+            1.098_612_288_668_109_6_f64.to_bits()
+        );
     }
 
     #[test]

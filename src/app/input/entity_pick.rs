@@ -20,6 +20,11 @@ use crate::sim::vision::FogState;
 /// mutation of authoritative entities. Native callers/tests retain raw geometry.
 pub(crate) trait PickSource: Copy {
     fn entities(&self) -> &EntityStore;
+    /// Type facts are supplied by the live presentation view. Bare stores used
+    /// for Tactical6DA380 fixtures have no rules and leave Display's gate open.
+    fn type_invisible(&self, _entity: &crate::sim::game_entity::GameEntity) -> bool {
+        false
+    }
     fn screen_position(&self, entity: &crate::sim::game_entity::GameEntity) -> (f32, f32) {
         crate::render::locomotor_visual::screen_position(entity)
     }
@@ -77,11 +82,17 @@ impl PickWorld for &crate::sim::world::Simulation {
 #[derive(Clone, Copy)]
 pub(crate) struct PresentedWorld<'a> {
     pub sim: &'a crate::sim::world::Simulation,
+    pub rules: Option<&'a RuleSet>,
     pub interpolation: &'a crate::app::presentation::interpolation::RenderInterpolation,
     /// [`crate::app::presentation::instances::translucent_fog_viewer`].
     pub translucent_viewer: Option<InternedId>,
 }
 impl PickSource for PresentedWorld<'_> {
+    fn type_invisible(&self, entity: &crate::sim::game_entity::GameEntity) -> bool {
+        self.rules
+            .and_then(|rules| self.sim.object_type(entity.type_ref(), rules))
+            .is_some_and(|object| object.invisible)
+    }
     fn entities(&self) -> &EntityStore {
         self.sim.entities()
     }
@@ -114,6 +125,7 @@ pub(crate) fn presented<'a>(
 ) -> PresentedWorld<'a> {
     PresentedWorld {
         sim,
+        rules: state.rules(),
         interpolation: &state.match_state.match_presentation.interpolation,
         translucent_viewer: crate::app::presentation::instances::translucent_fog_viewer(state, sim),
     }
@@ -200,7 +212,7 @@ pub(crate) fn hover_object_by_id(
     // What_Action asks the actor's house, here the local player's
     // (HouseClass::Is_Ally_ByObject4F9A90 at 7003C4).
     let is_friendly = crate::map::houses::is_allied_with(
-        sim.house_alliances(),
+        sim.house_alliances().as_map(),
         local_owner,
         sim.interner().resolve(entity.owner()),
     );
@@ -477,8 +489,8 @@ pub(crate) fn band_rect_contains_drawn_object(
 /// Without fog (sandbox full visibility) or a known player, only the first
 /// part applies. ProcessClickCoords also drops its chosen nonlocal object's
 /// TypeInvisible (`+0xC9A`, `0x0069256B..0x0069257F`) after the scan; that
-/// producer gate remains open. Building's InvisibleInGame can derive this byte
-/// too. Display's tooltip owns its separately repeated postwinner gate.
+/// gate is applied after the winner below. Building's InvisibleInGame can
+/// derive this byte too. Tooltips retain their separately repeated gate.
 pub(crate) fn pick_admits_object(
     entity: &crate::sim::game_entity::GameEntity,
     fog: Option<&FogState>,
@@ -841,9 +853,8 @@ fn type_select_candidates(
             let dynamic = selection_dynamic_prefix(entity, entities, rules, interner)
                 && type_is_selectable(type_id, rules)
                 && (!require_playfield_membership || entity.in_playfield());
-            // A structure answers false on the ordinary dynamic virtual; the ID
-            // match's building arm (`0x00732C61..0x00732C83`) admits it
-            // through `RuleSet::structure_type_selectable` instead.
+            // The ID match's independent building arm (732C61..732C83)
+            // admits UndeploysInto even when the dynamic virtual refuses it.
             let structure_admission = entity.category() == EntityCategory::Structure
                 && rules.is_some_and(|rules| rules.structure_type_selectable(type_id));
             (dynamic || structure_admission).then_some(*id)
@@ -1086,10 +1097,8 @@ fn entities_in_rect(
 /// mind-controlled unit is a different field in the original and is
 /// deliberately not tested here.
 ///
-/// One native clause is approximated rather than reproduced, because VERA has
-/// no matching state: the native bunker test reads one link field. VERA splits
-/// the link into an approach marker and an installed link, and only the
-/// installed link is treated as linked.
+/// Native +2E4 is the occupant on a Building and the installed-in link on a
+/// Foot. The Foot approach marker remains separate from its installed link.
 ///
 /// The powered-down clause reads byte `+0x1C8` (`0x006FC041`), and it is NOT a
 /// deploy-transition flag. An exhaustive instruction search finds exactly three
@@ -1108,16 +1117,26 @@ pub(crate) fn selection_dynamic_prefix(
     rules: Option<&RuleSet>,
     interner: Option<&crate::sim::intern::StringInterner>,
 ) -> bool {
-    // BuildingClass answers false on the ordinary dynamic selection virtual.
-    // TypeSelect owns the separate building admission
-    // (`RuleSet::structure_type_selectable`) instead.
-    if entity.category() == EntityCategory::Structure {
+    // BuildingClass::CanBeSelectedNow459C00 calls the existing type query
+    // Is1x1WithUndeploy465D40 before the shared Techno6FC030 prefix below.
+    let building = entity.category() == EntityCategory::Structure;
+    if building
+        && !rules
+            .zip(interner)
+            .and_then(|(rules, interner)| rules.object(interner.resolve(entity.type_ref())))
+            .is_some_and(|object| object.is_1x1_with_undeploy())
+    {
         return false;
     }
     if entity.slave.owner().is_some() || entity.deactivated.is_offline() {
         return false;
     }
-    if entity.bunker.link().installed_in().is_some() {
+    let bunker_linked = if building {
+        entity.bunker.occupant().is_some()
+    } else {
+        entity.bunker.link().installed_in().is_some()
+    };
+    if bunker_linked {
         return false;
     }
     if entity.tether.partner().is_some()
@@ -1266,15 +1285,30 @@ pub(crate) fn pick_object_at_point<'a>(
         }
     }
 
-    if let Some((stable_id, _)) = best {
-        return Some(CellObjectMember::Entity(stable_id));
-    }
-    match source.first_ground_cell_object(click_cell)? {
-        CellObjectMember::Entity(id) => entities
-            .get(id)
-            .filter(|entity| pick_admits_object(entity, fog, player) && !source.conceals(entity))
-            .map(|_| CellObjectMember::Entity(id)),
-        terrain => Some(terrain),
+    let picked = if let Some((stable_id, _)) = best {
+        Some(CellObjectMember::Entity(stable_id))
+    } else {
+        match source.first_ground_cell_object(click_cell)? {
+            CellObjectMember::Entity(id) => entities
+                .get(id)
+                .filter(|entity| {
+                    pick_admits_object(entity, fog, player) && !source.conceals(entity)
+                })
+                .map(|_| CellObjectMember::Entity(id)),
+            terrain => Some(terrain),
+        }
+    }?;
+    // DisplayClass::ProcessClickCoords @0x00692300, 0x0069252D..0x00692585:
+    // after Tactical::PickObjectAtScreenPoint6DA380 and its cell fallback,
+    // TypeInvisible+0xC9A clears the winner unless Techno+0x41A is set.
+    // Source: retail gamemd.exe instructions. Never retry objects behind it.
+    match picked {
+        CellObjectMember::Entity(id) => {
+            let entity = entities.get(id)?;
+            (entity.discovery.owned_by_current_house() || !source.type_invisible(entity))
+                .then_some(picked)
+        }
+        CellObjectMember::Terrain(_) => Some(picked),
     }
 }
 
@@ -1347,6 +1381,10 @@ mod building_type_select_tests;
 #[cfg(test)]
 #[path = "entity_pick_group_as_tests.rs"]
 mod group_as_tests;
+
+#[cfg(test)]
+#[path = "entity_pick_invisible_tests.rs"]
+mod invisible_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1611,6 +1649,7 @@ mod tests {
             for translucent_viewer in [None, Some(viewer)] {
                 let source = PresentedWorld {
                     sim: &sim,
+                    rules: None,
                     interpolation: &native,
                     translucent_viewer,
                 };
@@ -1619,7 +1658,7 @@ mod tests {
                     band_rect_contains_drawn_object(
                         source,
                         &[1],
-                        Some((sim.fog(), sim.house_alliances())),
+                        Some((sim.fog(), sim.house_alliances().as_map())),
                         Some("viewer"),
                         bx - 1.,
                         by - 1.,
@@ -1708,7 +1747,7 @@ mod tests {
                 Some("Americans"),
                 Some(viewer),
                 sim.fog(),
-                sim.house_alliances(),
+                sim.house_alliances().as_map(),
                 false,
                 0,
                 0,
@@ -1720,6 +1759,7 @@ mod tests {
             for (translucent_viewer, shown) in [(None, retail), (Some(viewer), translucent)] {
                 let source = PresentedWorld {
                     sim: &sim,
+                    rules: None,
                     interpolation: &native,
                     translucent_viewer,
                 };
@@ -1731,7 +1771,7 @@ mod tests {
                 let band = band_rect_contains_drawn_object(
                     source,
                     &[id],
-                    Some((sim.fog(), sim.house_alliances())),
+                    Some((sim.fog(), sim.house_alliances().as_map())),
                     Some("Americans"),
                     x - 1.,
                     y - 1.,

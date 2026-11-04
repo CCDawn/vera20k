@@ -330,9 +330,11 @@ impl Simulation {
                     impact,
                     shot.damage,
                     warhead,
+                    true,
                     (source_id, None, warhead_id),
                     effects,
-                );
+                )
+                .bridge_state_changed;
                 if let Some(source) = self.substrate.entities.get(source_id)
                     && let Some(report) = crate::sim::combat::world_fire::per_shot_report(
                         weapon,

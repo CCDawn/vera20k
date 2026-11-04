@@ -24,7 +24,8 @@ mod web_socket;
 #[cfg(all(feature = "wasm-net", target_arch = "wasm32", target_os = "unknown"))]
 use web_socket::UdpSocket;
 
-/// One compile-time proxy origin for both the browser datagram and HTTPS adapters.
+/// The compiled proxy origin: the built-in lobby's datagram and HTTPS adapters,
+/// and a spawn launch that names no `[Relay] GatewayUrl`.
 #[cfg(all(feature = "wasm-net", target_arch = "wasm32", target_os = "unknown"))]
 pub fn browser_proxy_url() -> &'static str {
     match option_env!("WS_PROXY_URL") {
@@ -75,6 +76,13 @@ const IO_PUMP_INTERVAL: Duration = Duration::from_millis(6);
 // Scope admission precedes every global/private ACK, sequence and receive cache.
 const LAN_SCOPE_MAGIC: &[u8; 4] = b"VLS\x01";
 const LAN_SCOPE_HEADER_LEN: usize = 4 + 16 + 8;
+// Explicit Leave is resent every 16 wall buckets (256 ms) until the relay
+// acknowledges it. A relay that answers none of these attempts (about a
+// minute) is gone or unreachable: release the route rather than block every
+// later online admission. The relay then treats the place as a lost
+// connection, and the next match's newer generation supersedes it
+// (services/relay/README.md).
+const RELAY_LEAVE_ATTEMPTS: u16 = 235;
 
 /// One admitted route progresses from the existing global loading channel to
 /// private gameplay. Loading peers may finish on different service passes.
@@ -198,11 +206,20 @@ struct PendingDatagram {
     endpoint: SocketAddrV4,
     bytes: [u8; UDP_DATAGRAM_CAPACITY],
     length: usize,
+    failed_attempts: u8,
 }
 
+// VERA adaptation: native retains a failing head forever (7B3D8B..7B3DB0) and
+// grows without a cap (7B20E0). One unreachable destination, such as a dead
+// peer or a forged source an ACK answers, would then stall every later send.
+// A head is retired like WouldBlock after this many failed attempts.
+const MAX_HEAD_ATTEMPTS: u8 = 8;
+// Twice native7B20E0's 128 pooled slots; past this a new raw attempt is
+// retired like WouldBlock, and its reliable owner may retry it.
+const MAX_PENDING_DATAGRAMS: usize = 256;
+
 /// Winsock7B23B0/UDP7B3AA0 owns attempts independently of reliable messages.
-/// Native7B20E0 falls back to heap blocks after its128 pooled slots; there is
-/// no fixed admission cap here. Only this FIFO owns retained wire bytes.
+/// Only this FIFO owns retained wire bytes.
 #[derive(Debug, Default)]
 struct UdpSendQueue {
     pending: VecDeque<PendingDatagram>,
@@ -249,11 +266,16 @@ impl UdpSendQueue {
             .copy_from_slice(&udp_checksum(frame).to_le_bytes());
         bytes[scope_len + CHECKSUM_LEN..scope_len + CHECKSUM_LEN + frame.len()]
             .copy_from_slice(frame);
-        self.pending.push_back(PendingDatagram {
-            endpoint,
-            bytes,
-            length: scope_len + CHECKSUM_LEN + frame.len(),
-        });
+        if self.pending.len() < MAX_PENDING_DATAGRAMS {
+            self.pending.push_back(PendingDatagram {
+                endpoint,
+                bytes,
+                length: scope_len + CHECKSUM_LEN + frame.len(),
+                failed_attempts: 0,
+            });
+        } else {
+            report.send_would_block += 1;
+        }
         //7B24A6..7B24B9 synchronously dispatches one write callback. An older
         //retained head is attempted first; the newly admitted block can wait.
         self.service(channel, report, send);
@@ -265,7 +287,7 @@ impl UdpSendQueue {
         report: &mut UdpServiceReport,
         send: &mut impl FnMut(&[u8], SocketAddrV4) -> io::Result<usize>,
     ) {
-        let Some(head) = self.pending.front() else {
+        let Some(head) = self.pending.front_mut() else {
             return;
         };
         //Each native FD_WRITE callback7B3BA8..7B3EB8 attempts one head only.
@@ -282,8 +304,16 @@ impl UdpSendQueue {
                 report.send_would_block += 1;
             }
             //7B3D8B..7B3DB0 keeps the exact head for every other error,
-            //including Interrupted. No later datagram overtakes it.
-            Err(error) => record_io_error(report, channel, UdpIoOperation::Send, error),
+            //including Interrupted. No later datagram overtakes it until it
+            //exhausts its attempts.
+            Err(error) => {
+                record_io_error(report, channel, UdpIoOperation::Send, error);
+                head.failed_attempts += 1;
+                if head.failed_attempts == MAX_HEAD_ATTEMPTS {
+                    self.pending.pop_front();
+                    report.send_would_block += 1;
+                }
+            }
         }
     }
 }
@@ -306,6 +336,8 @@ struct UdpIo {
     global: GlobalChannel,
     broadcast_targets: Vec<SocketAddrV4>,
     relay: Option<RelayRoute>,
+    #[cfg(all(feature = "wasm-net", target_arch = "wasm32", target_os = "unknown"))]
+    relay_gateway: Option<String>,
     lan_scope: Option<LanScopeState>,
     pending_report: UdpServiceReport,
 }
@@ -537,6 +569,17 @@ impl LanUdpTransport {
         result
     }
 
+    /// The WebSocket gateway of a browser relay session, from `[Relay] GatewayUrl`;
+    /// set before `enable_relay`. Desktop relay traffic is direct UDP and has none.
+    pub fn set_relay_gateway(&mut self, origin: Option<String>) {
+        #[cfg(all(feature = "wasm-net", target_arch = "wasm32", target_os = "unknown"))]
+        {
+            self.lock().relay_gateway = origin;
+        }
+        #[cfg(not(all(feature = "wasm-net", target_arch = "wasm32", target_os = "unknown")))]
+        let _ = origin;
+    }
+
     pub fn relay_ready(&self) -> bool {
         self.lock().relay_ready()
     }
@@ -595,6 +638,13 @@ impl LanUdpTransport {
         })
     }
 
+    /// See `ClientSession::set_ordering_restore`.
+    pub(super) fn set_ordering_restore(&mut self, restoring: bool) {
+        if let Some(route) = self.lock().relay.as_mut() {
+            route.session.set_ordering_restore(restoring);
+        }
+    }
+
     pub fn submit_ordering(&mut self, batch_id: u64, bytes: &[u8]) -> io::Result<()> {
         self.send_ordering(|route| {
             route
@@ -632,6 +682,18 @@ impl LanUdpTransport {
                 paused,
                 &mut route.encoded,
             )
+        })
+    }
+
+    pub fn report_ordering_pace(
+        &mut self,
+        pace: vera20k_relay_protocol::OrderPace,
+        frames_per_second: u16,
+    ) -> io::Result<()> {
+        self.send_ordering(|route| {
+            route
+                .session
+                .report_ordering_pace(pace, frames_per_second, &mut route.encoded)
         })
     }
 
@@ -817,6 +879,7 @@ struct RelayRoute {
 
 struct RelayRetirement {
     last_sent: Option<u32>,
+    attempts: u16,
 }
 
 struct PeerProbe {
@@ -883,6 +946,8 @@ impl UdpIo {
             global,
             broadcast_targets: Vec::new(),
             relay: None,
+            #[cfg(all(feature = "wasm-net", target_arch = "wasm32", target_os = "unknown"))]
+            relay_gateway: None,
             lan_scope: None,
             pending_report: UdpServiceReport::default(),
         })
@@ -982,8 +1047,9 @@ impl UdpIo {
             ClientSession::new(ticket, packet_key, payload_key).map_err(relay_io_error)?;
         #[cfg(all(feature = "wasm-net", target_arch = "wasm32", target_os = "unknown"))]
         {
-            self.primary.set_relay(address)?;
-            self.alternate.set_relay(address)?;
+            let gateway = self.relay_gateway.as_deref().unwrap_or(browser_proxy_url());
+            self.primary.set_relay(address, gateway)?;
+            self.alternate.set_relay(address, gateway)?;
         }
         self.relay = Some(RelayRoute {
             address,
@@ -1070,9 +1136,10 @@ impl UdpIo {
             route.renewing = None;
             route.peer_probes = None;
             route.ordering_inbox.clear();
-            route
-                .retiring
-                .get_or_insert(RelayRetirement { last_sent: None });
+            route.retiring.get_or_insert(RelayRetirement {
+                last_sent: None,
+                attempts: 0,
+            });
         } else {
             self.relay = None;
         }
@@ -1237,13 +1304,16 @@ impl UdpIo {
                 route.last_response = None;
             }
         }
+        let mut leave_unacknowledged = false;
         if let Some(route) = self.relay.as_mut() {
             if let Some(retiring) = route.retiring.as_mut() {
-                if retiring
+                let due = retiring
                     .last_sent
-                    .is_none_or(|last| now_ticks.wrapping_sub(last) >= 16)
-                {
+                    .is_none_or(|last| now_ticks.wrapping_sub(last) >= 16);
+                leave_unacknowledged = due && retiring.attempts == RELAY_LEAVE_ATTEMPTS;
+                if due && !leave_unacknowledged {
                     retiring.last_sent = Some(now_ticks);
+                    retiring.attempts += 1;
                     if let Err(error) = route
                         .session
                         .leave_ordering(&mut route.encoded)
@@ -1308,6 +1378,10 @@ impl UdpIo {
                     }
                 }
             }
+        }
+        if leave_unacknowledged {
+            log::warn!("The relay did not acknowledge leaving the online match.");
+            self.relay = None;
         }
         //Portable polling replaces Windows FD_WRITE notification timing.
         //Give each retained FIFO one write opportunity per pass; each later
@@ -1804,6 +1878,22 @@ fn record_io_error(
             operation,
             error,
         });
+    }
+}
+
+#[cfg(test)]
+impl LanUdpTransport {
+    /// Delivers an authenticated ordering event as the relay route would.
+    pub(super) fn push_ordering_received_for_test(
+        &mut self,
+        event: vera20k_relay_protocol::OrderEvent,
+    ) {
+        if let Some(route) = self.lock().relay.as_mut() {
+            route.ordering_inbox.push_back(ReceivedOrderEvent {
+                event,
+                received_at: Instant::now(),
+            });
+        }
     }
 }
 

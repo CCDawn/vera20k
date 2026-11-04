@@ -18,6 +18,8 @@ const LINK_DOMAIN: &[u8] = b"VERA20k relay federation link v1\0";
 pub(crate) const LINK_MAGIC: &[u8; 4] = b"VF1L";
 const LINK_HEADER: usize = 32;
 const FRAME_KIND: u8 = 0;
+// Link packets go out at least every 50 ms; a coordinator this quiet is gone.
+const COORDINATOR_SILENCE_MS: u64 = 10_000;
 const DATA_KIND: u8 = 1;
 const FRAME_HEADER: usize = 86;
 const ENTRY_HEADER: usize = 15;
@@ -27,6 +29,9 @@ const LINK_INTERVAL_MS: u64 = 50;
 // frame. A bare seal goes once: the next seal, one frame later, covers it.
 const LINK_COPIES: usize = 2;
 const LINK_PACKETS: usize = 4;
+// Entries go again once their acknowledgement is overdue: a round trip, the
+// link interval within which the peer sends it, and as much again for jitter.
+const RESEND_MARGIN_MS: u64 = 2 * LINK_INTERVAL_MS;
 const CLOCK_SAMPLES: usize = 32;
 // Before the coordinator has a round trip to every relay.
 const UNMEASURED_LINK_MS: u64 = 500;
@@ -39,7 +44,7 @@ pub(crate) fn is_roster_len(length: usize) -> bool {
     (2..=MAX_FEDERATED_RELAYS).any(|relays| roster_len(relays) == length)
 }
 
-/// Layout shared with services/lobby/service.js: `VO1F`, room UUID16, relay
+/// Layout shared with the lobby (docs/lobby-protocol.md): `VO1F`, room UUID16, relay
 /// count, then per relay IPv4, LE port and LE source mask. Per relay follow a
 /// 16-byte nonce, the 32-byte link key XORed with HMAC(relay key, wrap domain,
 /// room, nonce) and HMAC(relay key, roster domain, table, index, nonce,
@@ -144,6 +149,12 @@ struct Link {
     // Our contributions this relay holds; theirs we hold.
     acked: u64,
     inbox_next: u64,
+    // Our first contribution not yet sent, and (end, time) of each send of
+    // entries this relay has not acknowledged.
+    sent_next: u64,
+    flights: VecDeque<(u64, u64)>,
+    // Silent past a player's limit after the start; its sources departed.
+    lost: bool,
     sealed: u32,
     ready: u32,
     agreement: [u8; 32],
@@ -173,6 +184,8 @@ pub(crate) struct Federation {
     // This relay's sealed contributions, (frame, encoded entry), from `outbox_base`.
     outbox: VecDeque<(u32, Vec<u8>)>,
     outbox_base: u64,
+    // When a follower last moved its start toward the coordinator's.
+    slewed_ms: u64,
 }
 
 impl Federation {
@@ -222,6 +235,9 @@ impl Federation {
                 received: ReplayWindow::default(),
                 acked: 0,
                 inbox_next: 0,
+                sent_next: 0,
+                flights: VecDeque::new(),
+                lost: false,
                 sealed: 0,
                 ready: 0,
                 agreement: [0; 32],
@@ -242,6 +258,7 @@ impl Federation {
             links,
             outbox: VecDeque::new(),
             outbox_base: 0,
+            slewed_ms: 0,
         })
     }
 
@@ -264,10 +281,11 @@ impl Federation {
         self.outbox.push_back((frame, entry));
     }
 
-    /// A frame is complete once every relay has sealed it.
+    /// A frame is complete once every relay still linked has sealed it.
     pub(super) fn merged_through(&self, sealed: u32) -> u32 {
         self.links
             .iter()
+            .filter(|link| !link.lost)
             .map(|link| link.sealed)
             .fold(sealed, u32::min)
     }
@@ -284,6 +302,9 @@ impl Federation {
     pub(crate) fn data_links(&self, source: u8, target: u8) -> Vec<usize> {
         (0..self.links.len())
             .filter(|&position| {
+                if self.links[position].lost {
+                    return false;
+                }
                 let sources = self.links[position].sources & !(1 << source);
                 if target == BROADCAST {
                     sources != 0
@@ -353,6 +374,10 @@ impl Federation {
             .iter()
             .position(|link| link.index == bytes[20])
             .ok_or(RelayError::Authentication)?;
+        // A lost relay's players departed here; nothing it sends counts.
+        if self.links[position].lost {
+            return Err(RelayError::Unregistered);
+        }
         self.link
             .mac(LINK_DOMAIN, &bytes[..bytes.len() - MAC_LEN])
             .verify_slice(&bytes[bytes.len() - MAC_LEN..])
@@ -368,18 +393,65 @@ impl Federation {
     /// Startup: the coordinator starts once every relay reports the full
     /// roster ready, leaving its slowest link time to hear. The others place
     /// the same start on their own clocks and keep slewing toward it. Only
-    /// the coordinator cancels, on any relay's request before its start.
-    pub(super) fn coordinate(&self, ordering: &mut OrderingRoom, now_ms: u64) {
+    /// the coordinator cancels, on any relay's request before its start; each
+    /// relay requests it once its own startup reaches the loading limit.
+    pub(super) fn coordinate(&mut self, ordering: &mut OrderingRoom, now_ms: u64) {
         if ordering.finished_at.is_some() {
             return;
+        }
+        // Each relay ends only its own players' places, and one that restarts
+        // can neither resume its link nor recreate the room. Once a started
+        // two-relay room has not heard the other relay for as long as a player
+        // may be silent, its players depart as lost after the last frame it
+        // sealed here, and the merge goes on without it. With more relays the
+        // survivors would have to agree on that frame, which the link format
+        // cannot carry, so such a room ends only once its own players have
+        // left and every other relay has been silent that long.
+        if ordering.starts_at.is_some() && self.links.len() > 1 {
+            if ordering.active & self.local == 0
+                && self.links.iter().all(|link| {
+                    link.echo
+                        .is_none_or(|(_, heard)| now_ms.saturating_sub(heard) >= super::ABSENT_MS)
+                })
+            {
+                ordering.abandon(now_ms);
+                return;
+            }
+        } else if ordering.starts_at.is_some() {
+            for link in &mut self.links {
+                let heard = link.echo.map_or(ordering.created_ms, |(_, heard)| heard);
+                if link.lost || now_ms.saturating_sub(heard) < super::ABSENT_MS {
+                    continue;
+                }
+                link.lost = true;
+                for source in 0..MAX_PEERS {
+                    if ordering.active & link.sources & (1 << source) != 0 {
+                        ordering.accept_remote(link.sealed + 1, source, 0, &[1]);
+                    }
+                }
+            }
+        }
+        let overdue = ordering.starts_at.is_none()
+            && now_ms.saturating_sub(ordering.created_ms) >= super::LOADING_LIMIT_MS;
+        if overdue {
+            // A relay whose players never sent Ready has no room to ask with,
+            // so every relay asks once its own startup reaches the limit.
+            ordering.cancel_requested = true;
         }
         if ordering.starts_at.is_none()
             && if self.own == 0 {
                 ordering.cancel_requested || self.links.iter().any(|link| link.cancelled)
             } else {
-                self.links
-                    .iter()
-                    .any(|link| link.index == 0 && link.cancelled)
+                // A coordinator that never got a room, or already dropped it,
+                // cannot answer; its silence past the limit cancels here.
+                self.links.iter().any(|link| {
+                    link.index == 0
+                        && (link.cancelled
+                            || overdue
+                                && link.echo.is_none_or(|(_, heard)| {
+                                    now_ms.saturating_sub(heard) >= COORDINATOR_SILENCE_MS
+                                }))
+                })
             }
         {
             ordering.cancel(now_ms);
@@ -411,23 +483,59 @@ impl Federation {
             return;
         };
         let target = (i128::from(coordinator.start_at) - i128::from(offset)).max(0) as u64;
+        // At most a millisecond per elapsed millisecond, however often this
+        // relay passes: its frame clock runs at most double speed, or stands,
+        // while it converges.
+        let step = now_ms.saturating_sub(self.slewed_ms);
+        self.slewed_ms = now_ms;
         ordering.starts_at = Some(match ordering.starts_at {
             None => target,
-            Some(start) if start < target => start + 1,
-            Some(start) if start > target => start - 1,
-            Some(start) => start,
+            Some(start) if start < target => target.min(start + step),
+            Some(start) => target.max(start.saturating_sub(step)),
         });
     }
 
     /// Link packets due this pass: at each new seal, and otherwise paced.
+    /// Each entry goes once, and again only once its acknowledgement is
+    /// overdue; a relay that misses one ignores what follows until then.
     pub(super) fn frames(&mut self, view: &LinkView, now_ms: u64) -> Vec<ForwardDatagram> {
         let mut output = Vec::new();
         let outbox_end = self.outbox_base + self.outbox.len() as u64;
+        let held = self
+            .links
+            .iter()
+            .filter(|link| !link.lost)
+            .map(|link| link.acked)
+            .min()
+            .unwrap_or(outbox_end);
+        while self.outbox_base < held && self.outbox.pop_front().is_some() {
+            self.outbox_base += 1;
+        }
         for position in 0..self.links.len() {
-            let link = &self.links[position];
-            if link.last_sent.is_some_and(|(at, sealed)| {
-                sealed == view.sealed && now_ms.saturating_sub(at) < LINK_INTERVAL_MS
-            }) {
+            let link = &mut self.links[position];
+            if link.lost {
+                continue;
+            }
+            while link
+                .flights
+                .front()
+                .is_some_and(|&(end, _)| end <= link.acked)
+            {
+                link.flights.pop_front();
+            }
+            let overdue = link
+                .best_sample()
+                .map_or(UNMEASURED_LINK_MS, |(rtt, _)| rtt)
+                + RESEND_MARGIN_MS;
+            let resend = link
+                .flights
+                .front()
+                .is_some_and(|&(_, at)| now_ms.saturating_sub(at) >= overdue);
+            if !resend
+                && link.last_sent.is_some_and(|(at, sealed)| {
+                    sealed == view.sealed && now_ms.saturating_sub(at) < LINK_INTERVAL_MS
+                })
+            {
                 continue;
             }
             let start_at = if self.own == 0 {
@@ -442,7 +550,13 @@ impl Federation {
                 )
             });
             let acknowledged = link.inbox_next;
-            let mut first = link.acked.max(self.outbox_base);
+            let mut first = if resend {
+                link.acked
+            } else {
+                link.acked.max(link.sent_next)
+            }
+            .max(self.outbox_base);
+            let sent_from = first;
             for _ in 0..LINK_PACKETS {
                 let mut entries = Vec::new();
                 let mut count = 0u8;
@@ -488,7 +602,15 @@ impl Federation {
                     break;
                 }
             }
-            self.links[position].last_sent = Some((now_ms, view.sealed));
+            let link = &mut self.links[position];
+            if resend {
+                link.flights.clear();
+            }
+            if first > sent_from {
+                link.flights.push_back((first, now_ms));
+            }
+            link.sent_next = first;
+            link.last_sent = Some((now_ms, view.sealed));
         }
         output
     }
@@ -527,10 +649,12 @@ impl Federation {
                 || sources & (1 << source) == 0
                 || payload.len() < end
                 || frame == 0
-                || (batch_id == 0) != (length == 0)
-                || (batch_id != 0
-                    && (length <= OPAQUE_OVERHEAD
-                        || length > OPAQUE_OVERHEAD + ORDERING_BATCH_CAPACITY))
+                || if batch_id == 0 {
+                    // A departure carries nothing, or 1 when silence ended it.
+                    length > 1 || (length == 1 && payload[offset + ENTRY_HEADER] != 1)
+                } else {
+                    length <= OPAQUE_OVERHEAD || length > OPAQUE_OVERHEAD + ORDERING_BATCH_CAPACITY
+                }
             {
                 return Err(RelayError::Malformed);
             }
@@ -573,11 +697,6 @@ impl Federation {
             link.echo = Some((sent_ms, now_ms));
         }
         link.acked = link.acked.max(ack);
-        let held = self.links.iter().map(|link| link.acked).min().unwrap_or(0);
-        while self.outbox_base < held && self.outbox.pop_front().is_some() {
-            self.outbox_base += 1;
-        }
-        let link = &mut self.links[position];
         let Some(ordering) = ordering else {
             return Ok(());
         };
@@ -592,8 +711,11 @@ impl Federation {
         {
             return Err(RelayError::Malformed);
         }
-        for (frame, source, batch_id, range) in entries.iter().skip(fresh).cloned() {
-            ordering.accept_remote(frame, source, batch_id, &payload[range]);
+        // A finished room already has every entry it will archive.
+        if ordering.finished_at.is_none() {
+            for (frame, source, batch_id, range) in entries.iter().skip(fresh).cloned() {
+                ordering.accept_remote(frame, source, batch_id, &payload[range]);
+            }
         }
         link.inbox_next = link.inbox_next.max(first + entries.len() as u64);
         link.sealed = link.sealed.max(sealed);
@@ -616,10 +738,13 @@ impl RelayServer {
         let room = self.rooms.get_mut(&id).ok_or(RelayError::Unregistered)?;
         let federation = room.federation.as_mut().ok_or(RelayError::Unregistered)?;
         let (position, kind, payload) = federation.open(bytes)?;
-        if !self.ingress.permits(now, 1, INGRESS_PER_SECOND) {
+        if !self
+            .ingress
+            .admit_part(&mut room.ingress, now, 1, INGRESS_PER_SECOND)
+        {
             return Err(RelayError::RateLimited);
         }
-        self.ingress.charge(now, 1);
+        self.ingress.charge_part(&mut room.ingress, 1);
         match kind {
             FRAME_KIND => {
                 federation.receive_frame(position, payload, room.ordering.as_mut(), now_ms)?;
@@ -654,12 +779,16 @@ impl RelayServer {
                 let cost = (room.peers.iter().filter(|peer| recipients(peer)).count()
                     * (SERVER_HEADER + MAC_LEN + data.len())) as u64;
                 if !room.outgoing.permits(now, cost, ROOM_BYTES_PER_SECOND)
-                    || !self.outgoing.permits(now, cost, TOTAL_BYTES_PER_SECOND)
+                    || !self.outgoing.admit_part(
+                        &mut room.outgoing,
+                        now,
+                        cost,
+                        TOTAL_BYTES_PER_SECOND,
+                    )
                 {
                     return Err(RelayError::RateLimited);
                 }
-                room.outgoing.charge(now, cost);
-                self.outgoing.charge(now, cost);
+                self.outgoing.charge_part(&mut room.outgoing, cost);
                 room.peers
                     .iter_mut()
                     .filter(|peer| recipients(peer))
@@ -672,6 +801,7 @@ impl RelayServer {
 
     /// Start agreement and contribution exchange for every federated room.
     pub fn drain_federation(&mut self, now_ms: u64, now: u64) -> Vec<ForwardDatagram> {
+        self.prune(now);
         let mut output = Vec::new();
         for room in self.rooms.values_mut() {
             let Some(federation) = room.federation.as_mut() else {
@@ -702,8 +832,11 @@ impl RelayServer {
                 .iter()
                 .map(|datagram| datagram.bytes.len() as u64)
                 .sum();
-            if self.outgoing.permits(now, cost, TOTAL_BYTES_PER_SECOND) {
-                self.outgoing.charge(now, cost);
+            if self
+                .outgoing
+                .admit_part(&mut room.outgoing, now, cost, TOTAL_BYTES_PER_SECOND)
+            {
+                self.outgoing.charge_part(&mut room.outgoing, cost);
                 output.extend(datagrams);
             }
         }
@@ -725,17 +858,26 @@ mod tests {
     /// San Francisco and Singapore: source 0 homed on A, source 1 on B.
     struct Match {
         relays: [RelayServer; 2],
-        _journals: [TestDirectory; 2],
+        journals: [TestDirectory; 2],
         clients: [ClientSession; 2],
         addresses: [SocketAddrV4; 2],
         links: Vec<(u64, usize, Vec<u8>)>,
         delivered: Vec<ForwardDatagram>,
         drop_first_copies: bool,
+        // When each relay sent a link datagram carrying entries, and how
+        // many of relay A's are still to be lost.
+        carried: [Vec<u64>; 2],
+        lose: usize,
         now: u64,
     }
 
     impl Match {
         fn new(drop_first_copies: bool) -> Self {
+            Self::build(drop_first_copies, [true; 2])
+        }
+
+        /// A match whose players on unready relays connect but never send Ready.
+        fn build(drop_first_copies: bool, ready: [bool; 2]) -> Self {
             let keys = [SecretKey::new([11; 32]), SecretKey::new([12; 32])];
             let addresses = [
                 SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 5000),
@@ -754,24 +896,28 @@ mod tests {
                     RelayServer::with_journal(keys[0].clone(), 2, &journals[0].0).unwrap(),
                     RelayServer::with_journal(keys[1].clone(), 2, &journals[1].0).unwrap(),
                 ],
-                _journals: journals,
+                journals,
                 clients: [client(&keys[0], 0), client(&keys[1], 1)],
                 addresses,
                 links: Vec::new(),
                 delivered: Vec::new(),
                 drop_first_copies,
+                carried: [Vec::new(), Vec::new()],
+                lose: 0,
                 now: 0,
             };
             for relay in 0..2 {
                 let clock = game.clock(relay);
                 game.clients[relay].set_federation(&roster).unwrap();
                 connect(&mut game.relays[relay], &mut game.clients[relay], clock);
-                configure(
-                    &mut game.relays[relay],
-                    &mut game.clients[relay],
-                    &certificate(&keys[relay], 3, 1400),
-                    clock,
-                );
+                if ready[relay] {
+                    configure(
+                        &mut game.relays[relay],
+                        &mut game.clients[relay],
+                        &certificate(&keys[relay], 3, 2000),
+                        clock,
+                    );
+                }
             }
             game
         }
@@ -796,7 +942,14 @@ mod tests {
                     let copied = datagrams
                         .peek()
                         .is_some_and(|next| body(&next.bytes) == body(&datagram.bytes));
-                    if !(self.drop_first_copies && copied) {
+                    let carries = datagram.bytes[29] == FRAME_KIND
+                        && datagram.bytes[LINK_HEADER + FRAME_HEADER - 1] != 0;
+                    if carries {
+                        self.carried[from].push(self.now);
+                    }
+                    let lost = carries && from == 0 && self.lose > 0;
+                    self.lose -= usize::from(lost);
+                    if !(self.drop_first_copies && copied || lost) {
                         self.links
                             .push((self.now + LINK_MS, 1 - from, datagram.bytes));
                     }
@@ -881,6 +1034,7 @@ mod tests {
                         sequence,
                         frame,
                         source,
+                        ..
                     }) => Some((sequence, frame, Some((source, 0)))),
                     _ => None,
                 })
@@ -962,6 +1116,196 @@ mod tests {
         );
         let commands: Vec<_> = streams[0].iter().filter_map(|(.., entry)| *entry).collect();
         assert_eq!(commands, [(0, 1), (1, 1), (1, 0)]);
+    }
+
+    #[test]
+    fn a_follower_slews_its_start_by_elapsed_time_however_often_it_passes() {
+        let mut game = Match::new(false);
+        game.play();
+        // Relay B's start is 50 ms off the coordinator's. Ten passes in one
+        // millisecond move it one millisecond; one pass ten later, ten more.
+        let clock = game.clock(1);
+        let start = game.ordering(1).starts_at.unwrap() + 50;
+        let room = game.relays[1].rooms.get_mut(&[5; 16]).unwrap();
+        room.ordering.as_mut().unwrap().starts_at = Some(start);
+        for (now_ms, passes, moved) in [(clock + 1, 10, 1), (clock + 11, 1, 11)] {
+            for _ in 0..passes {
+                game.relays[1].drain_federation(now_ms, unix(now_ms));
+            }
+            assert_eq!(game.ordering(1).starts_at, Some(start - moved));
+        }
+    }
+
+    #[test]
+    fn players_leaving_on_both_relays_at_once_free_both_archives() {
+        let mut game = Match::new(false);
+        game.play();
+        game.leave(0);
+        game.leave(1);
+        for _ in 0..400 {
+            game.step();
+        }
+        // Each relay sealed frames past its last merge before the other's
+        // departure arrived, and merges their frame ends after finishing.
+        for relay in 0..2 {
+            let ordering = game.ordering(relay);
+            assert!(ordering.finished_at.is_some() && !ordering.storage_failed);
+            assert_eq!(ordering.head, ordering.sealed);
+            let clock = game.clock(relay) + crate::MAX_TICKET_LIFETIME * 1000;
+            game.relays[relay].advance_clock(clock, unix(clock));
+            assert!(!game.journals[relay].0.join("05".repeat(16)).exists());
+        }
+    }
+
+    #[test]
+    fn a_relay_ends_the_match_once_its_players_left_and_the_other_relay_went_silent() {
+        let mut game = Match::new(false);
+        game.play();
+        game.leave(0);
+        // Relay B restarts and loses the room, so its player's departure never
+        // reaches relay A. A ends the match once B has been silent as long as
+        // a player may be, and frees the archive after the replay grace.
+        let room = &game.relays[0].rooms[&[5; 16]];
+        let (_, heard) = room.federation.as_ref().unwrap().links[0].echo.unwrap();
+        for (now_ms, finished) in [(heard + ABSENT_MS - 1, false), (heard + ABSENT_MS, true)] {
+            game.relays[0].drain_federation(now_ms, unix(now_ms));
+            game.relays[0].advance_clock(now_ms, unix(now_ms));
+            assert_eq!(game.ordering(0).finished_at.is_some(), finished);
+        }
+        let freed = heard + ABSENT_MS + crate::MAX_TICKET_LIFETIME * 1000;
+        game.relays[0].advance_clock(freed, unix(freed));
+        assert!(!game.journals[0].0.join("05".repeat(16)).exists());
+    }
+
+    #[test]
+    fn silent_players_depart_as_lost_once_from_their_own_relay() {
+        let mut game = Match::new(false);
+        game.play();
+        // Neither player sends anything for ten minutes while the relays keep
+        // their link. Each relay ends only the place it homes, and both merge
+        // both departures.
+        for _ in 0..ABSENT_MS / 1000 {
+            game.now += 999;
+            game.step();
+        }
+        for _ in 0..300 {
+            game.step();
+        }
+        for relay in 0..2 {
+            // The departures precede ten minutes of frames, past the RAM cache.
+            let ordering = game.relays[relay]
+                .rooms
+                .get_mut(&[5; 16])
+                .unwrap()
+                .ordering
+                .as_mut()
+                .unwrap();
+            let mut departures = Vec::new();
+            let mut cursor = 1;
+            while cursor < ordering.next_seq {
+                let page = ordering.history_page(cursor, 32).unwrap();
+                cursor += page.len() as u64;
+                departures.extend(
+                    page.into_iter()
+                        .filter(|entry| entry[0] == DEPARTURE_EVENT)
+                        .map(|entry| entry[13..].to_vec()),
+                );
+            }
+            assert_eq!(departures, [[0, 1], [1, 1]], "relay {relay}");
+        }
+    }
+
+    #[test]
+    fn a_relay_departs_a_silent_relays_players_as_lost_and_plays_on() {
+        let mut game = Match::new(false);
+        game.play();
+        // Relay B restarts: its link counts from 1 again, which A's replay
+        // window refuses, and its files keep it from recreating the room. A
+        // never hears from B again; A's player stays.
+        let link = &game.relays[0].rooms[&[5; 16]]
+            .federation
+            .as_ref()
+            .unwrap()
+            .links[0];
+        let ((_, heard), sealed) = (link.echo.unwrap(), link.sealed);
+        let keepalive = heard + 150_000;
+        pull(&mut game.relays[0], &mut game.clients[0], 1, keepalive);
+        for (now_ms, merged) in [(heard + ABSENT_MS - 1, false), (heard + ABSENT_MS, true)] {
+            game.relays[0].drain_federation(now_ms, unix(now_ms));
+            game.relays[0].advance_clock(now_ms, unix(now_ms));
+            let ordering = game.ordering(0);
+            assert_eq!(ordering.head == ordering.sealed, merged);
+            assert!(ordering.finished_at.is_none(), "relay A's player plays on");
+        }
+        let ordering = game.relays[0]
+            .rooms
+            .get_mut(&[5; 16])
+            .unwrap()
+            .ordering
+            .as_mut()
+            .unwrap();
+        let mut departures = Vec::new();
+        let mut cursor = 1;
+        while cursor < ordering.next_seq {
+            let page = ordering.history_page(cursor, 32).unwrap();
+            cursor += page.len() as u64;
+            departures.extend(
+                page.into_iter()
+                    .filter(|entry| entry[0] == DEPARTURE_EVENT)
+                    .map(|entry| (read_u32(&entry, 9), entry[13..].to_vec())),
+            );
+        }
+        assert_eq!(
+            departures,
+            [(sealed + 1, vec![1, 1])],
+            "after B's last seal"
+        );
+    }
+
+    #[test]
+    fn link_entries_cross_twice_and_go_again_only_once_overdue() {
+        let mut game = Match::new(false);
+        let healthy = game.play();
+        for _ in 0..500 {
+            game.step();
+        }
+        assert_eq!(
+            game.carried.map(|sent| sent.len()),
+            [LINK_COPIES; 2],
+            "one command each way"
+        );
+        // Both copies of relay A's command are lost. B ignores A's later
+        // packets until A sends it again, a round trip and margin later.
+        let mut game = Match::new(false);
+        game.lose = LINK_COPIES;
+        let latency = game.play();
+        for _ in 0..500 {
+            game.step();
+        }
+        let sent = &game.carried[0];
+        assert_eq!(sent.len(), 2 * LINK_COPIES);
+        let overdue = 2 * LINK_MS + RESEND_MARGIN_MS;
+        assert!(
+            (overdue..=overdue + 2).contains(&(sent[LINK_COPIES] - sent[0])),
+            "sent again {} ms later",
+            sent[LINK_COPIES] - sent[0]
+        );
+        assert_eq!(latency[0], healthy[0]);
+        assert_eq!(game.stream(0), game.stream(1));
+    }
+
+    #[test]
+    fn a_start_whose_coordinator_never_answers_cancels_at_the_loading_limit() {
+        // The coordinator's only player never became ready, so it has no
+        // ordering room and, once that player's tickets lapse, no hop room.
+        let mut game = Match::build(false, [false, true]);
+        let limit = game.ordering(1).created_ms + LOADING_LIMIT_MS;
+        for now_ms in [limit - 1, limit] {
+            game.relays[1].advance_clock(now_ms, unix(now_ms));
+            game.relays[1].drain_federation(now_ms, unix(now_ms));
+        }
+        let ordering = game.ordering(1);
+        assert!(ordering.starts_at.is_none() && ordering.finished_at == Some(limit));
     }
 
     #[test]

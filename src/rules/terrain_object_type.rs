@@ -876,6 +876,7 @@ mod tests {
                 impact,
                 weapon.damage,
                 warhead,
+                true,
                 (crate::sim::combat::RAD_NO_ATTACKER, None, warhead_ref),
                 FrameEffects::default(),
             );

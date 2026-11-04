@@ -3,6 +3,7 @@
 //! result. The shared shell controller owns button capture and keyboard routing.
 
 use crate::app::{App, AppState};
+use crate::sim::world::NetworkInterruption;
 use crate::ui::shell::controller::{DialogController, ShellKey};
 use crate::ui::shell::descriptor::DialogId;
 use crate::ui::shell::layout::LaidOutControl;
@@ -14,21 +15,25 @@ pub(crate) const DIALOG: DialogId = DialogId(0xCE);
 pub(crate) const BODY: (&str, &str) = ("TXT_OUT_OF_SYNC", "Reconnection Error!");
 pub(crate) const STOP: (&str, &str) = ("TXT_STOP", "Stop");
 
-pub(crate) fn labels(
-    state: &AppState,
-) -> ((&'static str, &'static str), (&'static str, &'static str)) {
-    use crate::sim::world::NetworkInterruption;
-    let interruption = state
+fn interruption(state: &AppState) -> Option<NetworkInterruption> {
+    state
         .match_state
         .sim_runtime
         .as_ref()
-        .and_then(|rt| rt.simulation.pending_network_interruption());
-    let body = match interruption {
+        .and_then(|rt| rt.simulation.pending_network_interruption())
+}
+
+pub(crate) fn labels(
+    state: &AppState,
+) -> ((&'static str, &'static str), (&'static str, &'static str)) {
+    let body = match interruption(state) {
         Some(NetworkInterruption::ScenariosDiffer) => {
             ("TXT_SCENARIOS_DO_NOT_MATCH", "Scenarios do not match.")
         }
         Some(NetworkInterruption::QueueFull) => ("TXT_QUEUE_FULL", "Network event queue is full."),
-        Some(NetworkInterruption::ConnectionFailed) => (
+        // A newer relay's record ends the match in the same box; vera_body
+        // replaces its body.
+        Some(NetworkInterruption::ConnectionFailed | NetworkInterruption::NewerClientRequired) => (
             "TXT_SYSTEM_NOT_RESPONDING",
             "The other system is not responding.",
         ),
@@ -37,6 +42,30 @@ pub(crate) fn labels(
     //6480A7..64818A reads these body keys and825FB0=TXT_OK. The
     //checksum branch64CCEB uses TXT_STOP instead.
     (body, ("TXT_OK", "OK"))
+}
+
+/// VERA relay adaptation: no CSF string says that the relay sent records
+/// this build cannot read, so the box names the cause and the download page.
+/// An online match's connection failure is the relay's ordered stream, not
+/// another player (their silence removes only their House), so it names the
+/// game server rather than "the other system".
+pub(crate) fn vera_body(state: &AppState) -> Option<String> {
+    match interruption(state)? {
+        NetworkInterruption::NewerClientRequired => Some(format!(
+            "This online match needs a newer VERA20k. Download it from {}",
+            crate::app::shell_wol::RELEASES_URL
+        )),
+        NetworkInterruption::ConnectionFailed
+            if state.match_state.session_mode()
+                == crate::app::match_runtime::session::SessionMode::Wol =>
+        {
+            Some(
+                "The connection to the VERA20k game server failed, so this match cannot continue."
+                    .to_owned(),
+            )
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Default)]

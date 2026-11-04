@@ -86,6 +86,12 @@ impl GameEntity {
     pub fn has_airstrike_marker(&self) -> bool {
         self.airstrike.link.is_some()
     }
+    /// The strike owner this marker borrows its `+0x294` pointer from; its
+    /// type supplies the Phobos airstrike colours. `None` without a marker.
+    #[cfg(feature = "phobos")]
+    pub fn airstrike_owner(&self) -> Option<u64> {
+        self.airstrike.link
+    }
 }
 
 impl Simulation {
@@ -499,6 +505,10 @@ impl Simulation {
     /// GetFLH(0,zero); target is GetCoords(+48), without TargetCoordOffset.
     /// Presentation owns the planning/Health gate and clock-driven wobble.
     /// No RNG draw, timer write or detach; isolate the shared fallback Cell.
+    ///
+    /// Phobos `DEFINE_JUMP(LJMP, 0x6D481D, 0x6D482D)` ("Allow airstrike flare
+    /// draw to foot") skips the building-only gate, so a foot target draws the
+    /// line too.
     pub fn airstrike_designation_coordinates(
         &self,
         owner: u64,
@@ -514,6 +524,7 @@ impl Simulation {
             .substrate
             .entities
             .get(source.airstrike.manager.as_ref()?.target?)?;
+        #[cfg(not(feature = "phobos"))]
         if target.category() != EntityCategory::Structure {
             return None;
         }
@@ -542,6 +553,35 @@ impl Simulation {
 
     pub fn airstrike_tint_active(&self, target: u64) -> bool {
         self.substrate.airstrike_tint_active(target)
+    }
+
+    /// Phobos `TechnoExt::GetTintColor`'s airstrike arm
+    /// (`src/Ext/Techno/Body.Internal.cpp`): the `[ColorAdd]` index of the
+    /// strike owner type's `TintColorAirstrike`, which `TechnoTypeExt` resolves
+    /// as its own `LaserTargetColor`, then `[AudioVisual] LaserTargetColor`.
+    #[cfg(feature = "phobos")]
+    pub fn airstrike_laser_target_color(&self, target: u64, rules: &RuleSet) -> i32 {
+        self.substrate
+            .entities
+            .get(target)
+            .and_then(GameEntity::airstrike_owner)
+            .and_then(|owner| self.substrate.entities.get(owner))
+            .and_then(|owner| self.object_type(owner.type_ref(), rules))
+            .and_then(crate::rules::object_type::ObjectType::laser_target_color)
+            .unwrap_or(rules.general.laser_target_color)
+    }
+
+    /// Phobos `AirstrikeLineColor.Get(RulesExt::AirstrikeLineColor)` for a
+    /// strike drawn by `owner` (`TechnoClass_DrawAirstrikeFlare_LineColor`,
+    /// `0x007058F6`): its type's own value, then `[AudioVisual]`.
+    #[cfg(feature = "phobos")]
+    pub fn airstrike_line_color(&self, owner: u64, rules: &RuleSet) -> [u8; 3] {
+        self.substrate
+            .entities
+            .get(owner)
+            .and_then(|owner| self.object_type(owner.type_ref(), rules))
+            .and_then(crate::rules::object_type::ObjectType::airstrike_line_color)
+            .unwrap_or(rules.general.airstrike_line_color)
     }
 }
 

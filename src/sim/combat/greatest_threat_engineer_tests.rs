@@ -73,7 +73,13 @@ fn scene_with(
         )
         .unwrap();
     let actor = sim.substrate.entities.get(engineer).unwrap();
-    assert!(is_armed(actor, object));
+    assert!(is_armed(
+        actor,
+        object,
+        &sim.substrate.entities,
+        &rules,
+        &sim.interner
+    ));
     Some((sim, rules, registry, engineer, building))
 }
 

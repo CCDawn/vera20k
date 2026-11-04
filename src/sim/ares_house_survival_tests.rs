@@ -280,7 +280,7 @@ fn keep_alive_limbo_capture_reload_and_destruction_use_the_tracking_owner() {
 #[cfg(feature = "ares")]
 #[test]
 fn keep_alive_counter_and_future_removal_input_are_hashed_independently() {
-    use crate::sim::state_hasher::StateHasher;
+    use crate::util::state_hasher::StateHasher;
     use std::hash::Hasher;
 
     let hash = |tracking: &HouseTracking| {

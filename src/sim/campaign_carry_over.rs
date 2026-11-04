@@ -152,6 +152,22 @@ impl Simulation {
                 set,
             );
         }
+        self.restore_player_carry_over(record, rules);
+        self.session
+            .inherit_campaign_countdown(record.countdown_frames);
+        self.session.set_campaign_map_stage(record.map_stage);
+    }
+
+    /// `0x004C622F..0x004C6295`: the money and difficulty row go to PlayerPtr.
+    /// VERA network adaptation, as HasOccurred53's: each LAN Cooperative peer
+    /// saved its own House's record and would restore it onto that House
+    /// alone, so a network game restores neither.
+    /// RESIDUAL: online, a map's nonzero `CarryOverMoney=` carries no money.
+    /// No retail map reaches it: the 50 that set the key set it to 0.
+    fn restore_player_carry_over(&mut self, record: &CampaignCarryOver, rules: &RuleSet) {
+        if self.session.game_mode().is_network() {
+            return;
+        }
         let Some(player) = self.session.current_house() else {
             return;
         };
@@ -196,9 +212,6 @@ impl Simulation {
                 frame,
             );
         }
-        self.session
-            .inherit_campaign_countdown(record.countdown_frames);
-        self.session.set_campaign_map_stage(record.map_stage);
     }
 }
 
@@ -465,6 +478,38 @@ mod tests {
 
         sim.restore_campaign_carry_over(&record, &rules);
         assert_eq!(sim.save_campaign_carry_over(), record);
+    }
+
+    /// Each LAN Cooperative peer holds its own House's record: the shared
+    /// globals and stage still restore, the House part does not.
+    #[test]
+    fn a_network_game_restores_no_house_part() {
+        let rules = RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str("")).unwrap();
+        let mut sim = timer_campaign(&crate::rules::ini_parser::IniFile::from_str(
+            "[Basic]\nCarryOverMoney=100%\nCarryOverCap=-1\n",
+        ));
+        sim.session
+            .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Lan);
+        let player = sim.session.current_house().unwrap();
+        let difficulty = sim.houses.get(&player).unwrap().difficulty();
+        let mut globals = [false; SCENARIO_GLOBAL_COUNT];
+        globals[7] = true;
+        sim.restore_campaign_carry_over(
+            &CampaignCarryOver {
+                globals,
+                player_difficulty: HouseDifficulty::Hard,
+                money: 500,
+                map_stage: 3,
+                ..CampaignCarryOver::CLEARED
+            },
+            &rules,
+        );
+        let house = sim.houses.get(&player).unwrap();
+        assert_eq!(house.economy().credits(), 0);
+        assert_eq!(house.difficulty(), difficulty);
+        assert_ne!(difficulty, HouseDifficulty::Hard);
+        assert!(sim.global_variables()[7]);
+        assert_eq!(sim.session().campaign_map_stage(), 3);
     }
 
     #[test]

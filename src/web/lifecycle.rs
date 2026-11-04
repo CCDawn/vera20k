@@ -13,6 +13,8 @@ pub(crate) struct Lifecycle {
     error: Option<String>,
     terminal: bool,
     external_finished: bool,
+    /// A panic: memory and any borrow it interrupted can no longer be trusted.
+    fatal: bool,
 }
 
 impl Lifecycle {
@@ -20,10 +22,26 @@ impl Lifecycle {
         self.started
     }
 
+    /// Launch files and user data may change: nothing runs and nothing panicked.
+    pub(crate) fn idle(&self) -> bool {
+        !self.fatal && (!self.started || self.terminal)
+    }
+
+    /// A `start_spawn` launch that exited cleanly left App and winit torn down.
+    /// The imported files outlive it, so the next launch only builds a new App.
+    fn may_restart(&self, external: bool) -> bool {
+        external && self.external && self.terminal && !self.fatal
+    }
+
+    pub(crate) fn may_start(&self, external: bool) -> bool {
+        self.may_restart(external) || (!self.started && !self.terminal)
+    }
+
     pub(crate) fn start(&mut self, external: bool) -> Result<(), &'static str> {
-        if self.started || self.terminal {
+        if !self.may_start(external) {
             return Err("Game already started; reload to restart");
         }
+        *self = Self::default();
         self.started = true;
         self.external = external;
         Ok(())
@@ -100,6 +118,7 @@ impl Lifecycle {
         }
         self.request_exit(Some(error));
         self.terminal = true;
+        self.fatal = true;
         Some(json!({ "type": "engine-error", "error": error }))
     }
 }
@@ -133,6 +152,33 @@ mod tests {
         assert_eq!(lifecycle.exited().unwrap()["reason"], "match-ended");
         assert!(lifecycle.exited().is_none());
         assert!(lifecycle.start(false).is_err());
+    }
+
+    #[test]
+    fn a_clean_spawn_exit_admits_another_launch_with_fresh_state() {
+        let mut lifecycle = Lifecycle::default();
+        lifecycle.start(true).unwrap();
+        lifecycle.match_started();
+        assert!(!lifecycle.idle());
+        lifecycle.match_ended(json!({"result": "won"}));
+        lifecycle.finish_external(json!({"result": "won", "reason": null}));
+        lifecycle.exited().unwrap();
+        assert!(lifecycle.idle());
+        lifecycle.start(true).unwrap();
+        assert!(!lifecycle.idle() && lifecycle.spawn_running() && !lifecycle.external_finished());
+        assert!(lifecycle.exited().is_some());
+    }
+
+    #[test]
+    fn a_panic_and_a_menu_launch_never_restart() {
+        let mut panic = Lifecycle::default();
+        panic.start(true).unwrap();
+        panic.fatal("panic");
+        assert!(panic.start(true).is_err() && !panic.idle());
+        let mut menu = Lifecycle::default();
+        menu.start(false).unwrap();
+        menu.exited().unwrap();
+        assert!(menu.start(false).is_err() && menu.start(true).is_err());
     }
 
     #[test]

@@ -114,7 +114,6 @@ const NETWORK_OPTIONS_CHECKPOINTS: [(&str, movies::NetworkOptionsTarget); 7] = [
 ];
 const CHECKPOINT_MAIN_MENU_0XE2_NETWORK_BOUNCE: &str = "main-menu-0xe2-network-bounce";
 const CHECKPOINT_WOL_0X10E_STEADY: &str = "wol-0x10e-steady";
-const CHECKPOINT_WOL_ONLINE_WELCOME_STEADY: &str = "wol-online-welcome-steady";
 const CHECKPOINT_WOL_0X10E_ENTRY_PREFIX: &str = "wol-0x10e-entry-tick-";
 const CHECKPOINT_WOL_0X10E_HOVER_QUICK_MATCH: &str = "wol-0x10e-hover-quick-match";
 const CHECKPOINT_WOL_0X10E_API_MISSING: &str = "wol-0x10e-api-missing";
@@ -278,8 +277,6 @@ pub enum ShellCaptureCheckpoint {
     MainMenu0xE2NetworkBounce,
     /// Main Menu -> Internet: `0x10E` settled.
     Wol0x10ESteady,
-    /// The actual online welcome, without entering login or reading credentials.
-    WolOnlineWelcomeSteady,
     /// Its entry slide held at one tick (`wol-0x10e-entry-tick-<N>`).
     Wol0x10EEntry(u32),
     /// Settled with the pointer on Quick Match.
@@ -332,7 +329,7 @@ pub enum ShellCaptureCheckpoint {
     Skirmish0x105ListOpen,
     /// Use Map on `0x105` asks to eject AI players; the answer's dialog
     /// settles (`CHECKPOINT_SKIRMISH_0X105_EJECT_*`).
-    Skirmish0x105Eject(crate::ui::skirmish_shell::EjectPromptButton),
+    Skirmish0x105Eject(crate::ui::skirmish_shell::ChooseMapPromptButton),
     /// The same route's eject box, unanswered.
     Skirmish0x105EjectBox,
     /// Choose Map `0x6B` settled after Skirmish's Choose Map.
@@ -565,10 +562,10 @@ impl ShellCaptureCheckpoint {
                 Ok(Self::Skirmish0x105SeedBrowserReturn)
             }
             CHECKPOINT_SKIRMISH_0X105_EJECT_CANCEL => Ok(Self::Skirmish0x105Eject(
-                crate::ui::skirmish_shell::EjectPromptButton::Cancel,
+                crate::ui::skirmish_shell::ChooseMapPromptButton::Cancel,
             )),
             CHECKPOINT_SKIRMISH_0X105_EJECT_OK => Ok(Self::Skirmish0x105Eject(
-                crate::ui::skirmish_shell::EjectPromptButton::Ok,
+                crate::ui::skirmish_shell::ChooseMapPromptButton::Ok,
             )),
             CHECKPOINT_SKIRMISH_0X102_CHOOSE_MAP_RETURN => Ok(Self::Skirmish0x102ChooseMapReturn),
             CHECKPOINT_SKIRMISH_START_BLANK => Ok(Self::SkirmishStartBlank),
@@ -728,7 +725,6 @@ impl ShellCaptureCheckpoint {
             CHECKPOINT_OPTIONS_VERA_STEADY => Ok(Self::OptionsVeraSteady),
             CHECKPOINT_MAIN_MENU_0XE2_NETWORK_BOUNCE => Ok(Self::MainMenu0xE2NetworkBounce),
             CHECKPOINT_WOL_0X10E_STEADY => Ok(Self::Wol0x10ESteady),
-            CHECKPOINT_WOL_ONLINE_WELCOME_STEADY => Ok(Self::WolOnlineWelcomeSteady),
             CHECKPOINT_WOL_0X10E_HOVER_QUICK_MATCH => Ok(Self::Wol0x10EHoverQuickMatch),
             CHECKPOINT_WOL_0X10E_API_MISSING => Ok(Self::Wol0x10EApiMissing),
             CHECKPOINT_WOL_0X10E_BACK => Ok(Self::Wol0x10EBack),
@@ -940,7 +936,6 @@ impl ShellCaptureCheckpoint {
             }
             Self::MainMenu0xE2NetworkBounce => CHECKPOINT_MAIN_MENU_0XE2_NETWORK_BOUNCE,
             Self::Wol0x10ESteady => CHECKPOINT_WOL_0X10E_STEADY,
-            Self::WolOnlineWelcomeSteady => CHECKPOINT_WOL_ONLINE_WELCOME_STEADY,
             Self::Wol0x10EEntry(_) => "wol-0x10e-entry",
             Self::Wol0x10EHoverQuickMatch => CHECKPOINT_WOL_0X10E_HOVER_QUICK_MATCH,
             Self::Wol0x10EApiMissing => CHECKPOINT_WOL_0X10E_API_MISSING,
@@ -963,10 +958,10 @@ impl ShellCaptureCheckpoint {
             Self::Skirmish0x105SeedBrowserReturn => CHECKPOINT_SKIRMISH_0X105_SEED_BROWSER_RETURN,
             Self::Skirmish0x105ListOpen => CHECKPOINT_SKIRMISH_0X105_LIST_OPEN,
             Self::Skirmish0x105EjectBox => CHECKPOINT_SKIRMISH_0X105_EJECT_BOX,
-            Self::Skirmish0x105Eject(crate::ui::skirmish_shell::EjectPromptButton::Cancel) => {
+            Self::Skirmish0x105Eject(crate::ui::skirmish_shell::ChooseMapPromptButton::Cancel) => {
                 CHECKPOINT_SKIRMISH_0X105_EJECT_CANCEL
             }
-            Self::Skirmish0x105Eject(crate::ui::skirmish_shell::EjectPromptButton::Ok) => {
+            Self::Skirmish0x105Eject(crate::ui::skirmish_shell::ChooseMapPromptButton::Ok) => {
                 CHECKPOINT_SKIRMISH_0X105_EJECT_OK
             }
             Self::Skirmish0x6BSteady => CHECKPOINT_SKIRMISH_0X6B_STEADY,
@@ -1075,12 +1070,6 @@ impl ShellCaptureCheckpoint {
             Self::MainMenu0xE2NetworkBounce => movies::MoviesTarget::NetworkBounce,
             Self::Wol0x10ESteady => movies::MoviesTarget::WolWelcome {
                 provider: crate::app::shell_wol::WolProvider::Unavailable,
-                entry_tick: None,
-                hover: None,
-                press: movies::WolPress::None,
-            },
-            Self::WolOnlineWelcomeSteady => movies::MoviesTarget::WolWelcome {
-                provider: crate::app::shell_wol::WolProvider::Online,
                 entry_tick: None,
                 hover: None,
                 press: movies::WolPress::None,
@@ -1275,12 +1264,16 @@ pub(crate) struct LiveLanConfig {
 }
 
 impl ShellCaptureRequest {
-    /// Only explicit native WOL diagnostics retain the original UI surface.
-    pub(crate) fn legacy_wol_ui(&self) -> bool {
+    /// Only explicit native diagnostics retain the original WOL surface and
+    /// BD's Accept; the live LAN and online runs play as players do.
+    pub(crate) fn native_shell_ui(&self) -> bool {
         match self.checkpoint.movies_target() {
             Some(movies::MoviesTarget::Wol(target)) => !matches!(
                 target,
                 movies::WolTarget::ModernLobby
+                    | movies::WolTarget::ModernCreate
+                    | movies::WolTarget::ModernRoomOptions
+                    | movies::WolTarget::ModernSpectators
                     | movies::WolTarget::ModernOptions
                     | movies::WolTarget::ModernUsername
             ),
@@ -1288,6 +1281,7 @@ impl ShellCaptureRequest {
                 provider: crate::app::shell_wol::WolProvider::Unavailable,
                 ..
             }) => true,
+            Some(movies::MoviesTarget::Lan(target)) => !target.live(),
             _ => false,
         }
     }
@@ -2472,6 +2466,7 @@ impl ShellCaptureSession {
     pub(crate) fn prepare_state(&mut self, state: &mut AppState) {
         state.match_state.input.cursor_x = self.request.cursor_x as f32;
         state.match_state.input.cursor_y = self.request.cursor_y as f32;
+        state.frontend.native_shell_ui = self.request.native_shell_ui();
         self.started_at = Some(Instant::now());
     }
 
@@ -2570,32 +2565,25 @@ impl ShellCaptureSession {
                 "latency capture surface changed from the requested dimensions"
             );
         }
-        if let Some(visit) = state.frontend.wol.as_mut() {
-            let mut changed = visit.set_legacy_ui(self.request.legacy_wol_ui());
-            let mut provider_selected = false;
-            if !self.wol_welcome_provider_selected
-                && matches!(visit.page, crate::app::shell_wol::WolPage::Welcome)
-                && let Some(provider) = self.request.wol_welcome_provider()
-            {
-                visit.set_provider(provider);
-                self.wol_welcome_provider_selected = true;
-                provider_selected = true;
-                changed = true;
-            }
-            if changed {
-                if provider_selected && self.request.legacy_wol_ui() {
-                    // Normal Online entry skips native persona I/O. Only
-                    // after the explicit native diagnostic selection may
-                    // its existing owner prefill and reopen the welcome.
-                    crate::app::shell_wol::persona::enter_wol_main(state);
-                    crate::app::App::reopen_wol_welcome(state);
-                }
-                // The ordinary reducer rearms the selected page's entry before
-                // any controlled driver reads its controls. Native fixtures
-                // are confined to the capture's separately marked profile.
-                crate::app::frontend::shell_transition::invalidate_main_menu_dialog_instance(state);
-                return Ok(());
-            }
+        // A native visit opened with the retail welcome (`prepare_state`);
+        // the normal online visit has none and needs no selection.
+        if let Some(visit) = state.frontend.wol.as_mut()
+            && !self.wol_welcome_provider_selected
+            && matches!(visit.page, crate::app::shell_wol::WolPage::Welcome)
+            && let Some(provider) = self.request.wol_welcome_provider()
+        {
+            visit.set_provider(provider);
+            self.wol_welcome_provider_selected = true;
+            // Normal Online entry skips native persona I/O. Only after the
+            // explicit native diagnostic selection may its existing owner
+            // prefill and reopen the welcome.
+            crate::app::shell_wol::persona::enter_wol_main(state);
+            crate::app::App::reopen_wol_welcome(state);
+            // The ordinary reducer rearms the selected page's entry before
+            // any controlled driver reads its controls. Native fixtures are
+            // confined to the capture's separately marked profile.
+            crate::app::frontend::shell_transition::invalidate_main_menu_dialog_instance(state);
+            return Ok(());
         }
         if let Some(capture) = &mut self.skirmish {
             capture.after_present(state, rendered, self.frames_seen)?;
@@ -4114,7 +4102,7 @@ mod tests {
         ] {
             let checkpoint = ShellCaptureCheckpoint::parse(name).expect("WOL checkpoint");
             request.checkpoint = checkpoint;
-            assert!(request.legacy_wol_ui());
+            assert!(request.native_shell_ui());
             assert_eq!(
                 request.wol_welcome_provider(),
                 Some(crate::app::shell_wol::WolProvider::Unavailable)
@@ -4138,7 +4126,7 @@ mod tests {
             ),
         ] {
             request.checkpoint = ShellCaptureCheckpoint::parse(name).unwrap();
-            assert!(request.legacy_wol_ui());
+            assert!(request.native_shell_ui());
             assert_eq!(request.wol_welcome_provider(), Some(provider));
         }
         assert_eq!(
@@ -4149,45 +4137,31 @@ mod tests {
     }
 
     #[test]
-    fn online_welcome_capture_requires_no_login_inputs() {
-        let output = new_output_path("online-welcome");
+    fn modern_wol_captures_require_no_login_inputs() {
+        let output = new_output_path("modern-wol");
         let mut values = valid_args(&output);
-        values[1] = CHECKPOINT_WOL_ONLINE_WELCOME_STEADY.into();
+        values[1] = "wol-modern-username".into();
         let AppLaunchMode::ShellCapture(mut request) = parse_launch_args(values).expect("parse")
         else {
             panic!("capture");
         };
-        assert_eq!(
-            request.checkpoint().as_str(),
-            CHECKPOINT_WOL_ONLINE_WELCOME_STEADY
-        );
         assert!(request.live_online.is_none());
-        assert!(!request.legacy_wol_ui());
-        assert_eq!(
-            request.wol_welcome_provider(),
-            Some(crate::app::shell_wol::WolProvider::Online)
-        );
-        assert_eq!(
-            request.checkpoint().movies_target(),
-            Some(movies::MoviesTarget::WolWelcome {
-                provider: crate::app::shell_wol::WolProvider::Online,
-                entry_tick: None,
-                hover: None,
-                press: movies::WolPress::None,
-            })
-        );
         request.checkpoint = ShellCaptureCheckpoint::Lan(movies::LanTarget::OnlineHost);
-        assert!(!request.legacy_wol_ui());
+        assert!(!request.native_shell_ui());
         assert_eq!(request.wol_welcome_provider(), None);
+        request.checkpoint = ShellCaptureCheckpoint::Lan(movies::LanTarget::Accepted);
+        assert!(request.native_shell_ui(), "BD diagnostics keep Accept");
         request.checkpoint = ShellCaptureCheckpoint::parse("wol-modern-lobby").unwrap();
-        assert!(!request.legacy_wol_ui());
+        assert!(!request.native_shell_ui());
         assert!(request.live_online.is_none());
         assert_eq!(
             request.wol_welcome_provider(),
             Some(crate::app::shell_wol::WolProvider::TestService)
         );
+        request.checkpoint = ShellCaptureCheckpoint::parse("wol-modern-create").unwrap();
+        assert!(!request.native_shell_ui());
         request.checkpoint = ShellCaptureCheckpoint::parse("wol-modern-username").unwrap();
-        assert!(!request.legacy_wol_ui());
+        assert!(!request.native_shell_ui());
         assert_eq!(
             request.wol_welcome_provider(),
             Some(crate::app::shell_wol::WolProvider::Online)

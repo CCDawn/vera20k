@@ -153,7 +153,7 @@ fn record_activation_matches_original_and_keeps_raw_connectivity_rows() {
         let b = coord(&input["b"]);
         let native_index = (i32::from(b.1 as i16) * 17 + i32::from(b.0 as i16)).clamp(0, 288);
         base.zone_ids[(native_index / 17 * 16 + native_index % 17) as usize] = 2;
-        let raw: Vec<u16> = input
+        let raw: Vec<crate::sim::pathfinding::zone_map::ZoneId> = input
             .get("raw")
             .map(|v| serde_json::from_value(v.clone()).unwrap())
             .unwrap_or(vec![2, 3]);

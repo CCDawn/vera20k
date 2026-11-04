@@ -506,7 +506,7 @@ impl MatchDiagnosticsState {
             let sim = &runtime.simulation;
             ReplayLog::new(crate::sim::replay::ReplayHeader {
                 pixel_conversion_bounds: sim.session().pixel_conversion_bounds(),
-                version: 2,
+                version: crate::sim::replay::REPLAY_VERSION,
                 tick_hz: crate::app::types::SIM_TICK_HZ,
                 seed: sim.session().seed(),
                 map_name: sim.session().map_name().to_owned(),
@@ -565,6 +565,33 @@ impl MatchDiagnosticsState {
         replays_dir: &Path,
         unix_secs: u64,
     ) -> anyhow::Result<Option<ReplayLogFlush>> {
+        // The browser has no std::fs and nothing reads a segment back: it goes
+        // straight to the host, or nowhere when the host takes no replays.
+        #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+        {
+            let Some(log) = self.replay_log.take() else {
+                return Ok(None);
+            };
+            if (log.ticks.is_empty() && log.initial_scenario_services.is_empty())
+                || !crate::web::has_replay_callback()
+            {
+                return Ok(None);
+            }
+            let name = format!("replay_tick{session_tick}_{unix_secs}.json");
+            let mut bytes = Vec::new();
+            let written = log
+                .write_json(&mut bytes)
+                .and_then(|()| crate::web::hand_over_replay(&name, &bytes));
+            if let Err(error) = written {
+                self.replay_log = Some(log);
+                return Err(error);
+            }
+            return Ok(Some(ReplayLogFlush {
+                path: replays_dir.join(name),
+                tick_count: log.ticks.len(),
+            }));
+        }
+        #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
         self.flush_to_with_writer(session_tick, replays_dir, unix_secs, |log, file| {
             log.write_json(file)
         })
@@ -596,6 +623,7 @@ impl MatchDiagnosticsState {
                 let _ = crate::util::file_system::remove_file(&path);
                 return Err(error.context(format!("Diagnostic log: {}", path.display())));
             }
+            prune_old_segments(replays_dir, KEPT_SEGMENTS);
             Ok(Some(ReplayLogFlush {
                 path,
                 tick_count: log.ticks.len(),
@@ -625,6 +653,47 @@ impl MatchDiagnosticsState {
             self.replay_log = None;
         }
         result
+    }
+}
+
+/// How many diagnostic segments `replays/` keeps; each flush deletes older ones.
+const KEPT_SEGMENTS: usize = 20;
+
+/// The `(unix_secs, tick, n)` order key of a `replay_tick{tick}_{secs}[_{n}].json`
+/// name; None for any other file.
+fn segment_age(name: &str) -> Option<(u64, u64, u64)> {
+    let stem = name.strip_prefix("replay_tick")?.strip_suffix(".json")?;
+    let mut parts = stem.split('_').map(|part| part.parse::<u64>().ok());
+    let tick = parts.next()??;
+    let secs = parts.next()??;
+    let n = parts.next().unwrap_or(Some(0))?;
+    parts.next().is_none().then_some((secs, tick, n))
+}
+
+/// Delete all but the newest `keep` segments. Other files in the folder are
+/// left alone, and a failed delete is only logged.
+fn prune_old_segments(replays_dir: &Path, keep: usize) {
+    let Ok(entries) = crate::util::file_system::read_dir(replays_dir) else {
+        return;
+    };
+    let mut segments: Vec<_> = entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let age = segment_age(path.file_name()?.to_str()?)?;
+            Some((age, path))
+        })
+        .collect();
+    if segments.len() <= keep {
+        return;
+    }
+    segments.sort_unstable();
+    for (_, path) in &segments[..segments.len() - keep] {
+        if let Err(error) = crate::util::file_system::remove_file(path) {
+            log::warn!(
+                "Could not delete old diagnostic log {}: {error}",
+                path.display()
+            );
+        }
     }
 }
 
@@ -675,7 +744,7 @@ fn reserve_segment_path(
 
 #[cfg(test)]
 mod tests {
-    use super::MatchDiagnosticsState;
+    use super::{MatchDiagnosticsState, prune_old_segments};
     use crate::sim::replay::{ReplayHeader, ReplayLog};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -815,6 +884,36 @@ mod tests {
         assert!(log.ticks.is_empty());
         assert_eq!(log.initial_scenario_services, [ScenarioServiceInput::Pause]);
         assert!(diagnostics.replay_log.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_flush_keeps_only_the_newest_segments() {
+        let root = test_path("prune");
+        std::fs::create_dir_all(&root).unwrap();
+        // Name order is not age order: the tick comes before the seconds.
+        for name in [
+            "replay_tick9_100.json",
+            "replay_tick1_200.json",
+            "replay_tick1_200_1.json",
+        ] {
+            std::fs::write(root.join(name), b"{}").unwrap();
+        }
+        std::fs::write(root.join("notes.txt"), b"mine").unwrap();
+        prune_old_segments(&root, 2);
+        let mut left: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "notes.txt",
+                "replay_tick1_200.json",
+                "replay_tick1_200_1.json"
+            ]
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

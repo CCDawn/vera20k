@@ -18,6 +18,7 @@
 
 use crate::rules::ini_parser::{IniFile, IniSection};
 use crate::rules::object_image::{ImageTheater, ObjectImageKind, ObjectImageState};
+use crate::util::native_x87::NativeF64Bits;
 
 /// Shared inputs captured by ObjectType::LoadSHP5F9070; asset binding resolves
 /// the attempted name independently of constructor or later Image text.
@@ -131,6 +132,11 @@ pub struct ProjectileType {
     // --- Float fields ---
     /// Bounce elasticity coefficient (0.0 = no bounce, 1.0 = perfect bounce). (+0x2C8)
     pub elasticity: f64,
+    /// Phobos `BulletTypeExt::Gravity` (`Nullable<double>`): the ballistic
+    /// gravity this type uses, defaulting to `[General] Gravity=` and halved
+    /// for `Floater=`. Kept as exact binary64 bits, like `Elasticity=`.
+    #[cfg(feature = "phobos")]
+    gravity: Option<NativeF64Bits>,
 
     // --- Color ---
     /// Native BulletType +2D4 runtime ColorScheme index. The retained rules
@@ -143,6 +149,10 @@ pub struct ProjectileType {
     pub shrapnel_weapon: Option<String>,
     /// Airburst child weapon (+2B0), retained by the ordered Rules reader.
     pub airburst_weapon: Option<String>,
+    /// Phobos `BulletTypeExt` airburst/splits settings. Absent keys keep the
+    /// Phobos constructor defaults; only Phobos builds read or consume them.
+    #[cfg(feature = "phobos")]
+    pub phobos_airburst: crate::rules::phobos_airburst::PhobosAirburstType,
     /// Current native Image25 text; SHP admission is separately retained below.
     pub image: Option<String>,
     /// Admitted native5F9070 requests, independently of later Image text.
@@ -329,7 +339,51 @@ impl ProjectileArtState {
     }
 }
 
+/// Phobos `BulletTypeExt::Gravity` (`Nullable<double>`) as exact binary64
+/// bits, shared by the type reader and the weapon speed pass. RESIDUAL: a
+/// value the float parse makes infinite (such as `1e39`) counts as unset;
+/// Phobos would carry the infinity through its x87 gravity arithmetic.
+#[cfg(feature = "phobos")]
+pub(crate) fn read_phobos_gravity(section: &IniSection) -> Option<NativeF64Bits> {
+    section
+        .read_phobos_nullable_double("Gravity", None)
+        .filter(|value| value.is_finite())
+        .map(|value| NativeF64Bits::from_bits(value.to_bits()))
+}
+
 impl ProjectileType {
+    /// Phobos `Splits=`: the Phobos emitter replaces the native tail and the
+    /// parent's outer cluster loop, exactly as `BulletClass::Explodes`'s
+    /// airburst checks do with `Airburst || Splits`. False without the feature.
+    pub const fn splits(&self) -> bool {
+        #[cfg(feature = "phobos")]
+        {
+            self.phobos_airburst.splits
+        }
+        #[cfg(not(feature = "phobos"))]
+        {
+            false
+        }
+    }
+
+    /// Phobos `BulletTypeExt::Gravity`, unset when the key is absent.
+    #[cfg(feature = "phobos")]
+    pub fn gravity(&self) -> Option<NativeF64Bits> {
+        self.gravity
+    }
+
+    /// Phobos is compiled out: every shot uses the Rules gravity.
+    #[cfg(not(feature = "phobos"))]
+    pub fn gravity(&self) -> Option<NativeF64Bits> {
+        None
+    }
+
+    /// `Airburst=` or, in a Phobos build, `Splits=`: the BulletClass impact
+    /// and detonation arms Phobos' `BulletClass::Explodes` hooks select.
+    pub const fn airburst_arm(&self) -> bool {
+        self.airburst || self.splits()
+    }
+
     /// Runtime ColorScheme index (two native shade variants per Colors entry).
     pub fn color_scheme(&self) -> i32 {
         self.color_scheme
@@ -401,12 +455,18 @@ impl ProjectileType {
             // ReadDouble -> `FSTP qword [ESI+0x2C8]` (`0x0046BF71`) over the
             // constructor's 0.75 (`0x0046BC65`/`0x0046BC9A`).
             elasticity: section.read_double("Elasticity", 0.75),
+            #[cfg(feature = "phobos")]
+            gravity: read_phobos_gravity(section),
             // Constructor46BCA4. Resolution requires the pass-local Colors
             // registry and is supplied by the retained rules processor.
             color_scheme: 0,
             // Constructor null; only the ordered Process owner reads it.
             shrapnel_weapon: None,
             airburst_weapon: None,
+            #[cfg(feature = "phobos")]
+            phobos_airburst: crate::rules::phobos_airburst::PhobosAirburstType::from_section(
+                section,
+            ),
             image: None,
             image_loads: Vec::new(),
             voxel_image_load: None,
@@ -533,6 +593,25 @@ mod tests {
             rules.simulation_config_hash(),
             "late binding cannot replace Bullet state"
         );
+    }
+
+    /// Phobos `Nullable<double> Gravity`: absent keeps the Rules fallback
+    /// (None), `<default>` clears it, a value keeps its exact binary64, and an
+    /// infinite one is dropped.
+    #[cfg(feature = "phobos")]
+    #[test]
+    fn phobos_gravity_reads_nullable_double_and_clears() {
+        let ini =
+            IniFile::from_str("[P]\nGravity=6.5\n[Q]\nGravity=<default>\n[R]\nGravity=1e39\n");
+        let gravity = |name: &str| {
+            ProjectileType::from_ini_section(name, ini.section(name).unwrap(), None).gravity()
+        };
+        assert_eq!(
+            gravity("P"),
+            Some(NativeF64Bits::from_bits(6.5f64.to_bits()))
+        );
+        assert_eq!(gravity("Q"), None);
+        assert_eq!(gravity("R"), None);
     }
 
     #[test]

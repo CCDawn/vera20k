@@ -159,6 +159,7 @@ mod tests {
         let dialog = crate::ui::multiplayer_setup::SetupDialog {
             host: false,
             flavor: crate::ui::multiplayer_setup::SetupFlavor::Lan,
+            modern: false,
         };
         let mut local = super::super::NetworkSetupProtocol::new(dialog, false);
         local.local_map_verified = true;
@@ -206,7 +207,7 @@ mod tests {
         let mut session = MatchSession::default();
         session.enter_network(NetworkReturnContext::Wol);
         session
-            .accept_network_setup(launch.clone(), true, None)
+            .accept_network_setup(launch.clone(), true, None, false)
             .unwrap();
         let mut metadata = NetworkMapMetadata {
             display_name: "Authored map".into(),
@@ -231,6 +232,7 @@ mod tests {
             crate::ui::multiplayer_setup::SetupDialog {
                 host: true,
                 flavor: crate::ui::multiplayer_setup::SetupFlavor::Wol,
+                modern: false,
             },
             false,
         );
@@ -406,8 +408,13 @@ pub(crate) fn accept_transfer_asset(
                 "downloaded map differs"
             );
             let effective = expected.effective_digest.clone();
+            let keep = (resource == TransferResource::Map && !expected.official)
+                .then(|| (file.to_owned(), expected.source_sha256.clone()));
             if resource == TransferResource::Map {
                 install_authored_preview(state, &loaded)?;
+            }
+            if let Some((file, digest)) = keep {
+                keep_for_choose_map(state, &file, &loaded.source, &digest);
             }
             state
                 .match_state
@@ -416,6 +423,33 @@ pub(crate) fn accept_transfer_asset(
         }
     }
     Ok(())
+}
+
+/// A received custom map stays for later: it is saved into VERA's maps folder
+/// and listed in Choose Map, so the player can host it. Best effort; the room
+/// never waits on it, and a file the player already has is left alone.
+fn keep_for_choose_map(
+    state: &mut AppState,
+    host_file: &str,
+    source: &crate::map::source::LoadedMapSource,
+    digest: &str,
+) {
+    let crate::map::source::LoadedMapSource::Loose { path, .. } = source else {
+        return;
+    };
+    let kept = crate::util::file_system::read(path)
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| {
+            ensure!(
+                crate::util::sha256::sha256_hex(&bytes) == digest,
+                "received map changed"
+            );
+            crate::app::map_library::keep_map(state, host_file, &bytes)
+        });
+    match kept {
+        Ok(path) => log::info!("Kept the received map {host_file} as {}", path.display()),
+        Err(error) => log::warn!("Could not keep the received map {host_file}: {error:#}"),
+    }
 }
 
 /// A transferred authored map keeps derived marker bounds with its received

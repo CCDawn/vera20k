@@ -385,6 +385,95 @@ fn a_bound_radiation_type_tints_the_field_with_its_own_color() {
     );
 }
 
+/// Phobos `TechnoExt::UpdateTintValues`'s AttachEffect arm: every active
+/// effect with a tint ORs its `Tint.Color` word and sums
+/// `Tint.Intensity * 1000`, filtered by `Tint.VisibleToHouses` against the
+/// current player's Owner/Allies/Enemies bucket.
+#[cfg(feature = "phobos")]
+#[test]
+fn attach_effect_tint_ors_colours_and_sums_intensities_by_viewer() {
+    let ini = IniFile::from_str(
+        "[InfantryTypes]\n[AircraftTypes]\n[BuildingTypes]\n\
+         [VehicleTypes]\n0=TARGET\n\
+         [TARGET]\nStrength=1000\nSpeed=6\n\
+         AttachEffect.AttachTypes=RED,BLUE,HIDDEN\n\
+         [AttachEffectTypes]\n0=RED\n1=BLUE\n2=HIDDEN\n\
+         [RED]\nDuration=100\nTint.Color=255,0,0\nTint.Intensity=1.0\n\
+         [BLUE]\nDuration=100\nTint.Color=0,0,255\nTint.Intensity=0.5\n\
+         Tint.VisibleToHouses=enemies\n\
+         [HIDDEN]\nDuration=100\nTint.Color=0,255,0\nTint.Intensity=2.0\n\
+         Tint.VisibleToHouses=none\n",
+    );
+    let rules = crate::rules::ruleset::RuleSet::from_ini(&ini).expect("rules");
+    let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 3);
+    sim.intern_rule_type_ids(&rules);
+    sim.resolve_type_handles(&rules);
+    let target = sim
+        .spawn_object("TARGET", "Americans", 20, 20, 0, &rules)
+        .expect("spawn");
+    sim.advance_tick(&[], Some(&rules), None, Some(rules.overlay_registry()), 22);
+    let americans = sim.interner().get("Americans").expect("owner");
+    let russians = sim.interner().get("Russians").expect("rival");
+
+    sim.session_mut_for_test()
+        .set_current_house_for_test(Some(americans));
+    assert_eq!(
+        attach_effect_tint(sim.entities().get(target).unwrap(), &sim, &rules),
+        (0xF800, 1000),
+        "the owner sees RED only; enem-only and none stay out"
+    );
+    sim.session_mut_for_test()
+        .set_current_house_for_test(Some(russians));
+    assert_eq!(
+        attach_effect_tint(sim.entities().get(target).unwrap(), &sim, &rules),
+        (0xF800 | 0x001F, 1500),
+        "an enemy also sees BLUE; HIDDEN never applies"
+    );
+}
+
+/// `Tint.Cumulative`: stacked instances of one cumulative effect sum their
+/// colour channels and intensities before a single tint; without it the type
+/// tints once with its own colour.
+#[cfg(feature = "phobos")]
+#[test]
+fn cumulative_effect_tint_stacks_by_type_or_once() {
+    let scene = |extra: &str| {
+        let ini = IniFile::from_str(&format!(
+            "[InfantryTypes]\n[AircraftTypes]\n[BuildingTypes]\n\
+             [VehicleTypes]\n0=TARGET\n\
+             [TARGET]\nStrength=1000\nSpeed=6\n\
+             AttachEffect.AttachTypes=SAME,SAME\n\
+             [AttachEffectTypes]\n0=SAME\n\
+             [SAME]\nDuration=100\nCumulative=yes\nCumulative.MaxCount=3\n\
+             Tint.Color=10,20,30\nTint.Intensity=0.5\n{extra}"
+        ));
+        let rules = crate::rules::ruleset::RuleSet::from_ini(&ini).expect("rules");
+        let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 3);
+        sim.intern_rule_type_ids(&rules);
+        sim.resolve_type_handles(&rules);
+        let target = sim
+            .spawn_object("TARGET", "Americans", 20, 20, 0, &rules)
+            .expect("spawn");
+        sim.advance_tick(&[], Some(&rules), None, Some(rules.overlay_registry()), 22);
+        (sim, rules, target)
+    };
+
+    // Base (10,20,30)/(0.5) stacked twice sums to (20,40,60)/1.0.
+    let (sim, rules, target) = scene("");
+    assert_eq!(
+        attach_effect_tint(sim.entities().get(target).unwrap(), &sim, &rules),
+        (0x1147, 1000),
+        "the two instances of one type sum their tint"
+    );
+
+    let (sim, rules, target) = scene("Tint.Cumulative=no\n");
+    assert_eq!(
+        attach_effect_tint(sim.entities().get(target).unwrap(), &sim, &rules),
+        (0x08A3, 500),
+        "without Tint.Cumulative the type tints once"
+    );
+}
+
 /// Phobos `ApplyCustomTintValues` selects the viewer's shield-tint bucket and
 /// `Drawing::RGB_To_Int` packs `Tint.Color` as RGB565.
 #[cfg(feature = "phobos")]
@@ -420,4 +509,31 @@ fn shield_tint_uses_the_viewers_bucket_and_rgb565_word() {
     assert!(AffectedHouse::OWNER.contains(AffectedHouse::OWNER));
     assert!(!AffectedHouse::ENEMIES.contains(AffectedHouse::OWNER));
     assert!(AffectedHouse::ALL.contains(AffectedHouse::ENEMIES));
+}
+
+/// Phobos `TechnoClass_InvulnerabilityIntensity_Adjust` (`0x70E475`): the
+/// configured extra intensity scales by 1000 and is added by kind.
+#[cfg(feature = "phobos")]
+#[test]
+fn curtain_extra_tint_reads_the_audio_visual_globals() {
+    use crate::sim::superweapon::invulnerability::InvulnKind;
+    let rules =
+        crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
+            "[AudioVisual]\nIronCurtain.ExtraTintIntensity=0.4\n\
+             ForceShield.ExtraTintIntensity=-0.25\n",
+        ))
+        .expect("rules");
+    assert_eq!(
+        super::curtain_extra_tint(Some(&rules), Some(InvulnKind::IronCurtain)),
+        400
+    );
+    assert_eq!(
+        super::curtain_extra_tint(Some(&rules), Some(InvulnKind::ForceShield)),
+        -250
+    );
+    assert_eq!(
+        super::curtain_extra_tint(None, Some(InvulnKind::IronCurtain)),
+        0
+    );
+    assert_eq!(super::curtain_extra_tint(Some(&rules), None), 0);
 }

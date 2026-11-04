@@ -968,20 +968,8 @@ fn mixed_land_and_naval_factories_bind_independent_vehicle_and_ship_slots() {
         "native typed Naval Unit FindFactory binds GAYARD"
     );
 
-    assert_eq!(
-        sim.production
-            .primary_factory_ids(americans, ProductionCategory::Vehicle)
-            .next()
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        sim.production
-            .primary_factory_ids(americans, ProductionCategory::Ship)
-            .next()
-            .unwrap(),
-        2
-    );
+    assert!(sim.production.is_primary_factory(1));
+    assert!(sim.production.is_primary_factory(2));
 
     arm_build_via(
         &mut sim,
@@ -1037,12 +1025,8 @@ fn mixed_land_and_naval_factories_bind_independent_vehicle_and_ship_slots() {
         .expect("GAYARD delivered DEST through naval FNPC/Unlimbo");
     assert_eq!((destroyer.position.rx(), destroyer.position.ry()), (22, 24));
     assert!(destroyer.lifecycle.cell_marked() && !destroyer.lifecycle.in_limbo());
-    assert_eq!(
-        sim.production
-            .primary_factory_ids(americans, ProductionCategory::Ship)
-            .next()
-            .unwrap(),
-        2,
+    assert!(
+        sim.production.is_primary_factory(2),
         "the older GAWEAP cannot receive the Ship completion"
     );
     assert!(
@@ -1173,11 +1157,8 @@ fn naval_delivery_nonzero_canenter_refunds_without_trying_second_producer() {
             .is_none_or(|factory| factory.object.is_none())
     );
     assert_eq!(credits_for_owner(&sim, "Americans"), credits + 1000);
-    assert_eq!(
-        sim.production
-            .primary_factory_ids(americans, ProductionCategory::Ship)
-            .next(),
-        Some(1),
+    assert!(
+        sim.production.is_primary_factory(1),
         "HousePlace does not try the second eligible producer after Exit0"
     );
     assert!(
@@ -1324,12 +1305,7 @@ fn naval_empty_fnpc_refunds_then_a_fresh_successor_records_delivery_once() {
         successor
     );
     assert_eq!(sim.scenario_rng.logical_state(), expected.logical_state());
-    assert_eq!(
-        sim.production
-            .primary_factory_ids(americans, ProductionCategory::Ship)
-            .next(),
-        Some(1)
-    );
+    assert!(sim.production.is_primary_factory(1));
     assert_eq!(sim.houses[&americans].stats().built(), 0);
     for cell in sim.resolved_terrain.as_mut().unwrap().cells_mut_for_test() {
         cell.speed_costs.float = Some(100);

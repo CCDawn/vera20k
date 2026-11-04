@@ -1063,6 +1063,7 @@ fn assert_retail_wall_history(native_path: &'static str, wall_name: &str, direct
                         ProjectileCoord::new(center.x, center.y, center.z),
                         weapon.damage,
                         warhead,
+                        true,
                         (crate::sim::combat::RAD_NO_ATTACKER, None, ap),
                         FrameEffects::default(),
                     );
