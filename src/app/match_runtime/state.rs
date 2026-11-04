@@ -95,40 +95,25 @@ pub(crate) struct MatchState {
     /// every runtime install (fresh launch and saved-game restore) from the
     /// houses' own state, so no driver ever outlives its match.
     pub(crate) super_players: Vec<crate::super_ai::SuperAi>,
+    /// Config-sourced fork-only switch (`[gameplay] defense_ai`, default
+    /// off): rebuild_super_players seats the houses it drives that face no
+    /// other command-driven AI in the defense persona (`docs/defense-ai.md`).
+    /// Copied at startup like configured_input_delay_ticks.
+    pub(crate) defense_ai_enabled: bool,
 }
 
 impl MatchState {
     /// Rebuild the Super-AI drivers from the freshly installed runtime: one
     /// [`crate::super_ai::SuperAi`] per command-driven house. The tier rides
     /// on the house's own tier treatment — a build-time scale marks Super, a
-    /// command-driven house without one is Brutal (`docs/superai.md`).
+    /// command-driven house without one is Brutal (`docs/superai.md`). With
+    /// `defense_ai_enabled` the houses that face no other command-driven AI
+    /// adopt the defense persona (`docs/defense-ai.md`).
     pub(crate) fn rebuild_super_players(&mut self) {
         self.super_players = self
             .sim_runtime
             .as_ref()
-            .map(|rt| {
-                rt.simulation
-                    .houses()
-                    .iter()
-                    .filter(|(_, state)| {
-                        state.command_driven() && !state.multiplay_passive() && !state.is_human()
-                    })
-                    .map(|(&house, state)| {
-                        // The house carries its launch tier mark; saves from
-                        // before the mark fall back to the build-scale
-                        // heuristic (a scale marks Super, a scale-less
-                        // command-driven house is Brutal).
-                        let tier = state.super_tier().unwrap_or(
-                            if state.native_build_time_scale().is_some() {
-                                crate::super_ai::SuperAiDifficulty::Super
-                            } else {
-                                crate::super_ai::SuperAiDifficulty::Brutal
-                            },
-                        );
-                        crate::super_ai::SuperAi::new(house, tier)
-                    })
-                    .collect()
-            })
+            .map(|rt| rebuild_super_players_for(&rt.simulation, self.defense_ai_enabled))
             .unwrap_or_default();
     }
     /// Shared ScenarioPause684060 audio hold, independent of menu/debug pause.
@@ -287,7 +272,7 @@ fn held_session_mode(
 mod tests {
     use super::{
         elapsed_clock_pause_for_screen, held_session_mode, multiplayer_pause_reached,
-        presentation_pause_for_screen,
+        presentation_pause_for_screen, rebuild_super_players_for,
     };
     use crate::app::match_runtime::session::{MatchSession, NetworkReturnContext, SessionMode};
     use crate::sim::world::Simulation;
@@ -422,6 +407,67 @@ mod tests {
             Some(sim.session())
         ));
     }
+
+    /// The fork-only defense seating: only a command-driven house whose
+    /// enemies hold no other command-driven AI adopts the persona, and only
+    /// when the config switch asks. Allied command-driven houses are not
+    /// each other's opponents; a human never drives a driver.
+    #[test]
+    fn defense_flag_seats_only_houses_without_a_command_ai_opponent() {
+        use crate::sim::house_state::HouseState;
+        use crate::super_ai::DefenseStance;
+        use crate::super_ai::SuperAiDifficulty;
+
+        let mut house = |sim: &mut Simulation, name: &str, human: bool| {
+            let name = sim.intern(name);
+            let country = sim.intern("Americans");
+            let mut state = HouseState::new(name, 0, Some(country), human, 0, 10);
+            if !human {
+                state.make_command_driven(SuperAiDifficulty::Brutal);
+            }
+            sim.houses_mut_for_test().register(state);
+            name
+        };
+        let mut sim = Simulation::with_seed(1);
+        house(&mut sim, "Computer1", false);
+        house(&mut sim, "Computer2", false);
+        // Switch off: the battle persona stays, rivals or not.
+        let players = rebuild_super_players_for(&sim, false);
+        assert_eq!(players.len(), 2);
+        assert!(players.iter().all(|ai| ai.defense_stance().is_none()));
+        // Switch on: each AI faces a rival command-driven AI, so neither
+        // seats.
+        let players = rebuild_super_players_for(&sim, true);
+        assert!(players.iter().all(|ai| ai.defense_stance().is_none()));
+        // Allied teammates are not opponents: both seat.
+        for (asker, other) in [("Computer1", "Computer2"), ("Computer2", "Computer1")] {
+            sim.house_alliances_mut_for_test()
+                .entry(asker.to_ascii_uppercase())
+                .or_default()
+                .insert(other.to_ascii_uppercase());
+        }
+        let players = rebuild_super_players_for(&sim, true);
+        assert_eq!(
+            players
+                .iter()
+                .map(|ai| ai.defense_stance())
+                .collect::<Vec<_>>(),
+            [Some(DefenseStance::IndependentZone); 2]
+        );
+
+        // A lone command-driven AI against a human: its pressure is the
+        // map's waves, so it seats; the human drives nothing.
+        let mut sim = Simulation::with_seed(2);
+        let ai = house(&mut sim, "Computer1", false);
+        house(&mut sim, "Player", true);
+        let players = rebuild_super_players_for(&sim, true);
+        assert_eq!(players.len(), 1);
+        assert_eq!(players[0].house(), ai);
+        assert_eq!(
+            players[0].defense_stance(),
+            Some(DefenseStance::IndependentZone)
+        );
+    }
 }
 
 /// Native current House A83D4C is saved67F802, loaded67F9F3 and swizzled67FA0E.
@@ -433,4 +479,69 @@ pub(crate) fn scenario_local_owner(simulation: &crate::sim::world::Simulation) -
         .session()
         .current_house()
         .map(|owner| simulation.interner().resolve(owner))
+}
+
+/// The Super-AI driver assembly [`MatchState::rebuild_super_players`]
+/// delegates to, split from the MatchState owner so a test can seat it on a
+/// bare Simulation.
+fn rebuild_super_players_for(
+    simulation: &crate::sim::world::Simulation,
+    defense_ai: bool,
+) -> Vec<crate::super_ai::SuperAi> {
+    // Each house carries its launch tier mark; saves from before the mark
+    // fall back to the build-scale heuristic (a scale marks Super, a
+    // scale-less command-driven house is Brutal).
+    let command_driven: Vec<(
+        crate::sim::intern::InternedId,
+        crate::super_ai::SuperAiDifficulty,
+    )> = simulation
+        .houses()
+        .iter()
+        .filter(|(_, state)| {
+            state.command_driven() && !state.multiplay_passive() && !state.is_human()
+        })
+        .map(|(house, state)| {
+            (
+                *house,
+                state
+                    .super_tier()
+                    .unwrap_or(if state.native_build_time_scale().is_some() {
+                        crate::super_ai::SuperAiDifficulty::Super
+                    } else {
+                        crate::super_ai::SuperAiDifficulty::Brutal
+                    }),
+            )
+        })
+        .collect();
+    let alliances = simulation.house_alliances().as_map();
+    command_driven
+        .iter()
+        .copied()
+        .map(|(house, tier)| {
+            let mut ai = crate::super_ai::SuperAi::new(house, tier);
+            // Fork-only: with the config switch on, a house whose enemies
+            // hold no other command-driven AI is pressed by map waves rather
+            // than an AI opponent, so it plays the defense persona. The same
+            // both-direction ally read super_ai's own is_enemy makes
+            // (in-game diplomacy can be one-way); candidates above are
+            // already neither human nor MultiplayPassive.
+            let faces_command_ai = command_driven.iter().copied().any(|(other, _)| {
+                other != house
+                    && !crate::map::houses::is_allied_with(
+                        alliances,
+                        simulation.resolve(house),
+                        simulation.resolve(other),
+                    )
+                    && !crate::map::houses::is_allied_with(
+                        alliances,
+                        simulation.resolve(other),
+                        simulation.resolve(house),
+                    )
+            });
+            if defense_ai && !faces_command_ai {
+                ai.enable_defense_personality(crate::super_ai::DefenseStance::IndependentZone);
+            }
+            ai
+        })
+        .collect()
 }
