@@ -3166,6 +3166,34 @@ pub fn initialize_map_roster_houses(
             house_state.set_ui_name(crate::sim::house_state::HouseUiName::Csf(key.clone()));
         }
         house_state.resolve_multiplay_passive(rules, country_name);
+        // Fork deviation (upstream fix is a defect-queue item, not this seam):
+        // native multiplayer sessions never build the map's declared House
+        // sections — the map-roster reader `0x5009B0` is campaign-only
+        // (`ScenarioClass::Full_Init` calls it at `0x6877BD` in GameMode 0
+        // only) — so an unoccupied section like a defense map's `[Africans]`
+        // simply has no House in retail MP. VERA instantiates every declared
+        // section; in a noncampaign session (`game_mode_nonzero`, the defeat
+        // gate's own criterion at `HouseClass::Update 0x004F8440`) such a
+        // House holds nothing, the defeat gate kills it within the first
+        // frames, and `complete_multiplayer_after_defeat` then reads the
+        // surviving allied participants as the whole match and awards a
+        // false "Victorious!" in the opening seconds. Force MultiplayPassive
+        // on every section the Session roster/AI slots do not claim and that
+        // is not CreateHouses' fixed Neutral/Special tail, matching native's
+        // "does not exist" endgame semantics: the defeat gate's
+        // MultiplayPassive exemption skips it, the game-over alive scan
+        // excludes it, and trigger-spawned waves still resolve it as their
+        // owner. A section name a participant already holds stays that
+        // participant's House (registration admits distinct names only).
+        // Campaigns (game mode zero) keep the authored roster untouched.
+        // Upstream-grade fix: do not build the sections and remap the
+        // trigger house references instead.
+        let occupied = sim.houses.contains_key(&name_id)
+            || house.name.eq_ignore_ascii_case("Neutral")
+            || house.name.eq_ignore_ascii_case("Special");
+        if sim.session.game_mode_nonzero() && !occupied {
+            house_state.make_multiplay_passive();
+        }
         house_state.project_country_mults(rules, &sim.interner);
         // Registration admits distinct House names only.
         sim.houses.register(house_state);
@@ -4603,6 +4631,51 @@ mod tests {
             sim.houses[&first].is_human() && sim.houses[&first].player_control(),
             "selecting another House does not clear previously set flags"
         );
+    }
+
+    /// A defense map's declared but unoccupied house sections must sit the
+    /// noncampaign match out: native MP never builds them (the roster reader
+    /// `0x5009B0` is campaign-only, `0x6877BD`), so an instantiated empty
+    /// House dies in the defeat gate's opening frames and
+    /// `complete_multiplayer_after_defeat` awards a false victory. The fixed
+    /// Neutral/Special tail keeps its own country-resolved fact instead of
+    /// being forced, and a campaign load keeps the authored roster untouched.
+    #[test]
+    fn noncampaign_map_roster_seats_unoccupied_sections_passive() {
+        use crate::sim::campaign_carry_over::CampaignCarryOver;
+        use crate::sim::scenario_session::ScenarioGameMode;
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[Countries]\n0=Americans\n1=Africans\n2=Neutral\n[Americans]\n[Africans]\n[Neutral]\n",
+        ))
+        .expect("country fixture rules");
+        let map = IniFile::from_str(
+            "[Houses]\n0=Americans\n1=Africans\n2=Neutral\n[Americans]\n[Africans]\n[Neutral]\nCountry=Neutral\n",
+        );
+        let roster = crate::map::houses::parse_house_roster(&map, &[], Some(&rules));
+
+        // Noncampaign: every section no Session seat claims sits out, while
+        // the Neutral tail keeps its own (here non-passive) country fact.
+        let mut sim = Simulation::new();
+        sim.install_session_mode(ScenarioGameMode::Skirmish);
+        initialize_map_roster_houses(&mut sim, &roster, &rules, Some(&map));
+        let africans = sim.interner.get("Africans").unwrap();
+        assert!(sim.houses[&africans].multiplay_passive());
+        let americans = sim.interner.get("Americans").unwrap();
+        assert!(sim.houses[&americans].multiplay_passive());
+        let neutral = sim.interner.get("Neutral").unwrap();
+        assert!(!sim.houses[&neutral].multiplay_passive());
+
+        // Campaign: the authored roster keeps its own facts.
+        let mut campaign = Simulation::new();
+        campaign
+            .session
+            .initialize_campaign_startup(1, 1, None, 0, CampaignCarryOver::CLEARED)
+            .unwrap();
+        initialize_map_roster_houses(&mut campaign, &roster, &rules, Some(&map));
+        let campaign_africans = campaign.interner.get("Africans").unwrap();
+        assert!(!campaign.houses[&campaign_africans].multiplay_passive());
+        let campaign_neutral = campaign.interner.get("Neutral").unwrap();
+        assert!(!campaign.houses[&campaign_neutral].multiplay_passive());
     }
 
     #[test]
