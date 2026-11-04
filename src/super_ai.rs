@@ -4263,7 +4263,24 @@ impl SuperAi {
                 return vec![CommandEnvelope::new(self.house, at, command)];
             }
             let idle = self.idle_combat_units(sim, opening);
-            let alarm_armed = self.base_alarm_armed(sim, tick);
+            let mut alarm_armed = self.base_alarm_armed(sim, tick);
+            // The psychic early warning (A2): a hostile walking the sensor
+            // network's radius arms the same alarm before the first
+            // building hit — the stance latches the walker's cell as its
+            // focus, so the defense deployment (and the spy defense reusing
+            // this chain) meets the intruder at the perimeter, not the
+            // yard. The latch refreshes every tick the walker stands in
+            // range; the hold (`DEFENSE_HOLD_TICKS`) keeps the stance
+            // armed through the walk-in gap after it leaves the radius.
+            let psychic_focus = if alarm_armed {
+                None
+            } else {
+                self.psychic_alarm_focus(sim, rules)
+            };
+            if let Some(cell) = psychic_focus {
+                self.defense_focus = Some((cell, tick + DEFENSE_HOLD_TICKS));
+            }
+            alarm_armed = alarm_armed || psychic_focus.is_some();
             if alarm_armed || self.defense_focus.is_some() {
                 if let Some(command) =
                     self.base_defense_orders(sim, rules, opening, &idle, tick, alarm_armed)
@@ -14020,6 +14037,67 @@ impl SuperAi {
         last > 0 && i64::from(tick) - i64::from(last) <= i64::from(BASE_ALARM_TICKS)
     }
 
+    /// The psychic early warning (A2): the hostile combat unit standing
+    /// inside one of the house's operational PsychicDetection buildings'
+    /// radius, nearest any own yard — the sensor network's warning ahead
+    /// of the first building hit, the same chain the spy defense (E)
+    /// reuses. The engine's own sites
+    /// ([`Simulation::psychic_detection_sites`]) are the source; a
+    /// Chebyshev cell read of their leptons radii keeps the AI's scan
+    /// cheap. `None` — no sensor stands or no hostile walks in.
+    fn psychic_alarm_focus(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+    ) -> Option<(u16, u16)> {
+        let sites: Vec<(i16, i16, i32)> = sim
+            .psychic_detection_sites(self.house, rules)
+            .map(|(coord, radius)| ((coord.x >> 8) as i16, (coord.y >> 8) as i16, radius >> 8))
+            .collect();
+        if sites.is_empty() {
+            return None;
+        }
+        // The threat read's anchor: the first own structure's cell (the
+        // base's standing center) — the detected walker nearest it is the
+        // one marching on the base.
+        let anchor = self
+            .own_structures(sim)
+            .first()
+            .and_then(|&(id, _)| sim.substrate().entities.get(id))
+            .map(|entity| (i32::from(entity.position.rx()), i32::from(entity.position.ry())));
+        let mut best: Option<(i32, (u16, u16))> = None;
+        for (_, entity) in sim.substrate().entities.iter_sorted() {
+            if entity.lifecycle.in_limbo()
+                || !entity.lifecycle.object_alive()
+                || !matches!(
+                    entity.category(),
+                    crate::map::entities::EntityCategory::Unit
+                        | crate::map::entities::EntityCategory::Infantry
+                )
+                || !self.is_enemy(sim, entity.owner())
+            {
+                continue;
+            }
+            let (rx, ry) = (i32::from(entity.position.rx()), i32::from(entity.position.ry()));
+            if !sites.iter().any(|&(sx, sy, radius)| {
+                (rx - i32::from(sx)).abs() <= radius && (ry - i32::from(sy)).abs() <= radius
+            }) {
+                continue;
+            }
+            let distance_squared = anchor
+                .map(|(ax, ay)| {
+                    let dx = rx - ax;
+                    let dy = ry - ay;
+                    dx * dx + dy * dy
+                })
+                .unwrap_or(0);
+            if best.is_none_or(|(kept, _)| distance_squared < kept) {
+                best = Some((distance_squared, (entity.position.rx(), entity.position.ry())));
+            }
+        }
+        best.map(|(_, cell)| cell)
+    }
+
     /// The base-alarm limb's one order for this tick, or `None` to fall
     /// through to the idle perimeter and the branches below. `armed` says
     /// the damage stamp is fresh; the stance itself lives until the focus
@@ -22864,5 +22942,37 @@ mod tests {
             super::DEFENSE_AA_FLOOR + super::DEFENSE_ARMOR_CAP + super::DEFENSE_FOOT_CAP,
             "the raised quota is the mix's own capped answer (no aircraft observed)"
         );
+    }
+
+    /// The psychic early warning (A2): a hostile standing inside the
+    /// powered sensor network's radius is the alarm's focus ahead of any
+    /// building hit; outside every radius the read is quiet.
+    #[test]
+    fn psychic_detection_raises_the_alarm_before_a_hit() {
+        let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
+        else {
+            return;
+        };
+        let (mut sim, tank, americans) =
+            crate::sim::psychic_detection::psychic_sensor_watch_fixture(&rules);
+        let mut ai = SuperAi::new(americans, SuperAiDifficulty::Fair);
+        // The Russian tank stands 14 cells from the powered NAPSIS
+        // (`PsychicDetectionRadius=15`): the walker's cell is the focus.
+        assert_eq!(ai.psychic_alarm_focus(&sim, &rules), Some((2, 2)));
+
+        // The same walker beyond every sensor radius: the read is quiet.
+        sim.substrate_mut_for_test()
+            .entities
+            .get_mut(tank)
+            .unwrap()
+            .position = crate::sim::movement::ground_pose::Position::new(
+            40,
+            40,
+            0,
+            None,
+            crate::util::fixed_math::SIM_ZERO,
+            crate::util::fixed_math::SIM_ZERO,
+        );
+        assert_eq!(ai.psychic_alarm_focus(&sim, &rules), None);
     }
 }
