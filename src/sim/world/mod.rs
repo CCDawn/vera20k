@@ -1693,6 +1693,13 @@ pub struct Simulation {
     /// Serialized map trigger state, initialized and mutated by trigger_runtime.
     /// Remains installed while actions call other Simulation mechanisms.
     pub(crate) trigger_runtime: TriggerRuntime,
+    /// Fork-only defense-map form verdict (`docs/defense-ai.md`): derived,
+    /// never saved. The seat assembly's classification walk is the single
+    /// writer (`Simulation::set_defense_map_form`, once per runtime install
+    /// — a restore reinstalls the seat assembly before the next tick), and
+    /// the defeat gate (`world::house_defeat`) is the sole reader.
+    #[serde(skip)]
+    defense_map_form: bool,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -4521,6 +4528,7 @@ impl Simulation {
             planning: planning::PlanningState::default(),
             replaying_recorded_commands: false,
             trigger_runtime: TriggerRuntime::default(),
+            defense_map_form: false,
         };
         debug_assert_eq!(out.scenario_rng.state(), out.main_rng.state());
         // Authoritative map bounds are session state, known at construction —

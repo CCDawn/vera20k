@@ -5322,21 +5322,23 @@ impl Simulation {
     /// instance holding a team-spawn action (4 create-team, 7/80/107
     /// reinforcements, the same admission set the dispatcher and the
     /// armed-reinforcement read above take) whose TeamType's `GetHouse`
-    /// owner resolves outside the session roster — beside the count of
-    /// armed trigger instances carrying any team-spawn action at all (the
-    /// seat log's `spawn-triggers=N`).
+    /// owner resolves outside `driven` — beside the count of armed trigger
+    /// instances carrying any team-spawn action at all (the seat log's
+    /// `spawn-triggers=N`).
     ///
     /// The walk's shape is [`Simulation::house_has_armed_future_reinforcements`]'s
     /// own: live instances only (enabled, not pending — a spent one-shot
     /// waits pending and stops counting), the same spawn kinds, and the
     /// same dead ends (a TeamType name the interner never saw, or an owner
-    /// the session cannot resolve, reads nothing). A defense map whose
-    /// wave teams name session houses — President22's start-slot wave
-    /// owner — reads false here and keeps arming through the
-    /// no-command-driven-enemy test alone; a map whose wave owner is an
-    /// authored house no seat drives reads true. A battle map's
-    /// reinforcement triggers resolve to roster houses, so ordinary games
-    /// read false everywhere and stay byte-identical.
+    /// the session cannot resolve, reads nothing). `driven` is the
+    /// session's played houses — human seats plus command-driven AI seats —
+    /// which the seat assembly derives from its own seat enumeration: the
+    /// old roster test (membership in `self.houses`) was dead, because the
+    /// GetHouse paths (`House502D30`, the `Scenario510ED0` start-slot
+    /// mapping) only ever return installed houses. A defense map whose
+    /// wave owner is an unseated slot's house — PresidentDefense22's
+    /// `House=<Player @ G>` — reads true; a battle map's reinforcement
+    /// triggers resolve to driven AI houses and read false everywhere.
     ///
     /// Pure read: no RNG, no mutation, no render/ui dependency. Single
     /// owner and single entry: the seat assembly
@@ -5344,11 +5346,11 @@ impl Simulation {
     /// re-walks the trigger instances for map classification.
     pub fn defense_map_classification(
         &self,
+        driven: &[crate::sim::intern::InternedId],
         rules: &crate::rules::ruleset::RuleSet,
     ) -> (bool, usize) {
-        let roster: Vec<crate::sim::intern::InternedId> = self.houses.keys().copied().collect();
         let mut spawn_triggers = 0usize;
-        let mut foreign_owner = false;
+        let mut undriven_owner = false;
         for trigger in self
             .trigger_runtime
             .trigger_order
@@ -5367,7 +5369,7 @@ impl Simulation {
                     continue;
                 };
                 carries_spawn = true;
-                if foreign_owner {
+                if undriven_owner {
                     continue;
                 }
                 let Some(team_name) = self.trigger_runtime.definitions.team_types.get(team) else {
@@ -5379,15 +5381,24 @@ impl Simulation {
                 let Some(owner) = self.team_type_house(owner, rules) else {
                     continue;
                 };
-                if !roster.contains(&owner) {
-                    foreign_owner = true;
+                if !driven.contains(&owner) {
+                    undriven_owner = true;
                 }
             }
             if carries_spawn {
                 spawn_triggers += 1;
             }
         }
-        (foreign_owner, spawn_triggers)
+        (undriven_owner, spawn_triggers)
+    }
+
+    /// Single writer for the defense-map form verdict (`defense_map_form`):
+    /// the seat assembly sets the classification read above once per
+    /// runtime install — fresh launch and saved-game restore alike. No
+    /// simulation tick writes it; the defeat gate (`world::house_defeat`)
+    /// is the only reader.
+    pub(crate) fn set_defense_map_form(&mut self, defense_map_form: bool) {
+        self.defense_map_form = defense_map_form;
     }
 }
 
@@ -5833,6 +5844,10 @@ mod house_notification_tests;
 #[cfg(test)]
 #[path = "trigger_runtime_house_attacked_tests.rs"]
 mod house_attacked_tests;
+
+#[cfg(test)]
+#[path = "trigger_runtime_defense_map_tests.rs"]
+mod defense_map_tests;
 
 #[cfg(test)]
 #[path = "trigger_runtime_group_wakeup_tests.rs"]

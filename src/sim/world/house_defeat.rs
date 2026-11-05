@@ -394,18 +394,23 @@ impl Simulation {
         if house.is_defeated() || house.multiplay_passive() {
             return false;
         }
-        // Fork deviation (see `house_has_armed_future_reinforcements`): a
-        // wave map's trigger-driven house holds nothing in the lull between
-        // its waves, but its map still has those teams to send. Native never
-        // built such a house in a multiplayer session for this gate to
-        // judge; VERA's instantiation does. A house whose armed triggers can
-        // still spawn its teams is not a corpse: without this read the gate
-        // would kill it here and MPlayer_Defeated's settlement
+        // Fork deviation (`defense_map_form`, the seat assembly's
+        // classification verdict, see `house_has_armed_future_reinforcements`):
+        // only a defense-form house escapes the gate while its armed triggers
+        // can still spawn its teams. Native never built such a house in a
+        // multiplayer session for this gate to judge; VERA's instantiation
+        // does, and in the lull between waves such a house holds nothing
+        // while its map still has those teams to send. Without the form gate
+        // a battle map's own Repeat=2 reinforcement trigger would hold a
+        // wiped house alive forever, and MPlayer_Defeated's settlement
         // (0x004FC3DE..0x004FC6B7) would then read the surviving allied
-        // participants as the whole match — a premature "Victorious!". A
-        // session without such triggers reads false, so every other game is
-        // unchanged.
-        if self.house_has_armed_future_reinforcements(owner, rules) {
+        // participants as the whole match — a premature "Victorious!". The
+        // verdict is written on every install
+        // (`MatchState::rebuild_super_players`), switch off included, so a
+        // defense map keeps the hold without its persona; a session whose
+        // form reads false defeats immediately, as every battle game did
+        // before the read existed.
+        if self.defense_map_form && self.house_has_armed_future_reinforcements(owner, rules) {
             return false;
         }
         // Pure lazy type lookups: retail consumes exactly three entries;

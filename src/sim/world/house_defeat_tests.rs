@@ -1296,3 +1296,73 @@ fn the_civilian_house_is_asked_of_its_house_type() {
         );
     }
 }
+
+/// An armed wave trigger whose create-team TeamType's `GetHouse` owner
+/// resolves to `owners[0]` through the start-slot map, installed through
+/// the production ingress (`docs/defense-ai.md`). `owners[0]` holds nothing
+/// in the lull between its waves; `owners[1]` keeps a unit.
+fn wave_gate_sim() -> (Simulation, Vec<InternedId>) {
+    let (mut sim, owners) = sim_with_houses(&[0, 1]);
+    sim.session
+        .start_slot_houses_mut_for_test()
+        .insert(0, owners[0]);
+    let teams = IniFile::from_str(
+        "[TeamTypes]\n0=WAVETEAM\n[WAVETEAM]\nHouse=<Player @ A>\nScript=S\nTaskForce=F\nMax=-1\n\
+         [ScriptTypes]\n0=S\n[S]\n0=5,0\n[TaskForces]\n0=F\n",
+    );
+    let registry = crate::rules::team_ai_ini::TeamAiIniRegistry::from_sources(
+        &IniFile::empty(),
+        &teams,
+        false,
+    );
+    let map = crate::map::map_file::MapFile::from_bytes(
+        b"[Map]\nTheater=TEMPERATE\nSize=0,0,2,1\nLocalSize=0,0,2,1\n\
+          [IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n\
+          [Basic]\nNewINIFormat=4\n\
+          [Triggers]\nWAVE=<none>,<none>,Waves,0,1,1,1,0\n\
+          [Events]\nWAVE=1,8,0,0\n\
+          [Tags]\nTAGW=2,Waves,WAVE\n\
+          [Actions]\nWAVE=1,4,1,WAVETEAM,0,0,0,0,A\n",
+    )
+    .unwrap();
+    let rules = rules(0);
+    sim.initialize_trigger_definitions(&map, &registry, None, None, None);
+    let diagnostics = sim
+        .install_team_ai_registry(&registry, &rules)
+        .expect("scenario team AI installs");
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    sim.classify_map_triggers(&rules);
+    sim.houses
+        .get_mut(&owners[0])
+        .unwrap()
+        .tracking_mut()
+        .set_for_test(0, &[], (0, 0, 0), &[]);
+    sim.houses
+        .get_mut(&owners[1])
+        .unwrap()
+        .tracking_mut()
+        .set_for_test(1, &[], (0, 0, 0), &[]);
+    (sim, owners)
+}
+
+/// The defeat gate's future-reinforcement hold rides the seat assembly's
+/// defense-map form verdict, not the armed triggers alone: battle form
+/// defeats a wiped house at once (a `Repeat=2` trigger is not a lease on
+/// life, and the hold would dead-lock the match), defense form keeps the
+/// wave house alive between its waves — switch off included, since the
+/// verdict is written on every install.
+#[test]
+fn battle_form_defeats_a_wiped_wave_house_defense_form_holds_it() {
+    let rules = rules(0);
+    let (mut sim, owners) = wave_gate_sim();
+    sim.set_defense_map_form(false);
+    sim.check_defeat(Some(&rules), None);
+    assert!(sim.houses[&owners[0]].is_defeated());
+    assert!(!sim.houses[&owners[1]].is_defeated());
+
+    let (mut sim, owners) = wave_gate_sim();
+    sim.set_defense_map_form(true);
+    sim.check_defeat(Some(&rules), None);
+    assert!(!sim.houses[&owners[0]].is_defeated());
+    assert!(!sim.houses[&owners[1]].is_defeated());
+}
