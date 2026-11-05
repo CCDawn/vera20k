@@ -1970,6 +1970,14 @@ struct DefensePersona {
     /// Forward-interception recalls so far: the withdraw ladder's walks
     /// home plus the no-wave stand-downs. Telemetry only.
     intercept_withdraws: u32,
+    /// Production orders the mix has filed on each line — infantry,
+    /// then vehicles. The quality rotation's k: the next item a line
+    /// files is the cheap fodder row when this count mod the share's
+    /// denominator sits under its numerator, so the share rides the
+    /// line's own production stream instead of the fielded counts a
+    /// defense map's attrition keeps lying about.
+    infantry_files: u32,
+    vehicle_files: u32,
 }
 
 impl DefensePersona {
@@ -2007,6 +2015,8 @@ impl DefensePersona {
             entry_cells: Vec::new(),
             intercept_sorties: 0,
             intercept_withdraws: 0,
+            infantry_files: 0,
+            vehicle_files: 0,
         }
     }
 
@@ -2096,22 +2106,17 @@ fn defense_meet_cell(core: (i16, i16), anchor: (i16, i16)) -> (i16, i16) {
 
 /// One production line's candidate order under the quality policy: the
 /// rows walk cost-descending — the best hull first — with the cheapest
-/// row pulled to the front only while the fodder contingent sits under
-/// its wave-pressure share (the wall's bodies, [`DEFENSE_QUALITY_PRESSURE`]
-/// and friends). Ties hold the roster's own order. The caller's
-/// affordability and buildability gates still walk the list and skip —
-/// a poor wallet files the best hull it can afford, never a stall.
+/// row pulled to the front only while this filing lands in the line's
+/// fodder contingent (`fodder_due`, the caller's rotation read over
+/// the line's own production stream — the fielded counts a defense
+/// map's attrition keeps lying about are no longer consulted). Ties
+/// hold the roster's own order. The caller's affordability and
+/// buildability gates still walk the list and skip — a poor wallet
+/// files the best hull it can afford, never a stall.
 fn defense_quality_order(
     candidates: &[(i32, usize, &'static str)],
-    wartime: bool,
-    fielded_total: usize,
-    fodder_fielded: usize,
+    fodder_due: bool,
 ) -> Vec<&'static str> {
-    let (num, den) = if wartime {
-        (DEFENSE_FODDER_WARTIME_NUM, DEFENSE_FODDER_WARTIME_DEN)
-    } else {
-        (DEFENSE_FODDER_PEACE_NUM, DEFENSE_FODDER_PEACE_DEN)
-    };
     let mut ranked: Vec<(i32, usize, &'static str)> = candidates.to_vec();
     ranked.sort_by_key(|&(cost, index, _)| (std::cmp::Reverse(cost), index));
     let cheapest = candidates
@@ -2123,7 +2128,7 @@ fn defense_quality_order(
         Some(name) => name,
         None => return Vec::new(),
     };
-    if fodder_fielded < fielded_total * num / den {
+    if fodder_due {
         let mut order = vec![cheapest];
         order.extend(
             ranked
@@ -11875,6 +11880,49 @@ impl SuperAi {
         }
     }
 
+    /// The mix's line counter for the quality rotation: productions the
+    /// persona has filed on that line so far.
+    fn defense_line_files(&self, infantry: bool) -> usize {
+        match self.defense.as_ref() {
+            Some(persona) => {
+                if infantry {
+                    persona.infantry_files as usize
+                } else {
+                    persona.vehicle_files as usize
+                }
+            }
+            None => 0,
+        }
+    }
+
+    /// Whether the next filing on `infantry`'s line lands in the fodder
+    /// contingent: the count already filed mod the share's denominator
+    /// sits under its numerator (peace
+    /// [`DEFENSE_FODDER_PEACE_NUM`] over [`DEFENSE_FODDER_PEACE_DEN`],
+    /// wartime the pair beside it). The rotation rides the line's own
+    /// production stream — a defense map's attrition keeps the fielded
+    /// counts lying, the stream does not.
+    fn defense_fodder_due(&self, wartime: bool, infantry: bool) -> bool {
+        let (num, den) = if wartime {
+            (DEFENSE_FODDER_WARTIME_NUM, DEFENSE_FODDER_WARTIME_DEN)
+        } else {
+            (DEFENSE_FODDER_PEACE_NUM, DEFENSE_FODDER_PEACE_DEN)
+        };
+        self.defense_line_files(infantry) % den < num
+    }
+
+    /// The line counters advance after a filed production — the
+    /// rotation's k is the count already on the line.
+    fn note_defense_line_file(&mut self, infantry: bool) {
+        if let Some(persona) = self.defense.as_mut() {
+            if infantry {
+                persona.infantry_files += 1;
+            } else {
+                persona.vehicle_files += 1;
+            }
+        }
+    }
+
     /// The idle combat roster the line staffs from: own foot and hulls the
     /// persona holds off-duty, nearest `anchor` first, each due for an
     /// order. The bearings' and the core ring's staffing share the pool and
@@ -12363,8 +12411,9 @@ impl SuperAi {
         let (anti_air, anti_armor, anti_foot) = self.defense_mix_targets();
         // The candidates per role, under the quality policy: the rows
         // walk cost-descending with the cheapest pulled forward only
-        // while the fodder contingent sits under its share — the wave
-        // pressure ([`DEFENSE_QUALITY_PRESSURE`]) sizes the contingent.
+        // while the line's own production stream lands in its fodder
+        // share — the wave pressure ([`DEFENSE_QUALITY_PRESSURE`])
+        // picks the share's ratio, the line counter picks the slot.
         // The deficits, most-behind first; ties hold the air, armor,
         // foot order — the answer that dies fastest leads.
         let wartime = match self.defense.as_ref() {
@@ -12418,17 +12467,21 @@ impl SuperAi {
                     )
                 })
                 .collect();
-            let fielded_total = names
-                .iter()
-                .map(|&name| self.count_combat_of_type(sim, name))
-                .sum::<usize>();
-            let fodder_fielded = candidates
+            // The rotation's line: the demand's cheapest row decides the
+            // line the fodder slot reads — a role's candidates can ride
+            // either line, and the share governs the stream, not the
+            // fielded book.
+            let cheapest_line = candidates
                 .iter()
                 .copied()
                 .min_by_key(|&(cost, index, _)| (cost, index))
-                .map(|(_, _, name)| self.count_combat_of_type(sim, name))
-                .unwrap_or(0);
-            let order = defense_quality_order(&candidates, wartime, fielded_total, fodder_fielded);
+                .map(|(_, _, name)| {
+                    name == opening.basic_infantry
+                        || opening.infantry.iter().any(|entry| entry.name == name)
+                })
+                .unwrap_or(true);
+            let order =
+                defense_quality_order(&candidates, self.defense_fodder_due(wartime, cheapest_line));
             for &name in order.iter() {
                 let Some(ty) = rules.object(name) else {
                     continue;
@@ -12477,8 +12530,12 @@ impl SuperAi {
                     continue;
                 }
                 // The line holds; the surplus rolls to the idle pool like
-                // the battle wheel's own output.
-                return self.file_production(sim, rules, type_id, tick);
+                // the battle wheel's own output. The filing advances the
+                // line's rotation counter — the stream, not the wish.
+                if let Some(command) = self.file_production(sim, rules, type_id, tick) {
+                    self.note_defense_line_file(infantry);
+                    return Some(command);
+                }
             }
         }
         // The idle fill (D2-C): every role target met, the lines used to
@@ -12489,10 +12546,12 @@ impl SuperAi {
         // like the battle wheel's own output. Under the quality policy
         // the filler is the line's own roster in the quality order — the
         // best hull each line can build, with the cheapest row pulled
-        // forward while the fodder contingent sits under its share. The
-        // gates walk the order and skip (a gated tier-2 row, a hull the
-        // wallet cannot yet carry), so the line files the best row it
-        // can afford and never stalls on saving up.
+        // forward only while the line's production stream lands in its
+        // fodder share (the rotation over the line counter, not the
+        // fielded counts). The gates walk the order and skip (a gated
+        // tier-2 row, a hull the wallet cannot yet carry), so the line
+        // files the best row it can afford and never stalls on saving
+        // up.
         for infantry in [true, false] {
             let category = if infantry {
                 crate::sim::production::ProductionCategory::Infantry
@@ -12533,17 +12592,8 @@ impl SuperAi {
                     )
                 })
                 .collect();
-            let fielded_total = roster
-                .iter()
-                .map(|&name| self.count_combat_of_type(sim, name))
-                .sum::<usize>();
-            let fodder_fielded = candidates
-                .iter()
-                .copied()
-                .min_by_key(|&(cost, index, _)| (cost, index))
-                .map(|(_, _, name)| self.count_combat_of_type(sim, name))
-                .unwrap_or(0);
-            let order = defense_quality_order(&candidates, wartime, fielded_total, fodder_fielded);
+            let order =
+                defense_quality_order(&candidates, self.defense_fodder_due(wartime, infantry));
             for &name in order.iter() {
                 let Some(ty) = rules.object(name) else {
                     continue;
@@ -12577,6 +12627,7 @@ impl SuperAi {
                     continue;
                 }
                 if let Some(command) = self.file_production(sim, rules, type_id, tick) {
+                    self.note_defense_line_file(infantry);
                     return Some(command);
                 }
             }
