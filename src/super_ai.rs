@@ -693,6 +693,12 @@ const DEFENSE_PER_YARD_ASSAULT: usize = 4;
 /// Hostile ground combat units standing that count as a massed assault:
 /// the tier where every yard wants its fourth ground tower.
 const GROUND_HEAVY_THREATS: usize = 8;
+/// Hostile ground combat units standing that count as a massed wave
+/// twice over: the tier where the active-defense caps take their assault
+/// step ([`DEFENSE_PERIMETER_POOL_ASSAULT`],
+/// [`DEFENSE_INTERCEPT_DETACH_ASSAULT`]) — a wave of this size meets a
+/// detachment of its own size, not the quiet-map pair.
+const GROUND_ASSAULT_THREATS: usize = 16;
 /// The AA tower's per-yard ladder: one always (a base never stands
 /// without its AA answer — the bombers must meet a tower, not a tower
 /// the first raid taught the queue to buy), two once hostile air
@@ -937,6 +943,12 @@ const DEFENSE_REAR_RING: i32 = 4;
 const DEFENSE_AA_PER_AIRCRAFT: usize = 2;
 /// The army mix's AA floor: one answer gun even with no aircraft observed.
 const DEFENSE_AA_FLOOR: usize = 1;
+/// The army mix's AA ceiling, flat like the armor and foot caps below:
+/// the hostile-air read is a whole-field census, so an enemy air force
+/// anywhere on the map must not ask the home ring for two guns per
+/// plane of its full size — the answer grows with the wave and stops
+/// at this cap.
+const DEFENSE_AA_CAP: usize = 16;
 /// The army mix's answer ceiling per role: a wave of `n` of one category
 /// demands at most this multiple of itself, so a huge wave scales the
 /// answer and a lone scout cannot flood the lines.
@@ -990,8 +1002,18 @@ const DEFENSE_PERIMETER_CLUSTER_MIN: usize = 2;
 /// ring never walks out empty.
 const DEFENSE_PERIMETER_RING_FLOOR: usize = 2;
 /// The most units the perimeter engagement may hold off its posts at
-/// once — the aggro-dragging guardrail.
+/// once while the map stays under the massed-wave tiers — the
+/// aggro-dragging guardrail's baseline. The tiered steps above it
+/// ([`DEFENSE_PERIMETER_POOL_WARTIME`]/[`DEFENSE_PERIMETER_POOL_ASSAULT`])
+/// scale the hold to the wave so a massed group meets more than the
+/// quiet-map pair.
 const DEFENSE_PERIMETER_POOL_CAP: usize = 6;
+/// The perimeter hold's wartime step: the wave pressure at or past
+/// [`GROUND_HEAVY_THREATS`] holds this many off the posts.
+const DEFENSE_PERIMETER_POOL_WARTIME: usize = 9;
+/// The perimeter hold's assault step: the wave pressure at or past
+/// [`GROUND_ASSAULT_THREATS`] holds this many.
+const DEFENSE_PERIMETER_POOL_ASSAULT: usize = 12;
 /// Ticks between the perimeter engagement passes.
 const DEFENSE_PERIMETER_TICKS: u32 = 15;
 /// A marching cluster closer than this to an anchor is already the
@@ -1018,10 +1040,21 @@ const DEFENSE_INTERCEPT_RATIO_DEN: i32 = 2;
 /// Posted units above this many are the ring's floor: the detachment
 /// draws only the surplus above it, and the line keeps the rest.
 const DEFENSE_INTERCEPT_RING_FLOOR: usize = 4;
-/// The detachment's size cap: a commit bigger than this drags the whole
-/// line out with the wave's escort — the same lesson the single hunter
-/// teaches the leak.
+/// The detachment's size cap while the map stays under the massed-wave
+/// tiers: a commit bigger than this drags the whole line out with the
+/// wave's escort — the same lesson the single hunter teaches the leak.
+/// The tiered steps above it
+/// ([`DEFENSE_INTERCEPT_DETACH_WARTIME`]/[`DEFENSE_INTERCEPT_DETACH_ASSAULT`])
+/// scale the march to the wave: a massed cluster costs more than the
+/// quiet-map detachment's power, and a cap the commit ratio can never
+/// clear refuses every sortie for the whole match.
 const DEFENSE_INTERCEPT_DETACH_CAP: usize = 6;
+/// The forward march's wartime step: the wave pressure at or past
+/// [`GROUND_HEAVY_THREATS`] detaches this many.
+const DEFENSE_INTERCEPT_DETACH_WARTIME: usize = 9;
+/// The forward march's assault step: the wave pressure at or past
+/// [`GROUND_ASSAULT_THREATS`] detaches this many.
+const DEFENSE_INTERCEPT_DETACH_ASSAULT: usize = 12;
 /// The detachment withdraws once its remaining power fell below this
 /// fraction (thousandths) of the power it left with.
 const DEFENSE_INTERCEPT_WITHDRAW_FRACTION: i32 = 600;
@@ -1770,8 +1803,9 @@ enum PlacementRoute {
 /// ground the stone carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CorridorStone {
-    /// The stone type's retail name: the program's cheapest buildable
-    /// `BaseNormal=yes` building, resolved once per walk and cached.
+    /// The stone type's retail name: the house's own power plant
+    /// ([`SuperAi::defense_stone_type`]), re-verified against the build
+    /// gate each walk.
     name: String,
     /// The frontier link cell the stone anchors; the placement intent's
     /// weighted scan centers there.
@@ -3418,12 +3452,6 @@ pub struct SuperAi {
     /// [`DEFENSE_TELEMETRY_TICKS`]. Pinned state, never read from the
     /// runtime.
     telemetry_due: u32,
-    /// The corridor stone's type name — the cheapest buildable
-    /// `BaseNormal=yes` building this house can field — cached because
-    /// the rules do not change mid-game. The cache re-verifies the build
-    /// gate each tick (tech level and stolen tech move it). Pinned state,
-    /// never read from the runtime.
-    corridor_stone_name: Option<String>,
     /// Harness telemetry: the last [`Self::defense_gun_wants`] walk's
     /// result, `NAME@route` comma-joined (`-` when the walk rested).
     /// Read-only; never feeds a decision.
@@ -3780,7 +3808,6 @@ impl SuperAi {
             corridor_stones: Vec::new(),
             corridor_link_sites: Vec::new(),
             telemetry_due: 0,
-            corridor_stone_name: None,
             gun_want_note: String::from("-"),
             repairing_structure: None,
             repair_due: 0,
@@ -11138,7 +11165,7 @@ impl SuperAi {
         // rotation) and the ring keeps its floor.
         let recruits: Vec<(u64, (u16, u16))> = {
             let persona = self.defense.as_ref().expect("checked above");
-            if persona.perimeter_pool.len() >= DEFENSE_PERIMETER_POOL_CAP {
+            if persona.perimeter_pool.len() >= self.defense_perimeter_pool_cap() {
                 Vec::new()
             } else {
                 let aa_roster = Self::defense_role_entries(opening, Role::AntiAir);
@@ -11216,7 +11243,9 @@ impl SuperAi {
                 let mut posted_taken = 0usize;
                 let mut chosen: Vec<(u64, (u16, u16))> = Vec::new();
                 for &(_, from_idle, _, unit, home) in &ranked {
-                    if persona.perimeter_pool.len() + chosen.len() >= DEFENSE_PERIMETER_POOL_CAP {
+                    if persona.perimeter_pool.len() + chosen.len()
+                        >= self.defense_perimeter_pool_cap()
+                    {
                         break;
                     }
                     if from_idle == 0 {
@@ -11257,9 +11286,9 @@ impl SuperAi {
     /// available power must reach [`DEFENSE_INTERCEPT_RATIO_NUM`] over
     /// [`DEFENSE_INTERCEPT_RATIO_DEN`] of the cluster's, the ring keeps
     /// [`DEFENSE_INTERCEPT_RING_FLOOR`] posts after the split, and at
-    /// most [`DEFENSE_INTERCEPT_DETACH_CAP`] march — a survey that fails
-    /// keeps the wall. The detachment AttackMoves at the wave's own path
-    /// — the centroid walked [`DEFENSE_INTERCEPT_MEET_FRACTION`] back
+    /// most [`Self::defense_intercept_detach_cap`] march — a survey that
+    /// fails keeps the wall. The detachment AttackMoves at the wave's own
+    /// path — the centroid walked [`DEFENSE_INTERCEPT_MEET_FRACTION`] back
     /// toward the anchor — and withdraws when the cluster dies or its
     /// remaining power fell below [`DEFENSE_INTERCEPT_WITHDRAW_FRACTION`]
     /// of what it left with. The leak hunter and the rescue triggers run
@@ -11489,13 +11518,18 @@ impl SuperAi {
                 })
                 .collect();
             at_post.sort_by_key(|&(is_aa, dist, unit, _)| (is_aa, dist, unit));
+            // The gate the whole limb stands on: the survey's supply is
+            // the posted ring itself, so a ring at or under the floor
+            // fields no sortie by design and the ratio below is never
+            // reached — a zero-sortie match reads the line staffing's
+            // book, not a break here.
             if at_post.len() <= DEFENSE_INTERCEPT_RING_FLOOR {
                 return None;
             }
             let take = at_post
                 .len()
                 .saturating_sub(DEFENSE_INTERCEPT_RING_FLOOR)
-                .min(DEFENSE_INTERCEPT_DETACH_CAP);
+                .min(self.defense_intercept_detach_cap());
             at_post.truncate(take);
             at_post
         };
@@ -11704,23 +11738,19 @@ impl SuperAi {
         })
     }
 
-    /// The line (mode A): each spawn bearing anchors a hold position
-    /// [`DEFENSE_LINE_STANDOFF`] short of home (clamped just short of the
-    /// spawn itself), staffed with up to [`DEFENSE_LINE_PER_BEARING`]
-    /// combat units on `Guard` posts picked by the battle perimeter's own
-    /// site scan. Drift past [`DEFENSE_LINE_DRIFT_CELLS`] walks the
-    /// drifter back first — holding the line, never marching it.
-    /// The objective ring's quota: the baseline ring, raised to the army
     /// The mix's role targets for the wave the map holds: the field's
     /// observed presence answered two guns to one plane, a margin over the
     /// observed vehicles and infantry — and behind both, the armed
-    /// schedule's remaining composition answered the same way with the
-    /// flat caps lifted, so production keeps running while the schedule
-    /// holds an answer it has not fielded yet (an airstrike that spawns
-    /// on the map only becomes an observation once it is already here).
-    /// Every target floored so an early quiet map still fields a baseline.
-    /// `defense_army_orders` files the deficits and the objective ring
-    /// sizes itself on the sum.
+    /// schedule's remaining composition answered the same way (an
+    /// airstrike that spawns on the map only becomes an observation once
+    /// it is already here). Every target floored so an early quiet map
+    /// still fields a baseline, and every target capped so neither read
+    /// can flood the ring: the census is whole-field, so an enemy force
+    /// anywhere on the map — or one trigger team's full taskforce — must
+    /// not ask the home ring and the production lines for its own size in
+    /// answer (the uncapped reads asked for a thousand posts and held
+    /// every unit on the ring). `defense_army_orders` files the deficits
+    /// and the objective ring sizes itself on the sum.
     fn defense_mix_targets(&self) -> (usize, usize, usize) {
         let Some(persona) = self.defense.as_ref() else {
             return (DEFENSE_AA_FLOOR, DEFENSE_ARMOR_FLOOR, DEFENSE_FOOT_FLOOR);
@@ -11734,8 +11764,13 @@ impl SuperAi {
         } else {
             DEFENSE_AA_FLOOR
         };
-        let scheduled_air = scheduled.aircraft * DEFENSE_AA_PER_AIRCRAFT;
-        let anti_air = observed_air.max(scheduled_air);
+        let scheduled_air = if scheduled.aircraft > 0 {
+            (scheduled.aircraft * DEFENSE_AA_PER_AIRCRAFT)
+                .min(scheduled.aircraft * DEFENSE_ANSWER_CEILING_MULTIPLIER)
+        } else {
+            0
+        };
+        let anti_air = observed_air.max(scheduled_air).min(DEFENSE_AA_CAP);
         let observed_armor = (observed.vehicles + DEFENSE_ARMOR_MARGIN)
             .max(DEFENSE_ARMOR_FLOOR)
             .min(DEFENSE_ARMOR_CAP);
@@ -11745,7 +11780,7 @@ impl SuperAi {
         } else {
             0
         };
-        let anti_armor = observed_armor.max(scheduled_armor);
+        let anti_armor = observed_armor.max(scheduled_armor).min(DEFENSE_ARMOR_CAP);
         let observed_foot = (observed.infantry + DEFENSE_FOOT_MARGIN)
             .max(DEFENSE_FOOT_FLOOR)
             .min(DEFENSE_FOOT_CAP);
@@ -11755,7 +11790,7 @@ impl SuperAi {
         } else {
             0
         };
-        let anti_foot = observed_foot.max(scheduled_foot);
+        let anti_foot = observed_foot.max(scheduled_foot).min(DEFENSE_FOOT_CAP);
         (anti_air, anti_armor, anti_foot)
     }
 
@@ -11765,6 +11800,47 @@ impl SuperAi {
     fn defense_objective_quota(&self) -> usize {
         let (anti_air, anti_armor, anti_foot) = self.defense_mix_targets();
         DEFENSE_OBJECTIVE_POSTS.max(anti_air + anti_armor + anti_foot)
+    }
+
+    /// The wave-pressure read the active-defense caps scale on: the
+    /// observed-or-scheduled ground mass — the same read the mix's
+    /// wartime tier takes ([`DEFENSE_QUALITY_PRESSURE`]). Zero when no
+    /// persona stands, so the battle side keeps the baseline caps.
+    fn defense_wave_ground_pressure(&self) -> usize {
+        match self.defense.as_ref() {
+            Some(persona) => {
+                let observed = persona.observed_wave_composition;
+                let scheduled = persona.scheduled_wave_composition;
+                (observed.infantry + observed.vehicles).max(scheduled.infantry + scheduled.vehicles)
+            }
+            None => 0,
+        }
+    }
+
+    /// The perimeter engagement's hold cap on that pressure: the baseline
+    /// guardrail while the map is quiet, one step up once a real ground
+    /// force fields ([`GROUND_HEAVY_THREATS`]), the assault step against a
+    /// massed wave ([`GROUND_ASSAULT_THREATS`]) — a massed group at the
+    /// wall meets more than the quiet-map pair of marchers.
+    fn defense_perimeter_pool_cap(&self) -> usize {
+        match self.defense_wave_ground_pressure() {
+            pressure if pressure >= GROUND_ASSAULT_THREATS => DEFENSE_PERIMETER_POOL_ASSAULT,
+            pressure if pressure >= GROUND_HEAVY_THREATS => DEFENSE_PERIMETER_POOL_WARTIME,
+            _ => DEFENSE_PERIMETER_POOL_CAP,
+        }
+    }
+
+    /// The forward interception's march cap on the same pressure: the
+    /// commit ratio needs the detachment's power to answer the cluster's,
+    /// so a massed wave needs a detachment of its own size — the baseline
+    /// cap cannot clear a massed cluster's power no matter how many posts
+    /// stand, and every survey would refuse for the whole match.
+    fn defense_intercept_detach_cap(&self) -> usize {
+        match self.defense_wave_ground_pressure() {
+            pressure if pressure >= GROUND_ASSAULT_THREATS => DEFENSE_INTERCEPT_DETACH_ASSAULT,
+            pressure if pressure >= GROUND_HEAVY_THREATS => DEFENSE_INTERCEPT_DETACH_WARTIME,
+            _ => DEFENSE_INTERCEPT_DETACH_CAP,
+        }
     }
 
     /// The idle combat roster the line staffs from: own foot and hulls the
@@ -12697,14 +12773,14 @@ impl SuperAi {
         };
         self.corridor_stones.clear();
         self.corridor_link_sites.clear();
-        let Some(stone_name) = self.defense_stone_type(sim, rules) else {
+        let Some(stone_name) = self.defense_stone_type(sim, rules, opening) else {
             return Vec::new();
         };
         // The stone's standing count gates the pacing: the program's
         // first stone opens at full speed (read before the walk's
         // closures borrow `self` — the census is a mutable read).
-        let first_stone = self.count_structures_of_type(sim, &stone_name) == 0;
-        let Some(stone_ty) = rules.object(&stone_name) else {
+        let first_stone = self.count_structures_of_type(sim, stone_name) == 0;
+        let Some(stone_ty) = rules.object(stone_name) else {
             return Vec::new();
         };
         let owner = sim.interner.resolve(self.house).to_string();
@@ -12818,7 +12894,7 @@ impl SuperAi {
                     // The chain stops at the unserved link until the
                     // stone and its gun stand.
                     stones.push(CorridorStone {
-                        name: stone_name.clone(),
+                        name: String::from(stone_name),
                         anchor: next,
                         threat: landing,
                         // The chain's opening links climb at full speed
@@ -12842,57 +12918,72 @@ impl SuperAi {
         out
     }
 
-    /// The corridor stone's type ([`CorridorStone`]): the cheapest
-    /// buildable retail building that carries the owner's build area —
-    /// `BaseNormal=yes`, no wall segment, no water-bound foundation —
-    /// resolved from the rules at runtime, never hard-coded: the sides
-    /// differ (the Soviet plant prices under the Allied's) and a custom
-    /// table may too. The build gate is the engine's own
-    /// [`crate::sim::production::can_build`], the same admission the
-    /// army picks run: an AI house's Prerequisite-chain quirk answers
-    /// through it unchanged, and a type the house cannot field (tech
-    /// level, country lock, stolen tech) refuses and hands the pick to
-    /// the next candidate up the price ladder. Cached by name — the
-    /// rules do not change mid-game — with the gate re-verified each
-    /// call.
+    /// The corridor stone's type ([`CorridorStone`]): the house's own
+    /// power plant ([`Opening::power`]). The side's own name keeps the
+    /// stone faction-correct by construction — the old whole-table price
+    /// scan handed every house the cheapest `BaseNormal=yes` building in
+    /// the rules, and the AI house's `CanBuild` quirk let a cross-side
+    /// type through, so Soviet and Allied bases laddered Allied
+    /// barracks while a Yuri house passed on every candidate and never
+    /// laddered at all. The plant is `BaseNormal=yes` (it carries the
+    /// owner's build area), never a wall or water-bound foundation, and
+    /// it feeds the grid while it stands. The build gate is the engine's
+    /// own [`crate::sim::production::can_build`], re-verified each call
+    /// (tech level and stolen tech move it); a refusal returns no stone
+    /// for the tick. The fallback for a table whose plant name is
+    /// missing or gated walks this opening's own names only — never the
+    /// whole table, so a cross-side type can never win the pick.
     fn defense_stone_type(
-        &mut self,
+        &self,
         sim: &crate::sim::world::Simulation,
         rules: &crate::rules::ruleset::RuleSet,
-    ) -> Option<String> {
+        opening: &Opening,
+    ) -> Option<&'static str> {
         let buildable = |ty: &crate::rules::object_type::ObjectType| {
             crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
                 == crate::sim::production::CanBuild::Yes
         };
-        if let Some(name) = self.corridor_stone_name.clone()
-            && rules.object(&name).is_some_and(|ty| buildable(ty))
+        let stone_fit = |ty: &crate::rules::object_type::ObjectType| {
+            ty.category == crate::rules::object_type::ObjectCategory::Building
+                && ty.base_normal
+                && !ty.wall
+                && !ty.naval
+                && ty.cost > 0
+        };
+        if let Some(ty) = rules.object(opening.power)
+            && stone_fit(ty)
+            && buildable(ty)
         {
-            return Some(name);
+            return Some(opening.power);
         }
-        let mut candidates: Vec<&crate::rules::object_type::ObjectType> = rules
-            .all_objects()
-            .filter(|ty| {
-                ty.category == crate::rules::object_type::ObjectCategory::Building
-                    && ty.base_normal
-                    && !ty.wall
-                    && !ty.naval
-                    && ty.cost > 0
-            })
-            .collect();
-        candidates.sort_by(|a, b| a.cost.cmp(&b.cost).then_with(|| a.id.cmp(&b.id)));
-        let pick = candidates
-            .into_iter()
-            .find(|ty| buildable(ty))
-            .map(|ty| ty.id.clone());
-        self.corridor_stone_name = pick.clone();
-        pick
+        let own_names = [
+            opening.power,
+            opening.construction_yard,
+            opening.refinery,
+            opening.barracks,
+            opening.war_factory,
+            opening.radar,
+            opening.battle_lab,
+            opening.service_depot,
+            opening.naval_yard,
+            opening.defense_basic,
+            opening.defense_aa,
+            opening.defense_heavy,
+        ];
+        own_names
+            .iter()
+            .copied()
+            .filter_map(|name| rules.object(name).map(|ty| (ty, name)))
+            .filter(|(ty, _)| stone_fit(ty) && buildable(ty))
+            .min_by_key(|(ty, name)| (ty.cost, *name))
+            .map(|(_, name)| name)
     }
 
     /// The defense telemetry row (once every [`DEFENSE_TELEMETRY_TICKS`]
     /// per adopted defense house): one compact `log::info!` line under
     /// the `[DEF-AI]` tag carrying the whole defense posture — the
     /// engine's power totals, the wallet, the objective ring's on-duty
-    /// posts against its quota, the corridor ledger's entries and the
+    /// posts against its post slots, the corridor ledger's entries and the
     /// standing stones and fort guns, the interception books' sorties and
     /// recalls, and the building queue's current item. Every field is a
     /// read the frame already runs (the census, the persona's ledgers,
@@ -12915,22 +13006,27 @@ impl SuperAi {
         let (output, drain) = crate::sim::production::power_balance_for_owner(sim, rules, &owner);
         let credits = crate::sim::production::credits_for_owner(sim, &owner);
         // The persona's scalars first — the borrow must drop before the
-        // census and the stone cache read below.
-        let (ring_posts, ring_gap, entries, sorties, withdraws) = {
+        // census and the stone read below. The ring row's denominator is
+        // the ring's real post-slot count — the guard fan the staffing
+        // pass fills ([`defense_objective_fan`]) — not the mix quota:
+        // the quota rides the wave answer (an air-heavy field pushes it
+        // past a thousand) while the ring can only ever hold the fan's
+        // slots, so a quota read made the row's second number
+        // unjudgeable.
+        let (ring_posts, ring_slots, entries, sorties, withdraws) = {
             let persona = self.defense.as_ref().expect("checked above");
             let quota = self.defense_objective_quota();
             let posts = persona.line_posts.len();
             (
                 posts,
-                quota.saturating_sub(posts),
+                defense_objective_fan(quota).len(),
                 persona.entry_cells.len(),
                 persona.intercept_sorties,
                 persona.intercept_withdraws,
             )
         };
-        let stone = self.defense_stone_type(sim, rules);
+        let stone = self.defense_stone_type(sim, rules, opening);
         let stones = stone
-            .as_deref()
             .map(|name| self.count_structures_of_type(sim, name))
             .unwrap_or(0);
         let guns = self.count_structures_of_type(sim, opening.defense_basic)
@@ -12963,7 +13059,7 @@ impl SuperAi {
             .unwrap_or("-");
         log::info!(
             "[DEF-AI] tick={tick} house={owner} power={output}/{drain} credits={credits} \
-             ring={ring_posts}/{ring_gap} corridor=entries:{entries} stones:{stones} guns:{guns} \
+             ring={ring_posts}/{ring_slots} corridor=entries:{entries} stones:{stones} guns:{guns} \
              intercept=s:{sorties} w:{withdraws} build={building} unit={unit}"
         );
     }
@@ -13187,11 +13283,11 @@ impl SuperAi {
             } else {
                 opening.defense_basic
             };
-            let corridor_flush = self
-                .defense_stone_type(sim, rules)
-                .is_some_and(|stone_name| {
-                    self.corridor_pace_flush(sim, rules, &stone_name, lead_tower, &owner)
-                });
+            let corridor_flush =
+                self.defense_stone_type(sim, rules, opening)
+                    .is_some_and(|stone_name| {
+                        self.corridor_pace_flush(sim, rules, stone_name, lead_tower, &owner)
+                    });
             let mut sites: Vec<((i16, i16), (i16, i16), usize, usize, bool, usize)> = fort_sites
                 .iter()
                 .map(|&(anchor, spawn)| {
@@ -25936,12 +26032,13 @@ mod tests {
     /// The ring's quota reads the observed wave through the army mix's own
     /// capped targets: a heavy wave raises the ring above the baseline, a
     /// quiet map keeps it at the baseline.
-    /// A massed air wave scales the mix's air answer by the absolute
-    /// observation, not the old flat floor: eighty hostile aircraft ask
-    /// for their own guns at the core, the ring's quota reads the sum,
-    /// and the deepest deficit files the AA roster's first entry.
+    /// A massed air wave raises the mix's air answer up to its flat cap
+    /// and stops there: eighty hostile aircraft ask for the capped
+    /// answer at the core — the whole-field census never asks for its
+    /// own size in guns — and the deepest deficit still files the AA
+    /// roster's first entry.
     #[test]
-    fn aa_answer_scales_with_a_massed_air_wave() {
+    fn aa_answer_caps_a_massed_air_wave() {
         let (mut sim, rules, ai_house, enemy_house) = defense_forces_world();
         let ai_owner = sim.interner.resolve(ai_house).to_string();
         let enemy_owner = sim.interner.resolve(enemy_house).to_string();
@@ -25975,16 +26072,15 @@ mod tests {
             }
         }
 
-        // Two guns per plane: 80 observed asks for 160, the floored roles
-        // keep their baselines, and the ring's quota reads the sum.
+        // Two guns per plane up to the flat cap: 80 observed asks for the
+        // capped answer, the floored roles keep their baselines, and the
+        // ring's quota reads the sum — at the baseline, the capped air
+        // answer plus the floors never passes it.
         let (anti_air, anti_armor, anti_foot) = ai.defense_mix_targets();
-        assert_eq!(anti_air, 160, "eighty planes at two guns each");
+        assert_eq!(anti_air, super::DEFENSE_AA_CAP, "eighty planes at the cap");
         assert_eq!(anti_armor, super::DEFENSE_ARMOR_FLOOR);
         assert_eq!(anti_foot, super::DEFENSE_FOOT_FLOOR);
-        assert_eq!(
-            ai.defense_objective_quota(),
-            160 + super::DEFENSE_ARMOR_FLOOR + super::DEFENSE_FOOT_FLOOR,
-        );
+        assert_eq!(ai.defense_objective_quota(), super::DEFENSE_OBJECTIVE_POSTS,);
         // The deepest deficit is the air answer: the first production
         // filed rides the AA roster's ungated lead (the Allied IFV).
         let expected = runtime.simulation.interner().get("FV");
@@ -26062,10 +26158,11 @@ mod tests {
 
     /// The armed schedule pre-fields the answer before the strike: with a
     /// wave trigger armed that spawns twenty aircraft and nothing on the
-    /// field, the mix reads the scheduled wave (forty guns) through the
-    /// same ceiling rules as an observation, and the ring's quota carries
-    /// it — production files the AA answer while the wave is still only
-    /// a trigger.
+    /// field, the mix reads the scheduled wave through the same ceiling
+    /// and flat-cap rules as an observation — the scheduled answer rides
+    /// to the cap and stops there, the ring's quota carries the sum, and
+    /// production files the AA answer while the wave is still only a
+    /// trigger.
     #[test]
     fn scheduled_wave_pre_fields_the_answer_before_it_spawns() {
         let map_ini = b"[Map]\nTheater=TEMPERATE\nSize=0,0,2,1\nLocalSize=0,0,2,1\n\
@@ -26093,15 +26190,13 @@ mod tests {
         );
         let (anti_air, anti_armor, anti_foot) = ai.defense_mix_targets();
         assert_eq!(
-            anti_air, 40,
-            "the scheduled twenty planes ask for their two-guns-per-plane answer"
+            anti_air,
+            super::DEFENSE_AA_CAP,
+            "the scheduled twenty planes ask for the capped two-guns-per-plane answer"
         );
         assert_eq!(anti_armor, super::DEFENSE_ARMOR_FLOOR);
         assert_eq!(anti_foot, super::DEFENSE_FOOT_FLOOR);
-        assert_eq!(
-            ai.defense_objective_quota(),
-            40 + super::DEFENSE_ARMOR_FLOOR + super::DEFENSE_FOOT_FLOOR,
-        );
+        assert_eq!(ai.defense_objective_quota(), super::DEFENSE_OBJECTIVE_POSTS,);
         let _ = rules;
     }
 
