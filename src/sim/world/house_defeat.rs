@@ -11,7 +11,15 @@
 //! tracked destroys the whole remaining army in that one call.
 //! Optional Ares4F8EBD ->10024990 replaces only the admission predicate with
 //! HouseTracking's retained KeepAlive/full BaseUnit/Foot-presence decision.
-//! Executed controls: tools/spatial_oracle/ares_house_survival.md. The existing
+//! Fork deviation on top of that admission: the gate skips a house that
+//! still carries an armed future reinforcement trigger
+//! (`house_has_armed_future_reinforcements`, `sim::trigger_runtime`). Native
+//! multiplayer never builds a trigger-driven enemy house that starts with no
+//! force, so it never judges one; VERA's defense-map sessions do, and in the
+//! lull between waves the retail predicate reads such a house dead while its
+//! map still has teams to send, turning the next settlement into a premature
+//! allied "Victorious!". Executed controls:
+//! tools/spatial_oracle/ares_house_survival.md. The existing
 //! Blowup_All and MPlayer_Defeated downstream owners remain shared.
 //!
 //! Blowup_All walks TechnoClass::Array, limbo objects included, re-reading the
@@ -384,6 +392,20 @@ impl Simulation {
             return false;
         };
         if house.is_defeated() || house.multiplay_passive() {
+            return false;
+        }
+        // Fork deviation (see `house_has_armed_future_reinforcements`): a
+        // wave map's trigger-driven house holds nothing in the lull between
+        // its waves, but its map still has those teams to send. Native never
+        // built such a house in a multiplayer session for this gate to
+        // judge; VERA's instantiation does. A house whose armed triggers can
+        // still spawn its teams is not a corpse: without this read the gate
+        // would kill it here and MPlayer_Defeated's settlement
+        // (0x004FC3DE..0x004FC6B7) would then read the surviving allied
+        // participants as the whole match — a premature "Victorious!". A
+        // session without such triggers reads false, so every other game is
+        // unchanged.
+        if self.house_has_armed_future_reinforcements(owner, rules) {
             return false;
         }
         // Pure lazy type lookups: retail consumes exactly three entries;

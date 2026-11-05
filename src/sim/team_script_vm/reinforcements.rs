@@ -31,7 +31,14 @@ impl Simulation {
     /// Scenario1180 start-slot mapping used by Player@A..H510ED0 (VERA
     /// extends this to A..AD). Country
     /// resolution uses House array order502D30, never sorted owner names.
-    fn team_type_house(&self, team_type: InternedId, rules: &RuleSet) -> Option<InternedId> {
+    /// Sole owner of the TeamType -> House projection; shared read-only with
+    /// the defeat gate's armed-reinforcement scan
+    /// (`Simulation::house_has_armed_future_reinforcements`).
+    pub(crate) fn team_type_house(
+        &self,
+        team_type: InternedId,
+        rules: &RuleSet,
+    ) -> Option<InternedId> {
         match self.team_script_vm.team_type_ini.get(&team_type)?.house? {
             TeamTypeHouse::Country(country) => self.house_by_country_index(country, rules),
             TeamTypeHouse::PlayerAt(slot) => self.house_by_trigger_selector(

@@ -18,10 +18,10 @@ use crate::rules::ini_parser::is_native_none_type_name;
 use crate::rules::ini_value::{crt_atoi, truncate_native_bytes};
 use crate::sim::rng::SimRng;
 use crate::sim::scenario_session::ScenarioSession;
-use crate::util::state_hasher::hash_indices;
 use crate::sim::timer::CdTimer;
 use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::{FrameEffects, SimSoundEvent, Simulation};
+use crate::util::state_hasher::hash_indices;
 
 const ACTION_PLAY_SOUND: i32 = 19;
 const ACTION_FORCE_TRIGGER: i32 = 22;
@@ -5224,6 +5224,75 @@ impl Simulation {
             _ => return false,
         }
         true
+    }
+
+    /// Whether `owner` still has an armed future reinforcement: a live
+    /// Trigger instance that is enabled and not pending deletion, whose own
+    /// TriggerType carries a team-spawn action (4 create-team, 7/80/107
+    /// reinforcements — the same set the dispatcher admits at its
+    /// `4 | 7 | 80 | 107` arm above) whose TeamType's `GetHouse` resolves to
+    /// `owner`. Every linked TriggerType constructs its own live instance
+    /// (`construct_trigger_tag` walks the chain), so scanning the registered
+    /// instances covers authored chains without a separate traversal.
+    ///
+    /// Fork deviation, not native: retail multiplayer never builds a
+    /// trigger-driven enemy house that starts with no force, so the defeat
+    /// gate (HouseClass::Update 0x004F8440, 0x004F8E86..0x004F8F82) never
+    /// meets one. VERA's sessions do (the defense map's wave owner), and in
+    /// the lull between its waves that house holds nothing, so the retail
+    /// gate reads it dead while the map still has its waves to send; the
+    /// settlement MPlayer_Defeated then runs (0x004FC3DE..0x004FC6B7) and
+    /// reads every surviving participant as one allied block — the
+    /// premature "Victorious!". A house whose map can still spawn its teams
+    /// is not a corpse: the gate consults this read before judging it
+    /// (`house_holds_nothing`). Armed is the dispatcher's own admission
+    /// (RegisterEvent7264C0 / Spring7265C0: enabled, not pending): a spent
+    /// one-shot waits pending and is deleted, a repeatable timer trigger
+    /// stays armed. An action-53-disabled spawn chain is not armed here —
+    /// this read counts what can spawn on its own admission, not what
+    /// another trigger might later enable; a map that parks every future
+    /// wave behind a disabled trigger keeps today's behavior in that lull
+    /// (recorded residual). A session with no such trigger reads
+    /// false for every house, so ordinary games are unchanged.
+    /// Pure read: no RNG, no mutation, no render/ui dependency.
+    pub(crate) fn house_has_armed_future_reinforcements(
+        &self,
+        owner: crate::sim::intern::InternedId,
+        rules: &crate::rules::ruleset::RuleSet,
+    ) -> bool {
+        self.trigger_runtime
+            .trigger_order
+            .iter()
+            .filter_map(|&index| self.trigger_runtime.trigger(index))
+            .filter(|trigger| trigger.enabled && !trigger.pending)
+            .any(|trigger| {
+                self.trigger_runtime.definitions.trigger_types[trigger.type_index]
+                    .actions
+                    .iter()
+                    .any(|action| {
+                        if !matches!(action.entry.kind, 4 | 7 | 80 | 107) {
+                            return false;
+                        }
+                        let Some(DefinitionReference::Team(team)) = action.reference else {
+                            return false;
+                        };
+                        let Some(team_name) = self.trigger_runtime.definitions.team_types.get(team)
+                        else {
+                            return false;
+                        };
+                        // The dispatcher interns this same string before
+                        // GetHouse; the team registry interned every authored
+                        // TeamType name at install, so the case-folded lookup
+                        // resolves it without mutating the interner. A name
+                        // the interner never saw reads unresolvable and skips
+                        // — the same "owner not resolvable" dead end the
+                        // spawn itself would take.
+                        self.interner
+                            .get(team_name)
+                            .and_then(|team| self.team_type_house(team, rules))
+                            == Some(owner)
+                    })
+            })
     }
 }
 
