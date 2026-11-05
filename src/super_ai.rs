@@ -870,6 +870,25 @@ const DEFENSE_CORRIDOR_AA_PER_GROUND: usize = 3;
 /// between them so a rich wallet ladders the corridor without starving
 /// the barracks and factory rungs behind the gun loop.
 const DEFENSE_CORRIDOR_GUN_WINDOW: u32 = 450;
+/// The corridor track's own pace: the corridor stones and the chain
+/// links' towers no longer share the base anchors' gun window above —
+/// a base tower's 450-tick rest read as the chain's, and a ladder that
+/// may queue one link per 450 ticks never crossed the map in a match
+/// (the approaches stayed naked while the wallet was flush). The chain
+/// paces itself at this tighter window; each approach's first
+/// [`DEFENSE_CORRIDOR_FREE_LINKS`] links and any flush-wallet pass (see
+/// [`SuperAi::corridor_pace_flush`]) ride at full speed.
+const DEFENSE_CORRIDOR_WINDOW: u32 = 150;
+/// Each approach's first links queue without the corridor window: the
+/// chain's opening ladder is the difference between a corridor that
+/// exists and one that never starts, so the first three climb at full
+/// speed and the pace begins past them.
+const DEFENSE_CORRIDOR_FREE_LINKS: usize = 3;
+/// The defense telemetry's pace: one compact INFO row per adopted
+/// defense house every this many ticks — the whole defense posture in a
+/// single greppable line (`[DEF-AI]`), so a match's behavior reads from
+/// its log without hand-replaying the frame.
+const DEFENSE_TELEMETRY_TICKS: u32 = 600;
 /// The core's guard fan, sized to the answer it must hold: the standing
 /// ±3 hug first, then the same 3-cell lattice's ±6, ±9 and ±12 shells out
 /// to the ring spread. An answer wider than one shell stands on the next
@@ -1910,6 +1929,12 @@ struct DefensePersona {
     /// where they were met. The corridor program's primary threat
     /// ledger; merged and capped like [`DefensePersona::corridor_cells`].
     entry_cells: Vec<(u16, u16)>,
+    /// Forward-interception commits so far: the surveys that sent a
+    /// detachment at a marching cluster. Telemetry only.
+    intercept_sorties: u32,
+    /// Forward-interception recalls so far: the withdraw ladder's walks
+    /// home plus the no-wave stand-downs. Telemetry only.
+    intercept_withdraws: u32,
 }
 
 impl DefensePersona {
@@ -1945,6 +1970,8 @@ impl DefensePersona {
             corridor_cells: Vec::new(),
             seen_hostiles: std::collections::HashSet::new(),
             entry_cells: Vec::new(),
+            intercept_sorties: 0,
+            intercept_withdraws: 0,
         }
     }
 
@@ -3365,14 +3392,31 @@ pub struct SuperAi {
     /// runtime.
     placement_intent: Option<(InternedId, PlacementRoute)>,
     /// Earliest tick the corridor fort track may queue another gun past
-    /// the anchors' floors; see [`DEFENSE_CORRIDOR_GUN_WINDOW`]. Pinned
-    /// state, never read from the runtime.
+    /// the anchors' floors; see [`DEFENSE_CORRIDOR_GUN_WINDOW`]. The base
+    /// anchors' (objective and bearing) own clock — the corridor chain
+    /// reads [`Self::corridor_window_due`]. Pinned state, never read from
+    /// the runtime.
     fort_gun_window_due: u32,
+    /// Earliest tick the corridor chain — the stones and the walk links'
+    /// towers — may queue its next build; see
+    /// [`DEFENSE_CORRIDOR_WINDOW`]. Pinned state, never read from the
+    /// runtime.
+    corridor_window_due: u32,
     /// The corridor stone ladder's pending frontier links, recomputed by
     /// the last [`Self::defense_corridor_program`] walk and consumed by
     /// the build block's stone arm. Pinned state, never read from the
     /// runtime.
     corridor_stones: Vec<CorridorStone>,
+    /// The corridor walk's standing link cells — the chain sites the
+    /// last [`Self::defense_corridor_program`] walk produced — so the
+    /// gun loop's file-side rearm knows which [`PlacementRoute::Fort`]
+    /// gun rides the corridor clock and which the anchors'. Pinned
+    /// state, never read from the runtime.
+    corridor_link_sites: Vec<(i16, i16)>,
+    /// Earliest tick the next defense telemetry row may print; see
+    /// [`DEFENSE_TELEMETRY_TICKS`]. Pinned state, never read from the
+    /// runtime.
+    telemetry_due: u32,
     /// The corridor stone's type name — the cheapest buildable
     /// `BaseNormal=yes` building this house can field — cached because
     /// the rules do not change mid-game. The cache re-verifies the build
@@ -3731,7 +3775,10 @@ impl SuperAi {
             mcv_abandoned: std::collections::HashMap::new(),
             placement_intent: None,
             fort_gun_window_due: 0,
+            corridor_window_due: 0,
             corridor_stones: Vec::new(),
+            corridor_link_sites: Vec::new(),
+            telemetry_due: 0,
             corridor_stone_name: None,
             gun_want_note: String::from("-"),
             repairing_structure: None,
@@ -3870,6 +3917,30 @@ impl SuperAi {
         }
         let credits = i64::from(crate::sim::production::credits_for_owner(sim, owner));
         credits - i64::from(cost) >= credits * FORT_WALLET_RESERVE_PCT / 100
+    }
+
+    /// Whether the wallet affords a corridor stone plus its lead tower
+    /// outright and still clears the fort reserve
+    /// ([`FORT_WALLET_RESERVE_PCT`]) — the corridor jump's whole test: a
+    /// flush wallet queues the chain's next build ahead of the expansion
+    /// rungs (the window does not hold it), a short one keeps the old
+    /// pace where the expansion spends first. Two numeric compares over
+    /// the caller's reads; no scan of its own.
+    fn corridor_pace_flush(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        stone_name: &str,
+        tower_name: &'static str,
+        owner: &str,
+    ) -> bool {
+        let (Some(stone_ty), Some(tower_ty)) = (rules.object(stone_name), rules.object(tower_name))
+        else {
+            return false;
+        };
+        let credits = i64::from(crate::sim::production::credits_for_owner(sim, owner));
+        credits - i64::from(stone_ty.cost) - i64::from(tower_ty.cost)
+            >= credits * FORT_WALLET_RESERVE_PCT / 100
     }
 
     /// The tier this player plays at.
@@ -4157,6 +4228,10 @@ impl SuperAi {
         let Some(opening) = self.pinned_opening else {
             return Vec::new();
         };
+        // The defense telemetry row rides ahead of every branch that can
+        // return early: an adopted house prints its posture every
+        // [`DEFENSE_TELEMETRY_TICKS`] regardless of what the frame did.
+        self.defense_telemetry(sim, rules, opening, tick);
         // The ladder's superweapon rungs are once-per-game each: remember
         // the supers standing, so a razed storm never rebuilds (see the
         // walk below for the starvation that motivated the latch) and the
@@ -6777,17 +6852,34 @@ impl SuperAi {
                 // own gates: the wallet (a stone the wallet cannot buy
                 // outright parks the one building slot), the build gate
                 // the stone's pick already passed this tick, and the
-                // pacing window the fort guns rearm (while no stone
-                // stands at all, each approach's first stone opens at
-                // full speed). The intent routes the ready stone to the
-                // frontier link's weighted scan, whose candidates all
-                // sit inside the build area by construction — the same
-                // admission the PLACE runs.
+                // chain's own pacing window ([`DEFENSE_CORRIDOR_WINDOW`],
+                // no longer the anchors' gun window — the shared clock
+                // paced the ladder into stillness) — while the chain's
+                // free links climb ([`DEFENSE_CORRIDOR_FREE_LINKS`]) or
+                // the wallet affords stone and tower outright
+                // ([`Self::corridor_pace_flush`], the jump ahead of the
+                // expansion rungs), no window holds the stone. The intent
+                // routes the ready stone to the frontier link's weighted
+                // scan, whose candidates all sit inside the build area by
+                // construction — the same admission the PLACE runs.
                 let stones = std::mem::take(&mut self.corridor_stones);
-                if let Some(index) = stones
-                    .iter()
-                    .position(|stone| !stone.rides_window || tick >= self.fort_gun_window_due)
-                {
+                // The flush read: one numeric compare off the frontier
+                // stone's own name and the track's lead tower (radar
+                // standing → the heavy leads, the pillbox answers).
+                let corridor_flush = match stones.first().map(|stone| stone.name.clone()) {
+                    Some(stone_name) => {
+                        let lead_tower = if radar_standing.is_empty() {
+                            opening.defense_basic
+                        } else {
+                            opening.defense_heavy
+                        };
+                        self.corridor_pace_flush(sim, rules, &stone_name, lead_tower, &owner)
+                    }
+                    None => false,
+                };
+                if let Some(index) = stones.iter().position(|stone| {
+                    !stone.rides_window || tick >= self.corridor_window_due || corridor_flush
+                }) {
                     let CorridorStone {
                         name: stone_name,
                         anchor,
@@ -6811,11 +6903,11 @@ impl SuperAi {
                         && let Some(command) = self.file_production(sim, rules, type_id, tick)
                     {
                         // The corridor track's pace: the stone arms the
-                        // same window the fort guns ride — the next
-                        // build (a gun on the stone's ground, or the
-                        // next link's stone) queues after
-                        // [`DEFENSE_CORRIDOR_GUN_WINDOW`].
-                        self.fort_gun_window_due = tick + DEFENSE_CORRIDOR_GUN_WINDOW;
+                        // chain's own window — the next chain build (a
+                        // gun on the stone's ground, or the next link's
+                        // stone) queues after
+                        // [`DEFENSE_CORRIDOR_WINDOW`].
+                        self.corridor_window_due = tick + DEFENSE_CORRIDOR_WINDOW;
                         self.placement_intent = Some((
                             type_id,
                             PlacementRoute::Fort {
@@ -6848,12 +6940,18 @@ impl SuperAi {
                         && let Some(command) = self.file_production(sim, rules, type_id, tick)
                     {
                         // The corridor track's pace (D2-E): a fort gun
-                        // past the anchors' floors arms the window — the
-                        // next one queues after
-                        // [`DEFENSE_CORRIDOR_GUN_WINDOW`], leaving the
-                        // growth tail its slots between the towers.
-                        if matches!(route, PlacementRoute::Fort { .. }) {
-                            self.fort_gun_window_due = tick + DEFENSE_CORRIDOR_GUN_WINDOW;
+                        // past the anchors' floors arms the window its
+                        // site reads — a chain link the corridor window
+                        // ([`DEFENSE_CORRIDOR_WINDOW`]), a base anchor
+                        // the gun window
+                        // ([`DEFENSE_CORRIDOR_GUN_WINDOW`]) — leaving
+                        // the growth tail its slots between the towers.
+                        if let PlacementRoute::Fort { anchor, .. } = route {
+                            if self.corridor_link_sites.contains(&anchor) {
+                                self.corridor_window_due = tick + DEFENSE_CORRIDOR_WINDOW;
+                            } else {
+                                self.fort_gun_window_due = tick + DEFENSE_CORRIDOR_GUN_WINDOW;
+                            }
                         }
                         self.placement_intent = Some((type_id, route));
                         return vec![CommandEnvelope::new(self.house, at, command)];
@@ -11234,6 +11332,13 @@ impl SuperAi {
             if detachment.is_empty() {
                 return None;
             }
+            // The stand-down is a recall: the detachment walks home with
+            // no wave to meet (telemetry counts it beside the ladder's
+            // withdrawals).
+            self.defense
+                .as_mut()
+                .expect("checked above")
+                .intercept_withdraws += 1;
             let mut commands: Vec<Command> = Vec::new();
             for (unit, home, _) in detachment {
                 if self.order_gate.get(&unit).is_none_or(|&due| tick >= due) {
@@ -11295,6 +11400,7 @@ impl SuperAi {
                     let persona = self.defense.as_mut().expect("checked above");
                     persona.intercept_aim = None;
                     persona.intercept_commit_power = 0;
+                    persona.intercept_withdraws += 1;
                     std::mem::take(&mut persona.intercept_detachment)
                 };
                 let mut commands: Vec<Command> = Vec::new();
@@ -11414,6 +11520,7 @@ impl SuperAi {
             }
             persona.intercept_aim = Some(meet);
             persona.intercept_commit_power = our_power;
+            persona.intercept_sorties += 1;
         }
         for &(_, _, unit, _) in &surplus {
             self.gate_idle_order(unit, tick);
@@ -12483,13 +12590,21 @@ impl SuperAi {
         anchors
     }
 
-    /// The corridor fort program (D2-E/D2-F): each recorded approach —
+    /// The corridor fort program (D2-E/D2-F): the recorded approaches —
     /// the entry ledger ([`DefensePersona::entry_cells`], the first
     /// in-band crossings the waves arrived on) with the engagement
     /// ledger ([`DefensePersona::corridor_cells`]) as the fallback while
-    /// no crossing stands — extrapolates into build sites walked out
-    /// from the nearest standing fort anchor, one lattice step at a time
-    /// toward the threat cell. The step is
+    /// no crossing stands — extrapolate into build sites laid along the
+    /// walk the invaders actually use. The chain's line is the
+    /// landing→objective segment: the ledger's cluster centroid (where
+    /// the waves land) joined to the persona's protected charge (where
+    /// they march). The old line ran anchor→landing — a base-to-landing
+    /// diagonal the ground war never walks — so the towers covered a
+    /// line no invader crossed. The chain starts at the line point
+    /// nearest the standing anchor nearest the landing, climbs to it
+    /// from the anchor (usually zero links — the objective itself is the
+    /// anchor), then spreads along the line toward the landing: whichever
+    /// segment the invaders walk, the towers stand on it. The step is
     /// [`DEFENSE_CORRIDOR_STEP`], capped by the ladder stone's
     /// [`crate::sim::production::build_area_reach_cells`] reach, so a
     /// stone queued at one link always stands inside the build area the
@@ -12511,16 +12626,19 @@ impl SuperAi {
     /// site within [`DEFENSE_FORT_ANCHOR_SPREAD`] of an accepted anchor
     /// collapses into it, but the walk continues past it: two approaches
     /// sharing a chokepoint ladder through the same stones. Each gun
-    /// site carries the threat cell it faces — the placement scan's
-    /// enemy-facing bias.
+    /// site carries the landing cell it faces — the placement scan's
+    /// enemy-facing bias — and its index along the chain: the
+    /// first [`DEFENSE_CORRIDOR_FREE_LINKS`] links ride no pacing window
+    /// (see [`DEFENSE_CORRIDOR_WINDOW`]).
     fn defense_corridor_program(
         &mut self,
         sim: &crate::sim::world::Simulation,
         rules: &crate::rules::ruleset::RuleSet,
         opening: &Opening,
-    ) -> Vec<((i16, i16), (i16, i16))> {
+    ) -> Vec<((i16, i16), (i16, i16), usize)> {
         if self.defense.is_none() {
             self.corridor_stones.clear();
+            self.corridor_link_sites.clear();
             return Vec::new();
         }
         let Some(persona) = self.defense.as_ref() else {
@@ -12529,7 +12647,7 @@ impl SuperAi {
         // The approaches: the entry ledger first — where the waves
         // arrive from — and the engagement ledger while the persona has
         // seen no crossing yet (a just-adopted persona).
-        let threats: Vec<(i16, i16)> = if persona.entry_cells.is_empty() {
+        let ledger: Vec<(i16, i16)> = if persona.entry_cells.is_empty() {
             persona
                 .corridor_cells
                 .iter()
@@ -12542,10 +12660,42 @@ impl SuperAi {
                 .map(|&cell| (cell.0 as i16, cell.1 as i16))
                 .collect()
         };
-        self.corridor_stones.clear();
-        if threats.is_empty() {
+        if ledger.is_empty() {
+            self.corridor_stones.clear();
+            self.corridor_link_sites.clear();
             return Vec::new();
         }
+        // The landing point: the ledger's cluster centroid — the mean of
+        // the recorded cells, integer math (deterministic across hosts).
+        let (mut sum_x, mut sum_y) = (0_i64, 0_i64);
+        for &(x, y) in &ledger {
+            sum_x += i64::from(x);
+            sum_y += i64::from(y);
+        }
+        let count = ledger.len() as i64;
+        let landing = ((sum_x / count) as i16, (sum_y / count) as i16);
+        // The objective: the persona's protected charge — the first
+        // standing protected target's cell, the same read the fort
+        // anchors run — falling back to the home pin while no target
+        // stands. The persona's read ends here: the ledger and the
+        // objective are the walk's whole borrow of it.
+        let objective = persona
+            .protected_targets
+            .iter()
+            .find_map(|&id| {
+                let entity = sim.substrate().entities.get(id)?;
+                (entity.owner() == self.house && entity.lifecycle.object_alive())
+                    .then(|| (entity.position.rx() as i16, entity.position.ry() as i16))
+            })
+            .or(self.engine_home)
+            .or(self.pinned_home);
+        let Some(objective) = objective else {
+            self.corridor_stones.clear();
+            self.corridor_link_sites.clear();
+            return Vec::new();
+        };
+        self.corridor_stones.clear();
+        self.corridor_link_sites.clear();
         let Some(stone_name) = self.defense_stone_type(sim, rules) else {
             return Vec::new();
         };
@@ -12569,8 +12719,9 @@ impl SuperAi {
         };
         let forts = self.defense_fort_anchors(sim);
         let mut accepted: Vec<(i16, i16)> = forts.iter().map(|&(anchor, _)| anchor).collect();
-        let mut out: Vec<((i16, i16), (i16, i16))> = Vec::new();
+        let mut out: Vec<((i16, i16), (i16, i16), usize)> = Vec::new();
         let mut stones: Vec<CorridorStone> = Vec::new();
+        let mut link_sites: Vec<(i16, i16)> = Vec::new();
         let collapsed = |accepted: &[(i16, i16)], cell: (i16, i16)| {
             accepted
                 .iter()
@@ -12579,22 +12730,53 @@ impl SuperAi {
         let step = DEFENSE_CORRIDOR_STEP
             .max(1)
             .min(crate::sim::production::build_area_reach_cells(stone_ty));
-        for &threat in &threats {
-            // The walk starts at the standing anchor nearest the
-            // approach — the chain extends an armed fort, never floats
-            // free of the base.
-            let Some(start) = forts
-                .iter()
-                .copied()
-                .min_by_key(|&(anchor, _)| (defense_chebyshev(threat, anchor), anchor))
-                .map(|(anchor, _)| anchor)
-            else {
-                continue;
-            };
-            let mut prev = start;
-            while defense_chebyshev(threat, prev) as i32 > step {
-                let dx = i32::from(threat.0) - i32::from(prev.0);
-                let dy = i32::from(threat.1) - i32::from(prev.1);
+        // The walk starts at the standing anchor nearest the landing —
+        // the chain extends an armed fort, never floats free of the base.
+        let Some(start_anchor) = forts
+            .iter()
+            .copied()
+            .min_by_key(|&(anchor, _)| (defense_chebyshev(landing, anchor), anchor))
+            .map(|(anchor, _)| anchor)
+        else {
+            return Vec::new();
+        };
+        // The chain start: the point on the landing→objective line
+        // nearest the anchor, sampled every `step` from the objective end
+        // (the objective itself is usually the nearest anchor, so the
+        // climb to the line is often zero links). From there the chain
+        // spreads along the line toward the landing — the segment the
+        // invaders actually walk.
+        let line_len = defense_chebyshev(landing, objective).max(1) as i32;
+        let line_dx = i32::from(landing.0) - i32::from(objective.0);
+        let line_dy = i32::from(landing.1) - i32::from(objective.1);
+        let mut start = objective;
+        let mut best = defense_chebyshev(objective, start_anchor) as i32;
+        let mut walked = 0_i32;
+        while walked < line_len {
+            walked += step;
+            let t = walked.min(line_len);
+            let point = (
+                objective.0 + (line_dx * t / line_len) as i16,
+                objective.1 + (line_dy * t / line_len) as i16,
+            );
+            let dist = defense_chebyshev(point, start_anchor) as i32;
+            if dist < best {
+                best = dist;
+                start = point;
+            }
+        }
+        // The climb (anchor → the line) and the spread (the line → the
+        // landing) share the link machinery: the ladder predicate, the
+        // collapse, the ground probe. A link the chain cannot serve yet —
+        // the link before holds no gun, or the ground owes a stone — ends
+        // the whole walk: the frontier link is the chain's next build.
+        let mut prev = start_anchor;
+        let mut link_index = 0_usize;
+        let mut frontier = false;
+        for target in [start, landing] {
+            while defense_chebyshev(target, prev) as i32 > step {
+                let dx = i32::from(target.0) - i32::from(prev.0);
+                let dy = i32::from(target.1) - i32::from(prev.1);
                 let len = dx.abs().max(dy.abs()).max(1);
                 let next = (
                     prev.0 + (dx * step / len) as i16,
@@ -12605,6 +12787,7 @@ impl SuperAi {
                 // past the build area's reach and only feed placement
                 // refusals.
                 if !holds_gun(prev) {
+                    frontier = true;
                     break;
                 }
                 if collapsed(&accepted, next) {
@@ -12625,7 +12808,8 @@ impl SuperAi {
                     next.1 as u16,
                 );
                 if grounded {
-                    out.push((next, threat));
+                    out.push((next, landing, link_index));
+                    link_sites.push(next);
                 } else {
                     // The frontier: this link owes a BaseNormal stone
                     // before any tower — the towers carry no area out,
@@ -12635,15 +12819,25 @@ impl SuperAi {
                     stones.push(CorridorStone {
                         name: stone_name.clone(),
                         anchor: next,
-                        threat,
-                        rides_window: !first_stone,
+                        threat: landing,
+                        // The chain's opening links climb at full speed
+                        // (see [`DEFENSE_CORRIDOR_FREE_LINKS`]); past
+                        // them a stone whose predecessors stand rides the
+                        // corridor window.
+                        rides_window: link_index >= DEFENSE_CORRIDOR_FREE_LINKS && !first_stone,
                     });
+                    frontier = true;
                     break;
                 }
+                link_index += 1;
                 prev = next;
+            }
+            if frontier {
+                break;
             }
         }
         self.corridor_stones = stones;
+        self.corridor_link_sites = link_sites;
         out
     }
 
@@ -12693,6 +12887,86 @@ impl SuperAi {
         pick
     }
 
+    /// The defense telemetry row (once every [`DEFENSE_TELEMETRY_TICKS`]
+    /// per adopted defense house): one compact `log::info!` line under
+    /// the `[DEF-AI]` tag carrying the whole defense posture — the
+    /// engine's power totals, the wallet, the objective ring's on-duty
+    /// posts against its quota, the corridor ledger's entries and the
+    /// standing stones and fort guns, the interception books' sorties and
+    /// recalls, and the building queue's current item. Every field is a
+    /// read the frame already runs (the census, the persona's ledgers,
+    /// the queue view) — no scan of its own, and the 600-tick pace keeps
+    /// the format cost out of the profile. This is the row a match's
+    /// defense behavior reads from its log; without it every diagnostic
+    /// was a hand-replay.
+    fn defense_telemetry(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+        tick: u32,
+    ) {
+        if self.defense.is_none() || tick < self.telemetry_due {
+            return;
+        }
+        self.telemetry_due = tick + DEFENSE_TELEMETRY_TICKS;
+        let owner = sim.interner.resolve(self.house).to_string();
+        let (output, drain) = crate::sim::production::power_balance_for_owner(sim, rules, &owner);
+        let credits = crate::sim::production::credits_for_owner(sim, &owner);
+        // The persona's scalars first — the borrow must drop before the
+        // census and the stone cache read below.
+        let (ring_posts, ring_gap, entries, sorties, withdraws) = {
+            let persona = self.defense.as_ref().expect("checked above");
+            let quota = self.defense_objective_quota();
+            let posts = persona.line_posts.len();
+            (
+                posts,
+                quota.saturating_sub(posts),
+                persona.entry_cells.len(),
+                persona.intercept_sorties,
+                persona.intercept_withdraws,
+            )
+        };
+        let stone = self.defense_stone_type(sim, rules);
+        let stones = stone
+            .as_deref()
+            .map(|name| self.count_structures_of_type(sim, name))
+            .unwrap_or(0);
+        let guns = self.count_structures_of_type(sim, opening.defense_basic)
+            + self.count_structures_of_type(sim, opening.defense_aa)
+            + self.count_structures_of_type(sim, opening.defense_heavy);
+        let queue = crate::sim::production::queue_view_for_owner(sim, rules, &owner);
+        let building = queue
+            .iter()
+            .find(|item| {
+                matches!(
+                    item.queue_category,
+                    crate::sim::production::ProductionCategory::Building
+                        | crate::sim::production::ProductionCategory::Defense
+                )
+            })
+            .map(|item| sim.interner.resolve(item.type_id))
+            .unwrap_or("-");
+        let unit = queue
+            .iter()
+            .find(|item| {
+                matches!(
+                    item.queue_category,
+                    crate::sim::production::ProductionCategory::Vehicle
+                        | crate::sim::production::ProductionCategory::Infantry
+                        | crate::sim::production::ProductionCategory::Aircraft
+                        | crate::sim::production::ProductionCategory::Ship
+                )
+            })
+            .map(|item| sim.interner.resolve(item.type_id))
+            .unwrap_or("-");
+        log::info!(
+            "[DEF-AI] tick={tick} house={owner} power={output}/{drain} credits={credits} \
+             ring={ring_posts}/{ring_gap} corridor=entries:{entries} stones:{stones} guns:{guns} \
+             intercept=s:{sorties} w:{withdraws} build={building} unit={unit}"
+        );
+    }
+
     /// The gun limb's wants, one row per gated defense type. The tiered
     /// per-yard quotas read the standing threat counts here (the AA
     /// ladder, B3's ground ladder); the first gated type with a base under
@@ -12740,14 +13014,14 @@ impl SuperAi {
         // The fort anchors and the corridor program join only while the
         // persona is adopted; the battle read keeps the yard list
         // verbatim. Each anchor carries the wave source it faces (the
-        // anchor itself when no bearing resolves; the corridor's threat
-        // cell for a chain link).
-        let fort_sites = if self.defense.is_some() {
-            let mut sites = self.defense_fort_anchors(sim);
-            sites.extend(self.defense_corridor_program(sim, rules, opening));
-            sites
+        // anchor itself when no bearing resolves; the corridor's landing
+        // cell for a chain link), the corridor links their chain index.
+        let (fort_sites, corridor_sites) = if self.defense.is_some() {
+            let anchors = self.defense_fort_anchors(sim);
+            let links = self.defense_corridor_program(sim, rules, opening);
+            (anchors, links)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         // The quota tier's threat read: the battle census counts what
         // stands; the persona tiers on the wave the map holds — the
@@ -12885,15 +13159,39 @@ impl SuperAi {
         // grid-gated from here on. Each standing anchor — objective,
         // bearing or corridor link — asks for the one gun its ring
         // misses next, ranked most-naked first; a naked anchor fills at
-        // full speed, a standing one rides the pacing window armed where
-        // the gun files.
-        if !fort_sites.is_empty() {
+        // full speed, a standing one rides its pacing window armed where
+        // the gun files. The base anchors (objective, bearing) and the
+        // corridor chain read different clocks: the anchors keep the
+        // 450-tick gun window, the chain its tighter
+        // [`DEFENSE_CORRIDOR_WINDOW`] — the old shared window let a base
+        // tower's rest pace the whole ladder into stillness. The chain's
+        // opening links ([`DEFENSE_CORRIDOR_FREE_LINKS`]) and a
+        // flush-wallet pass ([`Self::corridor_pace_flush`]) ride no
+        // window at all: a wallet that can pay the stone and its tower
+        // outright jumps the corridor ahead of the expansion rungs
+        // instead of waiting behind them.
+        if !fort_sites.is_empty() || !corridor_sites.is_empty() {
             let heavy_open = radar_class
                 .iter()
                 .any(|&name| self.count_structures_of_type(sim, name) >= 1);
             let air_answer = enemy_air > 0;
             let window_open = tick >= self.fort_gun_window_due;
-            let mut sites: Vec<((i16, i16), (i16, i16), usize, usize)> = fort_sites
+            let corridor_window_open = tick >= self.corridor_window_due;
+            let owner = sim.interner.resolve(self.house).to_string();
+            // The chain's flush read: the wallet affords the frontier
+            // stone and its lead tower beyond the fort reserve — a
+            // numeric compare over the block's own reads, no scan.
+            let lead_tower = if heavy_open {
+                opening.defense_heavy
+            } else {
+                opening.defense_basic
+            };
+            let corridor_flush = self
+                .defense_stone_type(sim, rules)
+                .is_some_and(|stone_name| {
+                    self.corridor_pace_flush(sim, rules, &stone_name, lead_tower, &owner)
+                });
+            let mut sites: Vec<((i16, i16), (i16, i16), usize, usize, bool, usize)> = fort_sites
                 .iter()
                 .map(|&(anchor, spawn)| {
                     let ground_near = self.count_structures_of_type_near(
@@ -12913,27 +13211,52 @@ impl SuperAi {
                         anchor,
                         DEFENSE_FORT_GUN_RING,
                     );
-                    (anchor, spawn, ground_near, aa_near)
+                    (anchor, spawn, ground_near, aa_near, false, 0)
                 })
                 .collect();
-            sites.sort_by_key(|&(anchor, _, ground, aa)| (ground + aa, anchor));
-            for (anchor, spawn, ground_near, aa_near) in sites {
+            sites.extend(corridor_sites.iter().map(|&(anchor, spawn, link)| {
+                let ground_near = self.count_structures_of_type_near(
+                    sim,
+                    opening.defense_heavy,
+                    anchor,
+                    DEFENSE_FORT_GUN_RING,
+                ) + self.count_structures_of_type_near(
+                    sim,
+                    opening.defense_basic,
+                    anchor,
+                    DEFENSE_FORT_GUN_RING,
+                );
+                let aa_near = self.count_structures_of_type_near(
+                    sim,
+                    opening.defense_aa,
+                    anchor,
+                    DEFENSE_FORT_GUN_RING,
+                );
+                (anchor, spawn, ground_near, aa_near, true, link)
+            }));
+            sites.sort_by_key(|&(anchor, _, ground, aa, _, _)| (ground + aa, anchor));
+            for (anchor, spawn, ground_near, aa_near, corridor, link) in sites {
                 let route = PlacementRoute::Fort { anchor, spawn };
+                let window_due = if corridor {
+                    link < DEFENSE_CORRIDOR_FREE_LINKS || corridor_window_open || corridor_flush
+                } else {
+                    window_open
+                };
                 if air_answer && aa_near * DEFENSE_CORRIDOR_AA_PER_GROUND <= ground_near {
                     // The AA leg: the wave carries aircraft, and the
                     // anchor's share of them stands due.
-                    if aa_near == 0 || window_open {
+                    if aa_near == 0 || window_due {
                         wants.push((opening.defense_aa, route));
                     }
                 } else if heavy_open {
                     // The ground leg: the heavy tower leads, the pillbox
                     // answers behind it when the wallet refuses the
                     // heavy — the loop's own fall-through by price.
-                    if ground_near == 0 || window_open {
+                    if ground_near == 0 || window_due {
                         wants.push((opening.defense_heavy, route));
                         wants.push((opening.defense_basic, route));
                     }
-                } else if ground_near == 0 || window_open {
+                } else if ground_near == 0 || window_due {
                     wants.push((opening.defense_basic, route));
                 }
             }
@@ -26821,7 +27144,8 @@ mod tests {
         let bases = [(10_i16, 10_i16), (24_i16, 20_i16)];
         // Peace quotas; no radar stands, so the heavy row's gate stays
         // closed and the read is the AA and pillbox rows alone.
-        let wants = ai.defense_gun_wants(&sim, opening, &bases, false, &["GAAIRC"], false);
+        let wants =
+            ai.defense_gun_wants(&sim, &rules, opening, &bases, 0, false, &["GAAIRC"], false);
         assert_eq!(
             wants.iter().find(|(name, _)| *name == "GAPILL"),
             Some(&("GAPILL", PlacementRoute::Expansion)),
@@ -26830,7 +27154,8 @@ mod tests {
         // The floor stands: the home fill resumes the row.
         sim.spawn_object_at_height("GAPILL", &ai_owner, 29, 20, 0, 0, &rules)
             .expect("the outpost pillbox stands");
-        let wants = ai.defense_gun_wants(&sim, opening, &bases, false, &["GAAIRC"], false);
+        let wants =
+            ai.defense_gun_wants(&sim, &rules, opening, &bases, 0, false, &["GAAIRC"], false);
         assert_eq!(
             wants.iter().find(|(name, _)| *name == "GAPILL"),
             Some(&("GAPILL", PlacementRoute::Home)),
@@ -26906,7 +27231,8 @@ mod tests {
             .expect("the Allied opening");
         let anchor = super::defense_bearing_anchor((10, 10), (30, 10));
         let bases = [(10_i16, 10_i16)];
-        let wants = ai.defense_gun_wants(&sim, opening, &bases, false, &["GAAIRC"], false);
+        let wants =
+            ai.defense_gun_wants(&sim, &rules, opening, &bases, 0, false, &["GAAIRC"], false);
         assert!(
             wants.iter().any(|&(name, route)| name == "GAPILL"
                 && route
@@ -26925,7 +27251,7 @@ mod tests {
         // home/expansion split exactly as before.
         let mut battle = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
         let battle_wants =
-            battle.defense_gun_wants(&sim, opening, &bases, false, &["GAAIRC"], false);
+            battle.defense_gun_wants(&sim, &rules, opening, &bases, 0, false, &["GAAIRC"], false);
         assert!(
             battle_wants
                 .iter()
@@ -26966,15 +27292,24 @@ mod tests {
         let bases = [(10_i16, 10_i16)];
         // The climb's pick alone standing nowhere: the gate stays shut —
         // the heavy row rests (the pre-fix read).
-        let wants = ai.defense_gun_wants(&sim, opening, &bases, false, &["GAAIRC"], false);
+        let wants =
+            ai.defense_gun_wants(&sim, &rules, opening, &bases, 0, false, &["GAAIRC"], false);
         assert!(
             wants.iter().all(|&(name, _)| name != "ATESLA"),
             "no class radar standing holds the heavy row shut: {wants:?}"
         );
         // The twin stands: the class read opens the gate and the heavy row
         // claims its next tower (quota 4, two standing at home).
-        let wants =
-            ai.defense_gun_wants(&sim, opening, &bases, false, &["GAAIRC", "AMRADR"], false);
+        let wants = ai.defense_gun_wants(
+            &sim,
+            &rules,
+            opening,
+            &bases,
+            0,
+            false,
+            &["GAAIRC", "AMRADR"],
+            false,
+        );
         assert!(
             wants.iter().any(|&(name, _)| name == "ATESLA"),
             "the twin radar opens the heavy row: {wants:?}"
@@ -27020,7 +27355,8 @@ mod tests {
             .expect("the Allied opening");
         let anchor = super::defense_bearing_anchor((10, 10), (30, 10));
         let bases = [(10_i16, 10_i16)];
-        let wants = ai.defense_gun_wants(&sim, opening, &bases, false, &["GAAIRC"], false);
+        let wants =
+            ai.defense_gun_wants(&sim, &rules, opening, &bases, 0, false, &["GAAIRC"], false);
         assert!(
             wants.iter().any(|&(name, route)| name == "GAPILL"
                 && route
