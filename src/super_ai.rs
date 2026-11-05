@@ -1178,6 +1178,19 @@ const FORT_WALLET_RESERVE_PCT: i64 = 15;
 /// (observed: five plants while refineries sat at two).
 const POWER_HEADROOM_TARGET: i32 = 250;
 
+/// The stock-deficit bar (Layer 2.5's widened trigger): when the grid's
+/// margin (`output - drain`, the engine's health-scaled totals) sits
+/// below this — one retail power plant's full output, so a razed or
+/// burned-down plant puts the grid under the bar at once — the power
+/// preemption queues a plant ahead of everything in the building block
+/// (the wall ring, the corridor stones and towers, the ladder's and the
+/// growth tail's production-line rungs), and it reads no pacing window:
+/// a blackout that waits behind a superweapon's build time is a lost
+/// base. The old trigger priced only the queue's unlanded drain and let
+/// a post-raid stock deficit sit behind the whole expansion (observed:
+/// a game where the grid stayed red long after the raid left).
+const DEFENSE_POWER_MARGIN: i32 = 200;
+
 /// Deterministic fan-out offsets (cells) that keep the AI's destinations
 /// from converging on one point: rallies, guard posts and wave destinations
 /// each pick an offset by index or entity id, so a group spreads over
@@ -6585,17 +6598,27 @@ impl SuperAi {
             && !building_busy
         {
             // The power preemption (Layer 2.5). The grid's margin prices
-            // the queue's unlanded drain in, and a grid that would run red
-            // owes a power plant before anything else in this block: the
-            // guns and the ladder below used to claim the empty slot
-            // first, so a defended base chained one Powered gun after
-            // another into a deepening brownout — guns that stand offline
-            // in low power defend nothing — and by the time the growth
-            // tail's deficit rule finally ran, the blackout had already
-            // slowed every factory through the native power factor
-            // (observed live: blackouts mid-game with plants still owed
-            // behind the gun ring). The wallet gate keeps an unpayable
-            // plant from parking in the one building slot forever.
+            // the queue's unlanded drain in, and a grid at or under the
+            // stock bar ([`DEFENSE_POWER_MARGIN`]: the pending drain's red
+            // and the post-raid stock deficit alike — one razed plant puts
+            // the margin below one plant's output at once) owes a power
+            // plant before anything else in this block: the wall ring, the
+            // corridor stones and towers and the ladder's and growth tail's
+            // production-line rungs all sit behind it, and the plant reads
+            // no pacing window — the guns and the ladder below used to
+            // claim the empty slot first, so a defended base chained one
+            // Powered gun after another into a deepening brownout — guns
+            // that stand offline in low power defend nothing — and by the
+            // time the growth tail's deficit rule finally ran, the blackout
+            // had already slowed every factory through the native power
+            // factor (observed live: blackouts mid-game with plants still
+            // owed behind the gun ring; later, a stock deficit that sat
+            // behind the whole expansion long after the raid left). The
+            // want read is the engine's own: `power_balance_for_owner`
+            // returns the power system's health-scaled totals, the same
+            // numbers the low-power gates run on. The wallet gate keeps an
+            // unpayable plant from parking in the one building slot
+            // forever.
             let (output, drain) =
                 crate::sim::production::power_balance_for_owner(sim, rules, &owner);
             let pending = self.pending_structure_drain(sim, rules, &owner);
@@ -6629,7 +6652,7 @@ impl SuperAi {
                 self.placement_intent = None;
                 return vec![CommandEnvelope::new(self.house, at, command)];
             }
-            if output - drain - pending < 0
+            if output - drain < DEFENSE_POWER_MARGIN
                 && self.count_structures_of_type(sim, opening.power) < POWER_CAP
                 && let Some(ty) = rules.object(opening.power)
                 && crate::sim::production::credits_for_owner(sim, &owner) >= ty.cost
@@ -12788,9 +12811,10 @@ impl SuperAi {
             // lines, so the blackout gate above covers them for free — both
             // are retail `Powered=yes` with `Power=-100` and only queue
             // while the grid reads `output >= drain`, with the power
-            // preemption standing a plant first when the pending drain
-            // would run the grid red. Their entries sit after the core
-            // lines, so a base arms itself before it decorates. The sides
+            // preemption standing a plant first whenever the grid's margin
+            // sits under [`DEFENSE_POWER_MARGIN`] — the pending drain's
+            // red or a stock deficit alike. Their entries sit after the
+            // core lines, so a base arms itself before it decorates. The sides
             // without a piece hold the basic pillbox's name below — never
             // read, because the gate's `&&` chain short-circuits on the
             // `None` field and the gun filter reads the count only behind a
