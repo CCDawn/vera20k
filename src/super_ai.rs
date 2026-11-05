@@ -10511,10 +10511,12 @@ impl SuperAi {
     /// The defense persona's one order for this tick, or `None` to fall
     /// through to the battle branches, which keep the base's economy and
     /// its own close defense running behind it. The priority inside is
-    /// the rescue special, the leak response, the repair rotation, the
-    /// line, then the army mix — the scarcest resource first. Every
-    /// branch is gated on the persona being adopted; the battle AI reads
-    /// none of it.
+    /// the rescue special, the leak response, the air book, the line's
+    /// ring staffing, then the perimeter engagement, the repair
+    /// rotation, the forward interception, the garrison and the army
+    /// mix — the scarcest resource first, and the ring's quota filled
+    /// before any march recruits the idle pool. Every branch is gated
+    /// on the persona being adopted; the battle AI reads none of it.
     fn defense_orders(
         &mut self,
         sim: &crate::sim::world::Simulation,
@@ -10541,10 +10543,27 @@ impl SuperAi {
         if let Some(commands) = self.defense_air_orders(sim, rules, tick) {
             return Some(commands);
         }
+        // The line's staffing pass runs ahead of the ground marches: the
+        // perimeter pool's recruitment order (the posted ring's surplus
+        // first, the idle overflow second) assumes the ring already holds
+        // its quota — run the marches first and they drain the idle pool
+        // before the ring's own pass ever reads it (observed live: the
+        // ring pinned at its floor while the idle pool sat at zero, every
+        // house, every sample). The pass is throttled
+        // ([`DEFENSE_LINE_TICKS`], one tick under core attack) and issues
+        // at most one Guard, so a march loses only the tick the ring
+        // actually posts on — each branch advances its own window when
+        // reached, so a skipped due shifts that pass a tick, it does not
+        // compound.
+        if let Some(command) = self.defense_line_orders(sim, rules, opening, home_center, tick) {
+            return Some(vec![command]);
+        }
         // The active-defense marches (D2): the perimeter engagement
         // answers the group at the wall, the forward interception the
         // wave still marching in — each paced, each capped, both under
-        // the wave-pressure budget the pillars already share.
+        // the wave-pressure budget the pillars already share. Both
+        // recruit past a staffed ring, so what they pull is the ring's
+        // true surplus.
         if let Some(commands) = self.defense_perimeter_orders(sim, rules, opening, tick) {
             return Some(commands);
         }
@@ -10553,9 +10572,6 @@ impl SuperAi {
         }
         if let Some(commands) = self.defense_intercept_orders(sim, rules, opening, tick) {
             return Some(commands);
-        }
-        if let Some(command) = self.defense_line_orders(sim, rules, opening, home_center, tick) {
-            return Some(vec![command]);
         }
         if let Some(command) = self.defense_garrison_orders(sim, rules, opening, home_center, tick)
         {
@@ -12342,6 +12358,43 @@ impl SuperAi {
         candidates
     }
 
+    /// The house's whole ground combat force: every alive roster hull or
+    /// infantryman the side fields — the staffing universe
+    /// ([`Self::combat_roster`], the naval and the fly hulls out) with no
+    /// duty, mission or gate filter. The telemetry's `combat` row is the
+    /// total the ring, the idle pool and the books' holders decompose
+    /// against, so bunker occupants count too: they are the garrison's
+    /// held share of the same force. One scan per telemetry row — the
+    /// same pace as the `idle` read beside it.
+    fn defense_combat_total(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        opening: &Opening,
+    ) -> usize {
+        let roster = Self::combat_roster(opening);
+        sim.substrate()
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.owner() == self.house
+                    && entity.lifecycle.object_alive()
+                    && !entity.lifecycle.in_limbo()
+                    && matches!(
+                        entity.category(),
+                        crate::map::entities::EntityCategory::Unit
+                            | crate::map::entities::EntityCategory::Infantry
+                    )
+                    && {
+                        let name = sim.interner().resolve(entity.type_ref());
+                        roster.contains(&name)
+                            && !Self::is_naval_type(opening, name)
+                            && !Self::is_fly_type(rules, name)
+                    }
+            })
+            .count()
+    }
+
     /// A role's roster names, roster order first, the fallbacks last — the
     /// candidate list `defense_army_orders` files and the sub-ring reads.
     fn defense_role_entries(opening: &Opening, role: Role) -> Vec<&'static str> {
@@ -13437,15 +13490,16 @@ impl SuperAi {
     /// per adopted defense house): one compact `log::info!` line under
     /// the `[DEF-AI]` tag carrying the whole defense posture — the
     /// engine's power totals, the wallet, the objective ring's on-duty
-    /// posts against its post slots, the corridor ledger's entries and the
-    /// standing stones and fort guns, the interception books' sorties and
-    /// recalls, the building queue's current item and the air book's
-    /// standing flyers. Every field is a
-    /// read the frame already runs (the census, the persona's ledgers,
-    /// the queue view) — no scan of its own, and the 600-tick pace keeps
-    /// the format cost out of the profile. This is the row a match's
-    /// defense behavior reads from its log; without it every diagnostic
-    /// was a hand-replay.
+    /// posts against its post slots, the idle pool and the whole ground
+    /// combat force it decomposes against, the corridor ledger's entries
+    /// and the standing stones and fort guns, the interception books'
+    /// sorties and recalls, the building queue's current item and the
+    /// air book's standing flyers. Every field is a read the frame
+    /// already runs (the census, the persona's ledgers, the queue view)
+    /// or a staffing-grade candidate scan at the row's own pace, and the
+    /// 600-tick pace keeps the format cost out of the profile. This is
+    /// the row a match's defense behavior reads from its log; without it
+    /// every diagnostic was a hand-replay.
     fn defense_telemetry(
         &mut self,
         sim: &crate::sim::world::Simulation,
@@ -13497,6 +13551,11 @@ impl SuperAi {
         let idle = core_cell
             .map(|core| self.defense_idle_candidates(sim, opening, core, tick).len())
             .unwrap_or(0);
+        // The force total beside the split: ring + idle + the books'
+        // holders (the perimeter pool, the detachment, the leak chase,
+        // the repair walk) and the unbooked rest — the bunkers' men, the
+        // mission-busy free fighters — reads against this denominator.
+        let combat = self.defense_combat_total(sim, rules, opening);
         let stone = self.defense_stone_type(sim, rules, opening);
         let stones = stone
             .map(|name| self.count_structures_of_type(sim, name))
@@ -13535,7 +13594,8 @@ impl SuperAi {
             .unwrap_or("-");
         log::info!(
             "[DEF-AI] tick={tick} house={owner} power={output}/{drain} credits={credits} \
-             ring={ring_posts}/{ring_slots} idle={idle} corridor=entries:{entries} stones:{stones} guns:{guns} \
+             ring={ring_posts}/{ring_slots} idle={idle} combat={combat} \
+             corridor=entries:{entries} stones:{stones} guns:{guns} \
              intercept=s:{sorties} w:{withdraws} build={building} unit={unit} air={air}"
         );
     }
