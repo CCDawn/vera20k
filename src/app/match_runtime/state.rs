@@ -107,13 +107,20 @@ impl MatchState {
     /// [`crate::super_ai::SuperAi`] per command-driven house. The tier rides
     /// on the house's own tier treatment — a build-time scale marks Super, a
     /// command-driven house without one is Brutal (`docs/superai.md`). With
-    /// `defense_ai_enabled` the houses that face no other command-driven AI
-    /// adopt the defense persona (`docs/defense-ai.md`).
+    /// `defense_ai_enabled` the houses that face no other command-driven AI,
+    /// and the houses of an explicitly classified defense map, adopt the
+    /// defense persona (`docs/defense-ai.md`).
     pub(crate) fn rebuild_super_players(&mut self) {
         self.super_players = self
             .sim_runtime
             .as_ref()
-            .map(|rt| rebuild_super_players_for(&rt.simulation, self.defense_ai_enabled))
+            .map(|rt| {
+                rebuild_super_players_for(
+                    &rt.simulation,
+                    &rt.resources.rules,
+                    self.defense_ai_enabled,
+                )
+            })
             .unwrap_or_default();
     }
     /// Shared ScenarioPause684060 audio hold, independent of menu/debug pause.
@@ -431,13 +438,14 @@ mod tests {
         let mut sim = Simulation::with_seed(1);
         house(&mut sim, "Computer1", false);
         house(&mut sim, "Computer2", false);
+        let rules = crate::sim::runtime::SimResources::empty().rules;
         // Switch off: the battle persona stays, rivals or not.
-        let players = rebuild_super_players_for(&sim, false);
+        let players = rebuild_super_players_for(&sim, &rules, false);
         assert_eq!(players.len(), 2);
         assert!(players.iter().all(|ai| ai.defense_stance().is_none()));
         // Switch on: each AI faces a rival command-driven AI, so neither
         // seats.
-        let players = rebuild_super_players_for(&sim, true);
+        let players = rebuild_super_players_for(&sim, &rules, true);
         assert!(players.iter().all(|ai| ai.defense_stance().is_none()));
         // Allied teammates are not opponents: both seat.
         for (asker, other) in [("Computer1", "Computer2"), ("Computer2", "Computer1")] {
@@ -446,7 +454,7 @@ mod tests {
                 .or_default()
                 .insert(other.to_ascii_uppercase());
         }
-        let players = rebuild_super_players_for(&sim, true);
+        let players = rebuild_super_players_for(&sim, &rules, true);
         assert_eq!(
             players
                 .iter()
@@ -460,7 +468,7 @@ mod tests {
         let mut sim = Simulation::with_seed(2);
         let ai = house(&mut sim, "Computer1", false);
         house(&mut sim, "Player", true);
-        let players = rebuild_super_players_for(&sim, true);
+        let players = rebuild_super_players_for(&sim, &rules, true);
         assert_eq!(players.len(), 1);
         assert_eq!(players[0].house(), ai);
         assert_eq!(
@@ -486,8 +494,23 @@ pub(crate) fn scenario_local_owner(simulation: &crate::sim::world::Simulation) -
 /// bare Simulation.
 fn rebuild_super_players_for(
     simulation: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
     defense_ai: bool,
 ) -> Vec<crate::super_ai::SuperAi> {
+    // Fork-only defense-map classification (`docs/defense-ai.md`): the
+    // sim's single-entry read over the armed trigger instances. With the
+    // switch off this never runs — an ordinary match stays byte-identical
+    // and silent. One INFO line per install carries the verdict and the
+    // armed spawn-trigger count the verdict read.
+    let defense_map = if defense_ai {
+        let (defense_map, spawn_triggers) = simulation.defense_map_classification(rules);
+        log::info!(
+            "[DEF-AI] map classified: defense-map={defense_map} (spawn-triggers={spawn_triggers})"
+        );
+        defense_map
+    } else {
+        false
+    };
     // Each house carries its launch tier mark; saves from before the mark
     // fall back to the build-scale heuristic (a scale marks Super, a
     // scale-less command-driven house is Brutal).
@@ -538,7 +561,11 @@ fn rebuild_super_players_for(
                         simulation.resolve(house),
                     )
             });
-            if defense_ai && !faces_command_ai {
+            // The arming reads either signal: a house whose enemies hold no
+            // other command-driven AI, or a house of an explicitly
+            // classified defense map (allied AI co-defenders on one wave
+            // map face each other on the first test and still seat).
+            if defense_ai && (defense_map || !faces_command_ai) {
                 ai.enable_defense_personality(crate::super_ai::DefenseStance::IndependentZone);
             }
             ai

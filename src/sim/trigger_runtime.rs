@@ -5316,6 +5316,79 @@ impl Simulation {
                     })
             })
     }
+
+    /// The fork-only defense-map classification read (`docs/defense-ai.md`):
+    /// whether the map itself carries the wave machinery — an armed trigger
+    /// instance holding a team-spawn action (4 create-team, 7/80/107
+    /// reinforcements, the same admission set the dispatcher and the
+    /// armed-reinforcement read above take) whose TeamType's `GetHouse`
+    /// owner resolves outside the session roster — beside the count of
+    /// armed trigger instances carrying any team-spawn action at all (the
+    /// seat log's `spawn-triggers=N`).
+    ///
+    /// The walk's shape is [`Simulation::house_has_armed_future_reinforcements`]'s
+    /// own: live instances only (enabled, not pending — a spent one-shot
+    /// waits pending and stops counting), the same spawn kinds, and the
+    /// same dead ends (a TeamType name the interner never saw, or an owner
+    /// the session cannot resolve, reads nothing). A defense map whose
+    /// wave teams name session houses — President22's start-slot wave
+    /// owner — reads false here and keeps arming through the
+    /// no-command-driven-enemy test alone; a map whose wave owner is an
+    /// authored house no seat drives reads true. A battle map's
+    /// reinforcement triggers resolve to roster houses, so ordinary games
+    /// read false everywhere and stay byte-identical.
+    ///
+    /// Pure read: no RNG, no mutation, no render/ui dependency. Single
+    /// owner and single entry: the seat assembly
+    /// (`MatchState::rebuild_super_players`) consumes this; nothing else
+    /// re-walks the trigger instances for map classification.
+    pub fn defense_map_classification(
+        &self,
+        rules: &crate::rules::ruleset::RuleSet,
+    ) -> (bool, usize) {
+        let roster: Vec<crate::sim::intern::InternedId> = self.houses.keys().copied().collect();
+        let mut spawn_triggers = 0usize;
+        let mut foreign_owner = false;
+        for trigger in self
+            .trigger_runtime
+            .trigger_order
+            .iter()
+            .filter_map(|&index| self.trigger_runtime.trigger(index))
+            .filter(|trigger| trigger.enabled && !trigger.pending)
+        {
+            let mut carries_spawn = false;
+            for action in
+                &self.trigger_runtime.definitions.trigger_types[trigger.type_index].actions
+            {
+                if !matches!(action.entry.kind, 4 | 7 | 80 | 107) {
+                    continue;
+                }
+                let Some(DefinitionReference::Team(team)) = action.reference else {
+                    continue;
+                };
+                carries_spawn = true;
+                if foreign_owner {
+                    continue;
+                }
+                let Some(team_name) = self.trigger_runtime.definitions.team_types.get(team) else {
+                    continue;
+                };
+                let Some(owner) = self.interner.get(team_name) else {
+                    continue;
+                };
+                let Some(owner) = self.team_type_house(owner, rules) else {
+                    continue;
+                };
+                if !roster.contains(&owner) {
+                    foreign_owner = true;
+                }
+            }
+            if carries_spawn {
+                spawn_triggers += 1;
+            }
+        }
+        (foreign_owner, spawn_triggers)
+    }
 }
 
 impl TriggerRuntime {
