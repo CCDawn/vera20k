@@ -1909,11 +1909,15 @@ struct DefensePersona {
     /// last scan: the map's give chains re-own the objective mid-game,
     /// and a flipped charge is its own hazard (our fire acquires it).
     protected_owned: bool,
-    /// Standing own structures whose object-attached Tag chain reads a
-    /// destroyed-by-anything event (7) into a lose outcome (actions 2/68):
-    /// the map's "this falls, you lose" set. Chains the direct walk cannot
-    /// resolve — Tag- or trigger-less definitions, indirect links — stay
-    /// absent; that coverage gap is a recorded residual.
+    /// Standing objects whose object-attached Tag chain reads a
+    /// destroyed-by-anything event (7, or the structure twin 48) into a
+    /// lose outcome (actions 2/68): the map's "this falls, you lose" set.
+    /// Structures and the mobile classes alike — a solo defense map may
+    /// hang the whole chain on one key unit (the president), and the
+    /// ring, the leak hunter and the fort anchors all read this one list.
+    /// Chains the direct walk cannot resolve — Tag- or trigger-less
+    /// definitions, indirect links — stay absent; that coverage gap is a
+    /// recorded residual.
     protected_targets: Vec<u64>,
     // ---- D2 pinned state: the pillars' own books. Perception fields
     // above are overwritten every scan; these persist across scans.
@@ -10456,17 +10460,22 @@ impl SuperAi {
             }
         }
 
-        // Protected targets: standing structures the map itself charges
-        // the defense with — whose object tag chain reads a destroyed
-        // event into a lose outcome. The destroyed read is unit kind 7 or
+        // Protected targets: standing objects the map itself charges the
+        // defense with — whose object tag chain reads a destroyed event
+        // into a lose outcome. The destroyed read is unit kind 7 or
         // structure kind 48 (the two RecordKill publishes); the lose
         // outcome is the chain's own 2/68, or one action-53 hop (enable
         // trigger) to a trigger that carries one — a solo defense map's
-        // statue reads destroyed -> enable the lose trigger. The owner
-        // does not gate the read: the objective is the map's, and defense
-        // maps re-own it mid-game (a destroyed garrison hands the statue
-        // to another seat through a ChangeHouse give), while a win-chain
-        // (the enemy's 67) never qualifies.
+        // statue reads destroyed -> enable the lose trigger. The read
+        // walks the mobile classes beside the structures: a solo defense
+        // map can hang its whole lose chain on one key unit (President22's
+        // "Prez died": the flag unit's destroyed event feeds action 1, and
+        // a structure-only read left the objective off the books — no ring
+        // anchor, no leak hunt around it, and one leaked rifleman ended
+        // the match). The owner does not gate the read: the objective is
+        // the map's, and defense maps re-own it mid-game (a destroyed
+        // garrison hands the statue to another seat through a ChangeHouse
+        // give), while a win-chain (the enemy's 67) never qualifies.
         let carries_lose = |actions: &[crate::sim::trigger_runtime::TriggerActionView]| {
             actions.iter().any(|action| matches!(action.kind, 2 | 68))
         };
@@ -10475,7 +10484,12 @@ impl SuperAi {
             .entities
             .iter_sorted()
             .filter(|(_, entity)| {
-                entity.category() == crate::map::entities::EntityCategory::Structure
+                matches!(
+                    entity.category(),
+                    crate::map::entities::EntityCategory::Structure
+                        | crate::map::entities::EntityCategory::Unit
+                        | crate::map::entities::EntityCategory::Infantry
+                )
             })
             .filter(|(id, _)| {
                 sim.trigger_runtime()
@@ -10883,7 +10897,11 @@ impl SuperAi {
         {
             return None;
         }
-        let anchor = self
+        // Every standing protected target's cell — the key units ride the
+        // same list since the perception read went whole-object — ranked by
+        // the nearest charge: a map may charge several objects, and the
+        // leak that threatens the closest one is the leak.
+        let protected_cells: Vec<(i16, i16)> = self
             .defense
             .as_ref()
             .expect("checked above")
@@ -10891,13 +10909,19 @@ impl SuperAi {
             .iter()
             .filter_map(|&id| sim.substrate().entities.get(id))
             .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))
-            .next()
-            .or(home_center)?;
-        // The nearest hostile mobile past the line, carriers first: a wave
-        // rides its heroes in a transport and the transport fires out beside
-        // the charge (Defend Liberty's battle fortresses deliver Tanya onto
-        // the statue and hold the burst window). Within the same class the
-        // nearest hostile wins.
+            .collect();
+        let anchor = match protected_cells.first() {
+            Some(&cell) => cell,
+            None => home_center?,
+        };
+        // The hostile mobile past the line that stands nearest any key
+        // target, carriers first: a wave rides its heroes in a transport
+        // and the transport fires out beside the charge (Defend Liberty's
+        // battle fortresses deliver Tanya onto the statue and hold the
+        // burst window). Within the same class the nearest-to-a-charge
+        // hostile wins — the old read ranked against the first target's
+        // cell alone, so a second charge (the president beside the
+        // statue) took the leaks last.
         let mut leak: Option<((i32, i32), u64)> = None;
         for (id, entity) in sim.substrate().entities.iter_sorted() {
             if entity.lifecycle.in_limbo()
@@ -10911,9 +10935,19 @@ impl SuperAi {
             {
                 continue;
             }
-            let dx = i32::from(entity.position.rx() as i16) - i32::from(anchor.0);
-            let dy = i32::from(entity.position.ry() as i16) - i32::from(anchor.1);
-            let distance = dx.abs().max(dy.abs());
+            let (rx, ry) = (
+                i32::from(entity.position.rx() as i16),
+                i32::from(entity.position.ry() as i16),
+            );
+            let distance = protected_cells
+                .iter()
+                .map(|&(cx, cy)| (rx - i32::from(cx)).abs().max(ry - i32::from(cy)))
+                .min()
+                .unwrap_or_else(|| {
+                    (rx - i32::from(anchor.0))
+                        .abs()
+                        .max(ry - i32::from(anchor.1))
+                });
             if distance > DEFENSE_LEAK_RADIUS {
                 continue;
             }
@@ -13171,12 +13205,21 @@ impl SuperAi {
         let mut anchors: Vec<((i16, i16), (i16, i16))> = Vec::new();
         // The objective: every standing own protected target's cell, the
         // substrate order's determinism. The map's give chains re-own the
-        // objective mid-game — a flipped charge is not a fort site.
+        // objective mid-game — a flipped charge is not a fort site. A key
+        // unit (the charged president class) anchors whatever seat holds
+        // it: the waves march at its cell all the same, and a charge
+        // riding with an ally or a to-be-given garrison still owes the
+        // ring its guns.
         for &id in &persona.protected_targets {
             let Some(entity) = sim.substrate().entities.get(id) else {
                 continue;
             };
-            if entity.owner() != self.house || !entity.lifecycle.object_alive() {
+            if !entity.lifecycle.object_alive() {
+                continue;
+            }
+            if entity.owner() != self.house
+                && entity.category() == crate::map::entities::EntityCategory::Structure
+            {
                 continue;
             }
             let cell = (entity.position.rx() as i16, entity.position.ry() as i16);
@@ -13610,6 +13653,30 @@ impl SuperAi {
         // flyers the recruitment scan reads, so the row judges whether
         // the hulls the mix fields ever leave the yard.
         let air = self.defense_air_roster(sim, rules).len();
+        // The charged objectives' worst health — thousandths of strength,
+        // the wound watch's own units, worst object first. The key units
+        // ride the protected read beside the structures, so the row reads
+        // how the president class is holding without a second scan.
+        let objhp = self
+            .defense
+            .as_ref()
+            .map(|persona| {
+                persona
+                    .protected_targets
+                    .iter()
+                    .filter_map(|&id| sim.substrate().entities.get(id))
+                    .filter(|entity| entity.lifecycle.object_alive())
+                    .map(|entity| {
+                        Self::health_fraction(
+                            rules,
+                            sim.interner().resolve(entity.type_ref()),
+                            entity,
+                        )
+                    })
+                    .min()
+            })
+            .flatten();
+        let objhp = objhp.map_or_else(|| "-".to_string(), |value| value.to_string());
         let queue = crate::sim::production::queue_view_for_owner(sim, rules, &owner);
         let building = queue
             .iter()
@@ -13639,7 +13706,8 @@ impl SuperAi {
             "[DEF-AI] tick={tick} house={owner} power={output}/{drain} credits={credits} \
              ring={ring_posts}/{ring_slots} idle={idle} combat={combat} \
              corridor=entries:{entries} stones:{stones} guns:{guns} \
-             intercept=s:{sorties} w:{withdraws} build={building} unit={unit} air={air}"
+             intercept=s:{sorties} w:{withdraws} build={building} unit={unit} air={air} \
+             objhp={objhp}"
         );
     }
 
