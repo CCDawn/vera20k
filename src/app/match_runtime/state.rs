@@ -497,14 +497,21 @@ fn rebuild_super_players_for(
     defense_ai: bool,
 ) -> Vec<crate::super_ai::SuperAi> {
     // The driven-seat roster the classification read takes: every human seat
-    // plus every command-driven AI seat — the houses this session actually
-    // plays. A wave team whose GetHouse owner resolves to a house outside it
-    // belongs to an unseated slot, the defense map's own machinery rather
-    // than a battle opponent.
+    // plus every command-driven AI seat the map leaves in play — a
+    // multiplay-passive house is excluded, the persona seating's own filter
+    // (`command_driven() && !multiplay_passive()`), because a survival
+    // map's wave seat is exactly that: an AI-driven house the map holds
+    // passive so its triggers alone speak for it (DefendLiberty's
+    // `<Player @ E>` host). A wave team whose GetHouse owner resolves to a
+    // house outside the driven seats — an unseated slot or a passive wave
+    // host — belongs to the defense map's own machinery, not a battle
+    // opponent.
     let driven: Vec<crate::sim::intern::InternedId> = simulation
         .houses()
         .iter()
-        .filter(|(_, state)| state.is_human() || state.command_driven())
+        .filter(|(_, state)| {
+            state.is_human() || (state.command_driven() && !state.multiplay_passive())
+        })
         .map(|(house, _)| *house)
         .collect();
     // Fork-only defense-map classification (`docs/defense-ai.md`): the sim's
