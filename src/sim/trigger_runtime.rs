@@ -5391,15 +5391,6 @@ impl Simulation {
         }
         (undriven_owner, spawn_triggers)
     }
-
-    /// Single writer for the defense-map form verdict (`defense_map_form`):
-    /// the seat assembly sets the classification read above once per
-    /// runtime install — fresh launch and saved-game restore alike. No
-    /// simulation tick writes it; the defeat gate (`world::house_defeat`)
-    /// is the only reader.
-    pub(crate) fn set_defense_map_form(&mut self, defense_map_form: bool) {
-        self.defense_map_form = defense_map_form;
-    }
 }
 
 impl TriggerRuntime {

@@ -1702,6 +1702,20 @@ pub struct Simulation {
     defense_map_form: bool,
 }
 
+impl Simulation {
+    /// Single writer for the defense-map form verdict
+    /// (`defense_map_form`, defined beside its field): the seat assembly
+    /// (`MatchState::rebuild_super_players`) sets the trigger runtime's
+    /// classification read once per runtime install — fresh launch and
+    /// saved-game restore alike. No simulation tick writes it; the defeat
+    /// gate (`world::house_defeat`) is the only reader. `pub` only
+    /// because the seat assembly sits in the app crate; the field stays
+    /// private behind this one writer.
+    pub fn set_defense_map_form(&mut self, defense_map_form: bool) {
+        self.defense_map_form = defense_map_form;
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 impl Default for Simulation {
     fn default() -> Self {

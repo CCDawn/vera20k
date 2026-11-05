@@ -12701,7 +12701,8 @@ impl SuperAi {
                 && let Some(house_index) = sim.houses().index_of(self.house)
                 && !objective_fan.is_empty()
             {
-                objective_fan.rotate_left(house_index % objective_fan.len());
+                let shift = house_index % objective_fan.len();
+                objective_fan.rotate_left(shift);
             }
         }
         let core = self
@@ -13540,7 +13541,10 @@ impl SuperAi {
                 .filter(|&cell| self.corridor_cell_claimed(sim, cell))
                 .collect();
             if let Some(persona) = self.defense.as_mut() {
-                persona.claimed_corridors = claimed.clone();
+                persona.claimed_corridors = claimed
+                    .iter()
+                    .map(|&cell| (cell.0 as u16, cell.1 as u16))
+                    .collect();
             }
             claimed
         } else {
