@@ -3682,6 +3682,14 @@ impl Simulation {
                     _ => unreachable!(),
                 });
             }
+            // Native TAction 103 is the map timer's text ("Timer text", the
+            // community mapping index): the caption rides the timer display
+            // and is not an outcome action. PresidentDefense22's
+            // COOPERATIVEWIN caption is that display string only — its real
+            // victory is a disabled action-2 "Loser is" chain (invalid
+            // country selectors read every viewpoint as winning) that an
+            // action-53 enabler releases at the timer's end, which lands in
+            // the `1 | 2` outcome arm below.
             103 => self.session.set_scenario_timer_caption(action.csf_label()),
             20 => {
                 // Steam gamemd: Execute6DE8E4..6DE903 passes +90
@@ -5254,6 +5262,20 @@ impl Simulation {
     /// wave behind a disabled trigger keeps today's behavior in that lull
     /// (recorded residual). A session with no such trigger reads
     /// false for every house, so ordinary games are unchanged.
+    ///
+    /// Wave-schedule deduction, PresidentDefense22.yrm (the reported
+    /// premature "Victorious!"): its 51 wave triggers are Repeat=0 one-shot
+    /// event-13 timers (params 100..5800 s) each spawning one action
+    /// 107/80 team whose TeamType House=`<Player @ G>`; the wave owner is
+    /// that start-slot seat, anchored from scenario start by the
+    /// GiveEnemyBuilding change-house cluster. Constructed instances start
+    /// armed (`reset_trigger_timers` at construction), so in every lull
+    /// between two scheduled waves the unfired majority reads armed here
+    /// and the owner survives the gate; a fired Repeat=0 waits pending and
+    /// is deleted. A Repeat=2 tag re-arms instead (the tag dispatch passes
+    /// persistence=repeat==2 into `register_live_trigger_event`, whose
+    /// tail resets the timers, and action 53 re-arms on enable) and counts
+    /// for as long as it stays enabled — both semantics read armed.
     /// Pure read: no RNG, no mutation, no render/ui dependency.
     pub(crate) fn house_has_armed_future_reinforcements(
         &self,
