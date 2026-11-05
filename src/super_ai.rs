@@ -1224,8 +1224,11 @@ const DEFENSE_ECONOMY_CREDITS_CAP: i64 = 50_000;
 /// which the refinery rungs stop rebuilding. Two razed docks mark a
 /// ring the enemy works over; rebuilding there only feeds the loop —
 /// the count dips, the rung re-files, the wallet (a defense gift, the
-/// Unlimited floor) never objects. Power and the production lines stay
-/// out of the ledger: their destruction is the war's ordinary cost.
+/// Unlimited floor) never objects. The halt is the persona's read: a
+/// battle house ignores the tally and always rebuilds (its wallet only
+/// grows by income, so a razed dock still pays for itself). Power and
+/// the production lines stay out of the ledger: their destruction is
+/// the war's ordinary cost.
 const REFINERY_REBUILD_BACKOFF: usize = 2;
 const FACTORY_BUILDOUT: usize = 4;
 const FACTORY_CAP: usize = 6;
@@ -1270,9 +1273,12 @@ const POWER_HEADROOM_TARGET: i32 = 250;
 /// (the wall ring, the corridor stones and towers, the ladder's and the
 /// growth tail's production-line rungs), and it reads no pacing window:
 /// a blackout that waits behind a superweapon's build time is a lost
-/// base. The old trigger priced only the queue's unlanded drain and let
-/// a post-raid stock deficit sit behind the whole expansion (observed:
-/// a game where the grid stayed red long after the raid left).
+/// base. The bar is the defense persona's read — the battle houses keep
+/// the baseline pending-driven red, whose arm sits silent at a healthy
+/// opening margin. The old trigger priced only the queue's unlanded
+/// drain and let a post-raid stock deficit sit behind the whole
+/// expansion (observed: a game where the grid stayed red long after the
+/// raid left).
 const DEFENSE_POWER_MARGIN: i32 = 200;
 
 /// The persona's own ceiling on the preemption's standing plant count:
@@ -3439,8 +3445,9 @@ pub struct SuperAi {
     refinery_high_water: usize,
     /// Cumulative observed refinery losses: every scan whose standing
     /// dock count fell under [`Self::refinery_high_water`] adds the dip.
-    /// Past [`REFINERY_REBUILD_BACKOFF`] the refinery rungs stop
-    /// rebuilding — a ring the enemy works over gets no third dock.
+    /// Past [`REFINERY_REBUILD_BACKOFF`] the persona's refinery rungs
+    /// stop rebuilding — a ring the enemy works over gets no third
+    /// dock; the battle houses read no halt and always rebuild.
     /// Pinned state.
     refinery_losses: usize,
     /// Whether the expansion MCV's commission has issued. Pinned state,
@@ -6908,23 +6915,29 @@ impl SuperAi {
             .is_some()
             && !building_busy
         {
-            // The power preemption (Layer 2.5). The grid's margin prices
-            // the queue's unlanded drain in, and a grid at or under the
-            // stock bar ([`DEFENSE_POWER_MARGIN`]: the pending drain's red
-            // and the post-raid stock deficit alike — one razed plant puts
-            // the margin below one plant's output at once) owes a power
-            // plant before anything else in this block: the wall ring, the
-            // corridor stones and towers and the ladder's and growth tail's
-            // production-line rungs all sit behind it, and the plant reads
-            // no pacing window — the guns and the ladder below used to
-            // claim the empty slot first, so a defended base chained one
-            // Powered gun after another into a deepening brownout — guns
-            // that stand offline in low power defend nothing — and by the
-            // time the growth tail's deficit rule finally ran, the blackout
-            // had already slowed every factory through the native power
-            // factor (observed live: blackouts mid-game with plants still
-            // owed behind the gun ring; later, a stock deficit that sat
-            // behind the whole expansion long after the raid left). The
+            // The power preemption (Layer 2.5). A grid the queue would
+            // run red owes a power plant before anything else in this
+            // block: the wall ring, the corridor stones and towers and
+            // the ladder's and growth tail's production-line rungs all
+            // sit behind it, and the plant reads no pacing window — the
+            // guns and the ladder below used to claim the empty slot
+            // first, so a defended base chained one Powered gun after
+            // another into a deepening brownout — guns that stand
+            // offline in low power defend nothing — and by the time the
+            // growth tail's deficit rule finally ran, the blackout had
+            // already slowed every factory through the native power
+            // factor (observed live: blackouts mid-game with plants
+            // still owed behind the gun ring). The trigger splits by
+            // persona: the defense side reads the stock bar
+            // ([`DEFENSE_POWER_MARGIN`] — one razed plant puts the
+            // margin below one plant's output at once, so the post-raid
+            // stock deficit gets its plant without sitting behind the
+            // whole expansion, as it used to), while the battle houses
+            // keep the baseline pending-driven red — a battle opening's
+            // thin-but-positive margin (one plant against a refinery's
+            // drain) must not pre-queue a plant ahead of the war
+            // factory, and a razed battle plant rebuilds the moment the
+            // queue's own drain would run the grid red, as before. The
             // want read is the engine's own: `power_balance_for_owner`
             // returns the power system's health-scaled totals, the same
             // numbers the low-power gates run on. The wallet gate keeps an
@@ -6976,7 +6989,17 @@ impl SuperAi {
                 self.placement_intent = None;
                 return vec![CommandEnvelope::new(self.house, at, command)];
             }
-            if output - drain < DEFENSE_POWER_MARGIN
+            // The persona gate on the trigger: the stock bar is the
+            // defense side's read — its corridor program's stones are
+            // plants and its razed grid must not wait behind the pacing
+            // windows — while a battle house keeps the baseline
+            // pending-driven red, byte for byte.
+            let power_owed = if self.defense.is_some() {
+                output - drain < DEFENSE_POWER_MARGIN
+            } else {
+                output - drain - pending < 0
+            };
+            if power_owed
                 && self.count_structures_of_type(sim, opening.power) < power_cap
                 && let Some(ty) = rules.object(opening.power)
                 && crate::sim::production::credits_for_owner(sim, &owner) >= ty.cost
@@ -7285,12 +7308,16 @@ impl SuperAi {
             // The dock-destruction ledger: a standing count under the
             // latched high-water mark is a razed dock — the ledger adds
             // the dip. Past the backoff the refinery rungs (the ladder's
-            // and the tail's alike) stop rebuilding: a ring the enemy
-            // works over gets no third dock, and the wallet that never
-            // objects (a defense gift, the Unlimited floor) no longer
-            // feeds the razed-rebuild cycle (FaceOfDeath3: YAREFN in the
-            // build row through the whole match, Placing a dock every
-            // couple of seconds). The reads sit ahead of the ladder walk
+            // and the tail's alike) stop rebuilding for the persona: a
+            // ring the enemy works over gets no third dock, and the
+            // wallet that never objects (a defense gift, the Unlimited
+            // floor) no longer feeds the razed-rebuild cycle
+            // (FaceOfDeath3: YAREFN in the build row through the whole
+            // match, Placing a dock every couple of seconds). The battle
+            // houses read no backoff — the baseline always rebuilt, and
+            // a wallet that only grows by income still pays for its own
+            // dock — so the halt judgment gates on the persona. The
+            // reads sit ahead of the ladder walk
             // so its dock rungs take the same two gates.
             let refineries = self.count_structures_of_type(sim, opening.refinery);
             if refineries < self.refinery_high_water {
@@ -7305,7 +7332,14 @@ impl SuperAi {
             let economy_brake = self.defense.is_some()
                 && i64::from(crate::sim::production::credits_for_owner(sim, &owner))
                     > DEFENSE_ECONOMY_CREDITS_CAP;
-            let docks_rebuild = !economy_brake && self.refinery_losses < REFINERY_REBUILD_BACKOFF;
+            // The backoff halt is the persona's gate: a battle house
+            // never reads the ledger's tally — two raider kills must not
+            // leave it refinery-less for the rest of the match (the
+            // baseline always rebuilt) — while the defense side keeps
+            // the halt as written.
+            let docks_rebuild = !economy_brake
+                && (self.defense.is_none()
+                    || self.refinery_losses < REFINERY_REBUILD_BACKOFF);
             // The fleet that feeds the next dock: the table's harvester
             // when the side roams one; a side whose table names none reads
             // the dock's own FreeUnit (Yuri's slave miner — each dock
@@ -14060,9 +14094,10 @@ impl SuperAi {
             // lines, so the blackout gate above covers them for free — both
             // are retail `Powered=yes` with `Power=-100` and only queue
             // while the grid reads `output >= drain`, with the power
-            // preemption standing a plant first whenever the grid's margin
-            // sits under [`DEFENSE_POWER_MARGIN`] — the pending drain's
-            // red or a stock deficit alike. Their entries sit after the
+            // preemption standing a plant first (the persona's stock bar
+            // — [`DEFENSE_POWER_MARGIN`], the pending drain's red or a
+            // stock deficit alike — the battle houses the baseline
+            // pending-driven red). Their entries sit after the
             // core lines, so a base arms itself before it decorates. The sides
             // without a piece hold the basic pillbox's name below — never
             // read, because the gate's `&&` chain short-circuits on the
