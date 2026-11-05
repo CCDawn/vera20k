@@ -5075,19 +5075,29 @@ impl SuperAi {
             // weapons auto-fire) simply hold a home-defense post like any
             // defender. The engine's MiG flare support for Boris rides its
             // own thread and stays out of scope.
-            let hero_pick = sim.substrate().entities.iter_sorted().find(|(id, entity)| {
-                self.order_gate.get(id).is_none_or(|&due| tick >= due)
-                    && entity.owner() == self.house
-                    && !entity.lifecycle.in_limbo()
-                    && sim.interner().resolve(entity.type_ref()) == opening.hero
-                    && matches!(
-                        entity.passive_acquire_mission(),
-                        crate::sim::mission::MissionType::None
-                            | crate::sim::mission::MissionType::Sleep
-                            | crate::sim::mission::MissionType::Guard
-                            | crate::sim::mission::MissionType::AreaGuard
-                    )
-            });
+            // The hero's own pacing is battle-only (D2): the C4 sabotage run
+            // is a siege errand a defense persona never sends, and the home
+            // post is the yard ring's standing account — under the persona
+            // the hero sits in the combat roster the objective ring recruits
+            // from, so the battle branch releases him instead of posting him
+            // beside the factory.
+            let hero_pick = if self.defense.is_some() {
+                None
+            } else {
+                sim.substrate().entities.iter_sorted().find(|(id, entity)| {
+                    self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                        && entity.owner() == self.house
+                        && !entity.lifecycle.in_limbo()
+                        && sim.interner().resolve(entity.type_ref()) == opening.hero
+                        && matches!(
+                            entity.passive_acquire_mission(),
+                            crate::sim::mission::MissionType::None
+                                | crate::sim::mission::MissionType::Sleep
+                                | crate::sim::mission::MissionType::Guard
+                                | crate::sim::mission::MissionType::AreaGuard
+                        )
+                })
+            };
             if let Some((hero, hero_entity)) = hero_pick {
                 let from = (hero_entity.position.rx(), hero_entity.position.ry());
                 let c4_carrier = rules.object(opening.hero).is_some_and(|ty| ty.c4);
@@ -5600,7 +5610,16 @@ impl SuperAi {
             // fortress boarding uses. Above the guard poster on purpose: a
             // soldier owed to a bunker must not be posted on the ring first
             // and gated out for a window. See [`Self::garrison_orders`].
-            if let Some(command) = self.garrison_orders(sim, rules, opening, center, tick) {
+            // Battle-only dispatch (D2): under a defense persona the same
+            // chain runs inside the persona's replenish loop
+            // ([`Self::defense_garrison_orders`]) with its casualty ledger —
+            // the bare call here would drive it twice per tick whenever the
+            // persona's branches pace out, and a soldier boarded by the
+            // battle pass is a soldier the idle pool loses to `garrisoned`
+            // without the ledger ever seeing the walk.
+            if self.defense.is_none()
+                && let Some(command) = self.garrison_orders(sim, rules, opening, center, tick)
+            {
                 return vec![CommandEnvelope::new(self.house, at, command)];
             }
 
@@ -5616,15 +5635,27 @@ impl SuperAi {
             // dissolve the wave the march just formed.
             let wave_launched =
                 matches!(self.wave_stage, WaveStage::Marching | WaveStage::Striking);
-            let post_pool: Vec<u64> = idle
-                .iter()
-                .copied()
-                .filter(|unit| !(wave_launched && self.wave_members.contains(unit)))
-                // The inbound hold (T8): a unit past the gather cell sits
-                // out its home post while the outbound wave walks the
-                // corridor, instead of meeting it head-on.
-                .filter(|&unit| !self.inbound_held(sim, unit, tick))
-                .collect();
+            // The yard ring's standing posts are a battle-only account (D2):
+            // under a defense persona the idle ground force is the objective
+            // ring's own pool, and every hull this limb pinned at home was a
+            // hull the staffing pass never saw (observed: the ring short of
+            // its quota while the yard ring held the whole army). The air
+            // hulls were already spared below; the whole limb closes instead
+            // — non-roster civilians, miners and engineers never sat in the
+            // battle idle pool, so nothing outside the ground roster loses a
+            // branch it used.
+            let post_pool: Vec<u64> = if self.defense.is_some() {
+                Vec::new()
+            } else {
+                idle.iter()
+                    .copied()
+                    .filter(|unit| !(wave_launched && self.wave_members.contains(unit)))
+                    // The inbound hold (T8): a unit past the gather cell sits
+                    // out its home post while the outbound wave walks the
+                    // corridor, instead of meeting it head-on.
+                    .filter(|&unit| !self.inbound_held(sim, unit, tick))
+                    .collect()
+            };
             let poster = self
                 .due_idle_unit(&post_pool, tick)
                 .filter(|&unit| !self.futility_suppressed(unit, FutilityKind::GuardPost, tick))
@@ -7604,13 +7635,20 @@ impl SuperAi {
         // tank onto one point. The command archives the cell per factory
         // (`SetRallyPoint 0x00443860`), so correcting whichever factory's
         // archived cell differs — one per tick — suffices for all of them.
+        // Battle-only (D2): the rally is the production-side gathering
+        // account — a defense persona's output belongs to the objective
+        // ring's staffing pass, so the correction stops steering new ground
+        // hulls onto the yard's own parking ring and the factories keep
+        // whatever rally they hold (an exiting unit with none stops beside
+        // the factory on an idle mission, which is exactly the pool the
+        // ring's pass recruits first).
         let rally_anchors: Vec<(i16, i16)> = yard_centers
             .iter()
             .copied()
             .chain(self.pinned_home)
             .chain(outpost_anchor)
             .collect();
-        if !rally_anchors.is_empty() {
+        if self.defense.is_none() && !rally_anchors.is_empty() {
             let war_factories: Vec<(u64, (i16, i16))> = self
                 .own_structures(sim)
                 .into_iter()
@@ -12324,6 +12362,11 @@ impl SuperAi {
             .iter_sorted()
             .filter(|(id, entity)| {
                 entity.owner() == self.house
+                    // The dead sit in the substrate's stable order beside
+                    // the living; a corpse in the pool would hand the
+                    // staffing pass a post walk from a phantom.
+                    && entity.lifecycle.object_alive()
+                    && !entity.lifecycle.in_limbo()
                     && matches!(
                         entity.category(),
                         crate::map::entities::EntityCategory::Unit
