@@ -12468,8 +12468,24 @@ impl SuperAi {
         // The protected core's ring staffs ahead of the base bearings —
         // the map's lose-chain structure is the charge the waves march at,
         // and the base bearings answer only the raid on the base itself.
-        // Same book (line_posts); the pass paces at the window above.
+        // Same book (line_posts); the pass paces at the window above. A
+        // post whose every fan cell sits hemmed under the openness floor
+        // (the built-up objective) falls back to the wide ring walk
+        // ([`pick_ring_post_wide`]), so the quota fills on tower-sea
+        // ground the fan alone would refuse forever.
         if let Some(core) = core {
+            // The posts the book already holds — the wide fallback's skip
+            // list, so its outward walk spreads the ring instead of piling
+            // rows onto one held cell. One push per pass ends this pass, so
+            // the snapshot cannot go stale mid-loop.
+            let held: Vec<(u16, u16)> = self
+                .defense
+                .as_ref()
+                .expect("checked above")
+                .line_posts
+                .iter()
+                .map(|&(_, post)| post)
+                .collect();
             // The ring's hollow-aware rows: posted rows whose unit still
             // stands at its post — a walker does not hold the ring, and
             // its row admits a replacement while it is away.
@@ -12522,6 +12538,7 @@ impl SuperAi {
                 );
                 for &(_, unit) in &candidates {
                     let Some(post) = pick_guard_post(sim, rules, unit, core, &objective_fan, None)
+                        .or_else(|| pick_ring_post_wide(sim, rules, unit, core, &held))
                     else {
                         continue;
                     };
@@ -12548,6 +12565,7 @@ impl SuperAi {
                 let candidates = self.defense_idle_candidates(sim, opening, core, tick);
                 for &(_, unit) in &candidates {
                     let Some(post) = pick_guard_post(sim, rules, unit, core, &objective_fan, None)
+                        .or_else(|| pick_ring_post_wide(sim, rules, unit, core, &held))
                     else {
                         continue;
                     };
@@ -13462,6 +13480,23 @@ impl SuperAi {
                 persona.intercept_withdraws,
             )
         };
+        // The idle pool the staffing pass would read — the same candidate
+        // scan the ring's staffing walks (`defense_idle_candidates`, the
+        // roster foot and hulls with no duty and an idle mission) — so the
+        // row judges idle vs posted vs away against the book the ring
+        // holds. The core rides the protected read, the staffing's own
+        // anchor.
+        let core_cell = self.defense.as_ref().and_then(|persona| {
+            persona
+                .protected_targets
+                .iter()
+                .filter_map(|&id| sim.substrate().entities.get(id))
+                .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))
+                .next()
+        });
+        let idle = core_cell
+            .map(|core| self.defense_idle_candidates(sim, opening, core, tick).len())
+            .unwrap_or(0);
         let stone = self.defense_stone_type(sim, rules, opening);
         let stones = stone
             .map(|name| self.count_structures_of_type(sim, name))
@@ -13500,7 +13535,7 @@ impl SuperAi {
             .unwrap_or("-");
         log::info!(
             "[DEF-AI] tick={tick} house={owner} power={output}/{drain} credits={credits} \
-             ring={ring_posts}/{ring_slots} corridor=entries:{entries} stones:{stones} guns:{guns} \
+             ring={ring_posts}/{ring_slots} idle={idle} corridor=entries:{entries} stones:{stones} guns:{guns} \
              intercept=s:{sorties} w:{withdraws} build={building} unit={unit} air={air}"
         );
     }
@@ -20276,6 +20311,80 @@ fn cell_openness(
         }
     }
     open
+}
+
+/// Whether the cell's own ground holds a terrain object or a structure —
+/// the blocked read [`cell_openness`] takes of a neighbor, taken of the
+/// cell itself: a guard post the holder cannot stand on. Units are
+/// transient and do not block.
+fn cell_holds_obstacle(sim: &crate::sim::world::Simulation, cell: (u16, u16)) -> bool {
+    sim.cell_objects(cell, crate::sim::movement::locomotor::MovementLayer::Ground)
+        .any(|member| match member {
+            crate::sim::occupancy::CellObjectMember::Terrain(_) => true,
+            crate::sim::occupancy::CellObjectMember::Entity(id) => {
+                sim.substrate().entities.get(id).is_some_and(|entity| {
+                    entity.category() == crate::map::entities::EntityCategory::Structure
+                })
+            }
+        })
+}
+
+/// The ring staffing's sealed-ground fallback, the second chance after the
+/// fan ([`pick_guard_post`]) refused every offset for a candidate. A
+/// built-up objective hems the fan's cells under the openness floor — the
+/// yard's own structures, the wall walk's ring around the core
+/// ([`DEFENSE_FORT_WALL_KEY`]) and the fort program's tower sea (the
+/// objective is the first and densest fort site, and the fort track's guns
+/// carry no per-anchor quota) — so on a developed base every fan pick
+/// refuses while the staffing gate stays open, and the ring freezes at its
+/// opening posts no matter what the idle pool fields (observed: the ring
+/// book constant at its first posts for a whole match while the quota
+/// stayed at the baseline and the intercept's at-post floor never opened).
+/// The fallback walks outward radius by radius to
+/// [`DEFENSE_OBJECTIVE_RING_SPREAD`] — the same reach the ring's own
+/// at-post read credits — for the nearest cell that is zone-connected from
+/// the candidate, holds no obstacle, and no posted row already holds. The
+/// openness floor does not ride here: a hemmed post is still a post, and
+/// the drift tolerance ([`DEFENSE_LINE_DRIFT_CELLS`]) keeps the holder
+/// settled on it.
+fn pick_ring_post_wide(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    unit: u64,
+    core: (i16, i16),
+    held: &[(u16, u16)],
+) -> Option<(u16, u16)> {
+    let entity = sim.substrate().entities.get(unit)?;
+    let from = (entity.position.rx(), entity.position.ry());
+    let movement_zone = rules
+        .object(sim.interner().resolve(entity.type_ref()))
+        .map(|ty| ty.movement_zone)
+        .unwrap_or_default();
+    for radius in 1..=i32::from(DEFENSE_OBJECTIVE_RING_SPREAD) {
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx.abs().max(dy.abs()) != radius {
+                    continue; // the ring's own edge, tightest radius first
+                }
+                let cell = on_map_cell(
+                    sim,
+                    (
+                        i16::try_from(i32::from(core.0) + dx).unwrap_or(core.0),
+                        i16::try_from(i32::from(core.1) + dy).unwrap_or(core.1),
+                    ),
+                    core,
+                );
+                if held.contains(&cell) || !zones_connected(sim, movement_zone, from, cell) {
+                    continue;
+                }
+                if cell_holds_obstacle(sim, cell) {
+                    continue;
+                }
+                return Some(cell);
+            }
+        }
+    }
+    None
 }
 
 /// The chrono steal's drop point (W6): a passable cell two to three cells
