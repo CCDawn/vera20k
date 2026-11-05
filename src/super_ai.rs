@@ -6872,6 +6872,24 @@ impl SuperAi {
             }
 
             if any_tank && grid_black {
+                // The corridor track's tech gate: the chain's stones and
+                // fort towers hold the one building slot only once the
+                // side's science ladder has stood. A flush wallet ladders
+                // the corridor every tick ahead of the ladder walk below,
+                // so the radar — the heavy tower's own gate — and the
+                // battle lab — the tier-2 roster rows' gate — never
+                // reached their rungs, and the cheap pillbox laddered
+                // alone. The walls above keep their right of way and the
+                // yard gun rows below keep theirs: the gate bends the
+                // corridor track only.
+                let lab_gated_row = opening
+                    .vehicles
+                    .iter()
+                    .chain(opening.infantry.iter())
+                    .any(|entry| entry.needs == Some(opening.battle_lab));
+                let tech_open = !radar_standing.is_empty()
+                    && (!lab_gated_row
+                        || self.count_structures_of_type(sim, opening.battle_lab) >= 1);
                 // The corridor stone arm (D2-F): the frontier links the
                 // corridor program marked owe a `BaseNormal=yes` stone
                 // before any tower — the towers carry no build area out,
@@ -6890,7 +6908,15 @@ impl SuperAi {
                 // routes the ready stone to the frontier link's weighted
                 // scan, whose candidates all sit inside the build area by
                 // construction — the same admission the PLACE runs.
-                let stones = std::mem::take(&mut self.corridor_stones);
+                // Under the tech gate the track reads an empty book: the
+                // corridor program's walk rebuilds the stones each tick,
+                // so the slot simply falls through to the ladder rungs
+                // below.
+                let stones = if tech_open {
+                    std::mem::take(&mut self.corridor_stones)
+                } else {
+                    Vec::new()
+                };
                 // The flush read: one numeric compare off the frontier
                 // stone's own name and the track's lead tower (radar
                 // standing → the heavy leads, the pillbox answers).
@@ -6947,6 +6973,12 @@ impl SuperAi {
                     }
                 }
                 for (name, route) in gun_wants {
+                    // The tech gate holds the corridor's own towers out
+                    // with the stones; the yard rows keep their right of
+                    // way.
+                    if matches!(route, PlacementRoute::Fort { .. }) && !tech_open {
+                        continue;
+                    }
                     // Guns queue only from a wallet that can pay for them
                     // outright: a broke base that queues a 1500-credit
                     // Prism Tower parks it in the one building slot at
