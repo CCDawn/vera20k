@@ -839,6 +839,13 @@ const DEFENSE_CORRIDOR_MERGE_RADIUS: i32 = 12;
 /// The most corridors the ledger holds; the oldest entry yields when a
 /// wider map's waves open more approaches than the program can ladder.
 const DEFENSE_CORRIDOR_LEDGER_CAP: usize = 6;
+/// Mode B's ceiling on the shared charge: the seat arms
+/// [`DefenseStance::SharedObjective`] only while the map's lose-chain
+/// objective set holds between one and this many standing objects. Past
+/// it the objectives cannot be one ring's charge — the houses would
+/// spread thin across the whole map — and mode A's own-lane stance
+/// answers better.
+pub const DEFENSE_SHARED_OBJECTIVE_CAP: usize = 3;
 /// The ladder step: each corridor anchor stands this far past the last,
 /// close enough for the stone before it to carry the build area out to
 /// it. The step is capped by the ladder stone's own
@@ -1768,8 +1775,13 @@ pub enum SuperAiDifficulty {
 pub const UNLIMITED_WALLET_FLOOR: i32 = 1_000_000;
 
 /// The second personality's stance (`docs/defense-ai.md`). Mode A is the
-/// shipped phase; mode B is lobby-selectable in a later pillar and carries
-/// no behavior yet.
+/// independent zone; mode B — full-map cooperative defense — arms on a
+/// defense map whose shared lose-chain objective set is small
+/// (`DEFENSE_SHARED_OBJECTIVE_CAP` at most), and its behavior rides the
+/// three [`DefenseStance::SharedObjective`] branches: the fort anchors
+/// take the shared objective's cells for every house, the objective
+/// ring's fan start rotates by the house's session order, and the
+/// corridor program climbs only the approaches the house claims.
 ///
 /// Serialized as the plain unit-variant enum: bincode's non-self-describing
 /// codec writes and reads a variant index directly, so — unlike
@@ -1783,9 +1795,10 @@ pub enum DefenseStance {
     /// base's own spawn bearing, never cross-cover.
     #[default]
     IndependentZone,
-    /// Mode B — full-map cooperative defense (D3, reserved): watch the
-    /// whole map, dispatch to leaks, core hits and broken friendly lines.
-    Cooperative,
+    /// Mode B — full-map cooperative defense: the shared objective's ring
+    /// and corridors are every co-defender's charge, partitioned by house
+    /// (the fort anchors, the ring fan's start and the corridor claims).
+    SharedObjective,
 }
 
 /// The hostile presence the defense persona's field scan last read, by
@@ -2016,6 +2029,15 @@ struct DefensePersona {
     /// where they were met. The corridor program's primary threat
     /// ledger; merged and capped like [`DefensePersona::corridor_cells`].
     entry_cells: Vec<(u16, u16)>,
+    /// Mode B's claim book: the ledger cells the last corridor walk
+    /// answered as this house's own — the approaches whose cluster stands
+    /// nearest this house's base (session-wide Chebyshev over every
+    /// house's engine base centre, ties broken by the native house id).
+    /// Every co-defender computes the same winner from the same session
+    /// state, so one approach has one climber. Capped like the ledger it
+    /// filters ([`DEFENSE_CORRIDOR_LEDGER_CAP`]); empty in mode A, where
+    /// the house climbs everything its own ledger records.
+    claimed_corridors: Vec<(u16, u16)>,
     /// Forward-interception commits so far: the surveys that sent a
     /// detachment at a marching cluster. Telemetry only.
     intercept_sorties: u32,
@@ -2067,6 +2089,7 @@ impl DefensePersona {
             corridor_cells: Vec::new(),
             seen_hostiles: std::collections::HashSet::new(),
             entry_cells: Vec::new(),
+            claimed_corridors: Vec::new(),
             intercept_sorties: 0,
             intercept_withdraws: 0,
             infantry_files: 0,
@@ -2127,6 +2150,77 @@ fn defense_chebyshev(from: (i16, i16), to: (i16, i16)) -> u32 {
     i32::from(to.0)
         .abs_diff(i32::from(from.0))
         .max(i32::from(to.1).abs_diff(i32::from(from.1)))
+}
+
+/// The map's "this falls, you lose" set: standing objects whose
+/// object-attached Tag chain reads a destroyed-by-anything event (7, or
+/// the structure twin 48) into a lose outcome (actions 2/68): one
+/// action-53 hop (enable trigger) to a trigger that carries one allowed —
+/// a solo defense map's statue reads destroyed -> enable the lose
+/// trigger. The read walks the mobile classes beside the structures: a
+/// solo defense map can hang its whole lose chain on one key unit
+/// (President22's "Prez died": the flag unit's destroyed event feeds
+/// action 1, and a structure-only read left the objective off the books —
+/// no ring anchor, no leak hunt around it, and one leaked rifleman ended
+/// the match). The owner does not gate the read: the objective is the
+/// map's, and defense maps re-own it mid-game (a destroyed garrison hands
+/// the statue to another seat through a ChangeHouse give), while a
+/// win-chain (the enemy's 67) never qualifies. Chains the direct walk
+/// cannot resolve — Tag- or trigger-less definitions, indirect links —
+/// stay absent; that coverage gap is a recorded residual.
+///
+/// One owner, two consumers: the perception scan writes the set into the
+/// persona every tick, and the seat assembly reads its size once at
+/// install to pick mode B ([`defense_shared_target_count`]). Pure read:
+/// no RNG, no mutation, no render/ui dependency.
+fn defense_protected_targets(sim: &crate::sim::world::Simulation) -> Vec<u64> {
+    let carries_lose = |actions: &[crate::sim::trigger_runtime::TriggerActionView]| {
+        actions.iter().any(|action| matches!(action.kind, 2 | 68))
+    };
+    sim.substrate()
+        .entities
+        .iter_sorted()
+        .filter(|(_, entity)| {
+            matches!(
+                entity.category(),
+                crate::map::entities::EntityCategory::Structure
+                    | crate::map::entities::EntityCategory::Unit
+                    | crate::map::entities::EntityCategory::Infantry
+            )
+        })
+        .filter(|(id, _)| {
+            sim.trigger_runtime()
+                .object_tag_definition_views(*id)
+                .iter()
+                .any(|chain| {
+                    chain
+                        .events
+                        .iter()
+                        .any(|event| matches!(event.kind, 7 | 48))
+                        && (carries_lose(&chain.actions)
+                            || chain
+                                .actions
+                                .iter()
+                                .filter_map(|action| action.enable_trigger.as_deref())
+                                .any(|id| {
+                                    sim.trigger_runtime()
+                                        .trigger_definition_view(id)
+                                        .is_some_and(|view| carries_lose(&view.actions))
+                                }))
+                })
+        })
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// The seat-time read the mode-B stance choice takes (`docs/defense-ai.md`):
+/// how many standing objects the map charges with a lose chain — the
+/// shared objective set, every co-defender's charge alike. The install
+/// arms [`DefenseStance::SharedObjective`] while the count holds between
+/// one and [`DEFENSE_SHARED_OBJECTIVE_CAP`], and mode A otherwise; the
+/// read runs once per install, not per tick.
+pub fn defense_shared_target_count(sim: &crate::sim::world::Simulation) -> usize {
+    defense_protected_targets(sim).len()
 }
 
 /// The defense line's standoff anchor toward one spawn: `home` walked
@@ -10553,59 +10647,9 @@ impl SuperAi {
         }
 
         // Protected targets: standing objects the map itself charges the
-        // defense with — whose object tag chain reads a destroyed event
-        // into a lose outcome. The destroyed read is unit kind 7 or
-        // structure kind 48 (the two RecordKill publishes); the lose
-        // outcome is the chain's own 2/68, or one action-53 hop (enable
-        // trigger) to a trigger that carries one — a solo defense map's
-        // statue reads destroyed -> enable the lose trigger. The read
-        // walks the mobile classes beside the structures: a solo defense
-        // map can hang its whole lose chain on one key unit (President22's
-        // "Prez died": the flag unit's destroyed event feeds action 1, and
-        // a structure-only read left the objective off the books — no ring
-        // anchor, no leak hunt around it, and one leaked rifleman ended
-        // the match). The owner does not gate the read: the objective is
-        // the map's, and defense maps re-own it mid-game (a destroyed
-        // garrison hands the statue to another seat through a ChangeHouse
-        // give), while a win-chain (the enemy's 67) never qualifies.
-        let carries_lose = |actions: &[crate::sim::trigger_runtime::TriggerActionView]| {
-            actions.iter().any(|action| matches!(action.kind, 2 | 68))
-        };
-        let protected_targets = sim
-            .substrate()
-            .entities
-            .iter_sorted()
-            .filter(|(_, entity)| {
-                matches!(
-                    entity.category(),
-                    crate::map::entities::EntityCategory::Structure
-                        | crate::map::entities::EntityCategory::Unit
-                        | crate::map::entities::EntityCategory::Infantry
-                )
-            })
-            .filter(|(id, _)| {
-                sim.trigger_runtime()
-                    .object_tag_definition_views(*id)
-                    .iter()
-                    .any(|chain| {
-                        chain
-                            .events
-                            .iter()
-                            .any(|event| matches!(event.kind, 7 | 48))
-                            && (carries_lose(&chain.actions)
-                                || chain
-                                    .actions
-                                    .iter()
-                                    .filter_map(|action| action.enable_trigger.as_deref())
-                                    .any(|id| {
-                                        sim.trigger_runtime()
-                                            .trigger_definition_view(id)
-                                            .is_some_and(|view| carries_lose(&view.actions))
-                                    }))
-                    })
-            })
-            .map(|(id, _)| id)
-            .collect();
+        // defense with — the shared lose-chain read
+        // ([`defense_protected_targets`]), unchanged by the stance.
+        let protected_targets = defense_protected_targets(sim);
 
         // The core's wound watch: any protected target whose raw health
         // dropped since the last scan latches the rescue's hit window (the
@@ -12606,9 +12650,25 @@ impl SuperAi {
         home_center: Option<(i16, i16)>,
         tick: u32,
     ) -> Option<Command> {
-        let objective_fan = defense_objective_fan(self.defense_objective_quota());
+        let mut objective_fan = defense_objective_fan(self.defense_objective_quota());
         if self.defense.is_none() {
             return None;
+        }
+        // Mode B's ring partition: the fan's start sector rotates by the
+        // house's native session order ([`Houses::index_of`]), so
+        // co-defenders staffing the same shared objective begin their
+        // picks on different fan cells instead of stacking one arc
+        // (the staffing's own per-unit rotation rides on top of this
+        // shift). Mode A keeps the fan untouched, and the telemetry's
+        // slot count reads the same length either way.
+        {
+            let persona = self.defense.as_ref().expect("checked above");
+            if persona.stance == DefenseStance::SharedObjective
+                && let Some(house_index) = sim.houses().index_of(self.house)
+                && !objective_fan.is_empty()
+            {
+                objective_fan.rotate_left(house_index % objective_fan.len());
+            }
         }
         let core = self
             .defense
@@ -13309,7 +13369,13 @@ impl SuperAi {
             if !entity.lifecycle.object_alive() {
                 continue;
             }
-            if entity.owner() != self.house
+            // Mode A anchors only the house's own charge; a foreign
+            // structure is not a fort site. Mode B arms the shared
+            // objective: every standing lose-chain object — the whole
+            // co-defended charge, whoever holds it — anchors, so all
+            // houses' fort walls and guns stand on the same shared ring.
+            if persona.stance != DefenseStance::SharedObjective
+                && entity.owner() != self.house
                 && entity.category() == crate::map::entities::EntityCategory::Structure
             {
                 continue;
@@ -13403,24 +13469,48 @@ impl SuperAi {
             self.corridor_link_sites.clear();
             return Vec::new();
         }
-        let Some(persona) = self.defense.as_ref() else {
-            return Vec::new();
+        // The ledger read and the claim write split the persona borrow:
+        // the books read first, the borrow ends, the claim book writes,
+        // and the objective read re-borrows fresh below.
+        let (shared, raw_ledger) = {
+            let Some(persona) = self.defense.as_ref() else {
+                return Vec::new();
+            };
+            let shared = persona.stance == DefenseStance::SharedObjective;
+            // The approaches: the entry ledger first — where the waves
+            // arrive from — and the engagement ledger while the persona
+            // has seen no crossing yet (a just-adopted persona).
+            let raw_ledger: Vec<(i16, i16)> = if persona.entry_cells.is_empty() {
+                persona
+                    .corridor_cells
+                    .iter()
+                    .map(|&cell| (cell.0 as i16, cell.1 as i16))
+                    .collect()
+            } else {
+                persona
+                    .entry_cells
+                    .iter()
+                    .map(|&cell| (cell.0 as i16, cell.1 as i16))
+                    .collect()
+            };
+            (shared, raw_ledger)
         };
-        // The approaches: the entry ledger first — where the waves
-        // arrive from — and the engagement ledger while the persona has
-        // seen no crossing yet (a just-adopted persona).
-        let ledger: Vec<(i16, i16)> = if persona.entry_cells.is_empty() {
-            persona
-                .corridor_cells
-                .iter()
-                .map(|&cell| (cell.0 as i16, cell.1 as i16))
-                .collect()
+        // Mode B's corridor partition: the house climbs only the
+        // approaches it claims — the clusters standing nearest its own
+        // base in the session-wide read ([`Self::corridor_cell_claimed`])
+        // — and the claim book records what the walk answers. Mode A
+        // keeps the whole ledger and the book stays empty.
+        let ledger: Vec<(i16, i16)> = if shared {
+            let claimed: Vec<(i16, i16)> = raw_ledger
+                .into_iter()
+                .filter(|&cell| self.corridor_cell_claimed(sim, cell))
+                .collect();
+            if let Some(persona) = self.defense.as_mut() {
+                persona.claimed_corridors = claimed.clone();
+            }
+            claimed
         } else {
-            persona
-                .entry_cells
-                .iter()
-                .map(|&cell| (cell.0 as i16, cell.1 as i16))
-                .collect()
+            raw_ledger
         };
         if ledger.is_empty() {
             self.corridor_stones.clear();
@@ -13439,14 +13529,17 @@ impl SuperAi {
         // The objective: the persona's protected charge — the first
         // standing protected target's cell, the same read the fort
         // anchors run — falling back to the home pin while no target
-        // stands. The persona's read ends here: the ledger and the
-        // objective are the walk's whole borrow of it.
+        // stands. Mode B reads the shared charge: whoever holds the
+        // objective, the claimed corridors all walk toward it. The
+        // persona's read ends here: the ledger and the objective are the
+        // walk's whole borrow of it.
+        let persona = self.defense.as_ref().expect("checked above");
         let objective = persona
             .protected_targets
             .iter()
             .find_map(|&id| {
                 let entity = sim.substrate().entities.get(id)?;
-                (entity.owner() == self.house && entity.lifecycle.object_alive())
+                ((shared || entity.owner() == self.house) && entity.lifecycle.object_alive())
                     .then(|| (entity.position.rx() as i16, entity.position.ry() as i16))
             })
             .or(self.engine_home)
@@ -13603,6 +13696,46 @@ impl SuperAi {
         out
     }
 
+    /// Mode B's corridor claim read: whether the approach cluster at
+    /// `cell` is this house's to climb. The contenders are the session's
+    /// other command-driven drivers (the co-defenders mode B arms on)
+    /// beside this house; the winner is the one whose engine base centre
+    /// ([`crate::sim::house_state::HouseState::base_center`], the cell
+    /// every yard deploy moves the engine's `base_center` to) stands
+    /// nearest the cell — Chebyshev, ties broken by the native house id.
+    /// A human's ground needs no claim (mode B supports the player where
+    /// the player is not), a passive wave owner claims nothing, and a
+    /// house without a standing centre cannot ladder a corridor anyway.
+    /// Every contender runs the same pure read over the same session
+    /// state, so one approach has one climber; a centre that moves
+    /// between two houses' paced walks can flip one claim one frame
+    /// apart, and the next walk settles it (recorded residual). Pure
+    /// read: no RNG, no mutation.
+    fn corridor_cell_claimed(&self, sim: &crate::sim::world::Simulation, cell: (i16, i16)) -> bool {
+        let mut best: Option<(u32, usize, InternedId)> = None;
+        for (&owner, house) in sim.houses().iter() {
+            if owner != self.house
+                && (!house.command_driven() || house.multiplay_passive() || house.is_human())
+            {
+                continue;
+            }
+            let Some(center) = house.base_center() else {
+                continue;
+            };
+            if center == (0, 0) {
+                continue;
+            }
+            let distance = defense_chebyshev(cell, (center.0 as i16, center.1 as i16));
+            let index = sim.houses().index_of(owner).unwrap_or(usize::MAX);
+            if best.is_none_or(|(current, current_index, _)| {
+                (distance, index) < (current, current_index)
+            }) {
+                best = Some((distance, index, owner));
+            }
+        }
+        matches!(best, Some((_, _, owner)) if owner == self.house)
+    }
+
     /// The corridor stone's type ([`CorridorStone`]): the house's own
     /// power plant ([`Opening::power`]). The side's own name keeps the
     /// stone faction-correct by construction — the old whole-table price
@@ -13700,7 +13833,7 @@ impl SuperAi {
         // past a thousand) while the ring can only ever hold the fan's
         // slots, so a quota read made the row's second number
         // unjudgeable.
-        let (ring_posts, ring_slots, entries, sorties, withdraws) = {
+        let (ring_posts, ring_slots, entries, sorties, withdraws, stance) = {
             let persona = self.defense.as_ref().expect("checked above");
             let quota = self.defense_objective_quota();
             let posts = persona.line_posts.len();
@@ -13710,6 +13843,12 @@ impl SuperAi {
                 persona.entry_cells.len(),
                 persona.intercept_sorties,
                 persona.intercept_withdraws,
+                // The stance rides the row: A is the independent zone,
+                // B the shared objective's cooperative branches.
+                match persona.stance {
+                    DefenseStance::IndependentZone => "A",
+                    DefenseStance::SharedObjective => "B",
+                },
             )
         };
         // The idle pool the staffing pass would read — the same candidate
@@ -13795,7 +13934,7 @@ impl SuperAi {
             .map(|item| sim.interner.resolve(item.type_id))
             .unwrap_or("-");
         log::info!(
-            "[DEF-AI] tick={tick} house={owner} power={output}/{drain} credits={credits} \
+            "[DEF-AI] tick={tick} house={owner} stance={stance} power={output}/{drain} credits={credits} \
              ring={ring_posts}/{ring_slots} idle={idle} combat={combat} \
              corridor=entries:{entries} stones:{stones} guns:{guns} \
              intercept=s:{sorties} w:{withdraws} build={building} unit={unit} air={air} \

@@ -537,6 +537,22 @@ fn rebuild_super_players_for(
         })
         .collect();
     let alliances = simulation.house_alliances().as_map();
+    // Mode B's seat-time read (`docs/defense-ai.md`): a classified defense
+    // map whose shared lose-chain objective set holds between one and
+    // [`crate::super_ai::DEFENSE_SHARED_OBJECTIVE_CAP`] standing objects
+    // arms the full-map cooperative stance for every defense seat — the
+    // same read the persona's perception runs, taken once at install.
+    // Everything else plays mode A.
+    let stance = if defense_map {
+        let shared = crate::super_ai::defense_shared_target_count(simulation);
+        if (1..=crate::super_ai::DEFENSE_SHARED_OBJECTIVE_CAP).contains(&shared) {
+            crate::super_ai::DefenseStance::SharedObjective
+        } else {
+            crate::super_ai::DefenseStance::IndependentZone
+        }
+    } else {
+        crate::super_ai::DefenseStance::IndependentZone
+    };
     command_driven
         .iter()
         .copied()
@@ -561,12 +577,11 @@ fn rebuild_super_players_for(
                         simulation.resolve(house),
                     )
             });
-            // The arming reads either signal: a house whose enemies hold no
-            // other command-driven AI, or a house of an explicitly
-            // classified defense map (allied AI co-defenders on one wave
-            // map face each other on the first test and still seat).
+            // A classified defense map seats its houses whatever the
+            // enemy test reads (allied AI co-defenders face each other on
+            // it), at the stance chosen above.
             if defense_ai && (defense_map || !faces_command_ai) {
-                ai.enable_defense_personality(crate::super_ai::DefenseStance::IndependentZone);
+                ai.enable_defense_personality(stance);
             }
             ai
         })
