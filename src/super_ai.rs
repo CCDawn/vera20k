@@ -1780,9 +1780,10 @@ struct CorridorStone {
     threat: (i16, i16),
     /// Whether this stone rides the corridor pacing window: while no
     /// stone of the program stands at all, each approach's first stone
-    /// opens at full speed; every later one queues after
-    /// [`DEFENSE_CORRIDOR_GUN_WINDOW`], the same pace the fort guns
-    /// rearm.
+    /// opens at full speed, as does every link inside
+    /// [`DEFENSE_CORRIDOR_FREE_LINKS`]; later ones queue after
+    /// [`DEFENSE_CORRIDOR_WINDOW`], the chain's own pace (the flush read
+    /// [`SuperAi::corridor_pace_flush`] lifts it too).
     rides_window: bool,
 }
 
