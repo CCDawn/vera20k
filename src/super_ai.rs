@@ -1016,6 +1016,11 @@ const DEFENSE_PERIMETER_POOL_WARTIME: usize = 9;
 const DEFENSE_PERIMETER_POOL_ASSAULT: usize = 12;
 /// Ticks between the perimeter engagement passes.
 const DEFENSE_PERIMETER_TICKS: u32 = 15;
+/// Ticks between the air book's passes. Air is the fastest answer the
+/// persona fields — the hulls cross the map in seconds — so the book
+/// re-reads its target and its recruitment at the line's own pace
+/// ([`DEFENSE_LINE_TICKS`]), not the ground marches' wider windows.
+const DEFENSE_AIR_TICKS: u32 = 30;
 /// A marching cluster closer than this to an anchor is already the
 /// perimeter's business; the forward interception survey ignores it.
 const DEFENSE_INTERCEPT_INNER_RANGE: i32 = 24;
@@ -1963,6 +1968,12 @@ struct DefensePersona {
     intercept_threat: Option<((i16, i16), i32)>,
     /// Earliest tick the interception survey may run again.
     intercept_due: u32,
+    /// The air book: unit → the cell it returns to when the field
+    /// clears — its standing cell when it joined. The flyers take no
+    /// ground post, so this book is their whole duty ledger.
+    air_pool: Vec<(u64, (u16, u16))>,
+    /// Earliest tick the air pass may run again.
+    air_due: u32,
     /// The corridor ledger: hostile cluster cells observed at the
     /// perimeter or marching in the band — where the waves were met,
     /// oldest first. The corridor program
@@ -2027,6 +2038,8 @@ impl DefensePersona {
             intercept_commit_power: 0,
             intercept_threat: None,
             intercept_due: 0,
+            air_pool: Vec::new(),
+            air_due: 0,
             corridor_cells: Vec::new(),
             seen_hostiles: std::collections::HashSet::new(),
             entry_cells: Vec::new(),
@@ -2046,17 +2059,19 @@ impl DefensePersona {
             || self.marching(unit)
     }
 
-    /// Whether one of the active-defense marches — the perimeter pool or
-    /// the forward detachment — holds this unit. These members stay in
-    /// `line_posts` (they walk back to those posts on release), so the
-    /// books that would otherwise walk them home mid-march read this
-    /// first.
+    /// Whether one of the active-defense marches — the perimeter pool,
+    /// the forward detachment or the air book — holds this unit. The
+    /// ground marchers stay in `line_posts` (they walk back to those
+    /// posts on release), so the books that would otherwise walk them
+    /// home mid-march read this first; the air book's flyers hold no
+    /// post, their own walk-back cell rides in the book.
     fn marching(&self, unit: u64) -> bool {
         self.perimeter_pool.iter().any(|&(id, _)| id == unit)
             || self
                 .intercept_detachment
                 .iter()
                 .any(|&(id, _, _)| id == unit)
+            || self.air_pool.iter().any(|&(id, _)| id == unit)
     }
 }
 
@@ -5834,8 +5849,18 @@ impl SuperAi {
                             // check alone never saw them.
                             && (entity.category()
                                 == crate::map::entities::EntityCategory::Aircraft
+                                // The persona's war-factory flyers ride
+                                // the defense air book: this sortie's
+                                // structure siege would re-claim them
+                                // off their guard cells home, and its
+                                // structure-only targets never met the
+                                // defense maps' mobile waves anyway.
+                                // The Aircraft class keeps the battle
+                                // book — its jets are not the air
+                                // book's recruits.
                                 || (entity.category()
                                     == crate::map::entities::EntityCategory::Unit
+                                    && self.defense.is_none()
                                     && Self::is_fly_type(
                                         rules,
                                         sim.interner().resolve(entity.type_ref()),
@@ -10508,6 +10533,14 @@ impl SuperAi {
         if let Some(command) = self.defense_leak_orders(sim, rules, opening, home_center, tick) {
             return Some(vec![command]);
         }
+        // The air book (the flyers' sortie): the war-factory flyers no
+        // ground book ever holds march at the largest hostile cluster
+        // and walk back to the cells they left when the field clears.
+        // Air takes no ground post, so no perimeter or intercept ledger
+        // runs here.
+        if let Some(commands) = self.defense_air_orders(sim, rules, tick) {
+            return Some(commands);
+        }
         // The active-defense marches (D2): the perimeter engagement
         // answers the group at the wall, the forward interception the
         // wave still marching in — each paced, each capped, both under
@@ -10914,6 +10947,267 @@ impl SuperAi {
         })
     }
 
+    /// The air book (the flyers' sortie): the house's standing armed
+    /// war-factory flyers — Unit-category `MovementZone=Fly` hulls, the
+    /// Kirov and the Floating Disk the `Aircraft` class never contains —
+    /// march at the largest hostile cluster and Guard back to the cells
+    /// they left when the field clears. The ground books never hold
+    /// them: the rosters are land tables, the guard poster spares the
+    /// hulls, and the battle sortie's structure-only targets never met
+    /// the defense maps' mobile waves — so a Kirov or a Disk built by
+    /// the persona sat home forever (observed live: both hovering over
+    /// the yard the whole match). No sentry ring, no perimeter or
+    /// intercept ledger — air takes no ground post — and no health
+    /// gate: an outmatched flyer breaks off on its own. The flyers whose
+    /// weapons cannot reach an air target (the Kirov's bombs name no
+    /// `AA=` projectile) aim at the ground band alone; the rest take the
+    /// enemy's air into the same cluster read. A unit whose band cleared
+    /// under its own read walks home and leaves the book while the other
+    /// cohort's engagement stands.
+    fn defense_air_orders(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+        tick: u32,
+    ) -> Option<Vec<Command>> {
+        // The paced pass: advance the window first, then prune — a downed
+        // flyer drops from the book.
+        {
+            let persona = self.defense.as_mut()?;
+            if tick < persona.air_due {
+                return None;
+            }
+            persona.air_due = tick + DEFENSE_AIR_TICKS;
+        }
+        let house = self.house;
+        {
+            let persona = self.defense.as_mut().expect("checked above");
+            persona.air_pool.retain(|&(unit, _)| {
+                sim.substrate().entities.get(unit).is_some_and(|entity| {
+                    entity.owner() == house && entity.lifecycle.object_alive()
+                })
+            });
+        }
+        // The roster decides whether this pass has anything to command
+        // at all: with no flyer in the book and none standing idle, the
+        // band reads below stay unwon.
+        let roster = self.defense_air_roster(sim, rules);
+        {
+            let persona = self.defense.as_ref().expect("checked above");
+            if persona.air_pool.is_empty() && !roster.iter().any(|&(_, _, idle, _)| idle) {
+                return None;
+            }
+        }
+        // The engagement: the largest hostile cluster, ties to the
+        // smaller cell ([`Self::defense_marching_cluster`]'s stable
+        // pick), under the perimeter's own smallest-group bar — a lone
+        // scout stays the ground books' business. The ground band always;
+        // the hostile air joins it for the flyers that can shoot back at
+        // it.
+        let ground_band = self.defense_hostile_ground(sim);
+        let mut mixed_band = ground_band.clone();
+        mixed_band.extend(self.defense_hostile_air(sim, rules));
+        let ground_aim = Self::defense_marching_cluster(&ground_band)
+            .filter(|(members, _)| members.len() >= DEFENSE_PERIMETER_CLUSTER_MIN)
+            .map(|(_, cell)| cell);
+        let mixed_aim = Self::defense_marching_cluster(&mixed_band)
+            .filter(|(members, _)| members.len() >= DEFENSE_PERIMETER_CLUSTER_MIN)
+            .map(|(_, cell)| cell);
+        let (ground_cell, mixed_cell) = (ground_aim, mixed_aim);
+        // The whole field cleared: every flyer walks back to the cell it
+        // left, and the book closes. A gated flyer waits its gate — the
+        // next window releases it. When only one band cleared (the
+        // ground gone while hostile air stands, or the reverse), the
+        // split below walks just that cohort home.
+        if ground_cell.is_none() && mixed_cell.is_none() {
+            let pool = {
+                let persona = self.defense.as_mut().expect("checked above");
+                std::mem::take(&mut persona.air_pool)
+            };
+            if pool.is_empty() {
+                return None;
+            }
+            let mut commands: Vec<Command> = Vec::new();
+            for (unit, home) in pool {
+                let idle = sim.substrate().entities.get(unit).is_some_and(|entity| {
+                    matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    )
+                });
+                if idle && self.order_gate.get(&unit).is_none_or(|&due| tick >= due) {
+                    self.gate_idle_order(unit, tick);
+                    commands.push(Command::Guard {
+                        entity_id: unit,
+                        target: Some(crate::sim::combat::TargetKind::Cell(home.0, home.1)),
+                    });
+                }
+            }
+            return if commands.is_empty() {
+                None
+            } else {
+                Some(commands)
+            };
+        }
+        let mut commands: Vec<Command> = Vec::new();
+        // The book's standing members first: any idle member whose gate
+        // is due marches again at its band's current centroid — the
+        // cluster drifts, the sortie follows it. A member whose own band
+        // cleared (the bombs-only flyer while the hostiles are airborne)
+        // walks home and leaves the book.
+        let pool = self
+            .defense
+            .as_ref()
+            .expect("checked above")
+            .air_pool
+            .clone();
+        let mut walks_home: Vec<(u64, (u16, u16))> = Vec::new();
+        for &(unit, home) in &pool {
+            let Some(entity) = sim.substrate().entities.get(unit) else {
+                continue;
+            };
+            let idle = matches!(
+                entity.passive_acquire_mission(),
+                crate::sim::mission::MissionType::None
+                    | crate::sim::mission::MissionType::Sleep
+                    | crate::sim::mission::MissionType::Guard
+                    | crate::sim::mission::MissionType::AreaGuard
+            );
+            let aim = if Self::type_hits_air(rules, sim.interner().resolve(entity.type_ref())) {
+                mixed_cell
+            } else {
+                ground_cell
+            };
+            let Some((ax, ay)) = aim else {
+                walks_home.push((unit, home));
+                continue;
+            };
+            if idle && self.order_gate.get(&unit).is_none_or(|&due| tick >= due) {
+                self.gate_idle_order(unit, tick);
+                commands.push(Command::AttackMove {
+                    entity_id: unit,
+                    target: None,
+                    destination: Some(crate::sim::combat::TargetKind::Cell(
+                        ax.max(0) as u16,
+                        ay.max(0) as u16,
+                    )),
+                });
+            }
+        }
+        if !walks_home.is_empty() {
+            let persona = self.defense.as_mut().expect("checked above");
+            persona
+                .air_pool
+                .retain(|&(unit, _)| !walks_home.iter().any(|&(gone, _)| gone == unit));
+        }
+        for (unit, home) in walks_home {
+            let idle = sim.substrate().entities.get(unit).is_some_and(|entity| {
+                matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                )
+            });
+            if idle && self.order_gate.get(&unit).is_none_or(|&due| tick >= due) {
+                self.gate_idle_order(unit, tick);
+                commands.push(Command::Guard {
+                    entity_id: unit,
+                    target: Some(crate::sim::combat::TargetKind::Cell(home.0, home.1)),
+                });
+            }
+        }
+        // Recruitment: every idle armed flyer not already in the book
+        // joins the engagement — no cap, no ring floor: air takes no
+        // post, a defense base fields few flyers, and the field's
+        // largest cluster is their whole purpose. A flyer whose own band
+        // cleared stays home (and out of the book).
+        for (unit, reaches_air, idle, cell) in roster {
+            if !idle {
+                continue;
+            }
+            let already = self
+                .defense
+                .as_ref()
+                .expect("checked above")
+                .air_pool
+                .iter()
+                .any(|&(kept, _)| kept == unit);
+            if already {
+                continue;
+            }
+            let Some((ax, ay)) = (if reaches_air { mixed_cell } else { ground_cell }) else {
+                continue;
+            };
+            let home = (cell.0.max(0) as u16, cell.1.max(0) as u16);
+            self.defense
+                .as_mut()
+                .expect("checked above")
+                .air_pool
+                .push((unit, home));
+            self.gate_idle_order(unit, tick);
+            commands.push(Command::AttackMove {
+                entity_id: unit,
+                target: None,
+                destination: Some(crate::sim::combat::TargetKind::Cell(
+                    ax.max(0) as u16,
+                    ay.max(0) as u16,
+                )),
+            });
+        }
+        if commands.is_empty() {
+            None
+        } else {
+            Some(commands)
+        }
+    }
+
+    /// The house's standing armed flyers: Unit-category `MovementZone=Fly`
+    /// hulls ([`Self::is_fly_type`]) — the war-factory aircraft the
+    /// `Aircraft` class never contains, so the ground rosters and the
+    /// battle flight's class check both miss them. Unarmed hulls stay
+    /// out. Each row carries the AA reach of the type's weapons, the
+    /// idle flag the orders read and the cell the flyer stands at; the
+    /// telemetry's `air` field counts these rows.
+    fn defense_air_roster(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+    ) -> Vec<(u64, bool, bool, (i16, i16))> {
+        sim.substrate()
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                entity.owner() == self.house
+                    && entity.lifecycle.object_alive()
+                    && !entity.lifecycle.in_limbo()
+                    && entity.category() == crate::map::entities::EntityCategory::Unit
+                    && Self::is_fly_type(rules, sim.interner().resolve(entity.type_ref()))
+            })
+            .filter_map(|(id, entity)| {
+                let name = sim.interner().resolve(entity.type_ref());
+                // Unarmed hulls stay out: a flyer with no weapon list
+                // cannot sortie.
+                if rules.object(name)?.primary().is_none() {
+                    return None;
+                }
+                let idle = matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                );
+                let cell = (entity.position.rx() as i16, entity.position.ry() as i16);
+                Some((id, Self::type_hits_air(rules, name), idle, cell))
+            })
+            .collect()
+    }
+
     /// The quick power read the active-defense surveys lean on: a unit's
     /// retail cost — the one value the rules hold for every combat type.
     /// An unknown type reads as zero; a wounded hull holds its cost.
@@ -11028,6 +11322,35 @@ impl SuperAi {
                             | crate::map::entities::EntityCategory::Infantry
                     )
                     && self.is_enemy(sim, entity.owner())
+            })
+            .map(|(id, entity)| {
+                (
+                    id,
+                    (entity.position.rx() as i16, entity.position.ry() as i16),
+                )
+            })
+            .collect()
+    }
+
+    /// The hostile air mobiles: the `Aircraft` class plus the
+    /// war-factory flyers the class never contains
+    /// ([`Self::is_fly_type`]) — the battle flight roster's read,
+    /// inverted to the enemies. The air book adds these to the ground
+    /// band only for the flyers whose weapons can answer them.
+    fn defense_hostile_air(
+        &self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+    ) -> Vec<(u64, (i16, i16))> {
+        sim.substrate()
+            .entities
+            .iter_sorted()
+            .filter(|(_, entity)| {
+                !entity.lifecycle.in_limbo()
+                    && self.is_enemy(sim, entity.owner())
+                    && (entity.category() == crate::map::entities::EntityCategory::Aircraft
+                        || (entity.category() == crate::map::entities::EntityCategory::Unit
+                            && Self::is_fly_type(rules, sim.interner().resolve(entity.type_ref()))))
             })
             .map(|(id, entity)| {
                 (
@@ -13098,7 +13421,8 @@ impl SuperAi {
     /// engine's power totals, the wallet, the objective ring's on-duty
     /// posts against its post slots, the corridor ledger's entries and the
     /// standing stones and fort guns, the interception books' sorties and
-    /// recalls, and the building queue's current item. Every field is a
+    /// recalls, the building queue's current item and the air book's
+    /// standing flyers. Every field is a
     /// read the frame already runs (the census, the persona's ledgers,
     /// the queue view) — no scan of its own, and the 600-tick pace keeps
     /// the format cost out of the profile. This is the row a match's
@@ -13145,6 +13469,10 @@ impl SuperAi {
         let guns = self.count_structures_of_type(sim, opening.defense_basic)
             + self.count_structures_of_type(sim, opening.defense_aa)
             + self.count_structures_of_type(sim, opening.defense_heavy);
+        // The air book's roster count — the standing armed war-factory
+        // flyers the recruitment scan reads, so the row judges whether
+        // the hulls the mix fields ever leave the yard.
+        let air = self.defense_air_roster(sim, rules).len();
         let queue = crate::sim::production::queue_view_for_owner(sim, rules, &owner);
         let building = queue
             .iter()
@@ -13173,7 +13501,7 @@ impl SuperAi {
         log::info!(
             "[DEF-AI] tick={tick} house={owner} power={output}/{drain} credits={credits} \
              ring={ring_posts}/{ring_slots} corridor=entries:{entries} stones:{stones} guns:{guns} \
-             intercept=s:{sorties} w:{withdraws} build={building} unit={unit}"
+             intercept=s:{sorties} w:{withdraws} build={building} unit={unit} air={air}"
         );
     }
 
@@ -15066,6 +15394,30 @@ impl SuperAi {
         rules
             .object(name)
             .is_some_and(|ty| ty.movement_zone == crate::rules::locomotor_type::MovementZone::Fly)
+    }
+
+    /// Whether the type's weapon list reaches an air target: any weapon
+    /// whose projectile reads `AA=yes` — the same projectile word the
+    /// engine's threat mask reads (`weapon_class_bits`,
+    /// `src/sim/combat/combat_weapon.rs`). The air book reads it to take
+    /// the enemy's flyers into the target band only for the flyers
+    /// whose weapons can answer them — the Kirov's bombs name no `AA=`
+    /// projectile, the Floating Disk's laser does.
+    fn type_hits_air(rules: &crate::rules::ruleset::RuleSet, name: &str) -> bool {
+        let Some(ty) = rules.object(name) else {
+            return false;
+        };
+        (0..ty.weapon_count.max(0) as usize).any(|index| {
+            ty.weapon_at(index)
+                .and_then(|weapon| rules.weapon(weapon))
+                .is_some_and(|weapon| {
+                    weapon
+                        .projectile
+                        .as_ref()
+                        .and_then(|projectile| rules.projectile(projectile))
+                        .is_some_and(|projectile| projectile.aa)
+                })
+        })
     }
 
     /// Whether the type is one of the three sides' dogs — the roster's
