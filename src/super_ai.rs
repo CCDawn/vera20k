@@ -1200,6 +1200,26 @@ const LATE_SINK_CREDITS: i32 = 20_000;
 /// from the power-deficit rule (observed), so the rung owes it with
 /// ladder priority.
 const REFINERY_CAP: usize = 4;
+/// The defense persona's economy brake (D2): at a balance past this many
+/// credits a defense house stops adding economy — the refinery rungs and
+/// the miner top-up. A defense map's purse (scenario gifts, the Unlimited
+/// floor) can sit at a figure no income justifies: on FaceOfDeath3 — no
+/// ore anywhere, the balance a constant million — the tail's dock rung
+/// re-filed YAREFN through the whole match, every wave-killed dock
+/// rebuilt on the same ring the moment the count fell. A rich defense
+/// needs guns, walls and bodies, not another dock it has no ore for.
+/// The battle houses read no brake: their wallet only grows by income,
+/// so a large balance there is exactly the signal that more economy
+/// pays.
+const DEFENSE_ECONOMY_CREDITS_CAP: i64 = 50_000;
+/// The dock-destruction backoff: cumulative observed refinery losses
+/// (the standing count falling under its latched high-water mark) past
+/// which the refinery rungs stop rebuilding. Two razed docks mark a
+/// ring the enemy works over; rebuilding there only feeds the loop —
+/// the count dips, the rung re-files, the wallet (a defense gift, the
+/// Unlimited floor) never objects. Power and the production lines stay
+/// out of the ledger: their destruction is the war's ordinary cost.
+const REFINERY_REBUILD_BACKOFF: usize = 2;
 const FACTORY_BUILDOUT: usize = 4;
 const FACTORY_CAP: usize = 6;
 const FACTORY_CREDITS: i32 = 1500;
@@ -3319,6 +3339,16 @@ pub struct SuperAi {
     /// the second-MCV commission. Pinned state, set from observation the
     /// same way `sw_ever_stood` is.
     remote_refinery_stood: bool,
+    /// The standing refinery count's latched high-water mark — the base
+    /// the dock-destruction ledger compares the next scan against.
+    /// Pinned state.
+    refinery_high_water: usize,
+    /// Cumulative observed refinery losses: every scan whose standing
+    /// dock count fell under [`Self::refinery_high_water`] adds the dip.
+    /// Past [`REFINERY_REBUILD_BACKOFF`] the refinery rungs stop
+    /// rebuilding — a ring the enemy works over gets no third dock.
+    /// Pinned state.
+    refinery_losses: usize,
     /// Whether the expansion MCV's commission has issued. Pinned state,
     /// never read from the runtime.
     expansion_yard_issued: bool,
@@ -3810,6 +3840,8 @@ impl SuperAi {
             transport_issued: false,
             expansion_site: None,
             remote_refinery_stood: false,
+            refinery_high_water: 0,
+            refinery_losses: 0,
             expansion_yard_issued: false,
             expansion2_site: None,
             expansion_deploy_target: None,
@@ -7156,6 +7188,57 @@ impl SuperAi {
                 return vec![CommandEnvelope::new(self.house, at, command)];
             }
 
+            // The dock-destruction ledger: a standing count under the
+            // latched high-water mark is a razed dock — the ledger adds
+            // the dip. Past the backoff the refinery rungs (the ladder's
+            // and the tail's alike) stop rebuilding: a ring the enemy
+            // works over gets no third dock, and the wallet that never
+            // objects (a defense gift, the Unlimited floor) no longer
+            // feeds the razed-rebuild cycle (FaceOfDeath3: YAREFN in the
+            // build row through the whole match, Placing a dock every
+            // couple of seconds). The reads sit ahead of the ladder walk
+            // so its dock rungs take the same two gates.
+            let refineries = self.count_structures_of_type(sim, opening.refinery);
+            if refineries < self.refinery_high_water {
+                self.refinery_losses += self.refinery_high_water - refineries;
+            }
+            self.refinery_high_water = self.refinery_high_water.max(refineries);
+            // The defense persona's economy brake (D2): a balance past the
+            // cap closes the economy rungs — the docks and the miner
+            // top-up. The battle houses read no brake: their wallet only
+            // grows by income, so a large balance there is the signal that
+            // more economy pays.
+            let economy_brake = self.defense.is_some()
+                && i64::from(crate::sim::production::credits_for_owner(sim, &owner))
+                    > DEFENSE_ECONOMY_CREDITS_CAP;
+            let docks_rebuild = !economy_brake && self.refinery_losses < REFINERY_REBUILD_BACKOFF;
+            // The fleet that feeds the next dock: the table's harvester
+            // when the side roams one; a side whose table names none reads
+            // the dock's own FreeUnit (Yuri's slave miner — each dock
+            // ships its own miner, so the pairing is 1:1 by construction
+            // and the standing cap alone governs); a side with neither can
+            // feed only the first dock. The old fallback answered
+            // usize::MAX and the pairing guard in the tail held for
+            // nothing — a no-harvester side's dock rung no fleet fact ever
+            // refused.
+            let miner_name = opening.harvester.or_else(|| {
+                rules
+                    .object(opening.refinery)
+                    .and_then(|ty| ty.free_unit.as_deref())
+            });
+            let miners = miner_name
+                .map(|miner| self.count_units_of_type(sim, miner))
+                .unwrap_or(0);
+            let fleet_feeds = match (opening.harvester, miner_name) {
+                // The roaming fleet's own premise: two miners per dock.
+                (Some(_), _) => miners >= refineries * 2,
+                // The self-shipping dock: the pairing holds by
+                // construction, the cap governs.
+                (None, Some(_)) => true,
+                // No miner anywhere: the first dock only.
+                (None, None) => refineries == 0,
+            };
+            let factories = self.count_structures_of_type(sim, opening.war_factory);
             let mut ladder = vec![
                 (opening.power, 1),
                 (opening.refinery, 1),
@@ -7284,6 +7367,13 @@ impl SuperAi {
                 if self.count_structures_of_type(sim, name) >= *target {
                     continue;
                 }
+                // The dock rungs sit behind the same destruction ledger and
+                // economy brake as the growth tail's (see the ledger note
+                // above the ladder): a razed ring owes no third dock and a
+                // rich defense house files none.
+                if *name == opening.refinery && (!docks_rebuild || !fleet_feeds) {
+                    continue;
+                }
                 if let Some(ty) = rules.object(*name)
                     && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
                     // Read-only lookup: every retail type name is interned at
@@ -7325,12 +7415,6 @@ impl SuperAi {
             // preemption's `output`, `drain` and `pending` above — so
             // the deficit and margin rules below price the queue's
             // unlanded drain in too.
-            let refineries = self.count_structures_of_type(sim, opening.refinery);
-            let factories = self.count_structures_of_type(sim, opening.war_factory);
-            let miners = opening
-                .harvester
-                .map(|miner| self.count_units_of_type(sim, miner))
-                .unwrap_or(usize::MAX);
             // The expansion growth (Layer 2): a second yard is a
             // sub-base, not a monument. Before the house-wide growth
             // array, the cluster around the outpost anchor (P1: the
@@ -7371,6 +7455,7 @@ impl SuperAi {
                     return vec![CommandEnvelope::new(self.house, at, command)];
                 }
                 if cluster_refineries < 1
+                        && docks_rebuild
                         && refineries < REFINERY_CAP + 1
                         && let Some(ty) = rules.object(opening.refinery)
                         && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty)
@@ -7506,6 +7591,7 @@ impl SuperAi {
                         // economy's own cap bounds it instead.
                         self.expansion_site.is_some()
                             && !self.remote_refinery_stood
+                            && docks_rebuild
                             && refineries < REFINERY_CAP + 1,
                         opening.refinery,
                     ),
@@ -7549,7 +7635,7 @@ impl SuperAi {
                         opening.war_factory,
                     ),
                     (
-                        refineries < REFINERY_CAP && miners >= refineries * 2,
+                        docks_rebuild && refineries < REFINERY_CAP && fleet_feeds,
                         opening.refinery,
                     ),
                     (
@@ -7963,6 +8049,12 @@ impl SuperAi {
             // must then grow to match or the rule starves itself.
             let refineries = self.count_structures_of_type(sim, opening.refinery);
             self.count_units_of_type(sim, miner) < (refineries * 2).max(HARVESTER_TARGET)
+                // The defense persona's economy brake (D2): a rich defense
+                // house tops no fleet up — the docks it cannot feed are
+                // the same waste the dock rung's brake closes.
+                && (!self.defense.is_some()
+                    || i64::from(crate::sim::production::credits_for_owner(sim, &owner))
+                        <= DEFENSE_ECONOMY_CREDITS_CAP)
         });
         // The tier-2 tank takes over once the battle lab stands. The lab
         // standing is the switch's own condition: `cameo_draw_state` mirrors
