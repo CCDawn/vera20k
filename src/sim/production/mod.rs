@@ -44,7 +44,7 @@ pub use self::factory_lifecycle::{
 };
 pub(crate) use self::production_placement::place_production_with_overlays;
 pub use self::production_placement::{
-    cycle_active_producer_for_owner_category, is_within_build_area,
+    build_area_reach_cells, cycle_active_producer_for_owner_category, is_within_build_area,
     placement_preview_for_owner_with_overlays,
 };
 #[cfg(any(test, feature = "test-support"))]
@@ -86,11 +86,11 @@ pub use self::production_types::*;
 
 // Re-exports for external consumers (files outside production/ that previously
 // imported private submodules directly).
+#[cfg(feature = "ares")]
+pub(crate) use self::can_build::owns_prerequisites;
 pub(crate) use self::can_build::{
     CanBuild, can_build, initialize_factory_primary, toggle_factory_primary,
 };
-#[cfg(feature = "ares")]
-pub(crate) use self::can_build::owns_prerequisites;
 pub use self::can_build::{can_select_factory_primary, find_factory, object_find_factory};
 pub(crate) use self::factory_ai::{
     AiPlacementTimer, detach_all as detach_building_factory, factory_ai,

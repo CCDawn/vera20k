@@ -835,11 +835,31 @@ const DEFENSE_CORRIDOR_MERGE_RADIUS: i32 = 12;
 const DEFENSE_CORRIDOR_LEDGER_CAP: usize = 6;
 /// The ladder step: each corridor anchor stands this far past the last,
 /// close enough for the stone before it to carry the build area out to
-/// it — a placed tower is a `BaseNormal=yes` provider, and the ring it
-/// opens reaches about this far. The link before must hold a gun before
-/// the next enters, so the chain reaches as far as the wallet ladders
-/// it and never queues against ground the build area cannot touch.
+/// it. The step is capped by the ladder stone's own
+/// [`crate::sim::production::build_area_reach_cells`] reach, so a stone
+/// queued at one link always stands inside the build area the stone
+/// before it carries — the engine's own `Adjacent+1` admission, not a
+/// hand-picked spacing. The link before must hold a gun before the next
+/// enters, so the chain reaches as far as the wallet ladders it and
+/// never queues against ground the build area cannot touch.
 const DEFENSE_CORRIDOR_STEP: i32 = 3;
+/// The corridor stone (D2-F): the ladder's links are
+/// `BaseNormal=no` towers, and a tower carries no build area out —
+/// every stone (a retail `BaseNormal=yes` provider) is what carries the
+/// engine's `Adjacent+1` ring one link farther (President22's replay:
+/// 3011 `outside build area` rejects, every standing tower `bn=false`).
+/// The corridor program owes one stone per frontier link before any
+/// tower there; the stones queue through the corridor track's own
+/// money and pacing gates.
+/// A hostile mobile's first crossing of the defended band is an
+/// approach when its cell stands within this Chebyshev reach of a fort
+/// anchor: the entry ledger ([`DefensePersona::entry_cells`]) records
+/// the crossing cell as the corridor ladder's threat target. Sized to
+/// the forward interception's reach ([`DEFENSE_INTERCEPT_OUTER_RANGE`]),
+/// the band the waves cross on their way in; a sighting beyond it — an
+/// enemy garrison standing in its own base — is the enemy's ground, not
+/// an approach, and would drag the ladder across the map.
+const DEFENSE_ENTRY_RANGE: i32 = 64;
 /// The corridor mix rule: one AA gun per this many ground guns at an
 /// anchor, and only while the observed-or-scheduled wave carries
 /// aircraft — a ground war ladders direct-fire towers alone.
@@ -1711,6 +1731,29 @@ enum PlacementRoute {
     },
 }
 
+/// One pending corridor stone (D2-F): the frontier link the corridor
+/// program marked as past the build area. The stone is a retail
+/// `BaseNormal=yes` provider — the towers are `BaseNormal=no` and carry
+/// no area out — so the stone queues first and its gun follows on the
+/// ground the stone carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CorridorStone {
+    /// The stone type's retail name: the program's cheapest buildable
+    /// `BaseNormal=yes` building, resolved once per walk and cached.
+    name: String,
+    /// The frontier link cell the stone anchors; the placement intent's
+    /// weighted scan centers there.
+    anchor: (i16, i16),
+    /// The approach the link faces — the scan's enemy-facing bias.
+    threat: (i16, i16),
+    /// Whether this stone rides the corridor pacing window: while no
+    /// stone of the program stands at all, each approach's first stone
+    /// opens at full speed; every later one queues after
+    /// [`DEFENSE_CORRIDOR_GUN_WINDOW`], the same pace the fort guns
+    /// rearm.
+    rides_window: bool,
+}
+
 /// A read-only copy of [`DefensePersona`]'s perception and book sizes, for
 /// harnesses and tests (see [`SuperAi::defense_books`]). Counts, not
 /// contents: consumers compare sizes and timers across ticks.
@@ -1837,10 +1880,23 @@ struct DefensePersona {
     /// Earliest tick the interception survey may run again.
     intercept_due: u32,
     /// The corridor ledger: hostile cluster cells observed at the
-    /// perimeter or marching in the band — the attack approaches, oldest
-    /// first. The corridor fort chain
-    /// ([`SuperAi::defense_corridor_anchors`]) ladders out along these.
+    /// perimeter or marching in the band — where the waves were met,
+    /// oldest first. The corridor program
+    /// ([`SuperAi::defense_corridor_program`]) reads it as the threat
+    /// ledger's fallback while the entry ledger below stands empty: a
+    /// chrono wave is met where it lands, beside the objective it
+    /// attacks, so the engagement cells alone read as home cells and
+    /// collapse the ladder back onto the fort ring.
     corridor_cells: Vec<(u16, u16)>,
+    /// The hostile ground mobiles already observed, so each one's
+    /// first in-band crossing enters the entry ledger exactly once.
+    seen_hostiles: std::collections::HashSet<u64>,
+    /// The entry ledger: the first-seen cells of hostile ground mobiles
+    /// inside [`DEFENSE_ENTRY_RANGE`] of a fort anchor — where the waves
+    /// arrive from (chrono drops, edge spawns, band crossings), not
+    /// where they were met. The corridor program's primary threat
+    /// ledger; merged and capped like [`DefensePersona::corridor_cells`].
+    entry_cells: Vec<(u16, u16)>,
 }
 
 impl DefensePersona {
@@ -1874,6 +1930,8 @@ impl DefensePersona {
             intercept_threat: None,
             intercept_due: 0,
             corridor_cells: Vec::new(),
+            seen_hostiles: std::collections::HashSet::new(),
+            entry_cells: Vec::new(),
         }
     }
 
@@ -3297,6 +3355,17 @@ pub struct SuperAi {
     /// the anchors' floors; see [`DEFENSE_CORRIDOR_GUN_WINDOW`]. Pinned
     /// state, never read from the runtime.
     fort_gun_window_due: u32,
+    /// The corridor stone ladder's pending frontier links, recomputed by
+    /// the last [`Self::defense_corridor_program`] walk and consumed by
+    /// the build block's stone arm. Pinned state, never read from the
+    /// runtime.
+    corridor_stones: Vec<CorridorStone>,
+    /// The corridor stone's type name — the cheapest buildable
+    /// `BaseNormal=yes` building this house can field — cached because
+    /// the rules do not change mid-game. The cache re-verifies the build
+    /// gate each tick (tech level and stolen tech move it). Pinned state,
+    /// never read from the runtime.
+    corridor_stone_name: Option<String>,
     /// Harness telemetry: the last [`Self::defense_gun_wants`] walk's
     /// result, `NAME@route` comma-joined (`-` when the walk rested).
     /// Read-only; never feeds a decision.
@@ -3649,6 +3718,8 @@ impl SuperAi {
             mcv_abandoned: std::collections::HashMap::new(),
             placement_intent: None,
             fort_gun_window_due: 0,
+            corridor_stones: Vec::new(),
+            corridor_stone_name: None,
             gun_want_note: String::from("-"),
             repairing_structure: None,
             repair_due: 0,
@@ -4405,6 +4476,13 @@ impl SuperAi {
                                     self.house,
                                     home,
                                     EXPANSION_MIN_DISTANCE,
+                                    // The sidebar placement's own admission:
+                                    // the engine refuses a far pick past the
+                                    // outpost yard's ring at apply time, and
+                                    // the pick re-refused until the strike
+                                    // pause lifted — the loop the owner
+                                    // filter closes.
+                                    Some(owner.as_str()),
                                 )
                             })
                         })
@@ -5993,6 +6071,11 @@ impl SuperAi {
                                 self.house,
                                 home,
                                 EXPANSION_MIN_DISTANCE,
+                                // An MCV deployment: the build-area
+                                // admission never gates a unit unfold —
+                                // the deployed yard is what carries the
+                                // area out to the field.
+                                None,
                             )
                         })
                         .map(|(ox, oy)| (ox + 1, oy + 1))
@@ -6454,6 +6537,7 @@ impl SuperAi {
             .is_some_and(|house| sim.interner().resolve(house.house_type_id()) == "French");
         let gun_wants = self.defense_gun_wants(
             sim,
+            rules,
             opening,
             &bases,
             tick,
@@ -6662,6 +6746,63 @@ impl SuperAi {
             }
 
             if any_tank && grid_black {
+                // The corridor stone arm (D2-F): the frontier links the
+                // corridor program marked owe a `BaseNormal=yes` stone
+                // before any tower — the towers carry no build area out,
+                // so the stone is what carries the engine's `Adjacent+1`
+                // ring one link farther. It rides the corridor track's
+                // own gates: the wallet (a stone the wallet cannot buy
+                // outright parks the one building slot), the build gate
+                // the stone's pick already passed this tick, and the
+                // pacing window the fort guns rearm (while no stone
+                // stands at all, each approach's first stone opens at
+                // full speed). The intent routes the ready stone to the
+                // frontier link's weighted scan, whose candidates all
+                // sit inside the build area by construction — the same
+                // admission the PLACE runs.
+                let stones = std::mem::take(&mut self.corridor_stones);
+                if let Some(index) = stones
+                    .iter()
+                    .position(|stone| !stone.rides_window || tick >= self.fort_gun_window_due)
+                {
+                    let CorridorStone {
+                        name: stone_name,
+                        anchor,
+                        threat,
+                        ..
+                    } = stones[index].clone();
+                    if let Some(ty) = rules.object(&stone_name)
+                        && crate::sim::production::credits_for_owner(sim, &owner) >= ty.cost
+                        && crate::sim::production::can_build(
+                            sim,
+                            rules,
+                            self.house,
+                            ty,
+                            false,
+                            false,
+                        ) == crate::sim::production::CanBuild::Yes
+                        && let Some(type_id) = sim.interner().get(&stone_name)
+                        // The stone's retry gate, the guns': a refused
+                        // file re-files at [`BUILD_QUEUE_RETRY_TICKS`]
+                        // pace; the gun loop takes its turn meanwhile.
+                        && let Some(command) = self.file_production(sim, rules, type_id, tick)
+                    {
+                        // The corridor track's pace: the stone arms the
+                        // same window the fort guns ride — the next
+                        // build (a gun on the stone's ground, or the
+                        // next link's stone) queues after
+                        // [`DEFENSE_CORRIDOR_GUN_WINDOW`].
+                        self.fort_gun_window_due = tick + DEFENSE_CORRIDOR_GUN_WINDOW;
+                        self.placement_intent = Some((
+                            type_id,
+                            PlacementRoute::Fort {
+                                anchor,
+                                spawn: threat,
+                            },
+                        ));
+                        return vec![CommandEnvelope::new(self.house, at, command)];
+                    }
+                }
                 for (name, route) in gun_wants {
                     // Guns queue only from a wallet that can pay for them
                     // outright: a broke base that queues a 1500-credit
@@ -8138,6 +8279,9 @@ impl SuperAi {
                         self.house,
                         from,
                         EXPANSION_MIN_DISTANCE,
+                        // The survey validates the MCV walk's aim, not a
+                        // sidebar placement — no build-area gate.
+                        None,
                     )
                     .is_some()
                         // The field itself must sit in ground the zone grid
@@ -9600,6 +9744,11 @@ impl SuperAi {
                 .and_then(|id| overlays.flags(id))
                 .is_some_and(|flags| flags.wall)
         };
+        // The wall type the fresh-pick admits through the engine's own
+        // build-area read (below): `opening.wall` may be absent, and an
+        // absent wall keeps the legacy pick verbatim — the callers gate
+        // the queue on it anyway.
+        let wall_ty = opening.wall.and_then(|name| rules.object(name));
         // The target roster (B1): every standing structure of the priority
         // types — both superweapons, every construction yard (the home and
         // the outpost's), every refinery — collected in the substrate
@@ -9698,10 +9847,39 @@ impl SuperAi {
             if self.walled.contains(&id) {
                 continue;
             }
-            let cell = ring
-                .into_iter()
-                .find(|&cell| !self.wall_cells.contains(&cell) && !holds_wall(cell));
-            match cell {
+            let mut cell_pick: Option<(u16, u16)> = None;
+            for cell in ring {
+                if self.wall_cells.contains(&cell) || holds_wall(cell) {
+                    continue;
+                }
+                // The engine's own build-area read, folded into the pick:
+                // a wall segment the area cannot touch is refused at
+                // apply time with no recourse, and a ring of such cells —
+                // a fort anchor past the base, before the corridor
+                // stones carry the area out — used to burn the whole
+                // walk, then the strike counter and the pause, on
+                // guaranteed refusals. Refused-class cells enter
+                // [`Self::wall_cells`] spent, so the walk reaches the
+                // next candidate in the same pass; a ring the stones
+                // later open again would re-arm through the rebuild
+                // book, not the spent marks.
+                if wall_ty.is_some_and(|ty| {
+                    !crate::sim::production::is_within_build_area(
+                        sim,
+                        rules,
+                        sim.interner.resolve(self.house),
+                        ty,
+                        cell.0,
+                        cell.1,
+                    )
+                }) {
+                    self.wall_cells.insert(cell);
+                    continue;
+                }
+                cell_pick = Some(cell);
+                break;
+            }
+            match cell_pick {
                 Some(cell) => return Some(cell),
                 // The ring is spent. A ring fully walked needs no more
                 // segments; a fallen segment re-opens through the
@@ -10566,6 +10744,57 @@ impl SuperAi {
         }
     }
 
+    /// The entry ledger's record (D2-F): every hostile ground mobile's
+    /// first sighting inside [`DEFENSE_ENTRY_RANGE`] of a fort anchor
+    /// enters [`DefensePersona::entry_cells`] at its crossing cell —
+    /// where the wave arrived from (a chrono drop's landing, an edge
+    /// spawn, the band crossing), the true route start the engagement
+    /// centroid misses. Merged and capped like the corridor ledger; a
+    /// sighting beyond the band is unrecorded and unmarked, so a walker
+    /// from far out still enters when it first crosses. Called from both
+    /// active-defense passes (each idempotent on
+    /// [`DefensePersona::seen_hostiles`]); deterministic in the substrate
+    /// order's discipline.
+    fn record_entry_points(
+        &mut self,
+        hostiles: &[(u64, (i16, i16))],
+        anchors: &[((i16, i16), (i16, i16))],
+    ) {
+        for &(id, cell) in hostiles {
+            let near = anchors
+                .iter()
+                .map(|&(anchor, _)| defense_chebyshev(cell, anchor) as i32)
+                .min()
+                .unwrap_or(i32::MAX);
+            if near > DEFENSE_ENTRY_RANGE {
+                continue;
+            }
+            let Some(persona) = self.defense.as_mut() else {
+                return;
+            };
+            if !persona.seen_hostiles.insert(id) {
+                continue;
+            }
+            let cell = (cell.0.max(0) as u16, cell.1.max(0) as u16);
+            let standing = persona.entry_cells.iter().position(|&other| {
+                defense_chebyshev(
+                    (other.0 as i16, other.1 as i16),
+                    (cell.0 as i16, cell.1 as i16),
+                ) as i32
+                    <= DEFENSE_CORRIDOR_MERGE_RADIUS
+            });
+            match standing {
+                Some(index) => persona.entry_cells[index] = cell,
+                None => {
+                    persona.entry_cells.push(cell);
+                    if persona.entry_cells.len() > DEFENSE_CORRIDOR_LEDGER_CAP {
+                        persona.entry_cells.remove(0);
+                    }
+                }
+            }
+        }
+    }
+
     /// The hostile ground mobiles on the field as (unit, cell) pairs in
     /// substrate order — the read both active-defense passes start from.
     fn defense_hostile_ground(
@@ -10685,6 +10914,10 @@ impl SuperAi {
         }
         let anchors = self.defense_fort_anchors(sim);
         let hostiles = self.defense_hostile_ground(sim);
+        // The entry ledger rides the pass: every hostile's first in-band
+        // sighting marks the approach it arrived on, so the corridor
+        // program's threat targets read where the waves come from.
+        self.record_entry_points(&hostiles, &anchors);
         // The engagement: the anchor whose perimeter band holds the most
         // hostiles, ties to the smaller anchor cell (a stable pick).
         let mut engagement: Option<(usize, (i16, i16), i64, i64)> = None;
@@ -10948,6 +11181,11 @@ impl SuperAi {
         }
         let anchors = self.defense_fort_anchors(sim);
         let hostiles = self.defense_hostile_ground(sim);
+        // The entry ledger rides the survey too — the two passes' reads
+        // are idempotent on the seen-hostiles set, and a walker that
+        // crossed while the perimeter pass stood down still marks its
+        // approach here.
+        self.record_entry_points(&hostiles, &anchors);
         // The marching band: hostile ground past the perimeter, inside
         // the reach.
         let band: Vec<(u64, (i16, i16))> = hostiles
@@ -12222,32 +12460,80 @@ impl SuperAi {
         anchors
     }
 
-    /// The corridor fort chain (D2-E): each recorded approach
-    /// ([`DefensePersona::corridor_cells`]) extrapolates into build sites
-    /// walked out from the nearest standing fort anchor — the objective's
-    /// or a bearing's — one [`DEFENSE_CORRIDOR_STEP`] at a time toward
-    /// the threat cell. A link enters only while the link before it
-    /// holds a gun within [`DEFENSE_FORT_GUN_RING`]: the stones
-    /// themselves are `BaseNormal=yes` providers, so each landed tower
-    /// carries the build area one step farther out and the chain reaches
-    /// as far as the wallet ladders it — no fixed depth, only ground the
-    /// build area can actually touch. A site within
-    /// [`DEFENSE_FORT_ANCHOR_SPREAD`] of an accepted anchor (the standing
-    /// forts, or a link another corridor already claimed) collapses into
-    /// it, but the walk continues past it: two approaches sharing a
-    /// chokepoint ladder through the same stones. Each anchor carries the
-    /// threat cell it faces — the placement scan's enemy-facing bias.
-    fn defense_corridor_anchors(
-        &self,
+    /// The corridor fort program (D2-E/D2-F): each recorded approach —
+    /// the entry ledger ([`DefensePersona::entry_cells`], the first
+    /// in-band crossings the waves arrived on) with the engagement
+    /// ledger ([`DefensePersona::corridor_cells`]) as the fallback while
+    /// no crossing stands — extrapolates into build sites walked out
+    /// from the nearest standing fort anchor, one lattice step at a time
+    /// toward the threat cell. The step is
+    /// [`DEFENSE_CORRIDOR_STEP`], capped by the ladder stone's
+    /// [`crate::sim::production::build_area_reach_cells`] reach, so a
+    /// stone queued at one link always stands inside the build area the
+    /// stone before it carries.
+    ///
+    /// A link joins the gun track only on ground the build area already
+    /// reaches, probed with the engine's own
+    /// [`crate::sim::production::is_within_build_area`] for the stone
+    /// type — the same predicate the placement scan and the PLACE
+    /// admission run. The towers are `BaseNormal=no` and carry no build
+    /// area out: a gun queued past the frontier could only fall back to
+    /// the home rings (President22's replay: every tower piled at the
+    /// base while the approaches stayed naked), so a link past the
+    /// frontier owes a stone instead and the chain stops there — the
+    /// stone queues ([`Self::corridor_stones`]), its gun follows on the
+    /// ground the stone carries, and only then does the walk advance.
+    /// The armed-link gate keeps its shape: a link enters only while the
+    /// link before it holds a gun within [`DEFENSE_FORT_GUN_RING`]. A
+    /// site within [`DEFENSE_FORT_ANCHOR_SPREAD`] of an accepted anchor
+    /// collapses into it, but the walk continues past it: two approaches
+    /// sharing a chokepoint ladder through the same stones. Each gun
+    /// site carries the threat cell it faces — the placement scan's
+    /// enemy-facing bias.
+    fn defense_corridor_program(
+        &mut self,
         sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
         opening: &Opening,
     ) -> Vec<((i16, i16), (i16, i16))> {
+        if self.defense.is_none() {
+            self.corridor_stones.clear();
+            return Vec::new();
+        }
         let Some(persona) = self.defense.as_ref() else {
             return Vec::new();
         };
-        if persona.corridor_cells.is_empty() {
+        // The approaches: the entry ledger first — where the waves
+        // arrive from — and the engagement ledger while the persona has
+        // seen no crossing yet (a just-adopted persona).
+        let threats: Vec<(i16, i16)> = if persona.entry_cells.is_empty() {
+            persona
+                .corridor_cells
+                .iter()
+                .map(|&cell| (cell.0 as i16, cell.1 as i16))
+                .collect()
+        } else {
+            persona
+                .entry_cells
+                .iter()
+                .map(|&cell| (cell.0 as i16, cell.1 as i16))
+                .collect()
+        };
+        self.corridor_stones.clear();
+        if threats.is_empty() {
             return Vec::new();
         }
+        let Some(stone_name) = self.defense_stone_type(sim, rules) else {
+            return Vec::new();
+        };
+        // The stone's standing count gates the pacing: the program's
+        // first stone opens at full speed (read before the walk's
+        // closures borrow `self` — the census is a mutable read).
+        let first_stone = self.count_structures_of_type(sim, &stone_name) == 0;
+        let Some(stone_ty) = rules.object(&stone_name) else {
+            return Vec::new();
+        };
+        let owner = sim.interner.resolve(self.house).to_string();
         let towers = [
             opening.defense_aa,
             opening.defense_heavy,
@@ -12261,13 +12547,16 @@ impl SuperAi {
         let forts = self.defense_fort_anchors(sim);
         let mut accepted: Vec<(i16, i16)> = forts.iter().map(|&(anchor, _)| anchor).collect();
         let mut out: Vec<((i16, i16), (i16, i16))> = Vec::new();
+        let mut stones: Vec<CorridorStone> = Vec::new();
         let collapsed = |accepted: &[(i16, i16)], cell: (i16, i16)| {
             accepted
                 .iter()
                 .any(|&other| defense_chebyshev(other, cell) as i32 <= DEFENSE_FORT_ANCHOR_SPREAD)
         };
-        for &threat in &persona.corridor_cells {
-            let threat = (threat.0 as i16, threat.1 as i16);
+        let step = DEFENSE_CORRIDOR_STEP
+            .max(1)
+            .min(crate::sim::production::build_area_reach_cells(stone_ty));
+        for &threat in &threats {
             // The walk starts at the standing anchor nearest the
             // approach — the chain extends an armed fort, never floats
             // free of the base.
@@ -12280,29 +12569,105 @@ impl SuperAi {
                 continue;
             };
             let mut prev = start;
-            while defense_chebyshev(threat, prev) as i32 > DEFENSE_CORRIDOR_STEP {
+            while defense_chebyshev(threat, prev) as i32 > step {
                 let dx = i32::from(threat.0) - i32::from(prev.0);
                 let dy = i32::from(threat.1) - i32::from(prev.1);
                 let len = dx.abs().max(dy.abs()).max(1);
                 let next = (
-                    prev.0 + (dx * DEFENSE_CORRIDOR_STEP / len) as i16,
-                    prev.1 + (dy * DEFENSE_CORRIDOR_STEP / len) as i16,
+                    prev.0 + (dx * step / len) as i16,
+                    prev.1 + (dy * step / len) as i16,
                 );
-                // The ladder predicate: the stone before must hold a
-                // gun, or the chain stops here — the next step would
-                // stand past the build area's reach and only feed
-                // placement refusals.
+                // The ladder predicate: the link before must hold a gun,
+                // or the chain stops here — the next step would stand
+                // past the build area's reach and only feed placement
+                // refusals.
                 if !holds_gun(prev) {
                     break;
                 }
-                if !collapsed(&accepted, next) {
-                    accepted.push(next);
+                if collapsed(&accepted, next) {
+                    prev = next;
+                    continue;
+                }
+                accepted.push(next);
+                // The ground probe: does the build area reach this link?
+                // The engine's own adjacency read, for the stone type —
+                // a standing stone there satisfies it, as does the
+                // base's own frontier on the first links.
+                let grounded = crate::sim::production::is_within_build_area(
+                    sim,
+                    rules,
+                    &owner,
+                    stone_ty,
+                    next.0 as u16,
+                    next.1 as u16,
+                );
+                if grounded {
                     out.push((next, threat));
+                } else {
+                    // The frontier: this link owes a BaseNormal stone
+                    // before any tower — the towers carry no area out,
+                    // so a gun queued here could only fall back home.
+                    // The chain stops at the unserved link until the
+                    // stone and its gun stand.
+                    stones.push(CorridorStone {
+                        name: stone_name.clone(),
+                        anchor: next,
+                        threat,
+                        rides_window: !first_stone,
+                    });
+                    break;
                 }
                 prev = next;
             }
         }
+        self.corridor_stones = stones;
         out
+    }
+
+    /// The corridor stone's type ([`CorridorStone`]): the cheapest
+    /// buildable retail building that carries the owner's build area —
+    /// `BaseNormal=yes`, no wall segment, no water-bound foundation —
+    /// resolved from the rules at runtime, never hard-coded: the sides
+    /// differ (the Soviet plant prices under the Allied's) and a custom
+    /// table may too. The build gate is the engine's own
+    /// [`crate::sim::production::can_build`], the same admission the
+    /// army picks run: an AI house's Prerequisite-chain quirk answers
+    /// through it unchanged, and a type the house cannot field (tech
+    /// level, country lock, stolen tech) refuses and hands the pick to
+    /// the next candidate up the price ladder. Cached by name — the
+    /// rules do not change mid-game — with the gate re-verified each
+    /// call.
+    fn defense_stone_type(
+        &mut self,
+        sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
+    ) -> Option<String> {
+        let buildable = |ty: &crate::rules::object_type::ObjectType| {
+            crate::sim::production::can_build(sim, rules, self.house, ty, false, false)
+                == crate::sim::production::CanBuild::Yes
+        };
+        if let Some(name) = self.corridor_stone_name.clone()
+            && rules.object(&name).is_some_and(|ty| buildable(ty))
+        {
+            return Some(name);
+        }
+        let mut candidates: Vec<&crate::rules::object_type::ObjectType> = rules
+            .all_objects()
+            .filter(|ty| {
+                ty.category == crate::rules::object_type::ObjectCategory::Building
+                    && ty.base_normal
+                    && !ty.wall
+                    && !ty.naval
+                    && ty.cost > 0
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.cost.cmp(&b.cost).then_with(|| a.id.cmp(&b.id)));
+        let pick = candidates
+            .into_iter()
+            .find(|ty| buildable(ty))
+            .map(|ty| ty.id.clone());
+        self.corridor_stone_name = pick.clone();
+        pick
     }
 
     /// The gun limb's wants, one row per gated defense type. The tiered
@@ -12316,26 +12681,31 @@ impl SuperAi {
     /// ring arms. The house-wide bounds still cap the program — the split
     /// moves guns, never inflates them.
     ///
-    /// The defense persona's fortification branch (D2-B/D2-E) rides past
-    /// the yard rows: the fort anchors — the protected objective, then
-    /// the line's standoff bearings ([`Self::defense_fort_anchors`]) —
-    /// and the corridor chain ([`Self::defense_corridor_anchors`]) run
-    /// their own track, where money and a positive grid are the only
+    /// The defense persona's fortification branch (D2-B/D2-E/D2-F) rides
+    /// past the yard rows: the fort anchors — the protected objective,
+    /// then the line's standoff bearings ([`Self::defense_fort_anchors`])
+    /// — and the corridor program ([`Self::defense_corridor_program`])
+    /// run their own track, where money and a positive grid are the only
     /// caps. Each anchor asks for the one gun its ring misses next —
     /// the AA leg opens only while the wave carries aircraft and holds
     /// one AA gun per [`DEFENSE_CORRIDOR_AA_PER_GROUND`] ground guns,
     /// the heavy tower leads while its radar gate stands, the pillbox
     /// answers behind it when the wallet refuses the heavy. The sites
     /// rank most-naked first, so the program spreads along the corridor
-    /// instead of stacking one anchor. Past each anchor's floors the
-    /// track rides its pacing window ([`DEFENSE_CORRIDOR_GUN_WINDOW`],
-    /// armed where the gun files) — a pace, not a cap, keeping the
-    /// growth tail's slots alive between the towers. A fort want returns
-    /// its own [`PlacementRoute::Fort`], so the ready gun's weighted
-    /// scan centers the anchor instead of the yard.
+    /// instead of stacking one anchor; the corridor walk contributes
+    /// only links the build area already reaches (the frontier links it
+    /// owes stones to land in [`Self::corridor_stones`] instead — the
+    /// stone arm queues them ahead of the guns). Past each anchor's
+    /// floors the track rides its pacing window
+    /// ([`DEFENSE_CORRIDOR_GUN_WINDOW`], armed where the gun or stone
+    /// files) — a pace, not a cap, keeping the growth tail's slots alive
+    /// between the towers. A fort want returns its own
+    /// [`PlacementRoute::Fort`], so the ready gun's weighted scan
+    /// centers the anchor instead of the yard.
     fn defense_gun_wants(
         &mut self,
         sim: &crate::sim::world::Simulation,
+        rules: &crate::rules::ruleset::RuleSet,
         opening: &Opening,
         bases: &[(i16, i16)],
         tick: u32,
@@ -12344,14 +12714,14 @@ impl SuperAi {
         french_house: bool,
     ) -> Vec<(&'static str, PlacementRoute)> {
         let yards: Vec<(i16, i16)> = bases.to_vec();
-        // The fort anchors and the corridor chain join only while the
+        // The fort anchors and the corridor program join only while the
         // persona is adopted; the battle read keeps the yard list
         // verbatim. Each anchor carries the wave source it faces (the
         // anchor itself when no bearing resolves; the corridor's threat
         // cell for a chain link).
         let fort_sites = if self.defense.is_some() {
             let mut sites = self.defense_fort_anchors(sim);
-            sites.extend(self.defense_corridor_anchors(sim, opening));
+            sites.extend(self.defense_corridor_program(sim, rules, opening));
             sites
         } else {
             Vec::new()
@@ -19043,6 +19413,17 @@ fn chrono_steal_dest(
 /// two-cell ring included, in case an expansion ever drops a factory
 /// here): the expansion bases pack tighter than the home yard's ring and
 /// sealed their own doors the same way.
+/// The first legal placement origin for `ty` past `min_distance` from
+/// `from`, scanning outward from `center` ring by ring in a fixed
+/// row-major order. The MCV-deploy callers pass `build_area_owner =
+/// None`: a deployment is a unit unfold the build-area admission never
+/// gates, and the far aim is the point. A sidebar placement (the first
+/// expansion's refinery) names its house instead — the engine runs its
+/// own `Adjacent+1` admission ([`crate::sim::production::is_within_build_area`],
+/// the same read [`site_candidate_legal`] folds in) at apply time, and a
+/// far pick past the outpost yard's ring wedged the ready item on
+/// OutOfBuildArea rejections, one cell re-refused placement after
+/// placement until the strike pause lifted and the loop ran again.
 fn find_site_beyond(
     sim: &crate::sim::world::Simulation,
     rules: &crate::rules::ruleset::RuleSet,
@@ -19052,6 +19433,7 @@ fn find_site_beyond(
     house: InternedId,
     from: (i16, i16),
     min_distance: i16,
+    build_area_owner: Option<&str>,
 ) -> Option<(u16, u16)> {
     let own_rects = own_structure_rects(sim, rules, house);
     let clearance = if EXIT_CLEARANCE_TYPES.contains(&ty.id.as_str()) {
@@ -19085,7 +19467,7 @@ fn find_site_beyond(
                 ) {
                     continue;
                 }
-                if crate::sim::build_site::can_place_building_at(
+                if !crate::sim::build_site::can_place_building_at(
                     sim,
                     rules,
                     Some(registry),
@@ -19095,8 +19477,21 @@ fn find_site_beyond(
                     None,
                     None,
                 ) {
-                    return Some((origin.0 as u16, origin.1 as u16));
+                    continue;
                 }
+                if build_area_owner.is_some_and(|owner| {
+                    !crate::sim::production::is_within_build_area(
+                        sim,
+                        rules,
+                        owner,
+                        ty,
+                        origin.0 as u16,
+                        origin.1 as u16,
+                    )
+                }) {
+                    continue;
+                }
+                return Some((origin.0 as u16, origin.1 as u16));
             }
         }
     }

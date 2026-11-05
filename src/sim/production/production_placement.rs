@@ -855,6 +855,21 @@ pub fn is_within_build_area(
     false
 }
 
+/// The farthest Chebyshev center offset a next ladder stone of `obj`'s
+/// footprint may stand from a standing stone footprint while some provider
+/// cell still falls in the placed ring: the ring reaches
+/// `adjacent + 1` past the placed foundation's edges
+/// ([`cell_in_build_area_ring`]) and keeps that reach across the
+/// footprint's own span. The defense persona's corridor walk caps its
+/// lattice step with this, so each stone it queues stands inside the
+/// build area the stone before it carries — the engine's own admission
+/// ([`is_within_build_area`]), not a hand-picked spacing.
+pub fn build_area_reach_cells(obj: &ObjectType) -> i32 {
+    let (width, height) = obj.foundation.dimensions();
+    let span = i32::from(width.max(height)).saturating_sub(1);
+    obj.adjacent.saturating_add(1).saturating_add(span)
+}
+
 fn cell_in_build_area_ring(
     placed: (u16, u16, u16, u16),
     provider_cell: (u16, u16),
