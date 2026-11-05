@@ -1243,6 +1243,23 @@ const POWER_HEADROOM_TARGET: i32 = 250;
 /// a game where the grid stayed red long after the raid left).
 const DEFENSE_POWER_MARGIN: i32 = 200;
 
+/// The persona's own ceiling on the preemption's standing plant count:
+/// the battle AI's [`POWER_CAP`] keeps holding for a battle house, while
+/// a persona house rides this bound. The corridor program's stones are
+/// the power plant type itself — the stone picker takes the cheapest
+/// `BaseNormal=yes` provider and that is the plant — so the stones and
+/// the base plants together push the standing count past the battle cap
+/// long before the tower ring finishes, and with the cap reached the
+/// stock-deficit arm was the only plant path left: a browned grid could
+/// never buy its way out (observed live: a Yuri house at power
+/// 4779/5030 with the drain still climbing, the preemption capped while
+/// the towers drained past it). The margin itself is the natural bound —
+/// the arm goes quiet the moment the headroom clears
+/// [`DEFENSE_POWER_MARGIN`] — so the number only keeps a runaway queue
+/// finite; 48 is three battle caps, far past any grid the persona can
+/// drain.
+const DEFENSE_POWER_CAP: usize = 48;
+
 /// Deterministic fan-out offsets (cells) that keep the AI's destinations
 /// from converging on one point: rallies, guard posts and wave destinations
 /// each pick an offset by index or entity id, so a group spreads over
@@ -6730,6 +6747,19 @@ impl SuperAi {
             let (output, drain) =
                 crate::sim::production::power_balance_for_owner(sim, rules, &owner);
             let pending = self.pending_structure_drain(sim, rules, &owner);
+            // The preemption's plant ceiling: the battle AI's cap for a
+            // battle house, the persona's own bound while the persona
+            // stands ([`DEFENSE_POWER_CAP`]). The corridor stones are the
+            // plant type itself, so the persona's standing plant count
+            // rides past the battle cap long before the tower ring
+            // finishes — and a cap hit there pinned a browned grid into
+            // a permanent blackout, the stock arm below being the only
+            // plant path left.
+            let power_cap = if self.defense.is_some() {
+                DEFENSE_POWER_CAP
+            } else {
+                POWER_CAP
+            };
             // The late-power override (W2): when the power limb would
             // build a fifth-plus plant — [`NUCLEAR_OVERRIDE_PLANTS`]
             // standing and the limb's own want, the preemption's deficit
@@ -6761,7 +6791,7 @@ impl SuperAi {
                 return vec![CommandEnvelope::new(self.house, at, command)];
             }
             if output - drain < DEFENSE_POWER_MARGIN
-                && self.count_structures_of_type(sim, opening.power) < POWER_CAP
+                && self.count_structures_of_type(sim, opening.power) < power_cap
                 && let Some(ty) = rules.object(opening.power)
                 && crate::sim::production::credits_for_owner(sim, &owner) >= ty.cost
                 && crate::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
