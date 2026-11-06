@@ -194,6 +194,15 @@ pub struct ArtEntry {
     /// not its `Image=`, the current byte as default. Read through
     /// [`ArtRegistry::use_buffer`]; it selects the depth-tested voxel raster.
     pub use_buffer: bool,
+    /// `DisableVoxelCache=` (TechnoType `+0xDBE`) and `DisableShadowCache=`
+    /// (`+0xDBF`): the constructor writes false to both (`0x00711658`,
+    /// `0x0071165E`); ReadINI reads them like `UseBuffer=`, with ReadBool
+    /// under the type's own ID, the current byte as default (`0x00715967`,
+    /// `0x0071598B`). Read through [`ArtRegistry::disable_voxel_cache`] and
+    /// [`ArtRegistry::disable_shadow_cache`]: they key a part or shadow draw
+    /// -1 (`0x00706806`, `0x00706C33`).
+    pub disable_voxel_cache: bool,
+    pub disable_shadow_cache: bool,
     /// `CanBeHidden=` (TechnoType `+0x724`): constructor `0x00711229` writes
     /// true; ReadINI (`0x007121EB..0x00712202`) reads it the same way as
     /// `UseBuffer=`, with ReadBool from the ART INI under the type's own ID.
@@ -1225,16 +1234,18 @@ impl ArtRegistry {
             // BuildingTypeClass reads Height first, then passes that resolved
             // field value as the default for OccupyHeight.
             let occupy_height: i32 = section.read_int("OccupyHeight", height);
-            // `MuzzleFlash%d=` is ReadMinMax (`0x0046033F`).
+            // `MuzzleFlash%d=` is ReadMinMax (`0x0046033F`) for every index
+            // below MaxNumberOccupants (`0x00460285..0x00460382`): it reads
+            // past a missing index, and (0xFFFF, 0xFFFF), the default, becomes
+            // (0, 0). The type holds ten. Residual: a MaxNumberOccupants above
+            // ten overruns that array natively; no retail type sets one.
             let muzzle_flash_positions: Vec<(i32, i32)> = (0..10)
-                .map_while(|i| {
-                    let key = format!("MuzzleFlash{i}");
-                    if !section.is_present(&key) {
-                        return None;
-                    }
-                    let [x, y] = section.read_minmax(&key, [0, 0]);
-                    Some((x, y))
-                })
+                .map(
+                    |i| match section.read_minmax(&format!("MuzzleFlash{i}"), [0xFFFF, 0xFFFF]) {
+                        [0xFFFF, 0xFFFF] => (0, 0),
+                        [x, y] => (x, y),
+                    },
+                )
                 .collect();
             let add_occupy = parse_numbered_cell_offsets(section, "AddOccupy");
             let remove_occupy = parse_numbered_cell_offsets(section, "RemoveOccupy");
@@ -1306,6 +1317,8 @@ impl ArtRegistry {
                     extra_light,
                     terrain_palette: section.read_bool("TerrainPalette", false),
                     use_buffer: section.read_bool("UseBuffer", false),
+                    disable_voxel_cache: section.read_bool("DisableVoxelCache", false),
+                    disable_shadow_cache: section.read_bool("DisableShadowCache", false),
                     can_be_hidden: section.read_bool("CanBeHidden", true),
                     queueing_cell,
                     pads,
@@ -1728,6 +1741,21 @@ impl ArtRegistry {
         self.entries
             .get(type_id)
             .is_some_and(|entry| entry.use_buffer)
+    }
+
+    /// A TechnoType's `DisableVoxelCache=`, from the ART section named by its
+    /// exact type ID; false without that section.
+    pub fn disable_voxel_cache(&self, type_id: &str) -> bool {
+        self.entries
+            .get(type_id)
+            .is_some_and(|entry| entry.disable_voxel_cache)
+    }
+
+    /// A TechnoType's `DisableShadowCache=`, read the same way.
+    pub fn disable_shadow_cache(&self, type_id: &str) -> bool {
+        self.entries
+            .get(type_id)
+            .is_some_and(|entry| entry.disable_shadow_cache)
     }
 
     /// A TechnoType's `CanBeHidden=`, from the ART section named by its exact

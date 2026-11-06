@@ -62,9 +62,9 @@
 //! `--starts 30` the match map with ore and trees. Add `--size 500` for a
 //! literal `Size=0,0,500,500` map using the extended cell array.
 //!
-//! The simulation batches its path searches as a real match does;
-//! `--serial-paths` searches in native order instead. Target scans run at
-//! each object's turn; `--serial-scans` remains an accepted compatibility flag.
+//! The simulation batches its path searches and target scans as a real
+//! match does; `--serial-paths` searches and `--serial-scans` scans in native
+//! order instead.
 //!
 //! Beside each frame's wall time, the CSV's `cpu_ms` column and the
 //! `main_thread_cpu_*` line give the main thread's CPU time (Unix only). On a
@@ -158,6 +158,7 @@ struct Args {
     builtin_country: LaunchCountry,
     builtin_difficulty: AiDifficulty,
     super_tier: vera20k_core::super_ai::SuperAiDifficulty,
+    serial_scans: bool,
     frame_profile: bool,
     lan: bool,
     frame_hashes: Option<PathBuf>,
@@ -206,6 +207,7 @@ fn parse_args_from(mut argv: impl Iterator<Item = String>) -> Result<Args, Strin
         builtin_country: LaunchCountry::Russia,
         builtin_difficulty: AiDifficulty::Hard,
         super_tier: vera20k_core::super_ai::SuperAiDifficulty::Fair,
+        serial_scans: false,
         frame_profile: false,
         lan: false,
         frame_hashes: None,
@@ -300,7 +302,7 @@ fn parse_args_from(mut argv: impl Iterator<Item = String>) -> Result<Args, Strin
             "--lan" => args.lan = true,
             "--frame-hashes" => args.frame_hashes = Some(PathBuf::from(value()?)),
             "--client-timing" => args.client_timing = true,
-            "--serial-scans" => {} // All target scans already run at their object turn.
+            "--serial-scans" => args.serial_scans = true,
             other => return Err(format!("unrecognised argument {other}")),
         }
     }
@@ -897,7 +899,10 @@ fn main() -> Result<(), String> {
     // A defense run traces its triggers: the map's waves must be visible in
     // the same run that answers them.
     if args.defense {
-        scenario.runtime.simulation.enable_trigger_trace();
+        scenario.runtime.simulation.enable_headless_trigger_trace();
+    }
+    if !args.serial_scans {
+        scenario.runtime.simulation.batch_target_scans();
     }
     scenario
         .runtime
@@ -1015,7 +1020,7 @@ fn main() -> Result<(), String> {
     );
     let live_at_end = runtime.simulation.entities().len();
     if args.defense {
-        let trace = runtime.simulation.take_trigger_trace();
+        let trace = runtime.simulation.take_headless_trigger_trace();
         let mut spawned_teams = 0usize;
         let mut refused = 0usize;
         for event in &trace {

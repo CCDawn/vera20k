@@ -173,7 +173,7 @@ impl TraceSink {
         })
     }
 
-    fn write(&mut self, tick: u64, event: &vera20k_core::sim::trigger_runtime::TriggerTraceEvent) {
+    fn write(&mut self, tick: u64, event: &vera20k_core::sim::trigger_runtime::HeadlessTriggerEvent) {
         use std::io::Write;
         let line = serde_json::to_string(event).expect("trace event serialises");
         let _ = writeln!(self.writer, "{{\"tick\":{tick},\"event\":{line}}}");
@@ -197,7 +197,7 @@ struct TraceSummary {
 /// reports `ok = false`), a detail-only record is an effect, everything else
 /// is a bare trigger fire.
 fn summarize_events(
-    events: &[vera20k_core::sim::trigger_runtime::TriggerTraceEvent],
+    events: &[vera20k_core::sim::trigger_runtime::HeadlessTriggerEvent],
 ) -> TraceSummary {
     let mut summary = TraceSummary {
         fires: 0,
@@ -221,7 +221,7 @@ fn drain_trace(
     tick: u64,
     summary: &mut TraceSummary,
 ) {
-    let events = scenario.runtime.simulation.take_trigger_trace();
+    let events = scenario.runtime.simulation.take_headless_trigger_trace();
     if let Some(sink) = sink {
         for event in &events {
             sink.write(tick, event);
@@ -472,7 +472,7 @@ fn main() -> Result<(), String> {
                 println!("lobby slot houses installed: {}", slots.len());
             }
             if trace_sink.is_some() {
-                scenario.runtime.simulation.enable_trigger_trace();
+                scenario.runtime.simulation.enable_headless_trigger_trace();
             }
             println!(
                 "loaded {map} ({}x{}, theater {}) seed 0x{:08X}",
@@ -539,10 +539,10 @@ fn main() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vera20k_core::sim::trigger_runtime::TriggerTraceEvent;
+    use vera20k_core::sim::trigger_runtime::HeadlessTriggerEvent;
 
-    fn event(action: Option<i32>, ok: Option<bool>, detail: Option<&str>) -> TriggerTraceEvent {
-        TriggerTraceEvent {
+    fn event(action: Option<i32>, ok: Option<bool>, detail: Option<&str>) -> HeadlessTriggerEvent {
+        HeadlessTriggerEvent {
             trigger: None,
             event: None,
             action,
