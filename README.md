@@ -19,6 +19,34 @@ VERA20K is a community-led rewrite of the original engine, `gamemd.exe`. It uses
 game files, so you'll need your own copy of Red Alert 2: Yuri's Revenge.
 
 > **Fork note:** this branch adds **Super AI**, a stronger computer opponent — see [SUPERAI.md](SUPERAI.md).
+> The same build also carries a **defense persona**: on wave-defense maps the AI detects the
+> map form and co-defends automatically — fortifying the attack routes, staffing the objective
+> ring and holding the line with you. Setup and play instructions live in the
+> [defense-AI guide (中文)](docs/defense-ai-install.zh.md).
+
+### Defense AI showcase（防守 AI 展示）
+
+Shots from live defense matches — tower rings on the shared objective, fort lines laddered
+along the wave approaches, garrisons and quality units held in reserve:
+
+<table>
+  <tr>
+    <td><img src="docs/images/defense-ai/allied-fort-line.png" alt="Allied fort line: prism towers, pillboxes and walls layered in depth" width="100%"></td>
+    <td><img src="docs/images/defense-ai/yuri-corridor-guns.png" alt="Yuri corridor guns: gattling towers and walls climbing the approach" width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center">盟军：光棱塔+碉堡+围墙层层设防</td>
+    <td align="center">尤里：走廊炮阵沿进攻路线梯次推进</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/defense-ai/yuri-tower-ring-snow.png" alt="Yuri tower ring on snow: a walled base cluster with tech online" width="100%"></td>
+    <td><img src="docs/images/defense-ai/allied-base-stand.png" alt="Allied base standing against the incoming armor wave" width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center">尤里：雪地图塔环驻守、科技成型</td>
+    <td align="center">盟军：重兵囤防迎击装甲波次</td>
+  </tr>
+</table>
 
 VERA20K is made by gamers, for gamers, and gamers have the final say in where it goes.
 
