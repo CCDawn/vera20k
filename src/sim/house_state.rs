@@ -1526,7 +1526,7 @@ impl HouseState {
     /// saves written before the mark existed. The strongest policy knob
     /// decides (`DriverPolicy::infer_tier`), so a tier-launched house
     /// reports exactly its launch tier.
-    pub const fn super_tier(&self) -> Option<crate::super_ai::SuperAiDifficulty> {
+    pub const fn super_tier(&self) -> Option<crate::sim::driver::SuperAiDifficulty> {
         match self.super_tier {
             Some(policy) => Some(policy.infer_tier()),
             None => None,

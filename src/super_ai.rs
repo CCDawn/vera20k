@@ -42,6 +42,12 @@ use crate::sim::command::CommandEnvelope;
 use crate::sim::intern::InternedId;
 use crate::sim::runtime::SimRuntime;
 
+// The difficulty ladder and its Unlimited wallet floor live in
+// `sim::driver` beside the policy they map onto, so the engine never
+// imports this module (the Phase 1a cycle break). Re-exported unchanged
+// for every existing caller of `super_ai::SuperAiDifficulty`.
+pub use crate::sim::driver::{SuperAiDifficulty, UNLIMITED_WALLET_FLOOR};
+
 /// Ticks between two deploy retries: enough for the MCV's deploy animation to
 /// finish, few enough to recover within a minute of game time.
 const DEPLOY_RETRY_TICKS: u32 = 90;
@@ -1749,36 +1755,6 @@ impl ChronoSteal {
         }
     }
 }
-
-/// The ladder the Super AI plays at.
-///
-/// The tiers describe the target behaviour, not what the current milestone
-/// does; see the module docs for the milestone split.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub enum SuperAiDifficulty {
-    /// Zero bonuses, pure decisions: the benchmark baseline. Whatever the
-    /// decision layer achieves at this tier is skill, not subsidy.
-    #[default]
-    Fair,
-    /// Fair play plus credit and harvesting bonuses, in the economy the
-    /// simulation already owns. Lands in a later milestone.
-    Brutal,
-    /// Fast building, parallel factories and continuous unit production on
-    /// top of Brutal's economy. The build-speed knob is a later milestone's
-    /// minimal simulation-side change; nothing simulation-side changes yet.
-    Super,
-    /// Super's treatment plus a wallet floor topped up every tick: the
-    /// spectacle tier for watching the strategy spend without an economy
-    /// behind it. Fork-only showcase row — strength claims never cite it,
-    /// and the income-recovery cancel rule stays asleep under it (a
-    /// wallet above every buildable's cost can finish anything queued).
-    Unlimited,
-}
-
-/// The wallet floor the Unlimited tier tops up to every ordinary tick
-/// (`sim_tick` and the benches apply the same rule). Comfortably above the
-/// priciest retail buildable so every queue the house owns rolls at once.
-pub const UNLIMITED_WALLET_FLOOR: i32 = 1_000_000;
 
 /// The second personality's stance (`docs/defense-ai.md`). Mode A is the
 /// independent zone; mode B — full-map cooperative defense — arms on a

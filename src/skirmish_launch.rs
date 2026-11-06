@@ -575,7 +575,7 @@ pub struct SkirmishAiSlot {
     /// (`HouseState::command_driven`) and the app's match loop drives it
     /// through the command layer instead. `None` is a native computer.
     #[serde(default)]
-    pub super_tier: Option<crate::super_ai::SuperAiDifficulty>,
+    pub super_tier: Option<crate::sim::driver::SuperAiDifficulty>,
 }
 
 fn legacy_raw_ai_slot() -> u8 {

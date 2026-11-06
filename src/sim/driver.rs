@@ -27,9 +27,41 @@
 
 use crate::sim::intern::InternedId;
 use crate::sim::runtime::SimRuntime;
-use crate::super_ai::SuperAiDifficulty;
 use crate::util::native_x87::NativeF32Bits;
 use serde::{Deserialize, Serialize};
+
+/// The ladder the Super AI plays at.
+///
+/// The tiers describe the target behaviour, not what the current milestone
+/// does; see the `super_ai` module docs for the milestone split. The type
+/// lives here, beside the policy it maps onto, so the engine can carry a
+/// tier in launch slots and saved houses without reaching into the AI
+/// module; `super_ai` re-exports it unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum SuperAiDifficulty {
+    /// Zero bonuses, pure decisions: the benchmark baseline. Whatever the
+    /// decision layer achieves at this tier is skill, not subsidy.
+    #[default]
+    Fair,
+    /// Fair play plus credit and harvesting bonuses, in the economy the
+    /// simulation already owns. Lands in a later milestone.
+    Brutal,
+    /// Fast building, parallel factories and continuous unit production on
+    /// top of Brutal's economy. The build-speed knob is a later milestone's
+    /// minimal simulation-side change; nothing simulation-side changes yet.
+    Super,
+    /// Super's treatment plus a wallet floor topped up every tick: the
+    /// spectacle tier for watching the strategy spend without an economy
+    /// behind it. Fork-only showcase row — strength claims never cite it,
+    /// and the income-recovery cancel rule stays asleep under it (a
+    /// wallet above every buildable's cost can finish anything queued).
+    Unlimited,
+}
+
+/// The wallet floor the Unlimited tier tops up to every ordinary tick
+/// (`sim_tick` and the benches apply the same rule). Comfortably above the
+/// priciest retail buildable so every queue the house owns rolls at once.
+pub const UNLIMITED_WALLET_FLOOR: i32 = 1_000_000;
 
 /// A recurring credit bonus: `amount` every `interval_ticks` ticks. The
 /// tiers' drip is +1000 per 600 ticks.
@@ -58,7 +90,7 @@ pub struct DriverPolicy {
     /// Production build-time scale (`HouseState::set_native_build_time_scale`).
     pub build_time_scale: Option<NativeF32Bits>,
     /// Per-tick wallet top-up (`Self::apply_credit_support`); the tiers use
-    /// `crate::super_ai::UNLIMITED_WALLET_FLOOR`.
+    /// [`UNLIMITED_WALLET_FLOOR`].
     pub wallet_floor: Option<i32>,
 }
 
@@ -142,7 +174,7 @@ impl From<SuperAiDifficulty> for DriverPolicy {
                 native_hard_grant: true,
                 credit_drip: None,
                 build_time_scale: Some(HALVED_BUILD_TIME),
-                wallet_floor: Some(crate::super_ai::UNLIMITED_WALLET_FLOOR),
+                wallet_floor: Some(UNLIMITED_WALLET_FLOOR),
             },
         }
     }
@@ -250,7 +282,7 @@ mod tests {
         let unlimited = DriverPolicy::from(SuperAiDifficulty::Unlimited);
         assert_eq!(
             unlimited.wallet_floor,
-            Some(crate::super_ai::UNLIMITED_WALLET_FLOOR)
+            Some(UNLIMITED_WALLET_FLOOR)
         );
         assert_eq!(unlimited.credit_drip, None);
 
@@ -325,7 +357,7 @@ mod tests {
         DriverPolicy::from(SuperAiDifficulty::Unlimited).apply_credit_support(&mut runtime, id, 0);
         assert_eq!(
             runtime.simulation.houses[&id].economy().available_money(),
-            crate::super_ai::UNLIMITED_WALLET_FLOOR
+            UNLIMITED_WALLET_FLOOR
         );
 
         // Brutal: the drip lands on its interval ticks only.

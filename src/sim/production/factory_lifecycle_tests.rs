@@ -2513,7 +2513,7 @@ fn command_driven_completion_publishes_without_a_strip() {
     sim.houses
         .get_mut(&owner)
         .unwrap()
-        .make_command_driven(crate::super_ai::SuperAiDifficulty::Fair);
+        .make_command_driven(crate::sim::driver::SuperAiDifficulty::Fair);
     assert!(enqueue_by_type(
         &mut sim,
         &rules,
