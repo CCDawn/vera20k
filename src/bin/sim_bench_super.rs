@@ -31,7 +31,7 @@ use vera20k_core::sim::intern::InternedId;
 use vera20k_core::sim::runtime::SimRuntime;
 use vera20k_core::sim::world::{FrameEffects, TickLane};
 use vera20k_core::skirmish_launch::{AiDifficulty, LaunchCountry, SkirmishLaunchSession};
-use vera20k_core::super_ai::{SuperAi, SuperAiDifficulty};
+use vera20k_superai::{SuperAi, SuperAiDifficulty};
 
 /// The `--max-ticks` backstop when the flag is absent: at 66 ms a tick, half
 /// an hour of game time before a game is called dead.

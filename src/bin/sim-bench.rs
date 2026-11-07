@@ -157,7 +157,7 @@ struct Args {
     super_country: LaunchCountry,
     builtin_country: LaunchCountry,
     builtin_difficulty: AiDifficulty,
-    super_tier: vera20k_core::super_ai::SuperAiDifficulty,
+    super_tier: vera20k_superai::SuperAiDifficulty,
     serial_scans: bool,
     frame_profile: bool,
     lan: bool,
@@ -206,7 +206,7 @@ fn parse_args_from(mut argv: impl Iterator<Item = String>) -> Result<Args, Strin
         super_country: LaunchCountry::America,
         builtin_country: LaunchCountry::Russia,
         builtin_difficulty: AiDifficulty::Hard,
-        super_tier: vera20k_core::super_ai::SuperAiDifficulty::Fair,
+        super_tier: vera20k_superai::SuperAiDifficulty::Fair,
         serial_scans: false,
         frame_profile: false,
         lan: false,
@@ -286,10 +286,10 @@ fn parse_args_from(mut argv: impl Iterator<Item = String>) -> Result<Args, Strin
             }
             "--super-tier" => {
                 args.super_tier = match value()?.as_str() {
-                    "fair" => vera20k_core::super_ai::SuperAiDifficulty::Fair,
-                    "brutal" => vera20k_core::super_ai::SuperAiDifficulty::Brutal,
-                    "super" => vera20k_core::super_ai::SuperAiDifficulty::Super,
-                    "unlimited" => vera20k_core::super_ai::SuperAiDifficulty::Unlimited,
+                    "fair" => vera20k_superai::SuperAiDifficulty::Fair,
+                    "brutal" => vera20k_superai::SuperAiDifficulty::Brutal,
+                    "super" => vera20k_superai::SuperAiDifficulty::Super,
+                    "unlimited" => vera20k_superai::SuperAiDifficulty::Unlimited,
                     other => {
                         return Err(format!(
                             "unknown super tier {other}: fair, brutal, super or unlimited"
@@ -539,8 +539,8 @@ enum Plan {
     SkirmishSuper(
         Vec<(
             InternedId,
-            vera20k_core::super_ai::SuperAiDifficulty,
-            vera20k_core::super_ai::SuperAi,
+            vera20k_superai::SuperAiDifficulty,
+            vera20k_superai::SuperAi,
         )>,
     ),
 }
@@ -955,7 +955,7 @@ fn main() -> Result<(), String> {
                 }
                 let drivers = computer_ids
                     .into_iter()
-                    .map(|id| (id, tier, vera20k_core::super_ai::SuperAi::new(id, tier)))
+                    .map(|id| (id, tier, vera20k_superai::SuperAi::new(id, tier)))
                     .collect();
                 let seated = scenario.runtime.simulation.houses().order().len();
                 (seated, 0, Plan::SkirmishSuper(drivers), ticks)

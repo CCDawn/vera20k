@@ -13,7 +13,7 @@ publish = false
 # asset tools and the game binary). The core manifest sits in `src/`, so rustc
 # still names every source file `src/...`.
 [workspace]
-members = ["src", "services/relay-protocol", "services/relay"]
+members = ["src", "services/relay-protocol", "services/relay", "superai"]
 # Plain `cargo build`/`cargo test --lib` cover both crates.
 default-members = [".", "src"]
 
@@ -36,6 +36,12 @@ path = "src/bin/extract-ini.rs"
 name = "telemetry-serve"
 path = "src/bin/telemetry-serve.rs"
 required-features = ["telemetry-dashboard"]
+
+# Simulation tick benchmark at scale (see its module doc). Owned here since
+# Phase 1c: it drives the Super AI through vera20k-superai.
+[[bin]]
+name = "sim-bench"
+path = "src/bin/sim-bench.rs"
 
 [features]
 # Browser host support; target selection still controls every platform implementation.
@@ -75,6 +81,10 @@ debug-tools = ["telemetry-dashboard", "dev-overlays", "vera20k-core/debug-tools"
 [dependencies]
 # The GPU-free engine. Its dev features follow this package's.
 vera20k-core = { path = "src" }
+
+# The fork-original Super AI decision layer, its own crate since Phase 1c;
+# re-exported as `super_ai` from src/lib.rs.
+vera20k-superai = { path = "superai" }
 
 # Background HTTPS lobby I/O; verified TLS is independent of simulation.
 base64 = "0.22"

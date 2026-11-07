@@ -1,0 +1,20 @@
+[package]
+name = "vera20k-superai"
+version = "0.2.6"
+edition = "2024"
+description = "VERA20k's fork-original Super AI: a deterministic decision layer that plays one house through the command stream"
+publish = false
+
+# The client package re-exports this crate as `vera20k::super_ai`, so every
+# existing `crate::super_ai::...` path keeps resolving (Phase 1c crate split).
+[dependencies]
+vera20k-core = { path = "../src" }
+serde = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+# Unit tests round-trip the difficulty ladder through JSON.
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

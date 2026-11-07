@@ -12,9 +12,12 @@
 compile_error!("browser builds require --features wasm");
 
 pub use vera20k_core::{
-    assets, headless_scenario, map, net, rules, sim, skirmish_launch, skirmish_modes, super_ai,
-    util,
+    assets, headless_scenario, map, net, rules, sim, skirmish_launch, skirmish_modes, util,
 };
+
+// The Super AI lives in its own crate since Phase 1c (superai/); this alias
+// keeps every `crate::super_ai::...` path in the client resolving unchanged.
+pub use vera20k_superai as super_ai;
 
 // Cargo unifies dependency features across a workspace. Refuse a client built
 // without its Ares consumers when another package enables the core capability.

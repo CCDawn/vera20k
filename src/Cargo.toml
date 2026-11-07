@@ -19,11 +19,6 @@ path = "core_lib.rs"
 name = "parity-digest"
 path = "bin/parity-digest.rs"
 
-# Release-build simulation tick benchmark at scale (see its module doc).
-[[bin]]
-name = "sim-bench"
-path = "bin/sim-bench.rs"
-
 # External two-client LAN fault proof; absent from normal game builds.
 [[bin]]
 name = "lan-fault-proxy"

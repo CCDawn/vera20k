@@ -44,7 +44,7 @@ use vera20k_core::sim::runtime::SimRuntime;
 use vera20k_core::skirmish_launch::{
     AiDifficulty, LaunchCountry, LaunchStartPosition, SkirmishLaunchSession,
 };
-use vera20k_core::super_ai::{DefenseStance, SuperAi, SuperAiDifficulty};
+use vera20k_superai::{DefenseStance, SuperAi, SuperAiDifficulty};
 
 /// Objects in a squad.
 const SQUAD: usize = 30;
