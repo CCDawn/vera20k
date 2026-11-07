@@ -5801,7 +5801,9 @@ impl Simulation {
     /// Pure read: no RNG, no mutation, no render/ui dependency. Single
     /// owner and single entry: the seat assembly
     /// (`MatchState::rebuild_super_players`) consumes this; nothing else
-    /// re-walks the trigger instances for map classification.
+    /// re-walks the trigger instances for map classification. External
+    /// plugins (the super-AI crate) run their map-shape classification
+    /// through this entry.
     pub fn defense_map_classification(
         &self,
         driven: &[crate::sim::intern::InternedId],

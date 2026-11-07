@@ -2159,8 +2159,7 @@ fn defense_protected_targets(sim: &crate::sim::world::Simulation) -> Vec<u64> {
     let carries_lose = |actions: &[crate::sim::trigger_runtime::TriggerActionView]| {
         actions.iter().any(|action| matches!(action.kind, 2 | 68))
     };
-    sim.substrate()
-        .entities
+    sim.entities()
         .iter_sorted()
         .filter(|(_, entity)| {
             matches!(
@@ -4174,7 +4173,7 @@ impl SuperAi {
         // until the enemy found it).
         if let Some(mcv) = self.deployable_mcv(sim, rules)
             && !self.mcv_abandoned.contains_key(&mcv)
-            && let Some(entity) = sim.substrate().entities.get(mcv)
+            && let Some(entity) = sim.entities().get(mcv)
             && let Some(yard_name) = rules
                 .object(sim.interner().resolve(entity.type_ref()))
                 .and_then(|ty| ty.deploys_into.as_deref())
@@ -4212,8 +4211,7 @@ impl SuperAi {
                             )
                             .find_map(|member| match member {
                                 crate::sim::occupancy::CellObjectMember::Entity(id) => sim
-                                    .substrate()
-                                    .entities
+                                    .entities()
                                     .get(id)
                                     .filter(|e| {
                                         e.owner() == self.house
@@ -4369,7 +4367,7 @@ impl SuperAi {
         // not to any movement at all: a jiggle of one cell must not renew
         // the budgets the way it renewed the shove loop (observed).
         if let Some(mcv) = self.deployable_mcv(sim, rules)
-            && let Some(entity) = sim.substrate().entities.get(mcv)
+            && let Some(entity) = sim.entities().get(mcv)
         {
             let here = (entity.position.rx(), entity.position.ry());
             let resited = match self.deploy_origin {
@@ -4485,7 +4483,7 @@ impl SuperAi {
             home_center.and_then(|home| {
                 self.own_structures(sim).into_iter().find_map(|(id, name)| {
                     (name == opening.refinery)
-                        .then(|| sim.substrate().entities.get(id))
+                        .then(|| sim.entities().get(id))
                         .flatten()
                         .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))
                         .filter(|cell| {
@@ -4560,7 +4558,7 @@ impl SuperAi {
             && let Some(home) = home_center
             && self.own_structures(sim).iter().any(|(id, name)| {
                 name == opening.refinery
-                    && sim.substrate().entities.get(*id).is_some_and(|entity| {
+                    && sim.entities().get(*id).is_some_and(|entity| {
                         (entity.position.rx() as i16 - home.0)
                             .abs()
                             .max((entity.position.ry() as i16 - home.1).abs())
@@ -5197,7 +5195,7 @@ impl SuperAi {
             let hero_pick = if self.defense.is_some() {
                 None
             } else {
-                sim.substrate().entities.iter_sorted().find(|(id, entity)| {
+                sim.entities().iter_sorted().find(|(id, entity)| {
                     self.order_gate.get(id).is_none_or(|&due| tick >= due)
                         && entity.owner() == self.house
                         && !entity.lifecycle.in_limbo()
@@ -5283,7 +5281,7 @@ impl SuperAi {
             // raid by raid). A raider idle again with his gate lapsed, or
             // gone, is released; the Desolator's walk latch goes with him.
             self.raiders.retain(|&id| {
-                sim.substrate().entities.get(id).is_some_and(|entity| {
+                sim.entities().get(id).is_some_and(|entity| {
                     entity.owner() == self.house
                         && entity.lifecycle.object_alive()
                         && !entity.lifecycle.in_limbo()
@@ -5310,9 +5308,9 @@ impl SuperAi {
             // razed target drops its pair, so the plant's slot re-arms for
             // the next window and the de-dup never holds a ghost.
             self.disc_raids.retain(|(disc, target)| {
-                sim.substrate().entities.get(*disc).is_some_and(|entity| {
+                sim.entities().get(*disc).is_some_and(|entity| {
                     entity.owner() == self.house && entity.lifecycle.object_alive()
-                }) && sim.substrate().entities.get(*target).is_some_and(|entity| {
+                }) && sim.entities().get(*target).is_some_and(|entity| {
                     entity.category() == crate::map::entities::EntityCategory::Structure
                         && entity.lifecycle.object_alive()
                         && !entity.lifecycle.in_limbo()
@@ -5324,7 +5322,7 @@ impl SuperAi {
             // walk latch clears.
             let arrived = self.ore_denial.iter().find(|(deso, cell)| {
                 let (hx, hy) = **cell;
-                sim.substrate().entities.get(**deso).is_some_and(|entity| {
+                sim.entities().get(**deso).is_some_and(|entity| {
                     !entity.is_deployed()
                         && !self.deploy_issued.contains(*deso)
                         && (i32::from(entity.position.rx()) - i32::from(hx))
@@ -5345,7 +5343,7 @@ impl SuperAi {
             }
             if tick >= self.raid_due {
                 let mut raid: Option<(u64, Command)> = None;
-                for (id, entity) in sim.substrate().entities.iter_sorted() {
+                for (id, entity) in sim.entities().iter_sorted() {
                     if entity.owner() != self.house
                         || entity.lifecycle.in_limbo()
                         || !matches!(
@@ -5481,11 +5479,11 @@ impl SuperAi {
             if tick >= self.deploy_due {
                 self.deploy_due = tick + DEPLOY_MECH_TICKS;
                 self.deploy_issued.retain(|&id| {
-                    sim.substrate().entities.get(id).is_some_and(|entity| {
+                    sim.entities().get(id).is_some_and(|entity| {
                         entity.owner() == self.house && entity.lifecycle.object_alive()
                     })
                 });
-                let pick = sim.substrate().entities.iter_sorted().find(|(id, entity)| {
+                let pick = sim.entities().iter_sorted().find(|(id, entity)| {
                     entity.owner() == self.house
                         && entity.lifecycle.object_alive()
                         && !entity.lifecycle.in_limbo()
@@ -5561,7 +5559,7 @@ impl SuperAi {
                 // units inside five cells — an assault buys the field, a
                 // scout does not. Undeploy is nobody's order: the field
                 // decays without one.
-                let deso = sim.substrate().entities.iter_sorted().find(|(id, entity)| {
+                let deso = sim.entities().iter_sorted().find(|(id, entity)| {
                     entity.owner() == self.house
                         && entity.lifecycle.object_alive()
                         && !entity.lifecycle.in_limbo()
@@ -5620,8 +5618,7 @@ impl SuperAi {
                     * self.own_yard_centers(sim, opening).len().max(1)
                     + usize::from(choke.is_some());
                 let dogs_on_post = sim
-                    .substrate()
-                    .entities
+                    .entities()
                     .iter_sorted()
                     .filter(|(_, entity)| {
                         entity.owner() == self.house
@@ -5637,7 +5634,7 @@ impl SuperAi {
                     })
                     .count();
                 if dogs_on_post < sentry_cap {
-                    let pick = sim.substrate().entities.iter_sorted().find(|(id, entity)| {
+                    let pick = sim.entities().iter_sorted().find(|(id, entity)| {
                         self.order_gate.get(id).is_none_or(|&due| tick >= due)
                             && entity.owner() == self.house
                             && entity.category() == crate::map::entities::EntityCategory::Infantry
@@ -5668,7 +5665,7 @@ impl SuperAi {
                             .unwrap_or_default();
                         let post = choke
                             .filter(|&cell| {
-                                !sim.substrate().entities.iter_sorted().any(|(_, entity)| {
+                                !sim.entities().iter_sorted().any(|(_, entity)| {
                                     entity.owner() == self.house
                                         && entity.lifecycle.object_alive()
                                         && !entity.lifecycle.in_limbo()
@@ -5773,7 +5770,7 @@ impl SuperAi {
                 .due_idle_unit(&post_pool, tick)
                 .filter(|&unit| !self.futility_suppressed(unit, FutilityKind::GuardPost, tick))
                 .filter(|&unit| {
-                    sim.substrate().entities.get(unit).is_none_or(|entity| {
+                    sim.entities().get(unit).is_none_or(|entity| {
                         let name = sim.interner().resolve(entity.type_ref());
                         !Self::is_naval_type(opening, name) && !Self::is_fly_type(rules, name)
                     })
@@ -5842,7 +5839,7 @@ impl SuperAi {
                 // must wait its window, not re-pick per tick (the futility
                 // strikes count windows, not ticks).
                 self.gate_idle_order(unit, tick);
-                if let (Some((px, py)), Some(entity)) = (post, sim.substrate().entities.get(unit))
+                if let (Some((px, py)), Some(entity)) = (post, sim.entities().get(unit))
                     && !self.futile(
                         unit,
                         FutilityKind::GuardPost,
@@ -5881,8 +5878,7 @@ impl SuperAi {
         // cannot spin on it.
         {
             let idle_fleet: Vec<u64> = sim
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(id, entity)| {
                     entity.owner() == self.house
@@ -5926,7 +5922,7 @@ impl SuperAi {
                 let sail = self
                     .naval_sortie_target
                     .filter(|&target| {
-                        sim.substrate().entities.get(target).is_some_and(|entity| {
+                        sim.entities().get(target).is_some_and(|entity| {
                             entity.lifecycle.object_alive() && !entity.lifecycle.in_limbo()
                         })
                     })
@@ -5978,8 +5974,7 @@ impl SuperAi {
             let targets: Vec<u64> = self.air_sortie_targets(sim, tick);
             if !targets.is_empty() {
                 let flight: Vec<u64> = sim
-                    .substrate()
-                    .entities
+                    .entities()
                     .iter_sorted()
                     .filter(|(id, entity)| {
                         entity.owner() == self.house
@@ -6053,7 +6048,7 @@ impl SuperAi {
             // Reservation hygiene: dead or boarded boarders (passengers
             // ride in limbo) leave the set.
             self.boarders.retain(|&id| {
-                sim.substrate().entities.get(id).is_some_and(|entity| {
+                sim.entities().get(id).is_some_and(|entity| {
                     entity.owner() == self.house
                         && entity.lifecycle.object_alive()
                         && !entity.lifecycle.in_limbo()
@@ -6067,7 +6062,7 @@ impl SuperAi {
             for (&(unit, _), &attempts) in self.board_attempts.iter() {
                 if attempts >= BOARD_MAX_ATTEMPTS
                     && self.boarders.contains(&unit)
-                    && sim.substrate().entities.get(unit).is_some_and(|entity| {
+                    && sim.entities().get(unit).is_some_and(|entity| {
                         matches!(
                             entity.passive_acquire_mission(),
                             crate::sim::mission::MissionType::None
@@ -6093,7 +6088,7 @@ impl SuperAi {
             // [`FORTRESS_UNLOAD_IDLE_TICKS`] discharges where it stands; the
             // cargo fights on foot and the loading pair refills it later.
             self.fortress_loaded_since.retain(|&id, _| {
-                sim.substrate().entities.get(id).is_some_and(|entity| {
+                sim.entities().get(id).is_some_and(|entity| {
                     entity.owner() == self.house
                         && entity.lifecycle.object_alive()
                         && entity
@@ -6107,8 +6102,7 @@ impl SuperAi {
             {
                 let enemy_center = self.enemy_center(sim);
                 let loaded: Vec<(u64, (i16, i16), bool)> = sim
-                    .substrate()
-                    .entities
+                    .entities()
                     .iter_sorted()
                     .filter(|(_, entity)| {
                         entity.owner() == self.house
@@ -6162,7 +6156,7 @@ impl SuperAi {
             if let Some(fortress_name) = opening.fortress
                 && !cargo_quotas.is_empty()
                 && let Some((fortress_id, fortress_entity)) =
-                    sim.substrate().entities.iter_sorted().find(|(_, entity)| {
+                    sim.entities().iter_sorted().find(|(_, entity)| {
                         entity.owner() == self.house
                             && entity.category() == crate::map::entities::EntityCategory::Unit
                             && sim.interner().resolve(entity.type_ref()) == fortress_name
@@ -6188,7 +6182,7 @@ impl SuperAi {
                         cargo
                             .passengers()
                             .iter()
-                            .filter_map(|&rider| sim.substrate().entities.get(rider))
+                            .filter_map(|&rider| sim.entities().get(rider))
                             .map(|rider| sim.interner().resolve(rider.type_ref()))
                             .collect()
                     })
@@ -6196,7 +6190,7 @@ impl SuperAi {
                 let reserved: Vec<&str> = self
                     .boarders
                     .iter()
-                    .filter_map(|&unit| sim.substrate().entities.get(unit))
+                    .filter_map(|&unit| sim.entities().get(unit))
                     .map(|rider| sim.interner().resolve(rider.type_ref()))
                     .collect();
                 let open_seats: Vec<(usize, &'static str)> = cargo_quotas
@@ -6214,7 +6208,7 @@ impl SuperAi {
                 // and a pair past its attempt budget waits for the pool-back
                 // pass above.
                 let mut boarding: Option<(usize, u32, u64)> = None;
-                for (id, entity) in sim.substrate().entities.iter_sorted() {
+                for (id, entity) in sim.entities().iter_sorted() {
                     let type_name = sim.interner().resolve(entity.type_ref());
                     let Some(&(rank, _)) = open_seats.iter().find(|(_, name)| *name == type_name)
                     else {
@@ -6269,8 +6263,7 @@ impl SuperAi {
                 }
                 if let Some((_, _, boarder)) = boarding {
                     let boarder_from = sim
-                        .substrate()
-                        .entities
+                        .entities()
                         .get(boarder)
                         .map(|entity| (entity.position.rx(), entity.position.ry()));
                     if let Some(from) = boarder_from
@@ -6333,7 +6326,7 @@ impl SuperAi {
                     self.survey_due = tick + SURVEY_RETRY_TICKS;
                 }
             }
-            let walker = sim.substrate().entities.iter_sorted().find(|(id, entity)| {
+            let walker = sim.entities().iter_sorted().find(|(id, entity)| {
                 self.order_gate.get(id).is_none_or(|&due| tick >= due)
                     && entity.owner() == self.house
                     && entity.category() == crate::map::entities::EntityCategory::Unit
@@ -6476,8 +6469,7 @@ impl SuperAi {
         // march so the home defense keeps its line.
         let scout_is_core = opening.scout == opening.basic_infantry;
         let scouts_out = if scout_is_core {
-            sim.substrate()
-                .entities
+            sim.entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == self.house
@@ -6492,24 +6484,20 @@ impl SuperAi {
             0
         };
         if scouts_out < SCOUT_MAX_ACTIVE {
-            let mut idle_scouts = sim
-                .substrate()
-                .entities
-                .iter_sorted()
-                .filter(|(id, entity)| {
-                    self.order_gate.get(id).is_none_or(|&due| tick >= due)
-                        && entity.owner() == self.house
-                        && entity.category() == crate::map::entities::EntityCategory::Infantry
-                        && sim.interner().resolve(entity.type_ref()) == opening.scout
-                        && !entity.lifecycle.in_limbo()
-                        && matches!(
-                            entity.passive_acquire_mission(),
-                            crate::sim::mission::MissionType::None
-                                | crate::sim::mission::MissionType::Sleep
-                                | crate::sim::mission::MissionType::Guard
-                                | crate::sim::mission::MissionType::AreaGuard
-                        )
-                });
+            let mut idle_scouts = sim.entities().iter_sorted().filter(|(id, entity)| {
+                self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                    && entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Infantry
+                    && sim.interner().resolve(entity.type_ref()) == opening.scout
+                    && !entity.lifecycle.in_limbo()
+                    && matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    )
+            });
             if let Some((scout, entity)) = idle_scouts.next() {
                 let from = (entity.position.rx() as i16, entity.position.ry() as i16);
                 if let Some(cell) = self.nearest_unrevealed_cell(sim, from, &self.scout_blacklist) {
@@ -6550,24 +6538,22 @@ impl SuperAi {
         // ignores). With nothing revealed to run at, the spy stays home
         // like any other garrison piece. The futility backoff bounds the
         // re-issue loop the same way the scout's march is bounded.
-        if let Some((spy, spy_entity)) =
-            sim.substrate().entities.iter_sorted().find(|(id, entity)| {
-                self.order_gate.get(id).is_none_or(|&due| tick >= due)
-                    && entity.owner() == self.house
-                    && entity.category() == crate::map::entities::EntityCategory::Infantry
-                    && sim.interner().resolve(entity.type_ref()) == SPY_TYPE
-                    && !entity.lifecycle.in_limbo()
-                    && !self.boarders.contains(id)
-                    && !self.raiders.contains(id)
-                    && matches!(
-                        entity.passive_acquire_mission(),
-                        crate::sim::mission::MissionType::None
-                            | crate::sim::mission::MissionType::Sleep
-                            | crate::sim::mission::MissionType::Guard
-                            | crate::sim::mission::MissionType::AreaGuard
-                    )
-            })
-        {
+        if let Some((spy, spy_entity)) = sim.entities().iter_sorted().find(|(id, entity)| {
+            self.order_gate.get(id).is_none_or(|&due| tick >= due)
+                && entity.owner() == self.house
+                && entity.category() == crate::map::entities::EntityCategory::Infantry
+                && sim.interner().resolve(entity.type_ref()) == SPY_TYPE
+                && !entity.lifecycle.in_limbo()
+                && !self.boarders.contains(id)
+                && !self.raiders.contains(id)
+                && matches!(
+                    entity.passive_acquire_mission(),
+                    crate::sim::mission::MissionType::None
+                        | crate::sim::mission::MissionType::Sleep
+                        | crate::sim::mission::MissionType::Guard
+                        | crate::sim::mission::MissionType::AreaGuard
+                )
+        }) {
             let from = (
                 spy_entity.position.rx() as i16,
                 spy_entity.position.ry() as i16,
@@ -7314,8 +7300,7 @@ impl SuperAi {
             // baseline always rebuilt) — while the defense side keeps
             // the halt as written.
             let docks_rebuild = !economy_brake
-                && (self.defense.is_none()
-                    || self.refinery_losses < REFINERY_REBUILD_BACKOFF);
+                && (self.defense.is_none() || self.refinery_losses < REFINERY_REBUILD_BACKOFF);
             // The fleet that feeds the next dock: the table's harvester
             // when the side roams one; a side whose table names none reads
             // the dock's own FreeUnit (Yuri's slave miner — each dock
@@ -7848,7 +7833,7 @@ impl SuperAi {
                 .into_iter()
                 .filter(|(_, name)| name == opening.war_factory)
                 .filter_map(|(id, _)| {
-                    sim.substrate().entities.get(id).map(|entity| {
+                    sim.entities().get(id).map(|entity| {
                         (
                             id,
                             (entity.position.rx() as i16, entity.position.ry() as i16),
@@ -7872,7 +7857,7 @@ impl SuperAi {
                     .map(|cell| (id, cell))
                 })
                 .find(|&(id, desired)| {
-                    sim.substrate().entities.get(id).is_some_and(|factory| {
+                    sim.entities().get(id).is_some_and(|factory| {
                         factory.rally_cell() != Some(desired)
                             && self.rally_gate.get(&id).is_none_or(|&next| tick >= next)
                     })
@@ -7985,7 +7970,7 @@ impl SuperAi {
             .into_iter()
             .filter(|(_, name)| name == opening.war_factory)
             .filter_map(|(id, _)| {
-                sim.substrate().entities.get(id).and_then(|entity| {
+                sim.entities().get(id).and_then(|entity| {
                     (entity.lifecycle.object_alive() && entity.building_online()).then_some({
                         (
                             id,
@@ -8586,7 +8571,7 @@ impl SuperAi {
         sim: &crate::sim::world::Simulation,
         rules: &crate::rules::ruleset::RuleSet,
     ) -> Option<u64> {
-        let yard_stands = sim.substrate().entities.iter_sorted().any(|(_, entity)| {
+        let yard_stands = sim.entities().iter_sorted().any(|(_, entity)| {
             entity.owner() == self.house
                 && entity.category() == crate::map::entities::EntityCategory::Structure
                 && OPENINGS
@@ -8596,7 +8581,7 @@ impl SuperAi {
         if yard_stands {
             return None;
         }
-        for (id, entity) in sim.substrate().entities.iter_sorted() {
+        for (id, entity) in sim.entities().iter_sorted() {
             if entity.owner() != self.house
                 || entity.category() != crate::map::entities::EntityCategory::Unit
             {
@@ -8723,8 +8708,7 @@ impl SuperAi {
         // contested one when no free field qualifies (a small map's
         // reality), so the pick never dead-ends.
         let refinery_cells: Vec<(u16, u16)> = sim
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.category() == crate::map::entities::EntityCategory::Structure
@@ -8802,13 +8786,9 @@ impl SuperAi {
         // engineer on hut entry, so a successful repair clears the tracker
         // here; a killed one stops the re-issues until the next survey.
         if let Some(engineer) = self.bridge_engineer
-            && !sim
-                .substrate()
-                .entities
-                .get(engineer)
-                .is_some_and(|entity| {
-                    entity.owner() == self.house && entity.lifecycle.object_alive()
-                })
+            && !sim.entities().get(engineer).is_some_and(|entity| {
+                entity.owner() == self.house && entity.lifecycle.object_alive()
+            })
         {
             self.bridge_engineer = None;
         }
@@ -8829,7 +8809,7 @@ impl SuperAi {
                 )
             };
             // Worthiness: some hostile structure is unreachable from home.
-            let enemy_cut_off = sim.substrate().entities.iter_sorted().any(|(_, entity)| {
+            let enemy_cut_off = sim.entities().iter_sorted().any(|(_, entity)| {
                 entity.category() == crate::map::entities::EntityCategory::Structure
                     && !entity.lifecycle.in_limbo()
                     && self.is_enemy(sim, entity.owner())
@@ -8839,7 +8819,7 @@ impl SuperAi {
             // owner-filtered; the type resolves through the interner like
             // every other rules name (a rules set without it skips the limb).
             if enemy_cut_off {
-                let hut = sim.substrate().entities.iter_sorted().find(|(_, entity)| {
+                let hut = sim.entities().iter_sorted().find(|(_, entity)| {
                     entity.category() == crate::map::entities::EntityCategory::Structure
                         && sim.interner().resolve(entity.type_ref()) == BRIDGE_HUT_TYPE
                         && entity.lifecycle.object_alive()
@@ -8856,7 +8836,7 @@ impl SuperAi {
         // The dispatch half. The latched hut must still want repair — a span
         // already rebuilt (by this engineer or another house's) stops here.
         let hut = self.bridge_hut?;
-        let Some(hut_entity) = sim.substrate().entities.get(hut) else {
+        let Some(hut_entity) = sim.entities().get(hut) else {
             self.bridge_hut = None;
             return None;
         };
@@ -8870,23 +8850,20 @@ impl SuperAi {
         // retry window, never per tick.
         if tick < self.bridge_retry_due
             || self.bridge_engineer.is_some_and(|engineer| {
-                sim.substrate()
-                    .entities
-                    .get(engineer)
-                    .is_some_and(|entity| {
-                        !matches!(
-                            entity.passive_acquire_mission(),
-                            crate::sim::mission::MissionType::None
-                                | crate::sim::mission::MissionType::Sleep
-                                | crate::sim::mission::MissionType::Guard
-                                | crate::sim::mission::MissionType::AreaGuard
-                        )
-                    })
+                sim.entities().get(engineer).is_some_and(|entity| {
+                    !matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
+                    )
+                })
             })
         {
             return None;
         }
-        if let Some((engineer, _)) = sim.substrate().entities.iter_sorted().find(|(id, entity)| {
+        if let Some((engineer, _)) = sim.entities().iter_sorted().find(|(id, entity)| {
             entity.owner() == self.house
                 && entity.category() == crate::map::entities::EntityCategory::Infantry
                 && sim.interner().resolve(entity.type_ref()) == opening.engineer
@@ -8956,8 +8933,7 @@ impl SuperAi {
         opening: &Opening,
     ) -> (usize, usize) {
         let standing = sim
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.owner() == self.house
@@ -9042,14 +9018,10 @@ impl SuperAi {
         // so a gate armed in the same breath as the flip is never read).
         let mut fell_short: Vec<u64> = Vec::new();
         self.capture_bound.retain(|&engineer, target| {
-            let engineer_busy = sim
-                .substrate()
-                .entities
-                .get(engineer)
-                .is_some_and(|entity| {
-                    entity.owner() == self.house && entity.lifecycle.object_alive()
-                });
-            let target_neutral = sim.substrate().entities.get(*target).is_some_and(|entity| {
+            let engineer_busy = sim.entities().get(engineer).is_some_and(|entity| {
+                entity.owner() == self.house && entity.lifecycle.object_alive()
+            });
+            let target_neutral = sim.entities().get(*target).is_some_and(|entity| {
                 entity.category() == crate::map::entities::EntityCategory::Structure
                     && entity.lifecycle.object_alive()
                     && sim
@@ -9077,19 +9049,14 @@ impl SuperAi {
         // walker stops (observed: two allied engineers raced the same
         // neutral building, 17 attempts each). One stop per window, the
         // limb's one order; entity order, never the bound map's.
-        if let Some((engineer, target)) =
-            sim.substrate()
-                .entities
-                .iter_sorted()
-                .find_map(|(id, entity)| {
-                    let &target = self.capture_bound.get(&id)?;
-                    (entity.owner() == self.house
-                        && self
-                            .allied_capture_rival(sim, rules, target)
-                            .is_some_and(|rival| rival < self.house))
-                    .then_some((id, target))
-                })
-        {
+        if let Some((engineer, target)) = sim.entities().iter_sorted().find_map(|(id, entity)| {
+            let &target = self.capture_bound.get(&id)?;
+            (entity.owner() == self.house
+                && self
+                    .allied_capture_rival(sim, rules, target)
+                    .is_some_and(|rival| rival < self.house))
+            .then_some((id, target))
+        }) {
             self.capture_bound.remove(&engineer);
             self.capture_retry
                 .insert(target, tick + CAPTURE_RETRY_TICKS);
@@ -9107,29 +9074,26 @@ impl SuperAi {
         // instead of spending every window on it. Entity order, never the
         // bound map's: the determinism contract.
         if let Some((engineer, target, from)) =
-            sim.substrate()
-                .entities
-                .iter_sorted()
-                .find_map(|(id, entity)| {
-                    let &target = self.capture_bound.get(&id)?;
-                    (entity.owner() == self.house
-                        && entity.lifecycle.object_alive()
-                        && !entity.lifecycle.in_limbo()
-                        && self.order_gate.get(&id).is_none_or(|&due| tick >= due)
-                        && !self.futility_suppressed(id, FutilityKind::Capture, tick)
-                        && matches!(
-                            entity.passive_acquire_mission(),
-                            crate::sim::mission::MissionType::None
-                                | crate::sim::mission::MissionType::Sleep
-                                | crate::sim::mission::MissionType::Guard
-                                | crate::sim::mission::MissionType::AreaGuard
-                        ))
-                    .then_some((
-                        id,
-                        target,
-                        (entity.position.rx(), entity.position.ry()),
+            sim.entities().iter_sorted().find_map(|(id, entity)| {
+                let &target = self.capture_bound.get(&id)?;
+                (entity.owner() == self.house
+                    && entity.lifecycle.object_alive()
+                    && !entity.lifecycle.in_limbo()
+                    && self.order_gate.get(&id).is_none_or(|&due| tick >= due)
+                    && !self.futility_suppressed(id, FutilityKind::Capture, tick)
+                    && matches!(
+                        entity.passive_acquire_mission(),
+                        crate::sim::mission::MissionType::None
+                            | crate::sim::mission::MissionType::Sleep
+                            | crate::sim::mission::MissionType::Guard
+                            | crate::sim::mission::MissionType::AreaGuard
                     ))
-                })
+                .then_some((
+                    id,
+                    target,
+                    (entity.position.rx(), entity.position.ry()),
+                ))
+            })
             && !self.futile(engineer, FutilityKind::Capture, from, tick)
         {
             self.gate_idle_order(engineer, tick);
@@ -9153,7 +9117,7 @@ impl SuperAi {
             .unwrap_or_default();
         let home_cell = (home.0.max(0) as u16, home.1.max(0) as u16);
         let mut best: Option<(usize, i32, u64)> = None;
-        for (id, entity) in sim.substrate().entities.iter_sorted() {
+        for (id, entity) in sim.entities().iter_sorted() {
             if entity.category() != crate::map::entities::EntityCategory::Structure
                 || entity.lifecycle.in_limbo()
                 || !entity.lifecycle.object_alive()
@@ -9200,8 +9164,7 @@ impl SuperAi {
             return None;
         };
         let target_cell = sim
-            .substrate()
-            .entities
+            .entities()
             .get(target)
             .map(|entity| (entity.position.rx(), entity.position.ry()))?;
 
@@ -9209,8 +9172,7 @@ impl SuperAi {
         // this one's own latches (a bound walker keeps his building) —
         // whose own rows connect to the building (W3).
         if let Some((engineer, from)) = sim
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .find(|(id, entity)| {
                 entity.owner() == self.house
@@ -9350,7 +9312,7 @@ impl SuperAi {
         // well.
         let ride = self.find_raid_ride(sim, ride_name, tick);
         let seats = ride
-            .and_then(|id| sim.substrate().entities.get(id))
+            .and_then(|id| sim.entities().get(id))
             .and_then(|entity| entity.passenger_role.cargo().map(|cargo| cargo.capacity()))
             .unwrap_or(1)
             .max(1);
@@ -9418,7 +9380,7 @@ impl SuperAi {
         from: Option<(i16, i16)>,
     ) -> Option<(u64, (i16, i16))> {
         let mut best: Option<(i32, u64, (i16, i16))> = None;
-        for (id, entity) in sim.substrate().entities.iter_sorted() {
+        for (id, entity) in sim.entities().iter_sorted() {
             if entity.category() != crate::map::entities::EntityCategory::Structure
                 || entity.lifecycle.in_limbo()
                 || !entity.lifecycle.object_alive()
@@ -9450,8 +9412,7 @@ impl SuperAi {
         tick: u32,
         count: usize,
     ) -> Vec<u64> {
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .filter(|(id, entity)| {
                 entity.owner() == self.house
@@ -9489,8 +9450,7 @@ impl SuperAi {
         if count == 0 {
             return Vec::new();
         }
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .filter(|(id, entity)| {
                 entity.owner() == self.house
@@ -9531,8 +9491,7 @@ impl SuperAi {
         ride_name: &str,
         tick: u32,
     ) -> Option<u64> {
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .find(|(id, entity)| {
                 entity.owner() == self.house
@@ -9577,7 +9536,7 @@ impl SuperAi {
         // does not care. A lost payload piece or spare engineer merely
         // leaves the crew.
         let alive = |actor: u64| {
-            sim.substrate().entities.get(actor).is_some_and(|entity| {
+            sim.entities().get(actor).is_some_and(|entity| {
                 entity.owner() == self.house && entity.lifecycle.object_alive()
             })
         };
@@ -9586,7 +9545,7 @@ impl SuperAi {
             return None;
         }
         let idle = |actor: u64| {
-            sim.substrate().entities.get(actor).is_some_and(|entity| {
+            sim.entities().get(actor).is_some_and(|entity| {
                 matches!(
                     entity.passive_acquire_mission(),
                     crate::sim::mission::MissionType::None
@@ -9609,7 +9568,7 @@ impl SuperAi {
                     return None;
                 }
                 let aboard = |actor: u64| {
-                    sim.substrate().entities.get(ride).is_some_and(|entity| {
+                    sim.entities().get(ride).is_some_and(|entity| {
                         entity
                             .passenger_role
                             .cargo()
@@ -9629,7 +9588,7 @@ impl SuperAi {
                     // still connect to. None reachable yet — more scouting
                     // may open one — costs this tick only, the stage clock
                     // bounds the wait.
-                    let Some(ride_entity) = sim.substrate().entities.get(ride) else {
+                    let Some(ride_entity) = sim.entities().get(ride) else {
                         return None;
                     };
                     let from = (
@@ -9686,7 +9645,7 @@ impl SuperAi {
                 ride,
                 target,
             } => {
-                let Some(target_entity) = sim.substrate().entities.get(target) else {
+                let Some(target_entity) = sim.entities().get(target) else {
                     // The enemy razed the aim mid-sail: no delivery left.
                     self.end_engineer_raid(tick);
                     return None;
@@ -9695,7 +9654,7 @@ impl SuperAi {
                     target_entity.position.rx() as i16,
                     target_entity.position.ry() as i16,
                 );
-                let Some(ride_entity) = sim.substrate().entities.get(ride) else {
+                let Some(ride_entity) = sim.entities().get(ride) else {
                     return None;
                 };
                 let at = (
@@ -9740,7 +9699,7 @@ impl SuperAi {
                 // beat after the unload before it stands on foot again —
                 // poll until then, the stage clock bounding the wait.
                 let on_foot = |actor: u64| {
-                    sim.substrate().entities.get(actor).is_some_and(|entity| {
+                    sim.entities().get(actor).is_some_and(|entity| {
                         entity.owner() == self.house
                             && entity.lifecycle.object_alive()
                             && !entity.lifecycle.in_limbo()
@@ -9772,8 +9731,7 @@ impl SuperAi {
                 // The aim still standing is the point: razed mid-walk, the
                 // click is void and the crew walks home.
                 let target_stands = sim
-                    .substrate()
-                    .entities
+                    .entities()
                     .get(target)
                     .is_some_and(|entity| entity.lifecycle.object_alive());
                 if !target_stands {
@@ -9871,12 +9829,8 @@ impl SuperAi {
             .into_iter()
             .flatten()
             .collect();
-        let (transport, entity) = sim
-            .substrate()
-            .entities
-            .iter_sorted()
-            .find(|(id, entity)| {
-                entity.owner() == self.house
+        let (transport, entity) = sim.entities().iter_sorted().find(|(id, entity)| {
+            entity.owner() == self.house
                 && entity.category() == crate::map::entities::EntityCategory::Unit
                 && hulls.contains(&sim.interner().resolve(entity.type_ref()))
                 && !entity.lifecycle.in_limbo()
@@ -9894,7 +9848,7 @@ impl SuperAi {
                         | crate::sim::mission::MissionType::Guard
                         | crate::sim::mission::MissionType::AreaGuard
                 )
-            })?;
+        })?;
         let transport_name = sim.interner().resolve(entity.type_ref());
         let has_cargo = entity
             .passenger_role
@@ -9959,7 +9913,7 @@ impl SuperAi {
                 pool.push(opening.hero);
             }
             let mut best: Option<(i32, u64)> = None;
-            for (id, candidate) in sim.substrate().entities.iter_sorted() {
+            for (id, candidate) in sim.entities().iter_sorted() {
                 let type_name = sim.interner().resolve(candidate.type_ref());
                 if !pool.contains(&type_name)
                     || candidate.owner() != self.house
@@ -10087,8 +10041,7 @@ impl SuperAi {
     /// times; a fortress Enter clicked one tick after the fortress was
     /// queued; rally points set 600 ticks before the first factory).
     fn own_structures(&self, sim: &crate::sim::world::Simulation) -> Vec<(u64, String)> {
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.owner() == self.house
@@ -10158,7 +10111,7 @@ impl SuperAi {
     ) -> usize {
         if self.census_tick != self.now_tick {
             self.census_counts.clear();
-            for (_, entity) in sim.substrate().entities.iter_sorted() {
+            for (_, entity) in sim.entities().iter_sorted() {
                 // Placed only (W4), the `own_structures` reading: a
                 // building still in the factory is no rung climbed.
                 if entity.owner() == self.house
@@ -10180,8 +10133,7 @@ impl SuperAi {
 
     /// How many of the house's units are exactly this retail type name.
     fn count_units_of_type(&self, sim: &crate::sim::world::Simulation, type_name: &str) -> usize {
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.owner() == self.house
@@ -10243,7 +10195,7 @@ impl SuperAi {
         if self.defense.is_some() {
             let persona = self.defense.as_ref().expect("checked above");
             for &id in &persona.protected_targets {
-                let Some(entity) = sim.substrate().entities.get(id) else {
+                let Some(entity) = sim.entities().get(id) else {
                     continue;
                 };
                 if entity.owner() != self.house || !entity.lifecycle.object_alive() {
@@ -10275,7 +10227,7 @@ impl SuperAi {
             let Some(ty) = rules.object(name) else {
                 continue;
             };
-            for (eid, entity) in sim.substrate().entities.iter_sorted() {
+            for (eid, entity) in sim.entities().iter_sorted() {
                 if entity.owner() == self.house
                     && entity.category() == crate::map::entities::EntityCategory::Structure
                     && sim.interner().resolve(entity.type_ref()) == name
@@ -10375,16 +10327,12 @@ impl SuperAi {
             // walk rediscovers it next tick. A supers-first priority means
             // the reset never revisits a superweapon ring (those stay
             // retired in `walled`).
-            let yard = sim
-                .substrate()
-                .entities
-                .iter_sorted()
-                .find_map(|(eid, entity)| {
-                    (entity.owner() == self.house
-                        && entity.category() == crate::map::entities::EntityCategory::Structure
-                        && sim.interner().resolve(entity.type_ref()) == opening.construction_yard)
-                        .then_some(eid)
-                });
+            let yard = sim.entities().iter_sorted().find_map(|(eid, entity)| {
+                (entity.owner() == self.house
+                    && entity.category() == crate::map::entities::EntityCategory::Structure
+                    && sim.interner().resolve(entity.type_ref()) == opening.construction_yard)
+                    .then_some(eid)
+            });
             if let Some(id) = yard {
                 self.walled.remove(&id);
             }
@@ -10398,8 +10346,7 @@ impl SuperAi {
     /// count reads both: a soldiers-only count reads zero for an infantry
     /// roster and the mix would never see its shares met.
     fn count_combat_of_type(&self, sim: &crate::sim::world::Simulation, type_name: &str) -> usize {
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.owner() == self.house
@@ -10423,8 +10370,7 @@ impl SuperAi {
         sim: &crate::sim::world::Simulation,
         type_name: &str,
     ) -> usize {
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.owner() == self.house
@@ -10487,8 +10433,7 @@ impl SuperAi {
         sim: &crate::sim::world::Simulation,
         type_name: &str,
     ) -> usize {
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 self.is_enemy(sim, entity.owner())
@@ -10505,8 +10450,7 @@ impl SuperAi {
 
     /// The hostile vehicle count — the armor-pressure reading's enemy side.
     fn count_enemy_vehicles(&self, sim: &crate::sim::world::Simulation) -> usize {
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 self.is_enemy(sim, entity.owner())
@@ -10518,8 +10462,7 @@ impl SuperAi {
     /// The house's own vehicle count — the armor-pressure reading's home
     /// side.
     fn count_own_vehicles(&self, sim: &crate::sim::world::Simulation) -> usize {
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.owner() == self.house
@@ -10644,7 +10587,7 @@ impl SuperAi {
 
         // Observed hostile presence, by category.
         let mut composition = WaveComposition::default();
-        for (_, entity) in sim.substrate().entities.iter_sorted() {
+        for (_, entity) in sim.entities().iter_sorted() {
             if !self.is_enemy(sim, entity.owner()) {
                 continue;
             }
@@ -10672,7 +10615,7 @@ impl SuperAi {
         let mut protected_health: Vec<(u64, i32)> = Vec::new();
         let mut core_hit = false;
         for &id in &protected_targets {
-            let Some(entity) = sim.substrate().entities.get(id) else {
+            let Some(entity) = sim.entities().get(id) else {
                 continue;
             };
             let health = i32::from(entity.health.current());
@@ -10694,8 +10637,7 @@ impl SuperAi {
         persona.protected_targets = protected_targets;
         persona.protected_health = protected_health;
         persona.protected_owned = persona.protected_targets.iter().all(|&id| {
-            sim.substrate()
-                .entities
+            sim.entities()
                 .get(id)
                 .is_some_and(|entity| entity.owner() == self.house)
         });
@@ -10871,7 +10813,7 @@ impl SuperAi {
         if core_hit {
             let mut worst: Option<(i32, u64)> = None;
             for &id in &persona.protected_targets {
-                let Some(entity) = sim.substrate().entities.get(id) else {
+                let Some(entity) = sim.entities().get(id) else {
                     continue;
                 };
                 let type_name = sim.interner().resolve(entity.type_ref());
@@ -10882,8 +10824,7 @@ impl SuperAi {
             }
             if let Some((_, id)) = worst {
                 return sim
-                    .substrate()
-                    .entities
+                    .entities()
                     .get(id)
                     .map(|entity| (entity.position.rx(), entity.position.ry()));
             }
@@ -10891,8 +10832,7 @@ impl SuperAi {
         // The line's fighting edge: the posted unit nearest any hostile
         // mobile on the field.
         let nearest_hostile_cell = sim
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 !entity.lifecycle.in_limbo()
@@ -10907,7 +10847,7 @@ impl SuperAi {
             .next();
         let mut best: Option<(i64, (u16, u16))> = None;
         for &(unit, post) in &persona.line_posts {
-            let Some(entity) = sim.substrate().entities.get(unit) else {
+            let Some(entity) = sim.entities().get(unit) else {
                 continue;
             };
             let unit_cell = (entity.position.rx(), entity.position.ry());
@@ -10932,7 +10872,7 @@ impl SuperAi {
     /// ties. Below [`DEFENSE_RESCUE_CLUSTER_MIN`] the charge holds.
     fn defense_cluster_cell(&self, sim: &crate::sim::world::Simulation) -> Option<(u16, u16)> {
         let mut hostiles: Vec<(u16, u16)> = Vec::new();
-        for (_, entity) in sim.substrate().entities.iter_sorted() {
+        for (_, entity) in sim.entities().iter_sorted() {
             if entity.lifecycle.in_limbo()
                 || !matches!(
                     entity.category(),
@@ -10984,8 +10924,7 @@ impl SuperAi {
         rules: &crate::rules::ruleset::RuleSet,
         unit: u64,
     ) -> bool {
-        sim.substrate()
-            .entities
+        sim.entities()
             .get(unit)
             .and_then(|entity| {
                 rules
@@ -11020,7 +10959,7 @@ impl SuperAi {
             persona.leak_due = tick + DEFENSE_LEAK_TICKS;
             let house = self.house;
             persona.leak_interceptors.retain(|&unit| {
-                sim.substrate().entities.get(unit).is_some_and(|entity| {
+                sim.entities().get(unit).is_some_and(|entity| {
                     entity.owner() == house
                         && entity.lifecycle.object_alive()
                         && (!matches!(
@@ -11053,7 +10992,7 @@ impl SuperAi {
             .expect("checked above")
             .protected_targets
             .iter()
-            .filter_map(|&id| sim.substrate().entities.get(id))
+            .filter_map(|&id| sim.entities().get(id))
             .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))
             .collect();
         let anchor = match protected_cells.first() {
@@ -11069,7 +11008,7 @@ impl SuperAi {
         // cell alone, so a second charge (the president beside the
         // statue) took the leaks last.
         let mut leak: Option<((i32, i32), u64)> = None;
-        for (id, entity) in sim.substrate().entities.iter_sorted() {
+        for (id, entity) in sim.entities().iter_sorted() {
             if entity.lifecycle.in_limbo()
                 || !matches!(
                     entity.category(),
@@ -11107,8 +11046,7 @@ impl SuperAi {
         }
         let (_, leak_id) = leak?;
         let leak_cell = sim
-            .substrate()
-            .entities
+            .entities()
             .get(leak_id)
             .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))?;
         // The hunter: the nearest due line unit first, then the nearest
@@ -11125,7 +11063,7 @@ impl SuperAi {
                 .filter(|&&(unit, _)| self.order_gate.get(&unit).is_none_or(|&due| tick >= due))
                 .filter(|&&(unit, _)| Self::is_direct_fire_hull(sim, rules, unit))
                 .filter_map(|&(unit, _)| {
-                    sim.substrate().entities.get(unit).map(|entity| {
+                    sim.entities().get(unit).map(|entity| {
                         let dx = i32::from(entity.position.rx() as i16) - i32::from(leak_cell.0);
                         let dy = i32::from(entity.position.ry() as i16) - i32::from(leak_cell.1);
                         (dx * dx + dy * dy, unit)
@@ -11135,8 +11073,7 @@ impl SuperAi {
                 .map(|(_, unit)| unit);
             posted.or_else(|| {
                 let roster = Self::combat_roster(opening);
-                sim.substrate()
-                    .entities
+                sim.entities()
                     .iter_sorted()
                     .filter(|(id, entity)| {
                         entity.owner() == self.house
@@ -11217,7 +11154,7 @@ impl SuperAi {
         {
             let persona = self.defense.as_mut().expect("checked above");
             persona.air_pool.retain(|&(unit, _)| {
-                sim.substrate().entities.get(unit).is_some_and(|entity| {
+                sim.entities().get(unit).is_some_and(|entity| {
                     entity.owner() == house && entity.lifecycle.object_alive()
                 })
             });
@@ -11263,7 +11200,7 @@ impl SuperAi {
             }
             let mut commands: Vec<Command> = Vec::new();
             for (unit, home) in pool {
-                let idle = sim.substrate().entities.get(unit).is_some_and(|entity| {
+                let idle = sim.entities().get(unit).is_some_and(|entity| {
                     matches!(
                         entity.passive_acquire_mission(),
                         crate::sim::mission::MissionType::None
@@ -11300,7 +11237,7 @@ impl SuperAi {
             .clone();
         let mut walks_home: Vec<(u64, (u16, u16))> = Vec::new();
         for &(unit, home) in &pool {
-            let Some(entity) = sim.substrate().entities.get(unit) else {
+            let Some(entity) = sim.entities().get(unit) else {
                 continue;
             };
             let idle = matches!(
@@ -11338,7 +11275,7 @@ impl SuperAi {
                 .retain(|&(unit, _)| !walks_home.iter().any(|&(gone, _)| gone == unit));
         }
         for (unit, home) in walks_home {
-            let idle = sim.substrate().entities.get(unit).is_some_and(|entity| {
+            let idle = sim.entities().get(unit).is_some_and(|entity| {
                 matches!(
                     entity.passive_acquire_mission(),
                     crate::sim::mission::MissionType::None
@@ -11412,8 +11349,7 @@ impl SuperAi {
         sim: &crate::sim::world::Simulation,
         rules: &crate::rules::ruleset::RuleSet,
     ) -> Vec<(u64, bool, bool, (i16, i16))> {
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.owner() == self.house
@@ -11450,8 +11386,7 @@ impl SuperAi {
         rules: &crate::rules::ruleset::RuleSet,
         unit: u64,
     ) -> i32 {
-        sim.substrate()
-            .entities
+        sim.entities()
             .get(unit)
             .and_then(|entity| rules.object(sim.interner().resolve(entity.type_ref())))
             .map(|object| object.cost.max(0))
@@ -11545,8 +11480,7 @@ impl SuperAi {
         &self,
         sim: &crate::sim::world::Simulation,
     ) -> Vec<(u64, (i16, i16))> {
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 !entity.lifecycle.in_limbo()
@@ -11576,8 +11510,7 @@ impl SuperAi {
         sim: &crate::sim::world::Simulation,
         rules: &crate::rules::ruleset::RuleSet,
     ) -> Vec<(u64, (i16, i16))> {
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 !entity.lifecycle.in_limbo()
@@ -11678,7 +11611,7 @@ impl SuperAi {
         {
             let persona = self.defense.as_mut().expect("checked above");
             persona.perimeter_pool.retain(|&(unit, _)| {
-                sim.substrate().entities.get(unit).is_some_and(|entity| {
+                sim.entities().get(unit).is_some_and(|entity| {
                     entity.owner() == house
                         && entity.lifecycle.object_alive()
                         && !claimed.contains(&unit)
@@ -11762,7 +11695,7 @@ impl SuperAi {
             .perimeter_pool
             .clone();
         for &(unit, _) in &pool {
-            let Some(entity) = sim.substrate().entities.get(unit) else {
+            let Some(entity) = sim.entities().get(unit) else {
                 continue;
             };
             let idle = matches!(
@@ -11794,14 +11727,13 @@ impl SuperAi {
             } else {
                 let aa_roster = Self::defense_role_entries(opening, Role::AntiAir);
                 let is_aa = |unit: u64| {
-                    sim.substrate()
-                        .entities
+                    sim.entities()
                         .get(unit)
                         .map(|entity| sim.interner().resolve(entity.type_ref()).to_string())
                         .is_some_and(|name| aa_roster.iter().any(|entry| *entry == name))
                 };
                 let healthy = |unit: u64| {
-                    sim.substrate().entities.get(unit).is_some_and(|entity| {
+                    sim.entities().get(unit).is_some_and(|entity| {
                         Self::health_fraction(
                             rules,
                             sim.interner().resolve(entity.type_ref()),
@@ -11818,7 +11750,7 @@ impl SuperAi {
                     .line_posts
                     .iter()
                     .filter_map(|&(unit, post)| {
-                        let entity = sim.substrate().entities.get(unit)?;
+                        let entity = sim.entities().get(unit)?;
                         if entity.owner() != house
                             || !entity.lifecycle.object_alive()
                             || Self::garrisoned(entity)
@@ -11845,7 +11777,7 @@ impl SuperAi {
                     if !unclaimed(unit) || !healthy(unit) {
                         continue;
                     }
-                    let Some(entity) = sim.substrate().entities.get(unit) else {
+                    let Some(entity) = sim.entities().get(unit) else {
                         continue;
                     };
                     let home = on_map_cell(
@@ -11947,7 +11879,7 @@ impl SuperAi {
         {
             let persona = self.defense.as_mut().expect("checked above");
             persona.intercept_detachment.retain(|&(unit, _, _)| {
-                sim.substrate().entities.get(unit).is_some_and(|entity| {
+                sim.entities().get(unit).is_some_and(|entity| {
                     entity.owner() == house
                         && entity.lifecycle.object_alive()
                         && !claimed.contains(&unit)
@@ -12077,7 +12009,7 @@ impl SuperAi {
             self.defense.as_mut().expect("checked above").intercept_aim = Some(meet);
             let mut commands: Vec<Command> = Vec::new();
             for &(unit, _, _) in &detachment {
-                let Some(entity) = sim.substrate().entities.get(unit) else {
+                let Some(entity) = sim.entities().get(unit) else {
                     continue;
                 };
                 let idle = matches!(
@@ -12116,7 +12048,7 @@ impl SuperAi {
                 .line_posts
                 .iter()
                 .filter_map(|&(unit, post)| {
-                    let entity = sim.substrate().entities.get(unit)?;
+                    let entity = sim.entities().get(unit)?;
                     if entity.owner() != house
                         || !entity.lifecycle.object_alive()
                         || Self::garrisoned(entity)
@@ -12214,10 +12146,10 @@ impl SuperAi {
             persona.repair_due = tick + DEFENSE_REPAIR_TICKS;
             let house = self.house;
             persona.repair_inbound.retain(|&(unit, depot)| {
-                let walking = sim.substrate().entities.get(unit).is_some_and(|entity| {
+                let walking = sim.entities().get(unit).is_some_and(|entity| {
                     entity.owner() == house && entity.lifecycle.object_alive()
                 });
-                let depot_stands = sim.substrate().entities.get(depot).is_some_and(|entity| {
+                let depot_stands = sim.entities().get(depot).is_some_and(|entity| {
                     entity.category() == crate::map::entities::EntityCategory::Structure
                         && entity.lifecycle.object_alive()
                 });
@@ -12228,7 +12160,7 @@ impl SuperAi {
         let healed = {
             let persona = self.defense.as_ref().expect("checked above");
             persona.repair_inbound.iter().find_map(|&(unit, _)| {
-                let entity = sim.substrate().entities.get(unit)?;
+                let entity = sim.entities().get(unit)?;
                 let type_name = sim.interner().resolve(entity.type_ref());
                 if Self::health_fraction(rules, type_name, entity) < DEFENSE_RETURN_FRACTION {
                     return None;
@@ -12278,7 +12210,7 @@ impl SuperAi {
                     .into_iter()
                     .filter(|(_, name)| name == depot_name)
                     .filter_map(|(id, _)| {
-                        sim.substrate().entities.get(id).and_then(|entity| {
+                        sim.entities().get(id).and_then(|entity| {
                             (entity.lifecycle.object_alive() && !entity.lifecycle.in_limbo())
                                 .then_some((
                                     id,
@@ -12296,7 +12228,7 @@ impl SuperAi {
         let rotate = {
             let persona = self.defense.as_ref().expect("checked above");
             persona.line_posts.iter().find_map(|&(unit, post)| {
-                let entity = sim.substrate().entities.get(unit)?;
+                let entity = sim.entities().get(unit)?;
                 let type_name = sim.interner().resolve(entity.type_ref());
                 if persona.repair_inbound.iter().any(|&(id, _)| id == unit) {
                     return None;
@@ -12318,7 +12250,7 @@ impl SuperAi {
             })
         };
         let (unit, _post) = rotate?;
-        let entity = sim.substrate().entities.get(unit)?;
+        let entity = sim.entities().get(unit)?;
         let unit_cell = (entity.position.rx() as i16, entity.position.ry() as i16);
         if let Some((depot, _)) = depots.iter().copied().min_by_key(|&(id, cell)| {
             let dx = i32::from(cell.0) - i32::from(unit_cell.0);
@@ -12537,8 +12469,7 @@ impl SuperAi {
         let roster = Self::combat_roster(opening);
         let role_names = role.map(|role| Self::defense_role_entries(opening, role));
         let mut candidates: Vec<(i64, u64)> = sim
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .filter(|(id, entity)| {
                 entity.owner() == self.house
@@ -12596,8 +12527,7 @@ impl SuperAi {
         opening: &Opening,
     ) -> usize {
         let roster = Self::combat_roster(opening);
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.owner() == self.house
@@ -12687,13 +12617,13 @@ impl SuperAi {
             .expect("checked above")
             .protected_targets
             .iter()
-            .filter_map(|&id| sim.substrate().entities.get(id))
+            .filter_map(|&id| sim.entities().get(id))
             .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))
             .next();
         // The core under attack collapses the window: the wave is here, so
         // the ring staffs and reposts every tick until it holds again.
         let under_attack = core.is_some_and(|core| {
-            sim.substrate().entities.iter_sorted().any(|(_, entity)| {
+            sim.entities().iter_sorted().any(|(_, entity)| {
                 matches!(
                     entity.category(),
                     crate::map::entities::EntityCategory::Unit
@@ -12716,7 +12646,7 @@ impl SuperAi {
             persona.line_due = tick + if under_attack { 1 } else { DEFENSE_LINE_TICKS };
             let house = self.house;
             persona.line_posts.retain(|&(unit, _)| {
-                sim.substrate().entities.get(unit).is_some_and(|entity| {
+                sim.entities().get(unit).is_some_and(|entity| {
                     entity.owner() == house && entity.lifecycle.object_alive()
                 })
             });
@@ -12733,7 +12663,7 @@ impl SuperAi {
                 if persona.marching(unit) {
                     return None;
                 }
-                let entity = sim.substrate().entities.get(unit)?;
+                let entity = sim.entities().get(unit)?;
                 let idle = matches!(
                     entity.passive_acquire_mission(),
                     crate::sim::mission::MissionType::None
@@ -12790,7 +12720,7 @@ impl SuperAi {
                 .line_posts
                 .iter()
                 .filter(|&(unit, post)| {
-                    let at_post = sim.substrate().entities.get(*unit).is_some_and(|entity| {
+                    let at_post = sim.entities().get(*unit).is_some_and(|entity| {
                         let cell = (
                             i16::try_from(entity.position.rx()).unwrap_or(post.0 as i16),
                             i16::try_from(entity.position.ry()).unwrap_or(post.1 as i16),
@@ -12807,8 +12737,7 @@ impl SuperAi {
                 .map(|&(unit, post)| (unit, post))
                 .collect();
             let row_is_aa = |sim: &crate::sim::world::Simulation, unit: u64| {
-                sim.substrate()
-                    .entities
+                sim.entities()
                     .get(unit)
                     .map(|entity| sim.interner().resolve(entity.type_ref()).to_string())
                     .is_some_and(|name| aa_roster.iter().any(|entry| *entry == name))
@@ -12962,7 +12891,7 @@ impl SuperAi {
             let mut snapshot: Vec<(u64, usize)> = Vec::new();
             let mut casualties = 0usize;
             for &building in &self.garrison_targets {
-                let Some(entity) = sim.substrate().entities.get(building) else {
+                let Some(entity) = sim.entities().get(building) else {
                     if let Some(&(_, old)) = persona
                         .garrison_snapshot
                         .iter()
@@ -13327,8 +13256,7 @@ impl SuperAi {
     /// ([`ground_per_yard_quota`]), the same standing census the air
     /// ladder reads over [`AIR_THREAT_TYPES`].
     fn enemy_ground_count(&self, sim: &crate::sim::world::Simulation) -> usize {
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 self.is_enemy(sim, entity.owner())
@@ -13374,7 +13302,7 @@ impl SuperAi {
         // riding with an ally or a to-be-given garrison still owes the
         // ring its guns.
         for &id in &persona.protected_targets {
-            let Some(entity) = sim.substrate().entities.get(id) else {
+            let Some(entity) = sim.entities().get(id) else {
                 continue;
             };
             if !entity.lifecycle.object_alive() {
@@ -13552,7 +13480,7 @@ impl SuperAi {
             .protected_targets
             .iter()
             .find_map(|&id| {
-                let entity = sim.substrate().entities.get(id)?;
+                let entity = sim.entities().get(id)?;
                 ((shared || entity.owner() == self.house) && entity.lifecycle.object_alive())
                     .then(|| (entity.position.rx() as i16, entity.position.ry() as i16))
             })
@@ -13875,7 +13803,7 @@ impl SuperAi {
             persona
                 .protected_targets
                 .iter()
-                .filter_map(|&id| sim.substrate().entities.get(id))
+                .filter_map(|&id| sim.entities().get(id))
                 .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))
                 .next()
         });
@@ -13909,7 +13837,7 @@ impl SuperAi {
                 persona
                     .protected_targets
                     .iter()
-                    .filter_map(|&id| sim.substrate().entities.get(id))
+                    .filter_map(|&id| sim.entities().get(id))
                     .filter(|entity| entity.lifecycle.object_alive())
                     .map(|entity| {
                         Self::health_fraction(
@@ -14490,8 +14418,7 @@ impl SuperAi {
             // The steal's ride stands on its pad: the drop point is 2-3
             // cells beside the enemy conyard, passable and clear.
             let conyard_cell = sim
-                .substrate()
-                .entities
+                .entities()
                 .get(target)
                 .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))?;
             let home = home_center?;
@@ -14550,8 +14477,7 @@ impl SuperAi {
     ) -> Option<((u16, u16), Vec<u64>)> {
         let pad_types = [opening.tier2_tank, opening.main_tank];
         let candidates: Vec<(u64, (u16, u16))> = sim
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.owner() == self.house
@@ -14594,8 +14520,7 @@ impl SuperAi {
     fn enemy_power_pad(&self, sim: &crate::sim::world::Simulation) -> Option<(u16, u16)> {
         use crate::sim::find_nearby_cell::{NearbyArgs, NearbyFootprint, PassabilityArgs};
         let powers: Vec<(u16, u16)> = sim
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.category() == crate::map::entities::EntityCategory::Structure
@@ -14734,8 +14659,7 @@ impl SuperAi {
     ) -> Option<(u16, u16)> {
         let heavies = [opening.main_tank, opening.tier2_tank];
         let tanks: Vec<(u64, (u16, u16))> = sim
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.owner() == self.house
@@ -14760,7 +14684,7 @@ impl SuperAi {
             }
             // No own infantry in the pad: organic foot dies under the
             // curtain instead of riding it.
-            let infantry_inside = sim.substrate().entities.iter_sorted().any(|(_, entity)| {
+            let infantry_inside = sim.entities().iter_sorted().any(|(_, entity)| {
                 entity.owner() == self.house
                     && entity.category() == crate::map::entities::EntityCategory::Infantry
                     && !entity.lifecycle.in_limbo()
@@ -14786,7 +14710,7 @@ impl SuperAi {
             .enemy_center(sim)
             .map(|center| (center.0.max(0) as u16, center.1.max(0) as u16));
         let mut best: Option<(i64, (u16, u16))> = None;
-        for (_, entity) in sim.substrate().entities.iter_sorted() {
+        for (_, entity) in sim.entities().iter_sorted() {
             if entity.owner() != self.house
                 || entity.category() != crate::map::entities::EntityCategory::Unit
                 || entity.lifecycle.in_limbo()
@@ -14822,8 +14746,7 @@ impl SuperAi {
         rules: &crate::rules::ruleset::RuleSet,
     ) -> Option<(u16, u16)> {
         let vehicles: Vec<((u16, u16), i32)> = sim
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.category() == crate::map::entities::EntityCategory::Unit
@@ -14839,8 +14762,7 @@ impl SuperAi {
             })
             .collect();
         let owns: Vec<(u16, u16)> = sim
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.owner() == self.house
@@ -14881,8 +14803,7 @@ impl SuperAi {
     /// wants infantry, the slaves included), nearest on ties.
     fn mutator_pad(&self, sim: &crate::sim::world::Simulation) -> Option<(u16, u16)> {
         let feet: Vec<(u16, u16)> = sim
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.category() == crate::map::entities::EntityCategory::Infantry
@@ -14914,8 +14835,7 @@ impl SuperAi {
     /// line (the ore field's docks — the reinforcements land where the
     /// economy bleeds), else the hostile mass center.
     fn paradrop_target(&self, sim: &crate::sim::world::Simulation) -> Option<(u16, u16)> {
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .find(|(_, entity)| {
                 entity.category() == crate::map::entities::EntityCategory::Structure
@@ -14943,7 +14863,7 @@ impl SuperAi {
         }
         let opening = self.pinned_opening?;
         let conyard = self.own_yard_centers(sim, opening).first().copied()?;
-        let under_fire = sim.substrate().entities.iter_sorted().any(|(_, entity)| {
+        let under_fire = sim.entities().iter_sorted().any(|(_, entity)| {
             entity.owner() == self.house
                 && entity.category() == crate::map::entities::EntityCategory::Structure
                 && !entity.lifecycle.in_limbo()
@@ -14966,8 +14886,7 @@ impl SuperAi {
     /// first-priority-target clicks onto an empty refinery corner.
     fn scored_strike_cell(&self, sim: &crate::sim::world::Simulation) -> Option<(u16, u16)> {
         let structures: Vec<((u16, u16), i32)> = sim
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.category() == crate::map::entities::EntityCategory::Structure
@@ -15062,8 +14981,7 @@ impl SuperAi {
         opening: &Opening,
     ) -> Vec<u64> {
         let roster = Self::combat_roster(opening);
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .filter(|(id, entity)| {
                 entity.owner() == self.house
@@ -15277,7 +15195,7 @@ impl SuperAi {
     ) -> Vec<Command> {
         let roster = Self::combat_roster(opening);
         self.scout_chain.retain(|&id| {
-            sim.substrate().entities.get(id).is_some_and(|entity| {
+            sim.entities().get(id).is_some_and(|entity| {
                 entity.owner() == self.house && entity.lifecycle.object_alive()
             })
         });
@@ -15285,7 +15203,7 @@ impl SuperAi {
         let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut stuck: Vec<(u64, (u16, u16))> = Vec::new();
         let mut released: Vec<u64> = Vec::new();
-        for (id, entity) in sim.substrate().entities.iter_sorted() {
+        for (id, entity) in sim.entities().iter_sorted() {
             if entity.owner() != self.house
                 || Self::garrisoned(entity)
                 || !entity.lifecycle.object_alive()
@@ -15396,8 +15314,7 @@ impl SuperAi {
             self.wave_marched.retain(|unit| !released.contains(unit));
         }
         self.rescue_marks.retain(|id, &mut (_, marked)| {
-            tick.saturating_sub(marked) < RESCUE_MARK_TICKS
-                && sim.substrate().entities.get(*id).is_some()
+            tick.saturating_sub(marked) < RESCUE_MARK_TICKS && sim.entities().get(*id).is_some()
         });
         // The congestion hold: a standing jam keeps its members — the
         // congestion limb unpicks them — and holds the enemy leg below.
@@ -15419,7 +15336,7 @@ impl SuperAi {
             {
                 continue;
             }
-            let Some(entity) = sim.substrate().entities.get(unit) else {
+            let Some(entity) = sim.entities().get(unit) else {
                 continue;
             };
             let movement_zone = rules
@@ -15640,7 +15557,7 @@ impl SuperAi {
         from: (u16, u16),
     ) -> Option<((u16, u16), u64)> {
         let mut best: Option<(u32, u64, (u16, u16))> = None;
-        for (id, entity) in sim.substrate().entities.iter_sorted() {
+        for (id, entity) in sim.entities().iter_sorted() {
             if entity.lifecycle.in_limbo()
                 || entity.category() != crate::map::entities::EntityCategory::Unit
                 || !self.is_enemy(sim, entity.owner())
@@ -15678,8 +15595,7 @@ impl SuperAi {
             .iter()
             .map(|&(_, target)| target)
             .chain(
-                sim.substrate()
-                    .entities
+                sim.entities()
                     .iter_sorted()
                     .filter(|(_, entity)| {
                         entity.owner() == self.house
@@ -15691,7 +15607,7 @@ impl SuperAi {
             .collect();
         let nearest_free = |types: &[&str]| -> Option<(u64, (i16, i16))> {
             let mut best: Option<(u32, u64, (i16, i16))> = None;
-            for (id, entity) in sim.substrate().entities.iter_sorted() {
+            for (id, entity) in sim.entities().iter_sorted() {
                 if entity.category() != crate::map::entities::EntityCategory::Structure
                     || entity.lifecycle.in_limbo()
                     || !self.is_enemy(sim, entity.owner())
@@ -15731,7 +15647,7 @@ impl SuperAi {
     ) -> Option<u64> {
         let from_cell = (from.0.max(0) as u16, from.1.max(0) as u16);
         let mut best: Option<(u8, u32, u64)> = None;
-        for (id, entity) in sim.substrate().entities.iter_sorted() {
+        for (id, entity) in sim.entities().iter_sorted() {
             if entity.category() != crate::map::entities::EntityCategory::Structure
                 || entity.lifecycle.in_limbo()
                 || !self.is_enemy(sim, entity.owner())
@@ -15774,7 +15690,7 @@ impl SuperAi {
     ) -> Option<u64> {
         let from_cell = (from.0.max(0) as u16, from.1.max(0) as u16);
         let mut best: Option<(u32, u64)> = None;
-        for (id, entity) in sim.substrate().entities.iter_sorted() {
+        for (id, entity) in sim.entities().iter_sorted() {
             if entity.category() != crate::map::entities::EntityCategory::Structure
                 || entity.lifecycle.in_limbo()
                 || !TECH_BUILDING_TYPES.contains(&sim.interner().resolve(entity.type_ref()))
@@ -16104,8 +16020,7 @@ impl SuperAi {
             .copied()
             .filter(|&unit| !self.raid_involves(unit))
             .filter_map(|unit| {
-                sim.substrate()
-                    .entities
+                sim.entities()
                     .get(unit)
                     .map(|entity| (unit, sim.interner().resolve(entity.type_ref())))
             })
@@ -16257,7 +16172,7 @@ impl SuperAi {
     ) -> Option<Command> {
         // The members' hygiene runs every pass: the fallen drop out.
         self.wave_members.retain(|&unit| {
-            sim.substrate().entities.get(unit).is_some_and(|entity| {
+            sim.entities().get(unit).is_some_and(|entity| {
                 entity.owner() == self.house
                     && entity.lifecycle.object_alive()
                     && !entity.lifecycle.in_limbo()
@@ -16406,7 +16321,7 @@ impl SuperAi {
         let mut ground = 0usize;
         let mut arrived = 0usize;
         for &unit in &self.wave_members {
-            let Some(entity) = sim.substrate().entities.get(unit) else {
+            let Some(entity) = sim.entities().get(unit) else {
                 continue;
             };
             if entity.category() == crate::map::entities::EntityCategory::Aircraft
@@ -16528,7 +16443,7 @@ impl SuperAi {
         let mut ground = 0usize;
         let mut arrived = 0usize;
         for &unit in &self.wave_members {
-            let Some(entity) = sim.substrate().entities.get(unit) else {
+            let Some(entity) = sim.entities().get(unit) else {
                 continue;
             };
             if entity.category() == crate::map::entities::EntityCategory::Aircraft
@@ -16580,7 +16495,7 @@ impl SuperAi {
         };
         let mut leads: Vec<(i32, u64, (i16, i16))> = Vec::new();
         let mut hostile: Vec<(usize, i32, u64, (i16, i16), InternedId)> = Vec::new();
-        for (id, entity) in sim.substrate().entities.iter_sorted() {
+        for (id, entity) in sim.entities().iter_sorted() {
             if entity.category() != crate::map::entities::EntityCategory::Structure
                 || entity.lifecycle.in_limbo()
                 || !entity.lifecycle.object_alive()
@@ -16650,7 +16565,7 @@ impl SuperAi {
             .filter(|unit| !self.wave_marched.contains(unit))
             .collect::<Vec<_>>()
         {
-            let Some(entity) = sim.substrate().entities.get(unit) else {
+            let Some(entity) = sim.entities().get(unit) else {
                 continue;
             };
             if Self::is_fly_type(rules, sim.interner().resolve(entity.type_ref())) {
@@ -16731,7 +16646,7 @@ impl SuperAi {
             .wave_members
             .iter()
             .filter(|&&unit| {
-                sim.substrate().entities.get(unit).is_some_and(|entity| {
+                sim.entities().get(unit).is_some_and(|entity| {
                     entity.category() == crate::map::entities::EntityCategory::Aircraft
                         && opening
                             .aircraft
@@ -16751,7 +16666,7 @@ impl SuperAi {
             return;
         }
         let mut joiners: Vec<u64> = Vec::new();
-        for (id, entity) in sim.substrate().entities.iter_sorted() {
+        for (id, entity) in sim.entities().iter_sorted() {
             if on_board >= plan.escort {
                 break;
             }
@@ -16795,7 +16710,7 @@ impl SuperAi {
         // clock; the clock bounds a head the wave cannot reach (a wedged
         // march, an unreachable cell).
         while let Some(&(head, _)) = self.wave_targets.first() {
-            if sim.substrate().entities.get(head).is_some_and(|entity| {
+            if sim.entities().get(head).is_some_and(|entity| {
                 entity.lifecycle.object_alive()
                     && !entity.lifecycle.in_limbo()
                     && self.is_enemy(sim, entity.owner())
@@ -16842,7 +16757,7 @@ impl SuperAi {
             .filter(|unit| !self.wave_marched.contains(unit))
             .collect::<Vec<_>>()
         {
-            let Some(entity) = sim.substrate().entities.get(unit) else {
+            let Some(entity) = sim.entities().get(unit) else {
                 continue;
             };
             let type_name = sim.interner().resolve(entity.type_ref());
@@ -16967,7 +16882,7 @@ impl SuperAi {
             .filter(|unit| !self.wave_marched.contains(unit))
             .collect::<Vec<_>>()
         {
-            let Some(entity) = sim.substrate().entities.get(unit) else {
+            let Some(entity) = sim.entities().get(unit) else {
                 continue;
             };
             let type_name = sim.interner().resolve(entity.type_ref());
@@ -17057,15 +16972,15 @@ impl SuperAi {
             if !self.wave_entry_admits(sim, opening, wanted) {
                 continue;
             }
-            let standing =
-                self.wave_members
-                    .iter()
-                    .filter(|&&unit| {
-                        sim.substrate().entities.get(unit).is_some_and(|entity| {
-                            sim.interner().resolve(entity.type_ref()) == wanted
-                        })
-                    })
-                    .count();
+            let standing = self
+                .wave_members
+                .iter()
+                .filter(|&&unit| {
+                    sim.entities()
+                        .get(unit)
+                        .is_some_and(|entity| sim.interner().resolve(entity.type_ref()) == wanted)
+                })
+                .count();
             if standing >= count {
                 continue;
             }
@@ -17090,7 +17005,7 @@ impl SuperAi {
         opening: &Opening,
         unit: u64,
     ) -> Option<(i16, i16)> {
-        let Some(entity) = sim.substrate().entities.get(unit) else {
+        let Some(entity) = sim.entities().get(unit) else {
             return None;
         };
         // Only the AA vehicles take the economy post; every other unit
@@ -17112,7 +17027,7 @@ impl SuperAi {
         // into the jam; the nearest open anchor wins, the nearest closed
         // one only when none is open.
         let mut best: Option<(bool, u32, (i16, i16))> = None;
-        for (_, entity) in sim.substrate().entities.iter_sorted() {
+        for (_, entity) in sim.entities().iter_sorted() {
             if entity.owner() != self.house
                 || entity.category() != crate::map::entities::EntityCategory::Structure
                 || entity.lifecycle.in_limbo()
@@ -17184,33 +17099,25 @@ impl SuperAi {
         };
         let house = self.house;
         self.garrison_inbound.retain(|&(building, infantry)| {
-            let walking = sim
-                .substrate()
-                .entities
-                .get(infantry)
-                .is_some_and(|entity| {
-                    entity.owner() == house
-                        && entity.lifecycle.object_alive()
-                        && !entity.lifecycle.in_limbo()
-                        && !dropped(infantry, entity)
-                });
-            let target_stands = sim
-                .substrate()
-                .entities
-                .get(building)
-                .is_some_and(|entity| {
-                    entity.category() == crate::map::entities::EntityCategory::Structure
-                        && entity.lifecycle.object_alive()
-                });
+            let walking = sim.entities().get(infantry).is_some_and(|entity| {
+                entity.owner() == house
+                    && entity.lifecycle.object_alive()
+                    && !entity.lifecycle.in_limbo()
+                    && !dropped(infantry, entity)
+            });
+            let target_stands = sim.entities().get(building).is_some_and(|entity| {
+                entity.category() == crate::map::entities::EntityCategory::Structure
+                    && entity.lifecycle.object_alive()
+            });
             walking && target_stands
         });
         self.bunker_bound.retain(|&bunker, &mut vehicle| {
-            let bunker_open = sim.substrate().entities.get(bunker).is_some_and(|entity| {
+            let bunker_open = sim.entities().get(bunker).is_some_and(|entity| {
                 entity.owner() == house
                     && entity.lifecycle.object_alive()
                     && entity.bunker.occupant().is_none()
             });
-            let riding = sim.substrate().entities.get(vehicle).is_some_and(|entity| {
+            let riding = sim.entities().get(vehicle).is_some_and(|entity| {
                 entity.owner() == house
                     && entity.lifecycle.object_alive()
                     && entity.bunker.link().installed_in().is_none()
@@ -17225,7 +17132,7 @@ impl SuperAi {
 
         // The infantry dispatch: the first target short of its capacity.
         for building in self.garrison_targets.clone() {
-            let Some(entity) = sim.substrate().entities.get(building) else {
+            let Some(entity) = sim.entities().get(building) else {
                 continue;
             };
             if !entity.lifecycle.object_alive() || entity.lifecycle.in_limbo() {
@@ -17272,7 +17179,7 @@ impl SuperAi {
             .into_iter()
             .filter(|(_, name)| name == bunker_name)
             .filter_map(|(id, _)| {
-                sim.substrate().entities.get(id).and_then(|entity| {
+                sim.entities().get(id).and_then(|entity| {
                     (entity.lifecycle.object_alive()
                         && !entity.lifecycle.in_limbo()
                         && entity.bunker.occupant().is_none()
@@ -17327,7 +17234,7 @@ impl SuperAi {
             .unwrap_or_default();
         let mut civilians: Vec<(i32, u64)> = Vec::new();
         let mut bunkers: Vec<(i32, u64)> = Vec::new();
-        for (id, entity) in sim.substrate().entities.iter_sorted() {
+        for (id, entity) in sim.entities().iter_sorted() {
             if entity.category() != crate::map::entities::EntityCategory::Structure
                 || entity.lifecycle.in_limbo()
                 || !entity.lifecycle.object_alive()
@@ -17387,7 +17294,7 @@ impl SuperAi {
             .garrison_targets
             .iter()
             .map(|&building| {
-                let Some(entity) = sim.substrate().entities.get(building) else {
+                let Some(entity) = sim.entities().get(building) else {
                     return 0;
                 };
                 let Some(ty) = rules.object(sim.interner().resolve(entity.type_ref())) else {
@@ -17425,7 +17332,7 @@ impl SuperAi {
     ) -> Option<u64> {
         let to = (target_cell.0.max(0) as u16, target_cell.1.max(0) as u16);
         let mut candidates: Vec<(u32, u64)> = Vec::new();
-        for (id, entity) in sim.substrate().entities.iter_sorted() {
+        for (id, entity) in sim.entities().iter_sorted() {
             if entity.owner() != self.house
                 || entity.category() != crate::map::entities::EntityCategory::Infantry
                 || !entity.lifecycle.object_alive()
@@ -17494,7 +17401,7 @@ impl SuperAi {
         tick: u32,
     ) -> Option<u64> {
         let mut best: Option<(u32, u64)> = None;
-        for (id, entity) in sim.substrate().entities.iter_sorted() {
+        for (id, entity) in sim.entities().iter_sorted() {
             if entity.owner() != self.house
                 || entity.category() != crate::map::entities::EntityCategory::Unit
                 || !entity.lifecycle.object_alive()
@@ -17642,7 +17549,7 @@ impl SuperAi {
         rules: &crate::rules::ruleset::RuleSet,
         force: &[u64],
     ) -> Option<u64> {
-        let sailor = sim.substrate().entities.get(*force.first()?)?;
+        let sailor = sim.entities().get(*force.first()?)?;
         let from = (sailor.position.rx() as i16, sailor.position.ry() as i16);
         let zone = rules
             .object(sim.interner().resolve(sailor.type_ref()))
@@ -17660,8 +17567,7 @@ impl SuperAi {
         // the Unit category, but the rows decide — a cell the sailer's zone
         // never reaches is not a sortie target.
         let hulls: Vec<(u64, (i16, i16))> = sim
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.category() == crate::map::entities::EntityCategory::Unit
@@ -17690,8 +17596,7 @@ impl SuperAi {
         opening: &Opening,
     ) -> Vec<u64> {
         let roster = Self::combat_roster(opening);
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .filter(|(id, entity)| {
                 entity.owner() == self.house
@@ -17754,8 +17659,7 @@ impl SuperAi {
         cell: (i16, i16),
         radius: i16,
     ) -> usize {
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 let dx = i32::from(entity.position.rx() as i16) - i32::from(cell.0);
@@ -17781,7 +17685,7 @@ impl SuperAi {
     ) -> Option<u64> {
         let limit = i32::from(radius) * i32::from(radius);
         let mut best: Option<(i32, u64)> = None;
-        for (id, entity) in sim.substrate().entities.iter_sorted() {
+        for (id, entity) in sim.entities().iter_sorted() {
             if entity.lifecycle.in_limbo() || !self.is_enemy(sim, entity.owner()) {
                 continue;
             }
@@ -17837,7 +17741,7 @@ impl SuperAi {
         let anchor = self
             .own_structures(sim)
             .first()
-            .and_then(|&(id, _)| sim.substrate().entities.get(id))
+            .and_then(|&(id, _)| sim.entities().get(id))
             .map(|entity| {
                 (
                     i32::from(entity.position.rx()),
@@ -17845,7 +17749,7 @@ impl SuperAi {
                 )
             });
         let mut best: Option<(i32, (u16, u16))> = None;
-        for (_, entity) in sim.substrate().entities.iter_sorted() {
+        for (_, entity) in sim.entities().iter_sorted() {
             if entity.lifecycle.in_limbo()
                 || !entity.lifecycle.object_alive()
                 || !matches!(
@@ -17907,7 +17811,7 @@ impl SuperAi {
             .iter()
             .find_map(|&yard| self.nearest_intruder(sim, yard, ALARM_RADIUS));
         if let Some(target) = intruder
-            && let Some(entity) = sim.substrate().entities.get(target)
+            && let Some(entity) = sim.entities().get(target)
         {
             self.defense_focus = Some((
                 (entity.position.rx(), entity.position.ry()),
@@ -17931,7 +17835,7 @@ impl SuperAi {
         }
         // Dead defenders leave the roster — the substrate drops them.
         self.defenders
-            .retain(|&unit| sim.substrate().entities.get(unit).is_some());
+            .retain(|&unit| sim.entities().get(unit).is_some());
         let (focus, _) = self.defense_focus?;
         // A due idle unit attacks the intruder outright.
         if let Some(attacker) = self.due_idle_unit(idle, tick)
@@ -17963,7 +17867,7 @@ impl SuperAi {
                 {
                     continue;
                 }
-                let Some(entity) = sim.substrate().entities.get(unit) else {
+                let Some(entity) = sim.entities().get(unit) else {
                     continue;
                 };
                 if self.jam_on_corridor(
@@ -18004,7 +17908,7 @@ impl SuperAi {
         rules: &crate::rules::ruleset::RuleSet,
     ) -> Option<(u16, u16)> {
         let mut best: Option<(i64, u16, u16)> = None;
-        for (_, entity) in sim.substrate().entities.iter_sorted() {
+        for (_, entity) in sim.entities().iter_sorted() {
             if entity.owner() != self.house
                 || entity.category() != crate::map::entities::EntityCategory::Structure
                 || entity.lifecycle.in_limbo()
@@ -18077,7 +17981,7 @@ impl SuperAi {
         let mut yards = Vec::new();
         let mut factories = Vec::new();
         let mut structures = Vec::new();
-        for (id, entity) in sim.substrate().entities.iter_sorted() {
+        for (id, entity) in sim.entities().iter_sorted() {
             if entity.category() != crate::map::entities::EntityCategory::Structure
                 || entity.lifecycle.in_limbo()
                 || !self.is_enemy(sim, entity.owner())
@@ -18113,7 +18017,7 @@ impl SuperAi {
         let mut sum_x = 0i64;
         let mut sum_y = 0i64;
         let mut count = 0u64;
-        for (_, entity) in sim.substrate().entities.iter_sorted() {
+        for (_, entity) in sim.entities().iter_sorted() {
             if !matches!(
                 entity.category(),
                 crate::map::entities::EntityCategory::Unit
@@ -18142,7 +18046,7 @@ impl SuperAi {
             .iter()
             .find(|(_, name)| name == prefer_type)
             .or_else(|| structures.first())?;
-        let entity = sim.substrate().entities.get(pick.0)?;
+        let entity = sim.entities().get(pick.0)?;
         Some((entity.position.rx() as i16, entity.position.ry() as i16))
     }
 
@@ -18159,8 +18063,7 @@ impl SuperAi {
             .iter()
             .filter(|(_, name)| name == opening.construction_yard)
             .filter_map(|(id, _)| {
-                sim.substrate()
-                    .entities
+                sim.entities()
                     .get(*id)
                     .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))
             })
@@ -18182,7 +18085,7 @@ impl SuperAi {
             .iter()
             .filter(|(_, name)| name == type_name)
             .filter(|(id, _)| {
-                sim.substrate().entities.get(*id).is_some_and(|entity| {
+                sim.entities().get(*id).is_some_and(|entity| {
                     (entity.position.rx() as i16 - center.0)
                         .abs()
                         .max((entity.position.ry() as i16 - center.1).abs())
@@ -18207,7 +18110,7 @@ impl SuperAi {
             .iter()
             .filter(|(_, name)| name == type_name)
             .filter(|(id, _)| {
-                sim.substrate().entities.get(*id).is_some_and(|entity| {
+                sim.entities().get(*id).is_some_and(|entity| {
                     let (ex, ey) = (entity.position.rx() as i16, entity.position.ry() as i16);
                     sites
                         .iter()
@@ -18265,7 +18168,7 @@ impl SuperAi {
         // repair step stops the byte at full health or an empty wallet,
         // and a dead or captured structure stops being a repair job.
         if let Some(id) = self.repairing_structure
-            && !sim.substrate().entities.get(id).is_some_and(|entity| {
+            && !sim.entities().get(id).is_some_and(|entity| {
                 entity.owner() == self.house
                     && entity.category() == crate::map::entities::EntityCategory::Structure
                     && entity.lifecycle.object_alive()
@@ -18287,7 +18190,7 @@ impl SuperAi {
             name == opening.refinery || name == opening.power || name == opening.war_factory
         };
         let mut best: Option<(u64, (usize, i32))> = None;
-        for (id, entity) in sim.substrate().entities.iter_sorted() {
+        for (id, entity) in sim.entities().iter_sorted() {
             if entity.owner() != self.house
                 || entity.category() != crate::map::entities::EntityCategory::Structure
                 || entity.lifecycle.in_limbo()
@@ -18393,7 +18296,7 @@ impl SuperAi {
         let mut allied: Vec<(InternedId, bool)> = Vec::new();
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut stationary: Vec<(u64, (u16, u16), InternedId, bool)> = Vec::new();
-        for (id, entity) in sim.substrate().entities.iter_sorted() {
+        for (id, entity) in sim.entities().iter_sorted() {
             if entity.lifecycle.in_limbo()
                 || !entity.lifecycle.object_alive()
                 || !matches!(
@@ -18477,7 +18380,7 @@ impl SuperAi {
             .own_structures(sim)
             .into_iter()
             .filter(|(_, name)| name == opening.war_factory)
-            .filter_map(|(id, _)| sim.substrate().entities.get(id)?.rally_cell())
+            .filter_map(|(id, _)| sim.entities().get(id)?.rally_cell())
             .collect();
         // The cluster: the first stationary own unit (stable order) whose
         // box holds the quota of stationary ground units, enough of them
@@ -18588,7 +18491,7 @@ impl SuperAi {
                     .is_none_or(|&until| tick >= until)
             })
             .filter_map(|&(id, cell, _, _)| {
-                let entity = sim.substrate().entities.get(id)?;
+                let entity = sim.entities().get(id)?;
                 // A member with something to shoot at is fighting, not
                 // jammed: the Stop would drop its target too.
                 (entity.attack_target.target().is_none()
@@ -18663,7 +18566,7 @@ impl SuperAi {
             if tick.saturating_sub(scanned) >= CONGESTION_SCAN_TICKS {
                 continue;
             }
-            let Some(entity) = sim.substrate().entities.get(unit) else {
+            let Some(entity) = sim.entities().get(unit) else {
                 continue;
             };
             if entity.owner() != self.house
@@ -18840,8 +18743,7 @@ impl SuperAi {
                 continue;
             }
             let Some(rally) = sim
-                .substrate()
-                .entities
+                .entities()
                 .get(factory)
                 .and_then(|entity| entity.rally_cell())
             else {
@@ -18904,8 +18806,7 @@ impl SuperAi {
     /// then the house table's.
     fn allied_base_centers(&self, sim: &crate::sim::world::Simulation) -> Vec<(i16, i16)> {
         let mut bases: Vec<(i16, i16)> = sim
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.category() == crate::map::entities::EntityCategory::Structure
@@ -18941,13 +18842,11 @@ impl SuperAi {
         building: u64,
     ) -> Option<InternedId> {
         let at = sim
-            .substrate()
-            .entities
+            .entities()
             .get(building)
             .map(|entity| (entity.position.rx(), entity.position.ry()))?;
         const BESIDE: i32 = 3;
-        sim.substrate()
-            .entities
+        sim.entities()
             .iter_sorted()
             .filter_map(|(_, entity)| {
                 let owner = entity.owner();
@@ -18983,7 +18882,7 @@ impl SuperAi {
             cell_distance((home.0.max(0) as u16, home.1.max(0) as u16), cell) <= HOME_JAM_RADIUS
         };
         self.engine_home.is_some_and(near)
-            || sim.substrate().entities.iter_sorted().any(|(_, entity)| {
+            || sim.entities().iter_sorted().any(|(_, entity)| {
                 entity.owner() == self.house
                     && entity.category() == crate::map::entities::EntityCategory::Structure
                     && !entity.lifecycle.in_limbo()
@@ -19024,11 +18923,9 @@ impl SuperAi {
         if tick >= self.outbound_active_until {
             return false;
         }
-        let (Some(home), Some(gather), Some(entity)) = (
-            self.pinned_home,
-            self.wave_gather,
-            sim.substrate().entities.get(unit),
-        ) else {
+        let (Some(home), Some(gather), Some(entity)) =
+            (self.pinned_home, self.wave_gather, sim.entities().get(unit))
+        else {
             return false;
         };
         let reach = |x: u16, y: u16| {
@@ -19119,7 +19016,7 @@ impl SuperAi {
             .collect();
         book.sort_unstable();
         for (target, cycles) in book {
-            let stands = sim.substrate().entities.get(target).is_some_and(|entity| {
+            let stands = sim.entities().get(target).is_some_and(|entity| {
                 entity.lifecycle.object_alive()
                     && !entity.lifecycle.in_limbo()
                     && self.is_enemy(sim, entity.owner())
@@ -19181,7 +19078,7 @@ impl SuperAi {
         const REPOST_CAP: usize = 8;
         let roster = Self::combat_roster(opening);
         let mut commands: Vec<Command> = Vec::new();
-        for (id, entity) in sim.substrate().entities.iter_sorted() {
+        for (id, entity) in sim.entities().iter_sorted() {
             if commands.len() >= REPOST_CAP {
                 break;
             }
@@ -19270,8 +19167,7 @@ impl SuperAi {
         };
         let roster = Self::combat_roster(opening);
         let guard = sim
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .filter(|(_, entity)| {
                 entity.owner() == self.house
@@ -19315,7 +19211,7 @@ impl SuperAi {
         tick: u32,
     ) -> Option<Command> {
         let alive = |actor: u64| {
-            sim.substrate().entities.get(actor).is_some_and(|entity| {
+            sim.entities().get(actor).is_some_and(|entity| {
                 entity.owner() == self.house && entity.lifecycle.object_alive()
             })
         };
@@ -19329,7 +19225,7 @@ impl SuperAi {
             } else if let Some(unit) = units.iter().copied().find(|&unit| {
                 alive(unit)
                     && self.order_gate.get(&unit).is_none_or(|&due| tick >= due)
-                    && sim.substrate().entities.get(unit).is_some_and(|entity| {
+                    && sim.entities().get(unit).is_some_and(|entity| {
                         matches!(
                             entity.passive_acquire_mission(),
                             crate::sim::mission::MissionType::None
@@ -19360,7 +19256,7 @@ impl SuperAi {
             } else if let Some(unit) = units.iter().copied().find(|&unit| {
                 alive(unit)
                     && self.order_gate.get(&unit).is_none_or(|&due| tick >= due)
-                    && sim.substrate().entities.get(unit).is_some_and(|entity| {
+                    && sim.entities().get(unit).is_some_and(|entity| {
                         matches!(
                             entity.passive_acquire_mission(),
                             crate::sim::mission::MissionType::None
@@ -19371,8 +19267,7 @@ impl SuperAi {
                     })
             }) {
                 let from = sim
-                    .substrate()
-                    .entities
+                    .entities()
                     .get(unit)
                     .map(|entity| (entity.position.rx() as i16, entity.position.ry() as i16))
                     .unwrap_or((0, 0));
@@ -19402,7 +19297,7 @@ impl SuperAi {
         from: (u16, u16),
     ) -> Option<(u16, u16)> {
         let mut best: Option<(usize, i32, (u16, u16))> = None;
-        for (_, entity) in sim.substrate().entities.iter_sorted() {
+        for (_, entity) in sim.entities().iter_sorted() {
             if entity.category() != crate::map::entities::EntityCategory::Structure
                 || entity.lifecycle.in_limbo()
                 || !self.is_enemy(sim, entity.owner())
@@ -19438,7 +19333,7 @@ impl SuperAi {
         from: (i16, i16),
     ) -> Option<(u16, u16)> {
         let mut best: Option<(i32, (u16, u16))> = None;
-        for (_, entity) in sim.substrate().entities.iter_sorted() {
+        for (_, entity) in sim.entities().iter_sorted() {
             if entity.category() != crate::map::entities::EntityCategory::Structure
                 || entity.lifecycle.in_limbo()
                 || !self.is_enemy(sim, entity.owner())
@@ -19488,7 +19383,7 @@ impl SuperAi {
             }
             // Liveness: any lost actor ends the cycle.
             if stage.actors().into_iter().any(|actor| {
-                sim.substrate().entities.get(actor).is_none_or(|entity| {
+                sim.entities().get(actor).is_none_or(|entity| {
                     entity.owner() != self.house || !entity.lifecycle.object_alive()
                 })
             }) {
@@ -19497,7 +19392,7 @@ impl SuperAi {
                 return Vec::new();
             }
             let idle = |actor: u64| {
-                sim.substrate().entities.get(actor).is_some_and(|entity| {
+                sim.entities().get(actor).is_some_and(|entity| {
                     matches!(
                         entity.passive_acquire_mission(),
                         crate::sim::mission::MissionType::None
@@ -19510,7 +19405,7 @@ impl SuperAi {
             return match stage {
                 ChronoSteal::Loading { engineers, ride } => {
                     let aboard = |actor: u64| {
-                        sim.substrate().entities.get(ride).is_some_and(|entity| {
+                        sim.entities().get(ride).is_some_and(|entity| {
                             entity
                                 .passenger_role
                                 .cargo()
@@ -19525,8 +19420,7 @@ impl SuperAi {
                     if pending.is_empty() {
                         // Latch the pad (the ride's own cell) and the prize.
                         let pad = sim
-                            .substrate()
-                            .entities
+                            .entities()
                             .get(ride)
                             .map(|entity| (entity.position.rx(), entity.position.ry()));
                         let target = self.enemy_conyard(sim, None);
@@ -19563,8 +19457,7 @@ impl SuperAi {
                     // The ride holds the pad until the suite's two clicks
                     // fire; a ride drifted off the pad walks back on.
                     let at = sim
-                        .substrate()
-                        .entities
+                        .entities()
                         .get(ride)
                         .map(|entity| (entity.position.rx(), entity.position.ry()));
                     if at == Some(pad) {
@@ -19591,7 +19484,7 @@ impl SuperAi {
                         return Vec::new();
                     }
                     let on_foot = engineers.iter().any(|&actor| {
-                        sim.substrate().entities.get(actor).is_some_and(|entity| {
+                        sim.entities().get(actor).is_some_and(|entity| {
                             entity.owner() == self.house
                                 && entity.lifecycle.object_alive()
                                 && !entity.lifecycle.in_limbo()
@@ -19610,8 +19503,7 @@ impl SuperAi {
                 }
                 ChronoSteal::Capturing { engineers, target } => {
                     let target_stands = sim
-                        .substrate()
-                        .entities
+                        .entities()
                         .get(target)
                         .is_some_and(|entity| entity.lifecycle.object_alive());
                     if !target_stands {
@@ -19737,8 +19629,7 @@ impl SuperAi {
             return Vec::new();
         };
         let seats = sim
-            .substrate()
-            .entities
+            .entities()
             .get(ride)
             .and_then(|entity| entity.passenger_role.cargo().map(|cargo| cargo.capacity()))
             .unwrap_or(1)
@@ -20272,8 +20163,7 @@ fn own_structure_rects(
     rules: &crate::rules::ruleset::RuleSet,
     house: InternedId,
 ) -> Vec<(i32, i32, i32, i32)> {
-    sim.substrate()
-        .entities
+    sim.entities()
         .iter_sorted()
         .filter(|(_, entity)| {
             entity.owner() == house
@@ -20655,7 +20545,7 @@ fn pick_guard_post(
     offsets: &[(i8, i8)],
     axis: Option<((i16, i16), (i16, i16))>,
 ) -> Option<(u16, u16)> {
-    let entity = sim.substrate().entities.get(unit)?;
+    let entity = sim.entities().get(unit)?;
     let from = (entity.position.rx(), entity.position.ry());
     let movement_zone = rules
         .object(sim.interner().resolve(entity.type_ref()))
@@ -20717,7 +20607,7 @@ fn cell_openness(
                 .any(|member| match member {
                     crate::sim::occupancy::CellObjectMember::Terrain(_) => true,
                     crate::sim::occupancy::CellObjectMember::Entity(id) => {
-                        sim.substrate().entities.get(id).is_some_and(|entity| {
+                        sim.entities().get(id).is_some_and(|entity| {
                             entity.category() == crate::map::entities::EntityCategory::Structure
                         })
                     }
@@ -20739,7 +20629,7 @@ fn cell_holds_obstacle(sim: &crate::sim::world::Simulation, cell: (u16, u16)) ->
         .any(|member| match member {
             crate::sim::occupancy::CellObjectMember::Terrain(_) => true,
             crate::sim::occupancy::CellObjectMember::Entity(id) => {
-                sim.substrate().entities.get(id).is_some_and(|entity| {
+                sim.entities().get(id).is_some_and(|entity| {
                     entity.category() == crate::map::entities::EntityCategory::Structure
                 })
             }
@@ -20771,7 +20661,7 @@ fn pick_ring_post_wide(
     core: (i16, i16),
     held: &[(u16, u16)],
 ) -> Option<(u16, u16)> {
-    let entity = sim.substrate().entities.get(unit)?;
+    let entity = sim.entities().get(unit)?;
     let from = (entity.position.rx(), entity.position.ry());
     let movement_zone = rules
         .object(sim.interner().resolve(entity.type_ref()))
@@ -21811,16 +21701,11 @@ mod tests {
         let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
 
         let owns = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
-            scenario
-                .sim()
-                .substrate()
-                .entities
-                .iter_sorted()
-                .any(|(_, entity)| {
-                    entity.owner() == human
-                        && entity.category() == crate::map::entities::EntityCategory::Structure
-                        && scenario.sim().interner().resolve(entity.type_ref()) == name
-                })
+            scenario.sim().entities().iter_sorted().any(|(_, entity)| {
+                entity.owner() == human
+                    && entity.category() == crate::map::entities::EntityCategory::Structure
+                    && scenario.sim().interner().resolve(entity.type_ref()) == name
+            })
         };
 
         let tick = drive_until(&mut scenario, &mut ai, 6000, |scenario| {
@@ -21848,16 +21733,11 @@ mod tests {
             scenario.apply_super_ai_tier(human, tier);
             let mut ai = SuperAi::new(human, tier);
             let owns = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
-                scenario
-                    .sim()
-                    .substrate()
-                    .entities
-                    .iter_sorted()
-                    .any(|(_, entity)| {
-                        entity.owner() == human
-                            && entity.category() == crate::map::entities::EntityCategory::Structure
-                            && scenario.sim().interner().resolve(entity.type_ref()) == name
-                    })
+                scenario.sim().entities().iter_sorted().any(|(_, entity)| {
+                    entity.owner() == human
+                        && entity.category() == crate::map::entities::EntityCategory::Structure
+                        && scenario.sim().interner().resolve(entity.type_ref()) == name
+                })
             };
             drive_until(&mut scenario, &mut ai, 6000, |scenario| {
                 owns(scenario, "GACNST") && owns(scenario, "GAPOWR") && owns(scenario, "GAREFN")
@@ -21884,8 +21764,7 @@ mod tests {
         let units_of_type = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
             scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
@@ -21925,8 +21804,7 @@ mod tests {
         let combat = |scenario: &crate::headless_scenario::HeadlessScenario| {
             scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
@@ -21945,8 +21823,7 @@ mod tests {
         let yard = |scenario: &crate::headless_scenario::HeadlessScenario| {
             scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .find(|(_, entity)| {
                     entity.owner() == human
@@ -21961,24 +21838,18 @@ mod tests {
             };
             let limit =
                 i32::from(super::BASE_DEFENSE_RADIUS) * i32::from(super::BASE_DEFENSE_RADIUS);
-            scenario
-                .sim()
-                .substrate()
-                .entities
-                .iter_sorted()
-                .any(|(_, entity)| {
-                    if entity.owner() != human
-                        || entity.category() != crate::map::entities::EntityCategory::Unit
-                        || scenario.sim().interner().resolve(entity.type_ref()) != "MTNK"
-                        || entity.passive_acquire_mission()
-                            != crate::sim::mission::MissionType::Move
-                    {
-                        return false;
-                    }
-                    let dx = i32::from(entity.position.rx() as i16 - yard.0);
-                    let dy = i32::from(entity.position.ry() as i16 - yard.1);
-                    dx * dx + dy * dy > limit
-                })
+            scenario.sim().entities().iter_sorted().any(|(_, entity)| {
+                if entity.owner() != human
+                    || entity.category() != crate::map::entities::EntityCategory::Unit
+                    || scenario.sim().interner().resolve(entity.type_ref()) != "MTNK"
+                    || entity.passive_acquire_mission() != crate::sim::mission::MissionType::Move
+                {
+                    return false;
+                }
+                let dx = i32::from(entity.position.rx() as i16 - yard.0);
+                let dy = i32::from(entity.position.ry() as i16 - yard.1);
+                dx * dx + dy * dy > limit
+            })
         };
 
         // The tech climb trades early army for late power: past the first
@@ -22009,8 +21880,7 @@ mod tests {
                                   name: &str| {
             scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
@@ -22040,22 +21910,16 @@ mod tests {
         let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
 
         let owns_structure = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
-            scenario
-                .sim()
-                .substrate()
-                .entities
-                .iter_sorted()
-                .any(|(_, entity)| {
-                    entity.owner() == human
-                        && entity.category() == crate::map::entities::EntityCategory::Structure
-                        && scenario.sim().interner().resolve(entity.type_ref()) == name
-                })
+            scenario.sim().entities().iter_sorted().any(|(_, entity)| {
+                entity.owner() == human
+                    && entity.category() == crate::map::entities::EntityCategory::Structure
+                    && scenario.sim().interner().resolve(entity.type_ref()) == name
+            })
         };
         let units_of_type = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
             scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
@@ -22287,7 +22151,7 @@ mod tests {
             let gate_probe = ai
                 .deployable_mcv(sim, rules)
                 .and_then(|mcv| {
-                    let entity = sim.substrate().entities.get(mcv)?;
+                    let entity = sim.entities().get(mcv)?;
                     let mcv_cell = (entity.position.rx(), entity.position.ry());
                     let mut gates = format!(
                         "mission={:?} navcom={} ",
@@ -22331,7 +22195,7 @@ mod tests {
                             mcv_cell.1,
                             crate::sim::movement::locomotor::MovementLayer::Ground,
                         )
-                        .and_then(|building| sim.substrate().entities.get(building))
+                        .and_then(|building| sim.entities().get(building))
                         .and_then(|building| sim.object_type(building.type_ref(), rules))
                         .is_some_and(|kind| kind.weapons_factory);
                     gates.push_str(&format!("weapons_factory={weapons_factory} "));
@@ -22361,8 +22225,7 @@ mod tests {
                 .unwrap_or_else(|| "no-mcv ".to_string());
             let yards = scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == ai.house
@@ -22373,8 +22236,7 @@ mod tests {
                 .count();
             let structures = scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == ai.house && entity.category() == EntityCategory::Structure
@@ -22382,8 +22244,7 @@ mod tests {
                 .count();
             let units = scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == ai.house && entity.category() == EntityCategory::Unit
@@ -22497,7 +22358,7 @@ mod tests {
                         target_rx,
                         target_ry,
                     } => {
-                        if let Some(entity) = scenario.sim().substrate().entities.get(*entity_id)
+                        if let Some(entity) = scenario.sim().entities().get(*entity_id)
                             && entity.category() == EntityCategory::Unit
                             && mcv_names
                                 .iter()
@@ -22535,8 +22396,7 @@ mod tests {
             let name = sim.interner().resolve(ai.house).to_string();
             let wallet = crate::sim::production::credits_for_owner(sim, &name);
             let home = sim
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .find(|(_, e)| {
                     e.owner() == ai.house
@@ -22552,15 +22412,13 @@ mod tests {
                 })
                 .sum();
             let units = sim
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(_, e)| e.owner() == ai.house && e.category() == EntityCategory::Unit)
                 .count();
             let mcv_walks = moved_mcv.get(&name);
             let mut mcv_line = String::from("mcv_walks=no-orders ");
-            if let Some(entity) = mcv_walks.and_then(|(id, _, _)| sim.substrate().entities.get(*id))
-            {
+            if let Some(entity) = mcv_walks.and_then(|(id, _, _)| sim.entities().get(*id)) {
                 if let Some((hx, hy)) = home {
                     let dist = (entity.position.rx() as i16 - hx)
                         .abs()
@@ -22599,8 +22457,7 @@ mod tests {
         let any_units = drivers.iter().any(|ai| {
             scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .any(|(_, e)| e.owner() == ai.house && e.category() == EntityCategory::Unit)
         });
@@ -22621,8 +22478,7 @@ mod tests {
         let structures = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
             scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
@@ -22634,8 +22490,7 @@ mod tests {
         let units = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
             scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
@@ -22655,8 +22510,7 @@ mod tests {
         let aircraft = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
             scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
@@ -22759,8 +22613,7 @@ mod tests {
                 if seen.amradr_id.is_none() && seen.amradr_end > 0 {
                     seen.amradr_id = scenario
                         .sim()
-                        .substrate()
-                        .entities
+                        .entities()
                         .iter_sorted()
                         .find(|(_, entity)| {
                             entity.owner() == human
@@ -22777,8 +22630,7 @@ mod tests {
                 // home anchor, mirroring `structure_center`'s pick).
                 if let Some((hx, hy)) = scenario
                     .sim()
-                    .substrate()
-                    .entities
+                    .entities()
                     .iter_sorted()
                     .find(|(_, entity)| {
                         entity.owner() == human
@@ -22787,23 +22639,15 @@ mod tests {
                     })
                     .map(|(_, entity)| (entity.position.rx() as i16, entity.position.ry() as i16))
                 {
-                    let remote =
-                        scenario
-                            .sim()
-                            .substrate()
-                            .entities
-                            .iter_sorted()
-                            .any(|(_, entity)| {
-                                entity.owner() == human
-                                    && entity.category()
-                                        == crate::map::entities::EntityCategory::Structure
-                                    && scenario.sim().interner().resolve(entity.type_ref())
-                                        == "GAREFN"
-                                    && (entity.position.rx() as i16 - hx)
-                                        .abs()
-                                        .max((entity.position.ry() as i16 - hy).abs())
-                                        >= EXPANSION_MIN_DISTANCE
-                            });
+                    let remote = scenario.sim().entities().iter_sorted().any(|(_, entity)| {
+                        entity.owner() == human
+                            && entity.category() == crate::map::entities::EntityCategory::Structure
+                            && scenario.sim().interner().resolve(entity.type_ref()) == "GAREFN"
+                            && (entity.position.rx() as i16 - hx)
+                                .abs()
+                                .max((entity.position.ry() as i16 - hy).abs())
+                                >= EXPANSION_MIN_DISTANCE
+                    });
                     if remote {
                         seen.remote_refinery = 1;
                     }
@@ -22824,7 +22668,7 @@ mod tests {
                 seen.jets = seen
                     .jets
                     .max(aircraft(scenario, "ORCA") + aircraft(scenario, "BEAG"));
-                for (_, entity) in scenario.sim().substrate().entities.iter_sorted() {
+                for (_, entity) in scenario.sim().entities().iter_sorted() {
                     if entity.owner() == human
                         && entity.category() == crate::map::entities::EntityCategory::Unit
                         && scenario.sim().interner().resolve(entity.type_ref()) == "BFRT"
@@ -22969,8 +22813,7 @@ mod tests {
         // rerun.
         let mcv_probe = scenario
             .sim()
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .find(|(_, entity)| {
                 entity.owner() == human
@@ -23080,8 +22923,7 @@ mod tests {
         let structures = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
             scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
@@ -23132,8 +22974,7 @@ mod tests {
         let structures = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
             scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
@@ -23222,8 +23063,7 @@ mod tests {
         let structures = |scenario: &crate::headless_scenario::HeadlessScenario, name: &str| {
             scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
@@ -23440,8 +23280,7 @@ mod tests {
     fn pacific_hut(scenario: &crate::headless_scenario::HeadlessScenario) -> (u64, (u16, u16)) {
         scenario
             .sim()
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .find(|(_, entity)| {
                 scenario.sim().interner().resolve(entity.type_ref()) == super::BRIDGE_HUT_TYPE
@@ -23652,8 +23491,7 @@ mod tests {
     fn far_target_cell(scenario: &crate::headless_scenario::HeadlessScenario) -> (u16, u16) {
         scenario
             .sim()
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .find(|(_, entity)| {
                 entity.owner() != crate::sim::intern::InternedId::default()
@@ -23748,8 +23586,7 @@ mod tests {
         assert!(
             scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .get(engineer)
                 .is_none_or(|entity| !entity.lifecycle.object_alive()),
             "the engine consumes the engineer on hut entry"
@@ -24089,8 +23926,7 @@ mod tests {
         );
         let occupants = scenario
             .sim()
-            .substrate()
-            .entities
+            .entities()
             .get(bunker)
             .map(|entity| entity.passenger_role.occupants().count().max(0) as usize)
             .expect("the bunker stands");
@@ -24177,8 +24013,7 @@ mod tests {
         );
         let occupant = scenario
             .sim()
-            .substrate()
-            .entities
+            .entities()
             .get(bunker)
             .and_then(|entity| entity.bunker.occupant());
         assert_eq!(
@@ -24241,8 +24076,7 @@ mod tests {
                 .expect("simulation frame failed");
             if scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .get(derrick)
                 .is_some_and(|entity| entity.owner() == ai_house)
             {
@@ -24273,8 +24107,7 @@ mod tests {
             .filter(|&id| {
                 scenario
                     .sim()
-                    .substrate()
-                    .entities
+                    .entities()
                     .get(id)
                     .is_some_and(|entity| entity.lifecycle.object_alive())
             })
@@ -24575,8 +24408,7 @@ mod tests {
                                   name: &str| {
             scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
@@ -24588,8 +24420,7 @@ mod tests {
         let yard_cells = |scenario: &crate::headless_scenario::HeadlessScenario| {
             scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
@@ -24640,8 +24471,7 @@ mod tests {
         let cluster = |names: &[&str]| {
             scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
@@ -24714,8 +24544,7 @@ mod tests {
         assert!(
             !scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .get(refinery)
                 .expect("the spawned refinery")
                 .repairing
@@ -24754,8 +24583,7 @@ mod tests {
         assert!(
             scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .get(refinery)
                 .is_some_and(|entity| {
                     let strength = scenario
@@ -24787,8 +24615,7 @@ mod tests {
                                   name: &str| {
             scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
@@ -24910,8 +24737,7 @@ mod tests {
         // exactly as the latch does at game time.
         let mcv_cell = scenario
             .sim()
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .find(|(_, entity)| {
                 entity.owner() == human
@@ -24941,8 +24767,7 @@ mod tests {
         let neighbor = spawn_near(&mut scenario, "NAREFN", enemy_house, first);
         let neighbor_cell = scenario
             .sim()
-            .substrate()
-            .entities
+            .entities()
             .get(neighbor)
             .map(|entity| (entity.position.rx(), entity.position.ry()))
             .expect("the spawned neighbor refinery");
@@ -24983,8 +24808,7 @@ mod tests {
         let ai = SuperAi::new(human, SuperAiDifficulty::Fair);
         let mcv_cell = scenario
             .sim()
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .find(|(_, entity)| {
                 entity.owner() == human
@@ -25028,7 +24852,7 @@ mod tests {
             let mut sum_x = 0_i64;
             let mut sum_y = 0_i64;
             let mut count = 0_u64;
-            for (_, entity) in sim.substrate().entities.iter_sorted() {
+            for (_, entity) in sim.entities().iter_sorted() {
                 if !matches!(
                     entity.category(),
                     crate::map::entities::EntityCategory::Unit
@@ -25180,7 +25004,7 @@ mod tests {
                         envelope.payload
                     {
                         let sim = scenario.sim();
-                        if let Some(entity) = sim.substrate().entities.get(attacker_id)
+                        if let Some(entity) = sim.entities().get(attacker_id)
                             && entity.owner() == human
                             && entity.category() == EntityCategory::Aircraft
                         {
@@ -25207,7 +25031,7 @@ mod tests {
                     .expect("simulation frame failed");
                 // Parked read: a jet that flew before, holding Guard/AreaGuard
                 // with ordnance back.
-                for (id, entity) in scenario.sim().substrate().entities.iter_sorted() {
+                for (id, entity) in scenario.sim().entities().iter_sorted() {
                     if entity.owner() != human
                         || entity.category() != EntityCategory::Aircraft
                         || !strikes.iter().any(|&(_, jet)| jet == id)
@@ -25370,8 +25194,7 @@ mod tests {
             }
             let enemy_structure = scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .find(|(_, entity)| {
                     entity.owner() == enemy_house
@@ -25580,8 +25403,7 @@ mod tests {
                 let id = spawn_near(&mut scenario, "HARV", enemy_house, (60, 90));
                 let entity = scenario
                     .sim()
-                    .substrate()
-                    .entities
+                    .entities()
                     .get(id)
                     .expect("the enemy harvester");
                 (entity.position.rx(), entity.position.ry())
@@ -25679,7 +25501,7 @@ mod tests {
 
             let (rx, ry) = {
                 let sim = scenario.sim();
-                let entity = sim.substrate().entities.get(tank).expect("the tank");
+                let entity = sim.entities().get(tank).expect("the tank");
                 (entity.position.rx(), entity.position.ry())
             };
             ai.stuck_since.insert(tank, ((rx, ry), 0));
@@ -25722,7 +25544,7 @@ mod tests {
             let scout = spawn_near(&mut scenario, "ADOG", ai_house, (68, 94));
             let (rx, ry) = {
                 let sim = scenario.sim();
-                let entity = sim.substrate().entities.get(scout).expect("the dog");
+                let entity = sim.entities().get(scout).expect("the dog");
                 (entity.position.rx(), entity.position.ry())
             };
             ai.stuck_since.insert(scout, ((rx, ry), 0));
@@ -25783,8 +25605,7 @@ mod tests {
             }
             let yard_id = scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .iter_sorted()
                 .find(|(_, entity)| {
                     entity.owner() == ai_house
@@ -25880,8 +25701,7 @@ mod tests {
             let outpost_yard = spawn_near(&mut scenario, "GACNST", ai_house, far);
             let outpost_yard_cell = scenario
                 .sim()
-                .substrate()
-                .entities
+                .entities()
                 .get(outpost_yard)
                 .map(|entity| (entity.position.rx(), entity.position.ry()))
                 .expect("the expansion yard");
@@ -27559,7 +27379,7 @@ mod tests {
             .spawn_object_at_height("NAPOWR", &enemy_owner, 16, 16, 0, 0, &rules)
             .expect("the fixture cell admits the head");
         let head_cell = {
-            let head_entity = sim.substrate().entities.get(head).expect("the head");
+            let head_entity = sim.entities().get(head).expect("the head");
             (
                 head_entity.position.rx() as i16,
                 head_entity.position.ry() as i16,
@@ -27756,8 +27576,7 @@ mod tests {
         let rules = &scenario.runtime.resources.rules;
         let overlays = &scenario.runtime.resources.overlay_registry;
         let standing = |sim: &crate::sim::world::Simulation, name: &str| -> Vec<u64> {
-            sim.substrate()
-                .entities
+            sim.entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == ai_house
@@ -27789,7 +27608,7 @@ mod tests {
         // the served set — the walk reached past the home yard.
         let sim = scenario.sim();
         for id in refinery_ids.iter().chain(yard_ids.iter()) {
-            let Some(entity) = sim.substrate().entities.get(*id) else {
+            let Some(entity) = sim.entities().get(*id) else {
                 continue;
             };
             let Some(ty) = rules.object(sim.interner().resolve(entity.type_ref())) else {
@@ -27835,8 +27654,7 @@ mod tests {
             .filter_map(|&id| {
                 scenario
                     .sim()
-                    .substrate()
-                    .entities
+                    .entities()
                     .get(id)
                     .map(|entity| (entity.position.rx(), entity.position.ry()))
             })
@@ -27848,7 +27666,7 @@ mod tests {
             .reveal_cells_for_owner(ai_house, revealed);
 
         let from = {
-            let entity = scenario.sim().substrate().entities.get(disc).unwrap();
+            let entity = scenario.sim().entities().get(disc).unwrap();
             (entity.position.rx(), entity.position.ry())
         };
 
@@ -27963,8 +27781,7 @@ mod tests {
             .expect("the retail overlay table carries a wall");
         let (yard_id, rx, ry) = scenario
             .sim()
-            .substrate()
-            .entities
+            .entities()
             .iter_sorted()
             .find_map(|(id, entity)| {
                 (entity.owner() == ai_house
@@ -28591,8 +28408,7 @@ mod tests {
         let (hall, yard) = {
             let sim = &sim;
             let id_of = |name: &str| {
-                sim.substrate()
-                    .entities
+                sim.entities()
                     .iter_sorted()
                     .find(|(_, entity)| {
                         entity.owner() == ai_house
