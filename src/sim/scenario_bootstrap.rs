@@ -2088,7 +2088,7 @@ pub fn install_lobby_slot_houses(
             team: crate::skirmish_launch::LaunchTeam::None,
             is_human: false,
             observer: false,
-            source_human_index: None,
+            controllers: Vec::new(),
             handle: None,
             difficulty: HouseDifficulty::Normal,
             super_tier: None,
