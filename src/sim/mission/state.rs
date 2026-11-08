@@ -240,7 +240,8 @@ pub struct MissionTestFixture {
 impl MissionCom {
     /// A handler mid-mission: `current` holding Mission+0xBC `handler_state`,
     /// the other fields kept.
-    pub(crate) fn set_current_for_test(&mut self, current: MissionId, handler_state: u32) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_current_for_test(&mut self, current: MissionId, handler_state: u32) {
         self.current = current;
         self.handler_state = handler_state;
     }

@@ -112,7 +112,7 @@ impl Drain {
 
 #[cfg(any(test, feature = "test-support"))]
 impl Drain {
-    pub(crate) fn set_target_for_test(&mut self, target: Option<u64>) {
+    pub fn set_target_for_test(&mut self, target: Option<u64>) {
         self.target = target;
     }
 

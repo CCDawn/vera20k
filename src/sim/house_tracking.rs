@@ -597,7 +597,7 @@ impl HouseTracking {
     /// `0x00445946..0x00445988`) and its ChangeOwner (`-=` on the old house,
     /// unclamped, `0x00448B4C..0x00448B6A`; `+=` on the new one,
     /// `0x00449229..0x00449245`), none of which test the house.
-    pub(crate) const fn airport_docks(&self) -> i32 {
+    pub const fn airport_docks(&self) -> i32 {
         self.airport_docks
     }
 

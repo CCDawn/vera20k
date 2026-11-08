@@ -89,7 +89,7 @@ pub fn apply_bridge_damage_events(
     )
 }
 
-pub(crate) fn apply_bridge_damage_events_with_overlay_registry(
+pub fn apply_bridge_damage_events_with_overlay_registry(
     sim: &mut Simulation,
     rules: &RuleSet,
     events: &[BridgeDamageEvent],

@@ -359,7 +359,7 @@ pub(crate) fn query_object_cell_height(
 /// Object41BEA0's current packed cell. Both consume raw Location XY; Z is
 /// ignored. Callers retain the projection's ordered canonical Dummy lookups.
 /// Native body/caller: tools/spatial_oracle/unit_simple_deploy.md.
-pub(crate) fn terrain_projection_differs(cells: &NativeCellQuery<'_>, [x, y]: [i32; 2]) -> bool {
+pub fn terrain_projection_differs(cells: &NativeCellQuery<'_>, [x, y]: [i32; 2]) -> bool {
     let cell = (
         i32::from(crate::util::lepton::lepton_to_cell_packed(x)),
         i32::from(crate::util::lepton::lepton_to_cell_packed(y)),

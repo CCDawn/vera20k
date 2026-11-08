@@ -2127,7 +2127,7 @@ const NATIVE_AI_CM_PERCENT_MULTIPLIER_BITS: u64 = 0x3F84_7AE1_47AE_147B;
 /// differs (e.g. `3 * 0.01 * 100` chops to 2, not 3). `Math__ftol` returns the
 /// low dword of `FISTP qword`, so the i64 result is narrowed with `as i32`; an
 /// out-of-range operand stores the x87 integer indefinite (low dword 0).
-pub(crate) fn native_ai_opening_grant(coefficient: i32, money: i32) -> i32 {
+pub fn native_ai_opening_grant(coefficient: i32, money: i32) -> i32 {
     let percent = X87Chop53::load_f64(NativeF64Bits::from_bits(
         NATIVE_AI_CM_PERCENT_MULTIPLIER_BITS,
     ))

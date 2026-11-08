@@ -17,7 +17,7 @@ pub(crate) fn fixture() -> (
     fixture_with_rules("")
 }
 
-pub(crate) fn fixture_with_rules(
+pub fn fixture_with_rules(
     extra: &str,
 ) -> (
     Simulation,
@@ -28,7 +28,7 @@ pub(crate) fn fixture_with_rules(
 }
 
 /// Build the ordinary entry fixture with explicit ART available to native type reads.
-pub(crate) fn fixture_with_rules_and_fixed_art(
+pub fn fixture_with_rules_and_fixed_art(
     extra: &str,
     art: &IniFile,
 ) -> (

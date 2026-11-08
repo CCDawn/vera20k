@@ -4580,7 +4580,8 @@ impl SuperAi {
         // the same dropped-dispatch class). Three strikes on the same
         // still-ready type pauses that type's placement so production
         // continues; the pause lifts and placement retries.
-        let ready_stock = vera20k_core::sim::production::ready_buildings_for_owner(sim, rules, &owner);
+        let ready_stock =
+            vera20k_core::sim::production::ready_buildings_for_owner(sim, rules, &owner);
         // A type absent from the ready stock placed or drained: its
         // strike count starts over.
         self.place_stuck
@@ -5563,7 +5564,8 @@ impl SuperAi {
                     entity.owner() == self.house
                         && entity.lifecycle.object_alive()
                         && !entity.lifecycle.in_limbo()
-                        && entity.category() == vera20k_core::map::entities::EntityCategory::Infantry
+                        && entity.category()
+                            == vera20k_core::map::entities::EntityCategory::Infantry
                         && sim.interner().resolve(entity.type_ref()) == DESO_TYPE
                         && !self.deploy_issued.contains(id)
                         && !self.boarders.contains(id)
@@ -5622,7 +5624,8 @@ impl SuperAi {
                     .iter_sorted()
                     .filter(|(_, entity)| {
                         entity.owner() == self.house
-                            && entity.category() == vera20k_core::map::entities::EntityCategory::Infantry
+                            && entity.category()
+                                == vera20k_core::map::entities::EntityCategory::Infantry
                             && entity.lifecycle.object_alive()
                             && !entity.lifecycle.in_limbo()
                             && Self::is_dog(sim.interner().resolve(entity.type_ref()))
@@ -5637,7 +5640,8 @@ impl SuperAi {
                     let pick = sim.entities().iter_sorted().find(|(id, entity)| {
                         self.order_gate.get(id).is_none_or(|&due| tick >= due)
                             && entity.owner() == self.house
-                            && entity.category() == vera20k_core::map::entities::EntityCategory::Infantry
+                            && entity.category()
+                                == vera20k_core::map::entities::EntityCategory::Infantry
                             && entity.lifecycle.object_alive()
                             && !entity.lifecycle.in_limbo()
                             && Self::is_dog(sim.interner().resolve(entity.type_ref()))
@@ -5699,7 +5703,9 @@ impl SuperAi {
                                 at,
                                 Command::Guard {
                                     entity_id: dog,
-                                    target: Some(vera20k_core::sim::combat::TargetKind::Cell(px, py)),
+                                    target: Some(vera20k_core::sim::combat::TargetKind::Cell(
+                                        px, py,
+                                    )),
                                 },
                             )];
                         }
@@ -6106,7 +6112,8 @@ impl SuperAi {
                     .iter_sorted()
                     .filter(|(_, entity)| {
                         entity.owner() == self.house
-                            && entity.category() == vera20k_core::map::entities::EntityCategory::Unit
+                            && entity.category()
+                                == vera20k_core::map::entities::EntityCategory::Unit
                             && sim.interner().resolve(entity.type_ref()) == fortress_name
                             && !entity.lifecycle.in_limbo()
                             && entity
@@ -6158,7 +6165,8 @@ impl SuperAi {
                 && let Some((fortress_id, fortress_entity)) =
                     sim.entities().iter_sorted().find(|(_, entity)| {
                         entity.owner() == self.house
-                            && entity.category() == vera20k_core::map::entities::EntityCategory::Unit
+                            && entity.category()
+                                == vera20k_core::map::entities::EntityCategory::Unit
                             && sim.interner().resolve(entity.type_ref()) == fortress_name
                             && entity
                                 .passenger_role
@@ -6215,7 +6223,8 @@ impl SuperAi {
                         continue;
                     };
                     if entity.owner() != self.house
-                        || entity.category() != vera20k_core::map::entities::EntityCategory::Infantry
+                        || entity.category()
+                            != vera20k_core::map::entities::EntityCategory::Infantry
                         || entity.lifecycle.in_limbo()
                         || type_name == opening.hero
                         || self.order_gate.get(&id).is_some_and(|&due| tick < due)
@@ -6473,7 +6482,8 @@ impl SuperAi {
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == self.house
-                        && entity.category() == vera20k_core::map::entities::EntityCategory::Infantry
+                        && entity.category()
+                            == vera20k_core::map::entities::EntityCategory::Infantry
                         && sim.interner().resolve(entity.type_ref()) == opening.scout
                         && !entity.lifecycle.in_limbo()
                         && entity.passive_acquire_mission()
@@ -6752,8 +6762,9 @@ impl SuperAi {
             .into_iter()
             .find(|&name| {
                 rules.object(name).is_some_and(|ty| {
-                    vera20k_core::sim::production::can_build(sim, rules, self.house, ty, false, false)
-                        == vera20k_core::sim::production::CanBuild::Yes
+                    vera20k_core::sim::production::can_build(
+                        sim, rules, self.house, ty, false, false,
+                    ) == vera20k_core::sim::production::CanBuild::Yes
                 })
             })
             .unwrap_or(opening.radar);
@@ -6812,7 +6823,8 @@ impl SuperAi {
         } else {
             yard_centers.clone()
         };
-        let late_sink = vera20k_core::sim::production::credits_for_owner(sim, &owner) > LATE_SINK_CREDITS
+        let late_sink = vera20k_core::sim::production::credits_for_owner(sim, &owner)
+            > LATE_SINK_CREDITS
             && self.count_structures_of_type(sim, opening.war_factory) >= FACTORY_BUILDOUT
             && self.count_structures_of_type(sim, opening.refinery) >= REFINERY_CAP
             && bases.len() >= 2;
@@ -6871,7 +6883,9 @@ impl SuperAi {
                             .then_some(ty.cost)
                     })
                 })
-                .is_some_and(|cost| vera20k_core::sim::production::credits_for_owner(sim, &owner) < cost);
+                .is_some_and(|cost| {
+                    vera20k_core::sim::production::credits_for_owner(sim, &owner) < cost
+                });
         if self
             .structure_center(sim, opening.construction_yard)
             .is_some()
@@ -6944,7 +6958,8 @@ impl SuperAi {
                             < FACTORY_BUILDOUT))
                 && let Some(ty) = rules.object(reactor)
                 && vera20k_core::sim::production::credits_for_owner(sim, &owner) >= ty.cost
-                && vera20k_core::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
+                && vera20k_core::sim::production::cameo_draw_state(sim, rules, self.house, ty)
+                    .enabled
                 && let Some(type_id) = sim.interner().get(reactor)
                 && let Some(command) = self.file_production(sim, rules, type_id, tick)
             {
@@ -7292,8 +7307,9 @@ impl SuperAi {
             // grows by income, so a large balance there is the signal that
             // more economy pays.
             let economy_brake = self.defense.is_some()
-                && i64::from(vera20k_core::sim::production::credits_for_owner(sim, &owner))
-                    > DEFENSE_ECONOMY_CREDITS_CAP;
+                && i64::from(vera20k_core::sim::production::credits_for_owner(
+                    sim, &owner,
+                )) > DEFENSE_ECONOMY_CREDITS_CAP;
             // The backoff halt is the persona's gate: a battle house
             // never reads the ledger's tally — two raider kills must not
             // leave it refinery-less for the rest of the match (the
@@ -8128,9 +8144,9 @@ impl SuperAi {
         // battle lab standing); until then the side's first tank rolls. A
         // queue entered while short on credits simply waits for the money,
         // as a native production event does.
-        let vehicle_busy = queue
-            .iter()
-            .any(|item| item.queue_category == vera20k_core::sim::production::ProductionCategory::Vehicle);
+        let vehicle_busy = queue.iter().any(|item| {
+            item.queue_category == vera20k_core::sim::production::ProductionCategory::Vehicle
+        });
         let economy_first = opening.harvester.is_some_and(|miner| {
             // Two miners per standing dock, floored at the opening target:
             // the growth tail's refinery rule (below) builds the next dock
@@ -8447,8 +8463,9 @@ impl SuperAi {
             // cameo — the same country-lock lesson as `army_pick`.
             let scout_want = self.count_combat_of_type(sim, opening.scout) < SCOUT_TARGET
                 && rules.object(opening.scout).is_some_and(|ty| {
-                    vera20k_core::sim::production::can_build(sim, rules, self.house, ty, false, false)
-                        == vera20k_core::sim::production::CanBuild::Yes
+                    vera20k_core::sim::production::can_build(
+                        sim, rules, self.house, ty, false, false,
+                    ) == vera20k_core::sim::production::CanBuild::Yes
                 });
             // The hero's commission: once the battle lab stands the hero
             // takes the next specialist slot outright instead of waiting
@@ -8463,8 +8480,9 @@ impl SuperAi {
                 Some(opening.scout)
             } else if let Some(dog) = self.dog_sentry_short(sim, opening)
                 && rules.object(dog).is_some_and(|ty| {
-                    vera20k_core::sim::production::can_build(sim, rules, self.house, ty, false, false)
-                        == vera20k_core::sim::production::CanBuild::Yes
+                    vera20k_core::sim::production::can_build(
+                        sim, rules, self.house, ty, false, false,
+                    ) == vera20k_core::sim::production::CanBuild::Yes
                 })
             {
                 // The hounds' floor, the rotation's reservation: the sentry
@@ -8483,15 +8501,17 @@ impl SuperAi {
             } else if !self.hero_issued
                 && self.count_structures_of_type(sim, opening.battle_lab) >= 1
                 && rules.object(opening.hero).is_some_and(|ty| {
-                    vera20k_core::sim::production::cameo_draw_state(sim, rules, self.house, ty).enabled
+                    vera20k_core::sim::production::cameo_draw_state(sim, rules, self.house, ty)
+                        .enabled
                 })
             {
                 Some(opening.hero)
             } else if self.count_combat_of_type(sim, SPY_TYPE) < SPY_QUOTA
                 && self.count_structures_of_type(sim, opening.battle_lab) >= 1
                 && rules.object(SPY_TYPE).is_some_and(|ty| {
-                    vera20k_core::sim::production::can_build(sim, rules, self.house, ty, false, false)
-                        == vera20k_core::sim::production::CanBuild::Yes
+                    vera20k_core::sim::production::can_build(
+                        sim, rules, self.house, ty, false, false,
+                    ) == vera20k_core::sim::production::CanBuild::Yes
                 })
             {
                 // Layer 3: the spy — a quota of [`SPY_QUOTA`] behind the
@@ -8965,8 +8985,14 @@ impl SuperAi {
             return None;
         }
         let engineer_ty = rules.object(opening.engineer)?;
-        if vera20k_core::sim::production::can_build(sim, rules, self.house, engineer_ty, false, false)
-            != vera20k_core::sim::production::CanBuild::Yes
+        if vera20k_core::sim::production::can_build(
+            sim,
+            rules,
+            self.house,
+            engineer_ty,
+            false,
+            false,
+        ) != vera20k_core::sim::production::CanBuild::Yes
         {
             return None;
         }
@@ -9354,9 +9380,10 @@ impl SuperAi {
                 // pipe is the raid's already; another would pile up every
                 // window the field's stay busy.
                 let owner = sim.interner().resolve(self.house);
-                let ride_queued = vera20k_core::sim::production::queue_view_for_owner(sim, rules, owner)
-                    .iter()
-                    .any(|item| sim.interner().resolve(item.type_id) == ride_name);
+                let ride_queued =
+                    vera20k_core::sim::production::queue_view_for_owner(sim, rules, owner)
+                        .iter()
+                        .any(|item| sim.interner().resolve(item.type_id) == ride_name);
                 if ride_queued {
                     return None;
                 }
@@ -10055,7 +10082,11 @@ impl SuperAi {
     }
 
     /// Whether the house owns a structure of exactly this retail type name.
-    fn owns_structure_of_type(&self, sim: &vera20k_core::sim::world::Simulation, type_name: &str) -> bool {
+    fn owns_structure_of_type(
+        &self,
+        sim: &vera20k_core::sim::world::Simulation,
+        type_name: &str,
+    ) -> bool {
         self.own_structures(sim)
             .iter()
             .any(|(_, name)| name == type_name)
@@ -10082,7 +10113,11 @@ impl SuperAi {
     /// "an Allied radar stands", not "the literal section stands", so the
     /// consumers ([`Self::army_pick`], [`Self::naval_pick`]) must accept
     /// either twin or the locked rows above never open.
-    fn needs_structure_stands(&self, sim: &vera20k_core::sim::world::Simulation, gate: &str) -> bool {
+    fn needs_structure_stands(
+        &self,
+        sim: &vera20k_core::sim::world::Simulation,
+        gate: &str,
+    ) -> bool {
         if self.owns_structure_of_type(sim, gate) {
             return true;
         }
@@ -10132,7 +10167,11 @@ impl SuperAi {
     }
 
     /// How many of the house's units are exactly this retail type name.
-    fn count_units_of_type(&self, sim: &vera20k_core::sim::world::Simulation, type_name: &str) -> usize {
+    fn count_units_of_type(
+        &self,
+        sim: &vera20k_core::sim::world::Simulation,
+        type_name: &str,
+    ) -> usize {
         sim.entities()
             .iter_sorted()
             .filter(|(_, entity)| {
@@ -10345,7 +10384,11 @@ impl SuperAi {
     /// under `Unit` — are exactly this retail type name. The mix's fielded
     /// count reads both: a soldiers-only count reads zero for an infantry
     /// roster and the mix would never see its shares met.
-    fn count_combat_of_type(&self, sim: &vera20k_core::sim::world::Simulation, type_name: &str) -> usize {
+    fn count_combat_of_type(
+        &self,
+        sim: &vera20k_core::sim::world::Simulation,
+        type_name: &str,
+    ) -> usize {
         sim.entities()
             .iter_sorted()
             .filter(|(_, entity)| {
@@ -10595,7 +10638,9 @@ impl SuperAi {
                 vera20k_core::map::entities::EntityCategory::Infantry => composition.infantry += 1,
                 vera20k_core::map::entities::EntityCategory::Unit => composition.vehicles += 1,
                 vera20k_core::map::entities::EntityCategory::Aircraft => composition.aircraft += 1,
-                vera20k_core::map::entities::EntityCategory::Structure => composition.buildings += 1,
+                vera20k_core::map::entities::EntityCategory::Structure => {
+                    composition.buildings += 1
+                }
             }
         }
 
@@ -10870,7 +10915,10 @@ impl SuperAi {
     /// holds the most hostiles inside [`DEFENSE_RESCUE_CLUSTER_RADIUS`] —
     /// the marching wave's shoulder — with the smallest cell breaking
     /// ties. Below [`DEFENSE_RESCUE_CLUSTER_MIN`] the charge holds.
-    fn defense_cluster_cell(&self, sim: &vera20k_core::sim::world::Simulation) -> Option<(u16, u16)> {
+    fn defense_cluster_cell(
+        &self,
+        sim: &vera20k_core::sim::world::Simulation,
+    ) -> Option<(u16, u16)> {
         let mut hostiles: Vec<(u16, u16)> = Vec::new();
         for (_, entity) in sim.entities().iter_sorted() {
             if entity.lifecycle.in_limbo()
@@ -11710,7 +11758,9 @@ impl SuperAi {
                 commands.push(Command::AttackMove {
                     entity_id: unit,
                     target: None,
-                    destination: Some(vera20k_core::sim::combat::TargetKind::Cell(aim_cell.0, aim_cell.1)),
+                    destination: Some(vera20k_core::sim::combat::TargetKind::Cell(
+                        aim_cell.0, aim_cell.1,
+                    )),
                 });
             }
         }
@@ -11824,7 +11874,9 @@ impl SuperAi {
             commands.push(Command::AttackMove {
                 entity_id: unit,
                 target: None,
-                destination: Some(vera20k_core::sim::combat::TargetKind::Cell(aim_cell.0, aim_cell.1)),
+                destination: Some(vera20k_core::sim::combat::TargetKind::Cell(
+                    aim_cell.0, aim_cell.1,
+                )),
             });
         }
         if commands.is_empty() {
@@ -11995,7 +12047,9 @@ impl SuperAi {
                         self.gate_idle_order(unit, tick);
                         commands.push(Command::Guard {
                             entity_id: unit,
-                            target: Some(vera20k_core::sim::combat::TargetKind::Cell(home.0, home.1)),
+                            target: Some(vera20k_core::sim::combat::TargetKind::Cell(
+                                home.0, home.1,
+                            )),
                         });
                     }
                 }
@@ -12024,7 +12078,9 @@ impl SuperAi {
                     commands.push(Command::AttackMove {
                         entity_id: unit,
                         target: None,
-                        destination: Some(vera20k_core::sim::combat::TargetKind::Cell(meet.0, meet.1)),
+                        destination: Some(vera20k_core::sim::combat::TargetKind::Cell(
+                            meet.0, meet.1,
+                        )),
                     });
                 }
             }
@@ -12953,10 +13009,9 @@ impl SuperAi {
             rules,
             &sim.interner().resolve(self.house).to_string(),
         );
-        if queue
-            .iter()
-            .any(|item| item.queue_category == vera20k_core::sim::production::ProductionCategory::Infantry)
-        {
+        if queue.iter().any(|item| {
+            item.queue_category == vera20k_core::sim::production::ProductionCategory::Infantry
+        }) {
             return None;
         }
         if vera20k_core::sim::production::credits_for_owner(
@@ -13206,8 +13261,9 @@ impl SuperAi {
                 {
                     continue;
                 }
-                if vera20k_core::sim::production::can_build(sim, rules, self.house, ty, false, false)
-                    != vera20k_core::sim::production::CanBuild::Yes
+                if vera20k_core::sim::production::can_build(
+                    sim, rules, self.house, ty, false, false,
+                ) != vera20k_core::sim::production::CanBuild::Yes
                     || credits < ty.cost
                     || !self.above_fort_reserve(sim, owner, ty.cost)
                 {
@@ -13524,9 +13580,9 @@ impl SuperAi {
                 .iter()
                 .any(|&other| defense_chebyshev(other, cell) as i32 <= DEFENSE_FORT_ANCHOR_SPREAD)
         };
-        let step = DEFENSE_CORRIDOR_STEP
-            .max(1)
-            .min(vera20k_core::sim::production::build_area_reach_cells(stone_ty));
+        let step = DEFENSE_CORRIDOR_STEP.max(1).min(
+            vera20k_core::sim::production::build_area_reach_cells(stone_ty),
+        );
         // The walk starts at the standing anchor nearest the landing —
         // the chain extends an armed fort, never floats free of the base.
         let Some(start_anchor) = forts
@@ -13653,7 +13709,11 @@ impl SuperAi {
     /// between two houses' paced walks can flip one claim one frame
     /// apart, and the next walk settles it (recorded residual). Pure
     /// read: no RNG, no mutation.
-    fn corridor_cell_claimed(&self, sim: &vera20k_core::sim::world::Simulation, cell: (i16, i16)) -> bool {
+    fn corridor_cell_claimed(
+        &self,
+        sim: &vera20k_core::sim::world::Simulation,
+        cell: (i16, i16),
+    ) -> bool {
         let mut best: Option<(u32, usize, InternedId)> = None;
         for (&owner, house) in sim.houses().iter() {
             if owner != self.house
@@ -13765,7 +13825,8 @@ impl SuperAi {
         }
         self.telemetry_due = tick + DEFENSE_TELEMETRY_TICKS;
         let owner = sim.interner().resolve(self.house).to_string();
-        let (output, drain) = vera20k_core::sim::production::power_balance_for_owner(sim, rules, &owner);
+        let (output, drain) =
+            vera20k_core::sim::production::power_balance_for_owner(sim, rules, &owner);
         let credits = vera20k_core::sim::production::credits_for_owner(sim, &owner);
         // The persona's scalars first — the borrow must drop before the
         // census and the stone read below. The ring row's denominator is
@@ -14269,8 +14330,9 @@ impl SuperAi {
                 // still carries the prerequisites the AI house's quirk
                 // would skip.
                 let buildable = rules.object(entry.name).is_some_and(|ty| {
-                    vera20k_core::sim::production::can_build(sim, rules, self.house, ty, false, false)
-                        == vera20k_core::sim::production::CanBuild::Yes
+                    vera20k_core::sim::production::can_build(
+                        sim, rules, self.house, ty, false, false,
+                    ) == vera20k_core::sim::production::CanBuild::Yes
                 });
                 if buildable {
                     pick = Some((entry, standing));
@@ -15599,7 +15661,8 @@ impl SuperAi {
                     .iter_sorted()
                     .filter(|(_, entity)| {
                         entity.owner() == self.house
-                            && entity.category() == vera20k_core::map::entities::EntityCategory::Unit
+                            && entity.category()
+                                == vera20k_core::map::entities::EntityCategory::Unit
                             && entity.lifecycle.object_alive()
                     })
                     .filter_map(|(_, entity)| entity.drain.target()),
@@ -15759,9 +15822,9 @@ impl SuperAi {
     /// the air wing's sortie fields them and the guard-post filter spares
     /// them, both through this one answer.
     fn is_fly_type(rules: &vera20k_core::rules::ruleset::RuleSet, name: &str) -> bool {
-        rules
-            .object(name)
-            .is_some_and(|ty| ty.movement_zone == vera20k_core::rules::locomotor_type::MovementZone::Fly)
+        rules.object(name).is_some_and(|ty| {
+            ty.movement_zone == vera20k_core::rules::locomotor_type::MovementZone::Fly
+        })
     }
 
     /// Whether the type's weapon list reaches an air target: any weapon
@@ -15910,7 +15973,8 @@ impl SuperAi {
                 + queue
                     .iter()
                     .filter(|item| {
-                        item.queue_category == vera20k_core::sim::production::ProductionCategory::Vehicle
+                        item.queue_category
+                            == vera20k_core::sim::production::ProductionCategory::Vehicle
                             && sim.interner().resolve(item.type_id) == name
                     })
                     .count();
@@ -15970,8 +16034,10 @@ impl SuperAi {
     /// lead the house cannot field yet (the V3 team before its radar)
     /// yields the turn to the phase's first team.
     fn latch_wave_plan(&mut self, sim: &vera20k_core::sim::world::Simulation, opening: &Opening) {
-        let credits =
-            vera20k_core::sim::production::credits_for_owner(sim, sim.interner().resolve(self.house));
+        let credits = vera20k_core::sim::production::credits_for_owner(
+            sim,
+            sim.interner().resolve(self.house),
+        );
         let phase = self.wave_phase_index(sim, opening, credits);
         let siblings: &'static [WavePlan] = opening.waves[phase];
         let turn = self.wave_episodes as usize % siblings.len().max(1);
@@ -16484,7 +16550,10 @@ impl SuperAi {
     /// Greatest_Threat misses) — nearest the gather cell first within
     /// each class, so the wave works one base through instead of
     /// zigzagging between houses. Empty when no hostile structure stands.
-    fn wave_strike_sequence(&self, sim: &vera20k_core::sim::world::Simulation) -> Vec<(u64, (i16, i16))> {
+    fn wave_strike_sequence(
+        &self,
+        sim: &vera20k_core::sim::world::Simulation,
+    ) -> Vec<(u64, (i16, i16))> {
         let anchor = self.wave_gather.map(|(rx, ry)| (rx as i16, ry as i16));
         let distance = |cell: (i16, i16)| {
             anchor.map_or(0, |at: (i16, i16)| {
@@ -17889,7 +17958,9 @@ impl SuperAi {
                 return Some(Command::AttackMove {
                     entity_id: unit,
                     target: None,
-                    destination: Some(vera20k_core::sim::combat::TargetKind::Cell(focus.0, focus.1)),
+                    destination: Some(vera20k_core::sim::combat::TargetKind::Cell(
+                        focus.0, focus.1,
+                    )),
                 });
             }
         }
@@ -18504,7 +18575,8 @@ impl SuperAi {
                         id,
                         cell,
                         entity.navigation.nav_com().is_some()
-                            || vera20k_core::sim::movement::motion_query::is_moving(entity) == Some(true),
+                            || vera20k_core::sim::movement::motion_query::is_moving(entity)
+                                == Some(true),
                         rules
                             .object(sim.interner().resolve(entity.type_ref()))
                             .map(|ty| ty.movement_zone)
@@ -18768,7 +18840,11 @@ impl SuperAi {
     /// (stable id on ties), else the hostile mass centre. Runs on the
     /// congestion scan's cadence; the parking picks, the discharge and the
     /// rescue read the latch.
-    fn refresh_traffic_axis(&mut self, sim: &vera20k_core::sim::world::Simulation, home: (i16, i16)) {
+    fn refresh_traffic_axis(
+        &mut self,
+        sim: &vera20k_core::sim::world::Simulation,
+        home: (i16, i16),
+    ) {
         let aim = self
             .enemy_priority_targets(sim)
             .into_iter()
@@ -18790,7 +18866,11 @@ impl SuperAi {
     /// [`Self::is_enemy`] reading's complement among the non-passive
     /// houses. Allied houses share no state with this one; the sim they
     /// all read is the only channel.
-    fn is_allied_house(&self, sim: &vera20k_core::sim::world::Simulation, owner: InternedId) -> bool {
+    fn is_allied_house(
+        &self,
+        sim: &vera20k_core::sim::world::Simulation,
+        owner: InternedId,
+    ) -> bool {
         owner != self.house
             && sim
                 .houses()
@@ -18858,7 +18938,9 @@ impl SuperAi {
                         .object(sim.interner().resolve(entity.type_ref()))
                         .is_some_and(|ty| ty.engineer)
                     && (match entity.navigation.nav_com() {
-                        Some(vera20k_core::sim::components::NavTargetRef::Object { id }) => id == building,
+                        Some(vera20k_core::sim::components::NavTargetRef::Object { id }) => {
+                            id == building
+                        }
                         Some(vera20k_core::sim::components::NavTargetRef::Cell { rx, ry }) => {
                             cell_distance((rx, ry), at) <= BESIDE
                         }
@@ -18877,7 +18959,11 @@ impl SuperAi {
     /// engine parks every fresh infantryman in AreaGuard there, the rally
     /// and the guard posts share its offset grid — and the traffic limb's
     /// cue that only a wedged unit proves a jam inside it.
-    fn in_home_jam_box(&self, sim: &vera20k_core::sim::world::Simulation, cell: (u16, u16)) -> bool {
+    fn in_home_jam_box(
+        &self,
+        sim: &vera20k_core::sim::world::Simulation,
+        cell: (u16, u16),
+    ) -> bool {
         let near = |home: (i16, i16)| {
             cell_distance((home.0.max(0) as u16, home.1.max(0) as u16), cell) <= HOME_JAM_RADIUS
         };
@@ -18919,7 +19005,12 @@ impl SuperAi {
     /// where they stand (E3). The hold arms at the launch and lifts at the
     /// strike arm, the episode's end or [`WAVE_MARCH_TIMEOUT_TICKS`] past
     /// the launch, whichever comes first.
-    fn inbound_held(&self, sim: &vera20k_core::sim::world::Simulation, unit: u64, tick: u32) -> bool {
+    fn inbound_held(
+        &self,
+        sim: &vera20k_core::sim::world::Simulation,
+        unit: u64,
+        tick: u32,
+    ) -> bool {
         if tick >= self.outbound_active_until {
             return false;
         }
@@ -19007,7 +19098,11 @@ impl SuperAi {
     /// for 12600 ticks, fresh jet pairs each time) — and rests off the fan
     /// for [`STRIKE_BLACKLIST_TICKS`]. A target that fell or changed hands
     /// drops out of the book.
-    fn air_sortie_targets(&mut self, sim: &vera20k_core::sim::world::Simulation, tick: u32) -> Vec<u64> {
+    fn air_sortie_targets(
+        &mut self,
+        sim: &vera20k_core::sim::world::Simulation,
+        tick: u32,
+    ) -> Vec<u64> {
         self.strike_blacklist.retain(|_, &mut until| tick < until);
         let mut book: Vec<(u64, u32)> = self
             .strike_cycles
@@ -19241,7 +19336,9 @@ impl SuperAi {
                     return Some(Command::AttackMove {
                         entity_id: unit,
                         target: None,
-                        destination: Some(vera20k_core::sim::combat::TargetKind::Cell(cell.0, cell.1)),
+                        destination: Some(vera20k_core::sim::combat::TargetKind::Cell(
+                            cell.0, cell.1,
+                        )),
                     });
                 }
             }
@@ -19279,7 +19376,9 @@ impl SuperAi {
                     return Some(Command::AttackMove {
                         entity_id: unit,
                         target: None,
-                        destination: Some(vera20k_core::sim::combat::TargetKind::Cell(cell.0, cell.1)),
+                        destination: Some(vera20k_core::sim::combat::TargetKind::Cell(
+                            cell.0, cell.1,
+                        )),
                     });
                 }
             }
@@ -19607,8 +19706,9 @@ impl SuperAi {
                 {
                     continue;
                 }
-                if vera20k_core::sim::production::can_build(sim, rules, self.house, ty, false, false)
-                    != vera20k_core::sim::production::CanBuild::Yes
+                if vera20k_core::sim::production::can_build(
+                    sim, rules, self.house, ty, false, false,
+                ) != vera20k_core::sim::production::CanBuild::Yes
                 {
                     continue;
                 }
@@ -20608,7 +20708,8 @@ fn cell_openness(
                     vera20k_core::sim::occupancy::CellObjectMember::Terrain(_) => true,
                     vera20k_core::sim::occupancy::CellObjectMember::Entity(id) => {
                         sim.entities().get(id).is_some_and(|entity| {
-                            entity.category() == vera20k_core::map::entities::EntityCategory::Structure
+                            entity.category()
+                                == vera20k_core::map::entities::EntityCategory::Structure
                         })
                     }
                 });
@@ -20625,15 +20726,18 @@ fn cell_openness(
 /// cell itself: a guard post the holder cannot stand on. Units are
 /// transient and do not block.
 fn cell_holds_obstacle(sim: &vera20k_core::sim::world::Simulation, cell: (u16, u16)) -> bool {
-    sim.cell_objects(cell, vera20k_core::sim::movement::locomotor::MovementLayer::Ground)
-        .any(|member| match member {
-            vera20k_core::sim::occupancy::CellObjectMember::Terrain(_) => true,
-            vera20k_core::sim::occupancy::CellObjectMember::Entity(id) => {
-                sim.entities().get(id).is_some_and(|entity| {
-                    entity.category() == vera20k_core::map::entities::EntityCategory::Structure
-                })
-            }
-        })
+    sim.cell_objects(
+        cell,
+        vera20k_core::sim::movement::locomotor::MovementLayer::Ground,
+    )
+    .any(|member| match member {
+        vera20k_core::sim::occupancy::CellObjectMember::Terrain(_) => true,
+        vera20k_core::sim::occupancy::CellObjectMember::Entity(id) => {
+            sim.entities().get(id).is_some_and(|entity| {
+                entity.category() == vera20k_core::map::entities::EntityCategory::Structure
+            })
+        }
+    })
 }
 
 /// The ring staffing's sealed-ground fallback, the second chance after the
@@ -21655,7 +21759,8 @@ mod tests {
             let label = orders.first().map_or_else(
                 || "empty".to_string(),
                 |env| {
-                    if let vera20k_core::sim::command::Command::QueueProduction { type_id } = &env.payload
+                    if let vera20k_core::sim::command::Command::QueueProduction { type_id } =
+                        &env.payload
                     {
                         // Which type the queue branch kept issuing tells
                         // whether admission ever landed: a type issued
@@ -21732,10 +21837,12 @@ mod tests {
             let (mut scenario, human) = retail_battle();
             scenario.apply_super_ai_tier(human, tier);
             let mut ai = SuperAi::new(human, tier);
-            let owns = |scenario: &vera20k_core::headless_scenario::HeadlessScenario, name: &str| {
+            let owns = |scenario: &vera20k_core::headless_scenario::HeadlessScenario,
+                        name: &str| {
                 scenario.sim().entities().iter_sorted().any(|(_, entity)| {
                     entity.owner() == human
-                        && entity.category() == vera20k_core::map::entities::EntityCategory::Structure
+                        && entity.category()
+                            == vera20k_core::map::entities::EntityCategory::Structure
                         && scenario.sim().interner().resolve(entity.type_ref()) == name
                 })
             };
@@ -21761,7 +21868,8 @@ mod tests {
         let (mut scenario, human) = retail_battle();
         let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
 
-        let units_of_type = |scenario: &vera20k_core::headless_scenario::HeadlessScenario, name: &str| {
+        let units_of_type = |scenario: &vera20k_core::headless_scenario::HeadlessScenario,
+                             name: &str| {
             scenario
                 .sim()
                 .entities()
@@ -21827,7 +21935,8 @@ mod tests {
                 .iter_sorted()
                 .find(|(_, entity)| {
                     entity.owner() == human
-                        && entity.category() == vera20k_core::map::entities::EntityCategory::Structure
+                        && entity.category()
+                            == vera20k_core::map::entities::EntityCategory::Structure
                         && scenario.sim().interner().resolve(entity.type_ref()) == "GACNST"
                 })
                 .map(|(_, entity)| (entity.position.rx() as i16, entity.position.ry() as i16))
@@ -21842,7 +21951,8 @@ mod tests {
                 if entity.owner() != human
                     || entity.category() != vera20k_core::map::entities::EntityCategory::Unit
                     || scenario.sim().interner().resolve(entity.type_ref()) != "MTNK"
-                    || entity.passive_acquire_mission() != vera20k_core::sim::mission::MissionType::Move
+                    || entity.passive_acquire_mission()
+                        != vera20k_core::sim::mission::MissionType::Move
                 {
                     return false;
                 }
@@ -21884,7 +21994,8 @@ mod tests {
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
-                        && entity.category() == vera20k_core::map::entities::EntityCategory::Structure
+                        && entity.category()
+                            == vera20k_core::map::entities::EntityCategory::Structure
                         && scenario.sim().interner().resolve(entity.type_ref()) == name
                 })
                 .count()
@@ -21909,14 +22020,16 @@ mod tests {
         let (mut scenario, human) = retail_battle();
         let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
 
-        let owns_structure = |scenario: &vera20k_core::headless_scenario::HeadlessScenario, name: &str| {
+        let owns_structure = |scenario: &vera20k_core::headless_scenario::HeadlessScenario,
+                              name: &str| {
             scenario.sim().entities().iter_sorted().any(|(_, entity)| {
                 entity.owner() == human
                     && entity.category() == vera20k_core::map::entities::EntityCategory::Structure
                     && scenario.sim().interner().resolve(entity.type_ref()) == name
             })
         };
-        let units_of_type = |scenario: &vera20k_core::headless_scenario::HeadlessScenario, name: &str| {
+        let units_of_type = |scenario: &vera20k_core::headless_scenario::HeadlessScenario,
+                             name: &str| {
             scenario
                 .sim()
                 .entities()
@@ -21991,7 +22104,8 @@ mod tests {
             session.options.unit_count = 0;
             let starting_credits = session.options.starting_credits;
             let scenario =
-                vera20k_core::headless_scenario::load_session(&ra2, map, 0x00C0_FFEE, session).unwrap();
+                vera20k_core::headless_scenario::load_session(&ra2, map, 0x00C0_FFEE, session)
+                    .unwrap();
 
             let house_by_name = |name: &str| {
                 let id = scenario
@@ -22188,9 +22302,8 @@ mod tests {
                         ));
                     }
                     let weapons_factory = sim
-                        .substrate()
-                        .occupancy
-                        .first_building_on_layer(
+                        .occupancy_for_test()
+                                                .first_building_on_layer(
                             mcv_cell.0,
                             mcv_cell.1,
                             vera20k_core::sim::movement::locomotor::MovementLayer::Ground,
@@ -22475,14 +22588,16 @@ mod tests {
             retail_battle_as(vera20k_core::skirmish_launch::LaunchCountry::America, true);
         let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
 
-        let structures = |scenario: &vera20k_core::headless_scenario::HeadlessScenario, name: &str| {
+        let structures = |scenario: &vera20k_core::headless_scenario::HeadlessScenario,
+                          name: &str| {
             scenario
                 .sim()
                 .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
-                        && entity.category() == vera20k_core::map::entities::EntityCategory::Structure
+                        && entity.category()
+                            == vera20k_core::map::entities::EntityCategory::Structure
                         && scenario.sim().interner().resolve(entity.type_ref()) == name
                 })
                 .count()
@@ -22507,14 +22622,16 @@ mod tests {
         // The engine files pad aircraft under their own category — the
         // Unit/Infantry pair above reads zero for a living jet, and the
         // census would report the wing empty however many stood.
-        let aircraft = |scenario: &vera20k_core::headless_scenario::HeadlessScenario, name: &str| {
+        let aircraft = |scenario: &vera20k_core::headless_scenario::HeadlessScenario,
+                        name: &str| {
             scenario
                 .sim()
                 .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
-                        && entity.category() == vera20k_core::map::entities::EntityCategory::Aircraft
+                        && entity.category()
+                            == vera20k_core::map::entities::EntityCategory::Aircraft
                         && scenario.sim().interner().resolve(entity.type_ref()) == name
                 })
                 .count()
@@ -22634,14 +22751,16 @@ mod tests {
                     .iter_sorted()
                     .find(|(_, entity)| {
                         entity.owner() == human
-                            && entity.category() == vera20k_core::map::entities::EntityCategory::Structure
+                            && entity.category()
+                                == vera20k_core::map::entities::EntityCategory::Structure
                             && scenario.sim().interner().resolve(entity.type_ref()) == "GACNST"
                     })
                     .map(|(_, entity)| (entity.position.rx() as i16, entity.position.ry() as i16))
                 {
                     let remote = scenario.sim().entities().iter_sorted().any(|(_, entity)| {
                         entity.owner() == human
-                            && entity.category() == vera20k_core::map::entities::EntityCategory::Structure
+                            && entity.category()
+                                == vera20k_core::map::entities::EntityCategory::Structure
                             && scenario.sim().interner().resolve(entity.type_ref()) == "GAREFN"
                             && (entity.position.rx() as i16 - hx)
                                 .abs()
@@ -22920,14 +23039,16 @@ mod tests {
             retail_battle_as(vera20k_core::skirmish_launch::LaunchCountry::Russia, true);
         let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
 
-        let structures = |scenario: &vera20k_core::headless_scenario::HeadlessScenario, name: &str| {
+        let structures = |scenario: &vera20k_core::headless_scenario::HeadlessScenario,
+                          name: &str| {
             scenario
                 .sim()
                 .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
-                        && entity.category() == vera20k_core::map::entities::EntityCategory::Structure
+                        && entity.category()
+                            == vera20k_core::map::entities::EntityCategory::Structure
                         && scenario.sim().interner().resolve(entity.type_ref()) == name
                 })
                 .count()
@@ -22971,14 +23092,16 @@ mod tests {
             retail_battle_as(vera20k_core::skirmish_launch::LaunchCountry::America, false);
         let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
 
-        let structures = |scenario: &vera20k_core::headless_scenario::HeadlessScenario, name: &str| {
+        let structures = |scenario: &vera20k_core::headless_scenario::HeadlessScenario,
+                          name: &str| {
             scenario
                 .sim()
                 .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
-                        && entity.category() == vera20k_core::map::entities::EntityCategory::Structure
+                        && entity.category()
+                            == vera20k_core::map::entities::EntityCategory::Structure
                         && scenario.sim().interner().resolve(entity.type_ref()) == name
                 })
                 .count()
@@ -23060,14 +23183,16 @@ mod tests {
             retail_battle_as(vera20k_core::skirmish_launch::LaunchCountry::America, true);
         let mut ai = SuperAi::new(human, SuperAiDifficulty::Fair);
 
-        let structures = |scenario: &vera20k_core::headless_scenario::HeadlessScenario, name: &str| {
+        let structures = |scenario: &vera20k_core::headless_scenario::HeadlessScenario,
+                          name: &str| {
             scenario
                 .sim()
                 .entities()
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
-                        && entity.category() == vera20k_core::map::entities::EntityCategory::Structure
+                        && entity.category()
+                            == vera20k_core::map::entities::EntityCategory::Structure
                         && scenario.sim().interner().resolve(entity.type_ref()) == name
                 })
                 .count()
@@ -23262,7 +23387,10 @@ mod tests {
     /// The engine's own Normal-row zone id for `cell` — the oracle the
     /// gating assertions read (the helper under test wraps exactly this
     /// query, so the oracle stays the sim's, not the wrapper's).
-    fn ground_zone(scenario: &vera20k_core::headless_scenario::HeadlessScenario, cell: (u16, u16)) -> u32 {
+    fn ground_zone(
+        scenario: &vera20k_core::headless_scenario::HeadlessScenario,
+        cell: (u16, u16),
+    ) -> u32 {
         let sim = scenario.sim();
         sim.zone_grid()
             .expect("the retail map's zone grid")
@@ -23277,7 +23405,9 @@ mod tests {
 
     /// The map CABHUT entity nearest the evidence's hut coordinate, with
     /// its cell.
-    fn pacific_hut(scenario: &vera20k_core::headless_scenario::HeadlessScenario) -> (u64, (u16, u16)) {
+    fn pacific_hut(
+        scenario: &vera20k_core::headless_scenario::HeadlessScenario,
+    ) -> (u64, (u16, u16)) {
         scenario
             .sim()
             .entities()
@@ -23441,7 +23571,9 @@ mod tests {
                         target_rx,
                         target_ry,
                         ..
-                    } => Some(vera20k_core::sim::combat::TargetKind::Cell(*target_rx, *target_ry)),
+                    } => Some(vera20k_core::sim::combat::TargetKind::Cell(
+                        *target_rx, *target_ry,
+                    )),
                     _ => None,
                 };
                 if let Some(vera20k_core::sim::combat::TargetKind::Cell(rx, ry)) = destination {
@@ -23457,7 +23589,10 @@ mod tests {
                          order {:?} at ({rx},{ry}))",
                         order.payload
                     );
-                    if matches!(order.payload, vera20k_core::sim::command::Command::Guard { .. }) {
+                    if matches!(
+                        order.payload,
+                        vera20k_core::sim::command::Command::Guard { .. }
+                    ) {
                         guard_posts += 1;
                     }
                 }
@@ -23525,7 +23660,10 @@ mod tests {
         let engineer = spawn_near(&mut scenario, "ENGINEER", ai_house, PACIFIC_SHORE);
         let (hut_id, hut_cell) = pacific_hut(&scenario);
         assert!(
-            vera20k_core::sim::world::bridge_orchestrator::bridge_hut_can_repair(scenario.sim(), hut_cell),
+            vera20k_core::sim::world::bridge_orchestrator::bridge_hut_can_repair(
+                scenario.sim(),
+                hut_cell
+            ),
             "setup: the collapsed span wants repair"
         );
 
@@ -23658,7 +23796,9 @@ mod tests {
         let mut queued: Vec<String> = Vec::new();
         for tick in 0..10u32 {
             for order in ai.orders(&scenario.runtime, tick) {
-                if let vera20k_core::sim::command::Command::QueueProduction { type_id } = order.payload {
+                if let vera20k_core::sim::command::Command::QueueProduction { type_id } =
+                    order.payload
+                {
                     queued.push(scenario.sim().interner().resolve(type_id).to_string());
                 }
             }
@@ -23709,7 +23849,9 @@ mod tests {
         let mut queued: Vec<(u32, String)> = Vec::new();
         for tick in 0..160u32 {
             for order in ai.orders(&scenario.runtime, tick) {
-                if let vera20k_core::sim::command::Command::QueueProduction { type_id } = order.payload {
+                if let vera20k_core::sim::command::Command::QueueProduction { type_id } =
+                    order.payload
+                {
                     queued.push((tick, scenario.sim().interner().resolve(type_id).to_string()));
                 }
             }
@@ -23727,13 +23869,14 @@ mod tests {
         scenario
             .runtime
             .simulation
-            .substrate_mut_for_test()
-            .entities
+            .entities_mut_for_test()
             .remove(wing[0]);
         let replenish_start = 160u32;
         for tick in replenish_start..replenish_start + 2 * BUILD_QUEUE_RETRY_TICKS {
             for order in ai.orders(&scenario.runtime, tick) {
-                if let vera20k_core::sim::command::Command::QueueProduction { type_id } = order.payload {
+                if let vera20k_core::sim::command::Command::QueueProduction { type_id } =
+                    order.payload
+                {
                     queued.push((tick, scenario.sim().interner().resolve(type_id).to_string()));
                 }
             }
@@ -23796,7 +23939,9 @@ mod tests {
         let mut queued: Vec<(u32, String)> = Vec::new();
         for tick in 0..4 * BUILD_QUEUE_RETRY_TICKS {
             for order in ai.orders(&scenario.runtime, tick) {
-                if let vera20k_core::sim::command::Command::QueueProduction { type_id } = order.payload {
+                if let vera20k_core::sim::command::Command::QueueProduction { type_id } =
+                    order.payload
+                {
                     queued.push((tick, scenario.sim().interner().resolve(type_id).to_string()));
                 }
             }
@@ -24267,7 +24412,9 @@ mod tests {
                             }
                         }
                     }
-                    vera20k_core::sim::command::Command::DeployMcv { entity_id } if entity_id == mcv => {
+                    vera20k_core::sim::command::Command::DeployMcv { entity_id }
+                        if entity_id == mcv =>
+                    {
                         // a deploy draw means the site cleared; bounded either way
                     }
                     _ => {}
@@ -24304,7 +24451,8 @@ mod tests {
             "XMP03T4.MAP",
         ] {
             let ra2 = std::path::PathBuf::from(std::env::var_os("RA2_DIR").unwrap());
-            let Ok(mut scenario) = vera20k_core::headless_scenario::load(&ra2, map, 0x0B21_D6E5) else {
+            let Ok(mut scenario) = vera20k_core::headless_scenario::load(&ra2, map, 0x0B21_D6E5)
+            else {
                 eprintln!("PROBE {map}: LOAD FAILED");
                 continue;
             };
@@ -24412,7 +24560,8 @@ mod tests {
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
-                        && entity.category() == vera20k_core::map::entities::EntityCategory::Structure
+                        && entity.category()
+                            == vera20k_core::map::entities::EntityCategory::Structure
                         && scenario.sim().interner().resolve(entity.type_ref()) == name
                 })
                 .count()
@@ -24424,7 +24573,8 @@ mod tests {
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
-                        && entity.category() == vera20k_core::map::entities::EntityCategory::Structure
+                        && entity.category()
+                            == vera20k_core::map::entities::EntityCategory::Structure
                         && scenario.sim().interner().resolve(entity.type_ref()) == "GACNST"
                 })
                 .map(|(_, entity)| (entity.position.rx() as i16, entity.position.ry() as i16))
@@ -24475,7 +24625,8 @@ mod tests {
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
-                        && entity.category() == vera20k_core::map::entities::EntityCategory::Structure
+                        && entity.category()
+                            == vera20k_core::map::entities::EntityCategory::Structure
                         && names.contains(&scenario.sim().interner().resolve(entity.type_ref()))
                 })
                 .filter(|(_, entity)| {
@@ -24535,8 +24686,7 @@ mod tests {
                 .strength;
             let entity = runtime
                 .simulation
-                .substrate_mut_for_test()
-                .entities
+                .entities_mut_for_test()
                 .get_mut(refinery)
                 .expect("the spawned refinery");
             entity.health.set_for_test(strength / 2);
@@ -24558,7 +24708,9 @@ mod tests {
         for tick in 0..4 * super::REPAIR_SURVEY_TICKS {
             let orders = ai.orders(&scenario.runtime, tick);
             for order in &orders {
-                if let vera20k_core::sim::command::Command::ToggleRepair { entity_id } = &order.payload {
+                if let vera20k_core::sim::command::Command::ToggleRepair { entity_id } =
+                    &order.payload
+                {
                     assert_eq!(
                         *entity_id, refinery,
                         "the limb repairs the wounded economy structure, nothing else"
@@ -24619,7 +24771,8 @@ mod tests {
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == human
-                        && entity.category() == vera20k_core::map::entities::EntityCategory::Structure
+                        && entity.category()
+                            == vera20k_core::map::entities::EntityCategory::Structure
                         && scenario.sim().interner().resolve(entity.type_ref()) == name
                 })
                 .count()
@@ -24691,7 +24844,8 @@ mod tests {
         for tick in 0..8000u32 {
             let orders = ai.orders(&scenario.runtime, tick);
             for order in &orders {
-                if let vera20k_core::sim::command::Command::QueueProduction { type_id } = order.payload
+                if let vera20k_core::sim::command::Command::QueueProduction { type_id } =
+                    order.payload
                     && scenario.sim().interner().resolve(type_id) == "ROBO"
                 {
                     robo_queued = Some(tick);
@@ -25152,7 +25306,9 @@ mod tests {
             let mut tank_posts = 0usize;
             for tick in 0..1200u32 {
                 for order in ai.orders(&scenario.runtime, tick) {
-                    if let vera20k_core::sim::command::Command::Guard { entity_id, .. } = order.payload {
+                    if let vera20k_core::sim::command::Command::Guard { entity_id, .. } =
+                        order.payload
+                    {
                         if entity_id == kirov {
                             kirov_posts += 1;
                         }
@@ -25198,7 +25354,8 @@ mod tests {
                 .iter_sorted()
                 .find(|(_, entity)| {
                     entity.owner() == enemy_house
-                        && entity.category() == vera20k_core::map::entities::EntityCategory::Structure
+                        && entity.category()
+                            == vera20k_core::map::entities::EntityCategory::Structure
                         && scenario.sim().interner().resolve(entity.type_ref()) == "GAPOWR"
                 })
                 .map(|(id, _)| id)
@@ -25464,7 +25621,9 @@ mod tests {
             // drive stays inside the suppressed span.
             for tick in 0..9 * IDLE_REORDER_TICKS {
                 for order in ai.orders(&scenario.runtime, tick) {
-                    if let vera20k_core::sim::command::Command::Guard { entity_id, .. } = order.payload {
+                    if let vera20k_core::sim::command::Command::Guard { entity_id, .. } =
+                        order.payload
+                    {
                         *guards.entry(entity_id).or_insert(0) += 1;
                     }
                 }
@@ -25609,7 +25768,8 @@ mod tests {
                 .iter_sorted()
                 .find(|(_, entity)| {
                     entity.owner() == ai_house
-                        && entity.category() == vera20k_core::map::entities::EntityCategory::Structure
+                        && entity.category()
+                            == vera20k_core::map::entities::EntityCategory::Structure
                         && scenario.sim().interner().resolve(entity.type_ref()) == "GACNST"
                 })
                 .map(|(id, _)| id)
@@ -25807,7 +25967,10 @@ mod tests {
         // Every cell dark: the interior candidates share the full score
         // box, so the first row-major stride candidate with the full box
         // wins — the scan's determinism discipline.
-        insert_plane(&mut sim, vera20k_core::sim::vision::OwnerVisibility::new(64, 64));
+        insert_plane(
+            &mut sim,
+            vera20k_core::sim::vision::OwnerVisibility::new(64, 64),
+        );
         assert_eq!(ai.darkest_fog_cell(&sim), Some((8, 8)));
 
         // Reveal everything except a pocket in the far corner: the last
@@ -25885,11 +26048,11 @@ mod tests {
     ) {
         let (mut sim, rules, _overlays) =
             vera20k_core::sim::world::entry_test_fixture::fixture_with_rules(extra);
-        let country0 = sim.interner().intern("Country0");
-        let country1 = sim.interner().intern("Country1");
-        let ai_house = sim.interner().intern("DefenseHouse");
-        let enemy_house = sim.interner().intern("EnemyHouse");
-        sim.houses
+        let country0 = sim.interner_mut_for_test().intern("Country0");
+        let country1 = sim.interner_mut_for_test().intern("Country1");
+        let ai_house = sim.interner_mut_for_test().intern("DefenseHouse");
+        let enemy_house = sim.interner_mut_for_test().intern("EnemyHouse");
+        sim.houses_mut_for_test()
             .register(vera20k_core::sim::house_state::HouseState::new(
                 ai_house,
                 0,
@@ -25898,7 +26061,7 @@ mod tests {
                 0,
                 10,
             ));
-        sim.houses
+        sim.houses_mut_for_test()
             .register(vera20k_core::sim::house_state::HouseState::new(
                 enemy_house,
                 1,
@@ -25916,7 +26079,7 @@ mod tests {
         sim.initialize_trigger_definitions(&map, &teams, None, None, None);
         sim.install_team_ai_registry(&teams, &rules).unwrap();
         sim.initialize_trigger_definitions(&map, &teams, None, None, None);
-        sim.session.install_waypoints(&map.waypoints);
+        sim.session_mut_for_test().install_waypoints(&map.waypoints);
         sim.classify_map_triggers(&rules);
         (sim, rules, ai_house, enemy_house)
     }
@@ -26076,7 +26239,7 @@ mod tests {
             sim.spawn_object_at_height("TAGUNIT", &enemy_owner, x, y, 0, 0, &rules)
                 .expect("the fixture cell admits the vehicle");
         }
-        sim.houses
+        sim.houses_mut_for_test()
             .get_mut(&ai_house)
             .expect("the defense house")
             .economy_mut_for_test()
@@ -26126,7 +26289,7 @@ mod tests {
             .expect("the fixture cell admits the aircraft");
         sim.spawn_object_at_height("HORNET", &enemy_owner, 24, 22, 20, 0, &rules)
             .expect("the fixture cell admits the aircraft");
-        sim.houses
+        sim.houses_mut_for_test()
             .get_mut(&ai_house)
             .expect("the defense house")
             .economy_mut_for_test()
@@ -26355,9 +26518,13 @@ mod tests {
             )],
         );
         session.options.unit_count = 0;
-        let scenario =
-            vera20k_core::headless_scenario::load_session(&ra2, "XMP03T4.MAP", 0x00C0_FFEE, session)
-                .unwrap();
+        let scenario = vera20k_core::headless_scenario::load_session(
+            &ra2,
+            "XMP03T4.MAP",
+            0x00C0_FFEE,
+            session,
+        )
+        .unwrap();
         let rules = &scenario.runtime.resources.rules;
         for name in ["CANEWY01", "CANEWY02", "CANEWY03", "CANEWY04"] {
             // The statue family is sparse in the retail rules; the map's own
@@ -26500,8 +26667,12 @@ mod tests {
 
     /// Charge one super weapon instance for `house` the test-only setter
     /// way, so the rescue walk sees a ready launch.
-    fn charge_super_weapon(sim: &mut vera20k_core::sim::world::Simulation, house: InternedId, name: &str) {
-        let sw = sim.interner().intern(name);
+    fn charge_super_weapon(
+        sim: &mut vera20k_core::sim::world::Simulation,
+        house: InternedId,
+        name: &str,
+    ) {
+        let sw = sim.interner_mut_for_test().intern(name);
         let mut instance = vera20k_core::sim::superweapon::SuperWeaponInstance::new(sw, house, 0);
         instance.set_is_active_for_test(true);
         instance.set_is_ready_for_test(true);
@@ -26630,12 +26801,12 @@ mod tests {
             .expect("the fixture cell admits the yard");
         // The garrisoned hold: a neutral passive house's occupiable
         // building next to home, revealed so the scan admits it.
-        let neutral = sim.interner().intern("NeutralHold");
-        sim.houses
+        let neutral = sim.interner_mut_for_test().intern("NeutralHold");
+        sim.houses_mut_for_test()
             .register(vera20k_core::sim::house_state::HouseState::new(
                 neutral, 2, None, false, 0, 10,
             ));
-        sim.houses
+        sim.houses_mut_for_test()
             .get_mut(&neutral)
             .expect("the neutral house")
             .set_multiplay_passive_for_test(true);
@@ -26652,7 +26823,7 @@ mod tests {
             sim.fog_mut_for_test()
                 .set_ground_bits_for_test(ai_house, 16, 16, 0x08);
         }
-        sim.houses
+        sim.houses_mut_for_test()
             .get_mut(&ai_house)
             .expect("the defense house")
             .economy_mut_for_test()
@@ -26746,8 +26917,8 @@ mod tests {
         let _ = ai_house;
         // The neutral custodian: registered passive, as a spectatorless
         // map's civilian house reads to the persona (never an enemy).
-        let neutral_house = sim.interner().intern("NeutralHouse");
-        sim.houses
+        let neutral_house = sim.interner_mut_for_test().intern("NeutralHouse");
+        sim.houses_mut_for_test()
             .register(vera20k_core::sim::house_state::HouseState::new(
                 neutral_house,
                 1,
@@ -26756,7 +26927,7 @@ mod tests {
                 0,
                 10,
             ));
-        sim.houses
+        sim.houses_mut_for_test()
             .get_mut(&neutral_house)
             .expect("the custodian house")
             .make_multiplay_passive();
@@ -26862,7 +27033,7 @@ mod tests {
             sim.spawn_object_at_height("HORNET", &enemy_owner, x, y, 20, 0, &rules)
                 .expect("the fixture cell admits the aircraft");
         }
-        sim.houses
+        sim.houses_mut_for_test()
             .get_mut(&ai_house)
             .expect("the defense house")
             .economy_mut_for_test()
@@ -27154,8 +27325,7 @@ mod tests {
         // mission the parked units hold.
         use vera20k_core::sim::mission::MissionId;
         for id in [tank, fortress] {
-            sim.substrate
-                .entities
+            sim.entities_mut_for_test()
                 .get_mut(id)
                 .expect("the spawned hull")
                 .mission
@@ -27472,8 +27642,7 @@ mod tests {
             let tank = sim
                 .spawn_object_at_height("MTNK", &owner, x, y, 0, 0, &rules)
                 .expect("the fixture cell admits the wedged tank");
-            sim.substrate
-                .entities
+            sim.entities_mut_for_test()
                 .get_mut(tank)
                 .expect("the wedged tank")
                 .navigation
@@ -27530,7 +27699,8 @@ mod tests {
     /// building hit; outside every radius the read is quiet.
     #[test]
     fn psychic_detection_raises_the_alarm_before_a_hit() {
-        let Some(rules) = vera20k_core::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
+        let Some(rules) =
+            vera20k_core::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
         else {
             return;
         };
@@ -27542,18 +27712,15 @@ mod tests {
         assert_eq!(ai.psychic_alarm_focus(&sim, &rules), Some((2, 2)));
 
         // The same walker beyond every sensor radius: the read is quiet.
-        sim.substrate_mut_for_test()
-            .entities
-            .get_mut(tank)
-            .unwrap()
-            .position = vera20k_core::sim::movement::ground_pose::Position::new(
-            40,
-            40,
-            0,
-            None,
-            vera20k_core::util::fixed_math::SIM_ZERO,
-            vera20k_core::util::fixed_math::SIM_ZERO,
-        );
+        sim.entities_mut_for_test().get_mut(tank).unwrap().position =
+            vera20k_core::sim::movement::ground_pose::Position::new(
+                40,
+                40,
+                0,
+                None,
+                vera20k_core::util::fixed_math::SIM_ZERO,
+                vera20k_core::util::fixed_math::SIM_ZERO,
+            );
         assert_eq!(ai.psychic_alarm_focus(&sim, &rules), None);
     }
 
@@ -27580,7 +27747,8 @@ mod tests {
                 .iter_sorted()
                 .filter(|(_, entity)| {
                     entity.owner() == ai_house
-                        && entity.category() == vera20k_core::map::entities::EntityCategory::Structure
+                        && entity.category()
+                            == vera20k_core::map::entities::EntityCategory::Structure
                         && sim.interner().resolve(entity.type_ref()) == name
                 })
                 .map(|(id, _)| id)
@@ -27681,8 +27849,7 @@ mod tests {
         scenario
             .runtime
             .simulation
-            .substrate_mut_for_test()
-            .entities
+            .entities_mut_for_test()
             .get_mut(drainer_near)
             .unwrap()
             .drain
@@ -27697,8 +27864,7 @@ mod tests {
         scenario
             .runtime
             .simulation
-            .substrate_mut_for_test()
-            .entities
+            .entities_mut_for_test()
             .get_mut(drainer_far)
             .unwrap()
             .drain
@@ -27874,7 +28040,8 @@ mod tests {
     /// the walk ranks the whole field instead of the first legal ring.
     #[test]
     fn gun_site_walk_answers_the_enemy_facing_side() {
-        let Some(rules) = vera20k_core::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
+        let Some(rules) =
+            vera20k_core::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
         else {
             return;
         };
@@ -27938,7 +28105,8 @@ mod tests {
     /// constructor default 3 at `0x0045DEAC`).
     #[test]
     fn home_scan_degraded_pass_refuses_out_of_ring_candidates() {
-        let Some(rules) = vera20k_core::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
+        let Some(rules) =
+            vera20k_core::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
         else {
             return;
         };

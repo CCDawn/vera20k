@@ -15,6 +15,9 @@ log = { workspace = true }
 [dev-dependencies]
 # Unit tests round-trip the difficulty ladder through JSON.
 serde_json = { workspace = true }
+# The engine's test fixtures and `*_for_test` hooks, the same dev-dep shape
+# the client package uses for its own tests.
+vera20k-core = { path = "../src", features = ["test-support"] }
 
 [lints]
 workspace = true

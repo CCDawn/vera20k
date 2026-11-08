@@ -32,8 +32,8 @@ mod disk_laser;
 pub use disk_laser::DiskLaserObservation;
 #[cfg(test)]
 mod disk_laser_tests;
-#[cfg(test)]
-pub(crate) mod entry_test_fixture;
+#[cfg(any(test, feature = "test-support"))]
+pub mod entry_test_fixture;
 mod frame_channel;
 mod frame_effects;
 mod network_commands;
@@ -3896,6 +3896,13 @@ impl Simulation {
     #[cfg(any(test, feature = "test-support"))]
     pub fn substrate_mut_for_test(&mut self) -> &mut ObjectSubstrate {
         &mut self.substrate
+    }
+
+    /// Read-only occupancy for fixtures outside the crate (the super-AI
+    /// crate's tests walk a cell's standing building).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn occupancy_for_test(&self) -> &crate::sim::occupancy::OccupancyGrid {
+        &self.substrate.occupancy
     }
 
     #[cfg(any(test, feature = "test-support"))]

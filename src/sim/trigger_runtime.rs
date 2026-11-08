@@ -1746,7 +1746,7 @@ impl Simulation {
 
     /// Object5F5B50 attachment funnel. An absent/null authored reference clears
     /// the current attachment without destroying a zero-reference Tag.
-    pub(crate) fn attach_object_trigger_tag(&mut self, object: u64, name: Option<&str>) {
+    pub fn attach_object_trigger_tag(&mut self, object: u64, name: Option<&str>) {
         let type_index = name.and_then(|name| {
             self.trigger_runtime
                 .definitions
