@@ -86,6 +86,10 @@ vera20k-core = { path = "src" }
 # re-exported as `super_ai` from src/lib.rs.
 vera20k-superai = { path = "superai" }
 
+# sim-bench (a client-package bin since Phase 1c) draws its spread circles
+# with the same deterministic transcendental math the engine core uses.
+libm = "0.2.16"
+
 # Background HTTPS lobby I/O; verified TLS is independent of simulation.
 base64 = "0.22"
 

@@ -2958,6 +2958,7 @@ dependencies = [
  "image",
  "js-sys",
  "libc",
+ "libm",
  "log",
  "naga",
  "objc2 0.6.4",
@@ -2974,6 +2975,7 @@ dependencies = [
  "tungstenite",
  "ureq",
  "vera20k-core",
+ "vera20k-superai",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-rayon",
@@ -3031,6 +3033,16 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "zeroize",
+]
+
+[[package]]
+name = "vera20k-superai"
+version = "0.2.6"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "vera20k-core",
 ]
 
 [[package]]

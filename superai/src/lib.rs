@@ -10298,7 +10298,7 @@ impl SuperAi {
                     !vera20k_core::sim::production::is_within_build_area(
                         sim,
                         rules,
-                        sim.interner.resolve(self.house),
+                        sim.interner().resolve(self.house),
                         ty,
                         cell.0,
                         cell.1,
@@ -13503,7 +13503,7 @@ impl SuperAi {
         let Some(stone_ty) = rules.object(stone_name) else {
             return Vec::new();
         };
-        let owner = sim.interner.resolve(self.house).to_string();
+        let owner = sim.interner().resolve(self.house).to_string();
         let towers = [
             opening.defense_aa,
             opening.defense_heavy,
@@ -13764,7 +13764,7 @@ impl SuperAi {
             return;
         }
         self.telemetry_due = tick + DEFENSE_TELEMETRY_TICKS;
-        let owner = sim.interner.resolve(self.house).to_string();
+        let owner = sim.interner().resolve(self.house).to_string();
         let (output, drain) = vera20k_core::sim::production::power_balance_for_owner(sim, rules, &owner);
         let credits = vera20k_core::sim::production::credits_for_owner(sim, &owner);
         // The persona's scalars first — the borrow must drop before the
@@ -13860,7 +13860,7 @@ impl SuperAi {
                         | vera20k_core::sim::production::ProductionCategory::Defense
                 )
             })
-            .map(|item| sim.interner.resolve(item.type_id))
+            .map(|item| sim.interner().resolve(item.type_id))
             .unwrap_or("-");
         let unit = queue
             .iter()
@@ -13873,7 +13873,7 @@ impl SuperAi {
                         | vera20k_core::sim::production::ProductionCategory::Ship
                 )
             })
-            .map(|item| sim.interner.resolve(item.type_id))
+            .map(|item| sim.interner().resolve(item.type_id))
             .unwrap_or("-");
         log::info!(
             "[DEF-AI] tick={tick} house={owner} stance={stance} power={output}/{drain} credits={credits} \
@@ -14095,7 +14095,7 @@ impl SuperAi {
             let air_answer = enemy_air > 0;
             let window_open = tick >= self.fort_gun_window_due;
             let corridor_window_open = tick >= self.corridor_window_due;
-            let owner = sim.interner.resolve(self.house).to_string();
+            let owner = sim.interner().resolve(self.house).to_string();
             // The chain's flush read: the wallet affords the frontier
             // stone and its lead tower beyond the fort reserve — a
             // numeric compare over the block's own reads, no scan.
@@ -17645,8 +17645,8 @@ impl SuperAi {
             return false;
         }
         let alliances = sim.house_alliances();
-        !alliances.is_allied(&sim.interner, self.house, owner)
-            && !alliances.is_allied(&sim.interner, owner, self.house)
+        !alliances.is_allied(sim.interner(), self.house, owner)
+            && !alliances.is_allied(sim.interner(), owner, self.house)
     }
 
     /// Enemy infantry (the engine files foot soldiers under the Infantry
@@ -25885,10 +25885,10 @@ mod tests {
     ) {
         let (mut sim, rules, _overlays) =
             vera20k_core::sim::world::entry_test_fixture::fixture_with_rules(extra);
-        let country0 = sim.interner.intern("Country0");
-        let country1 = sim.interner.intern("Country1");
-        let ai_house = sim.interner.intern("DefenseHouse");
-        let enemy_house = sim.interner.intern("EnemyHouse");
+        let country0 = sim.interner().intern("Country0");
+        let country1 = sim.interner().intern("Country1");
+        let ai_house = sim.interner().intern("DefenseHouse");
+        let enemy_house = sim.interner().intern("EnemyHouse");
         sim.houses
             .register(vera20k_core::sim::house_state::HouseState::new(
                 ai_house,
@@ -25962,8 +25962,8 @@ mod tests {
     #[test]
     fn defense_perception_fills_wave_timing_bearings_composition_and_targets() {
         let (mut sim, rules, ai_house, enemy_house) = defense_world();
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
-        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
+        let enemy_owner = sim.interner().resolve(enemy_house).to_string();
         // The protected target: an own structure carrying the map's
         // destroyed-to-lose tag; the bystander structure carries none.
         let core = sim
@@ -26067,8 +26067,8 @@ mod tests {
     #[test]
     fn defense_army_mix_files_the_deficit_role_the_wave_demands() {
         let (mut sim, rules, ai_house, enemy_house) = defense_forces_world();
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
-        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
+        let enemy_owner = sim.interner().resolve(enemy_house).to_string();
         sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
         // The observed wave: five hostile vehicles, no foot, no air.
@@ -26105,8 +26105,8 @@ mod tests {
     #[test]
     fn defense_army_mix_answers_observed_aircraft_with_the_aa_role() {
         let (mut sim, rules, ai_house, enemy_house) = defense_forces_world();
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
-        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
+        let enemy_owner = sim.interner().resolve(enemy_house).to_string();
         sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
         // Three hostile vehicles (armor floor 4 → deficit 4 at 0 fielded)
@@ -26156,7 +26156,7 @@ mod tests {
     #[test]
     fn defense_line_posts_between_home_and_the_spawn_bearing() {
         let (mut sim, rules, ai_house, _enemy_house) = defense_forces_world();
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
         sim.spawn_object_at_height("GACNST", &ai_owner, 15, 15, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
         let tank = sim
@@ -26202,7 +26202,7 @@ mod tests {
     #[test]
     fn defense_repair_rotation_walks_to_the_depot_and_returns_to_the_post() {
         let (mut sim, rules, ai_house, _enemy_house) = defense_forces_world();
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
         sim.spawn_object_at_height("GACNST", &ai_owner, 15, 15, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
         let depot = sim
@@ -26297,8 +26297,8 @@ mod tests {
     #[test]
     fn defense_leak_intercept_sends_the_nearest_unit_at_the_intruder() {
         let (mut sim, rules, ai_house, enemy_house) = defense_forces_world();
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
-        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
+        let enemy_owner = sim.interner().resolve(enemy_house).to_string();
         let core = sim
             .spawn_object_at_height("GACNST", &ai_owner, 15, 15, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
@@ -26391,8 +26391,8 @@ mod tests {
              [WH_DIRECT]\nCellSpread=0\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n\
              [WH_SPLAT]\nCellSpread=2\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n";
         let (mut sim, rules, ai_house, enemy_house) = defense_world_with(extra, "1=MTNK\n2=FV\n");
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
-        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
+        let enemy_owner = sim.interner().resolve(enemy_house).to_string();
         sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
         let core = sim
@@ -26453,8 +26453,8 @@ mod tests {
              [105mm]\nDamage=65\nROF=50\nRange=6\nWarhead=WH_DIRECT\n\
              [WH_DIRECT]\nCellSpread=0\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n";
         let (mut sim, rules, ai_house, enemy_house) = defense_world_with(extra, "1=MTNK\n2=FV\n");
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
-        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
+        let enemy_owner = sim.interner().resolve(enemy_house).to_string();
         sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
         let core = sim
@@ -26501,7 +26501,7 @@ mod tests {
     /// Charge one super weapon instance for `house` the test-only setter
     /// way, so the rescue walk sees a ready launch.
     fn charge_super_weapon(sim: &mut vera20k_core::sim::world::Simulation, house: InternedId, name: &str) {
-        let sw = sim.interner.intern(name);
+        let sw = sim.interner().intern(name);
         let mut instance = vera20k_core::sim::superweapon::SuperWeaponInstance::new(sw, house, 0);
         instance.set_is_active_for_test(true);
         instance.set_is_ready_for_test(true);
@@ -26519,8 +26519,8 @@ mod tests {
     #[test]
     fn defense_rescue_curtain_covers_the_wounded_core() {
         let (mut sim, rules, ai_house, enemy_house) = defense_forces_world();
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
-        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
+        let enemy_owner = sim.interner().resolve(enemy_house).to_string();
         let core = sim
             .spawn_object_at_height("GACNST", &ai_owner, 15, 15, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
@@ -26580,8 +26580,8 @@ mod tests {
     #[test]
     fn defense_rescue_storm_strikes_the_densest_wave_cluster() {
         let (mut sim, rules, ai_house, enemy_house) = defense_forces_world();
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
-        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
+        let enemy_owner = sim.interner().resolve(enemy_house).to_string();
         sim.spawn_object_at_height("GACNST", &ai_owner, 15, 15, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
         // Four bunched at the shoulder, two strung out behind.
@@ -26624,13 +26624,13 @@ mod tests {
     #[test]
     fn defense_garrison_replenish_refills_the_casualty_ledger() {
         let (mut sim, rules, ai_house, enemy_house) = defense_forces_world();
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
-        let _enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
+        let _enemy_owner = sim.interner().resolve(enemy_house).to_string();
         sim.spawn_object_at_height("GACNST", &ai_owner, 15, 15, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
         // The garrisoned hold: a neutral passive house's occupiable
         // building next to home, revealed so the scan admits it.
-        let neutral = sim.interner.intern("NeutralHold");
+        let neutral = sim.interner().intern("NeutralHold");
         sim.houses
             .register(vera20k_core::sim::house_state::HouseState::new(
                 neutral, 2, None, false, 0, 10,
@@ -26639,7 +26639,7 @@ mod tests {
             .get_mut(&neutral)
             .expect("the neutral house")
             .set_multiplay_passive_for_test(true);
-        let neutral_owner = sim.interner.resolve(neutral).to_string();
+        let neutral_owner = sim.interner().resolve(neutral).to_string();
         let hold = sim
             .spawn_object_at_height("CIVHOLD", &neutral_owner, 16, 16, 0, 0, &rules)
             .expect("the fixture cell admits the hold");
@@ -26746,7 +26746,7 @@ mod tests {
         let _ = ai_house;
         // The neutral custodian: registered passive, as a spectatorless
         // map's civilian house reads to the persona (never an enemy).
-        let neutral_house = sim.interner.intern("NeutralHouse");
+        let neutral_house = sim.interner().intern("NeutralHouse");
         sim.houses
             .register(vera20k_core::sim::house_state::HouseState::new(
                 neutral_house,
@@ -26760,14 +26760,14 @@ mod tests {
             .get_mut(&neutral_house)
             .expect("the custodian house")
             .make_multiplay_passive();
-        let neutral_owner = sim.interner.resolve(neutral_house).to_string();
+        let neutral_owner = sim.interner().resolve(neutral_house).to_string();
         // The objective: a neutral structure carrying the destroyed ->
         // enable-hop chain; the enemy's own win chain stays out.
         let statue = sim
             .spawn_object_at_height("CABHUT", &neutral_owner, 15, 15, 0, 0, &rules)
             .expect("the fixture cell admits the objective structure");
         sim.attach_object_trigger_tag(statue, Some("STATUE_TAG"));
-        let enemy = sim.interner.resolve(enemy_house).to_string();
+        let enemy = sim.interner().resolve(enemy_house).to_string();
         let theirs = sim
             .spawn_object_at_height("CABHUT", &enemy, 16, 15, 0, 0, &rules)
             .expect("the fixture cell admits the hostile structure");
@@ -26796,7 +26796,7 @@ mod tests {
     #[test]
     fn objective_ring_staffs_before_the_base_bearings() {
         let (mut sim, rules, ai_house, _enemy_house) = defense_forces_world();
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
         sim.spawn_object_at_height("GACNST", &ai_owner, 15, 15, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
         // The protected core, three cells past the base bearing's side of
@@ -26851,8 +26851,8 @@ mod tests {
     #[test]
     fn aa_answer_caps_a_massed_air_wave() {
         let (mut sim, rules, ai_house, enemy_house) = defense_forces_world();
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
-        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
+        let enemy_owner = sim.interner().resolve(enemy_house).to_string();
         sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
         // The observed wave: eighty hostile aircraft, the wave that once
@@ -26905,8 +26905,8 @@ mod tests {
     #[test]
     fn air_sub_ring_staffs_the_aa_roster_at_the_core() {
         let (mut sim, rules, ai_house, enemy_house) = defense_forces_world();
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
-        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
+        let enemy_owner = sim.interner().resolve(enemy_house).to_string();
         sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
         let core = sim
@@ -27063,7 +27063,7 @@ mod tests {
     #[test]
     fn objective_quota_scales_with_the_observed_wave() {
         let (mut sim, rules, ai_house, enemy_house) = defense_world();
-        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        let enemy_owner = sim.interner().resolve(enemy_house).to_string();
         // Thirty hostile vehicles and thirty hostile infantry on the field:
         // the capped mix answers with 16 armor, 16 foot and the one-air
         // floor, together above the baseline ring.
@@ -27143,7 +27143,7 @@ mod tests {
              [BFRT]\nStrength=400\nSpeed=4\nSpeedType=Track\nMovementZone=Normal\n\
              Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\nPassengers=5\n";
         let (mut sim, rules, ai_house, _enemy_house) = defense_world_with("", more_vehicles);
-        let owner = sim.interner.resolve(ai_house).to_string();
+        let owner = sim.interner().resolve(ai_house).to_string();
         let tank = sim
             .spawn_object_at_height("MTNK", &owner, 15, 15, 0, 0, &rules)
             .expect("the tank cell admits the spawn");
@@ -27319,7 +27319,7 @@ mod tests {
              [NALASR]\nStrength=600\nFoundation=1x1\n\
              [NAPOWR]\nStrength=700\nFoundation=1x1\n";
         let (mut sim, rules, ai_house, enemy_house) = defense_world_with(extra, "");
-        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        let enemy_owner = sim.interner().resolve(enemy_house).to_string();
         // One structure per class, distances deliberately inverted against
         // the ladder (the yard spawned farthest, the rest-class hut
         // farther still): the class order must override the cells.
@@ -27371,8 +27371,8 @@ mod tests {
              MovementZone=Normal\nCost=700\nTechLevel=1\nPrimary=105mm\n\
              Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n";
         let (mut sim, rules, ai_house, enemy_house) = defense_world_with(extra, more_vehicles);
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
-        let enemy_owner = sim.interner.resolve(enemy_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
+        let enemy_owner = sim.interner().resolve(enemy_house).to_string();
         sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
         let head = sim
@@ -27446,7 +27446,7 @@ mod tests {
             "1=MTNK\n[MTNK]\nStrength=100\nSpeed=6\nSpeedType=Track\nMovementZone=Normal\n\
              Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n",
         );
-        let owner = sim.interner.resolve(ai_house).to_string();
+        let owner = sim.interner().resolve(ai_house).to_string();
         sim.spawn_object_at_height("GACNST", &owner, 10, 10, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
         // A choke box: nine members wedged mid-march (each still holding
@@ -28035,7 +28035,7 @@ mod tests {
              [GAPILL]\nStrength=400\nFoundation=1x1\nCost=500\nTechLevel=1\n",
             "",
         );
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
         sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
             .expect("the home yard stands");
         sim.spawn_object_at_height("GACNST", &ai_owner, 24, 20, 0, 0, &rules)
@@ -28108,7 +28108,7 @@ mod tests {
     #[test]
     fn the_fort_claims_guns_at_the_bearing_anchor() {
         let (mut sim, rules, _overlays, ai_house, _enemy) = defense_fort_world();
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
         sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
         let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
@@ -28172,7 +28172,7 @@ mod tests {
     #[test]
     fn the_heavy_row_opens_on_any_class_radar() {
         let (mut sim, rules, _overlays, ai_house, _enemy) = defense_fort_world();
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
         sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
         sim.spawn_object_at_height("ATESLA", &ai_owner, 11, 10, 0, 0, &rules)
@@ -28228,7 +28228,7 @@ mod tests {
     #[test]
     fn the_fort_anchor_counts_its_own_ring_only() {
         let (mut sim, rules, _overlays, ai_house, _enemy) = defense_fort_world();
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
         sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
         // The home ring at its wartime quota, all on the bearing's side but
@@ -28318,7 +28318,7 @@ mod tests {
     #[test]
     fn the_wall_walk_serves_and_rebuilds_the_fort_anchor() {
         let (mut sim, rules, overlays, ai_house, _enemy) = defense_fort_world();
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
         sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)
             .expect("the fixture cell admits the yard");
         let mut ai = SuperAi::new(ai_house, SuperAiDifficulty::Fair);
@@ -28394,7 +28394,7 @@ mod tests {
     #[test]
     fn garrison_scan_latches_own_occupiable_structures() {
         let (mut sim, rules, ai_house, _enemy) = defense_forces_world();
-        let ai_owner = sim.interner.resolve(ai_house).to_string();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
         sim.spawn_object_at_height("CIVHOLD", &ai_owner, 12, 12, 0, 0, &rules)
             .expect("the own hall stands");
         sim.spawn_object_at_height("GACNST", &ai_owner, 10, 10, 0, 0, &rules)

@@ -306,7 +306,7 @@ fn parse_args_from(mut argv: impl Iterator<Item = String>) -> Result<Args, Strin
             other => return Err(format!("unrecognised argument {other}")),
         }
     }
-    if args.frame_profile && !cfg!(feature = "telemetry") {
+    if args.frame_profile && !cfg!(feature = "telemetry-dashboard") {
         return Err("--frame-profile needs a build with --features telemetry".to_string());
     }
     if args.ra2_dir.as_os_str().is_empty() {
@@ -1004,7 +1004,7 @@ fn main() -> Result<(), String> {
         }
     }
 
-    #[cfg(feature = "telemetry")]
+    #[cfg(feature = "telemetry-dashboard")]
     runtime.simulation.set_frame_profiling(args.frame_profile);
     // A failed frame still reports the frames before it, then fails the run.
     let (measured, frames) = run_frames(
@@ -1057,7 +1057,7 @@ fn main() -> Result<(), String> {
             .map_err(|error| format!("{}: {error}", path.display()))
     });
     report(&mut std::io::stdout().lock(), &measured, warmup).map_err(|error| error.to_string())?;
-    #[cfg(feature = "telemetry")]
+    #[cfg(feature = "telemetry-dashboard")]
     if args.frame_profile {
         print_frame_profile(runtime);
     }
@@ -1072,7 +1072,7 @@ fn main() -> Result<(), String> {
 
 /// The simulation's frame profile over the measured frames: the buckets, the
 /// vision slice's share of the mean frame, then every phase's mean.
-#[cfg(feature = "telemetry")]
+#[cfg(feature = "telemetry-dashboard")]
 fn print_frame_profile(runtime: &SimRuntime) {
     use vera20k_core::sim::frame_profile::PHASE_KEYS;
     let Some(profile) = runtime.simulation.frame_profile().report() else {
