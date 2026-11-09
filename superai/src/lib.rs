@@ -8680,7 +8680,9 @@ impl SuperAi {
                 }) {
                     continue;
                 }
-                let Some(view) = vera20k_core::sim::tiberium::tiberium_cell_view(
+                // A registry inconsistency (TiberiumImageError) makes the
+                // cell unusable for siting, same as no tiberium there.
+                let Ok(Some(view)) = vera20k_core::sim::tiberium::tiberium_cell_view(
                     grid,
                     overlay_registry,
                     &rules.tiberium_types,
