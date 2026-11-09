@@ -2963,7 +2963,12 @@ impl Simulation {
             // engineers included) and the command layer only observes it a
             // tick later. The base centre, base-plan recalc and AI latches
             // written above stay; the layer relies on them.
-            if gather && !house.command_driven() {
+            if gather
+                && !self
+                    .houses
+                    .get(&owner_id)
+                    .is_some_and(|house| house.command_driven())
+            {
                 self.move_ground_forces_to_base(owner_id, rules, registry, frame_effects);
             }
         }

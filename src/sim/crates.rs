@@ -399,7 +399,19 @@ pub fn place_crate_at_for_tooling(
         .filter(|(_, slot)| !slot.is_empty())
         .map(|(index, _)| index)
         .collect();
-    if !place_crate(sim, rules, overlay_registry, requested, powerup) {
+    let placed = place_crate(
+        sim,
+        rules,
+        overlay_registry,
+        requested,
+        powerup,
+        FrameEffects::empty(),
+    )
+    .unwrap_or_else(|error| {
+        log::error!("tooling crate placement failed: {error}");
+        false
+    });
+    if !placed {
         return None;
     }
     sim.crate_authority
