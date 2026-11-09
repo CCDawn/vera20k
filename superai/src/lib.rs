@@ -14614,6 +14614,8 @@ impl SuperAi {
                 footprint: NearbyFootprint::new(3, 3),
                 allow_bridge_cells: true,
                 check_height: false,
+                // Ground placement; the burrow gate is burrowing callers' own.
+                require_burrowable: false,
                 check_occupancy: false,
                 target_cell: None,
                 options: vera20k_core::sim::find_nearby_cell::NearbySearchOptions {
