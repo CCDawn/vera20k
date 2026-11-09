@@ -13,6 +13,11 @@ use std::cell::{Cell, RefCell};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::time::{Duration, Instant};
 
+/// Stall guard for the two long real-UDP exchanges. They take seconds alone, but a
+/// debug build sharing a small CI machine with the rest of the suite runs many times
+/// slower, and only the wall clock bounds their loops.
+const LONG_EXCHANGE_LIMIT: Duration = Duration::from_secs(120);
+
 fn transport() -> LanUdpTransport {
     LanUdpTransport::bind(
         UdpBindConfig {
@@ -2625,7 +2630,7 @@ fn three_udp_clients_recover_a_retained_frontier_across_a_timing_shrink() {
             link.release();
         }
         assert!(
-            started.elapsed() < Duration::from_secs(20),
+            started.elapsed() < LONG_EXCHANGE_LIMIT,
             "heterogeneous exchange stalled: frames={:?}, local={:?}, waits={:?}, sending={:?}, peers={:?}, held={}, lost={:?}, retry={}, pressure={}, frontier={}",
             worlds.each_ref().map(|sim| sim.session().binary_frame()),
             worlds
@@ -2942,7 +2947,7 @@ fn real_udp_mass_order_survives_backpressure_and_executes_one_shared_frame() {
                 }
             }
             assert!(
-                started.elapsed() < Duration::from_secs(20),
+                started.elapsed() < LONG_EXCHANGE_LIMIT,
                 "mass UDP exchange stalled: frames={:?}, local={:?}, waits={:?}, peers={:?}, queued={:?}",
                 [a.session().binary_frame(), b.session().binary_frame()],
                 [
@@ -3087,6 +3092,7 @@ fn sequenced_udp_paused_client_catches_up_without_stalling_healthy_commands() {
         sources_mask: 3,
         tick_hz: 30,
         expires: 86_500,
+        pacing: Default::default(),
     }
     .sign(&key)
     .unwrap();
@@ -3358,6 +3364,7 @@ fn sequenced_service_ends_a_match_a_newer_relay_keeps_stalling() {
         sources_mask: 3,
         tick_hz: 30,
         expires: 86_500,
+        pacing: Default::default(),
     }
     .sign(&key)
     .unwrap();
@@ -3427,6 +3434,7 @@ fn sequenced_unsent_batch_retries_when_the_relay_route_recovers() {
         sources_mask: 3,
         tick_hz: 30,
         expires: 86_500,
+        pacing: Default::default(),
     }
     .sign(&key)
     .unwrap();
@@ -3470,20 +3478,22 @@ fn sequenced_unsent_batch_retries_when_the_relay_route_recovers() {
     let mut second = ClientSession::new(&ticket, packet_key, [29; 32]).unwrap();
     let from = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 9);
     let mut bytes = Vec::new();
-    second.probe(&mut bytes).unwrap();
+    second.probe_at(16_000, &mut bytes).unwrap();
     let challenge = relay.process_at(from, &bytes, 116, 16_000).unwrap();
-    let Ok(ServerEvent::Challenge(cookie)) = second.receive(&challenge[0].bytes) else {
+    let Ok(ServerEvent::Challenge(cookie)) = second.receive_at(&challenge[0].bytes, 16_000) else {
         panic!("challenge");
     };
-    second.confirm(&cookie.to_vec(), &mut bytes).unwrap();
+    second
+        .confirm_at(&cookie.to_vec(), 16_000, &mut bytes)
+        .unwrap();
     let ready = relay.process_at(from, &bytes, 116, 16_000).unwrap();
     assert!(matches!(
-        second.receive(&ready[0].bytes),
+        second.receive_at(&ready[0].bytes, 16_000),
         Ok(ServerEvent::Ready)
     ));
     let identity = agreement.sequencing_identity().unwrap().0;
     second
-        .configure_ordering(&certificate, identity, &mut bytes)
+        .configure_ordering_at(&certificate, identity, 16_000, &mut bytes)
         .unwrap();
     relay.process_at(from, &bytes, 116, 16_000).unwrap();
     let pump = |wire: &mut LanUdpTransport, relay: &mut RelayServer, now: u32| {
@@ -3600,20 +3610,12 @@ fn sequenced_unsent_batch_retries_when_the_relay_route_recovers() {
         "an unsent batch must not wait for the 100ms retransmission deadline"
     );
 
-    // Withhold the acceptance from the app owner. The ordinary later retry
-    // must receive another ACK, rather than a ModifiedRetry rejection.
+    // The ACK was withheld from the app owner, so the batch's records stay
+    // in its local queue; the relay session alone owns the acceptance and
+    // resends nothing more (spec §6.4).
     session.service(&mut wire, recovered_at + 112);
-    let mut acknowledged = false;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while !acknowledged && Instant::now() < deadline {
-        pump(&mut wire, &mut relay, recovered_at + 112);
-        acknowledged = drain_ack(&mut wire);
-        std::thread::yield_now();
-    }
-    assert!(
-        acknowledged,
-        "sealed retry retained the accepted ciphertext"
-    );
+    pump(&mut wire, &mut relay, recovered_at + 112);
+    assert!(!drain_ack(&mut wire), "no retry of an acknowledged batch");
     assert_eq!(session.sent_commands(), 0);
     assert_eq!(
         sim.network_command_queues().local_records().unwrap(),
@@ -3655,6 +3657,7 @@ fn sequenced_pair() -> (
         sources_mask: 3,
         tick_hz: 30,
         expires: 86_500,
+        pacing: Default::default(),
     }
     .sign(&key)
     .unwrap();
@@ -3712,13 +3715,15 @@ fn sequenced_pair() -> (
 }
 
 #[test]
-fn sequenced_push_is_probed_again_after_three_lost_replies() {
+fn sequenced_lost_first_uplink_is_resent_until_the_subscription_pushes() {
     use crate::net::udp::test_support::MAX_DATAGRAM;
 
     let (mut worlds, rules, _, boundaries, socket, mut relay) = sequenced_pair();
     let second_address = boundaries[1].live.borrow().primary_addr().unwrap();
     let mut now_ms = 16_000;
-    for step in 0..900 {
+    let mut dropped = None;
+    let mut subscribed = None;
+    for step in 0..200 {
         now_ms += 16;
         let unix = 100 + (now_ms - 16_000) / 1000;
         relay.advance_clock(now_ms, unix);
@@ -3732,6 +3737,13 @@ fn sequenced_push_is_probed_again_after_three_lost_replies() {
         let mut replies = Vec::new();
         let mut bytes = [0; MAX_DATAGRAM + 1];
         while let Ok((length, std::net::SocketAddr::V4(source))) = socket.recv_from(&mut bytes) {
+            // Lose the second client's first UPLINK (CONTROL kind 4 in the
+            // v3 `hdr`, request 8 after the 9-byte envelope header).
+            let uplink = bytes[0] & 0x1F == 4 && bytes[9] == 8;
+            if uplink && source == second_address && dropped.is_none() {
+                dropped = Some(step);
+                continue;
+            }
             replies.extend(
                 relay
                     .process_at(source, &bytes[..length], unix, now_ms)
@@ -3740,25 +3752,37 @@ fn sequenced_push_is_probed_again_after_three_lost_replies() {
         }
         replies.extend(relay.drain_ordering_push(now_ms, unix));
         for packet in replies {
-            // The first two seconds lose every push reply (CONTROL kind 4,
-            // payload event 7 after the 48-byte server header) to the second.
-            let push_reply = packet.bytes[4] == 4 && packet.bytes.get(48) == Some(&7);
-            if step >= 125 || packet.endpoint != second_address || !push_reply {
-                socket.send_to(&packet.bytes, packet.endpoint).unwrap();
-            }
+            socket.send_to(&packet.bytes, packet.endpoint).unwrap();
         }
         for (world, boundary) in worlds.iter_mut().zip(&boundaries) {
             production_frame(world, &rules, boundary);
         }
-        if step == 124 {
-            assert!(boundaries[1].live.borrow().sequenced_timing().is_none());
+        if subscribed.is_none()
+            && relay
+                .reader_link_stats([17; 16], 1)
+                .is_some_and(|stats| stats.subscribed)
+        {
+            subscribed = Some(step);
         }
+        // Each step counts as 16 ms but takes far less over real UDP, so on a busy
+        // machine the loop could run out before its packets cross loopback.
+        std::thread::sleep(Duration::from_millis(1));
     }
+    let (dropped, subscribed) = (dropped.unwrap(), subscribed.unwrap());
+    // Spec §6.0: resent every RTO until a PACK. Here that is three times the first
+    // RTT sample, capped by the 250 ms heartbeat (16 steps), and a packet arriving
+    // a step or more late inflates the sample. So this only bounds the recovery,
+    // at about a second; the UPLINK tests in the relay protocol's `link/uplink.rs`
+    // pin the exact schedule with a fake clock.
+    assert!(
+        subscribed - dropped <= 64,
+        "subscribed {} steps after the lost UPLINK",
+        subscribed - dropped
+    );
     assert!(
         boundaries
             .iter()
-            .all(|boundary| boundary.live.borrow().sequenced_timing().is_some()),
-        "a relay that answers a later probe delivers by push"
+            .all(|boundary| boundary.live.borrow().sequenced_timing().is_some())
     );
 }
 
@@ -4042,7 +4066,7 @@ fn sequenced_pause_stops_at_one_boundary_and_recovers_a_lost_resume() {
         let deliver = |packet: vera20k_relay_protocol::ForwardDatagram| {
             // Protocol v2 has a 48-byte server header; payload kind8 is
             // PauseStatus. Lose those replies but retain canonical history.
-            let lost_status = lose_pause_status && packet.bytes.get(48) == Some(&8);
+            let lost_status = lose_pause_status && packet.bytes.get(9) == Some(&8);
             if packet.endpoint != second_address || (!lose_second && !lost_status) {
                 socket.send_to(&packet.bytes, packet.endpoint).unwrap();
             }
@@ -4538,7 +4562,7 @@ fn sequenced_player_input_passes_an_unacknowledged_checksum_batch() {
 }
 
 #[test]
-fn sequenced_fresh_batch_survives_one_lost_datagram_without_a_retry_wait() {
+fn sequenced_fresh_batch_survives_one_lost_datagram_within_an_rto() {
     use crate::net::udp::test_support::MAX_DATAGRAM;
     use crate::sim::command::{Command, MEGAMISSION_OPCODE};
     let (mut worlds, rules, actor, boundaries, socket, mut relay) = sequenced_pair();
@@ -4610,12 +4634,14 @@ fn sequenced_fresh_batch_survives_one_lost_datagram_without_a_retry_wait() {
                 .filter(|(from, _)| *from == first_address)
                 .map(|(_, bytes)| bytes.len())
                 .max();
-            let index = packets
+            // The batch may leave on the next service: wait for it.
+            if let Some(index) = packets
                 .iter()
                 .position(|(from, bytes)| *from == first_address && Some(bytes.len()) == largest)
-                .unwrap();
-            packets.remove(index);
-            lost = true;
+            {
+                packets.remove(index);
+                lost = true;
+            }
         }
         for (from, bytes) in packets {
             for forwarded in relay
@@ -4647,9 +4673,10 @@ fn sequenced_fresh_batch_survives_one_lost_datagram_without_a_retry_wait() {
     }
     let (sent, observed) = (sent.unwrap(), observed.expect("Move executed"));
     assert!(lost);
-    // The 100ms retry is seven 16ms buckets away; the duplicate needs none.
+    // A good link sends no copy: the next UPLINK repairs it within
+    // max(100 ms, RTO), seven 16 ms buckets (spec §13.2), plus the turn.
     assert!(
-        observed - sent <= 4,
+        observed - sent <= 11,
         "Move waited {} steps after one lost datagram",
         observed - sent
     );

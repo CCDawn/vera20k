@@ -125,6 +125,16 @@ impl HeadlessScenario {
             std::slice::from_ref(&slot),
             &runtime.resources.rules,
         );
+        // A launch commits its ally graph after building every house
+        // (`apply_skirmish_launch_alliances`). Committing the unchanged graph
+        // again does the same here: the ally matrix the load already built
+        // is rebuilt with this house's id, instead of answering every
+        // question about the house by name.
+        let alliances = runtime.simulation.house_alliances.as_map().clone();
+        runtime.simulation.install_house_alliances(
+            crate::sim::house_diplomacy::HouseAllianceAdmission::Admitted(alliances),
+            &runtime.resources.rules,
+        );
         runtime
             .simulation
             .interner
@@ -396,8 +406,6 @@ fn load_with_assets(
     let theater = theater::load_theater(assets, &map.header.theater)
         .ok_or_else(|| format!("load theater {}", map.header.theater))?;
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art_ini));
-    let infantry_sequences =
-        crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art_ini);
     let overlay_registry = rules.overlay_registry().clone();
     let house_roster = crate::map::houses::parse_house_roster(
         &map.ini,
@@ -539,9 +547,7 @@ fn load_with_assets(
         theater.extension,
         crate::rules::terrain_asset_catalog::TerrainAssetLoadPhase::Fresh,
     );
-    let _alpha_image_bindings =
-        crate::rules::alpha_image_assets::bind(&rules, &overlay_registry, &assets);
-    rules.bind_animation_sequences(&infantry_sequences);
+    rules.bind_alpha_images(&overlay_registry, &assets);
     let overlay_shp_ids = crate::rules::effect_asset_catalog::resolved_overlay_shp_ids(
         &overlay_registry,
         &assets,
@@ -609,7 +615,8 @@ fn load_with_assets(
         overlay_grid,
         &house_roster,
         Some(&launch),
-    );
+    )
+    .map_err(|error| error.to_string())?;
     if !post_map.navigation_published {
         return Err("publish headless post-map navigation".to_string());
     }
@@ -3749,27 +3756,35 @@ mod launch_alliance_tests {
     /// A skirmish launch never reads a map House's `Allies=`: gamemd reads it
     /// in `HouseClass::Read_Scenario_INI @ 0x00500B40`, which an authored map
     /// reaches only through `HouseClass::Read_INI @ 0x005009B0`, called in
-    /// campaigns alone (`0x0068776E..0x006877B9`). FaceDown's `[Neutral]`
-    /// names Special.
+    /// campaigns alone (`0x0068776E..0x006877B9`). XMP29U2's `[Neutral]`
+    /// names Americans, here the human's House. A pair with Special cannot
+    /// probe this: Post_Map_Init allies Special with every House
+    /// (`0x00686A9E..0x00686AC1`).
     #[test]
     fn a_skirmish_launch_leaves_neutral_without_the_maps_allies() {
         let Some((root, _)) = crate::rules::retail_ini_fixture::retail_assets() else {
             return;
         };
-        let session = battle_session(
-            "FaceDown.map",
+        let mut session = battle_session(
+            "XMP29U2.MAP",
             &[(
                 crate::skirmish_launch::LaunchCountry::America,
                 crate::skirmish_launch::AiDifficulty::Easy,
             )],
         );
-        let scene = load_session(&root, "FaceDown.map", 0x1234_5678, session).unwrap();
+        session.humans[0].name = "Americans".to_string();
+        let scene = load_session(&root, "XMP29U2.MAP", 0x1234_5678, session).unwrap();
         let sim = scene.sim();
         let neutral = sim.interner().get("Neutral").unwrap();
-        let special = sim.interner().get("Special").unwrap();
+        let human = sim.interner().get("Americans").unwrap();
+        assert!(
+            sim.houses()
+                .get(&human)
+                .is_some_and(|house| house.is_human())
+        );
         assert!(
             !sim.house_alliances()
-                .is_allied(sim.interner(), neutral, special)
+                .is_allied(sim.interner(), neutral, human)
         );
     }
 }

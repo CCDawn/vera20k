@@ -34,6 +34,9 @@ const GAME_SPEED_BUCKET_MS: u32 = 16;
 /// Convert the stored speed byte to a UI/debug rate readout. Gameplay frame
 /// admission uses the native 16 ms bucket comparison directly.
 pub(crate) fn tps_for_game_speed(stored_speed: u32) -> u32 {
+    if stored_speed == u32::from(crate::sim::game_options::GAME_SPEED_90_TPS) {
+        return 90;
+    }
     if stored_speed == 0 {
         return 60;
     }
@@ -342,6 +345,8 @@ pub(crate) enum CursorFeedbackKind {
     Grind,
     /// NoEnter cursor (action 0x1F, row 0x1A at `0x004AB382`).
     NoEnter,
+    /// Tote cursor (action 0x11): a Carryall over a Unit it may lift.
+    Tote,
     /// Engineer action28 damage cursor. Its uncommon authored-threshold
     /// display route remains outside the ordinary repair cursor proof.
     EngineerDamage,
@@ -368,6 +373,11 @@ pub(crate) enum CursorFeedbackKind {
     /// Sell cursor mode active (sidebar dollar). `true` = an own building is
     /// under the cursor (sell), `false` = no eligible target (no-sell).
     SellMode(bool),
+    /// Ares 3.0 DisplayClass_ChooseAction_CanSell (10057E70, hook 0x6929FC):
+    /// sell mode over the player's own Unit or Aircraft that can be sold
+    /// (`production::foot_can_be_sold`) answers action 0xD, SellUnit.
+    #[cfg(feature = "ares")]
+    SellUnit,
     /// Superweapon targeting reticle — shown while a charged SW is armed
     /// and the cursor is over the tactical map. Payload is the per-SW
     /// CursorId resolved from the `Action=` INI string.
@@ -375,6 +385,11 @@ pub(crate) enum CursorFeedbackKind {
     /// Beacon placement mode with nothing selected: action 0x3C, row 0x4E
     /// (`0x004AB754` revealed, `0x004AB3DB` shrouded).
     PlaceBeacon,
+    /// Ares 3.0: a What_Action answer drawn with the `[MouseCursors]` entry
+    /// (this index) its hooks chose, where that entry draws other frames than
+    /// the answer's stock row (`app::input::ares_cursor::tactical`).
+    #[cfg(feature = "ares")]
+    AresAction(u16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

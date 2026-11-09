@@ -213,8 +213,8 @@ fn stock_flat_torpedo_pose_upload_and_surface_replay_match_original_pixels() {
                 );
                 prepared.push((layers, body));
             }
-            // Build all poses before the single upload, as the production frame.
-            cache.upload(&gpu.device, &gpu.queue, &batch);
+            // Build all poses before the single encode, as the production frame.
+            cache.submit(&gpu.device, &gpu.queue, &batch);
             let color = gpu.target(size, format);
             let cv = color.create_view(&Default::default());
             let depth = gpu.target(size, wgpu::TextureFormat::Depth32Float);
@@ -499,9 +499,11 @@ fn kirov_pose_upload_and_replay(interpolated: bool) {
             let object = crate::app::presentation::instances::projectile_draw_instance_sampled(
                 sim.projectiles().get(id).unwrap(),
                 painted,
+                sim.session().binary_frame(),
                 kind,
                 "BlimpBombP",
                 HouseColorIndex(8),
+                [1000; 3],
                 None,
                 sim.resolved_terrain().unwrap(),
                 cam,
@@ -539,8 +541,8 @@ fn kirov_pose_upload_and_replay(interpolated: bool) {
                 instance.uv_origin, reused.uv_origin,
                 "equal simultaneous bombs reuse the same page slot"
             );
-            // One upload after all requests, as the production frame builder.
-            cache.upload(&gpu.device, &gpu.queue, &batch);
+            // One encode after all requests, as the production frame.
+            cache.submit(&gpu.device, &gpu.queue, &batch);
             let texels = gpu.read_uint_texels(
                 &cache.page_texture(reused.page).unwrap().view,
                 instance.uv_origin.map(|v| (v * 1024.0) as u32),

@@ -37,9 +37,9 @@
 //! 5. The best is kept only on a **strictly greater** score (init −1), so ties
 //!    go to whatever the walk reached first.
 //! 6. After each ring, `if (best && (r == radius/4 || r == radius/2)) return`
-//!    (`0x006F94F1`). A close-enough target ends the scan early — this is why a
-//!    defence shoots the attacker at its feet rather than the juicier one three
-//!    cells further out.
+//!    (`0x006F9AE2..0x006F9B0A`). A close-enough target ends the scan early —
+//!    this is why a defence shoots the attacker at its feet rather than the
+//!    juicier one three cells further out.
 //!
 //! ## The score
 //!
@@ -421,7 +421,10 @@ fn threat_score(
 
     // B: the candidate's selected weapon against the scorer. A candidate
     // already targeting the scorer contributes the negated term (`FCHS` at
-    // `0x0070CEB9`).
+    // `0x0070CEB9`). Both verses terms read `WarheadType::interaction`, which
+    // under Ares is the extension's table, as TechnoClass_EvalThreatRating_
+    // Verses1 (10054310, hook 0x70CEA0) and TechnoClass_EvalThreatRating
+    // (100542E0, hook 0x70CF45) read it.
     let scorer_as_target = techno_target_facts(
         scorer,
         scorer_type,
@@ -569,7 +572,7 @@ fn finish_score(score: i32) -> Option<i32> {
 }
 
 /// The ring index at which the native walk returns early once it holds a
-/// candidate (`0x006F94D0..0x006F94F1`).
+/// candidate (`0x006F9AE2..0x006F9B0A`; both divides truncate toward zero).
 fn is_early_return_ring(ring: i32, radius: i32) -> bool {
     ring == radius / 4 || ring == radius / 2
 }
@@ -705,11 +708,11 @@ struct ScanContext<'a> {
     /// Truce session bit (`0x00687C16..0x00687C29`). World-less fixtures
     /// (walk and score unit tests) leave it off.
     harvester_immune: bool,
-    /// VERA-only: the [`crate::rules::ruleset::RuleSet::harvester_unit_types`]
-    /// names resolved through the interner once per scan, so the
-    /// HarvesterImmune gate (`0x006F8009..0x006F8047`) compares ids instead
-    /// of re-uppercasing each name per candidate. Empty while the bit is
-    /// clear, the ordinary skirmish path.
+    /// VERA-only: [`crate::sim::scenario_session::ScenarioSession::truce_harvester_types`]
+    /// resolved once per scan, so the HarvesterImmune gate
+    /// (`0x006F8009..0x006F8047`) compares ids instead of re-uppercasing each
+    /// name per candidate. Empty while the bit is clear, the ordinary
+    /// skirmish path.
     harvester_unit_ids: Vec<InternedId>,
     /// VERA-only: the Scenario stream (Scenario+0x218) the scan draws from,
     /// copied from `fire_world` at its first draw and handed back through
@@ -940,8 +943,11 @@ impl ScanContext<'_> {
                     )
                     .is_some();
         }
-        // `0x006F7FC5..0x006F7FDD`: anything else answers vt+0x80.
-        !vehicle_like(self, candidate, candidate_obj)
+        // `0x006F7FC5..0x006F7FDD`: anything else answers vt+0x80. Ares 3.0
+        // TechnoClass_CanAutoTargetObject_Heal (1004E490, hook 0x6F7FC5)
+        // jumps past it to 0x006F7FDF, so a healing vehicle may take any
+        // damaged ally.
+        !cfg!(feature = "ares") && !vehicle_like(self, candidate, candidate_obj)
     }
 
     /// The candidate's owner is `MultiplayPassive` (HouseType `+0x1A6`).
@@ -1274,6 +1280,39 @@ pub(crate) fn greatest_threat(
             };
         }
     };
+    // Ares FootClass_SelectAutoTarget_Cloaked (Ares.dll 100491E0, hook
+    // 0x4D9920, Foot's own entry): a human player's Foot on Guard whose type
+    // has `CanPassiveAquire.Guard=no`, or `CanPassiveAquire.Cloak=no` while
+    // it can cloak (IsCloakable vt+0x288, or the rank's CLOAK ability),
+    // returns no target before the latch and the scan.
+    #[cfg(feature = "ares")]
+    if foot_wrapper_entered
+        && standing.human
+        && scanner.mission.effective().known() == Some(crate::sim::mission::MissionType::Guard)
+    {
+        let combat = attacker_obj.techno_combat().combat();
+        let blocked = !combat.can_passive_acquire_guard()
+            || (!combat.can_passive_acquire_cloak()
+                && (crate::sim::world::techno_ai_cloak::ares_foot_is_cloakable(
+                    scanner,
+                    attacker_obj,
+                )
+                .unwrap_or(false)
+                    || crate::sim::combat::veterancy::has_weapon_ability(
+                        scanner.veterancy.rank_kind(),
+                        attacker_obj,
+                        crate::rules::object_type::Ability::Cloak,
+                    )));
+        if blocked {
+            return ThreatScanOutcome {
+                target: None,
+                foot_wrapper_entered: false,
+                collected: None,
+                scenario_rng: None,
+                met_idle_disguise: false,
+            };
+        }
+    }
     let result = |target: Option<u64>, collected, ctx: &ScanContext<'_>| ThreatScanOutcome {
         target: target.map(super::TargetKind::Entity),
         foot_wrapper_entered,
@@ -1389,15 +1428,9 @@ pub(crate) fn greatest_threat(
         probe_firer: Default::default(),
         scanner_facts: facts,
         harvester_immune,
-        harvester_unit_ids: if harvester_immune {
-            rules
-                .harvester_unit_types
-                .iter()
-                .filter_map(|type_id| interner.get(type_id))
-                .collect()
-        } else {
-            Vec::new()
-        },
+        harvester_unit_ids: fire_world.map_or_else(Vec::new, |world| {
+            world.session.truce_harvester_types(rules, interner)
+        }),
         scenario_rng: Default::default(),
         scenario_draws: Default::default(),
         met_idle_disguise: Default::default(),
@@ -1640,18 +1673,14 @@ fn wall_threat_score(ctx: &ScanContext<'_>, cell: (i16, i16)) -> i32 {
     ) else {
         return 0;
     };
-    let Some(warhead) = weapon
-        .warhead
-        .as_deref()
-        .and_then(|name| ctx.rules.warhead(name))
-    else {
+    let Some(warhead) = ctx.rules.weapon_warhead(weapon) else {
         return 0;
     };
-    let fired_at_ground = weapon.projectile.as_deref().is_none_or(|name| {
-        ctx.rules
-            .projectile(name)
-            .is_some_and(|projectile| projectile.ag)
-    });
+    let fired_at_ground = weapon.projectile.is_none()
+        || ctx
+            .rules
+            .weapon_projectile(weapon)
+            .is_some_and(|projectile| projectile.ag);
     if !fired_at_ground || !warhead.wall {
         return 0;
     }
@@ -1797,7 +1826,7 @@ fn scanner_mask<'r>(
 /// overwhelmingly nearest-first where a ring scanner barely weighs distance at
 /// all. Carried here by [`WalkArgs::reference`].
 ///
-/// There is no band early return on this path (`0x006F94D0` sits below the
+/// There is no band early return on this path (`0x006F9AE2` sits below the
 /// jump target), so each walk sees every object once. A landed aircraft is
 /// Ground-layer and can be scored by both walks, at the two scales.
 ///
@@ -2495,9 +2524,34 @@ fn evaluate_candidate(
         return None;
     }
 
+    // Ares TechnoClass_CanAutoTargetObject_CivilianEnemy (Ares.dll 10049D00,
+    // hook 0x6F826E): a `CivilianEnemy=` candidate, or one whose Techno
+    // target the scanner's house is allied with while `[CombatDamage]
+    // AutoRepel` (`PlayerAutoRepel` for a human scanner) is set, is an enemy:
+    // the passive-house and Insignificant gates are skipped (`0x006F8483`).
+    #[cfg(feature = "ares")]
+    let considered_enemy = candidate_obj.techno_combat().combat().civilian_enemy()
+        || (candidate
+            .attack_target
+            .target()
+            .is_some_and(|target| match target {
+                super::TargetKind::Entity(id) => ctx
+                    .entities
+                    .get(id)
+                    .is_some_and(|target| ctx.is_ally(target)),
+                _ => false,
+            })
+            && ctx
+                .rules
+                .ares_techno_combat()
+                .auto_repel(ctx.standing.human));
+    #[cfg(not(feature = "ares"))]
+    let considered_enemy = false;
+
     // `0x006F826E..0x006F835E`: outside the campaign, a `MultiplayPassive`
     // house's objects are off limits but for the building exception.
-    let passive_owner = ctx.standing.game_mode_nonzero && ctx.owner_is_passive(candidate);
+    let passive_owner =
+        !considered_enemy && ctx.standing.game_mode_nonzero && ctx.owner_is_passive(candidate);
     if passive_owner && !ctx.passive_building_exception(candidate, candidate_obj) {
         return None;
     }
@@ -2509,7 +2563,8 @@ fn evaluate_candidate(
     // which only a building meets. Stock authors `Insignificant=yes` on 26
     // civilian vehicles (cars, buses, taxis), 22 civilian infantry types
     // (civilians, the cow) and every wall.
-    if candidate_obj.insignificant
+    if !considered_enemy
+        && candidate_obj.insignificant
         && !candidate.mind_control.is_mind_controlled()
         && (!building || ctx.owner_is_passive(candidate))
         && !ctx.passive_building_exception(candidate, candidate_obj)

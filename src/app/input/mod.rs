@@ -4,12 +4,14 @@
 
 #[cfg(feature = "verax")]
 pub(crate) mod autoload;
+pub(crate) mod build_repeat;
 pub(crate) mod camera;
 pub(crate) mod chat;
 pub(crate) mod commands;
 pub(crate) mod coop_score;
 pub(crate) mod context_order;
 pub(crate) mod cursor;
+pub(crate) mod hardware_cursor;
 pub(crate) mod connection;
 pub(crate) mod diplomacy;
 pub(crate) mod restate;
@@ -36,6 +38,8 @@ pub(crate) mod tooltips;
 pub(crate) mod transport_orders;
 
 pub(crate) mod abort;
+#[cfg(feature = "ares")]
+pub(crate) mod ares_cursor;
 pub(crate) mod surrender;
 #[cfg(test)]
 mod bridge_click_tests;
@@ -45,7 +49,6 @@ pub(crate) mod sound;
 pub(crate) mod keyboard;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_pointer;
-pub(crate) mod network_options;
 pub(crate) mod multiplayer_setup;
 pub(crate) mod campaign_input;
 pub(crate) mod touch;

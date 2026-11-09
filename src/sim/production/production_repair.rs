@@ -213,6 +213,9 @@ pub fn toggle_repair(
         RepairControl::Start => entity.repairing.on = true,
     }
     let owner = entity.owner();
+    // The building being repaired is already resolved here; carry its type
+    // out so the EVA line can name it without a second lookup.
+    let type_id = entity.type_ref();
     let position = entity.position;
     let sound = if entity.repairing.on && entity.health.current() == strength {
         rules.general.scold_sound.clone()
@@ -226,7 +229,8 @@ pub fn toggle_repair(
                 sim.substrate
                     .flash_building(id, 7, sim.session.binary_frame());
             }
-            sim.sound_events.emit(SimSoundEvent::Repairing { owner });
+            sim.sound_events
+                .emit(SimSoundEvent::Repairing { owner, type_id });
         }
         rules.general.generic_click_sound.clone()
     };
@@ -497,7 +501,18 @@ fn repair_step(sim: &mut Simulation, rules: &RuleSet, id: u64) {
     let (strength, cost) = (object.strength, repair_step_cost(rules, object));
     let owner = entity.owner();
     if available_money(&sim.houses, owner) < cost {
-        if let Some(entity) = sim.substrate.entities.get_mut(id) {
+        // Ares 3.0 10014630 (hook 0x4509B4): with [General]
+        // RepairStopOnInsufficientFunds=no a human-controlled house's repair
+        // stays on (0x4509BB) and retries on a later period.
+        #[cfg(feature = "ares")]
+        let keeps_repairing = !rules.ares_repair_stop_on_insufficient_funds()
+            && sim
+                .houses
+                .get(&owner)
+                .is_some_and(|house| house.is_controlled_by_human(sim.session.game_mode_nonzero()));
+        #[cfg(not(feature = "ares"))]
+        let keeps_repairing = false;
+        if !keeps_repairing && let Some(entity) = sim.substrate.entities.get_mut(id) {
             entity.repairing.on = false;
         }
         return;

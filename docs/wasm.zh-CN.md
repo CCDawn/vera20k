@@ -16,6 +16,8 @@ python3 tools/wasm/build.py
 
 构建工具使用 `--target wasm32-unknown-unknown --no-default-features --features wasm`，按现有 `fast` profile 将客户端库构建为 `cdylib`，再将绑定代码和不含游戏资源的宿主页面打包到 `target/wasm-dist/`。可加 `--profile release` 使用 release 优化。工具会检查绑定 CLI 与 lockfile 的版本是否一致，并为引擎设置 8 MiB 的 Wasm 栈。桌面版的产物类型、默认 feature 和构建命令保持不变。
 
+界面自带的字体中，浏览器版引擎只内嵌 Noto Sans。其余字体（Noto Sans CJK 及 19 种文字的字体，约 28 MB）连同许可证复制到 `pkg/fonts/`，引擎在文字首次需要只有某个字体才有的字符时（例如聊天里的泰文名字），从自身文件旁边获取该字体。托管该包的站点也必须提供这个目录。
+
 可选联机版的构建命令：
 
 ```sh
@@ -67,7 +69,7 @@ python3 tools/wasm/serve.py
 - `util::file_system` 在桌面端重新导出标准文件操作。浏览器导入资源位于 `/retail`，存档位于 `/saves`，配置位于 `/saves/profile`；MIX 归档共享导入字节，不使用内存映射。
 - 浏览器通过现有并行工作接口串行执行工作。桌面端仍选择原生 Rayon 和工作线程路径。
 - GPU 获取通过现有初始化任务让出执行。渲染使用离屏 sRGB 帧和 canvas 呈现 pass。浏览器纹理上传不会阻塞等待 GPU 完成。
-- 没有可用的 WebGPU 适配器时，浏览器构建回退到 WebGL2。WebGL2 没有存储缓冲、计算着色器、片元原子操作和重解释格式的纹理视图，因此用到这些能力的渲染器只在该设备上改用等价的渲染目标实现（`render::webgl`、`gpu::webgl_fallback`）；其他设备的路径不变。原生测试会把这些着色器翻译为 GLSL ES 3.00，设置 `VERA20K_TEST_WEBGL_FALLBACK=1` 可在原生设备上让 GPU 基准测试走回退路径。
+- 没有可用的 WebGPU 适配器时，浏览器构建回退到 WebGL2。WebGL2 没有存储缓冲、计算着色器和重解释格式的纹理视图，因此用到这些能力的渲染器只在该设备上改用等价的渲染目标实现（`render::webgl`、`gpu::webgl_fallback`）；其他设备的路径不变。原生测试会把这些着色器翻译为 GLSL ES 3.00，设置 `VERA20K_TEST_WEBGL_FALLBACK=1` 可在原生设备上让 GPU 基准测试走回退路径。
 - 浏览器入口提供 canvas、状态回调和存储回调；现有 App 继续负责启动和对局生命周期。
 
 只有同时启用 `wasm-net` 和浏览器目标，才会启用 Fetch、WS socket 和延后的联机加载等待。桌面构建（包括启用 `wasm-net` 的构建）仍使用原生 UDP、阻塞 HTTPS 和线程调度。仅启用 `wasm` 的单机包仍会在网络入口明确返回不支持错误。浏览器不支持 LAN 发现和直接 UDP 连接。
@@ -101,6 +103,10 @@ python3 -m unittest tools.tests.test_wasm_build
   战役重开按 `quit` 结束，局内读档直接替换对局、不发送该事件。原版多人地图通常
   没有 `[Basic] Name`，此时 `map_name` 为 `null`。
   结算快照直接读取模拟已有结果，不额外消耗 RNG；没有快照时 `scores` 为 `null`。
+  只有在线 relay 对局附带 `network_quality`：本客户端按墙钟时间观察到的对局时长、
+  追帧、网络缺口与修复、指令往返时间、帧耗时与帧率、降速以及失步和重连情况。桌面
+  `-SPAWN` 把同一对象写入 `spawn_result.json`，每个客户端也会在对局交还网络传输时
+  记录一次 `Network quality:` 日志。
 - `engine-exited`：引擎收尾后通知一次，`reason` 为 `quit`、`match-ended` 或
   `error`，`error` 携带错误文本或 `null`。资源加载失败后点击退出也携带原错误。
 - `engine-error`：panic 的尽力通知，不能视为已正常收尾。浏览器终止页面或

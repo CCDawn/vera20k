@@ -11,6 +11,7 @@
 use crate::app::AppState;
 use crate::app::presentation::sidebar_render::current_sidebar_chrome;
 use crate::render::batch::SpriteInstance;
+use crate::render::bit_font::{BitFont, Fit};
 use crate::render::sidebar_chrome::{SidebarChromeAtlas, SidebarChromeEntry};
 use crate::ui::sidebar::power_bar_anim::PowerBarAnimState;
 use crate::ui::sidebar::{
@@ -297,6 +298,23 @@ pub(crate) const READY_PAD_X: f32 = 2.0;
 /// Vertical padding around the ready text (each side, in native pixels).
 pub(crate) const READY_PAD_Y: f32 = 1.0;
 
+/// VERA's own: the [`Fit`] that keeps a cameo's status label on one line on
+/// its cameo, `slot_w` less the strip's padding and less any queue `badge`
+/// sharing its row, so that a longer translation squeezes instead of running
+/// off the cameo or under the badge. Retail's labels fit at [`Fit::NONE`].
+/// The label's strip and its text take the same fit.
+pub(crate) fn status_label_fit(
+    font: &BitFont,
+    text: &str,
+    slot_w: f32,
+    badge: Option<&str>,
+) -> Fit {
+    let badge_w = badge.map_or(0.0, |badge| {
+        font.text_width(badge) as f32 + QUEUE_COUNT_PAD_X
+    });
+    font.fit_line(text, (slot_w - READY_PAD_X * 2.0 - badge_w).max(1.0) as u32)
+}
+
 /// Horizontal padding for queue count badge (native pixels, matches ComputeTextRect x_pad=2).
 const QUEUE_COUNT_PAD_X: f32 = 2.0;
 /// Vertical padding for queue count badge (native pixels, matches ComputeTextRect y_pad=1).
@@ -309,15 +327,75 @@ pub(crate) struct CameoStatusLabels<'a> {
     pub hold: &'a str,
     pub charging: &'a str,
     pub active: &'a str,
+    /// Ares: each type's localized `Text.*` labels ([`ares_status_texts`]).
+    #[cfg(feature = "ares")]
+    pub ares: Option<&'a AresStatusTexts>,
+}
+
+/// Each SuperWeaponType's localized NameReadiness texts, keyed by its
+/// upper-case section: Preparing, Hold, Ready, Charging, Active; an empty
+/// label resolves to no text.
+#[cfg(feature = "ares")]
+pub(crate) type AresStatusTexts = std::collections::HashMap<String, [String; 5]>;
+
+/// Resolve every type's Ares `Text.*` labels through the shared CSF owner.
+#[cfg(feature = "ares")]
+pub(crate) fn ares_status_texts(
+    rules: &crate::rules::ruleset::RuleSet,
+    text: impl Fn(&str) -> String,
+) -> AresStatusTexts {
+    rules
+        .super_weapons
+        .values()
+        .map(|sw| {
+            let texts = sw.ares_texts();
+            let labels = [
+                texts.preparing(),
+                texts.hold(),
+                texts.ready(),
+                texts.charging(),
+                texts.active(),
+            ];
+            (
+                sw.id.to_ascii_uppercase(),
+                labels.map(|label| {
+                    if label.is_empty() {
+                        String::new()
+                    } else {
+                        text(label)
+                    }
+                }),
+            )
+        })
+        .collect()
 }
 
 /// `SuperClass::NameReadiness6CC2B0` status label; `None` while it has no
 /// status text. Shared by the right cameo strip and the left sidebar button.
+/// Ares's replacement (hook 6CC2B0, Ares.dll 100356A0) returns the type's
+/// `Text.*` label, `Text.Preparing` without a status, and nothing for an
+/// empty label.
 pub(crate) fn superweapon_status_label<'a>(
+    section: Option<&str>,
     display: crate::sim::superweapon::SuperWeaponDisplay,
     labels: CameoStatusLabels<'a>,
 ) -> Option<&'a str> {
     use crate::sim::superweapon::SuperWeaponStatus;
+    #[cfg(feature = "ares")]
+    if let (Some(texts), Some(section)) = (labels.ares, section)
+        && let Some(texts) = texts.get(&section.to_ascii_uppercase())
+    {
+        let text = &texts[match display.status {
+            None => 0,
+            Some(SuperWeaponStatus::Hold) => 1,
+            Some(SuperWeaponStatus::Ready) => 2,
+            Some(SuperWeaponStatus::Charging) => 3,
+            Some(SuperWeaponStatus::Active) => 4,
+        }];
+        return (!text.is_empty()).then_some(text.as_str());
+    }
+    #[cfg(not(feature = "ares"))]
+    let _ = section;
     display.status.map(|status| match status {
         SuperWeaponStatus::Hold => labels.hold,
         SuperWeaponStatus::Ready => labels.ready,
@@ -332,7 +410,7 @@ fn cameo_status_text<'a>(
     labels: CameoStatusLabels<'a>,
 ) -> Option<&'a str> {
     if let Some(display) = item.super_weapon_display {
-        return superweapon_status_label(display, labels);
+        return superweapon_status_label(item.super_weapon_section.as_deref(), display, labels);
     }
     if item.is_ready {
         Some(labels.ready)
@@ -377,6 +455,28 @@ fn shows_queue_badge(item: &crate::ui::sidebar::SidebarItem, structure_badges: b
     // product is something else (`0x006A9C99..0x006A9CC3`).
     counts && (item.queued_count > 1 || (item.queued_count > 0 && !item.is_held_this_type))
 }
+
+/// The top-right badge text: the queue count, or VERA's endless-build mark
+/// (`build_repeat`, Ctrl + left click) after it. The mark is not native.
+fn queue_badge_text(
+    state: &AppState,
+    item: &crate::ui::sidebar::SidebarItem,
+    has_queue_badge: bool,
+) -> Option<String> {
+    if !item.is_superweapon
+        && state
+            .match_state
+            .input
+            .build_repeat
+            .is_repeating(&item.type_id)
+    {
+        return Some(format!("{}{}", item.queued_count, ENDLESS_BUILD_MARK));
+    }
+    has_queue_badge.then(|| item.queued_count.to_string())
+}
+
+/// Shown after the queue count of a type that builds endlessly.
+const ENDLESS_BUILD_MARK: &str = "+";
 
 /// Whether a status label sits at the cameo's left edge instead of centered.
 ///
@@ -686,13 +786,19 @@ pub(crate) fn build_sidebar_cameo_instances(
         if let Some(status_text) = cameo_status_text(item, labels)
             && state.renderer.bit_font.darken_texture().is_some()
         {
-            let text_w = state.renderer.bit_font.text_width(status_text) as f32;
+            let font = &state.renderer.bit_font;
+            let shifts_left = status_text_shifts_left(item, has_queue_badge);
+            let badge = shifts_left
+                .then(|| queue_badge_text(state, item, has_queue_badge))
+                .flatten();
+            let fit = status_label_fit(font, status_text, slot.w, badge.as_deref());
+            let text_w = font.fitted(fit, |font| font.text_width(status_text)) as f32;
             let strip_w = text_w + READY_PAD_X * 2.0;
             // gamemd `ComputeTextRect` uses `cell_height + 2*y_pad` for the
             // strip height (cell_height includes the 1 px inter-line gap that
             // gamemd extends below the glyphs).
-            let strip_h = state.renderer.bit_font.cell_height() + READY_PAD_Y * 2.0;
-            let strip_x = if status_text_shifts_left(item, has_queue_badge) {
+            let strip_h = font.cell_height() + READY_PAD_Y * 2.0;
+            let strip_x = if shifts_left {
                 slot.x + co[0]
             } else {
                 slot.x + (slot.w - strip_w) * 0.5 + co[0]
@@ -717,8 +823,9 @@ pub(crate) fn build_sidebar_cameo_instances(
         // Dark strip overlay behind queue count badge (top-right, same alpha as Ready strip).
         // Original: ComputeTextRect(cameo_x+60, cameo_y+1, 0x242, x_pad=2, y_pad=1)
         // The dark rect extends x_pad (2px) past the cameo right edge.
-        if has_queue_badge && state.renderer.bit_font.darken_texture().is_some() {
-            let count_str = format!("{}", item.queued_count);
+        if let Some(count_str) = queue_badge_text(state, item, has_queue_badge)
+            && state.renderer.bit_font.darken_texture().is_some()
+        {
             let text_w = state.renderer.bit_font.text_width(&count_str) as f32;
             let strip_w = text_w + QUEUE_COUNT_PAD_X * 2.0;
             let strip_h = state.renderer.bit_font.cell_height() + QUEUE_COUNT_PAD_Y * 2.0;
@@ -788,8 +895,14 @@ pub(crate) fn build_sidebar_text_instances(
         // Only the Hold label moves to the left edge, and only beside a queue
         // badge; see `status_text_shifts_left`.
         if let Some(status_text) = cameo_status_text(item, labels) {
-            let text_w = state.renderer.bit_font.text_width(status_text) as f32;
-            let text_x = if status_text_shifts_left(item, has_queue_badge) {
+            let font = &state.renderer.bit_font;
+            let shifts_left = status_text_shifts_left(item, has_queue_badge);
+            let badge = shifts_left
+                .then(|| queue_badge_text(state, item, has_queue_badge))
+                .flatten();
+            let fit = status_label_fit(font, status_text, slot.w, badge.as_deref());
+            let text_w = font.fitted(fit, |font| font.text_width(status_text)) as f32;
+            let text_x = if shifts_left {
                 slot.x + READY_PAD_X
             } else {
                 slot.x + (slot.w - text_w) * 0.5
@@ -802,22 +915,15 @@ pub(crate) fn build_sidebar_text_instances(
             } else {
                 &mut instances
             };
-            glyphs.extend(state.renderer.bit_font.build_text(
-                status_text,
-                text_x,
-                text_y,
-                1.0,
-                0.00042,
-                ready_tint,
-                co,
-            ));
+            glyphs.extend(font.fitted(fit, |font| {
+                font.build_text(status_text, text_x, text_y, 1.0, 0.00042, ready_tint, co)
+            }));
         }
 
         // Queue count badge — right-aligned at top-right of cameo.
         // Original: ComputeTextRect(cameo_x+60, cameo_y+1, 0x242, 2, 1)
         // 0x242 = right-align. Uses same side-dependent color as Ready text.
-        if has_queue_badge {
-            let count_str = format!("{}", item.queued_count);
+        if let Some(count_str) = queue_badge_text(state, item, has_queue_badge) {
             let text_w = state.renderer.bit_font.text_width(&count_str) as f32;
             // Right-align: text right edge at cameo right edge (anchor = cameo_x + 60).
             let text_x = slot.x + slot.w - text_w;
@@ -1024,6 +1130,8 @@ mod tests {
             hold: "On Hold",
             charging: "Charging",
             active: "Firestorm On",
+            #[cfg(feature = "ares")]
+            ares: None,
         };
         let display = SuperWeaponDisplay {
             stage: 0,
@@ -1084,9 +1192,78 @@ mod tests {
         assert_eq!(super::cameo_status_text(&item, labels), None);
     }
 
+    /// A status label wider than its cameo squeezes onto it, also clear of a
+    /// queue badge beside it; one that fits keeps its width.
+    #[test]
+    fn a_long_status_label_squeezes_onto_its_cameo_beside_the_badge() {
+        use super::{QUEUE_COUNT_PAD_X, READY_PAD_X, status_label_fit};
+        use crate::render::bit_font::Fit;
+        let font = crate::render::bit_font::tests::make_vector_test_font();
+        let text = "[Ôñ Ĥöļð ~~~~~~~~]";
+        let natural = font.text_width(text) as f32;
+        let fits = natural + READY_PAD_X * 2.0;
+        assert_eq!(status_label_fit(&font, text, fits, None), Fit::NONE);
+        let slot_w = natural * 0.9 + READY_PAD_X * 2.0;
+        for badge in [None, Some("3")] {
+            let fit = status_label_fit(&font, text, slot_w, badge);
+            let badge_w = badge.map_or(0.0, |badge| {
+                font.text_width(badge) as f32 + QUEUE_COUNT_PAD_X
+            });
+            let width = font.fitted(fit, |font| font.text_width(text)) as f32;
+            assert!(fit > Fit::NONE, "{badge:?}");
+            assert!(
+                width <= slot_w - READY_PAD_X * 2.0 - badge_w,
+                "{badge:?}: {width}"
+            );
+        }
+    }
+
     /// The cameo status slot carries `TXT_HOLD` for suspended production, the
     /// same way it carries `TXT_READY` for a placement-ready building. Before
     /// this, a held or unaffordable item looked identical to an idle one.
+    /// Ares NameReadiness (hook 6CC2B0, 100356A0): per-type `Text.*`,
+    /// Text.Preparing without a status, nothing for an empty label.
+    #[cfg(feature = "ares")]
+    #[test]
+    fn ares_status_label_reads_the_type_texts() {
+        use super::{CameoStatusLabels, ares_status_texts, superweapon_status_label};
+        use crate::sim::superweapon::{SuperWeaponDisplay, SuperWeaponStatus as S};
+        let rules =
+            crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
+                "[SuperWeaponTypes]\n0=Sonar\n[Sonar]\nText.Preparing=TXT_WAIT\n\
+                 Text.Hold=\nText.Ready=TXT_GO\n",
+            ))
+            .unwrap();
+        let texts = ares_status_texts(&rules, |label| format!("<{label}>"));
+        let labels = CameoStatusLabels {
+            ready: "Ready",
+            hold: "On Hold",
+            charging: "Charging",
+            active: "Active",
+            ares: Some(&texts),
+        };
+        let label = |section, status| {
+            let display = SuperWeaponDisplay {
+                stage: 0,
+                draw_progress: true,
+                status,
+            };
+            superweapon_status_label(section, display, labels)
+        };
+        assert_eq!(label(Some("sonar"), None), Some("<TXT_WAIT>"));
+        assert_eq!(label(Some("Sonar"), Some(S::Ready)), Some("<TXT_GO>"));
+        assert_eq!(
+            label(Some("Sonar"), Some(S::Hold)),
+            Some("<TXT_HOLD>"),
+            "an empty read keeps the constructor label"
+        );
+        assert_eq!(
+            label(Some("Sonar"), Some(S::Active)),
+            Some("<TXT_FIRESTORM_ON>")
+        );
+        assert_eq!(label(Some("Other"), Some(S::Ready)), Some("Ready"));
+    }
+
     #[test]
     fn cameo_status_text_covers_ready_and_hold() {
         use super::{CameoStatusLabels, cameo_status_text};
@@ -1095,6 +1272,8 @@ mod tests {
             hold: "On Hold",
             charging: "Charging",
             active: "Active",
+            #[cfg(feature = "ares")]
+            ares: None,
         };
 
         let mut item = crate::ui::sidebar::SidebarItem {

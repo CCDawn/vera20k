@@ -104,6 +104,9 @@ mod scatter;
 #[cfg(test)]
 pub(crate) use infantry_scatter::answered_process;
 pub(crate) use scatter::{DamageRetaliation, ScatterFlags};
+mod burrowing;
+#[cfg(test)]
+mod burrowing_tests;
 mod scatter_cell;
 pub mod slope_transition;
 mod track_continuation;
@@ -114,6 +117,10 @@ mod track_host;
 mod track_path;
 pub(crate) use track_path::SetterForceReassign;
 pub mod track_process;
+pub mod tunnel_movement;
+mod tunnel_process;
+#[cfg(test)]
+mod tunnel_tests;
 mod track_speed;
 pub(crate) mod track_turn;
 mod walk_admission;

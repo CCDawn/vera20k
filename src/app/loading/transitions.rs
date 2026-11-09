@@ -205,6 +205,8 @@ pub(crate) fn install_world_presentation(
 
     state.match_state.match_presentation.tile_atlas = assets.tile_atlas;
     state.match_state.match_presentation.building_zshape = assets.building_zshape;
+    // Growths prepared against the outgoing atlases never publish into these.
+    state.match_state.match_presentation.atlas_growth.cancel();
     state.match_state.match_presentation.unit_atlas = assets.unit_atlas;
     // Both voxel caches resolve model images through the replaced RuleSet.
     *state.renderer.vxl_pose_frame_cache.borrow_mut() = Default::default();
@@ -252,17 +254,27 @@ pub(crate) fn install_world_presentation(
         }
     }
     // GAME.FNT is process artwork, so retain the established process fallback
-    // when optional font preparation did not produce a replacement.
-    if let Some(ref fnt) = assets.fnt_file {
-        state.renderer.bit_font = crate::render::bit_font::BitFont::from_fnt(
+    // when optional font preparation did not produce a replacement, and keep
+    // the font itself, with the text it has laid out and drawn, when the
+    // scenario read the same bytes: a new font would build GAME.FNT's
+    // outline faces again (`FntFont::build`) and draw every glyph into an
+    // empty atlas.
+    if let Some(ref fnt) = assets.fnt_file
+        && !state.renderer.bit_font.is_built_from(fnt)
+    {
+        let mut font = crate::render::bit_font::BitFont::from_fnt(
             &state.renderer.gpu.device,
             &state.renderer.gpu.queue,
             &state.renderer.batch_renderer,
             fnt,
         );
+        font.inherit_settings(&state.renderer.bit_font);
+        state.renderer.bit_font = font;
     }
 
     // The final sidebar projection resolves incoming side/radar authority.
+    // `RadarClass::Init_Clear @ 0x00652DE0` starts each scenario offline at
+    // frame 0, outside any movie mode, with TacticalMapAvailable clear.
     state.match_state.match_presentation.radar_anim = None;
     state.match_state.match_presentation.radar_animation_source = None;
     state.match_state.match_presentation.radar_content_insets = None;
@@ -364,6 +376,29 @@ pub(crate) fn install_world_presentation(
             rules,
         );
     }
+    // Ares `IvanBomb.Image` SHPs, retained once per match like the
+    // WeaponTypeExt's SHPStruct pointers.
+    #[cfg(feature = "ares")]
+    if let Some(assets) = state.process_assets.manager()
+        && let Some(rules) = state
+            .match_state
+            .sim_runtime
+            .as_ref()
+            .map(|runtime| &runtime.resources.rules)
+        && let Some(overlay) = state
+            .match_state
+            .match_presentation
+            .selection_overlay
+            .as_mut()
+    {
+        overlay.load_ares_bomb_images(
+            &state.renderer.gpu.device,
+            &state.renderer.gpu.queue,
+            &state.renderer.batch_renderer,
+            assets,
+            rules,
+        );
+    }
     // Phobos placement preview strips embed the active theater's palette and
     // the local house colour; a map load invalidates them.
     #[cfg(feature = "phobos")]
@@ -424,7 +459,12 @@ pub(crate) fn install_world_presentation(
         // is set. It belongs to this same tactical source, not a sprite atlas.
         let fog = crate::assets::shp_file::ShpFile::from_bytes(assets.get_ref("fog.shp")?).ok()?;
         let (frames, width, height) = crate::render::shroud_buffer::extract_shp_brightness(&fog);
-        buffer.install_fog_frames(frames, [width, height]);
+        buffer.install_fog_frames(
+            &state.renderer.gpu.device,
+            &state.renderer.gpu.queue,
+            frames,
+            [width, height],
+        );
         Some(buffer)
     });
     state.match_state.match_presentation.shroud_buffer = shroud_buffer;
@@ -614,6 +654,12 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
         .match_presentation
         .sidebar_projection
         .reset_cameo_seed();
+    let owner = state.match_state.local_player_owner().map(str::to_owned);
+    state
+        .match_state
+        .match_presentation
+        .sidebar_projection
+        .start_scenario_credits_counter(owner.as_deref());
     if let Some(runtime) = state.match_state.sim_runtime.as_mut() {
         runtime
             .simulation
@@ -647,12 +693,18 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
     );
     state.match_state.input.reset_targeting_for_new_world();
     state.match_state.match_presentation.active_sidebar_tab = SidebarTab::default_active_tab();
-    state.match_state.match_presentation.message_list = crate::ui::messages::MessageList::new(
-        3,
-        0,
-        crate::ui::messages::MESSAGE_MAX_VISIBLE_RETAIL,
-        0,
-    );
+    // Read_Scenario's Init (`0x00684AC9`). Start_Scenario then changes video
+    // mode when the game size differs from the shell's (`0x00683DB8..0x00683DF3`):
+    // Change_Video_Mode's Set_View_Dimensions (`0x005610EC`) Inits the empty
+    // list again and SetWidth leaves it 6 px wider. VERA's match takes the
+    // window's size, so a match frame other than the 800x600 shell stands for
+    // that switch.
+    let mut message_list = crate::ui::messages::MessageList::scenario();
+    let shell = crate::app::persistence::options_profile::RETAIL_SHELL_SIZE;
+    if (state.render_width(), state.render_height()) != (shell.width, shell.height) {
+        message_list.set_width(tactical_width as i32);
+    }
+    state.match_state.match_presentation.message_list = message_list;
     state.match_state.match_presentation.chat = Default::default();
     // Clear_Scene6851F0 -> 534450 resets BeaconManagerClass (53499B).
     // Display Init_Clear4A88C0 clears +11B0..+11B2, not beacon mode +11B4.
@@ -663,6 +715,10 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
     state.match_state.input.cursor_x = tactical_width as f32 * 0.5;
     state.match_state.input.cursor_y = tactical_height as f32 * 0.5;
     state.platform.frame_pacer.reset_for_new_world();
+    state
+        .match_state
+        .network_quality
+        .reset(state.platform.frame_pacer.total_render_deferrals());
     state.match_state.input.queued_order_mode = render::OrderMode::Move;
     state.match_state.match_audio.reset_for_new_match();
     state.match_state.sandbox_full_visibility = result.scenario.sandbox_full_visibility;
@@ -782,7 +838,7 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
         Err(err) => {
             state.match_state.startup.clear();
             state.frontend.screen = GameScreen::MissionResult {
-                title: "Startup Rejected".to_string(),
+                title: crate::i18n::tr("VERA:StartupRejected"),
                 detail: err.clone(),
             };
             log::error!("Scenario installation rejected startup: {err}");

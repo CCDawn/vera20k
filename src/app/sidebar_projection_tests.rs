@@ -192,6 +192,43 @@ fn only_a_changed_view_moves_the_view_revision() {
     assert_ne!(projection.view_revision(), second);
 }
 
+/// The per-pass gadget refresh keeps a view built from the same inputs,
+/// strips and Factory links; a change to any of them builds it again.
+#[test]
+fn a_built_view_holds_only_while_its_inputs_and_strips_hold() {
+    use super::sidebar_projection::{SidebarSimInputs, SidebarViewInputs};
+    use std::sync::Arc;
+    let rules = RuleSet::from_ini_with_fixed_art_for_test(
+        &crate::sim::arena_fixture::clear_ground_ini("[Countries]\n0=Americans\n"),
+        &crate::rules::ini_parser::IniFile::empty(),
+    )
+    .unwrap();
+    let (sim, owner) = world(&rules, &[]);
+    let options = all_build_options_for_owner(&sim, &rules, "Americans");
+    let mut projection = SidebarProjectionState::default();
+    projection.reconcile_fixture(owner, &[], 4);
+    let kept = projection.sim_inputs(&sim, &rules, "Americans", true);
+    let inputs = |sim: &Arc<SidebarSimInputs>, tab| SidebarViewInputs {
+        spec: SidebarChromeLayoutSpec::stock(),
+        screen: (800.0, 600.0),
+        tab,
+        credits: 50_000,
+        sim: Arc::clone(sim),
+        button_sizes: [None; 7],
+        armed: None,
+        supers: Vec::new(),
+        gadgets: SidebarGadgetState::new(),
+    };
+    let drawn = view(&sim, &options, &projection, SidebarTab::Building, 600.0);
+    projection.replace_built_view(drawn, inputs(&kept, SidebarTab::Building));
+    assert!(projection.view_holds_for(&inputs(&kept, SidebarTab::Building)));
+    assert!(!projection.view_holds_for(&inputs(&kept, SidebarTab::Defense)));
+    let derived = projection.sim_inputs(&sim, &rules, "Americans", false);
+    assert!(!projection.view_holds_for(&inputs(&derived, SidebarTab::Building)));
+    projection.set_scroll_row(SidebarTab::Building, 1);
+    assert!(!projection.view_holds_for(&inputs(&kept, SidebarTab::Building)));
+}
+
 fn view(
     sim: &Simulation,
     options: &[BuildOption],
@@ -505,6 +542,10 @@ fn trigger_duplicate_type_keeps_selected_cameo_kind_through_sidebar_projection()
     );
 }
 
+// The native insertion order and top row: Ares 3.0 inserts at its own
+// lower bound (1002C2D0, hook 0x6A8710) and keeps the top cameo row after
+// a removal (1002C660, hook 0x6AA600); see docs/ares-sidebar-ui-hooks.md.
+#[cfg(not(feature = "ares"))]
 #[test]
 fn trigger_cameo_flash_reaches_view_and_survives_projection_save_lifecycle() {
     let native: Value = serde_json::from_str(crate::test_fixture::text(
@@ -590,6 +631,10 @@ fn trigger_cameo_flash_reaches_view_and_survives_projection_save_lifecycle() {
     );
 }
 
+// The native insertion order and top row: Ares 3.0 inserts at its own
+// lower bound (1002C2D0, hook 0x6A8710) and keeps the top cameo row after
+// a removal (1002C660, hook 0x6AA600); see docs/ares-sidebar-ui-hooks.md.
+#[cfg(not(feature = "ares"))]
 #[test]
 fn original_post_removal_scroll_reaches_view_and_hit_test() {
     let corpus: Value = serde_json::from_str(crate::test_fixture::text(
@@ -702,6 +747,10 @@ fn production_projection_uses_rule_side_category_flags_and_csf_utf16_inputs() {
     assert_eq!(compared, 26 * 26);
 }
 
+// The native insertion order and top row: Ares 3.0 inserts at its own
+// lower bound (1002C2D0, hook 0x6A8710) and keeps the top cameo row after
+// a removal (1002C660, hook 0x6AA600); see docs/ares-sidebar-ui-hooks.md.
+#[cfg(not(feature = "ares"))]
 #[test]
 fn native_order_reaches_localized_views_scrolling_and_click_identity() {
     let (sim, rules, owner, csf, expected) = native_history_world();

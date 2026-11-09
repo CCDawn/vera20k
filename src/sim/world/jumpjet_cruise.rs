@@ -109,6 +109,13 @@ impl JumpjetFlightHost for CruiseHost<'_> {
     fn is_object_alive(&self) -> bool {
         self.owner().is_object_alive()
     }
+    fn has_installed_jumpjet(&self) -> bool {
+        self.sim
+            .substrate
+            .entities
+            .get(self.stable_id)
+            .is_some_and(jumpjet_locomotor)
+    }
     fn visibility_tail(&mut self, runtime: &mut JumpjetRuntime) {
         let id = self.stable_id;
         // 0x0054B07D..0x0054B10C: the owner test compares PlayerPtr directly.
@@ -121,6 +128,9 @@ impl JumpjetFlightHost for CruiseHost<'_> {
             runtime.with_owner_call(self.sim, id, |sim| {
                 sim.discover_techno(id, player, context);
             });
+            if !self.has_installed_jumpjet() {
+                break;
+            }
         }
     }
     /// `Object+0x74`, Marked.
@@ -460,6 +470,20 @@ impl JumpjetFlightHost for CruiseHost<'_> {
         self.owner().landing_for_deploy()
     }
     fn deploy_facing(&self) -> Option<u16> {
+        // Ares 3.0 JumpjetLocomotionClass_State4_54C550_DeployDir (100499F0,
+        // hook 0x54C767): only a type with a `DeployingAnim=` turns, to its
+        // own `DeployDir` (eighth turns, << 13) when set.
+        #[cfg(feature = "ares")]
+        {
+            let object = self
+                .sim
+                .interner
+                .object_type(self.owner().type_ref(), self.rules)?;
+            object.deploying_anim.as_ref()?;
+            if let Some(dir) = object.techno_combat().movement().deploy_dir() {
+                return Some(u16::from(dir) << 13);
+            }
+        }
         Some(u16::from(self.rules.general.deploy_dir as u8) << 8)
     }
     fn touchdown(&mut self, runtime: &mut JumpjetRuntime) -> bool {
@@ -504,7 +528,13 @@ impl JumpjetFlightHost for CruiseHost<'_> {
             self.release_air_slot_at(here);
         }
         self.sim.substrate.aircraft_tracker_remove(id);
-        true
+        // A callback above can end a Magnetron lift: Change House reaches
+        // Foot Enter_Idle_Mode's End_Piggyback (0x004D8347..0x004D8373) and
+        // the Drive returns. gamemd crashes on this path: the released
+        // Jumpjet's destructor zeroes its owner (0x0055A6FD) and
+        // State4_Descend reads through it at 0x0054C8FD. VERA takes the Foot
+        // out of the air, as above, and ends the landing here.
+        self.has_installed_jumpjet()
     }
     fn finish_touchdown(&mut self, runtime: &mut JumpjetRuntime) {
         let id = self.stable_id;
@@ -520,6 +550,9 @@ impl JumpjetFlightHost for CruiseHost<'_> {
         runtime.with_owner_call(self.sim, id, |sim| {
             let _ = sim.pickup_crate_at(id, here, rules, registry, frame_effects);
         });
+        if !self.has_installed_jumpjet() {
+            return;
+        }
         let deploy_to_land = self.owner_kind() == FlightOwnerKind::Unit && self.type_flag_6ad();
         let owner = self.sim.substrate.entities.get_mut(id).unwrap();
         owner.lift.allow_end();
@@ -674,7 +707,7 @@ impl Simulation {
     /// shrouded on its map (`MapClass::IsShrouded @ 0x00586360`). So an enemy
     /// jumpjet flying into ground the player has mapped is discovered there;
     /// a Jumpjet's PerCell runs only at touchdown. Outside a campaign a Cell
-    /// put (`0x0047E953..0x0047E9DC`, [`Self::discover_cell_put_object`]) has
+    /// put (`0x0047E953..0x0047E9DC`, [`Self::discover_by_player`]) has
     /// already discovered every object it puts down, so the probe only acts
     /// in a campaign. Answers the player when the probe discovers.
     fn jumpjet_discovery_due(&self, id: u64) -> Vec<crate::sim::intern::InternedId> {
@@ -807,9 +840,9 @@ impl Simulation {
             }
             let ended_cruise =
                 entry_state == STATE_TRANSLATE && matches!(state, STATE_HOLD | STATE_DESCEND);
-            let entity = host.sim.substrate.entities.get_mut(stable_id).unwrap();
             if host.crash_latched
-                && entity.category() == EntityCategory::Infantry
+                && host.has_installed_jumpjet()
+                && host.owner_kind() == FlightOwnerKind::Infantry
                 && let Err(cause) = host.sim.infantry_do_action(
                     stable_id,
                     crate::sim::movement::infantry_action::DO_AIR_DEATH_START,
@@ -1042,6 +1075,21 @@ mod tests {
             e.air_spatial_bucket().is_some(),
             "the landing did not remove its tracker"
         );
+    }
+
+    #[test]
+    fn a_jumpjet_callback_can_remove_its_owner() {
+        let mut sim = hovering_jumpjet(0x40);
+        let result = sim.with_jumpjet_process(1, |runtime, sim| {
+            runtime.with_owner_call(sim, 1, |sim| {
+                sim.uninit(1);
+                sim.process_pending_delete();
+                "callback completed"
+            })
+        });
+
+        assert_eq!(result, Some("callback completed"));
+        assert!(sim.substrate.entities.get(1).is_none());
     }
 
     /// Supplied flags exercise each native54C905 gate independently; zero HP

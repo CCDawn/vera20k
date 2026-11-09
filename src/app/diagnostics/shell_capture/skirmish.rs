@@ -17,13 +17,13 @@ pub(crate) enum PresentedShell {
     Campaign,
     LoadSavedGame,
     Options,
-    NetworkOptions,
     LanLobby,
     NetworkSetup,
     WolWelcome,
     WolLogin,
     WolLobby,
     WolOptions,
+    WolChatTranslation,
     WolSoundOptions,
     WolAutoLoginQuery,
     WolLocale,
@@ -757,8 +757,12 @@ impl SkirmishCapture {
         let id = SkirmishComboId::AiType(1);
         let layout =
             crate::ui::skirmish_shell::compute_layout(state.render_width(), state.render_height());
-        let face = crate::ui::skirmish_shell::combo_rect(&layout, id)
-            .context("AI row 2 has no type combo")?;
+        let face = crate::ui::skirmish_shell::combo_rect(
+            &layout,
+            &state.frontend.skirmish_shell_state,
+            id,
+        )
+        .context("AI row 2 has no type combo")?;
         Self::set_pointer(
             state,
             (

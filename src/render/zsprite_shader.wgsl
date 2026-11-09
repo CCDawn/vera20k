@@ -61,7 +61,7 @@ struct VertexOutput {
     @location(9) @interpolate(flat) z_gradient: u32,
     @location(10) @interpolate(flat) zshape_origin: vec2f,
     @location(11) @interpolate(flat) palette_light: vec4u,
-    // Only vs_read_only supplies an ordered destination command ordinal.
+    // Only vs_ordinal supplies an ordered destination command ordinal.
     @location(12) @interpolate(flat) command_ordinal: u32,
     @location(13) @interpolate(flat) source_palette: u32,
 };
@@ -112,7 +112,7 @@ fn vs_main(@builtin(vertex_index) idx: u32, instance: Instance) -> VertexOutput 
 // The first vertex carries command sequence, independently of instance index:
 // draw(ordinal*6..ordinal*6+6, original_instance..original_instance+1).
 @vertex
-fn vs_read_only(@builtin(vertex_index) idx: u32, instance: Instance) -> VertexOutput {
+fn vs_ordinal(@builtin(vertex_index) idx: u32, instance: Instance) -> VertexOutput {
     var output = shp_vertex(idx % 6u, instance);
     output.command_ordinal = idx / 6u + 1u;
     return output;
@@ -196,10 +196,7 @@ struct FragOutput {
 @fragment
 fn fs_main(input: VertexOutput) -> FragOutput {
     let index: u32 = textureLoad(source_indices, source_texel(input.uv), 0).r;
-    var color: vec4f = textureSample(t_sprite, s_sprite, input.uv);
-    if (input.source_palette != 0u) {
-        color = indexed_color(index, input.source_palette);
-    }
+    let color = sampled_source_color(input.uv, index, input.source_palette);
     if (color.a < 0.01) {
         discard;
     }

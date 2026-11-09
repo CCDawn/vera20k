@@ -9,7 +9,9 @@
 
 use crate::app::AppState;
 use crate::app::input::cursor::CursorVisibility;
-use crate::app::input::gadget_input::{ID_SCROLL_DOWN, ID_SCROLL_UP, ID_TAB_BASE};
+use crate::app::input::gadget_input::{
+    ID_DIPLOMACY, ID_OPTIONS, ID_SCROLL_DOWN, ID_SCROLL_UP, ID_TAB_BASE,
+};
 use crate::app::presentation::sidebar_render::{
     current_sidebar_side, current_sidebar_theme, current_sidebar_view,
 };
@@ -18,7 +20,7 @@ use crate::map::entities::EntityCategory;
 use crate::render::batch::SpriteInstance;
 use crate::ui::game_screen::GameScreen;
 use crate::ui::sidebar::SidebarView;
-use crate::ui::tooltips::{TipRect, TipRegion};
+use crate::ui::tooltips::{TipRect, TipRegion, TooltipService};
 
 /// In-game tip ids mirror the gamemd id space: button ids as-is, cameo slots
 /// at 1000+.
@@ -99,18 +101,52 @@ pub(crate) fn on_mouse_move(state: &mut AppState) {
         return;
     }
     let (x, y) = state.match_state.input.cursor_px();
-    if state.frontend.screen == GameScreen::InGame && state.match_state.input.cursor_coordinates {
+    let in_game = state.frontend.screen == GameScreen::InGame;
+    if in_game && state.match_state.input.cursor_coordinates {
         // Native724200 resolves the current region/text at the mouse move,
         // including ordinary sidebar tips while the coordinate toggle is on.
-        sync_in_game_regions(state);
+        sync_in_game_regions(state, TextDemand::At(x, y));
         state
             .match_state
             .match_presentation
             .tooltips
             .on_mouse_move_immediate(x, y, now);
     } else {
+        // A zero delay (a highlighted cameo) takes the same immediate path:
+        // the region the move enters shows its text resolved at the move.
+        if in_game
+            && state
+                .match_state
+                .match_presentation
+                .tooltips
+                .shows_on_move()
+        {
+            sync_in_game_regions(state, TextDemand::At(x, y));
+        }
         let tips = &mut state.match_state.match_presentation.tooltips;
         tips.on_mouse_move(x, y, now);
+    }
+}
+
+/// Which regions' text a sync resolves. The service reads only the visible
+/// tip's text and, at a show, that of the region it hits, so the rest stays
+/// empty: no pick or CSF format runs for a tip nobody reads.
+#[derive(Clone, Copy)]
+enum TextDemand {
+    /// The per-frame pump at this time ([`TooltipService::pass_reads_text`]).
+    Pass(u64),
+    /// A move that shows at once at this cursor point, and the visible tip.
+    At(i32, i32),
+}
+
+impl TextDemand {
+    fn reads(self, tips: &TooltipService, id: u32, rect: TipRect) -> bool {
+        match self {
+            Self::Pass(now_ms) => tips.pass_reads_text(id, rect, now_ms),
+            Self::At(x, y) => {
+                rect.contains_inclusive(x, y) || tips.active().is_some_and(|tip| tip.id == id)
+            }
+        }
     }
 }
 
@@ -128,7 +164,7 @@ pub(crate) fn update(state: &mut AppState) -> u64 {
         && !state.match_state.paused()
         && state.frontend.keyboard_dialog.is_none()
     {
-        sync_in_game_regions(state);
+        sync_in_game_regions(state, TextDemand::Pass(now));
     } else {
         state
             .match_state
@@ -291,7 +327,16 @@ fn tactical_world_tip_text_sampled(
                     crate::assets::csf_file::type_ui_name(disguise.ui_name.as_deref(), csf)
                 });
         }
-        // BuildingClass::GetUIName @459ED0 returns actual Type+60.
+        // BuildingClass::GetUIName @459ED0 returns actual Type+60. Ares
+        // BuildingClass_GetUIName (10015DA0, hook 0x459ED0) shows a player
+        // its owner does not count as an ally the type's EnemyUIName, unless
+        // the building's DisplayProductionTo holds that player.
+        #[cfg(feature = "ares")]
+        EntityCategory::Structure
+            if let Some(label) = ares_enemy_ui_name(sim, entity, object, viewer) =>
+        {
+            return crate::assets::csf_file::type_ui_name(Some(label), csf);
+        }
         EntityCategory::Structure | EntityCategory::Infantry => {}
         // Aircraft41C1D0 returns its actual Type+60 directly, without a
         // disguise, dock or flight-state name branch. Keep the same picker
@@ -328,6 +373,29 @@ fn tactical_world_tip_text_sampled(
         }
     }
     crate::assets::csf_file::type_ui_name(object.ui_name.as_deref(), csf)
+}
+
+/// Ares BuildingClass_GetUIName (10015DA0, hook 0x459ED0): the type's
+/// `EnemyUIName` for a `viewer` the building's owner does not count as an
+/// ally, unless its DisplayProductionTo holds the viewer; `None` keeps the
+/// type's own name.
+#[cfg(feature = "ares")]
+fn ares_enemy_ui_name<'r>(
+    sim: &crate::sim::world::Simulation,
+    entity: &crate::sim::game_entity::GameEntity,
+    object: &'r crate::rules::object_type::ObjectType,
+    viewer: crate::sim::intern::InternedId,
+) -> Option<&'r str> {
+    object.enemy_ui_name().filter(|_| {
+        entity.owner() != viewer
+            && !crate::sim::combat::combat_weapon::is_ally_by_object(
+                Some(sim.house_alliances()),
+                sim.interner(),
+                entity.owner(),
+                viewer,
+            )
+            && !entity.shows_production_to(viewer)
+    })
 }
 
 /// `UnitClass::GetUIName @ 0x00746B20`'s turret formatter
@@ -511,17 +579,47 @@ fn superweapon_money_tip(money_format: Option<&str>, name: &str, amount: i32) ->
     }
 }
 
+/// `RadarClass` slot +0x88 @ 0x00654320 registers the two radar-top buttons
+/// with a CSF label: 0xF2 `Tip:BriefingButton` while GameMode is 0, else
+/// `Tip:DiplomacyButton`, and 0xF3 `Tip:OptionsButton`. A labelled tip is
+/// loaded straight from the string table (ToolTipManager::Process 0x00724AE0),
+/// so neither gets the sidebar's `Tip:Disabled` suffix. The radar's own
+/// `GetTooltipText @ 0x00658770` only forwards to DisplayClass's.
+fn radar_button_tip_labels(game_mode_nonzero: bool) -> [(u16, &'static str); 2] {
+    let diplomacy = if game_mode_nonzero {
+        "Tip:DiplomacyButton"
+    } else {
+        "Tip:BriefingButton"
+    };
+    [(ID_DIPLOMACY, diplomacy), (ID_OPTIONS, "Tip:OptionsButton")]
+}
+
+fn sync_in_game_regions(state: &mut AppState, demand: TextDemand) {
+    let regions = in_game_regions(state, demand);
+    state
+        .match_state
+        .match_presentation
+        .tooltips
+        .sync_regions(&regions);
+}
+
 /// Sidebar regions, mirroring the native registration set: tabs and scroll
 /// arrows from their `Tip:*` labels (with the disabled suffix), repair/sell
-/// from direct CSF keys, cameos through the money format.
-fn sync_in_game_regions(state: &mut AppState) {
-    let Some(view) = current_sidebar_view(state).cloned() else {
-        state
-            .match_state
-            .match_presentation
-            .tooltips
-            .sync_regions(&[]);
-        return;
+/// from direct CSF keys, cameos through the money format. Only the text
+/// `demand` reads is resolved.
+fn in_game_regions(state: &AppState, demand: TextDemand) -> Vec<TipRegion> {
+    let Some(view) = current_sidebar_view(state) else {
+        return Vec::new();
+    };
+    let tips = &state.match_state.match_presentation.tooltips;
+    let region = |id: u32, rect: TipRect, text: &dyn Fn() -> String| TipRegion {
+        id,
+        rect,
+        text: if demand.reads(tips, id, rect) {
+            text()
+        } else {
+            String::new()
+        },
     };
     let frame = state.sidebar_frame();
     let cursor = state.match_state.input.cursor_visibility;
@@ -530,11 +628,11 @@ fn sync_in_game_regions(state: &mut AppState) {
     // dynamic region500. CursorCheat537EF0 toggles its coordinate text at
     // 4AE580, before the ordinary object/shroud tooltip lookup.
     let (x, y, width, height) = crate::app::input::camera::tactical_viewport_px(state);
-    regions.push(TipRegion {
-        id: 500,
-        rect: TipRect::new(x as i32, y as i32, width as i32, height as i32),
-        text: dynamic_tip_text(cursor, || tactical_tip_text(state)),
-    });
+    regions.push(region(
+        500,
+        TipRect::new(x as i32, y as i32, width as i32, height as i32),
+        &|| dynamic_tip_text(cursor, || tactical_tip_text(state)),
+    ));
     // Power meter first: gamemd asks the power bar for a tip before the
     // sidebar gadget ids, and registration order decides the hit here.
     // Gadget idle republishes these retained House values each unlocked pump.
@@ -542,95 +640,110 @@ fn sync_in_game_regions(state: &mut AppState) {
         &view.layout,
         state.match_state.match_presentation.sidebar_layout_spec,
     );
-    let power_text = dynamic_tip_text(cursor, || {
-        state
-            .process_assets
-            .csf
-            .as_ref()
-            .map(|csf| {
-                format_csf(
-                    csf.text(TIP_LABEL_POWER_DRAIN).as_ref(),
-                    &[
-                        CsfArg::Int(i64::from(view.power_produced)),
-                        CsfArg::Int(i64::from(view.power_drained)),
-                    ],
-                )
-            })
-            .unwrap_or_default()
-    });
-    regions.push(TipRegion {
-        id: ID_POWER_TIP,
-        rect: tip_rect(frame, power_rect),
-        text: power_text,
-    });
+    regions.push(region(ID_POWER_TIP, tip_rect(frame, power_rect), &|| {
+        dynamic_tip_text(cursor, || {
+            state
+                .process_assets
+                .csf
+                .as_ref()
+                .map(|csf| {
+                    format_csf(
+                        csf.text(TIP_LABEL_POWER_DRAIN).as_ref(),
+                        &[
+                            CsfArg::Int(i64::from(view.power_produced)),
+                            CsfArg::Int(i64::from(view.power_drained)),
+                        ],
+                    )
+                })
+                .unwrap_or_default()
+        })
+    }));
     for (i, tab) in view.tabs.iter().enumerate() {
         let id = ID_TAB_BASE + i as u16;
-        regions.push(TipRegion {
-            id: u32::from(id),
-            rect: tip_rect(frame, tab.rect),
-            text: sidebar_button_tip_text(state, cursor, &view, id),
-        });
+        regions.push(region(u32::from(id), tip_rect(frame, tab.rect), &|| {
+            sidebar_button_tip_text(state, cursor, view, id)
+        }));
     }
-    regions.push(TipRegion {
-        id: crate::app::input::gadget_input::ID_REPAIR as u32,
-        rect: tip_rect(frame, view.repair_button.rect),
-        text: csf_text(state, "TXT_REPAIR_MODE"),
-    });
-    regions.push(TipRegion {
-        id: crate::app::input::gadget_input::ID_SELL as u32,
-        rect: tip_rect(frame, view.sell_button.rect),
-        text: csf_text(state, "TXT_SELL_MODE"),
-    });
+    regions.push(region(
+        crate::app::input::gadget_input::ID_REPAIR as u32,
+        tip_rect(frame, view.repair_button.rect),
+        &|| csf_text(state, "TXT_REPAIR_MODE"),
+    ));
+    regions.push(region(
+        crate::app::input::gadget_input::ID_SELL as u32,
+        tip_rect(frame, view.sell_button.rect),
+        &|| csf_text(state, "TXT_SELL_MODE"),
+    ));
     for (id, button) in [
         (ID_SCROLL_DOWN, &view.scroll_down_button),
         (ID_SCROLL_UP, &view.scroll_up_button),
     ] {
-        regions.push(TipRegion {
-            id: u32::from(id),
-            rect: tip_rect(frame, button.rect),
-            text: sidebar_button_tip_text(state, cursor, &view, id),
-        });
+        regions.push(region(u32::from(id), tip_rect(frame, button.rect), &|| {
+            sidebar_button_tip_text(state, cursor, view, id)
+        }));
+    }
+    let game_mode_nonzero = state.match_state.session_mode().is_nonzero();
+    for ((id, label), button) in radar_button_tip_labels(game_mode_nonzero)
+        .into_iter()
+        .zip(&view.top_buttons)
+    {
+        regions.push(region(u32::from(id), tip_rect(frame, button.rect), &|| {
+            csf_text(state, label)
+        }));
     }
     for (slot, item) in view.items.iter().enumerate() {
-        let text = dynamic_tip_text(cursor, || {
-            if item.is_superweapon {
-                // The retained view carries the same native UIName used for
-                // ordering. Only explicitly paid Supers add a localized cost.
-                let amount = item
-                    .super_weapon_section
-                    .as_deref()
-                    .and_then(|name| {
-                        let rules = state.rules()?;
-                        Some(crate::sim::superweapon::financial_type(
-                            rules,
-                            rules.super_weapon(name)?,
-                        ))
-                    })
-                    .map_or(0, |sw| sw.money_amount);
-                let money_format = state
-                    .process_assets
-                    .csf
-                    .as_ref()
-                    .map(|csf| csf.text(CAMEO_TIP_MONEY_FORMAT));
-                superweapon_money_tip(money_format.as_deref(), &item.display_name, amount)
-            } else {
-                let money_format = state
-                    .process_assets
-                    .csf
-                    .as_ref()
-                    .map(|csf| csf.text(CAMEO_TIP_MONEY_FORMAT));
-                cameo_tip_text(
-                    money_format.as_deref(),
-                    &item.display_name,
-                    item.cost.map(i64::from),
-                )
-            }
-        });
-        regions.push(TipRegion {
-            id: CAMEO_TIP_ID_BASE + slot as u32,
-            rect: tip_rect(frame, item.rect),
-            text,
-        });
+        let text = || {
+            dynamic_tip_text(cursor, || {
+                if item.is_superweapon {
+                    // The retained view carries the same native UIName used for
+                    // ordering. Only explicitly paid Supers add a localized cost.
+                    let amount = item
+                        .super_weapon_section
+                        .as_deref()
+                        .and_then(|name| {
+                            let rules = state.rules()?;
+                            Some(crate::sim::superweapon::financial_type(
+                                rules,
+                                rules.super_weapon(name)?,
+                            ))
+                        })
+                        .map_or(0, |sw| sw.money_amount);
+                    let money_format = state
+                        .process_assets
+                        .csf
+                        .as_ref()
+                        .map(|csf| csf.text(CAMEO_TIP_MONEY_FORMAT));
+                    superweapon_money_tip(money_format.as_deref(), &item.display_name, amount)
+                } else {
+                    let money_format = state
+                        .process_assets
+                        .csf
+                        .as_ref()
+                        .map(|csf| csf.text(CAMEO_TIP_MONEY_FORMAT));
+                    cameo_tip_text(
+                        money_format.as_deref(),
+                        &item.display_name,
+                        item.cost.map(i64::from),
+                    )
+                }
+            })
+        };
+        regions.push(region(
+            CAMEO_TIP_ID_BASE + slot as u32,
+            tip_rect(frame, item.rect),
+            &text,
+        ));
+    }
+    // TabClass::ToggleSidebar 0x006D04F0 registers the command bar's tips
+    // after SidebarClass's own; a labelled tip reads its CSF text directly.
+    for (id, rect, label) in crate::app::input::gadget_input::command_bar_tooltips(
+        &state.match_state.match_presentation.in_game_gadgets,
+    ) {
+        regions.push(region(
+            u32::from(id),
+            TipRect::new(rect.x, rect.y, rect.w, rect.h),
+            &|| csf_text(state, label),
+        ));
     }
     // Phobos left superweapon sidebar: `SWButtonClass` shows the same super
     // weapon name/cost tip as the right cameo.
@@ -667,11 +780,7 @@ fn sync_in_game_regions(state: &mut AppState) {
             }
         }
     }
-    state
-        .match_state
-        .match_presentation
-        .tooltips
-        .sync_regions(&regions);
+    regions
 }
 
 /// In-game tooltip draw: `(fill, outline, text)` instances, drawn between the
@@ -874,6 +983,37 @@ mod tests {
     /// Retail English `TXT_MONEY_FORMAT_2`.
     const RETAIL_MONEY_FORMAT_2: &str = "%s $%d";
 
+    /// Ares BuildingClass_GetUIName (10015DA0, hook 0x459ED0): the owner
+    /// reads the type's name, a player it does not count as an ally the
+    /// type's `EnemyUIName`.
+    #[cfg(feature = "ares")]
+    #[test]
+    fn ares_enemy_ui_name_shows_to_a_non_allied_player() {
+        use crate::rules::ruleset::RuleSet;
+        let rules = RuleSet::from_ini(&crate::sim::arena_fixture::clear_ground_ini(
+            "[BuildingTypes]\n0=POWR\n1=PLAIN\n[POWR]\nStrength=1\nEnemyUIName=NAME:Fake\n\
+             [PLAIN]\nStrength=1\n",
+        ))
+        .unwrap();
+        let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 7);
+        let [powr, plain] = [("POWR", 6), ("PLAIN", 10)].map(|(name, x)| {
+            sim.spawn_object(name, "Americans", x, 6, 0, &rules)
+                .unwrap()
+        });
+        let viewer = |name| sim.interner().get(name).unwrap();
+        let label = |id, name| {
+            let entity = sim.entities().get(id).unwrap();
+            let object = sim
+                .interner()
+                .object_type(entity.type_ref(), &rules)
+                .unwrap();
+            ares_enemy_ui_name(&sim, entity, object, viewer(name))
+        };
+        assert_eq!(label(powr, "Americans"), None);
+        assert_eq!(label(powr, "Russians"), Some("NAME:Fake"));
+        assert_eq!(label(plain, "Russians"), None);
+    }
+
     #[test]
     fn hidden_dynamic_provider_clears_power_tip_and_retains_its_timer() {
         use crate::app::input::cursor::CursorVisibility;
@@ -921,6 +1061,18 @@ mod tests {
         tips.on_mouse_move(6, 50, expiry + 2 * TOOLTIP_DURATION_MS);
         tips.poll(expiry + 2 * TOOLTIP_DURATION_MS + 1000);
         assert_eq!(tips.active().unwrap().id, ID_POWER_TIP);
+    }
+
+    #[test]
+    fn radar_diplomacy_tip_reads_briefing_in_campaign() {
+        assert_eq!(
+            radar_button_tip_labels(false),
+            [
+                (ID_DIPLOMACY, "Tip:BriefingButton"),
+                (ID_OPTIONS, "Tip:OptionsButton")
+            ]
+        );
+        assert_eq!(radar_button_tip_labels(true)[0].1, "Tip:DiplomacyButton");
     }
 
     #[test]

@@ -96,7 +96,7 @@ fn native_trigger_reveal_cell_put_discovers_unshrouded_campaign_resident() {
         let scenario = sim.scenario_rng.native_state_hex();
         let main = sim.main_rng.native_state_hex();
         let mapgen = sim.mapgen_rng.native_state_hex();
-        sim.discover_cell_put_object(id, (10, 10), super::UninitContext::default());
+        sim.discover_by_player(id, Some((10, 10)), super::UninitContext::default());
         let history = sim.substrate.entities.get(id).unwrap().discovery;
         assert_eq!(
             history.discovered_by_current_house(),
@@ -1081,13 +1081,14 @@ fn drive_ship_slope_production_spawn_unlimbo_snaps_without_manual_rocking_state(
             .unwrap();
         terrain_cell.slope_type = slope;
         terrain_cell.speed_costs = SpeedCostProfile {
-            foot: Some(100),
-            track: Some(100),
-            wheel: Some(100),
-            float: Some(100),
-            amphibious: Some(100),
-            float_beach: Some(100),
-            hover: Some(100),
+            foot: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            track: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            float: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            amphibious: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            float_beach: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            hover: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
         };
         terrain_cell.base_speed_costs = terrain_cell.speed_costs;
         let mut expected_rng = sim.scenario_rng.clone();
@@ -1141,13 +1142,14 @@ fn zero_speed_foot_drive_ship_payloads_survive_all_world_spawn_paths() {
             .unwrap();
         terrain_cell.slope_type = slope;
         terrain_cell.speed_costs = SpeedCostProfile {
-            foot: Some(100),
-            track: Some(100),
-            wheel: Some(100),
-            float: Some(100),
-            amphibious: Some(100),
-            float_beach: Some(100),
-            hover: Some(100),
+            foot: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            track: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            float: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            amphibious: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            float_beach: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            hover: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
         };
         terrain_cell.base_speed_costs = terrain_cell.speed_costs;
     }
@@ -4055,9 +4057,6 @@ fn infantry_target_expiry_clears_firing_action_before_target() {
     let art = IniFile::from_str(crate::rules::retail_ini_fixture::GI_ART_EXCERPT);
     let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-    );
     // Original 51B20E drops the firing latch before its unforced Ready
     // request. FireUp (4) admits it; Die2 (12) refuses and retains its stage.
     // The corresponding class-target receipts pin this ordering without RNG.
@@ -7180,7 +7179,7 @@ fn wave_pointer_expiry_target_survives_dying_then_uninit_starts_decay_tail() {
     sim.admit_wave(wave_id, wave);
     sim.active_wave_links.insert(owner_id, wave_id);
 
-    let represented = sim.wave_update_context(sim.waves.get(wave_id).unwrap(), &rules);
+    let represented = sim.wave_update_context(sim.waves.get(wave_id).unwrap(), &rules, None);
     assert_eq!(
         represented.target_position,
         Some(ProjectileCoord::new(4 * 256 + 128, 128, 0)),
@@ -7203,7 +7202,7 @@ fn wave_pointer_expiry_target_survives_dying_then_uninit_starts_decay_tail() {
         "UnInit synchronously expires +0xAC"
     );
     assert_eq!(sim.active_wave_links.get(&owner_id), Some(&wave_id));
-    let expired = sim.wave_update_context(sim.waves.get(wave_id).unwrap(), &rules);
+    let expired = sim.wave_update_context(sim.waves.get(wave_id).unwrap(), &rules, None);
     assert_eq!(expired.target_position, None);
     let _ = sim
         .waves
@@ -7257,11 +7256,13 @@ fn wave_pointer_expiry_owner_allows_dying_damage_then_uninit_nulls_later_calls()
         firer_id: owner_id,
         recorded_cells: vec![WaveRecordedCell::real(4, 5)],
         wave_z: 0,
+        ares_weapon: None,
     };
     assert!(
         sim.wave_update_context(
             sim.waves.get(wave_id).unwrap(),
-            crate::rules::ruleset::RuleSet::empty_for_test()
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            None
         )
         .owner_position
         .is_some(),
@@ -8021,7 +8022,11 @@ fn wave_tail_consumes_wall_roll_before_mandatory_cliff_chance_roll() {
 
     sim.scenario_rng = crate::sim::rng::SimRng::new(0x57_41_4c_4c);
     let mut expected = sim.scenario_rng.clone();
-    let _wall_roll = expected.next_range_u32_inclusive(0, 100);
+    // Ares WaveClass_DamageCell_Wall (1005D7A0, hook 0x75F46E) leaves the
+    // wall to a `Wall=yes` warhead; WH is not one, so no wall roll.
+    if !cfg!(feature = "ares") {
+        let _wall_roll = expected.next_range_u32_inclusive(0, 100);
+    }
     let _cliff_chance_roll = expected.next_range_u32_inclusive(0, 99);
 
     assert!(sim.object_ai_visit_one(
@@ -8059,7 +8064,7 @@ fn assert_direct_fatal_death_weapon_starts_crater(bridge: bool) {
     let ini = IniFile::from_str(
         "[CombatDamage]\nC4Warhead=KILLWH\n[InfantryTypes]\n[VehicleTypes]\n0=VICTIM\n1=FIRER\n\
          [AircraftTypes]\n[BuildingTypes]\n[OverlayTypes]\n\
-         [Warheads]\n0=KILLWH\n1=CRATERWH\n[SmudgeTypes]\n0=CR1\n\
+         [Warheads]\n0=KILLWH\n1=CRATERWH\n[SmudgeTypes]\n0=CR1\n[Animations]\n0=CRATERANIM\n\
          [VICTIM]\nStrength=1\nArmor=light\nExplodes=yes\nDeathWeapon=DeathBoom\n\
          [FIRER]\nStrength=100\nArmor=light\nPrimary=SONIC\n\
          [SONIC]\nDamage=1\nAmbientDamage=10\nWarhead=KILLWH\nIsSonic=yes\n\
@@ -9880,8 +9885,8 @@ fn unlimbo_levels_then_aims_the_barrel_elevation() {
             .unwrap()
             .cell_mut_for_test(4, 4)
             .unwrap();
-        cell.speed_costs.track = Some(100);
-        cell.speed_costs.wheel = Some(100);
+        cell.speed_costs.track = Some(crate::util::native_x87::NativeF32Bits::ONE);
+        cell.speed_costs.wheel = Some(crate::util::native_x87::NativeF32Bits::ONE);
         cell.base_speed_costs = cell.speed_costs;
         let id = sim
             .spawn_object(type_id, "Americans", 4, 4, 0, &rules)

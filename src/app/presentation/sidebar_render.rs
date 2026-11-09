@@ -13,6 +13,7 @@
 
 use crate::app::AppState;
 use crate::app::input::commands::preferred_local_owner_name;
+use crate::app::sidebar_projection::SidebarViewInputs;
 use crate::sim::production;
 use crate::ui::sidebar::{self, SidebarView};
 
@@ -287,7 +288,7 @@ fn refresh_projection(state: &mut AppState, reuse_sim_inputs: bool) {
             size(atlas.and_then(|atlas| atlas.sell_frames[0].as_ref())),
             size(atlas.and_then(|atlas| atlas.scroll_down_frames[0].as_ref())),
             size(atlas.and_then(|atlas| atlas.scroll_up_frames[0].as_ref())),
-            std::array::from_fn(|i| {
+            std::array::from_fn::<_, 2, _>(|i| {
                 size(atlas.and_then(|atlas| atlas.top_button_frames[i][0].as_ref()))
             }),
         )
@@ -309,32 +310,91 @@ fn refresh_projection(state: &mut AppState, reuse_sim_inputs: bool) {
                 sidebar::ArmedSidebarEntry::SuperWeapon(section.clone())
             }
         });
+    let view_inputs = SidebarViewInputs {
+        spec: state.match_state.match_presentation.sidebar_layout_spec,
+        screen: (screen_w, screen_h),
+        tab: state.match_state.match_presentation.active_sidebar_tab,
+        credits: display_credits,
+        sim: inputs,
+        button_sizes: [
+            tab_btn_size,
+            repair_btn_size,
+            sell_btn_size,
+            scroll_down_btn_size,
+            scroll_up_btn_size,
+            top_btn_sizes[0],
+            top_btn_sizes[1],
+        ],
+        armed: armed_entry,
+        supers: right_sw_views,
+        gadgets: state
+            .match_state
+            .match_presentation
+            .sidebar_gadget_state
+            .clone(),
+    };
+    // The gadget refresh runs this on every service pass, several per game
+    // frame; while the inputs, strips and Factory links all hold, the view
+    // it would build equals the retained one. Debug builds build it anyway
+    // and compare.
+    let holds = state
+        .match_state
+        .match_presentation
+        .sidebar_projection
+        .view_holds_for(&view_inputs);
+    if !holds || crate::sim::live_read_check_enabled() {
+        let view = build_view(state, &view_inputs, owner);
+        let projection = &mut state.match_state.match_presentation.sidebar_projection;
+        if holds {
+            assert_eq!(
+                projection.view(),
+                Some(&view),
+                "the sidebar view changed while its inputs held"
+            );
+        }
+        projection.replace_built_view(view, view_inputs);
+    }
+    #[cfg(feature = "phobos")]
+    {
+        let sw = &mut state.match_state.match_presentation.sw_sidebar;
+        sw.layout = sw_plan.0;
+        sw.entries = sw_plan.1;
+    }
+}
+
+/// The view a refresh retains, built from `inputs` and the projection's
+/// strips and Factory links, with each cameo's art and drawn state.
+fn build_view(
+    state: &mut AppState,
+    inputs: &SidebarViewInputs,
+    owner: crate::sim::intern::InternedId,
+) -> SidebarView {
     let mut view = sidebar::build_sidebar_view_with_spec(
-        state.match_state.match_presentation.sidebar_layout_spec,
-        screen_w,
-        screen_h,
-        state.match_state.match_presentation.active_sidebar_tab,
-        display_credits,
-        inputs.power_produced,
-        inputs.power_drained,
-        tab_btn_size,
-        &inputs.queue_items,
-        &inputs.build_options,
-        &inputs.ready_buildings,
-        armed_entry.as_ref(),
+        inputs.spec,
+        inputs.screen.0,
+        inputs.screen.1,
+        inputs.tab,
+        inputs.credits,
+        inputs.sim.power_produced,
+        inputs.sim.power_drained,
+        inputs.button_sizes[0],
+        &inputs.sim.queue_items,
+        &inputs.sim.build_options,
+        &inputs.sim.ready_buildings,
+        inputs.armed.as_ref(),
         state
             .match_state
             .sim_runtime
             .as_ref()
             .map(|rt| &rt.simulation)
             .map(|sim| sim.interner()),
-        &right_sw_views,
-        &state.match_state.match_presentation.sidebar_gadget_state,
-        repair_btn_size,
-        sell_btn_size,
-        scroll_down_btn_size,
-        scroll_up_btn_size,
-        top_btn_sizes,
+        &inputs.supers,
+        &inputs.gadgets,
+        inputs.button_sizes[1],
+        inputs.button_sizes[2],
+        inputs.button_sizes[3],
+        inputs.button_sizes[4],
+        [inputs.button_sizes[5], inputs.button_sizes[6]],
         state
             .match_state
             .match_presentation
@@ -348,10 +408,7 @@ fn refresh_projection(state: &mut AppState, reuse_sim_inputs: bool) {
         .match_state
         .match_presentation
         .sidebar_projection
-        .set_scroll_row(
-            state.match_state.match_presentation.active_sidebar_tab,
-            view.scroll_rows,
-        );
+        .set_scroll_row(inputs.tab, view.scroll_rows);
     if let Some(atlas) = state
         .match_state
         .match_presentation
@@ -394,7 +451,8 @@ fn refresh_projection(state: &mut AppState, reuse_sim_inputs: bool) {
     // write as every later frame, so it is never built from other rules.
     if let Some(runtime) = state.match_state.sim_runtime.as_ref() {
         let sim = &runtime.simulation;
-        let armed_building = armed_entry
+        let armed_building = inputs
+            .armed
             .as_ref()
             .and_then(sidebar::ArmedSidebarEntry::as_building_placement)
             .and_then(|name| sim.interner().get(name));
@@ -410,17 +468,7 @@ fn refresh_projection(state: &mut AppState, reuse_sim_inputs: bool) {
                 armed_building,
             );
     }
-    state
-        .match_state
-        .match_presentation
-        .sidebar_projection
-        .replace_view(Some(view));
-    #[cfg(feature = "phobos")]
-    {
-        let sw = &mut state.match_state.match_presentation.sw_sidebar;
-        sw.layout = sw_plan.0;
-        sw.entries = sw_plan.1;
-    }
+    view
 }
 
 /// The per-frame part of the projection: each retained object cameo's drawn
@@ -468,8 +516,8 @@ pub(crate) fn refresh_sidebar_cameo_draw_state(state: &mut AppState) {
 /// Ares1003D800 additionally admits the current Country's retained lists.
 /// An undeploying Building uses the Unit-list branch, comparing its own
 /// BuildingType pointer, not UndeploysInto; that cannot match an INI-produced
-/// UnitType list. New Ares SpyEffect.Custom House gains are a separate chain;
-/// this selector reads the stock spy flags currently represented by HouseState.
+/// UnitType list. Its spy arms read HouseState's stock flags and the Ares
+/// SpyEffect veterancy (`sim::spy_infiltration`).
 ///
 /// [`SidebarCameoAtlas::cameo`]: crate::render::sidebar_cameo_atlas::SidebarCameoAtlas::cameo
 fn shows_alt_cameo(
@@ -490,13 +538,30 @@ fn shows_alt_cameo(
         if rules.country_starts_veteran(country, obj) {
             return true;
         }
-        return obj.trainable
-            && !obj.naval
-            && match obj.category {
-                ObjectCategory::Infantry => house.veteran_infantry(),
-                ObjectCategory::Vehicle => house.veteran_units(),
-                ObjectCategory::Aircraft | ObjectCategory::Building => false,
-            };
+        // Ares 3.0 1003D89A/1003D8DE/1003D911: a naval unit asks the
+        // house's SpyEffect NavalVeterancy instead of the war factory's,
+        // aircraft and non-undeploying buildings their own.
+        #[cfg(feature = "ares")]
+        {
+            return obj.trainable
+                && match obj.category {
+                    ObjectCategory::Infantry => !obj.naval && house.veteran_infantry(),
+                    ObjectCategory::Vehicle if obj.naval => house.naval_veterancy(),
+                    ObjectCategory::Vehicle => house.veteran_units(),
+                    ObjectCategory::Aircraft => house.aircraft_veterancy(),
+                    ObjectCategory::Building => house.building_veterancy(),
+                };
+        }
+        #[cfg(not(feature = "ares"))]
+        {
+            return obj.trainable
+                && !obj.naval
+                && match obj.category {
+                    ObjectCategory::Infantry => house.veteran_infantry(),
+                    ObjectCategory::Vehicle => house.veteran_units(),
+                    ObjectCategory::Aircraft | ObjectCategory::Building => false,
+                };
+        }
     }
     obj.trainable
         && match obj.category {
@@ -547,6 +612,7 @@ pub(crate) fn minimap_camera_target(
         minimap.native_click_target_in_rect(
             cursor_x,
             cursor_y,
+            sidebar_cursor_centre(state),
             rect.x,
             rect.y,
             rect.w,
@@ -574,6 +640,7 @@ pub(crate) fn minimap_input_target(
         .as_ref()?
         .native_input_target_in_rect(
             sidebar_cursor(state),
+            sidebar_cursor_centre(state),
             [rect.x, rect.y, rect.w, rect.h],
             &runtime.simulation,
             &runtime.resources.rules,
@@ -668,6 +735,20 @@ fn sidebar_cursor(state: &AppState) -> (f32, f32) {
     )
 }
 
+/// The centre of the window pixel under the cursor, in the same layout space.
+/// The cursor sits on that pixel's corner in frame pixels; the HD radar picks
+/// its own finer pixels at the centre.
+fn sidebar_cursor_centre(state: &AppState) -> (f32, f32) {
+    let half = 0.5
+        / state
+            .match_zoom_pass()
+            .map_or(1.0, |pass| pass.geometry().scale());
+    state.sidebar_frame().point_to_layout(
+        state.match_state.input.cursor_x + half,
+        state.match_state.input.cursor_y + half,
+    )
+}
+
 /// The radar aperture in the sidebar's layout space. Input regions take it in
 /// frame pixels through [`crate::ui::sidebar::SidebarFrame::rect_to_frame`].
 pub(crate) fn active_minimap_screen_rect(state: &AppState) -> crate::ui::sidebar::Rect {
@@ -686,6 +767,25 @@ pub(crate) fn active_minimap_screen_rect(state: &AppState) -> crate::ui::sidebar
 // ---------------------------------------------------------------------------
 // Chrome / theme helpers
 // ---------------------------------------------------------------------------
+
+/// Keep VERA's smooth sidebar (`render::sidebar_smoothing`) at this frame's
+/// draw scale, or drop its copies when the option is off or the sidebar draws
+/// at its own pixels.
+pub(crate) fn prepare_smooth_sidebar(state: &mut AppState) {
+    let scale = state
+        .smooth_sidebar()
+        .then(|| state.sidebar_frame().draw_scale())
+        .filter(|&scale| scale > 1);
+    let side = current_sidebar_side(state);
+    let (gpu, batch) = (&state.renderer.gpu, &state.renderer.batch_renderer);
+    let presentation = &mut state.match_state.match_presentation;
+    if let Some(atlas) = presentation.sidebar_cameo_atlas.as_mut() {
+        atlas.set_smooth_scale(gpu, batch, scale);
+    }
+    if let Some(set) = presentation.sidebar_chrome.as_mut() {
+        set.set_smooth_scale(side, gpu, batch, scale);
+    }
+}
 
 pub(crate) fn current_sidebar_theme(
     state: &AppState,
@@ -780,7 +880,8 @@ fn refresh_radar_animation_source(state: &mut AppState) {
     let presentation = &mut state.match_state.match_presentation;
     if let Some(radar) = presentation.radar_anim.as_mut() {
         if !radar.replace_frames(
-            &state.renderer.gpu,
+            &state.renderer.gpu.device,
+            &state.renderer.gpu.queue,
             &state.renderer.batch_renderer,
             frames,
             width,
@@ -790,7 +891,8 @@ fn refresh_radar_animation_source(state: &mut AppState) {
         }
     } else {
         presentation.radar_anim = crate::render::radar::anim::RadarAnimState::new(
-            &state.renderer.gpu,
+            &state.renderer.gpu.device,
+            &state.renderer.gpu.queue,
             &state.renderer.batch_renderer,
             frames,
             width,

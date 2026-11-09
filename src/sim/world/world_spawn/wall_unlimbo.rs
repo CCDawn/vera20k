@@ -163,11 +163,25 @@ impl Simulation {
             crate_images: MarkCrateImages::resolve(&rules.crate_rules, registry),
         };
         let outcome = match mark_overlay(
-            &mut SimulationMarkHost::new(self, rules, registry),
+            &mut SimulationMarkHost::new(
+                self,
+                rules,
+                registry,
+                crate::sim::overlay_mark_host::OverlayRecalc::Immediate,
+                effects,
+            ),
             &request,
         ) {
             Ok(outcome) => outcome,
-            Err(never) => match never {},
+            Err(error) => {
+                // Refuse this construction on native-invalid Image state,
+                // keeping prior cell writes but retiring the transient object.
+                log::error!("Overlay reveal failed: {error}");
+                self.load_objects
+                    .finish_common(handle, &mut self.substrate.pending_delete)
+                    .expect("failed Mark retires its transient Overlay");
+                return Some(RevealOutcome::Failed(RevealFailure::MarkFailed));
+            }
         };
         match outcome {
             OverlayMarkOutcome::SlopeRefused => {
@@ -222,12 +236,13 @@ impl Simulation {
                 .clamp(0, i32::from(u16::MAX)) as u16;
             let config = self.sight_reveal_config(rules);
             let heights = self.sight_height_grid(&config);
+            let clients = self.fog_viewers();
             let viewers = self.reveal_viewers.direct(
-                &self.fog,
                 self.house_alliances.as_map(),
                 owner,
                 &config,
                 &self.interner,
+                &clients,
             );
             let _ = self.reveal_area(
                 &viewers,

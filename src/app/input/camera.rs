@@ -1233,38 +1233,26 @@ pub(crate) fn queue_keyboard_scroll(state: &mut AppState) {
     {
         return;
     }
+    let held = |arrow| {
+        !state.match_state.match_presentation.message_list.editing()
+            && state
+                .match_state
+                .input
+                .camera_scroll_keys
+                .held(&state.match_state.input.keys_held, arrow)
+    };
     let key_distance = keyboard_scroll_distance(state);
     let mut movement = (0.0, 0.0);
-    if state
-        .match_state
-        .input
-        .keys_held
-        .contains(&winit::keyboard::KeyCode::ArrowLeft)
-    {
+    if held(winit::keyboard::KeyCode::ArrowLeft) {
         movement.0 -= key_distance / state.match_state.input.zoom_level;
     }
-    if state
-        .match_state
-        .input
-        .keys_held
-        .contains(&winit::keyboard::KeyCode::ArrowRight)
-    {
+    if held(winit::keyboard::KeyCode::ArrowRight) {
         movement.0 += key_distance / state.match_state.input.zoom_level;
     }
-    if state
-        .match_state
-        .input
-        .keys_held
-        .contains(&winit::keyboard::KeyCode::ArrowUp)
-    {
+    if held(winit::keyboard::KeyCode::ArrowUp) {
         movement.1 -= key_distance / state.match_state.input.zoom_level;
     }
-    if state
-        .match_state
-        .input
-        .keys_held
-        .contains(&winit::keyboard::KeyCode::ArrowDown)
-    {
+    if held(winit::keyboard::KeyCode::ArrowDown) {
         movement.1 += key_distance / state.match_state.input.zoom_level;
     }
 
@@ -1514,15 +1502,6 @@ impl ViewDistanceTier {
     /// Camera zoom that makes the viewport span `scale` times the window.
     pub(crate) const fn zoom(self) -> f32 {
         1.0 / self.scale()
-    }
-
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::Small => "Small view",
-            Self::Default => "Default view",
-            Self::Large => "Large view",
-            Self::Huge => "Huge view",
-        }
     }
 
     /// The tier whose zoom is closest to `zoom`; a save or a mid-animation
@@ -2013,6 +1992,11 @@ fn clamp_camera_point_for_state(
     sw: f32,
     sh: f32,
 ) -> (f32, f32) {
+    // VERA-only: a map picture puts the camera where a map's own preview
+    // shows, which can reach rows past the playable area's edges.
+    if state.platform.capture_presentation.map_picture {
+        return point;
+    }
     let (frame_w, frame_h) = (sw.max(0.0) as u32, sh.max(0.0) as u32);
     let (viewport_w, viewport_h) = state.sidebar_frame_for(frame_w, frame_h).tactical_size();
     let viewport = (viewport_w as f32, viewport_h as f32);
@@ -2102,7 +2086,8 @@ fn shown_world_rect(area: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
 
 /// The world rectangle the tactical camera can show on the loaded map
 /// (`shown_world_rect` of its scroll rectangle), or None before a simulation
-/// has its LocalSize. Captures record it to frame the whole map.
+/// has its LocalSize. Pictures of whole maps (`app::map_picture`) are framed
+/// by it.
 pub(crate) fn tactical_view_area(state: &AppState) -> Option<(f32, f32, f32, f32)> {
     let runtime = state.match_state.sim_runtime.as_ref()?;
     let bounds = runtime.view().playfield_authority().0?;
@@ -2975,13 +2960,12 @@ fn view_distance_tiers_match_the_1280_reference_and_clamp_at_the_ends() {
         (1.5, 1920, 1200),
     ];
     for (tier, (scale, width, height)) in ViewDistanceTier::ALL.into_iter().zip(expected) {
-        assert_eq!(tier.scale(), scale, "{}", tier.name());
-        assert_eq!((1280.0 * tier.scale()) as u32, width, "{}", tier.name());
-        assert_eq!((800.0 * tier.scale()) as u32, height, "{}", tier.name());
+        assert_eq!(tier.scale(), scale, "{tier:?}");
+        assert_eq!((1280.0 * tier.scale()) as u32, width, "{tier:?}");
+        assert_eq!((800.0 * tier.scale()) as u32, height, "{tier:?}");
         assert!(
             (tier.zoom() - 1.0 / tier.scale()).abs() < f32::EPSILON,
-            "{}",
-            tier.name()
+            "{tier:?}"
         );
     }
     assert_eq!(ViewDistanceTier::Small.smaller(), ViewDistanceTier::Small);

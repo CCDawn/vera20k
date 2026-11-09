@@ -5,6 +5,7 @@
 
 use super::input::precedence::{ModalPage, ScreenPage};
 use super::loading::transitions;
+use super::match_runtime::redraw_gate::ProbeVerdict;
 use super::{
     ActiveEventLoop, App, AppState, GameScreen, Instant, Result, frontend::startup_splash, render,
     sim_tick,
@@ -44,7 +45,8 @@ pub(super) enum FrameRenderOutcome {
     Presented,
     Unavailable,
     Deferred,
-    /// A probe found the presented picture still standing and drew nothing.
+    /// A probe drew nothing: the presented picture still stands, or the draw
+    /// limits hold the next one.
     Unchanged,
 }
 
@@ -248,6 +250,7 @@ impl App {
                 }
             }
         }
+        crate::app::match_runtime::network_quality::observe_pass(state);
         result
     }
 
@@ -550,11 +553,14 @@ impl App {
         }
     }
 
-    /// The render continuation is allowed only outside every modal, focus,
-    /// exact-step and terminal path. The sequencer remains frame authority.
+    /// The next canonical frame and the committed frontier while that frame
+    /// is due now, so the draw may wait for it (`defer_online_render`).
+    /// The render continuation is allowed only outside every modal, focus
+    /// freeze, exact-step and terminal path. The sequencer remains frame
+    /// authority. A visible window without focus still catches up: it takes
+    /// no player input, and skipping its draws changes no simulation state.
     pub(super) fn next_online_render_frame(state: &AppState) -> Option<(u32, u32)> {
         if state.frontend.screen != GameScreen::InGame
-            || !state.platform.window_active
             || state.platform.window_hidden
             || state.focus_freeze_active()
             || state.match_state.paused()
@@ -591,7 +597,7 @@ impl App {
                     frame,
                 )
                 .is_some();
-            if !state.platform.frame_pacer.online_catch_up_ready(
+            if !state.platform.frame_pacer.online_frame_due(
                 Instant::now(),
                 frame,
                 live.committed_frontier(),
@@ -612,21 +618,59 @@ impl App {
             && (Self::house_outcome_wait_pending(state) || !state.focus_freeze_active())
     }
 
+    /// The active-game shell `page` into `destination`.
+    fn render_in_game_shell(
+        state: &mut AppState,
+        encoder: &mut wgpu::CommandEncoder,
+        destination: &wgpu::Texture,
+        page: ScreenPage,
+    ) -> Result<()> {
+        use crate::app::frontend::skirmish_shell_render as shell;
+        use crate::ui::pause_menu::InGameMenuState;
+        match page {
+            ScreenPage::InGameShell(InGameMenuState::Menu) => {
+                let buttons = crate::app::input::pause_menu::button_states(state);
+                shell::render_pause_menu_shell(state, encoder, destination, buttons)
+            }
+            ScreenPage::InGameShell(InGameMenuState::AbortConfirm) => {
+                shell::render_abort_shell(state, encoder, destination)
+            }
+            ScreenPage::InGameShell(InGameMenuState::Sound) => {
+                shell::render_sound_shell(state, encoder, destination)
+            }
+            ScreenPage::InGameShell(InGameMenuState::Diplomacy) => {
+                shell::render_diplomacy_shell(state, encoder, destination)
+            }
+            ScreenPage::InGameShell(InGameMenuState::MissionBriefing) => {
+                shell::render_restate_shell(state, encoder, destination)
+            }
+            ScreenPage::InGameShell(InGameMenuState::SavedGame(_)) => {
+                shell::render_saved_game_shell(state, encoder, destination)
+            }
+            _ => shell::render_in_game_options_shell(state, encoder, destination),
+        }
+    }
+
     /// The one owner of the window's own cursor after the startup splash, set
     /// after each frame's draw. gamemd's WWMouse constructor (`0x007B8730`)
     /// hides it with `ShowCursor(FALSE)` (`0x007B88BA`) and the game draws
-    /// mouse.shp itself, so it shows only where VERA draws no cursor but the
-    /// player points: over a status screen; over the battlefield where
-    /// `use_software_cursor` turns mouse.shp off (the debug pause, whose
-    /// developer overlay takes the pointer, or a missing mouse.sha) while
+    /// mouse.shp itself; VERA has the window system draw that shape
+    /// (`input::hardware_cursor`). The system arrow shows only where VERA
+    /// draws no cursor but the player points: over a status screen; over the
+    /// battlefield where `use_software_cursor` turns mouse.shp off (the debug
+    /// pause, whose developer overlay takes the pointer, or a missing mouse.sha) while
     /// WWMouse's depth is visible; wherever the pointer left the client area,
     /// because `DefWindowProc` answers a non-client `WM_SETCURSOR` with the
     /// system arrow and mouse.shp has no title-bar art, or the window is not
     /// active (see `PlatformState::owns_pointer`); and elsewhere only
     /// without mouse.sha, which the shell pages draw whenever it loaded.
-    fn show_os_cursor_only_without_game_cursor(state: &mut AppState, battlefield_drawn: bool) {
+    fn show_os_cursor_only_without_game_cursor(
+        state: &mut AppState,
+        event_loop: &ActiveEventLoop,
+        battlefield_drawn: bool,
+    ) {
         let status_screen_drawn = std::mem::take(&mut state.frontend.status_screen_drawn);
-        let visible = !state.platform.owns_pointer()
+        let arrow = !state.platform.owns_pointer()
             || if state.platform.cursor_confined {
                 // Confined: the game owns the pointer through its
                 // software cursor, so keep the OS cursor hidden everywhere the game
@@ -652,17 +696,7 @@ impl App {
                             .is_none()
                     }
             };
-        // Asking winit is not free on Windows: `set_cursor_visible` runs
-        // `refresh_os_cursor`, which clears any OS cursor clip winit does not own
-        // itself, so repeating the same answer every frame would tear
-        // `cursor_confined` down once per frame and let the pointer slip out of
-        // the window between two re-asserts. Hand over only a transition, then put
-        // the clip straight back.
-        if state.platform.os_cursor_visible == Some(visible) {
-            return;
-        }
-        crate::app::input::cursor::set_os_cursor_visible(state, visible);
-        crate::app::input::cursor::reassert_cursor_confinement(state);
+        crate::app::input::hardware_cursor::show(state, event_loop, arrow);
     }
 
     /// Dispatch rendering based on current GameScreen state.
@@ -670,12 +704,25 @@ impl App {
         state: &mut AppState,
         event_loop: &ActiveEventLoop,
         mut shell_capture: Option<&mut crate::app::diagnostics::shell_capture::ShellCaptureSession>,
-        mut tactical_capture: Option<
-            &mut crate::app::diagnostics::tactical_capture::session::TacticalCaptureSession,
-        >,
+        mut hidden_run: Option<&mut crate::app::hidden_run::HiddenRun>,
         pass: FramePass,
     ) -> Result<FrameRenderOutcome> {
+        // The glyph atlas empties or grows only between frames, while no
+        // instance built from it is waiting to draw.
+        state
+            .renderer
+            .bit_font
+            .begin_frame(&state.renderer.gpu.device, &state.renderer.batch_renderer);
+        state.platform.hardware_cursor.set_frames_read_back(
+            shell_capture.is_some()
+                || hidden_run.is_some()
+                || state
+                    .match_state
+                    .match_diagnostics
+                    .playback_capture_requested(),
+        );
         if let Some(presented) = crate::app::persistence::commands::pump_saved_game_load(state) {
+            crate::app::input::hardware_cursor::hide_game_cursor(state);
             return Ok(if presented {
                 FrameRenderOutcome::Presented
             } else {
@@ -683,8 +730,8 @@ impl App {
             });
         }
         anyhow::ensure!(
-            shell_capture.is_none() || tactical_capture.is_none(),
-            "shell and tactical capture cannot share a render"
+            shell_capture.is_none() || hidden_run.is_none(),
+            "a shell capture and a hidden run cannot share a render"
         );
         if state
             .match_state
@@ -699,14 +746,14 @@ impl App {
         state.platform.frame_pacer.clear_render_continuation();
         #[cfg(feature = "telemetry-dashboard")]
         crate::app::telemetry_capture::synchronize_observer(state);
-        if let Some(session) = tactical_capture.as_deref_mut() {
+        if let Some(session) = hidden_run.as_deref_mut() {
             session.drive_before_render(state)?;
         }
         state
             .match_state
             .match_diagnostics
             .begin_presentation_observation();
-        crate::app::presentation::interpolation::prepare(state, tactical_capture.is_some());
+        crate::app::presentation::interpolation::prepare(state, hidden_run.is_some());
         let tooltip_ms = crate::app::input::tooltips::update(state);
         // `Init_Game` plays the startup logo (`0x0052C5E2`) before it presents
         // the splash (`0x0052C5F3`): the splash waits while a movie owns the
@@ -730,14 +777,15 @@ impl App {
                 &state.renderer.batch_renderer,
                 &state.renderer.shell_surface_presenter,
                 &state.renderer.depth_view,
-                &state.renderer.fps_overlay,
+                &state.renderer.performance_overlay,
+                &state.renderer.bit_font,
                 Some(splash),
             )?;
             if presented {
                 state
                     .platform
                     .frame_pacer
-                    .record_presented(Instant::now(), false);
+                    .record_presented(Instant::now(), None);
                 state
                     .frontend
                     .startup_splash
@@ -771,9 +819,6 @@ impl App {
         let shell_capture_owns_simulation = shell_capture
             .as_deref()
             .is_some_and(|capture| capture.owns_simulation_steps(state));
-        let ordinary_online = tactical_capture.is_none()
-            && !shell_capture_owns_simulation
-            && Self::next_online_render_frame(state).is_some();
         // A capture that checks every committed frame needs one per render.
         let catch_up_allowed = !shell_capture
             .as_deref()
@@ -781,7 +826,7 @@ impl App {
         let runtime_pass = Self::service_match_runtime(
             state,
             event_loop,
-            tactical_capture.is_none() && !shell_capture_owns_simulation,
+            hidden_run.is_none() && !shell_capture_owns_simulation,
             catch_up_allowed,
         );
         if runtime_pass.quit_requested {
@@ -823,27 +868,44 @@ impl App {
         } else {
             crate::app::input::messages::update(
                 state,
-                runtime_pass.main_tick_admitted || tactical_capture.is_some(),
+                runtime_pass.main_tick_admitted || hidden_run.is_some(),
             )
         };
+        // Atlas growths publish before the picture is judged. Captures wait
+        // for them, so their pictures never depend on worker timing.
+        crate::app::match_runtime::sim_tick::publish_entity_atlas_growth(
+            state,
+            shell_capture.is_some() || hidden_run.is_some(),
+        );
         // A changed picture is drawn in this same pass, so each drawn frame
         // still follows exactly one match service. The picture is judged by
         // the clock before the draw (`redraw_gate::PictureClock`).
         let picture_clock = crate::app::match_runtime::redraw_gate::PictureClock::now();
-        let unchanged = pass == FramePass::Probe
-            && state.platform.redraw_gate.still_presented(
+        let verdict = (pass == FramePass::Probe).then(|| {
+            state.platform.redraw_gate.probe_verdict(
                 crate::app::match_runtime::redraw_gate::still_frame(
                     state,
                     false,
                     runtime_pass.screen_shake_offset,
                     picture_clock,
                 ),
-            );
-        // The gate's audit draws the pass anyway and checks its pixels.
-        if unchanged && !state.platform.redraw_gate.auditing() {
-            return Ok(FrameRenderOutcome::Unchanged);
+                picture_clock.at,
+            )
+        });
+        let unchanged = verdict == Some(ProbeVerdict::Stands);
+        match verdict {
+            // The gate's audit draws the pass anyway and checks its pixels.
+            Some(ProbeVerdict::Stands) if state.platform.redraw_gate.auditing() => {}
+            Some(ProbeVerdict::Stands | ProbeVerdict::PointerWaits) => {
+                state.match_state.network_quality.picture_stood();
+                return Ok(FrameRenderOutcome::Unchanged);
+            }
+            Some(ProbeVerdict::DrawWaits) => return Ok(FrameRenderOutcome::Unchanged),
+            Some(ProbeVerdict::Draw) | None => {}
         }
-        let next_canonical = ordinary_online
+        // Judged after the service: a frame that arrived or came due while
+        // it ran may still go before this draw.
+        let next_canonical = (hidden_run.is_none() && !shell_capture_owns_simulation)
             .then(|| Self::next_online_render_frame(state))
             .flatten();
         if state.platform.frame_pacer.defer_online_render(
@@ -854,7 +916,8 @@ impl App {
         ) {
             return Ok(FrameRenderOutcome::Deferred);
         }
-        state.diag.frame_timer.sample(Instant::now());
+        let draw_started = Instant::now();
+        state.diag.frame_timer.sample(draw_started);
 
         // Native queues/maintains [INTRO] before arming the 0xE2 first-paint
         // owner. An arm stays silent until the matching surface is acquired.
@@ -906,6 +969,14 @@ impl App {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Frame"),
                 });
+        state.renderer.gpu.timer.begin_frame(&mut encoder);
+        state.renderer.window_ui.begin_frame();
+        if state.match_state.input.retail_screenshot_requested {
+            state
+                .renderer
+                .retail_screenshot_frame_cache
+                .retain_presented(&state.renderer.gpu.device, &mut encoder);
+        }
         let mut pending_main_menu_entry_token = None;
         let mut pending_main_menu_title_receipt = None;
         use crate::app::diagnostics::shell_capture::PresentedShell;
@@ -929,6 +1000,11 @@ impl App {
         Self::update_saved_game_browser(state, false);
         // Input routes to these same pages (`input::precedence`).
         let (page, screen_page) = crate::app::input::precedence::presented(state);
+        // VERA's enlarged map preview shows only over the pages that open it.
+        if page.is_some() || !matches!(screen_page, ScreenPage::Skirmish | ScreenPage::NetworkSetup)
+        {
+            crate::app::frontend::preview_zoom::close(state);
+        }
         match &state.frontend.screen {
             _ if page == Some(ModalPage::ShellError) => {
                 Self::render_shell_error(state, &mut encoder, &view)?;
@@ -963,18 +1039,6 @@ impl App {
                 );
                 if !slid {
                     crate::app::frontend::skirmish_shell_render::render_keyboard_shell(state, &mut encoder, &output.texture)?;
-                }
-            }
-            _ if page == Some(ModalPage::NetworkOptions) => {
-                presented_shell = PresentedShell::NetworkOptions;
-                let slid = matches!(
-                    crate::app::frontend::shell_transition::render_shell_first_paint_slide(
-                        state, &mut encoder, &output.texture,
-                    )?,
-                    crate::app::frontend::shell_transition::ShellFirstPaintRenderResult::Rendered { .. }
-                );
-                if !slid {
-                    crate::app::frontend::skirmish_shell_render::render_network_options(state, &mut encoder, &output.texture)?;
                 }
             }
             _ if screen_page == ScreenPage::FullscreenMovie => {
@@ -1133,6 +1197,13 @@ impl App {
                         }
                     }
                 }
+                if page == Some(ModalPage::ShellMessageBox) {
+                    crate::app::frontend::main_menu_shell_render::render_shell_message_box_over_page(
+                        state,
+                        &mut encoder,
+                        &output.texture,
+                    );
+                }
             }
             GameScreen::Loading => {
                 match crate::app::loading::pump::render_loading_screen(
@@ -1147,7 +1218,8 @@ impl App {
                             .to_string();
                         crate::app::frontend::status_screen::render(
                             state, &mut encoder, &view,
-                            "Loading...", &format!("Map: {map_name_display}"),
+                            &crate::i18n::tr("VERA:Loading"),
+                            &crate::i18n::tr_fill("VERA:LoadingMap", &[("map", &map_name_display)]),
                             crate::app::frontend::status_screen::Buttons::NONE,
                         );
                     }
@@ -1159,43 +1231,27 @@ impl App {
             _ if matches!(screen_page, ScreenPage::InGameShell(_)) => {
                 // 621FCE -> 72F540 clears and paints a complete active-game shell.
                 // No battlefield commands share this encoder/camera upload.
-                use crate::ui::pause_menu::InGameMenuState;
-                match screen_page {
-                    ScreenPage::InGameShell(InGameMenuState::Menu) => {
-                        let buttons = crate::app::input::pause_menu::button_states(state);
-                        crate::app::frontend::skirmish_shell_render::render_pause_menu_shell(
-                            state, &mut encoder, &output.texture, buttons,
-                        )?;
-                    }
-                    ScreenPage::InGameShell(InGameMenuState::AbortConfirm) => {
-                        crate::app::frontend::skirmish_shell_render::render_abort_shell(state, &mut encoder, &output.texture)?;
-                    }
-                    ScreenPage::InGameShell(InGameMenuState::Sound) => {
-                        crate::app::frontend::skirmish_shell_render::render_sound_shell(state, &mut encoder, &output.texture)?;
-                    }
-                    ScreenPage::InGameShell(InGameMenuState::Diplomacy) => {
-                        crate::app::frontend::skirmish_shell_render::render_diplomacy_shell(state, &mut encoder, &output.texture)?;
-                    }
-                    ScreenPage::InGameShell(InGameMenuState::MissionBriefing) => {
-                        crate::app::frontend::skirmish_shell_render::render_restate_shell(state, &mut encoder, &output.texture)?;
-                    }
-                    ScreenPage::InGameShell(InGameMenuState::SavedGame(_)) => {
-                        crate::app::frontend::skirmish_shell_render::render_saved_game_shell(state, &mut encoder, &output.texture)?;
-                    }
-                    _ => {
-                        crate::app::frontend::skirmish_shell_render::render_in_game_options_shell(
-                            state, &mut encoder, &output.texture,
-                        )?;
-                    }
-                }
+                // Its text is laid out at the Sidebar size and drawn in the
+                // window (`window_ui::shell_raster`).
+                let raster = crate::app::presentation::window_ui::shell_raster(state, true)
+                    .unwrap_or(crate::render::bit_font::TextRaster::NATIVE);
+                let frame_raster = state.renderer.bit_font.set_raster(raster);
+                let painted =
+                    Self::render_in_game_shell(state, &mut encoder, &output.texture, screen_page);
+                state.renderer.bit_font.set_raster(frame_raster);
+                painted?;
             }
             _ if screen_page == ScreenPage::InGameCard => {
                 let abort = state.match_state.match_presentation.in_game_menu
                     == crate::ui::pause_menu::InGameMenuState::AbortConfirm;
                 crate::app::frontend::status_screen::render(
                     state, &mut encoder, &view,
-                    if abort { "Leave this mission?" } else { "Menu resources unavailable" },
-                    "Required retail dialog artwork could not be loaded. Check your game installation. Full details are in logs/ra2.log.",
+                    &crate::i18n::tr(if abort {
+                        "VERA:LeaveMissionQuestion"
+                    } else {
+                        "VERA:InGameMenuUnavailable"
+                    }),
+                    &crate::i18n::tr("VERA:InGameMenuArtworkMissing"),
                     if abort {
                         crate::app::frontend::status_screen::Buttons::ABORT_CONFIRM
                     } else {
@@ -1223,7 +1279,7 @@ impl App {
                 // (`tactical_composite`). Captures and the actor observer
                 // record every draw's composite.
                 let cadence = if shell_capture.is_some()
-                    || tactical_capture.is_some()
+                    || hidden_run.is_some()
                     || state.match_state.live_network.is_some()
                     || state
                         .match_state
@@ -1251,18 +1307,29 @@ impl App {
                         .as_ref()
                         .unwrap()
                         .draw(&mut encoder, &view);
+                    crate::app::presentation::sidebar_surface::draw_window_copy(
+                        state, &mut encoder, &view,
+                    );
+                    crate::app::presentation::window_ui::draw_battlefield(
+                        state,
+                        &mut encoder,
+                        &view,
+                        render_output.software_cursor,
+                    );
                     render_output
                 } else {
                     let render_output = render::render_game(state, &mut encoder, times, cadence)?;
                     state
                         .renderer
                         .copy_game_frame_to(&mut encoder, &output.texture);
+                    render::draw_software_cursor(
+                        state,
+                        &mut encoder,
+                        &view,
+                        render_output.software_cursor,
+                    );
                     render_output
                 };
-                #[cfg(feature = "telemetry-dashboard")]
-                if let Some(phases) = game_output.phases {
-                    state.diag.render_timing.record(phases);
-                }
                 game_render_output = Some(game_output);
             }
             GameScreen::MissionResult { title, detail } => {
@@ -1321,14 +1388,15 @@ impl App {
                 }
             }
         }
-        state.renderer.fps_overlay.encode(
+        state.renderer.performance_overlay.encode(
             &state.renderer.gpu,
             &state.renderer.batch_renderer,
             &mut encoder,
             &output.texture,
+            &state.renderer.bit_font,
+            crate::app::diagnostics::performance_overlay::match_panel(state),
         );
         if state.frontend.screen == GameScreen::InGame {
-            let csf = state.process_assets.csf.as_ref();
             let status = state
                 .match_state
                 .match_diagnostics
@@ -1354,17 +1422,11 @@ impl App {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .is_ok_and(|now| now.as_secs() >= expires)
                             });
-                            Some(
-                                crate::i18n::text(
-                                    csf,
-                                    if lapsed {
-                                        "VERA:ReconnectPassLapsed"
-                                    } else {
-                                        "VERA:Reconnecting"
-                                    },
-                                )
-                                .into_owned(),
-                            )
+                            Some(crate::i18n::tr(if lapsed {
+                                "VERA:ReconnectPassLapsed"
+                            } else {
+                                "VERA:Reconnecting"
+                            }))
                         }
                         crate::net::live_commands::NetworkRecoveryStatus::CatchingUp { frames } => {
                             let key = if live.restoring_match() {
@@ -1372,20 +1434,17 @@ impl App {
                             } else {
                                 "VERA:CatchingUp"
                             };
-                            Some(crate::i18n::fill(
-                                &crate::i18n::text(csf, key),
-                                &[("frames", &frames)],
-                            ))
+                            Some(crate::i18n::tr_count(key, frames, &[]))
                         }
                     }
                 })
                 .or_else(|| {
                     crate::app::input::pause_menu::multiplayer_control(state)?
                         .status
-                        .map(|key| crate::i18n::text(csf, key).into_owned())
+                        .map(crate::i18n::tr)
                 });
             if let Some(status) = status {
-                state.renderer.fps_overlay.encode_status(
+                state.renderer.performance_overlay.encode_status(
                     &state.renderer.gpu,
                     &state.renderer.batch_renderer,
                     &mut encoder,
@@ -1403,7 +1462,11 @@ impl App {
             // central primary-client rectangle.
             apply_screen_shake(state, &mut encoder, &output.texture, offset_px);
         }
-        Self::show_os_cursor_only_without_game_cursor(state, game_render_output.is_some());
+        Self::show_os_cursor_only_without_game_cursor(
+            state,
+            event_loop,
+            game_render_output.is_some(),
+        );
 
         let entry_sequence_identity = match shell_capture.as_deref_mut() {
             Some(session) if session.is_entry_sequence() => {
@@ -1415,19 +1478,21 @@ impl App {
             _ => None,
         };
         let pending_entry_sequence = if entry_sequence_identity.is_some() {
-            Some(crate::render::frame_readback::PendingBgra8Readback::encode(
-                &state.renderer.gpu.device,
-                &mut encoder,
-                &output.texture,
-                state.renderer.gpu.config.format,
-                state.renderer.gpu.config.width,
-                state.renderer.gpu.config.height,
-            )?)
+            Some(
+                crate::render::frame_readback::PendingTextureReadback::encode(
+                    &state.renderer.gpu.device,
+                    &mut encoder,
+                    &output.texture,
+                    state.renderer.gpu.config.format,
+                    state.renderer.gpu.config.width,
+                    state.renderer.gpu.config.height,
+                )?,
+            )
         } else {
             None
         };
-        let tactical_capture_current_frame =
-            match (tactical_capture.as_deref_mut(), game_render_output.as_ref()) {
+        let hidden_run_current_frame =
+            match (hidden_run.as_deref_mut(), game_render_output.as_ref()) {
                 (Some(session), Some(render_output)) => {
                     session.observe_after_render(state, render_output)?
                 }
@@ -1439,50 +1504,76 @@ impl App {
         }
         let replay_capture_current_frame = game_render_output.is_some()
             && state.match_state.match_diagnostics.playback_capture_ready();
-        let capture_current_frame = shell_capture_current_frame
-            || tactical_capture_current_frame
-            || replay_capture_current_frame;
+        let capture_current_frame =
+            shell_capture_current_frame || hidden_run_current_frame || replay_capture_current_frame;
         let pending_capture = if capture_current_frame {
-            Some(crate::render::frame_readback::PendingBgra8Readback::encode(
-                &state.renderer.gpu.device,
-                &mut encoder,
-                &output.texture,
-                state.renderer.gpu.config.format,
-                state.renderer.gpu.config.width,
-                state.renderer.gpu.config.height,
-            )?)
+            Some(
+                crate::render::frame_readback::PendingTextureReadback::encode(
+                    &state.renderer.gpu.device,
+                    &mut encoder,
+                    &output.texture,
+                    state.renderer.gpu.config.format,
+                    state.renderer.gpu.config.width,
+                    state.renderer.gpu.config.height,
+                )?,
+            )
         } else {
             None
         };
         let pending_gate_audit = if state.platform.redraw_gate.auditing() {
-            Some(crate::render::frame_readback::PendingBgra8Readback::encode(
-                &state.renderer.gpu.device,
-                &mut encoder,
-                &output.texture,
-                state.renderer.gpu.config.format,
-                state.renderer.gpu.config.width,
-                state.renderer.gpu.config.height,
-            )?)
+            Some(
+                crate::render::frame_readback::PendingTextureReadback::encode(
+                    &state.renderer.gpu.device,
+                    &mut encoder,
+                    &output.texture,
+                    state.renderer.gpu.config.format,
+                    state.renderer.gpu.config.width,
+                    state.renderer.gpu.config.height,
+                )?,
+            )
         } else {
             None
         };
         let retail_screenshot_current_frame =
             std::mem::take(&mut state.match_state.input.retail_screenshot_requested);
         let screenshot_central_rect = shake_central_rect(state, &output.texture);
-        let pending_retail_screenshot = state
+        // Text drawn in the window (`window_ui`) is not in the frame the
+        // screenshot retains: this frame's goes over its copy.
+        let window_text = state.renderer.window_ui.drew_text();
+        let previous_composition = state
             .renderer
             .retail_screenshot_frame_cache
-            .capture_previous_if_requested(
+            .previous_composition(
                 retail_screenshot_current_frame,
+                window_text,
                 &state.renderer.gpu.device,
                 &mut encoder,
                 state.renderer.gpu.config.format,
                 state.renderer.gpu.config.width,
                 state.renderer.gpu.config.height,
                 state.renderer.upscale_pass.as_ref(),
-                &mut state.renderer.screen_presentation,
-                screenshot_central_rect,
             )?;
+        if let Some(copy) = previous_composition
+            .as_ref()
+            .and_then(|previous| previous.copy())
+            .filter(|_| window_text)
+        {
+            state
+                .renderer
+                .window_ui
+                .draw_screenshot_text(state, &mut encoder, copy);
+        }
+        let pending_retail_screenshot = previous_composition
+            .map(|previous| {
+                previous.read_back(
+                    &state.renderer.gpu.device,
+                    &mut encoder,
+                    state.renderer.gpu.config.format,
+                    &mut state.renderer.screen_presentation,
+                    screenshot_central_rect,
+                )
+            })
+            .transpose()?;
         let capture_timeout = if capture_current_frame {
             Some(if replay_capture_current_frame {
                 crate::render::screenshot::READBACK_TIMEOUT
@@ -1492,24 +1583,50 @@ impl App {
                     .expect("shell capture session exists when readback is requested")
                     .readback_timeout()?
             } else {
-                tactical_capture
+                hidden_run
                     .as_deref()
-                    .expect("tactical capture session exists when readback is requested")
+                    .expect("hidden run exists when readback is requested")
                     .readback_timeout()?
             })
         } else {
             None
         };
+        let measured_phases = game_render_output
+            .as_ref()
+            .and_then(|output| output.phases)
+            .map(|phases| (phases, Instant::now()));
+        state.renderer.gpu.timer.end_frame(&mut encoder);
         let submission = state
             .renderer
             .gpu
             .queue
             .submit(std::iter::once(encoder.finish()));
         output.present(&state.renderer.gpu.queue);
+        let presented_at = Instant::now();
+        if let Some((mut phases, handoff_started)) = measured_phases {
+            // Handing the frame to the driver: every bounded submission this
+            // frame (render_game's and any after it), then encoding the rest,
+            // submitting and presenting.
+            phases.handoff = state.renderer.terrain_draw_renderer.frame_submit_time()
+                + presented_at.duration_since(handoff_started);
+            #[cfg(feature = "telemetry-dashboard")]
+            state.diag.render_timing.record(phases);
+            state
+                .renderer
+                .performance_overlay
+                .record_render_phases(phases);
+        }
+        let battlefield = state.frontend.screen == GameScreen::InGame;
         state
             .platform
             .frame_pacer
-            .record_presented(Instant::now(), state.frontend.screen == GameScreen::InGame);
+            .record_presented(presented_at, battlefield.then_some(draw_started));
+        if battlefield {
+            state
+                .match_state
+                .network_quality
+                .record_present(presented_at);
+        }
         if let Some(completed) = state
             .match_state
             .match_diagnostics
@@ -1543,13 +1660,39 @@ impl App {
             } else {
                 [0, 0]
             });
+        // A family renderer that drew a timer-driven 0x71C frame this pass
+        // advances it now that the frame reached the screen.
+        state.frontend.shell_monitor.commit_presented();
+        state.frontend.shell_page_title.commit_presented();
+        let mut status_step = state.frontend.shell_status_line.commit_presented();
+        if let Some(page) = state.frontend.score_page.as_mut() {
+            page.commit_presented();
+        }
+        if let Some(page) = state.frontend.campaign_score_page.as_mut() {
+            page.commit_presented();
+        }
+        if let Some(ui) = state.frontend.multiplayer_setup.as_mut() {
+            status_step |= ui.statics.commit_presented();
+        }
+        let skirmish = &mut state.frontend.skirmish_shell_state;
+        status_step |= skirmish.statics.commit_presented();
+        if let Some(modal) = skirmish.choose_map_modal.as_mut() {
+            status_step |= modal.statics.commit_presented();
+        }
+        if let Some(setup) = skirmish.random_map_setup_modal.as_mut() {
+            status_step |= setup.statics.commit_presented();
+        }
         let still = crate::app::match_runtime::redraw_gate::still_frame(
             state,
-            shell_capture.is_some() || tactical_capture.is_some(),
+            shell_capture.is_some() || hidden_run.is_some(),
             runtime_pass.screen_shake_offset,
             picture_clock,
         );
-        state.platform.redraw_gate.record_presented(still);
+        let limits = crate::app::match_runtime::redraw_gate::draw_limits(state, status_step);
+        state
+            .platform
+            .redraw_gate
+            .record_presented(still, draw_started, limits);
         if let Some(readback) = pending_gate_audit {
             let pixels = readback.finish(
                 &state.renderer.gpu.device,
@@ -1560,25 +1703,6 @@ impl App {
                 .platform
                 .redraw_gate
                 .audit_presented(pixels, unchanged);
-        }
-        // A family renderer that drew a timer-driven 0x71C frame this pass
-        // advances it now that the frame reached the screen.
-        state.frontend.shell_monitor.commit_presented();
-        state.frontend.shell_page_title.commit_presented();
-        state.frontend.shell_status_line.commit_presented();
-        if let Some(page) = state.frontend.score_page.as_mut() {
-            page.commit_presented();
-        }
-        if let Some(page) = state.frontend.campaign_score_page.as_mut() {
-            page.commit_presented();
-        }
-        let skirmish = &mut state.frontend.skirmish_shell_state;
-        skirmish.statics.commit_presented();
-        if let Some(modal) = skirmish.choose_map_modal.as_mut() {
-            modal.statics.commit_presented();
-        }
-        if let Some(setup) = skirmish.random_map_setup_modal.as_mut() {
-            setup.statics.commit_presented();
         }
         if let Some(token) = pending_main_menu_entry_token.take() {
             crate::app::frontend::shell_transition::record_main_menu_entry_presented(state, token)?;
@@ -1641,10 +1765,9 @@ impl App {
                 session.complete(state, surface_format, &pixels)?;
                 session.is_terminal()
             } else {
-                tactical_capture
-                    .expect("tactical capture session exists when readback completes")
-                    .complete_after_readback(state, surface_format, &pixels)?;
-                true
+                hidden_run
+                    .expect("hidden run exists when readback completes")
+                    .complete_after_readback(state, surface_format, &pixels)?
             };
             if capture_terminal {
                 event_loop.exit();

@@ -110,11 +110,12 @@ pub(crate) enum AttackAction {
     AttackSupport,
 }
 
-/// The allied-object part of Techno6FFEC0's unforced attack admission,
-/// 700314..7003D4. All consumers ask this through the existing action owner.
+/// Techno6FFEC0's disguise and real-owner admission,70025D..70041E.
+/// Native friendly-attack grants also override a disguise refusal.
+/// All consumers ask this through the existing action owner.
 /// IsAlly reads the real owner and the asking House's directional mask;
 /// display friendliness alone cannot decide whether to attack or select.
-fn friendly_attack_is_admitted(
+fn object_attack_is_admitted(
     sim: &crate::sim::world::Simulation,
     rules: &crate::rules::ruleset::RuleSet,
     actor_id: u64,
@@ -126,8 +127,8 @@ fn friendly_attack_is_admitted(
         return false;
     };
     let Some(target) = sim.entities().get(target_id) else {
-        // House4F9A90 sees Terrain's null owner (Object4104A0), so
-        // the allied-only restrictions do not apply to a real Terrain.
+        // Terrain has no House (Object4104A0) and IsDisguisedTo426430
+        // returns false. Neither restriction applies to a real Terrain.
         return crate::sim::movement::ground_pose::target_get_coords(
             TargetKind::Entity(target_id),
             sim,
@@ -135,12 +136,33 @@ fn friendly_attack_is_admitted(
         )
         .is_some();
     };
-    if !combat_weapon::is_ally_by_object(
+    let allied = combat_weapon::is_ally_by_object(
         Some(sim.house_alliances()),
         sim.interner(),
         actor.owner(),
         target.owner(),
-    ) {
+    );
+    //70025D..70030F: this is the firing blink, not the reacquisition timer.
+    let disguise_admitted = rules.general.attack_cursor_on_disguise
+        || sim
+            .interner()
+            .object_type(target.type_ref(), rules)
+            .is_some_and(|target_type| target_type.perma_disguise)
+        || target
+            .disguise
+            .as_ref()
+            .is_some_and(|disguise| disguise.blink_remaining(sim.session().binary_frame()) != 0)
+        || !target.is_disguised_to(
+            actor.owner(),
+            Some(sim.fog()),
+            Some(sim.house_alliances()),
+            sim.interner(),
+        )
+        || (target
+            .disguise_house(true, sim.session().current_house(), false)
+            .is_none()
+            && sim.fires_at_terrain(actor_id, &TargetKind::Entity(target_id), rules, None));
+    if !allied && disguise_admitted {
         return true;
     }
     let Some(kind) = sim.interner().object_type(actor.type_ref(), rules) else {
@@ -240,24 +262,11 @@ fn object_target_is_legal(
 /// in tools/spatial_oracle/bunker_attack_action.json.
 ///
 /// The real-owner ally gate and its shared weapon/type grants are handled by
-/// [`friendly_attack_is_admitted`]. A different allied House therefore takes
+/// [`object_attack_is_admitted`]. A different allied House therefore takes
 /// the identity-sensitive tail, then the existing class postprocessing.
 ///
-/// Unforced, an object target must pass [`object_target_is_legal`].
-///
-/// RESIDUAL (#605): the rest of admission (`0x00700255..0x0070043E`) is not
-/// ported as one gate. Unforced, native also leaves the rung for:
-/// - an object disguised to the actor's house (vt+0xC8), unless that grant
-///   holds, `[Rules+0xD6C]` is set, its type is `PermaDisguise=` (`+0xD30`),
-///   its `+0x1EC`/`+0x1F4` timer runs, or it wears no house (vt+0xD0) and the
-///   weapon may fire at terrain (vt+0x398, `0x0070EF00`, `TerrainFire=`).
-///
-/// DORMANT: `[Rules+0xD6C]` is `AttackCursorOnDisguise=` ([General], stored
-/// at `0x0066FC50`), which retail RULESMD sets to yes, so the grant always
-/// holds and retail never reaches the disguise refusal (SPY also authors
-/// `PermaDisguise=yes`). Trigger: a rules or map layer setting it to no, then
-/// an unforced hover or click over a disguised Spy or Mirage. Effect: VERA
-/// may answer Attack where native's rung refuses and the tail answers.
+/// Unforced, an object target must pass [`object_target_is_legal`] and
+/// [`object_attack_is_admitted`]. Both cursor and click use that answer.
 ///
 /// [`Simulation::cell_attack_rung_admits`]: crate::sim::world::Simulation::cell_attack_rung_admits
 pub(crate) fn attack_action(
@@ -467,10 +476,8 @@ pub(crate) fn attack_action(
                 rules,
                 sim.interner(),
             )
-            && (weapon
-                .projectile
-                .as_deref()
-                .and_then(|name| rules.projectile(name))
+            && (rules
+                .weapon_projectile(weapon)
                 .is_some_and(|projectile| !projectile.ag)
                 || kind.emp_pulse_cannon
                 || actor.mission.current().known()
@@ -534,7 +541,7 @@ pub(super) fn base_action(
             human
                 && (armed || infiltrator)
                 && (forced
-                    || (friendly_attack_is_admitted(sim, rules, actor_id, *target_id)
+                    || (object_attack_is_admitted(sim, rules, actor_id, *target_id)
                         && object_target_is_legal(sim, rules, actor_id, *target_id)))
         }
         TargetKind::Cell(..) => human,
@@ -836,6 +843,8 @@ pub(crate) fn resolved_unit_in_range(
                 overlay_grid: sim.overlay_grid(),
                 overlay_registry,
                 alliances: Some(sim.house_alliances()),
+                #[cfg(feature = "ares")]
+                buildings: Some(crate::sim::combat::line_of_fire::CellBuildings::of(sim)),
             },
             selection_target,
         );
@@ -1489,8 +1498,7 @@ fn finish_order(
                 .as_mut()
                 .map(|rt| &mut rt.simulation)
             {
-                let network = sim.session().game_mode().is_network();
-                accepted = sim.issue_local_commands(encoded) || !network;
+                accepted = sim.issue_local_commands(encoded);
             }
             if accepted {
                 if let Some(speaker_id) = speaker_id {
@@ -1507,6 +1515,8 @@ fn finish_order(
     // LeftUp4ABF78..4ABF8E refuses before dispatch; admitted clicks announce
     // after the append attempt, including a full OutList or a missed search
     // (4439DC/443A89 ->443A2B..443A69). Source: original gamemd.exe.
+    // Sim-scale deviation: a click VERA's larger queue refuses is not
+    // admitted, so it does not announce.
     if admitted && rally_announce {
         crate::app::input::dispatch::push_local_eva(
             state,
@@ -3334,6 +3344,7 @@ fn self_deploy_is_blocked(
             && object.passengers > 0
             && !object.is_simple_deployer
             && entity.bunker.link().installed_in().is_none()
+            && !object.no_manual_unload()
             && entity
                 .passenger_role
                 .cargo()
@@ -3567,12 +3578,34 @@ fn self_action(
             entity_id: target.stable_id,
         });
     }
+    // Ares 3.0 `NoManualUnload`: Unit What_Action leaves an unbunkered
+    // transport's self arm with action 0 (1004BEF0, hook 0x740031 ->
+    // 0x740115) ahead of its empty-hold NoDeploy (`self_deploy_is_blocked`),
+    // and Aircraft What_Action its Self (10048A90, hook 0x417DD2 -> 0x417DF4).
+    if obj.is_some_and(|object| {
+        object.no_manual_unload()
+            && match entity.category() {
+                EntityCategory::Unit => object.passengers > 0 && !object.is_simple_deployer,
+                EntityCategory::Aircraft => true,
+                _ => false,
+            }
+    }) {
+        return None;
+    }
     // Building447286..4472E7's gap rung precedes its cargo rungs; its Self
     // click queues Unload443514, which toggles the super-charge. Residual:
     // a type both GapGenerator= and a factory would also take the primary
     // tail4472EC and Event17 (44345F); no retail type is both.
     if let Some(offered) = sim.gap_generator_self_action(target.stable_id, rules) {
         return offered.then_some(Command::UnloadPassengers {
+            transport_id: target.stable_id,
+        });
+    }
+    // Ares 3.0 100173A0 (hook 0x44731C): a tunnel entrance with its
+    // owner's network loaded offers the unload action.
+    #[cfg(feature = "ares")]
+    if sim.ares_tunnel_offers_unload(target.stable_id, rules) {
+        return Some(Command::UnloadPassengers {
             transport_id: target.stable_id,
         });
     }
@@ -3834,7 +3867,19 @@ fn entry_orders(
         let mission = match action {
             crate::sim::world::EntryClickAction::Enter => crate::sim::mission::MissionType::Enter,
             crate::sim::world::EntryClickAction::Grind => crate::sim::mission::MissionType::Eaten,
-            crate::sim::world::EntryClickAction::NoEnter => return false,
+            crate::sim::world::EntryClickAction::NoEnter
+            | crate::sim::world::EntryClickAction::Nothing => return false,
+            // Aircraft ClickedAction (`0x00417BD0`) case 0x11:
+            // Player_Assign_Mission(Move, NULL, unit).
+            crate::sim::world::EntryClickAction::Tote => {
+                if sim.techno_player_controllable(id, rules) {
+                    orders.push(Command::MoveToObject {
+                        entity_id: id,
+                        target_id: hover.stable_id,
+                    });
+                }
+                return false;
+            }
         };
         if sim.techno_player_controllable(id, rules) {
             orders.push(Command::MegaMission {
@@ -3929,7 +3974,8 @@ fn engineer_capture_orders(
                         destination: Some(TargetKind::Entity(hover.stable_id)),
                     });
                 }
-                EngineerBuildingAction::Repair(false) => {}
+                // Ares NoEnter (10025220) gives no order either.
+                EngineerBuildingAction::Repair(false) | EngineerBuildingAction::NoEnter => {}
             }
         }
         false
@@ -4175,7 +4221,9 @@ fn disarm_bomb_engineers(
         .entities()
         .get(target)
         .is_some_and(|entity| entity.bomb.is_some());
-    if !bombed || !sim.bomb_seen_by(target, player) {
+    // Ares InfantryClass_GetActionOnObject2 (10056C00, hook 0x51E488) skips
+    // a bomb that is not `IvanBomb.Detachable`.
+    if !bombed || !sim.bomb_detachable(target, rules) || !sim.bomb_seen_by(target, player) {
         return Vec::new();
     }
     selected
@@ -4408,11 +4456,22 @@ fn shot_is_illegal(
                 .and_then(|object| sim.interner().object_type(object.type_ref(), rules)),
         )
         .is_some_and(|(infantry, building)| {
-            (if infantry.agent {
-                building.spyable
-            } else {
-                building.capturable
-            }) || (infantry.c4 && building.can_c4)
+            // Ares 3.0 100261F0 (hook 0x007004AD): any action of the shared
+            // classification keeps the rung.
+            #[cfg(feature = "ares")]
+            {
+                let _ = (infantry, building);
+                sim.infiltrate_action(actor_id, target_id, rules)
+                    != crate::sim::world::InfiltrateAction::None
+            }
+            #[cfg(not(feature = "ares"))]
+            {
+                (if infantry.agent {
+                    building.spyable
+                } else {
+                    building.capturable
+                }) || (infantry.c4 && building.can_c4)
+            }
         });
     !infiltrate_arm
         && sim.effective_shared_cell_dummy().detached(|| {
@@ -4673,7 +4732,10 @@ fn building_object_release(
     force_move_key: bool,
 ) -> LeftRelease {
     if cursor_owner(sim, rules, current_objects, target_id).is_some_and(|best| {
-        receivers.contains(&best) && building_moves_over_object(sim, rules, best, force_move_key)
+        receivers.contains(&best)
+            && (building_moves_over_object(sim, rules, best, force_move_key)
+                // Ares 3.0 100171B0 (hook 0x44725F): the trench Enter.
+                || ares_trench_enter(sim, rules, best, target_id))
     }) {
         return LeftRelease::Dispatch;
     }
@@ -4725,6 +4787,17 @@ fn building_object_orders(
         else {
             continue;
         };
+        // Ares 3.0 10016F60 (hook 0x443414): a building whose action over
+        // the building is the trench Enter (100171B0, hook 0x44725F) raises
+        // TrenchRedirectClick (0x60, RaiseTrenchRedirectClick 1006A170)
+        // with that building's Cell, and sends nothing else.
+        #[cfg(feature = "ares")]
+        if ares_trench_enter(sim, rules, id, target) {
+            if let Some(record) = sim.encode_ares_trench_redirect_record(id, cell) {
+                orders.push(Command::SynchronizedRecord { record });
+            }
+            continue;
+        }
         if !building_moves_over_object(sim, rules, id, force_move_key) {
             continue;
         }
@@ -4763,6 +4836,27 @@ fn building_object_orders(
         }
     }
     (orders, announce)
+}
+
+/// Ares 3.0 BuildingClass_GetActionOnObject_TargetABuilding (`100171B0`,
+/// hook `0x44725F`): the building `id` answers Enter over the building
+/// `target` when its occupants may traverse there (canTraverseTo
+/// `10011690`). Default builds have no such action.
+fn ares_trench_enter(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    id: u64,
+    target: u64,
+) -> bool {
+    #[cfg(feature = "ares")]
+    {
+        sim.ares_can_traverse_to(id, target, rules)
+    }
+    #[cfg(not(feature = "ares"))]
+    {
+        let _ = (sim, rules, id, target);
+        false
+    }
 }
 
 fn selected_rally_producer_ids(
@@ -8443,6 +8537,10 @@ mod retail_garrison_tests;
 #[cfg(test)]
 #[path = "context_order_retail_entry_tests.rs"]
 mod retail_entry_tests;
+
+#[cfg(test)]
+#[path = "disguise_cursor_tests.rs"]
+mod disguise_cursor_tests;
 
 #[cfg(test)]
 #[path = "context_order_retail_terrain_tests.rs"]

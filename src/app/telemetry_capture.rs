@@ -104,12 +104,9 @@ pub fn capture_snapshot(state: &AppState) -> Option<TelemetrySnapshot> {
             })
             .map(|name| bounded_text(name, TELEMETRY_MAX_NAME_BYTES));
     }
-    let speed = runtime
-        .simulation
-        .session()
-        .game_options()
-        .game_speed
-        .clamp(0, 6) as u8;
+    let speed = crate::sim::game_options::clamp_game_speed(
+        runtime.simulation.session().game_options().game_speed,
+    );
     let mut timing =
         state
             .match_state
@@ -126,6 +123,17 @@ pub fn capture_snapshot(state: &AppState) -> Option<TelemetrySnapshot> {
         .telemetry_tick_rate
         .rate(crate::util::time::Instant::now());
     snapshot.timing = Some(timing);
+    snapshot.network =
+        state
+            .match_state
+            .network_quality
+            .live()
+            .map(|live| crate::sim::telemetry::NetworkSample {
+                backlog_frames: live.backlog_frames,
+                catching_up: live.catching_up,
+                skipped_draws: live.skipped_draws,
+                relay_slowed: live.relay_slowed,
+            });
     let sim = &runtime.simulation;
     snapshot.session = Some(SessionContext {
         map_name: bounded_text(sim.session().map_name(), TELEMETRY_MAX_NAME_BYTES),

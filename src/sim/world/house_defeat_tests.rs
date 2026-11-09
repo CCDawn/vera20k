@@ -312,6 +312,20 @@ fn network_completion_keeps_shared_house_results_and_only_local_exit_and_vox() {
 }
 
 #[test]
+fn network_match_winners_are_the_humans_the_completion_flags_to_win() {
+    let rules = rules(3);
+    let (mut sim, owners) = network_result_world(1);
+    assert_eq!(sim.network_match_winners(), None);
+    sim.houses
+        .get_mut(&owners[1])
+        .unwrap()
+        .tracking_mut()
+        .set_for_test(0, &[], (0, 0, 0), &[]);
+    sim.check_defeat(Some(&rules), None);
+    assert_eq!(sim.network_match_winners(), Some(vec![owners[0]]));
+}
+
+#[test]
 fn network_country_result_actions_keep_each_human_decision_in_both_views() {
     use crate::sim::house_state::HouseOutcomeKind;
     let rules = rules(3);
@@ -1365,4 +1379,58 @@ fn battle_form_defeats_a_wiped_wave_house_defense_form_holds_it() {
     sim.check_defeat(Some(&rules), None);
     assert!(!sim.houses[&owners[0]].is_defeated());
     assert!(!sim.houses[&owners[1]].is_defeated());
+
+/// Ares 3.0 `10024150` (hook `0x004FC731`): with `ReturnStructures=yes`, a
+/// tech building captured from a passive house goes back to it, without its
+/// engineer and disabled, instead of dying with its holder's Blowup_All;
+/// `Returnable=no` keeps the original death.
+#[cfg(feature = "ares")]
+#[test]
+fn ares_blowup_returns_a_captured_tech_building_to_its_passive_owner() {
+    for (returnable, returned) in [("", true), ("Returnable=no\n", false)] {
+        let rules = RuleSet::from_ini(&IniFile::from_str(&format!(
+            "[General]\nReturnStructures=yes\n[CombatDamage]\nC4Warhead=Super\n\
+             [Warheads]\n0=Super\n\
+             [Super]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n\
+             [BuildingTypes]\n0=OIL\n[OIL]\nStrength=1000\nNeedsEngineer=yes\n{returnable}"
+        )))
+        .unwrap();
+        let (mut sim, houses) = sim_with_houses(&[0, 1]);
+        sim.houses
+            .get_mut(&houses[1])
+            .unwrap()
+            .set_multiplay_passive_for_test(true);
+        let oil = sim
+            .spawn_object_at_height("OIL", "house1", 10, 10, 0, 0, &rules)
+            .unwrap();
+        sim.change_owner_with_rules(oil, houses[0], &rules, None, Default::default());
+        assert!(
+            sim.substrate
+                .entities
+                .get(oil)
+                .unwrap()
+                .building_has_engineer
+                .is_set()
+        );
+
+        sim.house_blowup(
+            houses[0],
+            super::HouseBlowupSubset::All,
+            &rules,
+            None,
+            Default::default(),
+        );
+        let building = sim
+            .substrate
+            .entities
+            .get(oil)
+            .filter(|building| building.health.current() > 0);
+        assert_eq!(building.is_some(), returned, "{returnable:?}");
+        if let Some(building) = building {
+            assert_eq!(building.owner(), houses[1]);
+            assert_eq!(building.health.current(), 1000);
+            assert!(!building.building_has_engineer.is_set());
+            assert!(!building.building_art.stuff_enabled());
+        }
+    }
 }

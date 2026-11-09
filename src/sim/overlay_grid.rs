@@ -1729,6 +1729,7 @@ fn recompute_wall_connectivity_target(
         let connects = match crate::sim::cell_kernel::wall_connection_step(
             neighbor_id.map_or(-1, i32::from),
             i32::from(overlay_id),
+            Some(registry),
         ) {
             crate::sim::cell_kernel::WallConnectionStep::Return(connected) => connected,
             // Existing residual: this cleanup view does not implement native
@@ -2778,7 +2779,8 @@ NoUseTileLandType=yes
         );
         let registry = OverlayTypeRegistry::from_ini(&ini, None);
         let water_costs = SpeedCostProfile {
-            wheel: Some(0),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
             ..Default::default()
         };
 
@@ -2817,7 +2819,8 @@ NoUseTileLandType=yes
         let registry = OverlayTypeRegistry::empty();
         let mut overlay_grid = OverlayGrid::new(1, 1);
         let zero_wheel = SpeedCostProfile {
-            wheel: Some(0),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
             ..Default::default()
         };
 
@@ -2842,7 +2845,8 @@ NoUseTileLandType=yes
         let registry = gsi_04_04_registry();
         let clear = LandType::Clear.as_index();
         let clear_speed = SpeedCostProfile {
-            wheel: Some(100),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
             ..Default::default()
         };
 
@@ -2871,7 +2875,8 @@ NoUseTileLandType=yes
         }
 
         let zero_wheel = SpeedCostProfile {
-            wheel: Some(0),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
             ..Default::default()
         };
         let mut overlay_grid = OverlayGrid::new(1, 1);
@@ -2909,7 +2914,8 @@ NoUseTileLandType=yes
             (2, zone_class::GROUND),
         ] {
             let speed = SpeedCostProfile {
-                wheel: Some(wheel),
+                wheel: Some(crate::rules::terrain_rules::test_speed_percent(wheel)),
+                winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
                 ..Default::default()
             };
             let mut terrain = single_cell_terrain(clear, speed, false);
@@ -2949,7 +2955,8 @@ NoUseTileLandType=yes
 
         let registry = gsi_04_04_registry();
         let base_speed = SpeedCostProfile {
-            wheel: Some(100),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
             ..Default::default()
         };
 
@@ -3006,7 +3013,8 @@ NoUseTileLandType=yes
 
         let registry = gsi_04_04_registry();
         let base_speed = SpeedCostProfile {
-            wheel: Some(100),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
             ..Default::default()
         };
         let ordinary_ore_speed = registry
@@ -3123,13 +3131,14 @@ NoUseTileLandType=yes
         // Install a distinct Tiberium-mode speed profile so we can prove the
         // round-trip actually copies it (not the same default).
         let tib_speed = SpeedCostProfile {
-            foot: Some(90),
-            track: Some(70),
-            wheel: Some(100),
-            float: Some(100),
-            amphibious: Some(100),
-            float_beach: Some(100),
-            hover: Some(100),
+            foot: Some(crate::rules::terrain_rules::test_speed_percent(90)),
+            track: Some(crate::rules::terrain_rules::test_speed_percent(70)),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            float: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            amphibious: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            float_beach: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            hover: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
         };
         let mut overlay_grid = OverlayGrid::new(10, 10);
         let tib_lt = LandType::Tiberium.as_index();

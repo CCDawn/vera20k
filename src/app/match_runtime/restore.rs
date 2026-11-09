@@ -132,6 +132,13 @@ pub(crate) fn commit_prepared_load(
         map,
         committed.presentation,
     );
+    // Load_Game's Set_View_Dimensions (`0x0067E7F9`): Init `0x005D3A60`
+    // deletes every row and an open edit, and SetWidth `0x005D4AD0` leaves
+    // the list tactical_w − 8 wide.
+    let tactical_w = crate::app::input::camera::tactical_viewport_size(state).0 as i32;
+    let message_list = &mut state.match_state.match_presentation.message_list;
+    *message_list = crate::ui::messages::MessageList::scenario();
+    message_list.set_width(tactical_w);
     state
         .match_state
         .match_presentation
@@ -229,6 +236,10 @@ pub(crate) fn commit_prepared_load(
 
     // Reset pacing, not saved simulation input delay or elapsed score time.
     state.platform.frame_pacer.reset_for_new_world();
+    state
+        .match_state
+        .network_quality
+        .reset(state.platform.frame_pacer.total_render_deferrals());
     crate::app::presentation::sidebar_render::refresh_sidebar_projection(state);
     // The incoming chrome owns the footer allowance; refresh its layout
     // before initializing derived geometry, including on a cold/different-side

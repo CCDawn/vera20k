@@ -56,7 +56,7 @@ impl App {
     /// Main_Game returns past the router without 0x00686570's EVA and fades
     /// (0x0064806C..0x006482A6, 0x0055D347).
     pub(super) fn return_disconnected_to_main_menu(state: &mut AppState) {
-        Self::record_external_match_result(state, super::cncnet::ExternalMatchResult::Disconnected);
+        Self::record_match_result(state, super::cncnet::ExternalMatchResult::Disconnected);
         #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
         Self::browser_match_ended(state, super::cncnet::ExternalMatchResult::Disconnected);
         Self::return_to_main_menu(state);
@@ -257,6 +257,9 @@ impl App {
             return;
         }
         state.platform.window_active = active;
+        if active {
+            state.platform.clear_attention();
+        }
         let movie_active = crate::app::radar_movie::playback_active(state);
         state
             .match_state
@@ -588,10 +591,7 @@ impl App {
         if crate::app::commander_feedback::verdict_is_waiting_for_clip(state) {
             let wall_ms = crate::app::match_runtime::frame_pacer::wall_clock_ms();
             crate::app::commander_feedback::skip_verdict_clip(state, wall_ms);
-            Self::enter_in_game_menu_state(
-                state,
-                crate::ui::pause_menu::InGameMenuState::Closed,
-            );
+            Self::enter_in_game_menu_state(state, crate::ui::pause_menu::InGameMenuState::Closed);
             return;
         }
         log::info!("Abort Mission confirmed — queueing EXIT event");
@@ -677,7 +677,7 @@ impl App {
         // Abort is the independent EXIT-event route: it never inherits the
         // victory/defeat HouseClass SavourDelay or its outcome-voice wait.
         state.match_state.scenario_outcome = None;
-        Self::record_external_match_result(state, super::cncnet::ExternalMatchResult::Quit);
+        Self::record_match_result(state, super::cncnet::ExternalMatchResult::Quit);
         //686570 clears the movie queue before its independent audio fade.
         crate::app::radar_movie::retire(state, wall_ms);
         crate::app::commander_feedback::retire(state);
@@ -689,16 +689,16 @@ impl App {
         // audio master, bounds its voice pump to 300 timer buckets, and
         // finally hard-stops audio.
         state.audio.fade_out_theme(wall_ms);
-        let destination = Self::aborted_score_destination(state, elapsed_seconds).unwrap_or(
-            crate::app::match_runtime::scenario_exit::ScenarioExitDestination::MainMenu,
-        );
+        let destination = Self::aborted_score_destination(state, elapsed_seconds)
+            .unwrap_or(crate::app::match_runtime::scenario_exit::ScenarioExitDestination::MainMenu);
         let showed_score = !matches!(
             &destination,
             crate::app::match_runtime::scenario_exit::ScenarioExitDestination::MainMenu
         );
         let mut scenario_exit =
             crate::app::match_runtime::scenario_exit::ScenarioExitCascade::start(
-                wall_ms, destination,
+                wall_ms,
+                destination,
             );
         if showed_score {
             scenario_exit = scenario_exit.with_battle_control_terminated();
@@ -743,9 +743,8 @@ impl App {
             crate::app::match_runtime::scenario_exit::ScenarioExitDestination::Score {
                 title: crate::app::match_runtime::scenario_exit::outcome_title(
                     crate::sim::house_state::HouseOutcomeKind::Defeat,
-                )
-                .to_string(),
-                detail: "You left the battle.".to_string(),
+                ),
+                detail: crate::i18n::tr("VERA:YouLeftTheBattle"),
                 model: crate::app::match_runtime::sim_tick::build_aborted_score_screen_model(
                     state,
                     elapsed_seconds,

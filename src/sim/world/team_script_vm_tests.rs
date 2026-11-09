@@ -315,9 +315,6 @@ fn team_lookup_ordinary_ai_recruits_and_moves_first_name() {
             .bind_native_rules_receipt(receipt, &launch, &rules)
             .unwrap();
         rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
-        rules.bind_animation_sequences(
-            &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-        );
         let registry = TeamAiIniRegistry::from_sources(&fixed, &map.ini, true);
         // Use the production prefix admission for both RNG and native IDs;
         // the controlled terrain and named House are installed below.
@@ -496,6 +493,38 @@ fn production_install_refuses_fixed_resolution_loss_but_keeps_scenario_omissions
         (2, 1, 1, 1),
         "scenario-origin omissions remain diagnosed, nonfatal overlays"
     );
+}
+
+#[test]
+fn fixed_trigger_naming_an_absent_team_type_installs_without_a_team() {
+    let rules = RuleSet::from_ini(&IniFile::from_str(
+        "[InfantryTypes]\n0=E1\n[E1]\nStrength=100\n",
+    ))
+    .expect("minimal rules");
+    let comparison = zero_ai_trigger_comparison();
+    let fixed = IniFile::from_str(&format!(
+        "[AITriggerTypes]\nA=Dangling,NO_SUCH_TT,<all>,2,4,<none>,{comparison},40,10,40,1,0,1,0,<none>,1,1,1\n"
+    ));
+    let registry = TeamAiIniRegistry::from_sources(&fixed, &IniFile::from_str(""), true);
+    let mut sim = Simulation::new();
+    sim.intern_rule_type_ids(&rules);
+    sim.resolve_type_handles(&rules);
+
+    let diagnostics = sim
+        .install_team_ai_registry(&registry, &rules)
+        .expect("a fixed trigger's absent TeamType does not refuse the install");
+
+    assert_eq!(
+        diagnostics,
+        vec![TeamAiInstallDiagnostic::MissingAiTriggerTeamType {
+            trigger_id: "A".to_string(),
+            team_type_id: "NO_SUCH_TT".to_string(),
+            source: TeamAiDefinitionSource::FixedAimd,
+        }]
+    );
+    let vm = &sim.team_script_vm;
+    let trigger = vm.ai_trigger(vm.ai_trigger_order()[0]).unwrap();
+    assert_eq!(trigger.primary_team_type, None);
 }
 
 #[test]
@@ -933,6 +962,10 @@ fn a_computer_team_waits_on_its_charging_iron_curtain() {
 /// centre (11,10) and its Chrono Warp at the plant's cell, and the warp
 /// carries each member from the source block to the same place in the
 /// destination block, beside the plant.
+// Stock case 4 forces a Unit's track to its destination; installed Ares's
+// SW_ChronoWarp lambda (1006F4D0) forces it to the Unit's own coordinates,
+// which leaves the Drive's destination at the source block after the warp.
+#[cfg(not(feature = "ares"))]
 #[test]
 fn a_computer_team_chronoshifts_onto_the_enemy_power_plant() {
     let (mut sim, rules, team_id, members, [_, bigger]) = super_team_fixture("0=57,9\n1=49,0");
@@ -972,4 +1005,51 @@ fn a_computer_team_chronoshifts_onto_the_enemy_power_plant() {
             "member {member} arrived beside the plant"
         );
     }
+}
+
+/// Ares TeamClass_GatherAtFriendlyBase_Distance (1003A2A0, hook 0x6EFB69):
+/// action 54 regroups its argument plus `AIFriendlyDistance` (else
+/// `AISafeDistance`) cells from the base towards the enemy's, and action 53
+/// (1003A270, hook 0x6EF8A1) gathers its argument plus `AISafeDistance`
+/// from the enemy's base: each lands where the same total distance alone
+/// does, and not where `AISafeDistance` alone does.
+#[cfg(feature = "ares")]
+#[test]
+fn ares_gather_actions_add_their_argument_to_the_distance() {
+    let target = |general: &str, script: &str| {
+        let (mut sim, rules, team_id, _, _) = team_fixture(
+            &format!(
+                "[General]\n{general}\
+                 [InfantryTypes]\n0=E1\n[E1]\nStrength=100\nSpeed=4\n\
+                 Locomotor={{4A582744-9839-11D1-B709-00A024DDAFD1}}\n\
+                 [BuildingTypes]\n0=PLANTA\n1=PLANTB\n\
+                 [PLANTA]\nStrength=750\nPower=100\nFoundation=2x2\n\
+                 [PLANTB]\nStrength=750\nPower=200\nFoundation=2x2\n"
+            ),
+            "E1",
+            [("PLANTA", 18, 8), ("PLANTB", 18, 13)],
+            script,
+        );
+        for _ in 0..300 {
+            sim.advance_tick(&[], Some(&rules), None, None, 67);
+            if let Some(target) = sim
+                .team_script_vm
+                .team(team_id)
+                .and_then(|team| team.mission_target_for_test())
+            {
+                return target;
+            }
+        }
+        panic!("{script} assigns no mission target");
+    };
+    let regroup = target("AISafeDistance=4\nAIFriendlyDistance=3\n", "0=54,2");
+    assert_eq!(regroup, target("AISafeDistance=5\n", "0=54,0"));
+    assert_ne!(regroup, target("AISafeDistance=4\n", "0=54,0"));
+    assert_eq!(
+        target("AISafeDistance=4\n", "0=54,1"),
+        target("AISafeDistance=5\n", "0=54,0")
+    );
+    let gather = target("AISafeDistance=3\nAIFriendlyDistance=9\n", "0=53,2");
+    assert_eq!(gather, target("AISafeDistance=5\n", "0=53,0"));
+    assert_ne!(gather, target("AISafeDistance=3\n", "0=53,0"));
 }

@@ -16,6 +16,7 @@
 //!   render/vxl_raster (software rendering).
 //! - Reads from sim/ via EntityStore iteration (GameEntity fields).
 
+use crate::util::lookup_hash::LookupMap;
 use crate::util::time::Instant;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -188,14 +189,22 @@ pub(crate) struct UnitAtlasPageStatistics {
 pub struct UnitAtlas {
     /// Lossless texture pages containing all unit sprites.
     pub pages: Vec<UnitAtlasPage>,
-    /// Lookup: (type_id, facing, frame) → UV rectangle + offset data.
-    entries: HashMap<UnitSpriteKey, UnitSpriteEntry>,
+    /// Lookup: (type_id, facing, frame) → UV rectangle + offset data. Every
+    /// drawn unit piece looks its sprite up here.
+    entries: LookupMap<UnitSpriteKey, UnitSpriteEntry>,
     /// HVA frame counts per (type_id, layer, turret_index). Missing entries have 1 frame.
     /// A draw takes its HVA frame as `Foot+0x538` modulo the model's count.
     pub frame_counts: BTreeMap<(String, VxlLayer, i32), u32>,
     /// Palette indices of every resident sprite; native shadow masks are
     /// composed from them.
     rendered_cache: Vec<CachedUnitSprite>,
+    /// Each resident sprite's index in `rendered_cache`, by key and by atlas
+    /// placement, so shadow composition ([`Self::stamp_shadow_part`],
+    /// [`Self::masked_shadow`]) finds its source without walking every
+    /// sprite. The cache is the truth: it only grows, through
+    /// [`Self::append_sprites`], or is replaced whole by
+    /// [`Self::set_rendered_cache`], and both keep this index.
+    rendered_index: RenderedIndex,
     /// How many sprites the last build or refresh rendered.
     pub rendered: u32,
     /// First eligible composed-body mask for each supported shadow key, with
@@ -409,12 +418,13 @@ impl UnitAtlas {
         self.page(page).map(|atlas_page| &atlas_page.texture)
     }
 
-    fn new(pages: Vec<UnitAtlasPage>, entries: HashMap<UnitSpriteKey, UnitSpriteEntry>) -> Self {
+    fn new(pages: Vec<UnitAtlasPage>, entries: LookupMap<UnitSpriteKey, UnitSpriteEntry>) -> Self {
         Self {
             pages,
             entries,
             frame_counts: BTreeMap::new(),
             rendered_cache: Vec::new(),
+            rendered_index: RenderedIndex::default(),
             rendered: 0,
             shadow_masks: Default::default(),
             pool_bytes: HashMap::new(),
@@ -473,10 +483,13 @@ impl UnitAtlas {
             let page_size = [texture.width, texture.height];
             for (origin, sprite) in group.sprites {
                 let entry = unit_entry(&sprite, origin, group.page, page_size);
-                self.entries.insert(sprite.key.clone(), entry);
+                if let Some(old) = self.entries.insert(sprite.key.clone(), entry) {
+                    self.rendered_index.by_place.remove(&sprite_place(&old));
+                }
                 self.pool_bytes
-                    .insert(sprite.key.clone(), sprite.pool_bytes());
+                    .insert(sprite.key.clone(), sprite.pool_bytes);
                 self.rendered_cache.push(sprite);
+                self.index_rendered(self.rendered_cache.len() - 1);
             }
         }
         for sprite in unplaced {
@@ -487,6 +500,66 @@ impl UnitAtlas {
                 sprite.height,
             );
         }
+    }
+}
+
+/// [`UnitAtlas::rendered_index`]: the first resident sprite of each key, and
+/// of each placement its key's entry currently names.
+#[derive(Default)]
+struct RenderedIndex {
+    by_key: HashMap<UnitSpriteKey, usize>,
+    by_place: HashMap<SpritePlace, usize>,
+}
+
+/// An atlas rectangle: page, UV origin and UV size, compared bit for bit.
+type SpritePlace = (usize, [u32; 2], [u32; 2]);
+
+fn sprite_place(entry: &UnitSpriteEntry) -> SpritePlace {
+    (
+        entry.page,
+        entry.uv_origin.map(f32::to_bits),
+        entry.uv_size.map(f32::to_bits),
+    )
+}
+
+impl UnitAtlas {
+    /// Replace the resident sprites' pixels whole and index them.
+    fn set_rendered_cache(&mut self, rendered: Vec<CachedUnitSprite>) {
+        self.rendered_cache = rendered;
+        self.rendered_index = RenderedIndex::default();
+        for index in 0..self.rendered_cache.len() {
+            self.index_rendered(index);
+        }
+    }
+
+    /// Index `rendered_cache[index]` under its key and its key's placement,
+    /// keeping the first sprite of each, as a walk in cache order finds it.
+    fn index_rendered(&mut self, index: usize) {
+        let key = &self.rendered_cache[index].key;
+        let first = *self
+            .rendered_index
+            .by_key
+            .entry(key.clone())
+            .or_insert(index);
+        if let Some(entry) = self.entries.get(key) {
+            self.rendered_index
+                .by_place
+                .entry(sprite_place(entry))
+                .or_insert(first);
+        }
+    }
+
+    /// The first resident sprite with `key`.
+    fn rendered_by_key(&self, key: &UnitSpriteKey) -> Option<&CachedUnitSprite> {
+        let index = *self.rendered_index.by_key.get(key)?;
+        Some(&self.rendered_cache[index])
+    }
+
+    /// The first resident sprite whose key's entry is placed at `part`'s
+    /// page and UV rectangle.
+    fn rendered_by_place(&self, part: &UnitSpriteEntry) -> Option<&CachedUnitSprite> {
+        let index = *self.rendered_index.by_place.get(&sprite_place(part))?;
+        Some(&self.rendered_cache[index])
     }
 }
 
@@ -596,19 +669,21 @@ struct CachedUnitSprite {
     ///756860 adds its mask displacement to this fractional center before
     ///truncating. Source: the same model/key/HVA geometry as these pixels.
     shadow_center: Option<[f32; 2]>,
+    /// The pool bytes the original's image cache takes for these pixels
+    /// ([`crate::render::voxel_image_cache::sprite_pool_bytes`]). Counted
+    /// where the sprite is rasterized, so live growth scans no pixels on the
+    /// frame that publishes it.
+    pool_bytes: u32,
 }
 
 impl CachedUnitSprite {
-    fn pool_bytes(&self) -> u32 {
-        crate::render::voxel_image_cache::sprite_pool_bytes(
-            &self.pixels,
-            [self.width, self.height],
-            [self.offset_x, self.offset_y],
-            self.native_draw_bounds,
-        )
-    }
-
     fn from_rendered(rs: RenderedSprite) -> Self {
+        let pool_bytes = crate::render::voxel_image_cache::sprite_pool_bytes(
+            &rs.sprite.palette_indices,
+            [rs.sprite.width, rs.sprite.height],
+            [rs.sprite.offset_x, rs.sprite.offset_y],
+            rs.native_draw_bounds,
+        );
         Self {
             key: rs.key,
             pixels: rs.sprite.palette_indices,
@@ -618,6 +693,7 @@ impl CachedUnitSprite {
             offset_y: rs.sprite.offset_y,
             native_draw_bounds: rs.native_draw_bounds,
             shadow_center: None,
+            pool_bytes,
         }
     }
 }
@@ -811,11 +887,12 @@ fn needed_unit_keys(
 }
 
 /// Caller-owned upload state. Resident GPU pages never enter a raster worker.
+/// It completes into the atlas it was prepared against, which stays in use
+/// while the raster runs.
 pub(crate) struct UnitAtlasUpload {
     started: Instant,
     frame_counts: UnitFrameCounts,
     missing: UnitAtlasDemand,
-    existing: Option<UnitAtlas>,
 }
 
 /// Owned display inputs derived from the scene; no scene state is copied.
@@ -839,7 +916,9 @@ pub(crate) struct UnitRasterOutput {
 /// (`PreparedDraw::render_cpu`), each model's poses spread over the cores.
 ///
 /// Returns `None` only when no prior atlas exists and no voxel sprite can be
-/// produced.
+/// produced. The synchronous composition of [`prepare_unit_atlas`], the
+/// raster and [`UnitAtlasUpload::finish`]; live growth runs the raster on a
+/// worker instead ([`crate::render::entity_atlas_growth`]).
 pub fn build_unit_atlas(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -850,17 +929,21 @@ pub fn build_unit_atlas(
     existing: Option<UnitAtlas>,
     interner: Option<&crate::sim::intern::StringInterner>,
 ) -> Option<UnitAtlas> {
-    let (work, upload) = prepare_unit_atlas(entities, asset_manager, rules, existing, interner);
-    upload.finish(device, queue, batch, work.render())
+    let (work, upload) =
+        prepare_unit_atlas(entities, asset_manager, rules, existing.as_ref(), interner);
+    let mut atlas = existing;
+    upload.finish(device, queue, batch, work.render(), &mut atlas);
+    atlas
 }
 
 /// Freeze the physical source choices in their established model/key order.
 /// CPU raster scheduling may change; asset resolution and simulation do not.
+/// `existing` is the atlas the upload will complete into.
 pub(crate) fn prepare_unit_atlas(
     entities: &crate::sim::entity_store::EntityStore,
     asset_manager: &AssetManager,
     rules: Option<&RuleSet>,
-    existing: Option<UnitAtlas>,
+    existing: Option<&UnitAtlas>,
     interner: Option<&crate::sim::intern::StringInterner>,
 ) -> (UnitRasterWork, UnitAtlasUpload) {
     let started = Instant::now();
@@ -869,7 +952,7 @@ pub(crate) fn prepare_unit_atlas(
     // Body/Turret/Barrel entries per facing; for the rest a single Composite
     // entry per facing. Multi-frame HVA units get entries for each frame.
     let demand = UnitAtlasDemand::of_world(entities, rules, interner);
-    let missing = match &existing {
+    let missing = match existing {
         Some(atlas) => demand.without(&atlas.covered),
         None => demand,
     };
@@ -885,7 +968,6 @@ pub(crate) fn prepare_unit_atlas(
                 started,
                 frame_counts: BTreeMap::new(),
                 missing,
-                existing,
             },
         );
     }
@@ -894,11 +976,7 @@ pub(crate) fn prepare_unit_atlas(
     // shares its flat keys with the resident ones.
     let mut new_keys: Vec<UnitSpriteKey> = needed
         .into_iter()
-        .filter(|key| {
-            existing
-                .as_ref()
-                .is_none_or(|atlas| !atlas.entries.contains_key(key))
-        })
+        .filter(|key| existing.is_none_or(|atlas| !atlas.entries.contains_key(key)))
         .collect();
     // By model, then pose: each model is parsed once, and each pose's body,
     // turret and barrel are rasterized once for its three part keys.
@@ -969,7 +1047,6 @@ pub(crate) fn prepare_unit_atlas(
             started,
             frame_counts,
             missing,
-            existing,
         },
     )
 }
@@ -978,6 +1055,27 @@ impl UnitRasterWork {
     /// prepare_unit_atlas. It owns no simulation, asset manager or GPU handles.
     pub(crate) fn render(self) -> UnitRasterOutput {
         self.render_cancellable(&std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// Rasterize on a worker thread, which sends the output once and ends.
+    /// Setting `cancelled` stops it between models and poses; the receiver
+    /// may be dropped at any time. Map load and live growth share it.
+    pub(crate) fn spawn(
+        self,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<UnitRasterOutput>> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+        {
+            let _ = sender.send(self.render_cancellable(&cancelled));
+        }
+        #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+        std::thread::Builder::new()
+            .name("voxel-atlas-raster".into())
+            .spawn(move || {
+                let _ = sender.send(self.render_cancellable(&cancelled));
+            })?;
+        Ok(receiver)
     }
 
     pub(crate) fn render_cancellable(
@@ -1052,48 +1150,51 @@ impl UnitRasterWork {
 }
 impl UnitAtlasUpload {
     /// Main-thread completion of the same atlas owner used by map loading and
-    /// live growth. CPU workers never expose partially uploaded resources.
+    /// live growth: append to `atlas`, or pack a new one when there is none.
+    /// `atlas` must be the one this upload was prepared against. CPU workers
+    /// never expose partially uploaded resources. Whether `atlas` now covers
+    /// this upload's models; it is left as it was when it does not.
     pub(crate) fn finish(
         self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         batch: &BatchRenderer,
         output: UnitRasterOutput,
-    ) -> Option<UnitAtlas> {
+        atlas: &mut Option<UnitAtlas>,
+    ) -> bool {
         let Self {
             started,
             frame_counts,
             missing,
-            existing,
         } = self;
         if missing.is_empty() {
-            return existing;
+            return false;
         }
         let rendered = output.rendered;
         // Step 3: shelf-pack into new pages at map load; afterwards append to a
         // growth page so resident sprites are never repacked or re-uploaded.
         let added = rendered.len();
-        let mut atlas = match existing {
-            Some(mut atlas) => {
+        let atlas = match atlas {
+            Some(atlas) => {
                 atlas.append_sprites(device, queue, batch, rendered);
                 atlas
             }
             None if rendered.is_empty() => {
                 log::warn!("No unit sprites rendered");
-                return None;
+                return false;
             }
             None => match pack_sprites_on_device(device, queue, batch, &rendered) {
-                Ok(mut atlas) => {
-                    atlas.pool_bytes = rendered
+                Ok(mut packed) => {
+                    packed.pool_bytes = rendered
                         .iter()
-                        .map(|sprite| (sprite.key.clone(), sprite.pool_bytes()))
+                        .map(|sprite| (sprite.key.clone(), sprite.pool_bytes))
                         .collect();
-                    atlas.rendered_cache = rendered;
-                    atlas
+                    packed.set_rendered_cache(rendered);
+                    atlas.insert(packed)
                 }
                 Err(err) => {
                     log::error!("Unit atlas packing failed: {err}");
-                    return None;
+                    return false;
                 }
             },
         };
@@ -1114,7 +1215,7 @@ impl UnitAtlasUpload {
             atlas.page_count(),
             page_dimensions,
         );
-        Some(atlas)
+        true
     }
 }
 
@@ -1135,6 +1236,11 @@ fn render_part_on(
     depth: Option<&mut vxl_raster::DepthMap>,
 ) -> VxlSprite {
     vxl_raster::render_vxl_on(part.vxl(), part.hva(), params, vpl, depth)
+}
+
+/// A part's files, as a composite layer.
+fn part_layer(part: &VoxelPart) -> (&VxlFile, Option<&HvaFile>) {
+    (part.vxl(), part.hva())
 }
 
 /// `Ok(None)` for an omitted part; `Err` when a present part has no
@@ -1395,9 +1501,11 @@ impl UnitModel {
         // The rasterizer outputs post-VPL palette indices directly.
         let sprite: VxlSprite = match key.layer {
             VxlLayer::Composite => composite_parts(
-                self.body.as_ref().map(|body| (body.vxl(), body.hva())),
-                turret,
-                barrel,
+                &[self.body.as_ref(), turret, barrel]
+                    .into_iter()
+                    .flatten()
+                    .map(part_layer)
+                    .collect::<Vec<_>>(),
                 &params,
                 vpl,
                 depth,
@@ -1496,6 +1604,41 @@ impl UnitModel {
         depth_tested: bool,
         depth: Option<&mut vxl_raster::DepthMap>,
     ) -> Option<(VxlSprite, Option<[i32; 4]>)> {
+        let (layers, params, bounds) = self.pose_draw(key, tilt, depth_tested)?;
+        Some((composite_parts(&layers, &params, vpl, depth), bounds))
+    }
+
+    /// [`Self::render_pose`] on a clear depth map, as an image for the GPU
+    /// raster where the pose draws one part; a composite of several stays
+    /// on the CPU.
+    pub(crate) fn pose_image(
+        &self,
+        key: &UnitSpriteKey,
+        vpl: Option<&VplFile>,
+        tilt: PoseTilt,
+        depth_tested: bool,
+    ) -> Option<(vxl_raster::VoxelImage<'_>, Option<[i32; 4]>)> {
+        let (layers, params, bounds) = self.pose_draw(key, tilt, depth_tested)?;
+        let image = match layers[..] {
+            [(vxl, hva)] => vxl_raster::voxel_image(vxl, hva, &params, vpl),
+            _ => vxl_raster::VoxelImage::Cpu(composite_parts(&layers, &params, vpl, None)),
+        };
+        Some((image, bounds))
+    }
+
+    /// What a posed draw rasterizes, its parameters and its native draw
+    /// bounds: a ground part alone, or the body with its gun parts.
+    #[allow(clippy::type_complexity)]
+    fn pose_draw(
+        &self,
+        key: &UnitSpriteKey,
+        tilt: PoseTilt,
+        depth_tested: bool,
+    ) -> Option<(
+        Vec<(&VxlFile, Option<&HvaFile>)>,
+        VxlRenderParams,
+        Option<[i32; 4]>,
+    )> {
         let use_buffer = self.use_buffer || depth_tested;
         let body = self.body.as_ref()?;
         if let PoseTilt::Ground(pose) = tilt {
@@ -1522,10 +1665,8 @@ impl UnitModel {
                 use_buffer,
                 ..VxlRenderParams::default()
             };
-            return Some((
-                render_part_on(part, &params, vpl, depth),
-                part_native_draw_bounds(Some(part), &params).ok().flatten(),
-            ));
+            let bounds = part_native_draw_bounds(Some(part), &params).ok().flatten();
+            return Some((vec![part_layer(part)], params, bounds));
         }
         let body_tilt = match tilt {
             PoseTilt::Fly(angles) => vxl_raster::BodyTilt::Fly(angles),
@@ -1547,18 +1688,13 @@ impl UnitModel {
             ..VxlRenderParams::default()
         };
         let (turret, barrel) = self.gun_parts(key.turret_index);
-        let sprite = composite_parts(
-            Some((body.vxl(), body.hva())),
-            turret,
-            barrel,
-            &params,
-            vpl,
-            depth,
-        );
-        Some((
-            sprite,
-            self.native_draw_bounds(&params, VxlLayer::Composite, key.turret_index),
-        ))
+        let layers = [Some(body), turret, barrel]
+            .into_iter()
+            .flatten()
+            .map(part_layer)
+            .collect();
+        let bounds = self.native_draw_bounds(&params, VxlLayer::Composite, key.turret_index);
+        Some((layers, params, bounds))
     }
 
     /// A `VoxelAnimClass` piece at its bounce matrix: the body, drawn without
@@ -1577,10 +1713,7 @@ impl UnitModel {
         use_buffer: bool,
         depth: Option<&mut vxl_raster::DepthMap>,
     ) -> Option<(VxlSprite, Option<VxlSprite>)> {
-        let body = self.body.as_ref()?;
-        if section != 0 || body.vxl().limbs.len() != 1 {
-            return None;
-        }
+        let body = self.tumble_body(section)?;
         let (sprite, _) = self.render_matrix(
             matrix,
             0,
@@ -1596,11 +1729,45 @@ impl UnitModel {
         ))
     }
 
+    /// [`Self::render_tumble`] on a clear depth map, as images for the GPU
+    /// raster.
+    pub(crate) fn tumble_images(
+        &self,
+        section: i32,
+        matrix: glam::Mat4,
+        vpl: Option<&VplFile>,
+        use_buffer: bool,
+    ) -> Option<(
+        vxl_raster::VoxelImage<'_>,
+        Option<vxl_raster::VoxelImage<'_>>,
+    )> {
+        let body = self.tumble_body(section)?;
+        let (image, _) = self.matrix_image(
+            matrix,
+            0,
+            false,
+            vxl_raster::VxlLighting::Diffuse,
+            vpl,
+            use_buffer,
+        )?;
+        Some((
+            image,
+            vxl_raster::shadow::matrix_image(body.vxl(), matrix, 0, false),
+        ))
+    }
+
+    fn tumble_body(&self, section: i32) -> Option<&VoxelPart> {
+        self.body
+            .as_ref()
+            .filter(|body| section == 0 && body.vxl().limbs.len() == 1)
+    }
+
     /// Shared direct-matrix body raster. Bullet46B0C0 submits every section
     /// with HVA frame modulo count and diffuse lighting; the VoxelAnim caller
     /// instead selects no HVA and separately renders its shadow. Neither
     /// stores the image: `use_buffer` is 0xB43180 at the draw, and `depth`
     /// the shared depth map it reads and writes (None: a clear one).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_matrix(
         &self,
         matrix: glam::Mat4,
@@ -1611,6 +1778,42 @@ impl UnitModel {
         use_buffer: bool,
         depth: Option<&mut vxl_raster::DepthMap>,
     ) -> Option<(VxlSprite, Option<[i32; 4]>)> {
+        let (vxl, hva, params, bounds) =
+            self.matrix_draw(matrix, frame, use_hva, lighting, use_buffer)?;
+        Some((
+            vxl_raster::render_vxl_on(vxl, hva, &params, vpl, depth),
+            Some(bounds),
+        ))
+    }
+
+    /// [`Self::render_matrix`] on a clear depth map, as an image for the GPU
+    /// raster.
+    pub(crate) fn matrix_image(
+        &self,
+        matrix: glam::Mat4,
+        frame: u32,
+        use_hva: bool,
+        lighting: vxl_raster::VxlLighting,
+        vpl: Option<&VplFile>,
+        use_buffer: bool,
+    ) -> Option<(vxl_raster::VoxelImage<'_>, Option<[i32; 4]>)> {
+        let (vxl, hva, params, bounds) =
+            self.matrix_draw(matrix, frame, use_hva, lighting, use_buffer)?;
+        Some((
+            vxl_raster::voxel_image(vxl, hva, &params, vpl),
+            Some(bounds),
+        ))
+    }
+
+    /// A direct-matrix body draw's files, parameters and native draw bounds.
+    fn matrix_draw(
+        &self,
+        matrix: glam::Mat4,
+        frame: u32,
+        use_hva: bool,
+        lighting: vxl_raster::VxlLighting,
+        use_buffer: bool,
+    ) -> Option<(&VxlFile, Option<&HvaFile>, VxlRenderParams, [i32; 4])> {
         let body = self.body.as_ref()?;
         let hva = if use_hva { Some(body.hva()?) } else { None };
         let frame = if let Some(hva) = hva {
@@ -1626,10 +1829,7 @@ impl UnitModel {
             ..VxlRenderParams::default()
         };
         let bounds = vxl_raster::native_vxl_draw_bounds(body.vxl(), hva, &params)?;
-        Some((
-            vxl_raster::render_vxl_on(body.vxl(), hva, &params, vpl, depth),
-            Some(bounds),
-        ))
+        Some((body.vxl(), hva, params, bounds))
     }
 
     /// Metadata follows the requested VXL, not the union-sized texture canvas
@@ -1683,31 +1883,29 @@ pub fn composite_unit_vxl_cpu(
     let part = |layer| VoxelPart::load(asset_manager, &voxel_gun_basename(image, layer, 0), false);
     let turret = part(VxlLayer::Turret);
     let barrel = part(VxlLayer::Barrel);
-    composite_parts(
-        Some((body, body_hva)),
-        turret.as_ref(),
-        barrel.as_ref(),
-        params,
-        vpl,
-        None,
-    )
+    let layers: Vec<_> = [Some((body, body_hva))]
+        .into_iter()
+        .chain([turret.as_ref(), barrel.as_ref()].map(|part| part.map(part_layer)))
+        .flatten()
+        .collect();
+    composite_parts(&layers, params, vpl, None)
 }
 
-/// `depth` rasterizes each part in turn on the shared depth map.
+/// The parts, body first, rasterized and depth-composited; one part is its
+/// own image. `depth` rasterizes each part in turn on the shared depth map.
 fn composite_parts(
-    body: Option<(&VxlFile, Option<&HvaFile>)>,
-    turret: Option<&VoxelPart>,
-    barrel: Option<&VoxelPart>,
+    parts: &[(&VxlFile, Option<&HvaFile>)],
     params: &VxlRenderParams,
     vpl: Option<&VplFile>,
     mut depth: Option<&mut vxl_raster::DepthMap>,
 ) -> VxlSprite {
-    let mut layers: Vec<VxlSprite> = body
-        .map(|(body, hva)| vxl_raster::render_vxl_on(body, hva, params, vpl, depth.as_deref_mut()))
-        .into_iter()
+    let mut layers: Vec<VxlSprite> = parts
+        .iter()
+        .map(|&(vxl, hva)| vxl_raster::render_vxl_on(vxl, hva, params, vpl, depth.as_deref_mut()))
         .collect();
-    layers.extend(turret.map(|part| render_part_on(part, params, vpl, depth.as_deref_mut())));
-    layers.extend(barrel.map(|part| render_part_on(part, params, vpl, depth.as_deref_mut())));
+    if layers.len() == 1 {
+        return layers.pop().expect("one layer");
+    }
     composite_vxl_layers(&layers)
 }
 
@@ -2011,7 +2209,8 @@ fn pack_sprites_on_device(
     }
 
     let mut pages = Vec::with_capacity(plan.page_heights.len());
-    let mut entries = HashMap::with_capacity(plan.placements.len());
+    let mut entries =
+        LookupMap::with_capacity_and_hasher(plan.placements.len(), Default::default());
     for (page_index, &page_height) in plan.page_heights.iter().enumerate() {
         let mut pixels = vec![0u8; (plan.page_width * page_height) as usize];
         for placement in plan
@@ -2077,10 +2276,10 @@ mod tests;
 #[cfg(test)]
 impl UnitAtlas {
     pub(crate) fn from_test_pages(pages: Vec<UnitAtlasPage>) -> Self {
-        Self::new(pages, HashMap::new())
+        Self::new(pages, LookupMap::default())
     }
 
     pub(crate) fn from_test_entries(entries: HashMap<UnitSpriteKey, UnitSpriteEntry>) -> Self {
-        Self::new(Vec::new(), entries)
+        Self::new(Vec::new(), entries.into_iter().collect())
     }
 }

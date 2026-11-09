@@ -39,6 +39,25 @@ pub(crate) fn frame_budget(state: &AppState) -> Option<(u16, u32)> {
     Some((timing.frames_per_second(), delay))
 }
 
+/// One game frame's length in milliseconds, as the pacer admits frames;
+/// `None` with no match or at unlimited speed.
+pub(crate) fn game_frame_ms(state: &AppState) -> Option<f32> {
+    let speed = crate::sim::game_options::clamp_game_speed(
+        state
+            .match_state
+            .sim_runtime
+            .as_ref()?
+            .simulation
+            .session()
+            .game_options()
+            .game_speed,
+    );
+    state
+        .platform
+        .frame_pacer
+        .budget_ms(speed, frame_budget(state))
+}
+
 /// DestroyConnection's error argument (`EDX`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectionError {
@@ -306,6 +325,7 @@ pub(crate) fn post_speed_changes(state: &mut AppState) {
     for change in changes {
         let text = match change {
             MatchSpeedChange::SlowedBy(house) => {
+                state.match_state.network_quality.record_slowdown(house);
                 let Some(runtime) = state.match_state.sim_runtime.as_ref() else {
                     return;
                 };
@@ -315,11 +335,15 @@ pub(crate) fn post_speed_changes(state: &mut AppState) {
                     i32::from(house),
                 )
                 .map(|source| participant_name(&state.match_state.session, source))
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| "A player".to_owned());
-                format!("{name} is slowing the game down.")
+                .filter(|name| !name.is_empty());
+                match name {
+                    Some(name) => {
+                        crate::i18n::tr_fill("VERA:PlayerSlowingGame", &[("name", &name)])
+                    }
+                    None => crate::i18n::tr("VERA:SomeoneSlowingGame"),
+                }
             }
-            MatchSpeedChange::Normal => "Game speed is back to normal.".to_owned(),
+            MatchSpeedChange::Normal => crate::i18n::tr("VERA:GameSpeedNormal"),
         };
         crate::app::input::messages::post_match_speed(state, &text);
     }
@@ -343,8 +367,7 @@ pub(crate) fn post_caught_up(state: &mut AppState) {
             live.take_caught_up_in_pause(reached, frame) && !live.exit_requested()
         });
     if caught_up && !defeated {
-        let text =
-            crate::i18n::text(state.process_assets.csf.as_ref(), "VERA:CaughtUp").into_owned();
+        let text = crate::i18n::tr("VERA:CaughtUp");
         crate::app::input::chat::send_to_all(state, &text);
     }
 }
@@ -1929,6 +1952,7 @@ mod tests {
             sources_mask: 0b11,
             tick_hz: 30,
             expires: u64::MAX / 2,
+            pacing: Default::default(),
         }
         .sign(&key)
         .unwrap();

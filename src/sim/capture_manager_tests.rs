@@ -152,9 +152,10 @@ fn rules() -> RuleSet {
 }
 
 fn rules_from(text: &str) -> RuleSet {
-    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(
+    let mut rules = RuleSet::from_ini_with_fixed_art_and_sounds_for_test(
         &IniFile::from_str(text),
         &IniFile::from_str(ART),
+        &["YuriMindControl", "MindCleared", "MasterMindOverloadVoice"],
     )
     .expect("mind control rules");
     let mut art = crate::rules::art_data::ArtRegistry::from_ini(&IniFile::from_str(ART));
@@ -767,6 +768,31 @@ fn a_removed_foot_controller_frees_its_captives() {
             .mind_control
             .is_mind_controlled()
     );
+}
+
+/// Ares CaptureManagerClass_DecideUnitFate_BuildingFate (1005C680, hook
+/// 0x47243F): a computer's captured building queues Guard with no fate roll.
+#[cfg(feature = "ares")]
+#[test]
+fn a_computer_building_guards_without_a_fate_roll() {
+    let rules = rules();
+    let mut sim = sim(1);
+    let yuri = spawn(&mut sim, &rules, "YURI", "YuriCountry", 10, 10);
+    let plant = spawn(&mut sim, &rules, "GAPOWR", "Russians", 14, 10);
+    let mut replay = sim.scenario_rng.clone();
+    sim.decide_unit_fate(
+        yuri,
+        plant,
+        &rules,
+        None,
+        crate::sim::world::FrameEffects::default(),
+    );
+    let entity = sim.substrate.entities.get(plant).unwrap();
+    assert!(
+        entity.mission.queued().known() == Some(MissionType::Guard)
+            || entity.mission.current().known() == Some(MissionType::Guard)
+    );
+    assert_eq!(sim.scenario_rng.next_u32(), replay.next_u32(), "no roll");
 }
 
 /// Original DecideUnitFate `0x004723B0` under Unicorn
@@ -1770,13 +1796,19 @@ fn an_attack_order_captures_without_damage() {
     assert_eq!(victims(&sim, mind), [gi]);
 }
 
-/// Retail `rulesmd.ini` (the local `ini/`; skipped without it): the stock
-/// controllers' managers and the mind-control globals bind.
+/// Real startup/mode/map readers retain stock cues over bad map overrides;
+/// a type's unknown first override still falls back through live FreeUnit.
 #[test]
 fn retail_rules_bind_the_stock_controllers() {
-    let Some(rules) = crate::rules::retail_ini_fixture::retail_rulesmd_rules() else {
+    let patch = IniFile::from_str(
+        "[AudioVisual]\nYuriMindControlSound=Unknown\nMindClearedSound=Unknown\n\
+         MasterMindOverloadDeathSound=Unknown\n[E1]\nMindClearedSound=Unknown\n",
+    );
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules_with_map_patch(&patch)
+    else {
         return;
     };
+    let mut rules = retail.rules;
     let limits = |kind: &str| {
         init_capture_manager(rules.object(kind).unwrap(), &rules)
             .map(|manager| (manager.max_control, manager.infinite))
@@ -1818,6 +1850,39 @@ fn retail_rules_bind_the_stock_controllers() {
             "{kind}"
         );
     }
+    let frames = crate::assets::shp_file::ShpFile::frame_count_from_bytes(
+        &crate::rules::retail_ini_fixture::retail_archive_bytes("MINDANIM.SHP").unwrap(),
+    )
+    .unwrap();
+    rules.bind_anim_frame_count_for_test("MINDANIM", i32::from(frames));
+    let mut sim = sim(37);
+    let yuri = spawn(&mut sim, &rules, "YURI", "YuriCountry", 10, 10);
+    let gi = spawn(&mut sim, &rules, "E1", "Americans", 12, 10);
+    assert!(sim.capture_unit(yuri, gi, &rules, None, FrameEffects::default()));
+    let ring = sim
+        .substrate
+        .entities
+        .get(gi)
+        .unwrap()
+        .mind_control
+        .ring_anim
+        .unwrap();
+    sim.sound_events.clear_for_test();
+    let rng = sim.scenario_rng.native_state_hex();
+    assert!(sim.free_unit(yuri, gi, &rules, None, FrameEffects::default()));
+    assert_eq!(voc_sounds(&sim), ["MindCleared"]);
+    assert_eq!(owner(&sim, gi), "Americans");
+    assert!(
+        sim.substrate
+            .entities
+            .get(gi)
+            .unwrap()
+            .mind_control
+            .ring_anim
+            .is_none()
+    );
+    assert!(sim.anim(ring).is_none_or(|anim| !anim.in_logic_vector()));
+    assert_eq!(sim.scenario_rng.native_state_hex(), rng);
 }
 
 /// UnitClass::Deploy's CanDeploySlashUnload refuses a mind-controlled unit
@@ -2315,6 +2380,7 @@ fn a_due_ivan_bomb_precedes_the_same_turn_mastermind_overload() {
         assert!(controller.lifecycle.object_alive());
         let expired = controller
             .bomb
+            .as_ref()
             .unwrap()
             .expired(sim.session.binary_frame() as i32);
         if expired {

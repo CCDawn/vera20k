@@ -681,7 +681,7 @@ mod tests {
     /// cells read the shared Dummy's Clear row.
     fn test_terrain(width: u16, height: u16) -> ResolvedTerrainGrid {
         let mut terrain = crate::map::resolved_terrain::test_grid(width, height, |rx, ry| {
-            test_terrain_cell(rx, ry, Some(100))
+            test_terrain_cell(rx, ry, Some(crate::util::native_x87::NativeF32Bits::ONE))
         });
         terrain.set_land_speed_rules_for_test(
             &crate::map::resolved_terrain::test_retail_clear_rules(),
@@ -689,15 +689,21 @@ mod tests {
         terrain
     }
 
-    fn test_terrain_cell(rx: u16, ry: u16, track_cost: Option<u8>) -> ResolvedTerrainCell {
+    fn test_terrain_cell(
+        rx: u16,
+        ry: u16,
+        track_cost: Option<crate::util::native_x87::NativeF32Bits>,
+    ) -> ResolvedTerrainCell {
         ResolvedTerrainCell {
             speed_costs: SpeedCostProfile {
                 track: track_cost,
+                winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
                 ..Default::default()
             },
             zone_type: zone_class::GROUND,
             base_speed_costs: SpeedCostProfile {
                 track: track_cost,
+                winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
                 ..Default::default()
             },
             ..crate::map::resolved_terrain::test_flat_cell(rx, ry)
@@ -976,8 +982,9 @@ mod tests {
     fn native_gather_rejects_a_blocked_cell_inside_the_8x8_rect() {
         let mut terrain = test_terrain(32, 32);
         let blocked = terrain.cell_mut_for_test(11, 11).unwrap();
-        blocked.speed_costs.track = Some(0);
-        blocked.base_speed_costs.track = Some(0);
+        blocked.speed_costs.track = Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO);
+        blocked.base_speed_costs.track =
+            Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO);
         blocked.zone_type = zone_class::IMPASSABLE;
         let occupancy = crate::sim::occupancy::OccupancyGrid::new();
         let diamond = PlayfieldBounds {
@@ -1042,8 +1049,9 @@ mod tests {
         let map = test_map_with_starts(&[authored]);
         let mut terrain = test_terrain(64, 64);
         let blocked = terrain.cell_mut_for_test(61, 28).unwrap();
-        blocked.speed_costs.track = Some(0);
-        blocked.base_speed_costs.track = Some(0);
+        blocked.speed_costs.track = Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO);
+        blocked.base_speed_costs.track =
+            Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO);
         blocked.zone_type = zone_class::IMPASSABLE;
         let bounds = NativeStartBounds {
             min_rx: 0,
@@ -1864,7 +1872,7 @@ mod tests {
             session.options.bases = false;
             session.options.unit_count = 0;
 
-            let result = apply_explicit_skirmish_launch_session(
+            apply_explicit_skirmish_launch_session(
                 &mut sim,
                 &map,
                 &roster,
@@ -2230,6 +2238,9 @@ mod tests {
         );
     }
 
+    // The stock budget: Ares 3.0 MPGameModeClass_CreateStartingUnits_UnitCost
+    // (1001EE10, hook 0x5D6D9A) averages a type set without BaseUnit.
+    #[cfg(not(feature = "ares"))]
     #[test]
     fn skirmish_positive_unit_count_spawns_extra_starting_units() {
         let mut sim = Simulation::new();
@@ -2321,6 +2332,9 @@ mod tests {
     /// `Post_Map_Init` calls `Generate_Starting_Units` at `0x00686937` before
     /// the AI grant loop at `0x006869BE`, so the Hard multiplier applies to the
     /// balance that already includes the credited leftover budget.
+    // The stock budget: Ares 3.0 MPGameModeClass_CreateStartingUnits_UnitCost
+    // (1001EE10, hook 0x5D6D9A) averages a type set without BaseUnit.
+    #[cfg(not(feature = "ares"))]
     #[test]
     fn gsi_09_01_ai_grant_multiplies_post_leftover_balance() {
         let mut sim = Simulation::new();

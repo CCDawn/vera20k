@@ -161,3 +161,71 @@ fn ore_depletion_current_pair_and_rebuilt_surface_match_original() {
         }
     }
 }
+
+#[test]
+fn hd_terrain_resamples_changed_cells_like_full_generation() {
+    // Native zoom ~0.68 and the HD zoom above 1: spans of one and two pixels.
+    let geometry = NativeRadarSurfaceGeometry::from_raw_rect(80, 0, 161, 159).unwrap();
+    let color = |x: u16, y: u16, half: u16| [(x * 3) as u8, (y * 3) as u8, (half * 200) as u8];
+    let cells = (0..80u16)
+        .flat_map(|x| (0..80u16).map(move |y| (x, y)))
+        .map(|(x, y)| NativeRadarCellColors {
+            cell: (x, y),
+            left: color(x, y, 0),
+            right: color(x, y, 1),
+        })
+        .collect();
+    let mut surface = NativeRadarTerrainSurface::new(geometry, cells, BTreeMap::new(), 1.0);
+    surface.set_hd_scale(Some(3));
+    let (_, revision) = surface.hd_rgb565().unwrap();
+    // An inner cell's colours, and an overlay on the raw surface's corner cell.
+    let inner = NativeRadarCellColors {
+        cell: (40, 41),
+        left: [250, 1, 2],
+        right: [3, 250, 4],
+    };
+    let corner = NativeRadarCellColors {
+        cell: (79, 79),
+        left: color(79, 79, 0),
+        right: color(79, 79, 1),
+    };
+    assert!(surface.set_cell_states([
+        NativeRadarCellUpdate {
+            base: inner,
+            override_color: None,
+        },
+        NativeRadarCellUpdate {
+            base: corner,
+            override_color: Some([9, 9, 250]),
+        },
+    ]));
+    let (resampled, changed) = surface.hd_rgb565().unwrap();
+    assert_ne!(changed, revision);
+    let full = HdTerrain::new(surface.raw_rgb(), geometry, 3);
+    assert_eq!(resampled, full.rgb565.as_slice());
+}
+
+/// The surface's cell table answers as RenderCellPixel's inverse
+/// (`0x00655CB8..0x00655D03`) at its corners; a pixel off the surface, such as
+/// an edge building's brush, is inverted directly.
+#[test]
+fn visibility_cells_answer_as_the_native_inverse_on_and_off_the_surface() {
+    let geometry = NativeRadarSurfaceGeometry::from_raw_rect(3, 40, 137, 149).unwrap();
+    let surface = NativeRadarTerrainSurface::new(geometry, Vec::new(), BTreeMap::new(), 1.0);
+    let (width, height) = geometry.generated_size();
+    for pixel in [
+        (0, 0),
+        (width - 1, 0),
+        (0, height - 1),
+        (width - 1, height - 1),
+        (-2, 5),
+        (width, height - 1),
+        (4, height),
+    ] {
+        assert_eq!(
+            surface.visibility_cell(pixel),
+            geometry.surface_pixel_to_visibility_cell(pixel),
+            "{pixel:?}"
+        );
+    }
+}

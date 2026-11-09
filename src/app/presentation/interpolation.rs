@@ -280,7 +280,6 @@ impl Endpoints {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SimulationReadout {
     pub tps: f32,
-    pub interpolation: bool,
     pub sampling: bool,
 }
 
@@ -440,7 +439,6 @@ impl RenderInterpolation {
     pub(crate) fn readout(&self) -> SimulationReadout {
         SimulationReadout {
             tps: self.tps,
-            interpolation: self.enabled,
             sampling: self.enabled && !self.held && self.interval_ms.is_some(),
         }
     }
@@ -614,7 +612,10 @@ pub(crate) fn screen_position(state: &AppState, entity: &GameEntity) -> (f32, f3
 /// Hidden-window skipped intervals and map loads snap instead of long lerps.
 pub(crate) fn prepare(state: &mut AppState, exact_capture: bool) {
     if state.frontend.screen != crate::ui::game_screen::GameScreen::InGame {
-        state.renderer.fps_overlay.set_simulation_readout(None);
+        state
+            .renderer
+            .performance_overlay
+            .set_simulation_readout(None);
         return;
     }
     let held = exact_capture
@@ -626,20 +627,13 @@ pub(crate) fn prepare(state: &mut AppState, exact_capture: bool) {
     let Some(runtime) = state.match_state.sim_runtime.as_ref() else {
         return;
     };
-    let speed = runtime
-        .simulation
-        .session()
-        .game_options()
-        .game_speed
-        .clamp(0, 6) as u8;
-    let interval = state.platform.frame_pacer.budget_ms(
-        speed,
-        crate::app::match_runtime::network_match::frame_budget(state),
-    );
-    let phase = state
-        .platform
-        .frame_pacer
-        .interpolation_elapsed_ms(u64::from(now_ms));
+    let interval = crate::app::match_runtime::network_match::game_frame_ms(state);
+    let (speed, network_fps) = crate::app::match_runtime::sim_tick::local_pacing_inputs(state);
+    let phase =
+        state
+            .platform
+            .frame_pacer
+            .interpolation_elapsed_ms(u64::from(now_ms), speed, network_fps);
     let interpolation = &mut state.match_state.match_presentation.interpolation;
     interpolation.observe(&runtime.simulation, now_ms, interval, held);
     if let Some(elapsed) = phase {
@@ -648,7 +642,7 @@ pub(crate) fn prepare(state: &mut AppState, exact_capture: bool) {
     }
     state
         .renderer
-        .fps_overlay
+        .performance_overlay
         .set_simulation_readout(Some(interpolation.readout()));
 }
 
@@ -703,9 +697,9 @@ mod tests {
         );
         cache.set_enabled(false);
         assert!(cache.poses.is_empty());
-        assert!(!cache.readout().interpolation);
+        assert!(!cache.enabled);
         cache.set_enabled(true);
-        assert!(cache.readout().interpolation);
+        assert!(cache.enabled);
         assert!(
             !cache.readout().sampling,
             "reenabling waits for fresh history"
@@ -901,11 +895,11 @@ mod tests {
     }
 
     #[test]
-    fn render_interpolation_readout_distinguishes_requested_from_bypassed() {
+    fn render_interpolation_samples_only_with_fresh_unheld_history() {
         let mut sim = live_world();
         let mut cache = RenderInterpolation::new(true);
         cache.observe(&sim, 0, None, false);
-        assert!(cache.readout().interpolation);
+        assert!(cache.enabled);
         assert!(!cache.readout().sampling);
         let next_frame = sim.session().binary_frame() + 1;
         sim.session_mut_for_test()
@@ -915,7 +909,7 @@ mod tests {
         cache.observe(&sim, 40, Some(32.0), true);
         assert!(!cache.readout().sampling);
         cache.toggle();
-        assert!(!cache.readout().interpolation);
+        assert!(!cache.enabled);
     }
 
     #[test]

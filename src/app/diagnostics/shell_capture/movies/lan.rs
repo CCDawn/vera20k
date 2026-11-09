@@ -1131,7 +1131,7 @@ impl LanCapture {
     }
     /// The controlled host generates its random map from its own `.Sed`
     /// through the production loader, and computes the `'W'` staging the
-    /// way its Generate does (`0x0058B830`).
+    /// way its Generate does (`0x0058B820`).
     fn prepare_controlled_random_map(&mut self, state: &mut AppState) -> Result<()> {
         struct Silent;
         impl crate::app::loading::pump::LoadingProgressSink for Silent {
@@ -1147,16 +1147,29 @@ impl LanCapture {
             ..Default::default()
         };
         let sed = options.to_sed_bytes();
-        fs::write(
-            host_dir.join(crate::map::skirmish_scenarios::RANDMAP_SED),
-            &sed,
-        )?;
+        // A path, as a bare name would be read from VERA's random-map folder.
+        let sed_path = host_dir.join(crate::map::skirmish_scenarios::RANDMAP_SED);
+        fs::write(&sed_path, &sed)?;
+        let mode_file = state
+            .match_state
+            .session
+            .network_setup()
+            .map(|launch| launch.mode.override_file.clone());
+        let the_team_enabled = state
+            .frontend
+            .main_menu_shell_state
+            .typed_codes
+            .the_team_enabled();
         let (manager, rules, _) = state.process_assets.manager_and_rules_with_tile_cache();
         let initial = crate::app::loading::init::load_map_initial_with_assets(
             host_dir,
             manager.context("controlled host assets")?,
             rules,
-            Some(crate::map::skirmish_scenarios::RANDMAP_SED),
+            None,
+            Some(sed_path.to_str().context("controlled host seed path")?),
+            mode_file.as_deref(),
+            SessionMode::Lan,
+            the_team_enabled,
             &mut Silent,
         )?;
         let map = initial.map_data();
@@ -1217,7 +1230,8 @@ impl LanCapture {
         Ok(())
     }
     /// A random map's two GO receives land in the install directory,
-    /// overwriting the guest's own files (`0x005DDA31..0x005DDA6F`).
+    /// overwriting the guest's own files (`0x005DDA31..0x005DDA6F`). VERA's
+    /// land in its random-map folder, inside the marked settings root.
     fn deliver_random_map_file(&self, state: &AppState, file: &str) -> Result<()> {
         let random_map = self
             .random_map_host
@@ -1228,7 +1242,10 @@ impl LanCapture {
         } else {
             &random_map.sed
         };
-        fs::write(Self::isolated_root(state)?.join(file), bytes)?;
+        let settings = Self::isolated_settings_root(state)?;
+        let dir = crate::map::source::random_map_dir(&settings);
+        fs::create_dir_all(dir)?;
+        fs::write(dir.join(file), bytes)?;
         Ok(())
     }
     /// RandMap.Sed never verifies, so the map change sends one 0x1B; a
@@ -2286,9 +2303,8 @@ impl LanCapture {
                         .context("trackbar session")?
                         .options;
                     let actual = match control {
-                        SPEED => crate::ui::skirmish_shell::game_speed_visual_position(
-                            options.game_speed,
-                        ),
+                        SPEED => crate::ui::shell::game_speed::SpeedContext::Network
+                            .visual_position(options.game_speed),
                         CREDITS => options.starting_credits,
                         UNITS => options.unit_count,
                         _ => unreachable!(),
@@ -3911,7 +3927,10 @@ impl LanCapture {
                     .context("retail root")?
                     .paths
                     .ra2_dir;
-                let sed = std::fs::read(root.join(crate::map::skirmish_scenarios::RANDMAP_SED))?;
+                let sed = std::fs::read(
+                    crate::map::source::random_map_dir(root)
+                        .join(crate::map::skirmish_scenarios::RANDMAP_SED),
+                )?;
                 let mut options = crate::map::rmg::RmgOptions::default();
                 options.apply_sed(&crate::rules::ini_parser::IniFile::from_bytes(&sed)?);
                 ensure!(

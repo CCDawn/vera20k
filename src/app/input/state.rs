@@ -164,6 +164,7 @@ impl PreparedSavedLocalView {
         input.planning.reset();
         sidebar.repair_mode_on = modes.repair;
         sidebar.sell_mode_on = modes.sell;
+        sidebar.command_bar_closed = modes.command_bar_closed;
         input.targeting_mode = self.targeting;
         // The preview is derived from the cursor; the next tactical frame
         // recomputes it. The BandBoxLeftUp retry copy (+1190..+1198) loads
@@ -179,6 +180,7 @@ impl PreparedSavedLocalView {
         // same next-press behavior without persisting a wall-clock Instant.
         // Original reset witnesses: saved_game_layout.json/postload_clock_reset.
         input.last_control_group_press = None;
+        input.build_repeat = Default::default();
         input.reset_cheer_clock();
     }
 }
@@ -220,6 +222,7 @@ pub(crate) struct MatchInputState {
     /// saved nor simulation state and is discarded when pointer focus changes.
     last_cursor_window: Option<(f32, f32)>,
     pub(crate) keys_held: HashSet<KeyCode>,
+    pub(crate) camera_scroll_keys: super::hotkeys::CameraScrollKeys,
     pub(crate) hotkey_bindings: crate::app::input::hotkeys::HotkeyBindings,
     pub(crate) hotkey_modifiers: ModifiersState,
     /// Local AllToCheer730F30 admission scalar84555C. The simulation owns
@@ -263,6 +266,8 @@ pub(crate) struct MatchInputState {
     /// state: the original stamps `timeGetTime()` here and only a recall writes
     /// it — assigning with Ctrl+digit never does.
     pub(crate) last_control_group_press: Option<(usize, crate::util::time::Instant)>,
+    /// Types the local player builds endlessly (Ctrl + left click on a cameo).
+    pub(crate) build_repeat: crate::app::input::build_repeat::BuildRepeat,
     /// The object the camera is following, i.e. `DisplayClass +0x11A0` behind
     /// its valid byte `+0x119C`. `None` is the cleared pair.
     pub(crate) follow_target: Option<u64>,
@@ -367,6 +372,11 @@ impl MatchInputState {
         self.last_cursor_window = Some(point);
     }
 
+    /// The OS pointer's last position in window pixels, while one is known.
+    pub(crate) fn pointer_in_window(&self) -> Option<(f32, f32)> {
+        self.last_cursor_window
+    }
+
     /// Begin a fresh physical pointer history after focus or client entry changes.
     pub(crate) fn reset_window_cursor_motion(&mut self) {
         self.last_cursor_window = None;
@@ -413,6 +423,26 @@ impl MatchInputState {
         }
     }
 
+    /// The cursor while a tactical button holds the capture byte (`+0x555A`),
+    /// or `None` without it. `ScrollClass::UpdateMouseScrolling` 0x00692F30
+    /// then hands the frame to `BandBox_MouseMove` 0x004AC380 (left held) or
+    /// `RightDragPan` 0x00693440 (right held) and returns
+    /// (0x00692F85..0x00692FDB) before the action cursor
+    /// (0x00692FFC..0x0069302F) and the edge-scroll block. The band sets the
+    /// normal arrow as it activates (`SetCursor(0, 0)` at 0x004AC4DA); the pan
+    /// writes only its own cursor, which the caller asks first. Otherwise
+    /// nothing writes one and the last cursor stays.
+    pub(crate) fn captured_cursor(&self) -> Option<Option<crate::app::types::CursorFeedbackKind>> {
+        if !self.tactical_mouse.captured {
+            return None;
+        }
+        Some(if self.selection_state.is_band_box_active() {
+            None
+        } else {
+            self.shown_cursor.get()
+        })
+    }
+
     /// Construct the match input owner with the ordinary startup defaults.
     pub(crate) fn new(hotkey_bindings: crate::app::input::hotkeys::HotkeyBindings) -> Self {
         Self {
@@ -427,6 +457,7 @@ impl MatchInputState {
             selection_voice_enabled: true,
             queued_order_mode: crate::app::types::OrderMode::Move,
             last_control_group_press: None,
+            build_repeat: Default::default(),
             follow_target: None,
             targeting_mode: None,
             building_placement_preview: None,
@@ -446,6 +477,7 @@ impl MatchInputState {
             cursor_zoom: None,
             last_cursor_window: None,
             keys_held: HashSet::new(),
+            camera_scroll_keys: Default::default(),
             hotkey_bindings,
             hotkey_modifiers: ModifiersState::empty(),
             last_cheer_frame: -100,
@@ -792,6 +824,7 @@ impl MatchInputState {
                 // Active YR PlanMgr is outside Mouse's saved Display body.
                 planning: false,
                 targeting,
+                command_bar_closed: sidebar.command_bar_closed,
             },
         )
     }

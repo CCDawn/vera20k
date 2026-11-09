@@ -5,10 +5,9 @@ for the selected object (with the PIPBRD bracket) and a bare strip for the objec
 under the cursor; every other object draws nothing. This is a VERA display mode:
 `sim/` never reads it, so saves, replays, network sync and the AI are unaffected.
 
-Set it in **Options → Vera Options → Health Bars**, under the UI Options band's
-right column. It applies at once and is saved as `[VERA] HealthBars=` in
-`VERA.INI`; the profile writer stores the key again with the other `[VERA]`
-values, and editing the file directly works too.
+Set it in **Options → Interface → Health Bars**. It applies at once and is
+saved as `[VERA] HealthBars=` in `VERA.INI`; the profile writer stores the key
+again with the other `[VERA]` values, and editing the file directly works too.
 
 | Value | Behavior |
 |---|---|
@@ -21,11 +20,13 @@ the original strip.
 
 ## Which objects count as seen
 
-Own and allied objects always count. Another house's object needs its cell
-explored — and, under the `FogOfWar` game option, currently visible — the same
-reveal gate screen selection uses, so the strip never shows what shroud hides.
-gamemd's disguise rule still applies: an enemy Mirage worn as a tree draws no
-strip until it is selected, in every mode.
+The strip follows the shroud plane the bodies use: the object's cell must be
+explored and not covered by a hostile gap, for every house alike, so an object
+pre-placed on unrevealed ground gets no strip either. Under the `FogOfWar` game
+option the cell must also be in current sight. `MultiplayPassive` houses (stock Neutral and Special) get no
+automatic strip in modes 1 and 2; selecting or hovering one still draws gamemd's
+own strip. gamemd's disguise rule still applies: an enemy Mirage worn as a tree
+draws no strip until it is selected, in every mode.
 
 ## Full health
 

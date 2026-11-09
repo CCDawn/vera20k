@@ -33,8 +33,13 @@ pub struct RmgSettings {
     /// Indexed by map type.
     pub vegetation_min: [i32; MAP_TYPE_BUCKETS],
     pub vegetation_max: [i32; MAP_TYPE_BUCKETS],
+    /// VERA extension: the theater's civilian buildings the urban stage may
+    /// place (`tech_catalog::resolve_urban`). Not from `RMGMD.INI`; the app
+    /// fills it per theater. Empty places no towns.
+    pub urban_types: Vec<crate::map::rmg::phases::tech_buildings::TechType>,
 }
 
+/// `MapSeedClass::InitDefaults @ 0x00595740`.
 impl Default for RmgSettings {
     fn default() -> Self {
         Self {
@@ -48,6 +53,7 @@ impl Default for RmgSettings {
             snow_rgb: Default::default(),
             vegetation_min: [0; MAP_TYPE_BUCKETS],
             vegetation_max: [0; MAP_TYPE_BUCKETS],
+            urban_types: Vec::new(),
         }
     }
 }
@@ -69,12 +75,11 @@ impl RmgSettings {
     }
 
     /// Load from the asset manager, falling back per key to the defaults above.
+    /// `MapSeedClass::ReadINI @ 0x005981F0` opens `RMGMD.INI` alone
+    /// (0x0082BDCC); the RA2 `RMG.INI` is never read.
     pub fn load(assets: &AssetManager) -> Self {
         let mut settings = Self::default();
-        let Some(bytes) = assets
-            .get_ref("rmgmd.ini")
-            .or_else(|| assets.get_ref("rmg.ini"))
-        else {
+        let Some(bytes) = assets.get_ref("rmgmd.ini") else {
             return settings;
         };
         let Ok(ini) = IniFile::from_bytes(bytes) else {
@@ -90,7 +95,7 @@ impl RmgSettings {
     /// Native indexes the selected vector entries without a length guard. Missing
     /// entries have no defined numeric fallback; preserve the existing empty INI
     /// for that unsupported input rather than inventing ambient values.
-    pub(super) fn generated_lighting_ini(&self, options: &RmgOptions) -> Option<IniFile> {
+    pub fn generated_lighting_ini(&self, options: &RmgOptions) -> Option<IniFile> {
         let time = usize::try_from(options.time).ok()?;
         let ambient = if options.theater == 0 {
             &self.temperate_ambient
@@ -131,6 +136,7 @@ impl RmgSettings {
         })
     }
 
+    /// `MapSeedClass::ReadINI @ 0x005981F0` reads `RMGMD.INI`
     /// `[General]` through ReadInt over each field and the IntVector reader
     /// (`0x00475D70`) for the lists (`0x005982D0..0x0059877A`).
     pub(super) fn apply(&mut self, ini: &IniFile) {
@@ -187,6 +193,20 @@ mod tests {
             settings.max_trees, 500,
             "an absent RMGMD.INI must not mean zero trees"
         );
+    }
+
+    #[test]
+    fn load_reads_rmgmd_ini_only() {
+        use crate::assets::asset_manager::test_support::TestDirectory;
+        let ra2 = TestDirectory::new("rmg-settings-ra2-only");
+        std::fs::write(ra2.path().join("rmg.ini"), "[General]\nMaxTrees=42\n").unwrap();
+        let settings = RmgSettings::load(&AssetManager::from_loose_root_for_test(ra2.path()));
+        assert_eq!(settings.max_trees, 500, "the RA2 RMG.INI is not a fallback");
+
+        let yr = TestDirectory::new("rmg-settings-yr");
+        std::fs::write(yr.path().join("rmgmd.ini"), "[General]\nMaxTrees=42\n").unwrap();
+        let settings = RmgSettings::load(&AssetManager::from_loose_root_for_test(yr.path()));
+        assert_eq!(settings.max_trees, 42);
     }
 
     #[test]

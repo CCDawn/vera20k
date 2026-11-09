@@ -10,8 +10,7 @@
 use super::CancelOutcome;
 use super::can_build::{check_build_limit, find_factory};
 use super::factory::{
-    AbandonedObject, EnqueueOutcome, FactoryHolder, held_time_to_build, time_to_build,
-    time_to_build_inputs,
+    AbandonedObject, EnqueueOutcome, FactoryHolder, held_time_to_build, object_time_to_build,
 };
 use super::production_tech::{
     factory_category_for_building, production_category_for_object, strip_keeps,
@@ -260,6 +259,7 @@ pub(crate) fn enqueue_selected(
         cost,
         rules.general.maximum_queued_objects,
         at_build_limit,
+        force,
     );
     if outcome == EnqueueOutcome::AppendRefused {
         sim.sound_events
@@ -302,7 +302,7 @@ pub(crate) fn suspend_production(
 /// Start the build an active factory head holds. `HouseClass::Begin_Production
 /// @ 0x004FA350` runs `FactoryClass::StartProduction @ 0x004C9C70`, which calls
 /// `type->CreateInstance(owner)` and stores the result at `Factory+0x58`, then
-/// the build start `0x004C9EA0` (Ghidra label `FactoryClass__SetRate`) at
+/// the build start `FactoryClass::ResumeProduction @ 0x004C9EA0` at
 /// `0x004FA628`, which arms the step rate and timer from that object's
 /// `Time_To_Build`. Queued tail entries start only when
 /// `FactoryClass::StartNextQueued @ 0x004CA5A0` promotes them, which runs the
@@ -364,7 +364,7 @@ pub(super) fn start_active_production(
         .entities
         .get_mut(stable_id)?
         .record_production_start_price(start_price);
-    let time_to_build = time_to_build(&time_to_build_inputs(sim, rules, owner_id, obj));
+    let time_to_build = object_time_to_build(sim, rules, owner_id, obj);
     let frame = sim.session.binary_frame();
     let money = crate::sim::credit_income::available_money(&sim.houses, owner_id);
     sim.production
@@ -771,7 +771,7 @@ pub(super) fn publish_completion(
         .object_type_in_category(type_id, category.object_category(), rules)
         .is_some_and(|object| object.category == ObjectCategory::Building)
     {
-        sound_events.emit(SimSoundEvent::BuildingComplete { owner });
+        sound_events.emit(SimSoundEvent::BuildingComplete { owner, type_id });
     }
 }
 
@@ -1096,6 +1096,13 @@ pub(in crate::sim) fn update_factory_queue(
     category: ProductionCategory,
     effects: FrameEffects<'_>,
 ) {
+    // Ares 3.0 HouseClass_Update_Factories_Queues 10025100 (hook 0x00509140)
+    // first runs the BuildingType/DontCare call again for BuildCat::Combat,
+    // so the defense strip's queue follows its construction yards too.
+    #[cfg(feature = "ares")]
+    if category == ProductionCategory::Building {
+        update_factory_queue(sim, rules, owner, ProductionCategory::Defense, effects);
+    }
     let queued: Vec<_> = sim
         .production
         .factories()

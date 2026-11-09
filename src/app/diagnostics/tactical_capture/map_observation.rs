@@ -51,6 +51,51 @@ struct MapAudioProfile {
     coordinate_request_scope: Option<MapCoordinateRequestScope>,
 }
 
+/// The battle's Options presentation choices for one capture, as their
+/// `[VERA]` values. Absent, a capture keeps zoom 100%, the Normal sidebar,
+/// the native radar and the sidebar's own pixels.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct MapPresentationProfile {
+    /// `Zoom=`: 0 for Auto, otherwise a percent.
+    zoom: i32,
+    /// `Sidebar=`: 100, 150 or 200.
+    sidebar: i32,
+    /// `HdRadar=`: optional, off when absent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    hd_radar: bool,
+    /// `SmoothSidebar=`: optional, off when absent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    smooth_sidebar: bool,
+}
+
+impl MapPresentationProfile {
+    fn validate(&self) -> Result<()> {
+        use crate::ui::main_menu_dialogs::options::{SidebarSize, Zoom};
+        ensure!(
+            Zoom::from_ini_value(self.zoom).ini_value() == self.zoom,
+            "presentation.zoom must be 0 (Auto) or a 50-step percent from 100"
+        );
+        ensure!(
+            SidebarSize::from_ini_value(self.sidebar).ini_value() == self.sidebar,
+            "presentation.sidebar must be 100, 150 or 200"
+        );
+        Ok(())
+    }
+
+    fn apply(&self, state: &mut AppState) {
+        use crate::ui::main_menu_dialogs::options::{SidebarSize, Zoom};
+        state.platform.capture_presentation = crate::app::state::CapturePresentation {
+            zoom: Zoom::from_ini_value(self.zoom),
+            sidebar: SidebarSize::from_ini_value(self.sidebar),
+            hd_radar: self.hd_radar,
+            smooth_sidebar: self.smooth_sidebar,
+            map_picture: false,
+        };
+        crate::app::App::sync_zoom_pass(state);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum MapCoordinateRequestScope {
@@ -565,15 +610,6 @@ pub(crate) struct MapCaptureProfile {
         skip_serializing_if = "Option::is_none"
     )]
     camera_cell: Option<[u16; 2]>,
-    // The tactical view's world top-left instead of camera_cell's centred
-    // cell, clamped like any view change: exact framing, such as one tile of
-    // a whole-map render (tools/map_render.py).
-    #[serde(
-        default,
-        deserialize_with = "deserialize_present",
-        skip_serializing_if = "Option::is_none"
-    )]
-    camera_top_left: Option<[i32; 2]>,
     #[serde(
         default,
         deserialize_with = "deserialize_present",
@@ -610,6 +646,15 @@ pub(crate) struct MapCaptureProfile {
         skip_serializing_if = "Option::is_none"
     )]
     observe_sidebar_steps: Option<Vec<u32>>,
+    /// Zoom and Sidebar size for the battle frame. The frame
+    /// readback stays the window size; incompatible with gestures and the
+    /// cursor, whose coordinates are frame pixels at zoom 100%.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    presentation: Option<MapPresentationProfile>,
 }
 
 impl MapCaptureProfile {
@@ -658,22 +703,25 @@ impl MapCaptureProfile {
                     && self.observe_spawns.is_none()
                     && self.observe_crates.is_none()
                     && self.camera_cell.is_none()
-                    && self.camera_top_left.is_none()
                     && self.cursor_position.is_none()
                     && self.terrain_cells.is_none()
                     && self.observe_super_weapons.is_none()
                     && self.observe_diplomacy.is_none()
-                    && self.observe_sidebar_steps.is_none(),
+                    && self.observe_sidebar_steps.is_none()
+                    && self.presentation.is_none(),
                 "map observation profile v1 cannot declare v2 extension fields"
+            );
+        }
+        if let Some(presentation) = &self.presentation {
+            presentation.validate()?;
+            ensure!(
+                self.gestures.is_none() && self.cursor_position.is_none(),
+                "presentation cannot combine with gestures or cursor_position"
             );
         }
         ensure!(
             (640..=4096).contains(&self.width) && (480..=4096).contains(&self.height),
             "capture extent must be 640..4096 by 480..4096"
-        );
-        ensure!(
-            self.camera_cell.is_none() || self.camera_top_left.is_none(),
-            "camera_cell and camera_top_left are exclusive"
         );
         if let Some([x, y]) = self.cursor_position {
             ensure!(
@@ -2723,8 +2771,17 @@ fn terrain_render_observation(state: &AppState, rx: u16, ry: u16) -> Value {
     let a_source = (!state.match_state.sandbox_full_visibility)
         .then_some(presentation.shroud_buffer.as_ref())
         .flatten();
-    let a_center =
-        center.and_then(|point| a_source?.sample_world(point[0], point[1], camera[0], camera[1]));
+    let gpu = &state.renderer.gpu;
+    let a_center = center.and_then(|point| {
+        a_source?.read_world(
+            &gpu.device,
+            &gpu.queue,
+            point[0],
+            point[1],
+            camera[0],
+            camera[1],
+        )
+    });
     json!({
         "phase": "after_draw",
         "variant": cell.map(|cell| cell.variant),
@@ -3150,6 +3207,9 @@ impl TacticalCaptureSession {
             state.renderer.upscale_pass.is_none(),
             "map observation requires native-resolution rendering (no zoom)"
         );
+        if let Some(presentation) = profile.presentation {
+            presentation.apply(state);
+        }
         let cwd = std::env::current_dir()?;
         let inputs = json!({
             "config": artifact(&cwd.join("config.toml"), "config.toml")?,
@@ -3298,7 +3358,6 @@ impl TacticalCaptureSession {
                 );
             }
             let camera_cell = profile.camera_cell;
-            let camera_top_left = profile.camera_top_left;
             let cursor_position = profile.cursor_position;
             let audio_config = profile.observe_audio.as_ref().map(MapAudioProfile::config);
             let allow_load_segments = profile.allow_load_segments == Some(true);
@@ -3361,12 +3420,6 @@ impl TacticalCaptureSession {
             }
             if let Some([rx, ry]) = camera_cell {
                 crate::app::input::camera::center_camera_on_cell(state, rx, ry);
-            }
-            if let Some([x, y]) = camera_top_left {
-                let (sw, sh) = (state.render_width() as f32, state.render_height() as f32);
-                let input = &mut state.match_state.input;
-                crate::app::input::camera::set_camera_position(input, (x as f32, y as f32));
-                crate::app::input::camera::clamp_camera_to_playable_area(state, sw, sh);
             }
             self.record_map_frame(state)?;
             self.post_l0_started_at = Some(Instant::now());
@@ -3790,6 +3843,19 @@ impl TacticalCaptureSession {
                     command_bar.map(|(receipt, _)| receipt),
                 )
             };
+            if scheduled.gesture.is_quickload() {
+                // The key queues the ordinary two-phase loader. This sealed
+                // gesture must finish its loading frame and restoration before
+                // recording the rewound clock, without advancing simulation.
+                ensure!(
+                    crate::app::persistence::commands::pump_saved_game_load(state) == Some(true),
+                    "literal quickload did not present its loading frame"
+                );
+                ensure!(
+                    crate::app::persistence::commands::pump_saved_game_load(state) == Some(false),
+                    "literal quickload did not finish its queued restoration"
+                );
+            }
             let neutral_input_restored = crate::app::input::camera::camera_input_idle(state)
                 && state.match_state.input.hotkey_modifiers.is_empty()
                 && !state.match_state.input.selection_state.is_band_box_active()
@@ -4573,7 +4639,10 @@ impl TacticalCaptureSession {
         ensure!(
             ready && static_default_cursor && camera_input_idle,
             "map observation requires every draw ready with a static cursor and idle camera input: ready={ready}, static_cursor={static_default_cursor}, camera_idle={camera_input_idle}, cursor_feedback={:?}, cursor_position={cursor_position:?}",
-            crate::app::input::cursor::current_cursor_feedback_kind(state)
+            crate::app::input::cursor::current_cursor_feedback_kind(
+                state,
+                &crate::app::input::cursor::CursorTargets::read(state),
+            )
         );
         let profile = &self
             .request
@@ -4608,14 +4677,6 @@ impl TacticalCaptureSession {
         });
         if profile.cursor_position.is_some() {
             render["cursor_position"] = json!(cursor_position);
-        }
-        // Where the battlefield sits in the frame (tactical_viewport_px: its
-        // top-left corner) and the world rectangle the camera can show, so
-        // tiles of a whole-map render can be cropped and placed.
-        let (tactical_w, tactical_h) = crate::app::input::camera::tactical_viewport_size(state);
-        render["tactical_extent"] = json!([tactical_w, tactical_h]);
-        if let Some((x, y, w, h)) = crate::app::input::camera::tactical_view_area(state) {
-            render["view_area"] = json!([x, y, w, h]);
         }
         Ok((ready, render))
     }
@@ -5002,6 +5063,29 @@ mod tests {
         assert!(checked > 1, "found {checked} example profiles");
     }
 
+    /// The presentation block takes only values the Options page can save.
+    #[test]
+    fn presentation_takes_only_options_values() {
+        let mut profile = example();
+        profile.cursor_position = None;
+        profile.presentation = Some(MapPresentationProfile {
+            zoom: 0,
+            sidebar: 150,
+            hd_radar: true,
+            smooth_sidebar: true,
+        });
+        profile.validate().unwrap();
+        for (zoom, sidebar) in [(125, 100), (100, 120)] {
+            profile.presentation = Some(MapPresentationProfile {
+                zoom,
+                sidebar,
+                hd_radar: false,
+                smooth_sidebar: false,
+            });
+            assert!(profile.validate().is_err(), "{zoom} {sidebar}");
+        }
+    }
+
     #[test]
     fn ordinary_capture_admission_uses_canonical_color_and_source_roster() {
         let mut profile = example();
@@ -5098,12 +5182,12 @@ mod tests {
                 z_adjust: -32,
                 color: [0, 255, 0],
                 house: None,
-                house_color: false,
+                house_color: crate::sim::combat::radiation_beam::BeamHouseColor::None,
                 duration: 15,
                 amplitude: NativeF64Bits::from_bits(40.0_f64.to_bits()),
                 eruption: false,
             },
-            |_| [0; 3],
+            |_, _| [0; 3],
         );
         let initial =
             serde_json::to_value(MapRadiationBeamObservation::capture(&beams).unwrap()).unwrap();
@@ -5705,18 +5789,6 @@ mod tests {
         profile.observe_electric_bolts = Some(false);
         assert!(profile.validate().is_err());
         profile.observe_electric_bolts = None;
-        assert!(profile.validate().is_err());
-    }
-
-    #[test]
-    fn camera_top_left_is_a_v2_field_apart_from_camera_cell() {
-        let mut profile = example();
-        profile.camera_top_left = Some([-1766, 908]);
-        profile.validate().unwrap();
-        profile.camera_cell = Some([50, 50]);
-        assert!(profile.validate().is_err());
-        profile.camera_cell = None;
-        profile.schema_version = PROFILE_V1.to_owned();
         assert!(profile.validate().is_err());
     }
 
