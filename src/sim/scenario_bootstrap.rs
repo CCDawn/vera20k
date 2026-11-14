@@ -1925,7 +1925,14 @@ pub fn populate_special_houses(sim: &mut Simulation, house_roster: &HouseRoster,
         let country_name = definition
             .and_then(|house| house.country.as_deref())
             .unwrap_or(special_name);
-        let country_id = Some(sim.interner.intern(country_name));
+        // The tail's HouseType identity is its own special entry: a map House
+        // section's `Country=` feeds the side/passive/mults reads below, never
+        // `HouseClass+0x34`. GetHouse6F2070's country scan (House array order
+        // 502D30) resolves `House=Neutral` teams to this House only while its
+        // type stays the Neutral entry, so a `[Neutral] Country=Russians`
+        // survival map's wave teams keep their owner instead of resolving to
+        // no house at all.
+        let country_id = Some(sim.interner.intern(special_name));
         let declared_side = definition.and_then(|house| house.side.as_deref());
         let side_idx = crate::sim::house_state::resolve_house_side_index(
             rules,
@@ -5582,6 +5589,40 @@ mod tests {
         assert!(!campaign.houses[&campaign_africans].multiplay_passive());
         let campaign_neutral = campaign.interner.get("Neutral").unwrap();
         assert!(!campaign.houses[&campaign_neutral].multiplay_passive());
+    }
+
+    /// The fixed Neutral tail keeps the Neutral HouseType identity when the
+    /// map's `[Neutral]` section carries a `Country=` override (a survival
+    /// map's `[Neutral] Country=Russians` wave owner). GetHouse6F2070's
+    /// country scan (House array order 502D30) resolves `House=Neutral` teams
+    /// to it; with the override as the identity no house holds the Neutral
+    /// country, the wave teams resolve to no owner, and the defense-map
+    /// classification and its reinforcement hold read the map as a battle
+    /// map, letting the defeat gate kill the empty wave house in the opening
+    /// frames.
+    #[test]
+    fn special_tail_keeps_its_own_house_type_under_a_country_override() {
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[Countries]\n0=Americans\n1=Russians\n2=Neutral\n[Americans]\n[Russians]\n[Neutral]\n",
+        ))
+        .expect("country fixture rules");
+        let map =
+            IniFile::from_str("[Houses]\n0=Neutral\n[Neutral]\nCountry=Russians\nMultiplayPassive=no\n");
+        let roster = crate::map::houses::parse_house_roster(&map, &[], Some(&rules));
+
+        let mut sim = Simulation::new();
+        populate_special_houses(&mut sim, &roster, &rules);
+        let neutral = sim.interner.get("Neutral").unwrap();
+        let neutral_country = rules
+            .country_index_of_name("Neutral")
+            .expect("Neutral country registered");
+        assert_eq!(
+            sim.house_by_country_index(neutral_country, &rules),
+            Some(neutral),
+            "House=Neutral teams resolve to the tail house"
+        );
+        // The override still feeds the country facts, not the identity.
+        assert!(!sim.houses[&neutral].multiplay_passive());
     }
 
     #[test]
