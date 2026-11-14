@@ -27,6 +27,34 @@ select Easy, Normal or Hard AI from an open player slot in Battle or Free For Al
 The HTTPS service supplies match-specific relay credentials before the same loading
 and command handoff. Both paths transfer selected authored maps or generated
 seed/preview data and verify build, rules and effective-map agreement before start.
+Whether Ares plays in a match is decided from that same data: the rules, mode
+and map, and, in a build with Ares, whether the game ships `ares.mix`, which the
+rules agreement covers. Released builds never mount `ares.mix`: there Ares plays
+only from Ares keys in the rules, mode or map, with the part of Ares that has left
+its build feature ([Ares](ares.md)). Players on one version reach the same answer;
+a game from before this decides differently and is another version.
+
+The rules agreement is one digest of the process's rules sources
+(`ProcessAssets::multiplayer_rules_digest`). With a mod in use
+([modding guide](modding.md#the-mods-folder)) it also covers every file in the mod's
+folder but `mod.ini`, by path and content, so players whose copies of a mod differ are
+refused as on any rules difference. The files are read once, starting when the player
+opens Network or Internet. Nothing more is exchanged, and without a mod the digest is the
+same bytes as before. A game from before this is another version and is
+refused by the build check first; a rollback returns to the earlier digest for everyone
+on that build. Quick Match plays the original game, and the matchbot pairs without the
+rules hash, so a client ends its search before it queues with a message saying what to
+turn off: a mod in use; `[ini]` roots in config.toml other than YR's; game-folder files
+that change a compared INI (Rules, Art, AI, MPModesMD and the mode INIs, CoopCampMD,
+LANGRULE) from the retail copy; a copy from a retail archive (`langmd.mix`,
+`language.mix`, `expandmd01.mix`, `ra2md.mix`, `ra2.mix`) counts as the original, and
+another is compared with the retail archives' own entry, else `ra2md.mix`'s `localmd.mix`
+(`retail_sources::files_changing_shipped_inis`, found at startup and named in the
+message and the log); or personal rules and Terrain Deformation. A difference none of
+these catches still meets the guest's admission: after `WOL:MatchErrorJoiningGame` its
+status page says the games differ (`VERA:MatchStartMismatch`), the log records both
+hashes, and the search goes on after the stage timeout; the host only times out. This
+adds nothing to what game, lobby and relay exchange.
 
 Typing `/translate zh` (or `en`, `zh-tw`, `ja`, `ko`, `de`, `fr`, `es`, `pt`, `ru`,
 `ar`, `th`, `tr`, `sv`) in an online chat edit turns on chat translation, saved as `[VERA] TranslateChat=`;
@@ -90,7 +118,9 @@ replay and federation are unchanged. Measured traffic is in
 
 When every active player and the relay support synchronized pause, any player
 can use the Pause key or Options' **Pause All Players** / **Resume All Players**
-button. A pause marker follows the relay's last committed frame; clients finish
+button, or type `/pause` or `/resume` as a whole line in match chat. Such a line is
+not sent as chat; in a match without synchronized pause it answers that pausing is
+not available. A pause marker follows the relay's last committed frame; clients finish
 that same frame and stop. Resume uses a separate authenticated control, so it
 works while simulation ticks are stopped. Both markers use the normal ordered
 history and replay recovery. Connections, chat and ticket renewal keep running;
@@ -141,7 +171,11 @@ journal is not encrypted: it holds plain commands and relies on file permissions
 and world in the match; the client renews its ticket and reads missed frames when
 connectivity returns. The UI shows Reconnecting or Catching up while healthy
 clients continue. After ten minutes of silence the relay removes the player
-through the same stream. Like a native lost connection, a removal for silence
+through the same stream. A game that has had no answer from the relay for that
+long, and 15 seconds more, releases its relay route and sends it nothing more:
+its place is gone, and a game whose ticket lapsed gets no answer that says so.
+A match of two or more players then ends with the game-server connection
+message; a one-human match plays on without the relay. Like a native lost connection, a removal for silence
 destroys the player's House and shows "connection lost"; a player who quits still
 leaves through EXIT. While Reconnecting, the relay cannot sequence that EXIT, so
 a confirmed Abort Mission returns to the shell once the relay has been silent for
@@ -161,7 +195,8 @@ caught up; local orders given until then are dropped, and effects and voices sta
 silent. The relay refuses a different world as an agreement mismatch. Abort Mission
 during this replay leaves as it does while Reconnecting.
 
-Authored matches, Cooperative aside, record reconstructible JSON replays in `replays/`.
+Authored matches, Cooperative aside, record reconstructible JSON replays in `replays/`,
+offline skirmishes against computer players included.
 A replay is written when its match ends or the game closes, and also when an
 internal error (a panic) closes the game; the folder keeps the newest 20.
 `vera20k --replay <replay.json> --ra2-dir <retail-directory>` opens read-only
@@ -170,7 +205,9 @@ playback with camera controls and Escape to close.
 accepted launch and replays the production frame transaction without connecting
 to the lobby. Startup version, rules, map bytes, seed and initial state must match;
 recorded state hashes are checked during playback. Generated maps, campaigns and
-restored mid-match segments currently lack standalone replay startup.
+restored mid-match segments currently lack standalone replay startup; a skirmish or
+network match that cannot be recorded says why in the log. `--replay-verify` loads no personal rules (`VERARULES.INI`)
+and no mod, so it refuses a match played with either as a rules mismatch.
 Replay version 4 regenerates shared planning events through the simulation at
 their original frame phases. Earlier JSON logs remain readable for inspection;
 playback requires the current version to avoid executing old internal events twice.
@@ -209,6 +246,42 @@ kick, while its departure removes the admitted participant and endpoint.
 In VERA's rooms the host's own kick also keeps that address and name out for five
 minutes: their joins get the VERA-only denial reason 9, shown as the join ban.
 
+A VERA room's Teams count, which only its host sets, travels with the host's options:
+online as `launch.options.teams` ([lobby protocol](lobby-protocol.md)), on LAN as
+`teams` beside VERA's room options in the extended options. With it set, the host
+keeps every seated player on one of the room's teams and refuses a guest's pick of a
+full team, so guests only show what the host sends. A LAN guest from before Teams
+ignores the field and is refused at the build check. Online, an older guest cannot
+read the host's options while Teams is set and says the update was invalid, in a room
+that cannot start, since its players' versions differ. A lobby from before Teams
+refuses the field; the host's game then turns Teams Off, says so and sends its options
+again without it. A room has 2 to 15 teams, named A to O.
+
+Online, the host's Balance automatically travels the same way, as
+`launch.options.auto_balance`; setting a Teams count turns it on. While it is on, every
+game in the room closes its seated players' Team lists and team headers' Join (a
+spectator's Join still asks to play, and the balance places it), and the host's game asks
+the lobby to balance 5 seconds after who plays or the Teams count last changed, holding
+its Start Game until the answer comes. An older guest cannot read those options either,
+as with Teams. A lobby from before Balance automatically refuses the field; the host's
+game turns it off, says so and sends its options again, and a rollback past Teams then
+turns Teams Off too. The lobby decides each player's team, as for `/balance`; the host's
+game applies it.
+
+A VERA room queues its spectators for seats. A spectator who asks to play while no seat
+is free, with a team header's Join Queue or as a newcomer who prefers to play, joins the
+end of the host's join queue; Leave Queue, or picking to watch again, leaves it. The host's
+game owns the queue as it owns seating: when a seat frees (a player leaves or starts
+watching, or the host adds a slot or removes an AI), it seats the first spectator in the
+queue as its own Seat would and publishes its options. The queue's order travels online
+as `launch.options.queue` and on LAN as `queue` beside VERA's room options. Every game in
+the room lists the waiting spectators first, each with its place before its name, and a
+waiting player's own game says its place and when a seat came free. As with Teams, an
+older guest is refused at LAN's build check and online cannot read the options while
+anyone waits. A lobby from before the queue refuses the field; the host's game stops
+queueing in that room, says so and sends its options again, and its spectators keep
+watching. A rollback past Balance automatically and Teams then turns those off too.
+
 ## Native behavior and deliberate bounds
 
 The following native scheduling/reliability details apply to LAN and legacy routing;
@@ -240,6 +313,21 @@ modern online ordering above is an intentional adaptation.
 - Ordinary waits use the private response maximum from `542450`; primary-global
   acknowledgement history is excluded. The native optional extra channel at
   manager `+50` remains an unimplemented dependency.
+- The LAN application message's name field holds 19 bytes and a terminator. An
+  online name may be 24 characters, so VERA writes the first 19 bytes of a longer
+  name and receivers match a sender by that same prefix (together with its
+  endpoint, as before). LAN names are at most 19 and travel unchanged.
+  A LAN name is the saved player name's bytes: gamemd copies them into each packet
+  (`5DC6A6`) and shows them one byte to a character (`735120`), so every player,
+  the sender too, sees the same name, and a name beyond ASCII shows as its bytes.
+  The packet is unchanged. Older builds on Windows sent other bytes for such a
+  name than they used themselves, so a game they hosted could not be joined;
+  different builds meet only in the lobby, where such a name now looks different.
+- A player's colour travels as the number the lobby lists it under: 0 to 7 for
+  gamemd's eight, 8 for an observer and 9 to 30 for VERA's
+  [extra lobby colours](skirmish-colors.md). The LAN fields and the online slot
+  already carried that range, so no packet changed, and a room keeps each colour to
+  one player while it lists at least as many colours as it has players.
 - Setup Back retains transport history within a lobby visit. A fresh post-match
   visit resets queues, sequence history, observations and lobby timing while
   retaining the portable socket bindings.

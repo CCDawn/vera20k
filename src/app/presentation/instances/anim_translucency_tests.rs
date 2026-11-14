@@ -150,8 +150,8 @@ fn emit_with_lighting(
     let mut out = Vec::new();
     build_display_effect_instances(
         &DisplayEffectInputs {
-            interpolation: None,
             sim,
+            frame: &crate::app::presentation::frame::PresentationFrame::of_test(sim, rules),
             rules,
             camera,
             render_size: [160, 160],

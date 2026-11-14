@@ -673,11 +673,8 @@ fn fourth_base_unit_survival_reaches_the_production_defeat_gate() {
         .spawn_object_limbo_at_height("TANK", "house0", 10, 10, 0, 0, &rules)
         .unwrap();
     sim.check_defeat(Some(&rules), None);
-    assert_eq!(
-        sim.houses[&owner].is_defeated(),
-        !crate::rules::ARES_ENABLED
-    );
-    if crate::rules::ARES_ENABLED {
+    assert_eq!(sim.houses[&owner].is_defeated(), !rules.ares());
+    if rules.ares() {
         sim.uninit_with_rules(extra_mcv, &rules);
         sim.flush_pending_delete();
         sim.check_defeat(Some(&rules), None);
@@ -699,19 +696,18 @@ fn explicit_keep_alive_false_reaches_both_production_mode_arms() {
         sim.spawn_object_limbo_at_height("MARKER", "house0", 10, 10, 0, 0, &rules)
             .unwrap();
         sim.check_defeat(Some(&rules), None);
-        assert_eq!(
-            sim.houses[&houses[0]].is_defeated(),
-            crate::rules::ARES_ENABLED
-        );
+        assert_eq!(sim.houses[&houses[0]].is_defeated(), rules.ares());
     }
 }
 
 /// Rebuild only the native gate's supplied counter/object boundary, then use
 /// the real World presence query and House rung. Parasite input is an allocated
 /// class, not a victim/eater link; this is not a whole parasite lifecycle test.
+// Runs again once house tracking's `game_alive` moves to the switch.
 #[cfg(feature = "ares")]
 #[test]
 fn ares_normal_defeat_gate_matches_executed_object_array_controls() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     let corpus = crate::test_fixture::json("tools/spatial_oracle/ares_house_survival.json");
     for row in corpus["survival_cases"].as_array().unwrap() {
         let input = &row["input"];
@@ -856,7 +852,8 @@ fn native_blowup_subsets_corpus() {
                     .entities
                     .get_mut(controller)
                     .unwrap()
-                    .capture_manager = Some(CaptureManagerState::with_nodes_for_test(&nodes));
+                    .capture_manager =
+                    Some(Box::new(CaptureManagerState::with_nodes_for_test(&nodes)));
             }
         }
         let subset = match input["subset"].as_str().unwrap() {
@@ -978,7 +975,8 @@ fn native_blowup_all_corpus() {
                     .entities
                     .get_mut(controller)
                     .unwrap()
-                    .capture_manager = Some(CaptureManagerState::with_nodes_for_test(&nodes));
+                    .capture_manager =
+                    Some(Box::new(CaptureManagerState::with_nodes_for_test(&nodes)));
             }
         }
         let mut warpers = Vec::new();
@@ -1380,13 +1378,85 @@ fn battle_form_defeats_a_wiped_wave_house_defense_form_holds_it() {
     assert!(!sim.houses[&owners[0]].is_defeated());
     assert!(!sim.houses[&owners[1]].is_defeated());
 
+/// Inside an object pass the Houses are walked for the Civilian-side House
+/// once: later asks at the same House count reuse the answer, a House
+/// registered during the pass is seen, and an ask outside a pass walks.
+#[test]
+fn an_object_pass_walks_the_houses_for_the_civilian_house_once() {
+    let rules = RuleSet::from_ini(&IniFile::from_str(
+        "[Countries]\n0=Americans\n1=Neutral\n[Americans]\n[Neutral]\n\
+         [Sides]\nAllied=Americans\nCivilian=Neutral\n",
+    ))
+    .expect("civilian house rules");
+    let mut sim = Simulation::with_seed(5);
+    let register = |sim: &mut Simulation, name: &str| {
+        let id = sim.interner.intern(name);
+        sim.houses
+            .register(HouseState::new(id, 0, Some(id), false, 0, 10));
+        id
+    };
+    register(&mut sim, "Americans");
+    for walks in [1, 2] {
+        assert_eq!(sim.civilian_side_house_in_pass(&rules), None);
+        assert_eq!(sim.civilian_house_memo.walks(), walks);
+    }
+    sim.civilian_house_memo.begin();
+    for _ in 0..2 {
+        assert_eq!(sim.civilian_side_house_in_pass(&rules), None);
+        assert_eq!(sim.civilian_house_memo.walks(), 3);
+    }
+    let neutral = register(&mut sim, "Neutral");
+    for _ in 0..2 {
+        assert_eq!(sim.civilian_side_house_in_pass(&rules), Some(neutral));
+        assert_eq!(sim.civilian_house_memo.walks(), 4);
+    }
+    sim.civilian_house_memo.end();
+    assert_eq!(sim.civilian_side_house_in_pass(&rules), Some(neutral));
+    assert_eq!(sim.civilian_house_memo.walks(), 5);
+}
+
+/// The garrisonable civilian buildings of one object pass
+/// (`CheckAutoSellOrCivilian @ 0x00458200`, once per building) walk the Houses
+/// once between them, and stay the Civilian-side House's.
+#[test]
+fn garrisonable_civilian_buildings_share_one_house_walk_in_a_pass() {
+    let rules = RuleSet::from_ini(&crate::sim::arena_fixture::clear_ground_ini(
+        "[Countries]\n0=Americans\n1=Russians\n2=Neutral\n[Americans]\n[Russians]\n[Neutral]\n\
+         [Sides]\nAllied=Americans\nSoviet=Russians\nCivilian=Neutral\n\
+         [BuildingTypes]\n0=CITY\n\
+         [CITY]\nStrength=400\nTechLevel=-1\nCanBeOccupied=yes\nMaxNumberOccupants=5\n",
+    ))
+    .expect("city rules");
+    let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x458200);
+    let neutral = sim.interner.intern("Neutral");
+    sim.houses
+        .register(HouseState::new(neutral, 0, Some(neutral), false, 0, 10));
+    let buildings: Vec<u64> = [8, 14, 20]
+        .into_iter()
+        .map(|x| {
+            sim.spawn_object("CITY", "Neutral", x, 10, 0, &rules)
+                .expect("city building")
+        })
+        .collect();
+    sim.resolve_type_handles(&rules);
+    assert_eq!(sim.civilian_side_house(&rules), Some(neutral));
+
+    sim.advance_live_object_pass(&rules, None, crate::sim::world::FrameEffects::default())
+        .unwrap();
+
+    assert_eq!(sim.civilian_house_memo.walks(), 1);
+    for building in buildings {
+        assert_eq!(sim.substrate.entities.owner_of(building), Some(neutral));
+    }
+}
+
 /// Ares 3.0 `10024150` (hook `0x004FC731`): with `ReturnStructures=yes`, a
 /// tech building captured from a passive house goes back to it, without its
 /// engineer and disabled, instead of dying with its holder's Blowup_All;
 /// `Returnable=no` keeps the original death.
-#[cfg(feature = "ares")]
 #[test]
 fn ares_blowup_returns_a_captured_tech_building_to_its_passive_owner() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     for (returnable, returned) in [("", true), ("Returnable=no\n", false)] {
         let rules = RuleSet::from_ini(&IniFile::from_str(&format!(
             "[General]\nReturnStructures=yes\n[CombatDamage]\nC4Warhead=Super\n\
@@ -1409,6 +1479,7 @@ fn ares_blowup_returns_a_captured_tech_building_to_its_passive_owner() {
                 .entities
                 .get(oil)
                 .unwrap()
+                .building
                 .building_has_engineer
                 .is_set()
         );
@@ -1429,7 +1500,7 @@ fn ares_blowup_returns_a_captured_tech_building_to_its_passive_owner() {
         if let Some(building) = building {
             assert_eq!(building.owner(), houses[1]);
             assert_eq!(building.health.current(), 1000);
-            assert!(!building.building_has_engineer.is_set());
+            assert!(!building.building.building_has_engineer.is_set());
             assert!(!building.building_art.stuff_enabled());
         }
     }

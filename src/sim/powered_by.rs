@@ -193,7 +193,7 @@ impl Simulation {
         let Some(entity) = self.substrate.entities.get_mut(id) else {
             return true;
         };
-        let state = entity.powered_by.get_or_insert(PoweredBySource::new());
+        let state = entity.ares.powered_by.get_or_insert(PoweredBySource::new());
         if frame.wrapping_sub(state.last_scan) < SCAN_INTERVAL {
             return true;
         }
@@ -203,6 +203,7 @@ impl Simulation {
             return true;
         }
         entity
+            .ares
             .powered_by
             .as_mut()
             .expect("installed above")
@@ -217,7 +218,12 @@ impl Simulation {
         let busy = busy(entity.mission.current().known()) || busy(entity.mission.queued().known());
         let has_power = busy || self.powered_by_source_online(id, rules);
         let entity = self.substrate.entities.get_mut(id).expect("same object");
-        entity.powered_by.as_mut().expect("installed above").powered = has_power;
+        entity
+            .ares
+            .powered_by
+            .as_mut()
+            .expect("installed above")
+            .powered = has_power;
         let entity = self.substrate.entities.get(id).expect("same object");
         let offline = entity.deactivated.is_offline();
         if has_power {
@@ -311,7 +317,7 @@ impl Simulation {
             .object_type(entity.type_ref(), rules)
             .is_some_and(|object| object.powered_unit)
         {
-            return entity.powered_by.is_none_or(PoweredBySource::powered);
+            return entity.ares.powered_by.is_none_or(PoweredBySource::powered);
         }
         // No second building registry: the existing House+6C order.
         self.houses.get(&entity.owner()).is_some_and(|house| {
@@ -320,7 +326,7 @@ impl Simulation {
                     .entities
                     .get(*building)
                     .is_some_and(|center| {
-                        center.building_powered_center.is_counted()
+                        center.building.building_powered_center.is_counted()
                             && center.emp_remaining() <= 0
                             && self
                                 .object_type(center.type_ref(), rules)
@@ -514,47 +520,9 @@ impl Simulation {
         {
             manager.resume_work(frame);
         }
-        let Some(entity) = self.substrate.entities.get(id) else {
-            return;
-        };
-        if !category.is_foot() {
-            return;
-        }
         // Driverless units go Harmless; harvesters resume their saved
         // mission (Enter for Guard); AI units Hunt.
-        let (mission, commence) = if entity.driver_killed() {
-            (MissionType::Harmless, 1)
-        } else if category == EntityCategory::Unit
-            && self
-                .entity_object_type(entity, rules)
-                .is_some_and(|object| object.harvester || object.resource_gatherer)
-        {
-            let saved = MissionId::from_raw(entity.emp_last_mission());
-            let saved = if saved.known() == Some(MissionType::Guard) {
-                MissionId::from_known(MissionType::Enter)
-            } else {
-                saved
-            };
-            let _ = self.mission_queue_exact(
-                id,
-                saved,
-                1,
-                self.session.binary_frame(),
-                &crate::sim::mission::authority::LiveReadyInputProvider { rules },
-            );
-            return;
-        } else if !self.owner_is_human(entity.owner()) {
-            (MissionType::Hunt, 0)
-        } else {
-            return;
-        };
-        let _ = self.mission_queue_exact(
-            id,
-            MissionId::from_known(mission),
-            commence,
-            self.session.binary_frame(),
-            &crate::sim::mission::authority::LiveReadyInputProvider { rules },
-        );
+        self.recover_ares_emp_foot_mission(id, MissionType::Hunt, rules);
     }
 }
 

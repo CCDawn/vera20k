@@ -127,6 +127,11 @@ fn answer_setup(state: &mut AppState, request: NetworkSetupRequest) {
         }
         return;
     }
+    // The stand-in lobby rates nobody, so its balance moves nobody.
+    if let NetworkSetupRequest::Balance { .. } = request {
+        crate::app::shell_network_setup::balance_answered(state);
+        return;
+    }
     // 0x0078F000: the stand-in server keeps the host's new record.
     if request == NetworkSetupRequest::Advertise {
         super::lobby::republish_channel(state);
@@ -376,13 +381,8 @@ fn answer(state: &mut AppState, request: WolServiceRequest) {
             service_event(state, WolServiceEvent::NetStatus(SERVER_STATUS_READY));
             WolServiceEvent::ServerList(Ok(servers()))
         }
-        // VERA's own message of the day, then this service's.
         WolServiceRequest::Connect { .. } => WolServiceEvent::Login(Ok(WolLoginAccepted {
-            motd: format!(
-                "{}\n{}",
-                super::service::vera_motd(state),
-                crate::i18n::tr(MOTD)
-            ),
+            motd: crate::i18n::tr(MOTD),
         })),
         WolServiceRequest::ListChannels { kind, .. } => WolServiceEvent::Channels {
             kind,

@@ -17,7 +17,9 @@ use crate::app::diagnostics::tactical_capture::profile::{
     CHECKPOINT_RADAR_ONLINE_V2, SealedJsonFile, TacticalCaptureContract, TacticalCaptureProfile,
     validate_new_output_directory,
 };
-use crate::app::frontend::startup_options::{RetailStartupOptions, consume_retail_switches};
+use crate::app::frontend::startup_options::{
+    RetailStartupOptions, StartupExit, consume_retail_switches,
+};
 use crate::skirmish_launch::SkirmishLaunchSession;
 
 use crate::app::diagnostics::tactical_capture::session::MapCaptureProfile;
@@ -112,7 +114,8 @@ where
 
 /// `vera20k --probe [--ra2-dir <dir>] [--map <path>]` (docs/spawn.md): print
 /// one JSON object describing what a spawn launch on this installation is
-/// checked against, then exit. Headless: no logger, window or audio.
+/// checked against, then exit. Headless: no logger, window or audio. `--mod
+/// <folder>` and `--no-mod` choose the mod as they do for that launch.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub fn try_probe<I>(args: I) -> Option<Result<i32>>
 where
@@ -123,8 +126,13 @@ where
         return None;
     }
     Some((|| {
-        let (ra2_dir, map) = parse_probe_args(args)?;
-        let report = crate::app::spawn_probe::run_desktop(ra2_dir.as_deref(), map.as_deref())?;
+        let (mod_switch, args) = crate::app::mods::take_switch(args.collect())?;
+        let (ra2_dir, map) = parse_probe_args(args.into_iter())?;
+        let report = crate::app::spawn_probe::run_desktop(
+            ra2_dir.as_deref(),
+            map.as_deref(),
+            mod_switch.as_ref(),
+        )?;
         println!("{}", serde_json::to_string(&report)?);
         Ok(0)
     })())
@@ -162,9 +170,10 @@ pub enum AppLaunchMode {
     Spawn(RetailStartupOptions),
     /// Watch a strictly reconstructed recording through the normal renderer.
     Replay(ReplayLaunchRequest),
-    /// A help switch: print usage and terminate before any window is created,
-    /// exactly as native's switch parser makes `WinMain` bail.
-    Usage,
+    /// A help switch or an invalid `-X` tail: print its text and terminate
+    /// before any window is created, exactly as native's switch parser makes
+    /// `WinMain` bail.
+    Exit(StartupExit),
     ShellCapture(ShellCaptureRequest),
     TacticalCapture(TacticalCaptureRequest),
     /// A hidden run that draws one map's picture for the setup screens.
@@ -419,8 +428,8 @@ where
     }
     // This is the only process-argument owner for retail startup decisions.
     let (retail_options, args) = consume_retail_switches(args);
-    if retail_options.usage_requested {
-        return Ok(AppLaunchMode::Usage);
+    if let Some(exit) = retail_options.exit {
+        return Ok(AppLaunchMode::Exit(exit));
     }
     let spawn_count = args
         .iter()

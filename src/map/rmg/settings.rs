@@ -33,10 +33,43 @@ pub struct RmgSettings {
     /// Indexed by map type.
     pub vegetation_min: [i32; MAP_TYPE_BUCKETS],
     pub vegetation_max: [i32; MAP_TYPE_BUCKETS],
-    /// VERA extension: the theater's civilian buildings the urban stage may
-    /// place (`tech_catalog::resolve_urban`). Not from `RMGMD.INI`; the app
-    /// fills it per theater. Empty places no towns.
-    pub urban_types: Vec<crate::map::rmg::phases::tech_buildings::TechType>,
+    /// VERA extension: the urban pass's lists for an opted-in Urban Presence
+    /// (`tech_catalog::resolve_vera_urban`). Not from `RMGMD.INI`; the app
+    /// fills it per theater. Empty places no buildings or foots.
+    pub vera_urban: crate::map::rmg::phases::urban_areas::UrbanCatalog,
+    /// VERA extension: `[Extras]`, what the random map's Extras place and
+    /// the light of their moods.
+    pub extras: super::extras::ExtrasSettings,
+    /// Ares `[General] GenerateUrbanAreas=`: the process's first value of
+    /// the urban-areas switch ([`RmgOptions::urban_areas`]).
+    #[cfg(feature = "ares")]
+    pub generate_urban_areas: bool,
+    /// Ares `[Urban] Structures=`, `Infantry=` and `Vehicles=` names.
+    #[cfg(feature = "ares")]
+    pub urban_structures: Vec<String>,
+    #[cfg(feature = "ares")]
+    pub urban_infantry: Vec<String>,
+    #[cfg(feature = "ares")]
+    pub urban_vehicles: Vec<String>,
+}
+
+/// The `[Urban]` defaults of MapSeedClass_LoadFromINI (Ares.dll 1006ABF0).
+#[cfg(feature = "ares")]
+const URBAN_STRUCTURES: &str = "CABUNK01,CABUNK02,CAARMY01,CAARMY02,CAARMY03,CAARMY04,CACHIG03,\
+CANEWY01,CANEWY14,CANWY09,CANWY26,CANWY25,CATEXS07";
+#[cfg(feature = "ares")]
+const URBAN_INFANTRY: &str = "CIV1,CIV2,CIV3,CIVA,CIVB,CIVC";
+#[cfg(feature = "ares")]
+const URBAN_VEHICLES: &str = "TRUCKA,TRUCKB,COP,EUROC,SUVW,SUVB,FTRK,AMBU";
+
+/// Ares `VectorNames::Tokenize`: `strtok` on commas alone, so empty tokens
+/// vanish and spaces stay in the names.
+#[cfg(feature = "ares")]
+fn tokenize_names(text: &str) -> Vec<String> {
+    text.split(',')
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// `MapSeedClass::InitDefaults @ 0x00595740`.
@@ -53,7 +86,17 @@ impl Default for RmgSettings {
             snow_rgb: Default::default(),
             vegetation_min: [0; MAP_TYPE_BUCKETS],
             vegetation_max: [0; MAP_TYPE_BUCKETS],
-            urban_types: Vec::new(),
+            vera_urban: Default::default(),
+            extras: Default::default(),
+            // RMG::UrbanAreas starts false; an absent file reads the defaults.
+            #[cfg(feature = "ares")]
+            generate_urban_areas: false,
+            #[cfg(feature = "ares")]
+            urban_structures: tokenize_names(URBAN_STRUCTURES),
+            #[cfg(feature = "ares")]
+            urban_infantry: tokenize_names(URBAN_INFANTRY),
+            #[cfg(feature = "ares")]
+            urban_vehicles: tokenize_names(URBAN_VEHICLES),
         }
     }
 }
@@ -61,6 +104,7 @@ impl Default for RmgSettings {
 impl RmgSettings {
     /// Agreement over the resolved settings consumed by generation. File
     /// selection and per-key defaults remain owned by `load` and `apply`.
+    /// The Extras are offline-only, so `[Extras]` stays out.
     pub fn multiplayer_digest(&self) -> String {
         let mut bytes = b"VERA20k RMG settings v1\0".to_vec();
         for value in [self.min_tiberium, self.max_tiberium, self.max_trees]
@@ -70,6 +114,18 @@ impl RmgSettings {
             .chain(self.vegetation_max)
         {
             bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        #[cfg(feature = "ares")]
+        for list in [
+            &self.urban_structures,
+            &self.urban_infantry,
+            &self.urban_vehicles,
+        ] {
+            for name in list {
+                bytes.extend_from_slice(name.as_bytes());
+                bytes.push(b',');
+            }
+            bytes.push(0);
         }
         crate::util::sha256::sha256_hex(&bytes)
     }
@@ -102,7 +158,11 @@ impl RmgSettings {
         } else {
             &self.snow_ambient
         };
-        let ambient = TruncF64::from_f64(f64::from(*ambient.get(time)?))
+        // VERA extension: a mood's ambient stands in for the time's.
+        let ambient = self
+            .mood(options)
+            .map_or_else(|| ambient.get(time).copied(), |mood| Some(mood.0))?;
+        let ambient = TruncF64::from_f64(f64::from(ambient))
             .mul(TruncF64::from_f64(0.01))
             .to_f64();
         // 0059991D..0059993D divides signed integers before FILD, not /100.0.
@@ -129,11 +189,29 @@ impl RmgSettings {
         } else {
             (&self.snow_ambient, &self.snow_rgb)
         };
+        let level_units = *self.level_light.get(time)?;
+        // VERA extension: a mood's ambient and tint stand in for the time's;
+        // the level light stays the time's.
+        if let Some((ambient_percent, rgb_percent)) = self.mood(options) {
+            return Some(crate::map::construction_trace::GeneratedLightingOverride {
+                ambient_percent,
+                rgb_percent,
+                level_units,
+            });
+        }
         Some(crate::map::construction_trace::GeneratedLightingOverride {
             ambient_percent: *ambient.get(time)?,
             rgb_percent: [*rgb[0].get(time)?, *rgb[1].get(time)?, *rgb[2].get(time)?],
-            level_units: *self.level_light.get(time)?,
+            level_units,
         })
+    }
+
+    /// VERA extension (`Extra::Mood`): the light of the mood the options
+    /// choose, none at 0.
+    fn mood(&self, options: &RmgOptions) -> Option<(i32, [i32; 3])> {
+        usize::from(options.extras.get(super::extras::Extra::Mood))
+            .checked_sub(1)
+            .and_then(|index| self.extras.moods.get(index).copied())
     }
 
     /// `MapSeedClass::ReadINI @ 0x005981F0` reads `RMGMD.INI`
@@ -169,6 +247,24 @@ impl RmgSettings {
         if let Some(value) = int_list::<MAP_TYPE_BUCKETS>(general, "RMGVegetationMaximums") {
             self.vegetation_max = value;
         }
+        // MapSeedClass_LoadFromINI (Ares.dll 1006ABF0, hook 0x5982D5, after
+        // RMGMaximumTiberium): gamemd's ReadBool and 0x800-byte ReadString.
+        // Ares reads them once per process; RMGMD.INI does not change, so
+        // each load reads the same values.
+        #[cfg(feature = "ares")]
+        {
+            self.generate_urban_areas =
+                general.read_bool("GenerateUrbanAreas", self.generate_urban_areas);
+            let urban = ini.section_or_empty("Urban");
+            self.urban_structures =
+                tokenize_names(&urban.read_string("Structures", URBAN_STRUCTURES, 0x800));
+            self.urban_infantry =
+                tokenize_names(&urban.read_string("Infantry", URBAN_INFANTRY, 0x800));
+            self.urban_vehicles =
+                tokenize_names(&urban.read_string("Vehicles", URBAN_VEHICLES, 0x800));
+        }
+        // VERA extension: gamemd reads no `[Extras]`.
+        self.extras.apply(ini.section_or_empty("Extras"));
     }
 }
 
@@ -229,6 +325,33 @@ mod tests {
         assert_eq!(settings.level_light, [3, 3, 3, 3]);
         assert_eq!(settings.vegetation_min, [60; 5]);
         assert_eq!(settings.vegetation_max, [100; 5]);
+    }
+
+    /// Ares MapSeedClass_LoadFromINI (Ares.dll 1006ABF0, hook 0x5982D5):
+    /// gamemd's ReadBool and ReadString with Ares' defaults, split on commas
+    /// alone. The loader drops a key with an empty value, so it keeps the
+    /// default.
+    #[cfg(feature = "ares")]
+    #[test]
+    fn urban_keys_read_with_ares_defaults_and_comma_tokens() {
+        let defaults = RmgSettings::default();
+        assert!(!defaults.generate_urban_areas);
+        assert_eq!(
+            defaults.urban_infantry,
+            ["CIV1", "CIV2", "CIV3", "CIVA", "CIVB", "CIVC"]
+        );
+        assert_eq!(defaults.urban_structures.len(), 13);
+        assert_eq!(defaults.urban_structures[12], "CATEXS07");
+
+        let mut settings = RmgSettings::default();
+        settings.apply(&IniFile::from_str(
+            "[General]\nGenerateUrbanAreas=yes\n\
+             [Urban]\nStructures=CAX,,CA Y\nVehicles=\n",
+        ));
+        assert!(settings.generate_urban_areas);
+        assert_eq!(settings.urban_structures, ["CAX", "CA Y"]);
+        assert_eq!(settings.urban_vehicles, defaults.urban_vehicles);
+        assert_eq!(settings.urban_infantry, defaults.urban_infantry);
     }
 
     #[test]
@@ -322,5 +445,71 @@ mod tests {
         assert!(settings.temperate_ambient.is_empty());
         assert!(settings.snow_ambient.is_empty());
         assert!(settings.level_light.is_empty());
+    }
+
+    /// VERA extension: a mood lights the map in place of its time of day,
+    /// keeping the time's level light; with no mood the time's light stands.
+    #[test]
+    fn a_mood_stands_in_for_the_light_of_the_time_of_day() {
+        use crate::map::rmg::extras::Extra;
+        let mut settings = RmgSettings::default();
+        settings.apply(&IniFile::from_str(
+            "[General]\nTemperateAmbientLight=75,100\nRMGLevelLightSettings=3,4\n\
+             TemperateAmbientRed=109,108\nTemperateAmbientGreen=80,94\n\
+             TemperateAmbientBlue=49,68\n",
+        ));
+        let mut options = RmgOptions {
+            time: 1,
+            ..Default::default()
+        };
+        let plain = settings.generated_lighting_override(&options).unwrap();
+        assert_eq!(
+            (plain.ambient_percent, plain.rgb_percent, plain.level_units),
+            (100, [108, 94, 68], 4)
+        );
+        options.extras.set(Extra::Mood, 2);
+        let dusk = settings.generated_lighting_override(&options).unwrap();
+        assert_eq!(
+            (dusk.ambient_percent, dusk.rgb_percent),
+            (62, [135, 70, 55])
+        );
+        assert_eq!(dusk.level_units, 4);
+        let ini = settings.generated_lighting_ini(&options).unwrap();
+        assert_eq!(
+            ini.section("Lighting").unwrap().get_for_test("Ambient"),
+            Some("0.620000")
+        );
+    }
+
+    /// VERA's `[Extras]` keys name what the Extras place and set a mood's
+    /// light; an absent key, or a mood short of a number, keeps the default.
+    #[test]
+    fn extras_keys_replace_the_names_and_the_mood_light() {
+        use crate::map::rmg::extras::{Extra, ExtrasSettings};
+        let mut settings = RmgSettings::default();
+        settings.apply(&IniFile::from_str(
+            "[Extras]\nFarms=CABARN02, CAFARM01\nFairTech=CAMACH\nTownFence=CAFNCG\n\
+             RedDusk=50,140,60,40\nMoonlight=40,50\n",
+        ));
+        let (read, defaults) = (&settings.extras, ExtrasSettings::default());
+        assert_eq!(read.farms, ["CABARN02", "CAFARM01"]);
+        assert_eq!(
+            (read.fair_tech.as_str(), read.town_fence.as_str()),
+            ("CAMACH", "CAFNCG")
+        );
+        assert_eq!(
+            (&read.landmarks, &read.farm_fence),
+            (&defaults.landmarks, &defaults.farm_fence)
+        );
+        assert_eq!(read.moods[2], defaults.moods[2], "a short mood is refused");
+        let options = RmgOptions {
+            extras: {
+                let mut extras = crate::map::rmg::extras::RmgExtras::default();
+                extras.set(Extra::Mood, 2);
+                extras
+            },
+            ..Default::default()
+        };
+        assert_eq!(settings.mood(&options), Some((50, [140, 60, 40])));
     }
 }

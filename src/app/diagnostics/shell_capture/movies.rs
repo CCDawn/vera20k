@@ -72,6 +72,11 @@ pub(super) enum MoviesTarget {
     },
     /// Exit Game through the production teardown slide, then state 6.
     ExitConfirm,
+    /// Main Menu -> Options -> Mods: VERA's page settled; with `ask`, after a press on
+    /// a row the run does not play and on Use This Mod.
+    Mods {
+        ask: bool,
+    },
     /// A teardown slide held at `tick`: Exit Game on `0xE2` or Back on
     /// `0x129`.
     SlideOut {
@@ -178,6 +183,10 @@ enum Phase {
     MainMenu,
     Page,
     List,
+    /// Options is opening on the way to the Mods page: its Mods button is
+    /// pressed once it has settled.
+    ModsOptions,
+    Mods,
     Credits,
     Movie,
     Exit,
@@ -303,6 +312,42 @@ impl MoviesCapture {
     fn slide_settled(state: &AppState, kind: ShellSlideKind) -> bool {
         state.frontend.shell_first_paint_slide.is_none()
             && state.frontend.shell_slide_active_shell == Some(kind)
+    }
+
+    /// Through the page's own pointer handlers: a press on the first row in
+    /// view that the run does not play and can, then on Use This Mod, which
+    /// asks.
+    fn press_mod_row_and_use(state: &mut AppState) -> Result<()> {
+        let layout = crate::app::frontend::shell_layout::mods_layout(state);
+        let mods = &state.frontend.mods;
+        let page = mods.page.as_ref().context("the Mods page has no list")?;
+        let geometry = page.geometry(
+            layout.list,
+            crate::ui::shell::list::ListMetrics::scaled(layout.page.scale),
+        );
+        // The list opens with the row in use in view: pick from what shows.
+        let visible = page
+            .rows
+            .iter()
+            .skip(page.top)
+            .take(geometry.visible_rows)
+            .position(|row| !mods.in_use(row) && row.needs.is_none())
+            .context("the Mods list shows no other row to pick")?;
+        let use_button = layout
+            .page
+            .button_rect(crate::ui::mods_shell::USE)
+            .context("the Mods page has no Use This Mod button")?;
+        for rect in [geometry.row(visible), use_button] {
+            state.match_state.input.cursor_x = (rect.x + rect.w / 2) as f32;
+            state.match_state.input.cursor_y = (rect.y + rect.h / 2) as f32;
+            App::handle_mods_mouse_down(state);
+            App::handle_mods_mouse_up(state);
+        }
+        ensure!(
+            state.frontend.shell_message_box.is_some(),
+            "Use This Mod did not ask before restarting"
+        );
+        Ok(())
     }
 
     fn restore_neutral_pointer(state: &mut AppState) {
@@ -531,6 +576,16 @@ impl MoviesCapture {
                         self.phase = Phase::NetworkLeaving;
                         return Ok(());
                     }
+                    if matches!(self.target, MoviesTarget::Mods { .. }) {
+                        self.route
+                            .push(json!({"dialog": 0xe2, "frame": frame, "action": "Options"}));
+                        App::handle_main_menu_shell_action(
+                            state,
+                            crate::ui::main_menu_shell::MainMenuShellAction::Options,
+                        );
+                        self.phase = Phase::ModsOptions;
+                        return Ok(());
+                    }
                     if matches!(self.target, MoviesTarget::Options0xD5 { .. }) {
                         self.route
                             .push(json!({"dialog": 0xe2, "frame": frame, "action": "Options"}));
@@ -617,6 +672,7 @@ impl MoviesCapture {
                             crate::ui::movies_credits_shell::MoviesCreditsAction::SneakPeeks
                         }
                         MoviesTarget::ExitConfirm
+                        | MoviesTarget::Mods { .. }
                         | MoviesTarget::SlideOut { .. }
                         | MoviesTarget::Campaign0x94 { .. }
                         | MoviesTarget::CampaignStart { .. }
@@ -959,6 +1015,57 @@ impl MoviesCapture {
                     self.phase = Phase::Settling(SETTLE_FRAMES);
                 }
             }
+            (Phase::ModsOptions, PresentedShell::Options) => {
+                use crate::ui::main_menu_dialogs::options::{LauncherButton, LauncherParentResult};
+                let showing = state
+                    .frontend
+                    .options_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.category());
+                if let Some(showing) = showing
+                    && state.frontend.shell_exit.is_none()
+                    && Self::slide_settled(state, ShellSlideKind::Options)
+                {
+                    let layout =
+                        crate::app::frontend::shell_layout::launcher_options_layout(state, showing);
+                    let rect = layout
+                        .buttons
+                        .iter()
+                        .find(|(button, _)| {
+                            *button == LauncherButton::Exit(LauncherParentResult::Mods)
+                        })
+                        .map(|(_, rect)| *rect)
+                        .context("D5 Mods button")?;
+                    state.match_state.input.cursor_x = (rect.x + rect.w / 2) as f32;
+                    state.match_state.input.cursor_y = (rect.y + rect.h / 2) as f32;
+                    App::handle_launcher_options_mouse(state, None);
+                    App::handle_launcher_options_mouse(state, Some(true));
+                    App::handle_launcher_options_mouse(state, Some(false));
+                    ensure!(
+                        state.frontend.shell_exit.is_some(),
+                        "Mods did not start the 0xD5 teardown slide"
+                    );
+                    self.route.push(json!({"dialog": 0xd5, "frame": frame,
+                        "action": "Mods through ordinary pointer handler"}));
+                    self.phase = Phase::Mods;
+                }
+            }
+            (Phase::Mods, PresentedShell::Mods) => {
+                if Self::slide_settled(state, ShellSlideKind::Mods) {
+                    if self.target == (MoviesTarget::Mods { ask: true }) {
+                        Self::press_mod_row_and_use(state)?;
+                        self.route
+                            .push(json!({"dialog": crate::ui::mods_shell::DIALOG.0,
+                            "frame": frame, "action": "press a row, then Use This Mod"}));
+                        Self::restore_neutral_pointer(state);
+                    } else {
+                        // Hover over the list writes its status help.
+                        Self::restore_neutral_pointer(state);
+                        App::handle_mods_mouse_move(state);
+                    }
+                    self.phase = Phase::Settling(SETTLE_FRAMES);
+                }
+            }
             (Phase::List, PresentedShell::MovieList) => {
                 if Self::slide_settled(state, ShellSlideKind::MovieList) {
                     if let MoviesTarget::FullList { down_presses } = self.target {
@@ -1231,7 +1338,7 @@ impl MoviesCapture {
                     let sim = &state
                         .match_state
                         .sim_runtime
-                        .as_ref()
+                        .runtime()
                         .context("EXIT lost its installed runtime")?
                         .simulation;
                     ensure!(
@@ -1383,7 +1490,10 @@ impl MoviesCapture {
         // Steady page frames wait for the heading's and the status line's
         // kind-1 reveals to finish.
         let heading_settled = match self.target {
+            // The question's box covers the page's statics.
+            MoviesTarget::Mods { ask: true } => true,
             MoviesTarget::Page0x101
+            | MoviesTarget::Mods { ask: false }
             | MoviesTarget::List0x129
             | MoviesTarget::List0x129Selected
             | MoviesTarget::FullList { .. }
@@ -1439,6 +1549,11 @@ impl MoviesCapture {
         }
         let expected = match self.target {
             MoviesTarget::Page0x101 => state.frontend.shell_route.movies_and_credits(),
+            MoviesTarget::Mods { ask } => {
+                state.frontend.shell_route.mods()
+                    && state.frontend.mods.page.is_some()
+                    && state.frontend.shell_message_box.is_some() == ask
+            }
             MoviesTarget::List0x129
             | MoviesTarget::List0x129Selected
             | MoviesTarget::FullList { .. } => {
@@ -1858,7 +1973,7 @@ fn campaign_abort_cleanup_receipt(state: &AppState) -> Result<Value> {
     let sim = &state
         .match_state
         .sim_runtime
-        .as_ref()
+        .runtime()
         .context("ordinary return unexpectedly discarded the retained campaign runtime")?
         .simulation;
     let mission_counter = sim
@@ -1888,7 +2003,7 @@ fn campaign_abort_cleanup_receipt(state: &AppState) -> Result<Value> {
         "campaign_page_present": state.frontend.campaign.is_some(), "fullscreen_movie_present": state.frontend.fullscreen_movie.is_some(),
         "scenario_exit_present": state.match_state.scenario_exit.is_some(), "scenario_outcome_present": state.match_state.scenario_outcome.is_some(),
         "in_game_menu": format!("{:?}", state.match_state.match_presentation.in_game_menu),
-        "retained_runtime_present": state.match_state.sim_runtime.is_some(), "retained_tick": sim.session().tick(),
+        "retained_runtime_present": state.match_state.sim_runtime.is_installed(), "retained_tick": sim.session().tick(),
         "retained_quit_requested": sim.quit_requested(),
         "retained_scenario_started": sim.session().started(),
         "campaign_mission_counter": mission_counter, "pending_exit_commands": pending_exit_commands,
@@ -1902,7 +2017,7 @@ fn campaign_runtime_receipt(state: &AppState) -> Result<Value> {
         state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .is_some_and(|runtime| runtime.simulation.session().tick() == 0),
         "first live capture passed simulation tick zero"
     );
@@ -1913,7 +2028,7 @@ fn initial_save_receipt(state: &AppState, directory: &Path) -> Result<Value> {
     let runtime = state
         .match_state
         .sim_runtime
-        .as_ref()
+        .runtime()
         .context("initial save has no world")?;
     ensure!(
         runtime.simulation.session().tick() == 1,
@@ -1974,7 +2089,7 @@ fn installed_campaign_runtime_receipt(state: &AppState) -> Result<Value> {
     let runtime = state
         .match_state
         .sim_runtime
-        .as_ref()
+        .runtime()
         .context("first live frame has no runtime")?;
     let sim = &runtime.simulation;
     ensure!(

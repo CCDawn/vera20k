@@ -157,7 +157,7 @@ pub(crate) fn build_identity() -> BuildIdentity {
     BuildIdentity {
         package_version: env!("CARGO_PKG_VERSION").to_owned(),
         network_build: env!("VERA20K_NETWORK_BUILD").to_owned(),
-        ares: crate::rules::ARES_ENABLED,
+        ares: crate::rules::ARES_BUILD,
         phobos: crate::rules::PHOBOS_ENABLED,
         npatch: crate::rules::NPATCH_ENABLED,
         verax: crate::rules::VERAX_ENABLED,
@@ -171,20 +171,23 @@ pub(crate) fn build_identity() -> BuildIdentity {
 
 /// Load the process sources as startup does (config INI roots, personal
 /// rules, neutral archives) and report them; `map` is a path to the
-/// launcher's map file.
+/// launcher's map file, and `mod_dir` the folder of the mod the launch would
+/// read (`mods::launch_dir`).
 pub(crate) fn probe(
     config: &crate::util::config::GameConfig,
     personal_rules: crate::rules::personal_rules::PersonalRules,
     media_archive_mode: MediaArchiveMode,
     map: Option<&str>,
+    mod_dir: Option<std::path::PathBuf>,
 ) -> Result<ProbeReport> {
     let root = &config.paths.ra2_dir;
-    let mut assets = AssetManager::new(root, media_archive_mode)
+    let mut assets = AssetManager::with_mod(root, mod_dir.as_deref(), media_archive_mode)
         .and_then(|assets| assets.with_ini_roots(&config.ini))
         .context("could not load the game archives")?;
     let mut process =
         ProcessAssets::new_with_ini_config(media_archive_mode, true, config.ini.clone())
-            .with_personal_rules(personal_rules);
+            .with_personal_rules(personal_rules)
+            .with_mod_dir(mod_dir);
     let (startup_rules, projection) = process
         .initialize_sources_if_needed(&assets)
         .map_err(anyhow::Error::msg)
@@ -223,10 +226,7 @@ pub(crate) fn probe(
             name: id.to_owned(),
         })
         .collect();
-    let schemes = projection
-        .as_ref()
-        .map(crate::rules::color_scheme::parse_color_schemes)
-        .unwrap_or_default();
+    let schemes = probe_color_schemes(startup_rules.as_ref(), projection.as_ref());
     let color_mode = startup_rules
         .as_ref()
         .map(crate::rules::ruleset::RuleSet::skirmish_colors)
@@ -379,19 +379,37 @@ fn mission_chain(
     chain
 }
 
+/// The `[Colors]` entries the colours are named from: the startup rules'
+/// list, which holds the built-in extra lobby colours the section leaves out
+/// (`SkirmishColorMode::from_ini`), or the projection's own section without
+/// rules.
+fn probe_color_schemes(
+    rules: Option<&crate::rules::ruleset::RuleSet>,
+    projection: Option<&crate::rules::ini_parser::IniFile>,
+) -> Vec<crate::rules::color_scheme::ColorSchemeEntry> {
+    match rules {
+        Some(rules) => rules.color_schemes.clone(),
+        None => projection
+            .map(crate::rules::color_scheme::parse_color_schemes)
+            .unwrap_or_default(),
+    }
+}
+
 /// Each `Color=` priority this build admits and the `[Colors]` entry it
-/// selects (`Game_GetLinkedColor`). Vanilla offers the eight lobby
-/// priorities; Phobos `SkirmishUnlimitedColors` addresses every entry.
+/// selects (`Game_GetLinkedColor`). Vanilla offers the lobby's priorities:
+/// YR's eight, then VERA's extra colours the rules list; Phobos
+/// `SkirmishUnlimitedColors` addresses every entry.
 fn color_names(
     schemes: &[crate::rules::color_scheme::ColorSchemeEntry],
     mode: crate::rules::skirmish_colors::SkirmishColorMode,
 ) -> Vec<IndexedName> {
-    let last = if mode.unlimited() {
-        (schemes.len() as i32 - 1).min(max_spawn_color_index())
+    let priorities: Vec<i32> = if mode.unlimited() {
+        (0..=(schemes.len() as i32 - 1).min(max_spawn_color_index())).collect()
     } else {
-        7
+        mode.lobby_priorities().map(i32::from).collect()
     };
-    (0..=last)
+    priorities
+        .into_iter()
         .filter_map(|priority| {
             let entry = mode.entry_for_priority(priority);
             schemes.get(entry).map(|scheme| IndexedName {
@@ -403,9 +421,14 @@ fn color_names(
 }
 
 /// Desktop `--probe [--ra2-dir DIR] [--map PATH]`: the game folder comes from
-/// config.toml as for play unless `--ra2-dir` names one.
+/// config.toml as for play unless `--ra2-dir` names one, and the mod from
+/// config.toml unless `--mod` or `--no-mod` chooses.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) fn run_desktop(ra2_dir: Option<&Path>, map: Option<&Path>) -> Result<ProbeReport> {
+pub(crate) fn run_desktop(
+    ra2_dir: Option<&Path>,
+    map: Option<&Path>,
+    mod_switch: Option<&crate::app::mods::ModSwitch>,
+) -> Result<ProbeReport> {
     let config = crate::util::config::GameConfig::load()?;
     let config = match ra2_dir {
         Some(directory) => config.with_retail_directory(
@@ -430,6 +453,7 @@ pub(crate) fn run_desktop(ra2_dir: Option<&Path>, map: Option<&Path>) -> Result<
         personal_rules,
         crate::app::frontend::startup_options::RetailStartupOptions::default().media_archive_mode,
         map.as_deref(),
+        crate::app::mods::launch_dir(&config.paths, mod_switch),
     )
 }
 
@@ -495,6 +519,36 @@ mod tests {
                 (7, "C7")
             ]
         );
+    }
+
+    #[test]
+    fn vanilla_colors_go_on_with_the_extra_lobby_colours_past_the_observers() {
+        let colors = color_names(
+            &schemes(40),
+            SkirmishColorMode::with_extra_entries(&[30, 31]),
+        );
+        let extras: Vec<_> = colors
+            .iter()
+            .skip(8)
+            .map(|c| (c.index, c.name.as_str()))
+            .collect();
+        assert_eq!(extras, [(9, "C30"), (10, "C31")]);
+    }
+
+    /// Retail `[Colors]` leaves out the built-in extra colours; the rules'
+    /// scheme list holds them, so the probe names all thirty.
+    #[test]
+    fn retail_probe_names_the_thirty_lobby_colours() {
+        let Some(rules) = crate::rules::retail_ini_fixture::retail_rulesmd_rules() else {
+            return;
+        };
+        let colors = color_names(
+            &probe_color_schemes(Some(&rules), None),
+            rules.skirmish_colors(),
+        );
+        let listed: Vec<u32> = colors.iter().map(|c| c.index).collect();
+        assert_eq!(listed, (0..8).chain(9..=30).collect::<Vec<u32>>());
+        assert_eq!(colors[8].name, "VeraBurgundy");
     }
 
     #[test]

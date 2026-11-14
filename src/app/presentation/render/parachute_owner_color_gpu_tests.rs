@@ -191,7 +191,7 @@ fn retail_parachute_canopy_uses_each_attached_house_remap_in_gpu_pixels() {
             let anim = sim.anim(anim_id).unwrap();
             let key = ShpSpriteKey {
                 palette_context: ShpPaletteContext::AnimScheme,
-                type_id: parachute_name.clone(),
+                type_id: parachute_name.clone().into(),
                 facing: 0,
                 frame: u16::try_from(anim.runtime().current_frame).unwrap(),
                 house_color: color,
@@ -229,8 +229,8 @@ fn retail_parachute_canopy_uses_each_attached_house_remap_in_gpu_pixels() {
     let lighting = CellLightGrid::new();
     let hidden = BTreeSet::new();
     let input = DisplayEffectInputs {
-        interpolation: None,
         sim: &sim,
+        frame: &crate::app::presentation::frame::PresentationFrame::of_test(&sim, &rules),
         rules: &rules,
         camera: view_camera,
         render_size: size,

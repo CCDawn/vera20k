@@ -8,10 +8,10 @@ use crate::rules::ini_parser::IniFile;
 use crate::sim::production::ProductionCategory;
 use serde_json::{Value, json};
 
-#[cfg(feature = "ares")]
 #[path = "can_build_ares_tests.rs"]
 mod ares_tests;
 
+#[cfg(not(feature = "ares"))]
 fn rows(section: &str) -> Vec<Value> {
     let data: Value =
         serde_json::from_str(crate::test_fixture::text("tools/can_build_oracle.json")).unwrap();
@@ -24,7 +24,7 @@ fn comparable_can_build_rows() -> impl Iterator<Item = Value> {
         // These gamemd controls intentionally differ from Ares100082B0's
         // positive specific count and CountOwnedNow100032F0's tracked
         // alternates. The Ares corpus covers those component boundaries.
-        !crate::rules::ARES_ENABLED
+        !crate::rules::ARES_BUILD
             || (row["proc_alternate"].is_null()
                 && row["name"].as_str() != Some("BuildingType count negative"))
     })
@@ -52,6 +52,7 @@ fn category(class: &str) -> EntityCategory {
 
 /// The row's rules: the oracle's types, the asked type `Q` of its class and
 /// the `[General]` lists.
+#[cfg(not(feature = "ares"))]
 fn rules_for(row: &Value) -> RuleSet {
     let class = row["class"].as_str().unwrap();
     let spec = &row["type"];
@@ -496,7 +497,10 @@ fn comma_only_required_houses_refuses_ordinary_can_build_but_keeps_shortcuts() {
     );
 }
 
+// Ares hook 0x50B370 (10024F80) replaces CheckBuildLimit; its own tests are
+// in can_build_ares_tests.rs.
 #[test]
+#[cfg(not(feature = "ares"))]
 fn check_build_limit_matches_the_original() {
     for row in rows("check_build_limit") {
         let rules = rules_for(&row);
@@ -534,10 +538,11 @@ fn captured_secret_lab_grants_before_normal_tech_admission_and_retracts_on_loss(
         sim.houses
             .register(HouseState::new(id, 0, Some(country), human, 1000, 10));
     }
-    #[cfg(feature = "ares")]
-    crate::sim::production::tests::spawn_structure(
-        &mut sim, &rules, 10000, "Self", "FACTORY", 20, 20,
-    );
+    if rules.ares_form() {
+        crate::sim::production::tests::spawn_structure(
+            &mut sim, &rules, 10000, "Self", "FACTORY", 20, 20,
+        );
+    }
     let lab = sim.spawn_object("LAB", "Other", 12, 5, 0, &rules).unwrap();
     let product = rules.object("Q").unwrap();
     assert_eq!(
@@ -618,16 +623,17 @@ fn retail_slave_miner_meets_proc_and_docks_limit_harriers() {
         .register(HouseState::new(yuri, 2, None, true, 0, 10));
     on_map(&mut sim, yuri, EntityCategory::Structure, "YABRCK", 1);
     on_map(&mut sim, yuri, EntityCategory::Structure, "YACNST", 1);
-    #[cfg(feature = "ares")]
-    crate::sim::production::tests::spawn_structure(
-        &mut sim,
-        rules,
-        10000,
-        "YuriCountry",
-        "YACNST",
-        20,
-        20,
-    );
+    if rules.ares_form() {
+        crate::sim::production::tests::spawn_structure(
+            &mut sim,
+            rules,
+            10000,
+            "YuriCountry",
+            "YACNST",
+            20,
+            20,
+        );
+    }
     let yaweap = rules.object("YAWEAP").unwrap();
     assert_eq!(
         can_build(&sim, rules, yuri, yaweap, false, true),
@@ -646,7 +652,12 @@ fn retail_slave_miner_meets_proc_and_docks_limit_harriers() {
     let orca = rules.object("ORCA").unwrap();
     assert!(orca.airport_bound);
     on_map(&mut sim, americans, EntityCategory::Aircraft, "ORCA", 3);
-    assert!(!check_build_limit(&sim, rules, americans, orca));
+    // Below the docks Ares 10024F80 (hook 0x50B370) goes on to the limit and
+    // a usable factory, and this house owns no airfield.
+    assert_eq!(
+        check_build_limit(&sim, rules, americans, orca),
+        rules.ares_form()
+    );
     on_map(&mut sim, americans, EntityCategory::Aircraft, "BEAG", 1);
     assert!(check_build_limit(&sim, rules, americans, orca));
 }

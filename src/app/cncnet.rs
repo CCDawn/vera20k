@@ -372,6 +372,7 @@ impl App {
                 .as_deref()
                 .unwrap_or_default()
         );
+        let request = request.admit_loaded_modes(&state.frontend.skirmish_modes)?;
         if let SpawnGame::Network(network) = &request.game {
             match &network.transport {
                 // Browsers cannot open the UDP sockets direct play needs.
@@ -399,6 +400,12 @@ impl App {
                 )))]
                 SpawnTransport::Relay(_) => {}
             }
+        }
+        // The mod this launch asked for is not in use (`app::mods`): end on
+        // the reason, which a start without the mod would bury in a rules
+        // mismatch with the other players.
+        if let Some(reason) = state.frontend.mods.refusal() {
+            anyhow::bail!("{reason}");
         }
         Self::check_spawn_expectations(state, &request)?;
         state.frontend.external_launch = true;
@@ -545,7 +552,7 @@ impl App {
         {
             return;
         }
-        let Some(runtime) = state.match_state.sim_runtime.as_ref() else {
+        let Some(runtime) = state.match_state.sim_runtime.runtime() else {
             return;
         };
         let frame = runtime.simulation.session().binary_frame();
@@ -698,7 +705,7 @@ impl App {
         use crate::ui::shell::abort::{AbortButton, AbortSecondary};
         match &state.frontend.screen {
             GameScreen::InGame => {
-                if state.match_state.sim_runtime.is_none()
+                if !state.match_state.sim_runtime.is_installed()
                     || state.match_state.scenario_exit.is_some()
                     || state.match_state.scenario_outcome.is_some()
                     || Self::house_outcome_wait_pending(state)
@@ -828,7 +835,7 @@ impl App {
         let sim = state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .map(|runtime| &runtime.simulation);
         let local = sim.and_then(|sim| {
             sim.session()

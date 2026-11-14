@@ -35,6 +35,12 @@
 //! - Fire legality (`TechnoClass::GetFireError` `0x006FCB8D`, `0x006FCBAD`): a
 //!   BombDisarm weapon needs a bombed target, an IvanBomb weapon an unbombed
 //!   one.
+//! - A player's Detonate: the lone selected carrier of a human player's bomb
+//!   answers Detonate over itself where `[CombatDamage]
+//!   CanDetonateTimeBomb=`/`CanDetonateDeathBomb=` allow its kind, both no in
+//!   retail ([`Simulation::bomb_detonate_action`]); the click sends DETONATE
+//!   with the bomb's house, whose Execute sets it off
+//!   ([`Simulation::execute_detonate_event`]).
 //! - Who sees it (`BombListClass::UpdateAll @ 0x00438BF0`, every frame before
 //!   the object AI): every 46th call, and the second call after an attach, the
 //!   carrier's `+0x68` becomes "the local player owns the planter's house or a
@@ -68,10 +74,6 @@
 //! - The death bomb (kind `+0x30 = 1`: no fuse, clock frame 12) has no native
 //!   writer, so only timed bombs exist in stock builds; Ares PlantBomb writes
 //!   it.
-//! - The player's DETONATE action (`EventClass` `0x004C7823`, behind
-//!   `CanDetonateTimeBomb=`/`CanDetonateDeathBomb=`, both off in stock, and
-//!   Ares's `IvanBomb.CanDetonate*` with its What_Action hooks) is not
-//!   represented.
 //! - Campaign visibility: `HouseClass::IsHumanPlayer @ 0x0050B6F0` also admits
 //!   a house with PlayerControl (`+0x1ED`) in a campaign; the app tests the
 //!   local player's house only, as for the other gated sounds. Trigger: a
@@ -249,6 +251,19 @@ impl Bomb {
         self.planter
     }
 
+    /// `+0x28`: the planter's house at the attach.
+    pub(crate) fn house(&self) -> InternedId {
+        self.planter_house
+    }
+
+    /// `BombClass::GetType @ 0x004389F0`, the kind `+0x30`: a death bomb (1).
+    fn is_death_bomb(&self) -> bool {
+        #[cfg(feature = "ares")]
+        return self.death_bomb;
+        #[cfg(not(feature = "ares"))]
+        false
+    }
+
     /// `BombClass::IsTimerExpired @ 0x00438A70`: a timed bomb (kind 0)
     /// once `Frame > end`; a death bomb never.
     pub(crate) fn expired(&self, frame: i32) -> bool {
@@ -275,21 +290,14 @@ impl Bomb {
     /// last stage's index. `None` where native divides by zero.
     #[cfg(feature = "ares")]
     fn ares_clock_frame(&self, frame: i32, frames: i32, delay: i32, rate: i32) -> Option<i32> {
-        if frames < 2 {
-            return Some(0);
-        }
-        if self.death_bomb {
-            return Some(frames - 1);
-        }
-        let elapsed = frame.wrapping_sub(self.start_frame);
-        let stages = frames / 2;
-        let last = stages - 1;
-        if rate < 1 {
-            return Some(elapsed.checked_div(delay / (stages * 2))?.min(last));
-        }
-        let stage = elapsed.checked_div(delay / stages)?.min(last);
-        let blink = frame.checked_rem(rate.wrapping_mul(2))? >= rate;
-        Some(stage.wrapping_mul(2) + i32::from(blink))
+        ares_clock_frame(
+            self.start_frame,
+            self.death_bomb,
+            frame,
+            frames,
+            delay,
+            rate,
+        )
     }
 
     /// `BombClass::GetClockFrame @ 0x00438A00`: the clock art's frame, the
@@ -608,7 +616,7 @@ impl Simulation {
             owner: ticking_sound_owner(target),
         });
         if let Some(carrier) = self.substrate.entities.get_mut(target) {
-            carrier.bomb = Some(bomb);
+            carrier.bomb = Some(Box::new(bomb));
         }
         self.bombs.carriers.insert(target);
         // 0x00438FCA: the carrier is seen from the second UpdateAll on.
@@ -642,7 +650,6 @@ impl Simulation {
     /// rings around the cell of the target's GetCoords, or the bullet's own
     /// when it has none) finds, except the owner and those already carrying
     /// one. Each plant is `PlantBomb` ([`Self::bomb_attach`]).
-    #[cfg(feature = "ares")]
     pub(crate) fn ares_ivan_bomb_detonation(
         &mut self,
         detonation: &crate::sim::projectile::ProjectileDetonation,
@@ -657,7 +664,10 @@ impl Simulation {
             log::warn!("IvanBomb bullet without attached WeaponType.");
             return;
         };
-        let Some(warhead) = rules.warhead(self.interner.resolve(detonation.payload.warhead)) else {
+        let Some(warhead) = self
+            .interner
+            .warhead_type(detonation.payload.warhead, rules)
+        else {
             return;
         };
         if warhead.cell_spread_f64 < 0.5 {
@@ -726,30 +736,39 @@ impl Simulation {
     /// weapon's `IvanBomb.Delay`/`IvanBomb.FlickerRate` over the Rules ones.
     /// `None` without a bomb or where native divides by zero.
     pub fn bomb_clock_frame(&self, carrier: u64, rules: &RuleSet, frames: usize) -> Option<i32> {
-        let bomb = self.substrate.entities.get(carrier)?.bomb.as_ref()?;
         let frame = self.session.binary_frame() as i32;
-        let (delay, rate) = (
-            rules.combat_damage.ivan_timed_delay,
-            rules.combat_damage.ivan_icon_flicker_rate,
-        );
         #[cfg(feature = "ares")]
         {
-            let settings = bomb.ares_settings(&self.interner, rules);
-            // TechnoClass_DrawExtras reads the SHP header's frame count, a
-            // short.
-            let frames = i32::from(i16::try_from(frames).unwrap_or(i16::MAX));
-            bomb.ares_clock_frame(
-                frame,
-                frames,
-                settings.delay.unwrap_or(delay),
-                settings.flicker_rate.unwrap_or(rate),
-            )
+            self.bomb_clock(carrier, rules)?.frame(frame, frames)
         }
         #[cfg(not(feature = "ares"))]
         {
             let _ = frames;
-            bomb.clock_frame(frame, delay, rate)
+            let bomb = self.substrate.entities.get(carrier)?.bomb.as_ref()?;
+            bomb.clock_frame(
+                frame,
+                rules.combat_damage.ivan_timed_delay,
+                rules.combat_damage.ivan_icon_flicker_rate,
+            )
         }
+    }
+
+    /// The Ares clock of the carrier's bomb, with the planting weapon's
+    /// `IvanBomb.Delay`/`IvanBomb.FlickerRate` over the Rules ones.
+    #[cfg(feature = "ares")]
+    pub fn bomb_clock(&self, carrier: u64, rules: &RuleSet) -> Option<BombClock> {
+        let bomb = self.substrate.entities.get(carrier)?.bomb.as_ref()?;
+        let settings = bomb.ares_settings(&self.interner, rules);
+        Some(BombClock {
+            start_frame: bomb.start_frame,
+            death_bomb: bomb.death_bomb,
+            delay: settings
+                .delay
+                .unwrap_or(rules.combat_damage.ivan_timed_delay),
+            rate: settings
+                .flicker_rate
+                .unwrap_or(rules.combat_damage.ivan_icon_flicker_rate),
+        })
     }
 
     /// The carrier bomb's Ares `IvanBomb.Image` candidates, in pass order
@@ -799,7 +818,6 @@ impl Simulation {
     /// deploying or undeploying object's bomb moves to the object it becomes
     /// when that one carries none, with its BombVisible (`+0x68`). The
     /// record keeps its fuse; the app restarts its loop on the new carrier.
-    #[cfg(feature = "ares")]
     pub(crate) fn transfer_ivan_bomb(&mut self, from: u64, to: u64) {
         if self
             .substrate
@@ -954,9 +972,77 @@ impl Simulation {
         self.bomb_detonate(carrier, rules, overlay_registry, frame_effects)
     }
 
+    /// The Detonate rung of `TechnoClass::What_Action_OnObject`
+    /// (`0x006FFF8D..0x00700003`), past the lone-selection (`[0xA8ECC8] == 1`)
+    /// and self tests its callers make: `carrier` holds a bomb of a human
+    /// player's house (`HouseClass::IsHumanPlayer @ 0x0050B6F0`), and Rules
+    /// lets that kind go off on a click: a death bomb `CanDetonateDeathBomb=`,
+    /// a timed one `CanDetonateTimeBomb=`. Retail sets both to no.
+    ///
+    /// Ares 3.0 answers it at the entry of What_Action instead
+    /// (`TechnoClass_GetActionOnObject_IvanBombsA @ 10056D30`, hook
+    /// `0x006FFEC0`, ahead of the berserk and warp exits; `IvanBombsB @
+    /// 10056D70`, hook `0x006FFF9E`, skips the stock rung):
+    /// `TechnoExt::CanDetonateAttachedBomb @ 100433A0` reads the planting
+    /// weapon's `IvanBomb.CanDetonateTimeBomb`/`.CanDetonateDeathBomb` over the
+    /// Rules keys.
+    pub fn bomb_detonate_action(&self, carrier: u64, rules: &RuleSet) -> bool {
+        let Some(bomb) = self
+            .substrate
+            .entities
+            .get(carrier)
+            .and_then(|entity| entity.bomb.as_ref())
+        else {
+            return false;
+        };
+        let combat = &rules.combat_damage;
+        if !self.house_is_human_player(bomb.planter_house) {
+            return false;
+        }
+        #[cfg(feature = "ares")]
+        return bomb.ares_settings(&self.interner, rules).can_detonate(
+            bomb.is_death_bomb(),
+            combat.can_detonate_time_bomb,
+            combat.can_detonate_death_bomb,
+        );
+        #[cfg(not(feature = "ares"))]
+        if bomb.is_death_bomb() {
+            combat.can_detonate_death_bomb
+        } else {
+            combat.can_detonate_time_bomb
+        }
+    }
+
+    /// The DETONATE arm of `EventClass::Execute @ 0x004C6CB0`
+    /// (`0x004C7823..0x004C7850`): the event's object as a Techno
+    /// (`TargetClass::As_Techno`) drops its planning tokens
+    /// (`TechnoClass::ClearPlanningTokens`, [`Self::planning_detach_actor`]),
+    /// then its bomb, if any, goes off ([`Self::bomb_detonate`]). The event's
+    /// house and the carrier's owner are not asked. Answers whether a bomb
+    /// went off.
+    pub(crate) fn execute_detonate_event(
+        &mut self,
+        carrier: u64,
+        rules: &RuleSet,
+        overlay_registry: Option<&OverlayTypeRegistry>,
+        frame_effects: FrameEffects<'_>,
+    ) -> bool {
+        // Every entity in the store is a Techno.
+        let Some(entity) = self.substrate.entities.get(carrier) else {
+            return false;
+        };
+        let armed = entity.bomb.is_some();
+        self.planning_detach_actor(carrier);
+        if !armed {
+            return false;
+        }
+        self.bomb_detonate(carrier, rules, overlay_registry, frame_effects);
+        true
+    }
+
     /// `BombClass::Detonate @ 0x00438720` outside any damage transaction
-    /// ([`apply_area_damage`]): the fuse and Ares's sale detonation. Returns
-    /// whether a bridge changed.
+    /// ([`apply_area_damage`]): the fuse, a player's DETONATE event and
+    /// Ares's sale detonation. Returns whether a bridge changed.
     pub(crate) fn bomb_detonate(
         &mut self,
         carrier: u64,
@@ -1141,3 +1227,63 @@ impl BombBlast {
 #[cfg(test)]
 #[path = "bomb_tests.rs"]
 mod tests;
+
+/// [`Bomb::ares_clock_frame`] of a bomb started at `start_frame`.
+#[cfg(feature = "ares")]
+fn ares_clock_frame(
+    start_frame: i32,
+    death_bomb: bool,
+    frame: i32,
+    frames: i32,
+    delay: i32,
+    rate: i32,
+) -> Option<i32> {
+    if frames < 2 {
+        return Some(0);
+    }
+    if death_bomb {
+        return Some(frames - 1);
+    }
+    let elapsed = frame.wrapping_sub(start_frame);
+    let stages = frames / 2;
+    let last = stages - 1;
+    if rate < 1 {
+        return Some(elapsed.checked_div(delay / (stages * 2))?.min(last));
+    }
+    let stage = elapsed.checked_div(delay / stages)?.min(last);
+    let blink = frame.checked_rem(rate.wrapping_mul(2))? >= rate;
+    Some(stage.wrapping_mul(2) + i32::from(blink))
+}
+
+/// What the Ares clock frame of a carrier's bomb reads beside its art's frame
+/// count ([`Simulation::bomb_clock`]), for a draw that knows the count.
+#[cfg(feature = "ares")]
+#[derive(Clone, Copy, Debug)]
+pub struct BombClock {
+    start_frame: i32,
+    death_bomb: bool,
+    delay: i32,
+    rate: i32,
+}
+
+#[cfg(feature = "ares")]
+impl BombClock {
+    /// [`Simulation::bomb_clock_frame`] at `binary_frame` with `frames`.
+    pub fn frame(self, binary_frame: i32, frames: usize) -> Option<i32> {
+        // TechnoClass_DrawExtras reads the SHP header's frame count, a
+        // short.
+        let frames = i32::from(i16::try_from(frames).unwrap_or(i16::MAX));
+        ares_clock_frame(
+            self.start_frame,
+            self.death_bomb,
+            binary_frame,
+            frames,
+            self.delay,
+            self.rate,
+        )
+    }
+}
+
+#[cfg(test)]
+#[path = "bomb_detonate_tests.rs"]
+pub(crate) mod detonate_tests;

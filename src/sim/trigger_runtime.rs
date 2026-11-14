@@ -141,7 +141,6 @@ pub enum TriggerEffect {
     /// Ares trigger action 148 (TActionExt::Execute 100396C0) selects the
     /// announcer voice, VoxClass::EVAIndex: a process cache the client's
     /// announcer owns, which applies the voice-count bound.
-    #[cfg(feature = "ares")]
     EvaVoice {
         index: i32,
     },
@@ -1175,14 +1174,12 @@ struct TagEventInput {
     cell: (i16, i16),
     force: bool,
     /// A non-Techno object Ares passes in the Techno source slot.
-    #[cfg(feature = "ares")]
     ares_source: Option<AresEventSource>,
 }
 
 /// What Ares 3.0 passes as RaiseEvent's `TechnoClass*` source when it is not
 /// a Techno. TEventExt::HasOccured (1004F7A0) reads it only for the kind it
 /// was raised with.
-#[cfg(feature = "ares")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum AresEventSource {
     /// A HouseClass: an abductee's previous owner (74) or a destroyer's
@@ -1461,17 +1458,18 @@ impl Simulation {
     /// are interned and before the first gameplay tick. This is data ingress
     /// only: the installed VM contains no live TeamClass instances.
     ///
-    /// A fixed-AIMD definition that fails RuleSet resolution refuses the whole
-    /// install (`Err`, nothing installed); scenario-origin omissions install
-    /// and come back as logged, nonfatal diagnostics.
+    /// A definition that names something the RuleSet lacks still installs, from
+    /// fixed AIMD as from a scenario, and comes back as a logged diagnostic.
+    /// gamemd refuses none of them: TaskForceClass::ReadINI (`0x006E8420`)
+    /// keeps a member only when its type resolved; TeamTypeClass::ReadINI
+    /// (`0x006F1090`) finds or allocates its Script and TaskForce;
+    /// AITriggerTypeClass::ReadINI (`0x0041F580`) keeps a trigger whose owner
+    /// (`nOwnerMode` stays 0) or condition object (null) did not resolve.
     pub fn install_team_ai_registry(
         &mut self,
         registry: &crate::rules::team_ai_ini::TeamAiIniRegistry,
         rules: &crate::rules::ruleset::RuleSet,
-    ) -> Result<
-        Vec<crate::sim::team_script_vm::TeamAiInstallDiagnostic>,
-        Vec<crate::sim::team_script_vm::TeamAiInstallDiagnostic>,
-    > {
+    ) -> Vec<crate::sim::team_script_vm::TeamAiInstallDiagnostic> {
         // Cold callers stage the same physical Team prefix. Ordinary loaders
         // already prepared the map and its action-created identities; never
         // replay those reads or replace that tail during AI installation.
@@ -1485,12 +1483,6 @@ impl Simulation {
                 &mut self.interner,
                 rules,
             );
-        if diagnostics
-            .iter()
-            .any(crate::sim::team_script_vm::TeamAiInstallDiagnostic::is_fixed_source_refusal)
-        {
-            return Err(diagnostics);
-        }
         if let Some(definitions) = staged {
             self.trigger_runtime.definitions = definitions;
         }
@@ -1498,7 +1490,7 @@ impl Simulation {
         for diagnostic in &diagnostics {
             log::warn!("Team AI install diagnostic: {diagnostic:?}");
         }
-        Ok(diagnostics)
+        diagnostics
     }
 
     pub(crate) fn trigger_definitions_prepared(&self) -> bool {
@@ -4349,7 +4341,7 @@ impl Simulation {
                             self.object_type(e.type_ref(), rules)
                                 .is_some_and(|o| o.has_spotlight)
                         })
-                        .and_then(|e| e.building_light.light());
+                        .and_then(|e| e.building.building_light.light());
                     if let Some(light) = light
                         && self.tag_contains_live_trigger(TagAttachment::Object(id), live)
                     {

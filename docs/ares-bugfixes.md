@@ -5,7 +5,8 @@ in `Misc/Bugfixes.cpp`, `Misc/Bugfixes.Safeguards.cpp`,
 `Misc/Bugfixes.Buffer.cpp` and `Misc/Bugfixes.Perf.cpp`; these take no INI
 keys. Default builds keep the original behaviour, bugs included. Each Rust
 port sits in the engine owner of the hooked gamemd function, behind
-`cfg(feature = "ares")` or `rules::ARES_ENABLED`, with the Ares.dll function
+`cfg(feature = "ares")` or the per-game switch `RuleSet::ares` (on when the
+game's data uses Ares, see `rules::ares_switch`), with the Ares.dll function
 and the gamemd hook cited next to it. Part 2 (the Buffer and Perf rows at
 the end of the table) also has `sim::ares_bugfixes_buffer_tests` and
 `sim::combat::ares_cliff_tests`.
@@ -52,7 +53,7 @@ as Ares in both builds); **residual** (gameplay, but its host is unported);
 | `0x44A5F0` | `1005C550` | Sale survivors: at most nine re-picks after an Engineer, then none (original loops) | ported: `crew_survival::spawn_sale_crew` |
 | `0x44A8A2` | `1005C530` | A sold building remembers its survivors are out (NoSurvivor) | ported: `production_sell::sell_stage_one` |
 | `0x455E4C` | `1005CB50` | FindRepairBay asks only bays of the unit's Naval kind that are no aircraft pad, and takes only ROGER | ported: `unit_repair_seek` |
-| `0x4586D6` | `1005C510` | KillOccupants registers the killer as the occupants' destroyer (vanilla swapped it) | residual: `KillOccupants(killer)` is reached only by the `Assaulter=` arm, which VERA does not represent; no retail assaulter |
+| `0x4586D6` | `1005C510` | KillOccupants registers the killer as the occupants' destroyer (vanilla swapped it) | ported: `passenger::garrison_eject::kill_building_occupants` books each occupant as killed by the assaulter ([dormant-stock-rules.md](dormant-stock-rules.md#assaulters)) |
 | `0x4692A2` | `1005C630` | The second attacked-by-house event rereads the Tag | equivalent: the tag dispatcher rereads the Tag (`capture_manager`) |
 | `0x4693B0` | `1005C650` | A Unit's ElectricAssault shot charges an Overpowerable building too | ported: `tesla_charging::electric_assault_detonation` |
 | `0x469467` | `1005C600` | Temporal warps a Foot in the Air or Top layer too | ported: `temporal::temporal_detonation` |
@@ -69,19 +70,20 @@ as Ares in both builds); **residual** (gameplay, but its host is unported);
 | `0x4D5782` | `1005C9F0` | Approach_Target does not chase a passively acquired Target | ported: `foot_approach::approach_foot_target` |
 | `0x4D9EE1` | `1005CA30` | A unit is sold at the depot's dock coordinate | ported: `production::foot_can_be_sold` ([ares-reverse-engineering.md](ares-reverse-engineering.md)) |
 | `0x4DB87E` | `1005CA50` | A Foot's parasite takes its new Location | ported: `ground_pose::foot_set_location` |
-| `0x4FA2E0` | `1005CC10` | SetThreat rejects a negative index | equivalent: `house_threat` refuses writes outside its grid |
+| `0x4FA2E0` | `1005CC10` | SetThreat rejects a negative index | ported: `house_threat::HouseSpatialThreat::adjust` skips a kernel outside its grid in an Ares build, the rebuild's inline kernel too, which natively writes past the grid |
 | `0x5005CC`, `0x50067C`, `0x5007BE` | `1005CBD0`, `1005CB30`, `1005CBF0` | The infantry production-request flag no longer falls through to the vehicle flag | ported (presentation): `app::sidebar_projection` cameo prediction |
 | `0x50928C` | `1005CC30` | The empty Factory is not deleted (broken destructor) | n/a: Ares leaks the Factory; VERA keeps deleting it (no visible difference) |
 | `0x51DF27` | `1005CD50` | A Teleporter's Limbo clears its Teleport locomotor's Marked coordinate | ported: `lifecycle::techno_limbo_with_context` |
 | `0x51F716` | `1005CD20` | A deployed man's Unload returns 1 after Guard instead of 450 | ported: `deploy::infantry_mission_unload` |
 | `0x52070F` | `1005CDD0` | A cloaked infantryman surfaces to fire only in range | ported: `world_fire` infantry case 9 (no test: fire-path fixture) |
 | `0x52BA78` | `1005D7F0` | Animated ParaDrop, Chronosphere, IronCurtain, Detonate, BlueMove and IvanBomb cursors | presentation (cursor timing) |
-| `0x52BB64`, `0x53029E`, `0x6BD7E3`, `0x6BE9BD` | `1005C940`, `1005CE30`, `1005C950`, `1005D840` | MIX bootstrap and Ares resources | n/a: DLL/resource plumbing |
+| `0x52BB64`, `0x53029E`, `0x6BD7E3` | `1005C940`, `1005CE30`, `1005C950` | Base MIX files mount before LANGMD.MIX, and `ares.mix` after the expansion archives, ahead of the masters | ported: `AssetManager::mount_base_mix_files` |
+| `0x6BE9BD` | `1005D840` | Ares resources | n/a: DLL/resource plumbing |
 | `0x531726`, `0x53173F` | `1005D130`, `1005D140` | Loading screen pips | presentation |
 | `0x534F89`, `0x5C9A6E`, `0x5FDDA4`, `0x615BD3`, `0x6BB9DD`, `0x720A61`, `0x720C42`, `0x720DE8`, `0x720F37` | various | Log lines | n/a: logging |
 | `0x547043` | `1005E270` | Fatal error for a missing tileset file | n/a: loader diagnostics |
 | `0x56017A`, `0x5601E3` | `1005CF10`, `1005CF00` | Options dialog resolution limits | presentation (launcher UI) |
-| `0x56BC54` | `1005D4A0` | Threat index `(130*Y)/4 + X/4 + 131` with a 512 bounds check | residual: Ares changes the index of the `0x0056BC50` callers (`0x00481884`, `0x004D8657`, `0x005094BE`, `0x0050957C`) only, not the inline readers (`0x0056BCD0`, `0x00585F40`); VERA's one `house_threat` index would need a per-caller split. Affects computer threat maps only |
+| `0x56BC54` | `1005D4A0` | Threat index `(130*Y)/4 + X/4 + 131` with a 512 bounds check | ported: `house_threat::HouseSpatialThreat::caller_index`, for the `0x0056BC50` callers only (Cell `0x00481884`, Foot `0x004D8657`/`0x004D8664`, House rebuild `0x005094BE`/`0x0050957C`); the inline readers (`0x0056BCD0`, `0x00585F40`, the hierarchy seeds) keep the stock index, so off every fourth row a threat lands away from the cell they read. Affects computer threat maps only |
 | `0x5CB0B1` | `1005D020` | Performance timer of zero | n/a: CRT |
 | `0x5F6515`, `0x5F6560` | `1005C1A0`, `1005C240` | Squared XY distances in 64 bits, clamped to `INT_MAX` | ported: `util::native_coord::squared_xy_distance` (team recruit/centre, dock search) |
 | `0x5F698F` | `1005CE70` | GetCell skips a duplicate lookup | n/a: no behaviour change |

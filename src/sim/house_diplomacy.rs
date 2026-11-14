@@ -124,6 +124,15 @@ impl PartialEq for HouseAlliances {
 impl Eq for HouseAlliances {}
 
 impl HouseAlliances {
+    /// A copy that shares no storage with this one, for the presentation
+    /// copy of the world (docs/sim-thread.md); its matrix builds on demand.
+    pub(crate) fn detached(&self) -> Self {
+        Self {
+            graph: Arc::new((*self.graph).clone()),
+            matrix: OnceLock::new(),
+        }
+    }
+
     /// A graph with no matrix built yet.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new(graph: HouseAllianceMap) -> Self {
@@ -420,6 +429,11 @@ impl Simulation {
         if !rules.general.allies_allowed {
             return;
         }
+        // VERA `[General] AINearestEnemy=` (off by default): the computers
+        // neither band together nor all turn on the humans.
+        if rules.general.ai_nearest_enemy {
+            return;
+        }
         // 0x00501668..0x00501675.
         if self.session.computer_slot_has_team() {
             return;
@@ -587,6 +601,7 @@ impl Simulation {
             other,
             anger.wrapping_neg(),
             self.session.game_mode_nonzero(),
+            rules.general.ai_nearest_enemy,
         );
         if let Some(house) = self.houses.get_mut(&owner)
             && house.enemy_house() == Some(other)
@@ -734,6 +749,7 @@ impl Simulation {
             other,
             1,
             self.session.game_mode_nonzero(),
+            rules.general.ai_nearest_enemy,
         );
         // 0x004F9FE7..0x004FA01A: only an alliance is broken.
         if is_ally_by_object(Some(&self.house_alliances), &self.interner, owner, other) {
@@ -768,6 +784,7 @@ impl Simulation {
                     other,
                     1,
                     self.session.game_mode_nonzero(),
+                    rules.general.ai_nearest_enemy,
                 );
             }
             if !self.object_placement_scope_active() {

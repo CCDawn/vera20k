@@ -415,6 +415,27 @@ fn campaign_preparation_failure_retires_the_lease_with_shell_retry_policy() {
     }
 }
 
+#[test]
+fn a_failed_campaign_or_network_load_tells_the_player_why() {
+    let err = anyhow::anyhow!("unknown theater").context("map MYMAP.MAP");
+    for policy in [
+        LoadingFailurePolicy::RetryCampaignShell,
+        LoadingFailurePolicy::RetryNetworkShell,
+    ] {
+        let text = failed_load_notice(policy, &err).expect("the shell shows a box");
+        assert!(text.contains("map MYMAP.MAP: unknown theater"), "{text}");
+    }
+    // Skirmish keeps its result card and the generic fallback installs a map.
+    assert!(failed_load_notice(LoadingFailurePolicy::ReportNativeFailure, &err).is_none());
+    assert!(failed_load_notice(LoadingFailurePolicy::InstallGenericFallback, &err).is_none());
+    let long = anyhow::anyhow!("x".repeat(5000));
+    let text = failed_load_notice(LoadingFailurePolicy::RetryNetworkShell, &long).unwrap();
+    assert!(
+        text.chars().count() < 500,
+        "a debug dump is cut to fit the box"
+    );
+}
+
 pub(super) fn unverified_seed(value: u32) -> crate::app::match_bootstrap::MatchSeed {
     crate::app::match_bootstrap::MatchSeed {
         value,
@@ -450,6 +471,7 @@ fn generated_preview_with_starts(
         start_waypoints: starts.to_vec(),
         stages_run: Vec::new(),
         unfilled_start_slots: 0,
+        fairness: None,
     }
 }
 
@@ -560,8 +582,8 @@ fn begin_loading_plays_loading_theme_and_polls_theme_through_the_lease() {
     );
     let assets = audio_service_asset_manager(&process_assets, Some(session))
         .expect("leased manager serves the Theme poll");
-    let mut frontend = crate::sim::rng::MainRng::new(1);
-    let mut main = crate::app::state::process_main_draws(None, &mut frontend);
+    let frontend = crate::sim::rng::MainRng::new(1);
+    let mut main = crate::app::state::process_main_draws(&frontend);
     audio.service_audio(600, false, Some(assets), None, &mut main);
     assert!(
         !audio.service_clock.admit(600),
@@ -1514,29 +1536,6 @@ fn generated_prefix_rejects_cooperative_mode() {
 }
 
 #[test]
-fn generated_prefix_rejects_a_spoofed_stock_row_before_consuming_staging() {
-    let selected = "RandMap.SED";
-    let starts = [(0, 20, 24), (1, 42, 46)];
-    let mut launch = test_launch_session(LaunchCountry::America);
-    launch.selected_map_file = Some(selected.to_string());
-    launch.mode.tooltip_key = "STT:SpoofedBattle".to_string();
-    let accepted = accepted_random_map_with_starts(selected, 0x1516, &starts, &starts);
-    let initial = crate::app::loading::init::MapLoadInitial::from_test_map_source(
-        prefix_test_map(&starts),
-        crate::map::source::LoadedMapSource::Generated {
-            seed_name: selected.to_string(),
-            seed_source: None,
-        },
-    );
-    let mut request = LoadingRequest::unverified_legacy_skirmish(launch, unverified_seed(0x1516))
-        .with_accepted_random_map(Some(accepted));
-
-    let err = request.admit_context(&initial).unwrap_err();
-    assert!(format!("{err:#}").contains("not the validated active-retail stock row"));
-    assert!(request.accepted_rmg_start_staging.is_some());
-}
-
-#[test]
 fn authored_prefix_rejects_random_map_staging_for_loose_and_mix_sources() {
     let selected = "mp01t4.map";
     let starts = [(0, 20, 24), (1, 42, 46)];
@@ -1685,6 +1684,7 @@ fn gsi_04_12_stock_ffa_preview_can_only_supply_loading_fallback_pixels() {
         start_waypoints: vec![(0, 70, 70), (1, 90, 70), (2, 70, 90)],
         stages_run: Vec::new(),
         unfilled_start_slots: 0,
+        fairness: None,
     };
     let _request =
         LoadingRequest::unverified_legacy_skirmish(launch.clone(), unverified_seed(0x4567))

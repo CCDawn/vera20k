@@ -238,7 +238,7 @@ fn tank_bunker_seek(sim: &mut Simulation, rules: &RuleSet, id: u64) -> bool {
 fn install_state(sim: &Simulation, bunker: u64) -> (BunkerState, Option<u64>) {
     let building = entity(sim, bunker);
     (
-        building.bunker_runtime.unwrap().state(),
+        building.building.bunker_runtime.unwrap().state(),
         building.radio_contacts.slot(0),
     )
 }
@@ -508,13 +508,13 @@ fn an_absorber_refuses_a_controller() {
         .entities
         .get_mut(controller)
         .unwrap()
-        .capture_manager = Some(
+        .capture_manager = Some(Box::new(
         crate::sim::capture_manager::CaptureManagerState::with_victims_for_test(
             1,
             false,
             &[captive],
         ),
-    );
+    ));
 
     assert_eq!(
         can_load(&mut sim, &rules, controller, reactor),
@@ -1940,14 +1940,17 @@ fn occupants_are_admitted_in_order_and_a_human_drops_its_seek() {
     sim.sound_events.clear_for_test();
 
     for id in [first, second] {
-        assert!(crate::sim::passenger::add_garrison_occupant(
-            &mut sim,
-            &rules,
-            id,
-            bunker,
-            None,
-            FrameEffects::default(),
-        ));
+        assert!(
+            crate::sim::passenger::add_garrison_occupant(
+                &mut sim,
+                &rules,
+                id,
+                bunker,
+                None,
+                FrameEffects::default(),
+            )
+            .unwrap()
+        );
     }
 
     assert_eq!(occupants(&sim, bunker), [first, second]);
@@ -2060,14 +2063,17 @@ fn an_ejected_human_occupant_drops_its_seek() {
     for (owner, ry) in [("Americans", 10), ("YuriCountry", 16)] {
         let bunker = spawn(&mut sim, &rules, "NABNKR", owner, 16, ry);
         let occupant = spawn(&mut sim, &rules, "E1", owner, 12, ry);
-        assert!(crate::sim::passenger::add_garrison_occupant(
-            &mut sim,
-            &rules,
-            occupant,
-            bunker,
-            None,
-            FrameEffects::default(),
-        ));
+        assert!(
+            crate::sim::passenger::add_garrison_occupant(
+                &mut sim,
+                &rules,
+                occupant,
+                bunker,
+                None,
+                FrameEffects::default(),
+            )
+            .unwrap()
+        );
         set_should_enter_occupiable_for_test(
             sim.substrate.entities.get_mut(occupant).unwrap(),
             true,
@@ -2236,7 +2242,7 @@ fn a_refused_foot_or_a_held_tank_bunker_gets_no_order() {
     let unarmed = spawn(&mut sim, &rules, "LTNK", "YuriCountry", 10, 12);
     let infantry = spawn(&mut sim, &rules, "INIT", "YuriCountry", 10, 14);
     for id in [drone, unarmed, infantry] {
-        let mission = entity(&sim, id).mission;
+        let mission = entity(&sim, id).mission.clone();
         assert!(!tank_bunker_seek(&mut sim, &rules, id));
         assert_eq!(entity(&sim, id).mission, mission);
         assert_eq!(entity(&sim, id).bunker.link(), BunkerLink::None);
@@ -2252,7 +2258,7 @@ fn a_refused_foot_or_a_held_tank_bunker_gets_no_order() {
         .bunker
         .set_bunker_occupant_for_test(Some(occupant));
     let tank = spawn(&mut sim, &rules, "YTNK", "YuriCountry", 12, 16);
-    let mission = entity(&sim, tank).mission;
+    let mission = entity(&sim, tank).mission.clone();
 
     assert!(!tank_bunker_seek(&mut sim, &rules, tank));
 

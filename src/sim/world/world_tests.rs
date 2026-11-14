@@ -387,11 +387,18 @@ fn a_state_hash_interval_selects_frames_by_tick() {
     assert_eq!(first.state_hash, None);
     sim.hash_state_every(std::num::NonZeroU64::new(3).unwrap());
     for step in 1..=6 {
+        let foretold = sim.next_frame_hashes_state();
         let result = sim.advance_tick(&[], None, None, None, 67);
         assert_eq!(
             result.tick,
             first.tick + step,
             "each frame advances the tick"
+        );
+        assert_eq!(
+            foretold,
+            result.state_hash.is_some(),
+            "tick {} was foretold",
+            result.tick
         );
         assert_eq!(
             result.state_hash,
@@ -2585,11 +2592,13 @@ fn gsi_04_11_bullet_ore_reduction_precedes_outer_crater_anim_start() {
         "the outer crater must observe the already-cleared overlay cell"
     );
     let mut expected_rng = crate::sim::rng::SimRng::new(1);
-    // Ares 3.0 CellChainReact (10050DD0, hook 0x48964F): the spread walk
-    // rolls RandomRanged(0, 99) for the ChainReaction ore before its
-    // reduction; with Power 0 a reaction deals nothing and the ore clears.
-    #[cfg(feature = "ares")]
-    let _ = expected_rng.next_range_i32_inclusive(0, 99);
+    // When Ares plays, Ares 3.0 CellChainReact (10050DD0, hook 0x48964F):
+    // the spread walk rolls RandomRanged(0, 99) for the ChainReaction ore
+    // before its reduction; with Power 0 a reaction deals nothing and the
+    // ore clears.
+    if rules.ares() {
+        let _ = expected_rng.next_range_i32_inclusive(0, 99);
+    }
     let _ = expected_rng.next_range_u32(1);
     assert_eq!(sim.scenario_rng.state(), expected_rng.state());
 }
@@ -2651,11 +2660,12 @@ fn gsi_04_11_missile_outer_anim_precedes_per_cell_ore_reduction() {
     sim.substrate.entities.insert(missile);
     sim.reveal(1);
     let mut expected_rng = sim.scenario_rng.clone();
-    // Ares 3.0 CellChainReact (10050DD0, hook 0x48964F): the ChainReaction
-    // ore's RandomRanged(0, 99) roll in the spread walk; with Power 0 a
-    // reaction deals nothing and the ore still clears.
-    #[cfg(feature = "ares")]
-    let _ = expected_rng.next_range_i32_inclusive(0, 99);
+    // When Ares plays, Ares 3.0 CellChainReact (10050DD0, hook 0x48964F):
+    // the ChainReaction ore's RandomRanged(0, 99) roll in the spread walk;
+    // with Power 0 a reaction deals nothing and the ore still clears.
+    if rules.ares() {
+        let _ = expected_rng.next_range_i32_inclusive(0, 99);
+    }
 
     sim.process_rocket(
         1,
@@ -3000,7 +3010,11 @@ fn gsi_04_15_active_tube_leaf_preempts_unit_and_infantry_mission_host() {
                     sim.substrate
                         .entities
                         .get(2)
-                        .is_some_and(|building| building.pending_c4_detonation.pending().is_none()),
+                        .is_some_and(|building| building
+                            .building
+                            .pending_c4_detonation
+                            .pending()
+                            .is_none()),
                     "Tube final returns before Mission_Enter; no C4 claim is made"
                 );
             }
@@ -3502,13 +3516,12 @@ fn target_coord_offset_moves_initial_wave_endpoint_but_not_tracking() {
     let event = sonic_fire_event(&mut sim, &rules, dolphin, yard);
     let wave = sim.prepare_fired_wave(&rules, &event, 0).unwrap();
     // Ares CreateWave passes the launch source first instead.
-    #[cfg(not(feature = "ares"))]
-    assert_eq!(
-        wave.source(),
-        crate::sim::projectile::ProjectileCoord::new(centre.x + 300, centre.y + 200, centre.z,)
-    );
-    #[cfg(feature = "ares")]
-    let _ = (wave, centre);
+    if !rules.ares() {
+        assert_eq!(
+            wave.source(),
+            crate::sim::projectile::ProjectileCoord::new(centre.x + 300, centre.y + 200, centre.z,)
+        );
+    }
     admit_test_wave(&mut sim, &rules, &event);
     let id = sim.active_wave_links[&dolphin];
     assert_eq!(
@@ -3520,8 +3533,8 @@ fn target_coord_offset_moves_initial_wave_endpoint_but_not_tracking() {
     );
 }
 
-#[cfg(feature = "ares")]
 fn ares_sonic_rules(weapon_keys: &str) -> RuleSet {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     RuleSet::from_ini(&IniFile::from_str(&format!(
         "[VehicleTypes]\n0=DLPH\n1=TARGET\n\n\
          [DLPH]\nStrength=200\nArmor=light\nSpeed=8\nPrimary=SonicZap\nElitePrimary=SonicZapE\n\n\
@@ -3537,9 +3550,9 @@ fn ares_sonic_rules(weapon_keys: &str) -> RuleSet {
 /// Ares WaveClass_Update_Beam (Ares.dll 10057290, hook 0x762B62): a Sonic
 /// wave keeps tracking within its weapon's Range (here ten cells, beyond the
 /// stock 2172 leptons) and draws from the target end for a reversing class.
-#[cfg(feature = "ares")]
 #[test]
 fn ares_wave_tracks_within_weapon_range_and_reverses_by_target_class() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     for reverse in [false, true] {
         let rules = ares_sonic_rules(if reverse {
             "Wave.ReverseAgainstVehicles=yes"
@@ -3573,9 +3586,9 @@ fn ares_wave_tracks_within_weapon_range_and_reverses_by_target_class() {
 /// WaveClass_DamageCell (10056FA0, hook 0x75F38F): the recorded cells take
 /// the fired weapon's AmbientDamage, not the elite owner's GetWeapon(0), and
 /// a weapon without AmbientDamage damages nothing.
-#[cfg(feature = "ares")]
 #[test]
 fn ares_wave_damage_uses_the_fired_weapon_and_its_ambient_damage() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     for ambient in [10, 0] {
         let rules = ares_sonic_rules(&format!("AmbientDamage={ambient}"));
         let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x5EED_A2E6);
@@ -3619,9 +3632,9 @@ fn ares_wave_damage_uses_the_fired_weapon_and_its_ambient_damage() {
 /// `Wave.IsBigLaser` shot creates a TS laser wave of type 1 or 2, whose
 /// AmbientDamage strikes the cells under the beam on each of its 22 updates
 /// (nLaserIntensity 160, less 6 each, leaves below 32), and then it leaves.
-#[cfg(feature = "ares")]
 #[test]
 fn ares_laser_wave_damages_its_cells_on_each_update_until_it_fades() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     for (key, wave_type) in [("Wave.IsLaser", 1), ("Wave.IsBigLaser", 2)] {
         let Some(patched) = crate::rules::retail_ini_fixture::retail_battle_rules_with_map_patch(
             &IniFile::from_str(&format!(
@@ -3880,7 +3893,7 @@ fn guard_infantry_acquire_return_fire_and_finish_a_duel() {
     crate::sim::arena_fixture::discover(&mut sim, enemy);
     sim.path_grid = Some(std::sync::Arc::new(PathGrid::test_all_passable(12, 3)));
     let mut runtime = crate::sim::runtime::SimRuntime::from_simulation(sim);
-    runtime.resources.rules = rules;
+    runtime.resources_mut().rules = rules;
 
     // The two identical guards both acquire and return fire. A fixed winner
     // was an accidental property of the old globally delayed firing host:
@@ -4038,7 +4051,7 @@ fn sonic_fire_registers_immediately_but_later_techno_fires_before_wave_tail_ai()
     let path = PathGrid::test_all_passable(8, 3);
     sim.path_grid = Some(std::sync::Arc::new(path));
     let mut runtime = crate::sim::runtime::SimRuntime::from_simulation(sim);
-    runtime.resources.rules = rules;
+    runtime.resources_mut().rules = rules;
     let output = runtime
         .advance_frame(
             &[],
@@ -4223,7 +4236,7 @@ fn sonic_cell_fire_wave_damage_selects_level_two_bridge_plane() {
     let path = PathGrid::test_all_passable(8, 1);
     sim.path_grid = Some(std::sync::Arc::new(path));
     let mut runtime = crate::sim::runtime::SimRuntime::from_simulation(sim);
-    runtime.resources.rules = rules;
+    runtime.resources_mut().rules = rules;
     let output = runtime
         .advance_frame(
             &[],
@@ -7270,7 +7283,7 @@ fn combat_death_after_its_repair_visit_is_freed_at_end_of_tick() {
     bld.type_facts
         .set_foundation_for_test("1x1".to_string().into());
     bld.health = Health::new(50);
-    bld.repairing.set_for_test(true);
+    bld.building.repairing.set_for_test(true);
     sim.interner = crate::sim::intern::test_interner();
     let russia = sim.interner.intern("Russia");
     sim.houses
@@ -8237,15 +8250,20 @@ fn repro_second_vehicle_ordered_onto_an_occupied_cell() {
     );
 }
 
-/// Idle objects are handed out mutably only for their own turn, plus an
-/// infantry's frame-end animation clock: the per-frame walks read first and
-/// borrow only what they change. The tanks carry turrets, whose idle return
-/// the facing pass sets every frame. Every hand-out lands in the entity store's
-/// touch logs, whose per-object budget (`TouchLog::note`) a 20k-object world
-/// overran when each walk borrowed every entity, so the blocker plane and
-/// the kept Ground keys rebuilt from every object each tick.
+/// Idle objects stay out of the touch logs. The per-frame walks read first
+/// and borrow only what they change, so an idle object is handed out mutably
+/// only on the frames its Guard handler runs (every 14 to 16 frames here) and
+/// an idle building never: the mission AI counter and a building's tint
+/// sample, which change every frame, are written without a note. The logs'
+/// readers (the blocker plane, the kept Ground keys and the expiry listener
+/// index) re-read every object named, so when each walk borrowed every
+/// entity, a 20k-object world was re-read almost whole every frame.
+// A build that still carries Ares behind its feature sleeps nothing
+// (`Simulation::extension_steps_unsorted`), so this runs once that
+// feature is gone.
+#[cfg(not(feature = "ares"))]
 #[test]
-fn idle_objects_are_handed_out_only_for_their_own_turn() {
+fn idle_objects_stay_out_of_the_touch_logs() {
     use crate::sim::entity_store::TouchReader;
     use crate::sim::touch_log::Touched;
 
@@ -8289,22 +8307,26 @@ fn idle_objects_are_handed_out_only_for_their_own_turn() {
         .substrate
         .entities
         .take_touched(TouchReader::BlockerPlane);
-    let _ = sim.advance_tick(&[], Some(&rules), Some(&grid), None, 100);
-    let Touched::Ids(ids) = sim
-        .substrate
-        .entities
-        .take_touched(TouchReader::BlockerPlane)
-    else {
-        panic!("an idle tick overflowed the touch log");
-    };
-    // A log drops a repeat of its last id, so this counts the runs of
-    // hand-outs; an object's own turn is one run.
-    let handed_out = |id: u64| ids.iter().filter(|&&noted| noted == id).count();
-    for &id in vehicles.iter().chain(&buildings) {
-        assert!(handed_out(id) <= 1, "idle vehicle or building {id}");
+    let mut ticks = BTreeMap::<u64, usize>::new();
+    for _ in 0..40 {
+        let _ = sim.advance_tick(&[], Some(&rules), Some(&grid), None, 100);
+        let Touched::Ids(ids) = sim
+            .substrate
+            .entities
+            .take_touched(TouchReader::BlockerPlane)
+        else {
+            panic!("an idle tick overflowed the touch log");
+        };
+        for id in ids.into_iter().collect::<BTreeSet<_>>() {
+            *ticks.entry(id).or_default() += 1;
+        }
     }
-    for &id in &infantry {
-        assert!(handed_out(id) <= 2, "idle infantry {id}");
+    let handed_out = |id: u64| ticks.get(&id).copied().unwrap_or(0);
+    for &id in vehicles.iter().chain(&infantry) {
+        assert!(handed_out(id) <= 3, "idle vehicle or infantry {id}");
+    }
+    for &id in &buildings {
+        assert_eq!(handed_out(id), 0, "idle building {id}");
     }
 }
 
@@ -9156,7 +9178,7 @@ fn runtime_frame_call_order_matches_the_app_seam() {
         },
     );
     let mut runtime = crate::sim::runtime::SimRuntime::from_simulation(sim);
-    runtime.resources.rules = rules;
+    runtime.resources_mut().rules = rules;
     runtime.simulation.queue_command(select);
 
     assert!(runtime.simulation.take_due_commands().is_empty());
@@ -9404,7 +9426,7 @@ fn engineer_capture_of_an_ordinary_building_requests_the_radar_event() {
         .position
         .set_rx_for_test(11);
 
-    sim.announce_engineer_capture(1, player, &rules);
+    sim.announce_building_capture(1, player, &rules);
     assert_eq!(
         captured_events(&sim),
         vec![(enemy, player, false, true, None)]
@@ -9412,7 +9434,7 @@ fn engineer_capture_of_an_ordinary_building_requests_the_radar_event() {
 
     // A second capture one cell away publishes its own request as well.
     sim.sound_events.clear_for_test();
-    sim.announce_engineer_capture(2, player, &rules);
+    sim.announce_building_capture(2, player, &rules);
     assert_eq!(
         captured_events(&sim),
         vec![(enemy, player, false, true, None)]
@@ -9432,7 +9454,7 @@ fn engineer_capture_of_a_tech_building_carries_its_capture_eva_event() {
     let civilian = insert_passive_house_with_counts(&mut sim, "Neutral", 1, 0);
     insert_test_entity_for_owner(&mut sim, 1, civilian, "CAOILD", EntityCategory::Structure);
 
-    sim.announce_engineer_capture(1, player, &rules);
+    sim.announce_building_capture(1, player, &rules);
     let line = sim.interner.get("EVA_OilRefineryCaptured");
     assert!(
         line.is_some(),
@@ -9466,12 +9488,12 @@ fn engineer_capture_is_silent_without_a_human_side_or_into_a_passive_house() {
     insert_test_entity_for_owner(&mut sim, 1, ai_a, "GAPOWR", EntityCategory::Structure);
     insert_test_entity_for_owner(&mut sim, 2, player, "GAPOWR", EntityCategory::Structure);
 
-    sim.announce_engineer_capture(1, ai_b, &rules);
+    sim.announce_building_capture(1, ai_b, &rules);
     assert!(
         captured_events(&sim).is_empty(),
         "AI-vs-AI capture: nobody listens"
     );
-    sim.announce_engineer_capture(2, civilian, &rules);
+    sim.announce_building_capture(2, civilian, &rules);
     assert!(
         captured_events(&sim).is_empty(),
         "passive new owner is silent"
@@ -9670,10 +9692,7 @@ fn radar_terrain_dirty_marks_deduplicate_and_clear() {
     sim.dirty_cells.mark_radar([(3, 3)]);
     sim.dirty_cells.mark_radar([(3, 3), (4, 4)]);
     assert_eq!(sim.dirty_cells.radar(), [(1, 1), (2, 2), (3, 3), (4, 4)]);
-    assert!(
-        sim.dirty_cells
-            .acknowledge_radar(sim.dirty_cells.radar_generation())
-    );
+    assert!(!sim.dirty_cells.take_radar().is_empty());
     sim.dirty_cells.mark_radar([(1, 1)]);
     assert_eq!(sim.dirty_cells.radar(), [(1, 1)]);
 }

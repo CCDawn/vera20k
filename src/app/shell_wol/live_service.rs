@@ -1259,6 +1259,7 @@ pub(super) fn poll(state: &mut AppState) -> Option<Instant> {
         if service.spawned {
             poll_spawned_exit(state, &mut service);
         }
+        show_problem_line(state);
     }
     put_service(state, service);
     Some(Instant::now() + POLL_INTERVAL)
@@ -1273,6 +1274,48 @@ fn notice(state: &mut AppState, text: &str) {
         },
     );
     state.platform.window.request_redraw();
+}
+
+/// The chat a returning player lands in: the kept room once the lobby gives
+/// it back, the chat lobby or the Quick Match page. Anywhere else, such as a
+/// sign-in after a lost connection, the line keeps waiting.
+fn problem_chat_open(
+    route: crate::app::shell_route::ShellRoute,
+    setup_open: bool,
+    quick_match_open: bool,
+    lobby_open: bool,
+    awaiting_room: bool,
+) -> bool {
+    match route {
+        crate::app::shell_route::ShellRoute::NetworkSetup => setup_open,
+        route if route.wol() => quick_match_open,
+        route => route.wol_lobby() && lobby_open && !awaiting_room,
+    }
+}
+
+fn show_problem_line(state: &mut AppState) {
+    let open = problem_chat_open(
+        state.frontend.shell_route,
+        state.frontend.multiplayer_setup.is_some(),
+        super::quick_match::page_open(state),
+        state
+            .frontend
+            .wol
+            .as_ref()
+            .is_some_and(|visit| visit.lobby().is_some()),
+        super::lobby::awaiting_room(state),
+    );
+    if !open {
+        return;
+    }
+    if let Some(text) = state
+        .frontend
+        .wol
+        .as_mut()
+        .and_then(|visit| visit.take_problem_line())
+    {
+        notice(state, &text);
+    }
 }
 
 fn fail_start(state: &mut AppState, text: &str) {
@@ -1349,6 +1392,10 @@ fn match_report(state: &AppState) -> MatchReport {
 }
 
 impl super::WolVisit {
+    fn take_problem_line(&mut self) -> Option<String> {
+        self.problem_line.take()
+    }
+
     fn match_returned(&mut self, report: MatchReport, now: Instant) {
         if self.provider != WolProvider::Online {
             return;
@@ -1923,12 +1970,19 @@ fn accepted_human_matches(accepted: &Value, human: &Value) -> bool {
 
 /// Whether the accepted options hold a player's requested choices in
 /// whatever row the host seated it: the host's `choices` takes no row, and a
-/// guest's first choices leave before its seat is known.
+/// guest's first choices leave before its seat is known. With Teams set, the
+/// host's game puts every seated player on a team itself
+/// (`MatchSession::admit_network_team`), so it answers with whatever team
+/// it gave.
 fn accepted_choices_match(accepted: &Value, human: &Value) -> bool {
+    let any_team = !accepted["launch"]["options"]["teams"].is_null();
     let seatless = |human: &Value| {
         let mut human = human.clone();
         if let Some(fields) = human.as_object_mut() {
             fields.remove("raw_slot_index");
+            if any_team && let Some(slot) = fields.get_mut("slot").and_then(Value::as_object_mut) {
+                slot.remove("team");
+            }
         }
         human
     };
@@ -2144,6 +2198,13 @@ fn request_setup(
             }
         }
         NetworkSetupRequest::RequestPings => service.command("ping", json!({})),
+        // VERA's room: the host's Balance is `/balance` as typed, Balance
+        // automatically the lobby's quiet `balance` command
+        // (docs/lobby-protocol.md).
+        NetworkSetupRequest::Balance { automatic: true } => service.command("balance", json!({})),
+        NetworkSetupRequest::Balance { automatic: false } => {
+            service.command("chat", json!({"text":"/balance","to":[],"action":false}))
+        }
         NetworkSetupRequest::WolChat(line) => send_chat(service, line, Vec::new()),
         NetworkSetupRequest::WolEmote(text) => service.command(
             "chat",
@@ -2225,9 +2286,10 @@ fn apply_response(state: &mut AppState, service: &mut LiveService, response: htt
             service.player_id = player_id;
             state.frontend.wol_account.nickname = nickname;
             state.frontend.wol_account.password.clear();
+            // The operator's welcome is the only one: the game has none of its own.
             let motd = motd
                 .filter(|motd| !motd.trim().is_empty())
-                .unwrap_or_else(|| super::service::vera_motd(state));
+                .unwrap_or_default();
             service_event(state, WolServiceEvent::Login(Ok(WolLoginAccepted { motd })));
         }
         http::Response::LoginFailed { attempt, code } if attempt == service.auth_attempt => {
@@ -2288,6 +2350,7 @@ fn apply_response(state: &mut AppState, service: &mut LiveService, response: htt
             "leave" => service.leave_completed(id),
             "logout" => service.logout_completed(id),
             "relay_ready" | "latency_ready" => service.report_completed(id),
+            "balance" => crate::app::shell_network_setup::balance_answered(state),
             _ => {}
         },
         http::Response::CommandFailed {
@@ -2316,6 +2379,17 @@ fn apply_response(state: &mut AppState, service: &mut LiveService, response: htt
                 service.start_preparation = None;
                 fail_start(state, &tr("VERA:SettingsNotPublished"));
             }
+            "options" if failure == http::CommandFailure::InvalidOptions => {
+                // A lobby from before Teams, Balance automatically or the
+                // join queue refuses the field: the room goes on without it
+                // and publishes its options again.
+                let text = crate::app::shell_network_setup::lobby_refused_option(state)
+                    .unwrap_or("VERA:OnlineRequestRefused");
+                notice(state, &tr(text));
+            }
+            // The room no longer balances itself, or the lobby refused it:
+            // the next change of who plays asks again.
+            "balance" => crate::app::shell_network_setup::balance_answered(state),
             "choices"
                 if service
                     .pending_choices
@@ -3466,6 +3540,47 @@ mod completion_tests {
     use super::*;
     use crate::app::shell_wol::{WolHighScoreRecord, WolLadderRecord};
 
+    /// The reason must not land in a transcript the player is about to lose.
+    #[test]
+    fn a_failed_matchs_reason_waits_for_the_chat_the_player_lands_in() {
+        use crate::app::shell_route::ShellRoute;
+        assert!(problem_chat_open(
+            ShellRoute::WolLobby,
+            false,
+            false,
+            true,
+            false
+        ));
+        assert!(!problem_chat_open(
+            ShellRoute::WolLobby,
+            false,
+            false,
+            true,
+            true
+        ));
+        assert!(problem_chat_open(
+            ShellRoute::NetworkSetup,
+            true,
+            false,
+            true,
+            true
+        ));
+        assert!(problem_chat_open(
+            ShellRoute::Wol,
+            false,
+            true,
+            false,
+            false
+        ));
+        assert!(!problem_chat_open(
+            ShellRoute::Wol,
+            false,
+            false,
+            false,
+            false
+        ));
+    }
+
     #[test]
     fn relay_grant_requires_match_player_and_encryption_key_agreement() {
         use crate::net::udp::{
@@ -4358,6 +4473,32 @@ mod completion_tests {
             !pending.answered_by(&json!({"launch":other})),
             "other choices still wait"
         );
+    }
+
+    #[test]
+    fn a_room_with_teams_answers_choices_with_the_team_it_gave() {
+        // A guest's first choices ask for no team; with Teams set the host
+        // keeps the guest on the team it gave.
+        use crate::skirmish_launch::LaunchTeam;
+        let session = setup_session();
+        let mut launch = session.network_setup().unwrap().clone();
+        let mut human = launch.humans[1].clone();
+        human.slot.team = LaunchTeam::None;
+        let expected_human = serde_json::to_value(&human).unwrap();
+        human.slot.country_random = true;
+        let pending = PendingChoices {
+            request_id: 1,
+            expected_human,
+            expected_random: serde_json::to_value(&human).unwrap(),
+            deadline: Instant::now() + RELAY_TIMEOUT,
+        };
+        launch.humans[1].slot.team = LaunchTeam::Team(1);
+        assert!(
+            !pending.answered_by(&json!({"launch":launch})),
+            "without Teams another team still waits"
+        );
+        launch.options.teams = Some(2);
+        assert!(pending.answered_by(&json!({"launch":launch})));
     }
 
     #[test]

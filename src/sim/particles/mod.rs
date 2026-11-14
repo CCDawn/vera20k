@@ -27,6 +27,7 @@ use glam::IVec3;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub mod ares_system;
 pub mod fire;
 pub mod gas;
 pub mod railgun;
@@ -38,6 +39,8 @@ pub mod spawn;
 pub mod system_ai;
 pub mod wind;
 
+#[cfg(all(test, feature = "ares"))]
+mod ares_gas_tests;
 #[cfg(test)]
 mod fire_native_tests;
 #[cfg(test)]
@@ -46,12 +49,11 @@ mod gas_native_tests;
 mod native_fixture;
 #[cfg(test)]
 mod native_identity_tests;
-#[cfg(test)]
+// Ares simulates this Railgun system itself (hooks 0x62DF05, 0x62FD60).
+#[cfg(all(test, not(feature = "ares")))]
 mod railgun_native_tests;
 #[cfg(test)]
 mod virus_tests;
-#[cfg(all(test, feature = "ares"))]
-mod ares_gas_tests;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParticleSystem {
@@ -107,6 +109,10 @@ pub struct ParticleSystem {
     owner_fire_link: bool,
     alive: bool,
     in_limbo: bool,
+    /// Ares 3.0 ParticleSystemExt (`ares_system`): present for a system Ares
+    /// simulates itself, from the constructor hook `0x62DF05` on.
+    #[serde(default)]
+    ares: Option<Box<ares_system::AresParticleSystemExt>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,8 +411,17 @@ impl Particle {
         } else {
             pt.velocity
         };
-        assert_ne!(divisor, 0, "native Particle constructor divides by MaxEC");
-        let lifetime_extra = sim.particle_rng().next_raw_abs_modulo(divisor) as i16;
+        // The native Particle constructor (0x0062B5E0) divides its lifetime
+        // draw by MaxEC, so `MaxEC=0`, which only a map or mod can set, traps
+        // in gamemd. VERA carries on: no draw and no extra lifetime. The
+        // identity and any Smoke draw are already taken here and the callers
+        // cannot carry a refusal, so the particle is still built.
+        let lifetime_extra = if divisor == 0 {
+            log::warn!("particle type {type_id:?} has MaxEC=0: no lifetime draw");
+            0
+        } else {
+            sim.particle_rng().next_raw_abs_modulo(divisor) as i16
+        };
         let lifetime_remaining = (pt.max_ec as i16).wrapping_add(lifetime_extra);
         let location = floor_constructor_coords_with(coords, |x, y| ground(sim, x, y))?;
         let direction = spawn::native_velocity(coords, target);
@@ -557,6 +572,21 @@ impl ParticleSystem {
         &self.particles
     }
 
+    /// The Ares records of a system Ares simulates ([`ares_system`]).
+    pub fn ares(&self) -> Option<&ares_system::AresParticleSystemExt> {
+        self.ares.as_deref()
+    }
+
+    /// No ParticleClass child (`+0xCC`) and, under Ares 3.0
+    /// (`ExtData::Update @ 10026C70`), no record of its own either: the
+    /// emptiness the AI tail retires a done system on.
+    pub(crate) fn holds_no_particles(&self) -> bool {
+        if self.ares.as_ref().is_some_and(|ext| !ext.is_empty()) {
+            return false;
+        }
+        self.particles.is_empty()
+    }
+
     pub const fn lifetime(&self) -> i32 {
         self.lifetime
     }
@@ -703,6 +733,7 @@ impl ParticleSystem {
             owner_fire_link: false,
             alive: true,
             in_limbo: false,
+            ares: None,
         }
     }
 }
@@ -1103,6 +1134,26 @@ mod tests {
 
     fn fake_system(stable_id: u64) -> ParticleSystem {
         ParticleSystem::test_fixture(stable_id, ParticleSystemTypeId(0), IVec3::ZERO)
+    }
+
+    #[test]
+    fn zero_max_ec_constructs_without_a_lifetime_draw() {
+        let rules =
+            crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
+                "[Particles]\n0=GasP\n[GasP]\nBehavesLike=Gas\nMaxEC=0\n",
+            ))
+            .expect("particle rules");
+        let mut sim = Simulation::with_seed(7);
+        let rng_before = sim.scenario_rng.logical_state();
+        let particle = Particle::new(
+            ParticleTypeId(0),
+            IVec3::ZERO,
+            IVec3::ZERO,
+            rules.particle_type(ParticleTypeId(0)),
+            &mut sim,
+        );
+        assert_eq!(particle.lifetime_remaining(), 0);
+        assert_eq!(sim.scenario_rng.logical_state(), rng_before);
     }
 
     #[test]

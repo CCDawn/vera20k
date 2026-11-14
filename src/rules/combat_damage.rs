@@ -120,8 +120,8 @@ pub struct CombatDamageDefaults {
     /// `TiberiumExplosive=` (`RulesClass+0x17E5`, ReadBool over the current
     /// value at `0x0066CE7E`; constructor false). Stock UnitClass::
     /// Death_Explosion only sums a dead local with it; Ares 1004BD90 (hook
-    /// `0x738749`) turns it into the harvester's blast.
-    #[cfg(feature = "ares")]
+    /// `0x738749`) turns it into the harvester's blast, so only a read the
+    /// Ares way reads it.
     pub tiberium_explosive: bool,
     /// `IvanWarhead=` (`RulesClass+0xFC8`, ReadINI `0x0066C52A`; constructor
     /// null): the warhead of an Ivan bomb's blast (`BombClass::Detonate @
@@ -136,6 +136,14 @@ pub struct CombatDamageDefaults {
     /// `IvanIconFlickerRate=` in frames (`RulesClass+0xFD8`, ReadINI
     /// `0x0066C62B`; constructor 8 at `0x00666BA8`): the bomb clock's blink.
     pub ivan_icon_flicker_rate: i32,
+    /// `CanDetonateTimeBomb=` and `CanDetonateDeathBomb=` (`RulesClass+0xFD4`,
+    /// `+0xFD5`, ReadBool over the current value at `0x0066C545` and
+    /// `0x0066C564`; constructor false at `0x00666B9C`): the lone selected
+    /// carrier of a player's timed or death bomb over itself answers Detonate
+    /// (`TechnoClass::What_Action_OnObject` `0x006FFF8D..0x00700003`;
+    /// `Simulation::bomb_detonate_action`). Retail sets both to no.
+    pub can_detonate_time_bomb: bool,
+    pub can_detonate_death_bomb: bool,
     /// `SplashList=` (`RulesClass+0xBC4`, count `+0xBD0`; constructor empty):
     /// the water explosions. A bouncing debris chunk landing in water below
     /// the deck plays the first (`AnimClass::AI 0x00423DD2`).
@@ -202,12 +210,14 @@ impl CombatDamageDefaults {
             drain_animation_type: None,
             falling_damage_multiplier: section.read_float("FallingDamageMultiplier", 1.0),
             current_strength_damage: section.read_bool("CurrentStrengthDamage", true),
-            #[cfg(feature = "ares")]
-            tiberium_explosive: section.read_bool("TiberiumExplosive", false),
+            tiberium_explosive: crate::rules::ares_switch::ares_way()
+                && section.read_bool("TiberiumExplosive", false),
             ivan_warhead: None,
             ivan_damage: section.read_int("IvanDamage", 100),
             ivan_timed_delay: section.read_int("IvanTimedDelay", 450),
             ivan_icon_flicker_rate: section.read_int("IvanIconFlickerRate", 8),
+            can_detonate_time_bomb: section.read_bool("CanDetonateTimeBomb", false),
+            can_detonate_death_bomb: section.read_bool("CanDetonateDeathBomb", false),
             splash_list: Vec::new(),
             default_large_grey_smoke_system: None,
             default_small_grey_smoke_system: None,
@@ -243,12 +253,13 @@ impl Default for CombatDamageDefaults {
             drain_animation_type: None,
             falling_damage_multiplier: 1.0,
             current_strength_damage: true,
-            #[cfg(feature = "ares")]
             tiberium_explosive: false,
             ivan_warhead: None,
             ivan_damage: 100,
             ivan_timed_delay: 450,
             ivan_icon_flicker_rate: 8,
+            can_detonate_time_bomb: false,
+            can_detonate_death_bomb: false,
             splash_list: Vec::new(),
             default_large_grey_smoke_system: None,
             default_small_grey_smoke_system: None,

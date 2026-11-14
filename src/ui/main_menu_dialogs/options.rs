@@ -66,8 +66,6 @@ pub(crate) const ORIGINAL_SHAPE_LABEL: &str = "VERA:OriginalShape";
 pub(crate) const ORIGINAL_SHAPE_HELP: &str = "VERA:OriginalShapeHelp";
 pub(crate) const YR_ORIGINAL_STYLE_LABEL: &str = "VERA:YrOriginalStyle";
 pub(crate) const YR_ORIGINAL_STYLE_HELP: &str = "VERA:YrOriginalStyleHelp";
-pub(crate) const RENDER_INTERPOLATION_LABEL: &str = "VERA:RenderInterpolation";
-pub(crate) const RENDER_INTERPOLATION_HELP: &str = "VERA:RenderInterpolationHelp";
 pub(crate) const MOUSE_WHEEL_ZOOM_LABEL: &str = "VERA:MouseWheelZoom";
 pub(crate) const MOUSE_WHEEL_ZOOM_HELP: &str = "VERA:MouseWheelZoomHelp";
 pub(crate) const RIGHT_CLICK_ORDERS_LABEL: &str = "VERA:RightClickOrders";
@@ -89,6 +87,7 @@ pub(crate) const HAS_HD_MAP_PREVIEWS: bool =
 pub(crate) const HD_MAP_PREVIEWS_LABEL: &str = "VERA:HdMapPreviews";
 pub(crate) const HD_MAP_PREVIEWS_HELP: &str = "VERA:HdMapPreviewsHelp";
 pub(crate) const SHIFT_QUEUE_LABEL: &str = "VERA:ShiftQueue";
+pub(crate) const AUTO_REPAIR_LABEL: &str = "VERA:AutoRepair";
 /// The two category pages retail's string table has no band name for.
 pub(crate) const CONTROLS_LABEL: &str = "VERA:Controls";
 pub(crate) const DEVELOPER_OPTIONS_LABEL: &str = "VERA:DeveloperOptions";
@@ -115,6 +114,7 @@ pub(crate) const CUSTOM_END_GAME_MOVIE_HELP: &str = "VERA:CustomEndGameMovieHelp
 pub(crate) const DETAILED_EVA_TEXT_LABEL: &str = "VERA:DetailedEvaText";
 pub(crate) const DETAILED_EVA_TEXT_HELP: &str = "VERA:DetailedEvaTextHelp";
 pub(crate) const SHIFT_QUEUE_HELP: &str = "VERA:ShiftQueueHelp";
+pub(crate) const AUTO_REPAIR_HELP: &str = "VERA:AutoRepairHelp";
 /// VERA's terrain deformation box (`docs/terrain-deformation.md`).
 pub(crate) const TERRAIN_DEFORMATION_LABEL: &str = "VERA:TerrainDeformation";
 pub(crate) const TERRAIN_DEFORMATION_HELP: &str = "VERA:TerrainDeformationHelp";
@@ -127,6 +127,10 @@ pub(crate) const HEALTH_BARS_HELP: &str = "VERA:HealthBarsHelp";
 /// string table has nothing for it.
 pub(crate) const HOUSE_COLOR_STRENGTH_LABEL: &str = "VERA:HouseColorStrength";
 pub(crate) const HOUSE_COLOR_STRENGTH_HELP: &str = "VERA:HouseColorStrengthHelp";
+/// VERA's whole-viewport colour-vision filter. Retail's string table has
+/// nothing for it.
+pub(crate) const COLOR_VISION_LABEL: &str = "VERA:ColorVision";
+pub(crate) const COLOR_VISION_HELP: &str = "VERA:ColorVisionHelp";
 /// The Display list's first row: the window system's own choice.
 pub(crate) const DISPLAY_AUTO_LABEL: &str = "VERA:DisplayAuto";
 /// VERA's Language list on the Interface page. Its rows are each language's
@@ -140,6 +144,9 @@ pub(crate) const HAS_CHECK_FOR_UPDATES: bool =
     !cfg!(all(target_arch = "wasm32", target_os = "unknown"));
 pub(crate) const CHECK_FOR_UPDATES_LABEL: &str = "VERA:CheckForUpdates";
 pub(crate) const CHECK_FOR_UPDATES_HELP: &str = "VERA:CheckForUpdatesHelp";
+/// The column's Mods button, which opens VERA's Mods page
+/// (`ui::mods_shell`). The browser build has no Mods folder.
+pub(crate) const HAS_MODS: bool = !cfg!(all(target_arch = "wasm32", target_os = "unknown"));
 /// The Esc menu's Set Window Size button. A browser tab's canvas takes its size
 /// from the page and an Android window fills the screen, so those builds have
 /// none.
@@ -148,6 +155,7 @@ pub(crate) const HAS_SET_WINDOW_SIZE: bool = !cfg!(any(
     target_os = "android"
 ));
 pub(crate) const SET_WINDOW_SIZE_LABEL: &str = "VERA:SetWindowSize";
+pub(crate) const SET_WINDOW_SIZE_HELP: &str = "VERA:SetWindowSizeHelp";
 
 /// A button of the dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,13 +168,21 @@ pub(crate) enum LauncherButton {
     CheckForUpdates,
     /// The Esc menu's Set Window Size: the window goes back to how a launch opens it.
     SetWindowSize,
+    /// The in-game menu's Keyboard, which opens gamemd's in-game `0xA3`.
+    InGameKeyboard,
+    /// The in-game menu's Sound, which opens gamemd's Sound Controls (`0xB8`)
+    /// and its song list.
+    InGameSound,
 }
 
 impl LauncherButton {
     /// Whether it sits among the page's own controls, rather than being one
     /// of the right-hand column's.
     pub(crate) const fn on_page(self) -> bool {
-        matches!(self, Self::CheckForUpdates | Self::SetWindowSize)
+        matches!(
+            self,
+            Self::CheckForUpdates | Self::SetWindowSize | Self::InGameKeyboard | Self::InGameSound
+        )
     }
 }
 
@@ -376,6 +392,79 @@ impl HealthBarMode {
     }
 }
 
+/// VERA's `[VERA] ColorVisionMode=` whole-viewport colour-vision filter.
+///
+/// gamemd has no equivalent: this is a presentation-only final-frame pass
+/// (`render::color_vision`), never simulation state. `Generic` and
+/// `Deuteranopia` are the same correction matrix; the former is just a label
+/// for players who cannot name their deficiency. The matrices themselves live
+/// in `render/`, so `ui/` owns only the enum and its strings and the app frame
+/// maps a mode to a matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ColorVisionMode {
+    /// The retail image; the pass is skipped entirely.
+    #[default]
+    Off,
+    /// "Not sure? Use this": the common red-green correction.
+    Generic,
+    /// Red-green, green-cone.
+    Deuteranopia,
+    /// Red-green, red-cone.
+    Protanopia,
+    /// Blue-yellow; the rarest and least reliable model.
+    Tritanopia,
+}
+
+impl ColorVisionMode {
+    /// The list's rows, top to bottom; the first is the default.
+    const ALL: [Self; 5] = [
+        Self::Off,
+        Self::Generic,
+        Self::Deuteranopia,
+        Self::Protanopia,
+        Self::Tritanopia,
+    ];
+
+    /// The row's text.
+    pub(crate) fn label(self) -> String {
+        crate::i18n::tr(match self {
+            Self::Off => "VERA:ColorVisionOff",
+            Self::Generic => "VERA:ColorVisionGeneric",
+            Self::Deuteranopia => "VERA:ColorVisionDeuteranopia",
+            Self::Protanopia => "VERA:ColorVisionProtanopia",
+            Self::Tritanopia => "VERA:ColorVisionTritanopia",
+        })
+    }
+
+    /// The list's rows, top to bottom.
+    pub(crate) fn choices() -> Vec<Self> {
+        Self::ALL.to_vec()
+    }
+
+    /// The `[VERA] ColorVisionMode` value.
+    pub(crate) const fn ini_value(self) -> i32 {
+        match self {
+            Self::Off => 0,
+            Self::Generic => 1,
+            Self::Deuteranopia => 2,
+            Self::Protanopia => 3,
+            Self::Tritanopia => 4,
+        }
+    }
+
+    /// A value this build does not know reads as `Off`, so a hand-edited INI
+    /// never enables a filter the build has no matrix for.
+    pub(crate) const fn from_ini_value(value: i32) -> Self {
+        match value {
+            1 => Self::Generic,
+            2 => Self::Deuteranopia,
+            3 => Self::Protanopia,
+            4 => Self::Tritanopia,
+            _ => Self::Off,
+        }
+    }
+}
+
 /// One screen the Display list offers, as the window layer reported it when the
 /// page opened. VERA's own data: no profile or native code names a monitor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -459,6 +548,8 @@ pub(crate) enum LauncherComboId {
     Display,
     /// The `[VERA] HealthBars=` list.
     HealthBars,
+    /// The `[VERA] ColorVisionMode=` list: the whole-viewport filter.
+    ColorVision,
     /// The `[VERA] Language=` list: VERA's interface language.
     Language,
 }
@@ -545,6 +636,11 @@ pub(crate) enum LauncherTrackbarId {
     /// the level minus [`crate::rules::house_colors::STRENGTH_MIN`], so the
     /// retail strength is position 0 and the strongest is position 9.
     HouseColorStrength,
+    /// The in-game menu's Game Speed, the slider of gamemd's Game Controls
+    /// (`0xBBB` control `0x529`). No main-menu page has it and the profile
+    /// pack leaves it out: the menu sets it up with
+    /// [`OptionsDialogState::set_in_game_controls`] and applies it on close.
+    GameSpeed,
 }
 
 impl LauncherTrackbarId {
@@ -553,6 +649,7 @@ impl LauncherTrackbarId {
             Self::Detail => 1,
             Self::Difficulty => 2,
             Self::Scroll => 6,
+            Self::GameSpeed => crate::ui::shell::game_speed::MAX_POSITION as u8,
             Self::Score | Self::Sound | Self::Voice => 10,
             Self::HouseColorStrength => {
                 crate::rules::house_colors::STRENGTH_MAX - crate::rules::house_colors::STRENGTH_MIN
@@ -564,7 +661,7 @@ impl LauncherTrackbarId {
     /// plaque off (`0x4AC` with 0).
     pub(crate) const fn plaque_reserve(self) -> i32 {
         match self {
-            Self::Detail | Self::Difficulty | Self::Scroll => 0,
+            Self::Detail | Self::Difficulty | Self::Scroll | Self::GameSpeed => 0,
             Self::Score | Self::Sound | Self::Voice | Self::HouseColorStrength => 50,
         }
     }
@@ -598,12 +695,13 @@ pub(crate) enum LauncherCheckboxId {
     /// VERA's own box: Shift + left click on a mobile build cameo queues
     /// several copies instead of gamemd's one. It applies at once.
     ShiftQueue,
+    /// VERA's own box: the player's damaged buildings are sent the Repair
+    /// order by themselves (`app::input::auto_repair`). It applies at once.
+    AutoRepair,
     /// VERA's own box: explosions dent open ground as in Tiberian Sun and a
     /// nuke leaves a crater. Saved; the next game's rules read it, so a match
     /// already running keeps its own.
     TerrainDeformation,
-    /// Client-only smoothing, independent of native simulation and detail.
-    RenderInterpolation,
     /// VERA's local camera option: the wheel changes battle view distance.
     MouseWheelZoom,
     /// VERA-only alternative controls: left selects, right commands.
@@ -690,6 +788,8 @@ pub(crate) enum LauncherOptionsEvent {
     SidebarSelected(SidebarSize),
     /// The Health Bars list's pick, applied at once like Sidebar.
     HealthBarModeSelected(HealthBarMode),
+    /// The Colour Vision list's pick, applied to the very next frame.
+    ColorVisionModeSelected(ColorVisionMode),
     /// The Display list's pick, applied to the window at once.
     DisplaySelected(DisplayTarget),
     /// The Language list's pick, a language tag, applied at once.
@@ -700,8 +800,8 @@ pub(crate) enum LauncherOptionsEvent {
     OriginalShapeChanged(bool),
     YrOriginalStyleChanged(bool),
     ShiftQueueChanged(bool),
+    AutoRepairChanged(bool),
     TerrainDeformationChanged(bool),
-    RenderInterpolationChanged(bool),
     MouseWheelZoomChanged(bool),
     RightClickOrdersChanged(bool),
     LockCursorChanged(bool),
@@ -722,6 +822,10 @@ pub(crate) enum LauncherOptionsEvent {
     ScorePreview(f32),
     SoundPreview(f32),
     VoicePreview(f32),
+    /// The in-game menu's Keyboard and Sound buttons, which that menu routes
+    /// (`app::input::pause_menu`).
+    InGameKeyboardRequested,
+    InGameSoundRequested,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -731,6 +835,10 @@ pub(crate) enum LauncherOptionsEvent {
 pub(crate) enum LauncherParentResult {
     Back,
     Keyboard,
+    /// VERA's own: the Mods page, a child of the dialog as Keyboard is. The
+    /// profile is written before it opens, since Use This Mod leaves the game
+    /// from there.
+    Mods,
     Terminal,
 }
 
@@ -754,7 +862,6 @@ pub(crate) struct LauncherOptionsValues {
     pub(crate) full_screen: bool,
     pub(crate) original_shape: bool,
     pub(crate) yr_original_style: bool,
-    pub(crate) render_interpolation: bool,
     pub(crate) mouse_wheel_zoom: bool,
     pub(crate) right_click_orders: bool,
     pub(crate) lock_cursor: bool,
@@ -764,6 +871,7 @@ pub(crate) struct LauncherOptionsValues {
     pub(crate) smooth_online_menus: bool,
     pub(crate) hd_map_previews: bool,
     pub(crate) shift_queue: bool,
+    pub(crate) auto_repair: bool,
     pub(crate) terrain_deformation: bool,
     /// The FPS readout's live state when the page opened, then each toggle.
     pub(crate) performance_stats: bool,
@@ -785,6 +893,9 @@ pub(crate) struct LauncherOptionsValues {
     pub(crate) sidebar: SidebarSize,
     /// The Health Bars list's choice; like Sidebar, it applies at once.
     pub(crate) health_bars: HealthBarMode,
+    /// The Colour Vision list's choice; reads every frame, so it applies at
+    /// once without rebuilding anything.
+    pub(crate) color_vision: ColorVisionMode,
     /// VERA's team-colour strength as the slider's position,
     /// [`crate::rules::house_colors::STRENGTH_MIN`] less than the level the
     /// profile stores. Position 0 is gamemd's own bands.
@@ -806,7 +917,6 @@ impl Default for LauncherOptionsValues {
             full_screen: false,
             original_shape: false,
             yr_original_style: false,
-            render_interpolation: false,
             mouse_wheel_zoom: false,
             right_click_orders: false,
             lock_cursor: false,
@@ -816,6 +926,7 @@ impl Default for LauncherOptionsValues {
             smooth_online_menus: false,
             hd_map_previews: true,
             shift_queue: false,
+            auto_repair: false,
             terrain_deformation: false,
             performance_stats: false,
             show_string_keys: false,
@@ -826,6 +937,7 @@ impl Default for LauncherOptionsValues {
             detailed_eva_text: false,
             sidebar: SidebarSize::Normal,
             health_bars: HealthBarMode::Vanilla,
+            color_vision: ColorVisionMode::Off,
             house_color_position: 0,
             score_position: 4,
             sound_position: 7,
@@ -915,6 +1027,13 @@ pub(crate) struct OptionsDialogState {
     /// Window Size button names. Set by [`Self::set_launch_window_size`]; zero
     /// until then.
     launch_window_size: (u32, u32),
+    /// The in-game menu's Game Speed slider: its position, and the caption
+    /// and one value name per position. Set by [`Self::set_in_game_controls`].
+    game_speed_position: u8,
+    game_speed_caption: String,
+    game_speed_names: Vec<String>,
+    /// The in-game menu's Sound button caption. Set with the speed.
+    in_game_sound_label: String,
     /// The list that is open, if any.
     open_combo: Option<LauncherComboId>,
     launcher_audio_available: bool,
@@ -992,6 +1111,10 @@ impl OptionsDialogState {
             languages: Vec::new(),
             language: String::new(),
             launch_window_size: (0, 0),
+            game_speed_position: 0,
+            game_speed_caption: String::new(),
+            game_speed_names: Vec::new(),
+            in_game_sound_label: String::new(),
             open_combo: None,
             launcher_audio_available,
             capture: None,
@@ -1042,6 +1165,13 @@ impl OptionsDialogState {
         !id.is_audio() || self.launcher_audio_available
     }
 
+    /// Whether a button window is enabled: BBB's init disables its Sound
+    /// button without an output device (`0x004E2201..0x004E2223`), and the
+    /// in-game page's Sound button stands for it.
+    pub(crate) const fn button_enabled(&self, id: LauncherButton) -> bool {
+        !matches!(id, LauncherButton::InGameSound) || self.launcher_audio_available
+    }
+
     /// gamemd-derived: the parent snapshot consumed by
     /// `OptionsClass__ApplyFromLauncherDialog @ 0x0055FAA0` maps the six
     /// positions and three normalized checkboxes exactly as below.
@@ -1063,8 +1193,29 @@ impl OptionsDialogState {
         }
     }
 
+    /// Give the in-game menu's Game Speed slider its caption, the name of
+    /// each position's speed and where it stands, and the Sound button its
+    /// caption. A position past the slider's end shows as its first.
+    pub(crate) fn set_in_game_controls(
+        &mut self,
+        speed_caption: String,
+        speed_names: Vec<String>,
+        speed_position: u8,
+        sound_label: String,
+    ) {
+        self.game_speed_caption = speed_caption;
+        self.game_speed_names = speed_names;
+        self.game_speed_position = if speed_position > LauncherTrackbarId::GameSpeed.maximum() {
+            0
+        } else {
+            speed_position
+        };
+        self.in_game_sound_label = sound_label;
+    }
+
     pub(crate) fn trackbar_position(&self, id: LauncherTrackbarId) -> u8 {
         match id {
+            LauncherTrackbarId::GameSpeed => self.game_speed_position,
             LauncherTrackbarId::Detail => self.values.detail_position,
             LauncherTrackbarId::Difficulty => self.values.difficulty_position,
             LauncherTrackbarId::Scroll => self.values.scroll_position,
@@ -1100,6 +1251,7 @@ impl OptionsDialogState {
             return;
         }
         let slot = match id {
+            LauncherTrackbarId::GameSpeed => &mut self.game_speed_position,
             LauncherTrackbarId::Detail => &mut self.values.detail_position,
             LauncherTrackbarId::Difficulty => &mut self.values.difficulty_position,
             LauncherTrackbarId::Scroll => &mut self.values.scroll_position,
@@ -1125,6 +1277,12 @@ impl OptionsDialogState {
             }
             LauncherTrackbarId::Scroll => {
                 self.scroll_caption = self.labels.scroll_tokens[usize::from(position)].clone();
+                self.pending_events
+                    .push(LauncherOptionsEvent::Cue(LauncherCue::GenericClick));
+            }
+            // 61E609..61E6DD: a changed position plays the cue. The speed
+            // itself applies when the menu closes.
+            LauncherTrackbarId::GameSpeed => {
                 self.pending_events
                     .push(LauncherOptionsEvent::Cue(LauncherCue::GenericClick));
             }
@@ -1219,8 +1377,8 @@ impl OptionsDialogState {
             LauncherCheckboxId::OriginalShape => &mut self.values.original_shape,
             LauncherCheckboxId::YrOriginalStyle => &mut self.values.yr_original_style,
             LauncherCheckboxId::ShiftQueue => &mut self.values.shift_queue,
+            LauncherCheckboxId::AutoRepair => &mut self.values.auto_repair,
             LauncherCheckboxId::TerrainDeformation => &mut self.values.terrain_deformation,
-            LauncherCheckboxId::RenderInterpolation => &mut self.values.render_interpolation,
             LauncherCheckboxId::MouseWheelZoom => &mut self.values.mouse_wheel_zoom,
             LauncherCheckboxId::RightClickOrders => &mut self.values.right_click_orders,
             LauncherCheckboxId::LockCursor => &mut self.values.lock_cursor,
@@ -1254,12 +1412,12 @@ impl OptionsDialogState {
             LauncherCheckboxId::ShiftQueue => self
                 .pending_events
                 .push(LauncherOptionsEvent::ShiftQueueChanged(checked)),
+            LauncherCheckboxId::AutoRepair => self
+                .pending_events
+                .push(LauncherOptionsEvent::AutoRepairChanged(checked)),
             LauncherCheckboxId::TerrainDeformation => self
                 .pending_events
                 .push(LauncherOptionsEvent::TerrainDeformationChanged(checked)),
-            LauncherCheckboxId::RenderInterpolation => self
-                .pending_events
-                .push(LauncherOptionsEvent::RenderInterpolationChanged(checked)),
             LauncherCheckboxId::MouseWheelZoom => self
                 .pending_events
                 .push(LauncherOptionsEvent::MouseWheelZoomChanged(checked)),
@@ -1371,6 +1529,15 @@ impl OptionsDialogState {
         self.open_combo = None;
         self.pending_events
             .push(LauncherOptionsEvent::HealthBarModeSelected(mode));
+    }
+
+    /// The Colour Vision list publishes its pick at once too: the filter reads
+    /// the profile every frame, so no atlas or ramp has to be rebuilt.
+    pub(crate) fn select_color_vision(&mut self, mode: ColorVisionMode) {
+        self.values.color_vision = mode;
+        self.open_combo = None;
+        self.pending_events
+            .push(LauncherOptionsEvent::ColorVisionModeSelected(mode));
     }
 
     /// The Display list publishes its pick at once too: the window moves to
@@ -1491,9 +1658,9 @@ impl Category {
                 Setting::List(List::Zoom),
                 Setting::List(List::Display),
                 Setting::Slider(Slider::HouseColorStrength),
+                Setting::List(List::ColorVision),
                 Setting::Checkbox(Check::FullScreen),
                 Setting::Checkbox(Check::OriginalShape),
-                Setting::Checkbox(Check::RenderInterpolation),
                 Setting::Checkbox(Check::YrOriginalStyle),
             ],
             Self::Gameplay => &[
@@ -1502,6 +1669,7 @@ impl Category {
                 Setting::Checkbox(Check::TargetLines),
                 Setting::Checkbox(Check::ShowHidden),
                 Setting::Checkbox(Check::ShiftQueue),
+                Setting::Checkbox(Check::AutoRepair),
                 Setting::Checkbox(Check::TerrainDeformation),
                 Setting::Checkbox(Check::CustomEndGameBanner),
                 Setting::Checkbox(Check::CustomEndGameScore),
@@ -1565,6 +1733,62 @@ impl Category {
             Self::Controls => "VERA:ControlsPageHelp",
             Self::Developer if HAS_CHECK_FOR_UPDATES => "VERA:DeveloperPageHelp",
             Self::Developer => "VERA:DeveloperPageHelpBrowser",
+        }
+    }
+
+    /// The category's page on the in-game menu: what a running match can use
+    /// of all the main menu's categories. Controls is the page the menu opens
+    /// on, under the template's own Game Controls button: the settings of
+    /// gamemd's Game Controls (`0xBBB`) with the three volumes of its Sound
+    /// child, so the ones a player reaches for mid-match are one Escape away.
+    /// Game Options and Display Options have a tab each.
+    pub(crate) const fn in_game_settings(self) -> &'static [Setting] {
+        use LauncherCheckboxId as Check;
+        use LauncherComboId as List;
+        use LauncherTrackbarId as Slider;
+        match self {
+            Self::Gameplay => &[
+                Setting::Slider(Slider::Detail),
+                Setting::List(List::HealthBars),
+                Setting::Checkbox(Check::RightClickOrders),
+                Setting::Checkbox(Check::ShiftQueue),
+                Setting::Checkbox(Check::AutoRepair),
+                Setting::Checkbox(Check::MouseWheelZoom),
+                Setting::Checkbox(Check::LockCursor),
+            ],
+            Self::Display => &[
+                Setting::List(List::Zoom),
+                Setting::List(List::Display),
+                Setting::List(List::Sidebar),
+                Setting::List(List::ColorVision),
+                Setting::List(List::Language),
+                Setting::Checkbox(Check::FullScreen),
+                Setting::Checkbox(Check::OriginalShape),
+                Setting::Checkbox(Check::YrOriginalStyle),
+                Setting::Checkbox(Check::HdRadar),
+                Setting::Checkbox(Check::SmoothSidebar),
+                Setting::Checkbox(Check::PerformanceStats),
+            ],
+            Self::Controls => &[
+                Setting::Slider(Slider::GameSpeed),
+                Setting::Slider(Slider::Scroll),
+                Setting::Slider(Slider::Score),
+                Setting::Slider(Slider::Sound),
+                Setting::Slider(Slider::Voice),
+                Setting::Checkbox(Check::TargetLines),
+                Setting::Checkbox(Check::ShowHidden),
+                Setting::Checkbox(Check::Tooltips),
+            ],
+            _ => &[],
+        }
+    }
+
+    /// [`Self::help`] for the page's tab on the in-game menu.
+    pub(crate) const fn in_game_help(self) -> &'static str {
+        match self {
+            Self::Gameplay => "VERA:InGameGameplayHelp",
+            Self::Display => "VERA:InGameDisplayHelp",
+            _ => self.help(),
         }
     }
 }
@@ -1995,41 +2219,6 @@ mod tests {
     }
 
     #[test]
-    fn original_yr_style_and_render_interpolation_toggle_independently() {
-        let mut state = state(true);
-        let initial = state.values;
-        state.checkbox_mouse_down(LauncherCheckboxId::YrOriginalStyle, frame(5, 5, 220, 20));
-        assert_ne!(state.values.yr_original_style, initial.yr_original_style);
-        assert_eq!(
-            state.values.render_interpolation,
-            initial.render_interpolation
-        );
-        assert_eq!(
-            state.drain_output().events,
-            [
-                LauncherOptionsEvent::Cue(LauncherCue::Checkbox),
-                LauncherOptionsEvent::YrOriginalStyleChanged(!initial.yr_original_style),
-            ]
-        );
-        state.checkbox_mouse_down(
-            LauncherCheckboxId::RenderInterpolation,
-            frame(5, 5, 220, 20),
-        );
-        assert_ne!(
-            state.values.render_interpolation,
-            initial.render_interpolation
-        );
-        assert_ne!(state.values.yr_original_style, initial.yr_original_style);
-        assert_eq!(
-            state.drain_output().events,
-            [
-                LauncherOptionsEvent::Cue(LauncherCue::Checkbox),
-                LauncherOptionsEvent::RenderInterpolationChanged(!initial.render_interpolation),
-            ]
-        );
-    }
-
-    #[test]
     fn the_first_request_of_a_frame_wins_across_results_and_the_update_check() {
         let mut state = state(true);
         state.request_update_check();
@@ -2184,6 +2373,7 @@ mod tests {
             List::Sidebar,
             List::Display,
             List::HealthBars,
+            List::ColorVision,
             List::Language,
         ]
         .map(Setting::List)
@@ -2208,7 +2398,6 @@ mod tests {
                 Check::FullScreen,
                 Check::OriginalShape,
                 Check::YrOriginalStyle,
-                Check::RenderInterpolation,
                 Check::MouseWheelZoom,
                 Check::RightClickOrders,
                 Check::LockCursor,
@@ -2218,6 +2407,7 @@ mod tests {
                 Check::SmoothOnlineMenus,
                 Check::HdMapPreviews,
                 Check::ShiftQueue,
+                Check::AutoRepair,
                 Check::TerrainDeformation,
                 Check::PerformanceStats,
                 Check::ShowStringKeys,

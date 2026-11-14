@@ -36,10 +36,20 @@ pub(crate) fn transfer_outgoing_simulation_rules(
 pub(crate) struct ProcessAssets {
     /// Selected at launch, retained even if initial archive loading fails.
     media_archive_mode: MediaArchiveMode,
+    /// The launch's mod folder (`app::mods`): a manager rebuilt after a lost
+    /// lease reads the same files.
+    mod_dir: Option<std::path::PathBuf>,
+    /// That folder's files as one digest (`app::mods::files_digest`), taken
+    /// once: the pre-match check compares it.
+    mod_files: std::sync::Arc<std::sync::OnceLock<Result<[u8; 32], String>>>,
+    /// [`ProcessAssets::read_mod_files_ahead`] has started its thread.
+    mod_files_ahead: std::sync::atomic::AtomicBool,
     /// Launch request and its first resolved names survive a lost asset lease.
     ini_config: crate::util::ini_roots::IniRootConfig,
     selected_ini_roots: Option<crate::util::ini_roots::IniRoots>,
-    /// Personal rules are frozen at startup, like the selected game sources.
+    /// Personal rules are read once at startup, like the selected game
+    /// sources; only the Options switches change them later
+    /// ([`Self::set_terrain_deformation`]).
     personal_rules: crate::rules::personal_rules::PersonalRules,
     manager: Option<AssetManager>,
     leased: bool,
@@ -68,6 +78,16 @@ pub(crate) struct ProcessAssets {
     /// The network games' Rules/AI/Art INI hashes, computed once from the
     /// process sources; `None` without them.
     native_ini_hashes: Option<crate::rules::native_ini_hash::NativeIniHashes>,
+    /// Game-folder files that change those sources from the retail copies,
+    /// found with the hashes.
+    changed_game_files: Vec<String>,
+}
+
+fn mod_files_digest(dir: &std::path::Path) -> Result<[u8; 32], String> {
+    crate::app::mods::files_digest(dir).map_err(|error| {
+        log::warn!("Could not read the mod in {}: {error}", dir.display());
+        format!("the mod's files could not be read: {error}")
+    })
 }
 
 /// Immutable process sources; output players and match queues have separate
@@ -95,6 +115,9 @@ impl ProcessAssets {
     pub(crate) fn new(media_archive_mode: MediaArchiveMode, load_audio_index: bool) -> Self {
         Self {
             media_archive_mode,
+            mod_dir: None,
+            mod_files: Default::default(),
+            mod_files_ahead: Default::default(),
             ini_config: Default::default(),
             selected_ini_roots: None,
             personal_rules: Default::default(),
@@ -108,6 +131,7 @@ impl ProcessAssets {
             csf: None,
             tile_variant_selector_cache: Default::default(),
             native_ini_hashes: None,
+            changed_game_files: Vec::new(),
         }
     }
 
@@ -129,6 +153,39 @@ impl ProcessAssets {
         self
     }
 
+    pub(crate) fn with_mod_dir(mut self, mod_dir: Option<std::path::PathBuf>) -> Self {
+        self.mod_dir = mod_dir;
+        self
+    }
+
+    /// The player opened a multiplayer menu: start reading the mod's files
+    /// now, off the thread that draws, so the pre-match check that follows
+    /// rarely waits. A mod's archives take a moment to read, and a run that
+    /// never comes here (single player, a map picture) never reads them.
+    /// Where no thread starts, that check reads them itself.
+    pub(crate) fn read_mod_files_ahead(&self) {
+        use std::sync::atomic::Ordering;
+        let Some(dir) = self.mod_dir.clone() else {
+            return;
+        };
+        if self.mod_files_ahead.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let files = std::sync::Arc::clone(&self.mod_files);
+        let _ = std::thread::Builder::new()
+            .name("mod-files".into())
+            .spawn(move || {
+                files.get_or_init(|| mod_files_digest(&dir));
+            });
+    }
+
+    /// The launch's mod folder as one digest, or why it could not be read;
+    /// `None` without a mod.
+    fn mod_files(&self) -> Option<&Result<[u8; 32], String>> {
+        let dir = self.mod_dir.as_deref()?;
+        Some(self.mod_files.get_or_init(|| mod_files_digest(dir)))
+    }
+
     /// The Options page's Terrain Deformation box: the next scenario's rules
     /// read it, and network agreement compares it from now on.
     pub(crate) fn set_terrain_deformation(&mut self, on: bool) {
@@ -138,13 +195,42 @@ impl ProcessAssets {
         }
     }
 
+    /// VERARULES.INI and the Options switches, as the network rules hash
+    /// ([`Self::native_ini_hashes`]) compares them.
+    pub(crate) fn personal_rules(&self) -> &crate::rules::personal_rules::PersonalRules {
+        &self.personal_rules
+    }
+
+    /// The Rules, Art and AI roots are the stock YR files; config.toml's
+    /// `[ini]` profiles and names can pick others.
+    pub(crate) fn stock_ini_roots(&self) -> bool {
+        let stock = crate::util::ini_roots::IniRoots::default();
+        self.selected_ini_roots.as_ref().is_none_or(|roots| {
+            [
+                (roots.rules(), stock.rules()),
+                (roots.art(), stock.art()),
+                (roots.ai(), stock.ai()),
+            ]
+            .iter()
+            .all(|(used, stock)| used.eq_ignore_ascii_case(stock))
+        })
+    }
+
+    /// Loose files or archives in the game folder that change the rules the
+    /// network compares from the retail copies, e.g. `rulesmd.ini` or
+    /// `expandmd99.mix`; found at startup.
+    pub(crate) fn changed_game_files(&self) -> &[String] {
+        &self.changed_game_files
+    }
+
     /// Recovery uses the process's already resolved choice, never a new Auto
     /// decision against an archive set that may have changed since startup.
     pub(crate) fn reconstruct_manager(
         &self,
         root: &std::path::Path,
     ) -> anyhow::Result<AssetManager> {
-        let assets = AssetManager::new(root, self.media_archive_mode)?;
+        let assets =
+            AssetManager::with_mod(root, self.mod_dir.as_deref(), self.media_archive_mode)?;
         Ok(if let Some(roots) = &self.selected_ini_roots {
             assets.with_selected_ini_roots(roots.clone())
         } else {
@@ -351,6 +437,19 @@ impl ProcessAssets {
                 bytes.extend_from_slice(digest.as_bytes());
             }
         }
+        // Whether Ares plays (`rules::ares_switch`) follows these sources and
+        // the map, which the map agreement covers, and whether `ares.mix`
+        // ships. A build without the `ares` feature never mounts `ares.mix`
+        // and keeps the old bytes.
+        #[cfg(feature = "ares")]
+        bytes.push(u8::from(assets.ships_ares()));
+        // VERA: with a mod in use, its other files too (art, maps, archives),
+        // so players whose copies of a mod differ never start a match. Without
+        // a mod the digest is what it was before mods.
+        if let Some(files) = self.mod_files() {
+            bytes.extend_from_slice(b"mod files\0");
+            bytes.extend_from_slice(files.as_ref().map_err(String::clone)?);
+        }
         Ok(crate::util::sha256::sha256_hex(&bytes))
     }
 
@@ -382,6 +481,9 @@ impl ProcessAssets {
     /// Hash the process sources once (`crate::rules::native_ini_hash`):
     /// the selected rules root and ART, AIMD, each mode's INI by id
     /// `1..=count` and CoopCampMD.
+    /// VERA: also finds the game-folder files that change those sources or
+    /// LANGRULE.INI (VERA's own agreement compares it) from the retail
+    /// copies ([`Self::changed_game_files`]).
     pub(crate) fn install_native_ini_hashes(
         &mut self,
         assets: &AssetManager,
@@ -389,6 +491,28 @@ impl ProcessAssets {
     ) {
         use crate::rules::ini_parser::IniFile;
         use crate::rules::retail_sources::{select_ini, select_mode_ini};
+        let roots = assets.ini_roots();
+        // MPModesMD.ini is the mode roster: which mode INIs the hash adds.
+        let mut compared = vec![
+            roots.rules(),
+            roots.art(),
+            roots.ai(),
+            "langrule.ini",
+            "MPModesMD.ini",
+        ];
+        compared.extend(modes.iter().map(|mode| mode.override_file.as_str()));
+        compared
+            .push(crate::app::frontend::skirmish_session::cooperative::COOPERATIVE_CAMPAIGN_INI);
+        self.changed_game_files =
+            crate::rules::retail_sources::files_changing_shipped_inis(assets, &compared);
+        log::info!(
+            "Game files that change the original rules: {}",
+            if self.changed_game_files.is_empty() {
+                "none".to_owned()
+            } else {
+                self.changed_game_files.join(", ")
+            }
+        );
         let Some(rules) = self.native_rules.as_ref() else {
             return;
         };
@@ -693,6 +817,42 @@ mod tests {
             original,
             fresh.multiplayer_rules_digest("mode.ini").unwrap()
         );
+    }
+
+    /// VERA: players whose copies of a mod differ in a file the rules do not
+    /// read never agree, nor a player with a mod and one without.
+    #[test]
+    fn a_mods_other_files_take_part_in_the_agreement() {
+        let dir = crate::assets::asset_manager::test_support::audio_test_install("mod-files");
+        for (name, bytes) in [
+            ("rulesmd.ini", "[General]\nBuildSpeed=.7\n"),
+            ("artmd.ini", "[UNIT]\nVoxel=yes\n"),
+            ("aimd.ini", "[AI]\nValue=1\n"),
+        ] {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        let mods = dir.path().join("mods-under-test");
+        for (folder, art) in [("one", "a"), ("same", "a"), ("other", "b")] {
+            std::fs::create_dir_all(mods.join(folder)).unwrap();
+            std::fs::write(mods.join(folder).join("tank.vxl"), art).unwrap();
+        }
+        let digest = |folder: Option<&str>| {
+            let mod_dir = folder.map(|folder| mods.join(folder));
+            let mut process = ProcessAssets::new(MediaArchiveMode::STOCK_DIGITAL, false)
+                .with_mod_dir(mod_dir.clone());
+            let assets = AssetManager::with_mod(
+                dir.path(),
+                mod_dir.as_deref(),
+                MediaArchiveMode::STOCK_DIGITAL,
+            )
+            .unwrap();
+            process.initialize_sources_if_needed(&assets).unwrap();
+            process.return_from_loading(assets);
+            process.multiplayer_rules_digest("").unwrap()
+        };
+        assert_eq!(digest(Some("one")), digest(Some("same")));
+        assert_ne!(digest(Some("one")), digest(Some("other")));
+        assert_ne!(digest(Some("one")), digest(None));
     }
 
     #[test]

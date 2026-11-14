@@ -5,7 +5,7 @@
 //! can continue using `crate::app::presentation::instances::*`.
 //!
 //! ## Sub-modules
-//! - `helpers` — depth sorting, interpolation, visibility checks
+//! - `helpers` — depth sorting, visibility checks
 //! - `units` — voxel unit instance generation (turrets, harvest overlays)
 //! - `shp` — SHP building/infantry instances (building anims, bibs)
 //! - `overlays` — map overlays, AnimClass objects, fog snapshots
@@ -21,7 +21,7 @@ pub(crate) use helpers::*;
 mod anim_draw;
 #[cfg(test)]
 mod anim_translucency_tests;
-mod foot_depth;
+pub(crate) mod foot_depth;
 #[cfg(test)]
 mod parachute_scene_tests;
 

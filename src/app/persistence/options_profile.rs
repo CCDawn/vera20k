@@ -47,6 +47,27 @@ pub(crate) const RETAIL_SHELL_SIZE: ScreenSize = ScreenSize {
     width: 800,
     height: 600,
 };
+/// The size VERA opens the player's window at in place of gamemd's 800x600
+/// shell, in logical units. A VERA difference: 800x600 is small on today's
+/// screens. Only the window is larger; the shell's 800x600 art scales to fit
+/// it (`ShellScale`) and a match takes the window's size, as at any size the
+/// player drags it to.
+pub(crate) const VERA_LAUNCH_WINDOW_SIZE: ScreenSize = ScreenSize {
+    width: 1024,
+    height: 768,
+};
+
+/// The size the player's window opens at, and the Esc menu's Set Window Size
+/// button and Full Screen going off return to, for gamemd's startup shell
+/// size: [`VERA_LAUNCH_WINDOW_SIZE`] for the 800x600 shell, while the 640x480
+/// one a player asks for with `AllowModeToggle` stays.
+pub(crate) fn player_launch_window_size(startup_shell_screen: ScreenSize) -> ScreenSize {
+    if startup_shell_screen == RETAIL_SHELL_SIZE {
+        VERA_LAUNCH_WINDOW_SIZE
+    } else {
+        startup_shell_screen
+    }
+}
 
 /// The process-lifetime subset of active-YR `OptionsClass` owned by
 /// `VERA.INI` `[Options]`, `[Video]`, and `[Audio]`.
@@ -136,10 +157,6 @@ pub(crate) struct RetailOptionsProfile {
     /// own string-table key. Off by default; a start with it on shows the
     /// texts until the hotkey asks for keys.
     pub(crate) show_string_keys: bool,
-    /// `[VERA] RenderInterpolation=`: client-only motion smoothing. Off by
-    /// default, so new profiles draw the original tick-stepped motion; it never
-    /// changes the simulation rate or saves.
-    pub(crate) render_interpolation: bool,
     /// `[VERA] MouseWheelZoom=`: let the mouse wheel change the battle's
     /// view distance. Off by default; this is a local camera preference.
     pub(crate) mouse_wheel_zoom: bool,
@@ -185,6 +202,12 @@ pub(crate) struct RetailOptionsProfile {
     /// mobile strip while [`Self::shift_queue`] is on. VERA's own convenience;
     /// gamemd never reads this section. Clamped by [`SHIFT_QUEUE_COUNT_RANGE`].
     pub(crate) shift_queue_count: u32,
+    /// `[VERA] AutoRepair=`: the Options page's Auto Repair box. On, the
+    /// player's own game sends the ordinary Repair order for each of their
+    /// damaged buildings (`app::input::auto_repair`, `docs/auto-repair.md`).
+    /// A local input preference: nothing in the rules or on the network
+    /// changes. Off by default, so buildings wait for the wrench as in gamemd.
+    pub(crate) auto_repair: bool,
     /// `[VERA] TerrainDeformation=`: the Options page's Terrain Deformation
     /// box. Explosions dent open ground as in Tiberian Sun and a nuke leaves a
     /// crater (`docs/terrain-deformation.md`). Unlike the presentation boxes it
@@ -234,6 +257,11 @@ pub(crate) struct RetailOptionsProfile {
     /// value. Defaults to the native rule. Client presentation only: the
     /// simulation never reads it, and the profile writer round-trips the value.
     pub(crate) health_bars: crate::ui::main_menu_dialogs::options::HealthBarMode,
+    /// `[VERA] ColorVisionMode=`: the whole-viewport colour-vision filter, as
+    /// a [`ColorVisionMode`](crate::ui::main_menu_dialogs::options::ColorVisionMode)
+    /// value. `Off` keeps the retail image. Client presentation only: the
+    /// final frame pass reads it live, and the simulation never sees it.
+    pub(crate) color_vision: crate::ui::main_menu_dialogs::options::ColorVisionMode,
     /// `[VERA] Translate*=`: what received online chat is translated into, and
     /// where. The lobby's Chat Translation page and the `/translate` chat
     /// command change it, and write it alone
@@ -324,7 +352,6 @@ impl Default for RetailOptionsProfile {
             yr_original_style: false,
             skip_intro: false,
             show_string_keys: false,
-            render_interpolation: false,
             mouse_wheel_zoom: false,
             right_click_orders: false,
             lock_cursor: false,
@@ -335,6 +362,7 @@ impl Default for RetailOptionsProfile {
             hd_map_previews: true,
             house_color_strength: crate::rules::house_colors::STRENGTH_RETAIL,
             shift_queue: false,
+            auto_repair: false,
             shift_queue_count: DEFAULT_SHIFT_QUEUE_COUNT,
             terrain_deformation: false,
             wol_test_service: false,
@@ -344,6 +372,7 @@ impl Default for RetailOptionsProfile {
             custom_end_game_score: false,
             custom_end_game_movie: false,
             health_bars: crate::ui::main_menu_dialogs::options::HealthBarMode::Vanilla,
+            color_vision: crate::ui::main_menu_dialogs::options::ColorVisionMode::Off,
             chat_translation: Default::default(),
             language: None,
             skipped_update: String::new(),
@@ -367,7 +396,7 @@ pub(crate) struct FormattedProfileSections {
     pub(crate) audio: [(&'static str, String); 7],
     pub(crate) network: [(&'static str, String); 4],
     /// VERA's own section, written after the native ones.
-    pub(crate) vera: [(&'static str, String); 30],
+    pub(crate) vera: [(&'static str, String); 31],
 }
 
 impl RetailOptionsLoad {
@@ -568,8 +597,6 @@ impl RetailOptionsProfile {
             let legacy_skip = vera.read_bool("SkipStartupLogo", self.skip_intro);
             self.skip_intro = vera.read_bool("SkipIntro", legacy_skip);
             self.show_string_keys = vera.read_bool("ShowStringKeys", self.show_string_keys);
-            self.render_interpolation =
-                vera.read_bool("RenderInterpolation", self.render_interpolation);
             self.mouse_wheel_zoom = vera.read_bool("MouseWheelZoom", self.mouse_wheel_zoom);
             self.right_click_orders = vera.read_bool("RightClickOrders", self.right_click_orders);
             self.lock_cursor = vera.read_bool("LockCursor", self.lock_cursor);
@@ -592,6 +619,7 @@ impl RetailOptionsProfile {
             );
             self.terrain_deformation =
                 vera.read_bool("TerrainDeformation", self.terrain_deformation);
+            self.auto_repair = vera.read_bool("AutoRepair", self.auto_repair);
             self.wol_test_service = vera.read_bool("WolTestService", self.wol_test_service);
             self.solo_skirmish = vera.read_bool("SoloSkirmish", self.solo_skirmish);
             self.commander_feedback = vera.read_bool("CommanderFeedback", self.commander_feedback);
@@ -607,6 +635,12 @@ impl RetailOptionsProfile {
             self.health_bars = crate::ui::main_menu_dialogs::options::HealthBarMode::from_ini_value(
                 vera.read_int("HealthBars", self.health_bars.ini_value()),
             );
+            // Absent keeps the current value; a value this build does not know
+            // reads as Off instead of enabling a filter with no matrix.
+            self.color_vision =
+                crate::ui::main_menu_dialogs::options::ColorVisionMode::from_ini_value(
+                    vera.read_int("ColorVisionMode", self.color_vision.ini_value()),
+                );
             let chat = &mut self.chat_translation;
             if let Some(value) = vera.read_name("TranslateChat", 16) {
                 chat.set_language(crate::ui::chat_translation::ChatLanguage::from_tag(value));
@@ -751,10 +785,6 @@ impl RetailOptionsProfile {
                     format_bool(self.custom_end_game_movie).to_string(),
                 ),
                 (
-                    "RenderInterpolation",
-                    format_bool(self.render_interpolation).to_string(),
-                ),
-                (
                     "MouseWheelZoom",
                     format_bool(self.mouse_wheel_zoom).to_string(),
                 ),
@@ -789,10 +819,12 @@ impl RetailOptionsProfile {
                     "TerrainDeformation",
                     format_bool(self.terrain_deformation).to_string(),
                 ),
+                ("AutoRepair", format_bool(self.auto_repair).to_string()),
                 (
                     "ShowStringKeys",
                     format_bool(self.show_string_keys).to_string(),
                 ),
+                ("ColorVisionMode", self.color_vision.ini_value().to_string()),
             ],
         }
     }
@@ -832,6 +864,7 @@ impl RetailOptionsProfile {
             VERA_SECTION,
             &[
                 "RA2Look",
+                "RenderInterpolation",
                 "SoundDefaultsApplied",
                 "SkipStartupLogo",
                 "WindowX",
@@ -1409,6 +1442,32 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
         );
     }
 
+    /// The player's window opens at 1024x768 where gamemd's shell is 800x600,
+    /// with or without a VERA.INI; AllowModeToggle's 640x480 stays.
+    #[test]
+    fn player_window_opens_at_1024x768_in_place_of_the_800x600_shell() {
+        let defaults = RetailStartupOptions::default();
+        let no_file = RetailOptionsLoad::without_settings(&defaults);
+        let game_size = load_snapshot(&defaults, b"[Video]\nScreenWidth=640\nScreenHeight=480\n");
+        for load in [no_file, game_size] {
+            assert_eq!(
+                player_launch_window_size(load.startup_shell_screen),
+                ScreenSize {
+                    width: 1024,
+                    height: 768
+                }
+            );
+        }
+        let toggle = load_snapshot(&defaults, b"[Video]\nAllowModeToggle=yes\n");
+        assert_eq!(
+            player_launch_window_size(toggle.startup_shell_screen),
+            ScreenSize {
+                width: 640,
+                height: 480
+            }
+        );
+    }
+
     #[test]
     fn present_ini_key_overrides_argv_while_missing_key_keeps_argv_default() {
         let startup = RetailStartupOptions {
@@ -1827,7 +1886,7 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
                 .retained_profile
                 .mouse_wheel_zoom
         );
-        let input = b"[VERA]\nMouseWheelZoom=yes\nRenderInterpolation=no\nUnowned=keep\n";
+        let input = b"[VERA]\nMouseWheelZoom=yes\nUnowned=keep\n";
         let mut profile = load_snapshot(&startup, input).retained_profile;
         assert!(profile.mouse_wheel_zoom);
         let written = profile.transform_settings(input);
@@ -1840,7 +1899,6 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
         let written = profile.transform_settings(&written);
         let reloaded = load_snapshot(&startup, &written).retained_profile;
         assert!(!reloaded.mouse_wheel_zoom);
-        assert!(!reloaded.render_interpolation);
         assert!(String::from_utf8_lossy(&written).contains("Unowned=keep"));
     }
 
@@ -1869,29 +1927,6 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
                 .right_click_orders
         );
         assert!(String::from_utf8_lossy(&written).contains("Unowned=keep"));
-    }
-
-    #[test]
-    fn render_interpolation_preference_uses_the_existing_vera_profile_transaction() {
-        let startup = RetailStartupOptions::default();
-        assert!(
-            !load_snapshot(&startup, b"")
-                .retained_profile
-                .render_interpolation
-        );
-        for (value, expected) in [("yes", true), ("no", false)] {
-            let input = format!("[VERA]\nRenderInterpolation={value}\nUnowned=keep\n");
-            let profile = load_snapshot(&startup, input.as_bytes()).retained_profile;
-            assert_eq!(profile.render_interpolation, expected);
-            let written = profile.transform_settings(input.as_bytes());
-            assert!(String::from_utf8_lossy(&written).contains("Unowned=keep"));
-            assert_eq!(
-                load_snapshot(&startup, &written)
-                    .retained_profile
-                    .render_interpolation,
-                expected
-            );
-        }
     }
 
     /// `[VERA] CommanderFeedback=` is the talking-head switch. It defaults to
@@ -1950,6 +1985,42 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
                     .health_bars,
                 expected,
                 "HealthBars={value} survives the profile writer"
+            );
+        }
+    }
+
+    /// `[VERA] ColorVisionMode=` is the whole-viewport filter: zero is the
+    /// retail image and the default, and a value this build does not know
+    /// reads as Off, so a hand-edited INI never enables an unknown matrix.
+    #[test]
+    fn color_vision_modes_read_and_round_trip() {
+        use crate::ui::main_menu_dialogs::options::ColorVisionMode;
+
+        let startup = RetailStartupOptions::default();
+        assert_eq!(
+            load_snapshot(&startup, b"").retained_profile.color_vision,
+            ColorVisionMode::Off
+        );
+        for (value, expected) in [
+            (0, ColorVisionMode::Off),
+            (1, ColorVisionMode::Generic),
+            (2, ColorVisionMode::Deuteranopia),
+            (3, ColorVisionMode::Protanopia),
+            (4, ColorVisionMode::Tritanopia),
+            (7, ColorVisionMode::Off),
+            (-1, ColorVisionMode::Off),
+        ] {
+            let input = format!("[VERA]\nColorVisionMode={value}\nUnowned=keep\n");
+            let profile = load_snapshot(&startup, input.as_bytes()).retained_profile;
+            assert_eq!(profile.color_vision, expected, "ColorVisionMode={value}");
+            let written = String::from_utf8(profile.transform_settings(input.as_bytes())).unwrap();
+            assert!(written.contains("Unowned=keep"), "{written}");
+            assert_eq!(
+                load_snapshot(&startup, written.as_bytes())
+                    .retained_profile
+                    .color_vision,
+                expected,
+                "ColorVisionMode={value} survives the profile writer"
             );
         }
     }
@@ -2013,26 +2084,22 @@ ScoreVolume=0.3\nIsScoreShuffle=yes\nSoundLatency=4\nInGameMusic=no\n[VERA]\nZoo
     }
 
     #[test]
-    fn original_yr_style_and_render_interpolation_round_trip_independently() {
+    fn original_yr_style_round_trips_and_retired_keys_are_dropped() {
         let startup = RetailStartupOptions::default();
         for style in [false, true] {
-            for interpolation in [false, true] {
-                let input = format!(
-                    "[VERA]\nYROriginalStyle={}\nRenderInterpolation={}\nRA2Look=yes\nUnowned=keep\n",
-                    format_bool(style),
-                    format_bool(interpolation),
-                );
-                let profile = load_snapshot(&startup, input.as_bytes()).retained_profile;
-                assert_eq!(profile.yr_original_style, style);
-                assert_eq!(profile.render_interpolation, interpolation);
-                let written = profile.transform_settings(input.as_bytes());
-                let text = String::from_utf8_lossy(&written);
-                assert!(!text.contains("RA2Look="));
-                assert!(text.contains("Unowned=keep"));
-                let reloaded = load_snapshot(&startup, &written).retained_profile;
-                assert_eq!(reloaded.yr_original_style, style);
-                assert_eq!(reloaded.render_interpolation, interpolation);
-            }
+            let input = format!(
+                "[VERA]\nYROriginalStyle={}\nRenderInterpolation=yes\nRA2Look=yes\nUnowned=keep\n",
+                format_bool(style),
+            );
+            let profile = load_snapshot(&startup, input.as_bytes()).retained_profile;
+            assert_eq!(profile.yr_original_style, style);
+            let written = profile.transform_settings(input.as_bytes());
+            let text = String::from_utf8_lossy(&written);
+            assert!(!text.contains("RA2Look="));
+            assert!(!text.contains("RenderInterpolation="));
+            assert!(text.contains("Unowned=keep"));
+            let reloaded = load_snapshot(&startup, &written).retained_profile;
+            assert_eq!(reloaded.yr_original_style, style);
         }
     }
 

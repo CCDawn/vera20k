@@ -101,8 +101,9 @@ const CAMERA_COMMANDS: [CommandMetadata; 4] = [
 
 /// VERA's built-in keys, with their default keys in the binding owner
 /// (`hotkeys::VERA_DEFAULT_KEYS`). Each name is the Options page's label for
-/// the same setting; each category literal is [`VERA_CATEGORY_KEY`].
-const SHORTCUT_COMMANDS: [CommandMetadata; 5] = [
+/// the same setting, but Ferry's, Relation Colours' and the two Formation
+/// commands', which have none; each category literal is [`VERA_CATEGORY_KEY`].
+const SHORTCUT_COMMANDS: [CommandMetadata; 10] = [
     command!(
         HotkeyCommand::PerformanceStats,
         "PerformanceStats",
@@ -128,19 +129,59 @@ const SHORTCUT_COMMANDS: [CommandMetadata; 5] = [
         None
     ),
     command!(
-        HotkeyCommand::RenderInterpolation,
-        "RenderInterpolation",
-        "VERA:RenderInterpolation",
-        "VERA:HotkeyCategory",
-        "VERA:RenderInterpolationDesc",
-        None
-    ),
-    command!(
         HotkeyCommand::StringKeys,
         "StringKeys",
         "VERA:ShowStringKeys",
         "VERA:HotkeyCategory",
         "VERA:ShowStringKeysDesc",
+        None
+    ),
+    command!(
+        HotkeyCommand::LayoutEdit,
+        "LayoutEdit",
+        "VERA:LayoutEdit",
+        "VERA:HotkeyCategory",
+        "VERA:LayoutEditDesc",
+        None
+    ),
+    command!(
+        HotkeyCommand::FormationLine,
+        "FormationLine",
+        "VERA:FormationLine",
+        "VERA:HotkeyCategory",
+        "VERA:FormationLineDesc",
+        None
+    ),
+    command!(
+        HotkeyCommand::FormationLock,
+        "FormationLock",
+        "VERA:FormationLock",
+        "VERA:HotkeyCategory",
+        "VERA:FormationLockDesc",
+        None
+    ),
+    command!(
+        HotkeyCommand::Ferry,
+        "Ferry",
+        "VERA:Ferry",
+        "VERA:HotkeyCategory",
+        "VERA:FerryDesc",
+        None
+    ),
+    command!(
+        HotkeyCommand::RotatePrimary,
+        "RotatePrimary",
+        "VERA:RotatePrimary",
+        "VERA:HotkeyCategory",
+        "VERA:RotatePrimaryDesc",
+        None
+    ),
+    command!(
+        HotkeyCommand::RelationColors,
+        "RelationColors",
+        "VERA:RelationColors",
+        "VERA:HotkeyCategory",
+        "VERA:RelationColorsDesc",
         None
     ),
 ];

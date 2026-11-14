@@ -42,24 +42,17 @@ pub(crate) enum Multiplier {
 /// separately from derived Techno+158/+160. The constructor seeds both baselines
 /// to 1.0; only the Armor and Firepower arms ([`apply_multiplier_crate`]) write
 /// these permanent baselines. Each arm skips a baseline that is not exactly 1.0.
-/// The attachment owner separately recomputes effective values. The receiver's
-/// damage build reads the armor multiplier;
-/// `FireAt`'s damage build folds in the firepower one
-/// (`0x006FE33D..0x006FE34D`).
+/// The attachment owner separately recomputes effective values, which live in
+/// the object's Ares part. The receiver's damage build reads the effective
+/// armor multiplier (`GameEntity::armor_multiplier`); `FireAt`'s damage build
+/// folds in the firepower one (`GameEntity::firepower_multiplier`,
+/// `0x006FE33D..0x006FE34D`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CrateMultipliers {
     #[serde(default = "one")]
     armor: NativeF64Bits,
     #[serde(default = "one")]
     firepower: NativeF64Bits,
-    /// Ares derived Techno+160; None retains the permanent Ext+80 baseline.
-    #[cfg(feature = "ares")]
-    #[serde(default)]
-    attached_firepower: Option<NativeF64Bits>,
-    /// Ares derived Techno+158; None retains the permanent Ext+88 baseline.
-    #[cfg(feature = "ares")]
-    #[serde(default)]
-    attached_armor: Option<NativeF64Bits>,
 }
 
 fn one() -> NativeF64Bits {
@@ -72,71 +65,33 @@ impl Default for CrateMultipliers {
         Self {
             armor: NativeF64Bits::ONE,
             firepower: NativeF64Bits::ONE,
-            #[cfg(feature = "ares")]
-            attached_firepower: None,
-            #[cfg(feature = "ares")]
-            attached_armor: None,
         }
     }
 }
 
 impl CrateMultipliers {
-    /// `Techno+0x158`.
-    pub(crate) const fn armor(self) -> NativeF64Bits {
-        #[cfg(feature = "ares")]
-        if let Some(value) = self.attached_armor {
-            return value;
-        }
-        self.armor
-    }
-
-    /// Permanent armor crate baseline (Ares Ext+88), never an AE product.
+    /// Permanent armor crate baseline (Ares Ext+88), never an AE product:
+    /// `Techno+0x158` itself in a game Ares doesn't play in.
     pub(crate) const fn crate_armor(self) -> NativeF64Bits {
         self.armor
     }
 
-    #[cfg(feature = "ares")]
-    pub(crate) fn set_attached_armor(&mut self, value: NativeF64Bits) {
-        self.attached_armor = (value != self.armor).then_some(value);
-    }
-
-    /// Effective Techno+160, read by both FireAt and EstimateDamage.
-    pub(crate) const fn firepower(self) -> NativeF64Bits {
-        #[cfg(feature = "ares")]
-        if let Some(value) = self.attached_firepower {
-            return value;
-        }
-        self.firepower
-    }
-
-    /// Permanent firepower crate baseline (Ares Ext+80), never an AE product.
+    /// Permanent firepower crate baseline (Ares Ext+80), never an AE product:
+    /// `Techno+0x160` itself in a game Ares doesn't play in.
     pub(crate) const fn crate_firepower(self) -> NativeF64Bits {
         self.firepower
-    }
-
-    #[cfg(feature = "ares")]
-    pub(crate) fn set_attached_firepower(&mut self, value: NativeF64Bits) {
-        self.attached_firepower = (value != self.firepower).then_some(value);
     }
 
     /// Install a fixture's armor multiplier.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_armor_multiplier_for_test(&mut self, value: NativeF64Bits) {
         self.armor = value;
-        #[cfg(feature = "ares")]
-        {
-            self.attached_armor = None;
-        }
     }
 
     /// Install a fixture's firepower multiplier.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_firepower_multiplier_for_test(&mut self, value: NativeF64Bits) {
         self.firepower = value;
-        #[cfg(feature = "ares")]
-        {
-            self.attached_firepower = None;
-        }
     }
 }
 
@@ -771,9 +726,11 @@ pub(super) enum UnitCrateOutcome {
 /// MCV pre-empt flag; `bases` the lobby Bases byte (`0x00A8B258`).
 ///
 /// A pre-empted pickup asks for the first ownable `BaseUnit=`. Otherwise, a
-/// house with one of the first two `[AI] BuildConst=` types tracked and
-/// neither of the first two `HarvesterUnit=` types tracked gets its first
-/// ownable `HarvesterUnit=`. `[CrateRules] UnitCrateType=` overrides both.
+/// house with one of the first two `[AI] BuildRefinery=` types tracked
+/// (Rules `+0x8E4`, items `+0x8E8`, against House `+0x5500` at
+/// `0x0048208A..0x004820DD`) and neither of the first two `HarvesterUnit=`
+/// types tracked (`0x004820DF..0x00482131`) gets its first ownable
+/// `HarvesterUnit=`. `[CrateRules] UnitCrateType=` overrides both.
 /// With no type yet, draw `RandomRanged(0, UnitTypes.Count - 1)` until a
 /// `CrateGoodie=` type passes: with Bases on, a `BaseUnit=` type is accepted
 /// for a human house or a pre-empted pickup; with Bases off, never.
@@ -809,8 +766,8 @@ pub(super) fn choose_unit_crate_type<'r>(
                 .get(type_id)
                 .map_or(0, |type_id| house.tracking().owned_count(category, type_id))
         };
-        let has_conyard = rules
-            .build_const_types
+        let has_refinery = rules
+            .build_refinery_types
             .iter()
             .take(2)
             .any(|type_id| tracked(EntityCategory::Structure, type_id) > 0);
@@ -819,7 +776,7 @@ pub(super) fn choose_unit_crate_type<'r>(
             .iter()
             .take(2)
             .any(|type_id| tracked(EntityCategory::Unit, type_id) != 0);
-        if has_conyard && !has_harvester {
+        if has_refinery && !has_harvester {
             chosen = first_owner_compatible(
                 rules,
                 &rules.harvester_unit_types,

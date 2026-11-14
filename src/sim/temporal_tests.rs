@@ -221,7 +221,8 @@ fn link(sim: &Simulation, id: u64) -> TemporalLink {
     entity(sim, id)
         .temporal
         .link
-        .clone()
+        .as_deref()
+        .cloned()
         .expect("a Temporal firer")
 }
 
@@ -251,7 +252,7 @@ fn chain(sim: &mut Simulation, target: u64, attackers: &[u64], warp_remaining: i
             .get_mut(attacker)
             .unwrap()
             .temporal
-            .link = Some(link);
+            .link = Some(Box::new(link));
     }
     sim.substrate
         .entities
@@ -1265,7 +1266,9 @@ fn a_warped_superweapon_building_holds_its_super() {
 /// The online test asks for any online provider (`0x0050B04F`): with two
 /// silos, warping one leaves the Nuke charging and warping both holds it. A
 /// Super that is not `IsPowered=` (`SuperClass::IsPowered @ 0x006CC2A0`)
-/// charges on though its only provider is warped.
+/// charges on though its only provider is warped; with Ares (hook
+/// `0x50AF10`, 10039450) it is held without a Charging provider, which a
+/// warped one is not (10038F10).
 #[test]
 fn a_super_holds_only_while_no_provider_is_online() {
     let rules = rules_from(
@@ -1307,7 +1310,11 @@ fn a_super_holds_only_while_no_provider_is_online() {
     );
     step(&mut sim);
     assert!(!held(&sim, nuke), "the other silo is online");
-    assert!(!held(&sim, spy_plane), "not IsPowered=");
+    assert_eq!(
+        held(&sim, spy_plane),
+        crate::rules::ARES_BUILD,
+        "not IsPowered="
+    );
 
     sim.temporal_initiate_warp(
         clegs[1],
@@ -1318,7 +1325,44 @@ fn a_super_holds_only_while_no_provider_is_online() {
     );
     step(&mut sim);
     assert!(held(&sim, nuke), "no silo is online");
-    assert!(!held(&sim, spy_plane), "still charging");
+    assert_eq!(
+        held(&sim, spy_plane),
+        crate::rules::ARES_BUILD,
+        "still charging"
+    );
+}
+
+/// A game Ares turned on in by a key, with its Rules read the stock way
+/// (no `ares.mix`), holds no SWTypeExt data, so its superweapons stay
+/// stock (`RuleSet::ares_form`): the house is granted its Supers
+/// and one that is not `IsPowered=` charges on. A build with the `ares`
+/// feature reads every game the Ares way and has no such game.
+#[cfg(not(feature = "ares"))]
+#[test]
+fn a_stock_read_game_with_an_ares_key_keeps_stock_superweapons() {
+    let rules = rules_from(
+        &format!(
+            "{}[SuperWeaponTypes]\n0=SpyPlaneSpecial\n\
+             [SpyPlaneSpecial]\nType=SpyPlane\nRechargeTime=1\nIsPowered=no\n\
+             [RADAR]\nStrength=40\nSuperWeapon=SpyPlaneSpecial\n",
+            RULES
+                .replace("3=GAWEAP\n", "3=GAWEAP\n4=RADAR\n")
+                .replace("[CLEG]\n", "[CLEG]\nImmuneToAbduction=yes\n")
+        ),
+        ART,
+    );
+    assert!(rules.ares(), "the key turns Ares on");
+    assert!(!rules.reads_ares_way(), "read the stock way");
+    let (mut sim, grid) = arena(12, &rules);
+    spawn(&mut sim, &rules, "RADAR", "Americans", 16, 10);
+    let americans = sim.interner.get("Americans").unwrap();
+    let spy_plane = sim.interner.get("SpyPlaneSpecial").unwrap();
+    for _ in 0..3 {
+        sim.advance_tick(&[], Some(&rules), Some(&grid), None, 33);
+    }
+    let instance = &sim.super_weapons[&americans][&spy_plane];
+    assert!(instance.is_active(), "granted by its provider");
+    assert!(!instance.is_suspended(), "charging");
 }
 
 /// Through the production fire path: a Chrono Legionnaire ordered to attack
@@ -1553,6 +1597,102 @@ fn a_chrono_legionnaire_erases_a_tank() {
     );
 }
 
+/// Retail rules and real orders: a Chrono Legionnaire warps the Americans'
+/// only War Factory while it builds a Grizzly, then walks off and lets it
+/// go. In stock the warp and release make no queue callback and the tank
+/// keeps building. Ares 3.0 BuildingClass_Disable_Temporal_Factories and
+/// _Enable_Temporal_Factories (`10013FA0`, hooks `0x004521C8` and
+/// `0x00452218`) refresh the vehicle queue: with no online factory the warp
+/// suspends it (`0x00509252`), and the release resumes it.
+#[test]
+fn a_warped_war_factory_holds_its_queue_until_released() {
+    use crate::sim::command::{Command, CommandEnvelope};
+    use crate::sim::production::ProductionCategory;
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = retail.rules;
+    let (mut sim, grid) = arena(0x4521C8, &rules);
+    let americans = sim.interner.intern("Americans");
+    sim.houses
+        .get_mut(&americans)
+        .unwrap()
+        .economy_mut()
+        .set_credits_for_test(10_000);
+    spawn(&mut sim, &rules, "GAPOWR", "Americans", 22, 16);
+    let factory = spawn(&mut sim, &rules, "GAWEAP", "Americans", 14, 8);
+    let cleg = spawn(&mut sim, &rules, "CLEG", "Russians", 10, 10);
+    let order = |sim: &mut Simulation, command: Command| {
+        let at = sim.session.tick() + 1;
+        sim.queue_command(CommandEnvelope::new(americans, at, command));
+    };
+    let step = |sim: &mut Simulation, frames: usize| {
+        for _ in 0..frames {
+            let commands = sim.take_due_commands();
+            sim.advance_tick(&commands, Some(&rules), Some(&grid), None, 33);
+        }
+    };
+    let queue = |sim: &Simulation| {
+        let view = sim
+            .production
+            .factories()
+            .view(americans, ProductionCategory::Vehicle)
+            .expect("the Grizzly's factory");
+        (view.suspended, view.progress)
+    };
+    let tank = sim.interner.intern("MTNK");
+    order(&mut sim, Command::QueueProduction { type_id: tank });
+    step(&mut sim, 30);
+    let (held, before) = queue(&sim);
+    assert!(!held && before > 0, "the Grizzly builds");
+
+    order(
+        &mut sim,
+        Command::Attack {
+            attacker_id: cleg,
+            target_id: factory,
+        },
+    );
+    for _ in 0..300 {
+        if head_of(&sim, factory) == Some(cleg) {
+            break;
+        }
+        step(&mut sim, 1);
+    }
+    assert_eq!(head_of(&sim, factory), Some(cleg), "the warp starts");
+    step(&mut sim, 2);
+    let (held, warped) = queue(&sim);
+    step(&mut sim, 60);
+    let (_, later) = queue(&sim);
+    assert_eq!(held, cfg!(feature = "ares"), "suspended while warped");
+    assert_eq!(
+        later > warped,
+        !cfg!(feature = "ares"),
+        "builds while warped"
+    );
+
+    order(
+        &mut sim,
+        Command::Move {
+            entity_id: cleg,
+            target_rx: 4,
+            target_ry: 4,
+        },
+    );
+    for _ in 0..300 {
+        if head_of(&sim, factory).is_none() {
+            break;
+        }
+        step(&mut sim, 1);
+    }
+    assert_eq!(head_of(&sim, factory), None, "the walk lets it go");
+    step(&mut sim, 2);
+    let (held, released) = queue(&sim);
+    step(&mut sim, 60);
+    assert!(!held, "resumed on release");
+    assert!(queue(&sim).1 > released, "builds again");
+}
+
 /// The normal loader must bind both General references before Temporal can
 /// construct them. Synthetic temporal fixtures already supplied frame counts,
 /// which hid missing roots in the production asset closure.
@@ -1654,7 +1794,7 @@ fn erasing_a_bunkered_tank_clears_its_bunker() {
     let tank = spawn(&mut sim, &rules, "HTNK", "Americans", 11, 10);
     let cleg = spawn(&mut sim, &rules, "CLEG", "Russians", 12, 10);
     if let Some(building) = sim.substrate.entities.get_mut(bunker) {
-        building.bunker_runtime = Some(BunkerRuntime::idle());
+        building.building.bunker_runtime = Some(BunkerRuntime::idle());
     }
     // Occupied walls, as UpdateBunker's install leaves them.
     crate::sim::docking::bunker_link::install_bunker_link(&mut sim, bunker, tank, &rules);
@@ -1675,7 +1815,10 @@ fn erasing_a_bunkered_tank_clears_its_bunker() {
     let building = entity(&sim, bunker);
     assert_eq!(building.bunker.occupant(), None);
     assert_eq!(
-        building.bunker_runtime.map(|runtime| runtime.state()),
+        building
+            .building
+            .bunker_runtime
+            .map(|runtime| runtime.state()),
         Some(BunkerState::Idle)
     );
     assert_eq!(
@@ -1963,7 +2106,7 @@ fn a_warped_object_runs_none_of_its_ai_phases() {
     {
         let building = sim.substrate.entities.get_mut(plant).unwrap();
         building.health.set_for_test(300);
-        building.repairing.set_for_test(true);
+        building.building.repairing.set_for_test(true);
     }
     let americans = sim.interner.get("Americans").unwrap();
     sim.houses
@@ -2662,7 +2805,7 @@ fn native_initiate_warp_corpus() {
                 .get_mut(target)
                 .unwrap()
                 .temporal
-                .link = Some(TemporalLink::default());
+                .link = Some(Box::default());
             chain(&mut sim, other, &[target], 555);
         }
         sim.substrate
@@ -3226,7 +3369,7 @@ fn ares_temporal_update_frees_the_targets_radar_jammer() {
     let target = spawn(&mut sim, &rules, "HTNK", "Russians", 20, 20);
     let attacker = spawn(&mut sim, &rules, "CLEG", "Americans", 22, 20);
     sim.update_ares_radar_jammer(target, &rules);
-    assert!(!entity(&sim, target).radar_jam.is_default());
+    assert!(!entity(&sim, target).ares.radar_jam.is_default());
     chain(&mut sim, target, &[attacker], 1_000_000);
     sim.temporal_update_head(
         attacker,
@@ -3234,5 +3377,22 @@ fn ares_temporal_update_frees_the_targets_radar_jammer() {
         None,
         crate::sim::world::FrameEffects::default(),
     );
-    assert!(entity(&sim, target).radar_jam.is_default());
+    assert!(entity(&sim, target).ares.radar_jam.is_default());
+}
+
+/// A tank with no head of its own that is neither warped out nor warping in
+/// costs the prologue one lookup, and its turn goes on.
+#[test]
+fn an_untouched_tank_costs_the_prologue_one_lookup() {
+    let rules = rules();
+    let mut sim = sim(1);
+    let tank = spawn(&mut sim, &rules, "HTNK", "Americans", 12, 10);
+    let before = sim.substrate.entities.lookups().0;
+    assert!(!sim.temporal_ai_prologue(
+        tank,
+        &rules,
+        crate::sim::world::ObjectAiCtx::default(),
+        &mut false,
+    ));
+    assert_eq!(sim.substrate.entities.lookups().0 - before, 1);
 }

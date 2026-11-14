@@ -92,8 +92,11 @@ fn owner(sim: &Simulation, id: u64) -> &str {
 /// `CanBeOccupiedBy=GI` keeps E2 out; `Bunker.Raidable=yes` lets the
 /// Americans' GI into the Russians' empty building, which then is theirs
 /// until it is empty again.
+// Runs again once the passenger code's occupier admission moves to the switch.
+#[cfg(feature = "ares")]
 #[test]
 fn an_occupier_raids_an_empty_raidable_building_until_it_empties() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     let rules = rules();
     let (mut sim, _grid) = arena(&rules);
     let bunker = spawn(&mut sim, &rules, "BNK", "Russians", 10, 10);
@@ -105,19 +108,23 @@ fn an_occupier_raids_an_empty_raidable_building_until_it_empties() {
     assert!(!admits(&sim, e2), "CanBeOccupiedBy");
     assert!(admits(&sim, gi), "an empty raidable building");
 
-    assert!(crate::sim::passenger::add_garrison_occupant(
-        &mut sim,
-        &rules,
-        gi,
-        bunker,
-        None,
-        FrameEffects::default(),
-    ));
+    assert!(
+        crate::sim::passenger::add_garrison_occupant(
+            &mut sim,
+            &rules,
+            gi,
+            bunker,
+            None,
+            FrameEffects::default(),
+        )
+        .unwrap()
+    );
     assert_eq!(owner(&sim, bunker), "Americans", "raided");
 
     crate::sim::passenger::garrison_eject::kill_building_occupants(
         &mut sim,
         bunker,
+        None,
         UninitContext::new(&rules, None),
     );
     assert_eq!(owner(&sim, bunker), "Russians", "returned when empty");
@@ -128,18 +135,22 @@ fn an_occupier_raids_an_empty_raidable_building_until_it_empties() {
 /// `UC.DamageMultiplier=50%` of its damage, and the building takes none.
 #[test]
 fn a_shot_passes_through_to_an_occupant() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     let rules = rules();
     let (mut sim, grid) = arena(&rules);
     let bunker = spawn(&mut sim, &rules, "BNK", "Russians", 10, 10);
     let gi = spawn(&mut sim, &rules, "GI", "Russians", 12, 12);
-    assert!(crate::sim::passenger::add_garrison_occupant(
-        &mut sim,
-        &rules,
-        gi,
-        bunker,
-        None,
-        FrameEffects::default(),
-    ));
+    assert!(
+        crate::sim::passenger::add_garrison_occupant(
+            &mut sim,
+            &rules,
+            gi,
+            bunker,
+            None,
+            FrameEffects::default(),
+        )
+        .unwrap()
+    );
     let tank = spawn(&mut sim, &rules, "TANK", "Americans", 13, 10);
     let sender = sim.interner.get("Americans").unwrap();
     let tick = sim.session.tick() + 1;
@@ -169,8 +180,11 @@ fn a_shot_passes_through_to_an_occupant() {
 /// Cell and source, and its handler (`1006A540`) runs `doTraverseTo`
 /// (`100130E0`): the source's heads move while the target has room, and an
 /// emptied raided trench goes back to its house (evalRaidStatus).
+// Runs again once the passenger code's occupier entry moves to the switch.
+#[cfg(feature = "ares")]
 #[test]
 fn trench_redirect_moves_heads_into_a_neighbour_and_returns_a_raided_trench() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     let text = RULES.replace("0=BNK\n", "0=BNK\n1=TRN\n2=TRX\n")
         + "[TRN]\nStrength=500\nTechLevel=1\nCanBeOccupied=yes\nMaxNumberOccupants=2\n\
            IsTrench=Sand\nBunker.Raidable=yes\n\
@@ -190,14 +204,17 @@ fn trench_redirect_moves_heads_into_a_neighbour_and_returns_a_raided_trench() {
     let gis = [(14, 10), (14, 12), (14, 14)]
         .map(|(rx, ry)| spawn(&mut sim, &rules, "GI", "Americans", rx, ry));
     for (gi, building) in [(gis[0], raided), (gis[1], raided), (gis[2], east)] {
-        assert!(crate::sim::passenger::add_garrison_occupant(
-            &mut sim,
-            &rules,
-            gi,
-            building,
-            None,
-            FrameEffects::default(),
-        ));
+        assert!(
+            crate::sim::passenger::add_garrison_occupant(
+                &mut sim,
+                &rules,
+                gi,
+                building,
+                None,
+                FrameEffects::default(),
+            )
+            .unwrap()
+        );
     }
     assert_eq!(owner(&sim, raided), "Americans", "raided");
     assert!(

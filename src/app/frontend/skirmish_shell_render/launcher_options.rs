@@ -13,7 +13,8 @@ use crate::ui::main_menu_dialogs::options::shell::{
     LauncherLabelAlign, LauncherOptionsLayout, LauncherStatusHelp,
 };
 use crate::ui::main_menu_dialogs::options::{
-    HealthBarMode, LauncherCheckboxId, LauncherComboId, OptionsDialogState, SidebarSize, Zoom,
+    ColorVisionMode, HealthBarMode, LauncherCheckboxId, LauncherComboId, OptionsDialogState,
+    SidebarSize, Zoom,
 };
 use crate::ui::shell::geom::{RectPx, ShellScale};
 use crate::util::time::Instant;
@@ -67,7 +68,7 @@ fn text_draw(
 
 /// The left-side controls, and the right-panel buttons unless a slide draws
 /// the column in their place.
-fn build_controls(
+pub(super) fn build_controls(
     atlas: &SkirmishShellChromeAtlas,
     layout: &LauncherOptionsLayout,
     dialog: &OptionsDialogState,
@@ -121,7 +122,7 @@ fn build_controls(
             page_buttons.push(crate::render::shell_paint::ModalButton {
                 rect,
                 pressed,
-                enabled: true,
+                enabled: dialog.button_enabled(id),
             });
         } else if buttons {
             // The page that shows keeps its category button lit in the
@@ -158,7 +159,7 @@ fn build_controls(
     out
 }
 
-fn build_text(
+pub(super) fn build_text(
     font: &BitFont,
     layout: &LauncherOptionsLayout,
     dialog: &OptionsDialogState,
@@ -253,6 +254,7 @@ fn build_text(
             LauncherComboId::Sidebar => dialog.shell_selected_sidebar(layout).label(),
             LauncherComboId::Display => dialog.shell_display_label(),
             LauncherComboId::HealthBars => dialog.shell_selected_health_bars().label(),
+            LauncherComboId::ColorVision => dialog.shell_selected_color_vision().label(),
             LauncherComboId::Language => dialog.shell_language_label(),
         };
         out.push(text_draw(
@@ -283,7 +285,7 @@ fn build_text(
                 native_text.h as i32,
             ),
             ShellAlign::BUTTON_CAPTION,
-            button_label_color(),
+            super::text::button_label_color_for_disabled(!dialog.button_enabled(id)),
             glyph,
         ));
     }
@@ -291,7 +293,7 @@ fn build_text(
 }
 
 /// The list that is open, over the page: its backing and frame, then its rows.
-fn build_open_list(
+pub(super) fn build_open_list(
     font: &BitFont,
     atlas: &SkirmishShellChromeAtlas,
     layout: &LauncherOptionsLayout,
@@ -327,6 +329,10 @@ fn build_open_list(
         LauncherComboId::HealthBars => HealthBarMode::choices()
             .into_iter()
             .map(HealthBarMode::label)
+            .collect(),
+        LauncherComboId::ColorVision => ColorVisionMode::choices()
+            .into_iter()
+            .map(ColorVisionMode::label)
             .collect(),
         LauncherComboId::Language => dialog.shell_language_rows(),
     };

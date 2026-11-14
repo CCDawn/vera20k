@@ -114,7 +114,7 @@ fn a_growth_that_changes_no_atlas_is_not_published() {
     growth.grow_sprites_for_test(work, empty_upload(false));
     // Captures publish waiting and restart growths after each publish, so a
     // growth that changed nothing must not count or it restarts for ever.
-    assert!(!growth.publish(&gpu.device, &gpu.queue, &batch, &mut None, &mut None, true));
+    assert!(!growth.publish(&gpu.device, &gpu.queue, &batch, &mut None, true));
     assert_eq!(growth.published(), 0);
     assert!(!growth.running());
 }
@@ -264,7 +264,7 @@ fn loader_uses_stored_shp_rect_for_depth_but_retains_logical_canvas_for_picking(
         for frame in 0..2 {
             let key = ShpSpriteKey {
                 palette_context: crate::render::sprite_atlas::ShpPaletteContext::Legacy,
-                type_id: name.to_string(),
+                type_id: name.into(),
                 facing: 0,
                 frame,
                 house_color: crate::rules::house_colors::NO_REMAP,
@@ -331,7 +331,7 @@ fn loader_uses_stored_shp_rect_for_depth_but_retains_logical_canvas_for_picking(
 fn make_shp_key(type_id: &str, facing: u8) -> ShpSpriteKey {
     ShpSpriteKey {
         palette_context: crate::render::sprite_atlas::ShpPaletteContext::Legacy,
-        type_id: type_id.to_string(),
+        type_id: type_id.into(),
         facing,
         frame: 0,
         house_color: HouseColorIndex::default(),
@@ -412,7 +412,7 @@ fn retail_shp_vehicle_keys_include_the_native_embedded_shadow_half() {
                 assert!(
                     needed.contains(&ShpSpriteKey {
                         palette_context: ShpPaletteContext::Legacy,
-                        type_id: type_id.to_owned(),
+                        type_id: type_id.into(),
                         facing: 0,
                         frame,
                         house_color: color,
@@ -438,7 +438,7 @@ fn retail_shp_vehicle_keys_include_the_native_embedded_shadow_half() {
                         assert!(
                             needed.contains(&ShpSpriteKey {
                                 palette_context: ShpPaletteContext::Legacy,
-                                type_id: type_id.to_owned(),
+                                type_id: type_id.into(),
                                 facing: 0,
                                 frame: selected,
                                 house_color,
@@ -563,7 +563,7 @@ fn ordinary_building_atlas_retains_native_completed_health_frames() {
             assert!(
                 needed.contains(&ShpSpriteKey {
                     palette_context: ShpPaletteContext::Legacy,
-                    type_id: "GAPOWR".to_string(),
+                    type_id: "GAPOWR".into(),
                     facing: 0,
                     frame,
                     house_color: color,
@@ -620,7 +620,7 @@ fn retail_gapowr_atlas_registers_native_embedded_shadow_frames() {
     let extra_building_types = ["GAPOWR"];
     let frozen_body = ShpSpriteKey {
         palette_context: ShpPaletteContext::SelectedScheme,
-        type_id: "GAPOWR".to_string(),
+        type_id: "GAPOWR".into(),
         facing: 0,
         frame: 1,
         house_color: HouseColorIndex(2),
@@ -651,7 +651,7 @@ fn retail_gapowr_atlas_registers_native_embedded_shadow_frames() {
 
     let key = |frame| ShpSpriteKey {
         palette_context: ShpPaletteContext::Legacy,
-        type_id: "GAPOWR".to_string(),
+        type_id: "GAPOWR".into(),
         facing: 0,
         frame,
         house_color: HouseColorIndex(2),
@@ -783,7 +783,7 @@ fn registered_underscore_building_requests_make_frames_from_buildup_asset() {
     for frame in 0..20 {
         assert!(needed.contains(&ShpSpriteKey {
             palette_context: ShpPaletteContext::Legacy,
-            type_id: "GAGATE_A_MAKE".to_string(),
+            type_id: "GAGATE_A_MAKE".into(),
             facing: 0,
             frame,
             house_color: HouseColorIndex(2),
@@ -1234,7 +1234,7 @@ fn infantry_nonempty_shadow_is_uploaded_and_selected_from_the_second_half() {
     .unwrap();
     let key = ShpSpriteKey {
         palette_context: ShpPaletteContext::Legacy,
-        type_id: "RAWGI".to_string(),
+        type_id: "RAWGI".into(),
         facing: 0,
         frame: 0,
         house_color: HouseColorIndex(0),
@@ -1243,7 +1243,7 @@ fn infantry_nonempty_shadow_is_uploaded_and_selected_from_the_second_half() {
     let selected = embedded_shp_shadow_piece(
         &atlas,
         rules.object("RAWGI"),
-        world.values().next().unwrap(),
+        &crate::app::presentation::frame::ObjectRecord::of_test(world.values().next().unwrap()),
         None,
         &key,
         body,
@@ -1372,7 +1372,7 @@ fn raw_infantry_render_does_not_substitute_an_out_of_asset_key() {
     );
     // Preserve the existing generic class adapter; this does not establish
     // original invalid-frame shape access or full Infantry drawing parity.
-    key.type_id = "LEGACY".to_string();
+    key.type_id = "LEGACY".into();
     assert!(
         render_shp_key(
             &source,
@@ -1654,7 +1654,7 @@ fn cell_anim_remap_registration_covers_every_bound_frame_for_its_color() {
     for frame in 0..3 {
         assert!(needed.contains(&ShpSpriteKey {
             palette_context: ShpPaletteContext::AnimScheme,
-            type_id: "Crate_Spark".to_string(),
+            type_id: "Crate_Spark".into(),
             facing: 0,
             frame,
             house_color: HouseColorIndex(1),
@@ -1696,7 +1696,7 @@ fn gsi_13_08_warpout_keeps_all_frames_and_drives_the_progressive_alpha_ladder() 
     for frame in 0..=20 {
         assert!(needed.contains(&ShpSpriteKey {
             palette_context: ShpPaletteContext::GlobalAnim,
-            type_id: "WARPOUT".to_string(),
+            type_id: "WARPOUT".into(),
             facing: 0,
             frame,
             house_color: HouseColorIndex(0),
@@ -1821,7 +1821,7 @@ fn gsi_13_04_tem_only_tile_root_uses_iso_palette_and_registers_every_frame() {
     for frame in 0..4 {
         assert!(needed.contains(&ShpSpriteKey {
             palette_context: ShpPaletteContext::GlobalAnim,
-            type_id: "CUSTOM_TILE_ANIM".to_string(),
+            type_id: "CUSTOM_TILE_ANIM".into(),
             facing: 0,
             frame,
             house_color: HouseColorIndex(0),
@@ -2053,7 +2053,7 @@ fn retail_statue_bakes_against_the_theater_lib_palette() {
     let unit = Palette::from_bytes(assets.get_ref("unitubn.pal").unwrap()).unwrap();
     let key = ShpSpriteKey {
         palette_context: ShpPaletteContext::Legacy,
-        type_id: "CANEWY04".to_string(),
+        type_id: "CANEWY04".into(),
         facing: 0,
         frame: 0,
         house_color: HouseColorIndex(3),
@@ -2844,14 +2844,14 @@ fn building_palette_groups_survive_refresh_and_palette_texture_growth() {
             "{name}"
         );
     }
-    if !crate::rules::ARES_ENABLED {
+    if !crate::rules::ARES_BUILD {
         assert_eq!(
             atlas.get(&key("B")).unwrap().source_palette,
             resident_unit_row.expect("the Unit fallback was already resident") + 1,
             "OFF B reuses the existing Unit palette row"
         );
     }
-    let high_type = if crate::rules::ARES_ENABLED {
+    let high_type = if crate::rules::ARES_BUILD {
         "B"
     } else {
         "CELL"
@@ -3002,7 +3002,7 @@ fn building_palette_groups_survive_refresh_and_palette_texture_growth() {
     let second_anim = spawn(&mut sim);
     sim.anims_mut_for_test().set_anim_remap(
         second_anim,
-        if crate::rules::ARES_ENABLED {
+        if crate::rules::ARES_BUILD {
             AnimRemap::ExtraBuildingScheme {
                 house,
                 palette: second_palette,
@@ -3549,4 +3549,183 @@ fn building_type_bounds_publish_with_color_growth_type_growth_and_abort() {
     assert_eq!(extended.building_type_bounds("CANEWY06"), Some(bounds));
     assert!(extended.building_type_bounds("CANEWY01").is_some());
     assert_eq!(extended.building_type_bounds.len(), 2);
+}
+
+/// The coverage check runs on every spawn and death, so objects of one type
+/// and owner give one pair between them; another owner's keeps its own.
+#[test]
+fn object_pairs_give_each_type_and_owner_once() {
+    let colors = HouseColorMap::from([
+        ("Americans".to_string(), HouseColorIndex(2)),
+        ("Russians".to_string(), HouseColorIndex(5)),
+    ]);
+    let mut world = crate::sim::entity_store::EntityStore::new();
+    for (id, owner) in [(1, "Americans"), (2, "Americans"), (3, "Russians")] {
+        let mut entity = crate::sim::game_entity::GameEntity::test_default(id, "E1", owner, 5, 5);
+        entity.set_is_voxel_for_test(false);
+        world.insert(entity);
+    }
+    let interner = crate::sim::intern::test_interner();
+    let pairs: Vec<_> = object_pairs(&world, &colors, &[], Some(&interner)).collect();
+    assert_eq!(
+        pairs,
+        [("E1", HouseColorIndex(2)), ("E1", HouseColorIndex(5))]
+    );
+}
+
+#[test]
+fn retail_spy_atlas_loads_its_default_disguise_without_a_real_infantryman() {
+    use crate::sim::{house_state::HouseState, world::Simulation};
+    let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art() else {
+        return;
+    };
+    let (_, mut assets) = crate::rules::retail_ini_fixture::retail_assets().unwrap();
+    let theater = crate::map::theater::load_theater(&mut assets, "TEMPERATE").unwrap();
+    let mut sim = Simulation::with_seed(3);
+    let owner = sim.intern("Americans");
+    sim.register_house(HouseState::new(owner, 0, None, false, 0, 10));
+    let spy = sim
+        .spawn_object_at_height("SPY", "Americans", 10, 10, 0, 0, &rules)
+        .unwrap();
+    let entity = sim.entities().get(spy).unwrap();
+    let disguise = entity.disguise.as_ref().unwrap();
+    let worn = sim.interner().resolve(disguise.type_id().unwrap());
+    assert_eq!(worn, "E1");
+    assert_eq!(sim.entities().len(), 1);
+    let colors = HouseColorMap::from([("Americans".to_owned(), HouseColorIndex(2))]);
+    let pairs = object_pairs(sim.entities(), &colors, &[], Some(sim.interner()))
+        .map(|(kind, color)| (kind.to_owned(), color))
+        .collect();
+    let mut needed = HashSet::new();
+    let sources = insert_new_object_keys(
+        &mut needed,
+        &pairs,
+        sim.entities(),
+        Some(sim.interner()),
+        &assets,
+        "tem",
+        "TEMPERATE",
+        Some(&rules),
+        Some(rules.art()),
+    );
+    let source = sources
+        .get(&(ShpImageKind::Object, worn.to_owned()))
+        .and_then(Option::as_ref)
+        .expect("the Spy's disguise must load without a real E1");
+    let record = rules
+        .animation_sequence_in_category(crate::rules::object_type::ObjectCategory::Infantry, worn)
+        .unwrap()
+        .infantry_action(0)
+        .unwrap();
+    let frame = crate::sim::animation::resolve_shp_frame(record, 0, 0) as u16;
+    let key = ShpSpriteKey {
+        type_id: worn.into(),
+        frame,
+        house_color: HouseColorIndex(2),
+        ..make_shp_key(worn, 0)
+    };
+    assert!(
+        needed.contains(&key),
+        "the draw-selected disguise frame must be resident"
+    );
+    let sprite = render_shp_key(
+        source,
+        &theater.unit_palette,
+        true,
+        &key,
+        Some(&rules),
+        &mut ShpPalettes::default(),
+    )
+    .expect("physical disguise frame");
+    assert!(sprite.indices().iter().any(|&index| index != 0));
+}
+
+#[test]
+fn spy_atlas_growth_tracks_each_active_disguise_and_its_house_color() {
+    let (mut world, _) = one_object_world("SPY", EntityCategory::Infantry);
+    let owner = crate::sim::intern::test_intern("Americans");
+    let enemy = crate::sim::intern::test_intern("Russians");
+    let e1 = crate::sim::intern::test_intern("E1");
+    let e2 = crate::sim::intern::test_intern("E2");
+    world
+        .get_mut(1)
+        .unwrap()
+        .disguise
+        .as_mut()
+        .unwrap()
+        .acquire(0, Some(e1), Some(owner));
+    let mut second = crate::sim::game_entity::GameEntity::test_default_of_category(
+        2,
+        "SPY",
+        "Americans",
+        6,
+        5,
+        EntityCategory::Infantry,
+    );
+    second.set_is_voxel_for_test(false);
+    second
+        .disguise
+        .as_mut()
+        .unwrap()
+        .acquire(0, Some(e2), Some(enemy));
+    world.insert(second);
+    let interner = crate::sim::intern::test_interner();
+    let colors = HouseColorMap::from([
+        ("Americans".to_owned(), HouseColorIndex(2)),
+        ("Russians".to_owned(), HouseColorIndex(5)),
+    ]);
+    let mut atlas = SpriteAtlas::from_test_entries(Default::default());
+    for kind in ["SPY", "E1"] {
+        atlas
+            .covered_objects
+            .entry(kind.to_owned())
+            .or_default()
+            .insert(HouseColorIndex(2));
+    }
+    let covered = |atlas: &SpriteAtlas, world: &crate::sim::entity_store::EntityStore| {
+        atlas_covers_world(
+            Some(atlas),
+            world,
+            &colors,
+            &[],
+            &HashSet::new(),
+            Some(&interner),
+        )
+    };
+    assert!(
+        !covered(&atlas, &world),
+        "a second Spy's enemy-coloured disguise needs growth"
+    );
+    atlas
+        .covered_objects
+        .entry("E2".to_owned())
+        .or_default()
+        .insert(HouseColorIndex(5));
+    assert!(covered(&atlas, &world));
+    world
+        .get_mut(2)
+        .unwrap()
+        .disguise
+        .as_mut()
+        .unwrap()
+        .clear_unit();
+    atlas.covered_objects.remove("E2");
+    assert!(
+        covered(&atlas, &world),
+        "inactive disguises must not request growth"
+    );
+}
+
+/// A type's SHP frame count is found whatever the case of the name asked,
+/// also for a name longer than the stack key.
+#[test]
+fn an_object_shp_frame_count_is_found_by_any_case_of_its_name() {
+    let long = "x".repeat(80);
+    let mut atlas = SpriteAtlas::from_test_entries(Default::default());
+    atlas.set_object_shp_frame_count_for_test("GaPowr", 8);
+    atlas.set_object_shp_frame_count_for_test(&long, 3);
+    assert_eq!(atlas.object_shp_frame_count("gapowr"), Some(8));
+    assert_eq!(atlas.object_shp_frame_count("GAPOWR"), Some(8));
+    assert_eq!(atlas.object_shp_frame_count(&long), Some(3));
+    assert_eq!(atlas.object_shp_frame_count("GAPILE"), None);
 }

@@ -24,6 +24,7 @@ fn generated_tree_color_survives_progress_and_thumbnail_persistence() {
         vegetation: 30,
         urban_presence: 40,
         urban_enabled: false,
+        fair_starts: false,
         seed: 4242,
         ..Default::default()
     };
@@ -42,7 +43,7 @@ fn generated_tree_color_survives_progress_and_thumbnail_persistence() {
         prepared.settings,
         prepared.resolved_inputs,
         prepared.blocks,
-        prepared.tech_types,
+        RandomMapObjects::tech(prepared.tech_types),
         crate::map::resolved_terrain::SharedCellDummy::fresh(),
         decision,
     )
@@ -87,8 +88,8 @@ fn generated_tree_color_survives_progress_and_thumbnail_persistence() {
         crate::rules::terrain_asset_catalog::TerrainAssetLoadPhase::Fresh,
     );
     let format = crate::render::native_surface_format::RGB565;
-    let mut rng = crate::sim::rng::MainRng::new(0x0401_599d);
-    let mut main = crate::app::state::process_main_draws(None, &mut rng);
+    let rng = crate::sim::rng::MainRng::new(0x0401_599d);
+    let mut main = crate::app::state::process_main_draws(&rng);
     let mut selectors = crate::map::tile_variant_selector::TileVariantSelectorCache::default();
     let mut selected = None;
     let mut final_colors = Vec::new();

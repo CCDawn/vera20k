@@ -101,10 +101,16 @@ fn source_location() {
 
 /// The language files VERA ships (`src/i18n/vera20k.<tag>.ini`), which
 /// src/i18n/mod.rs compiles in: shipping a language is adding its file.
-/// English, which holds every label, comes first.
+/// English, which holds every label, comes first. An installer's build sets
+/// `VERA20K_LANGUAGE_FOLDER` and compiles in only English, and no fonts beyond
+/// what English needs (the `language_folder` cfg): the installer puts the rest
+/// in a folder (.github/release/languages.sh), where they can be removed after
+/// the build.
 fn shipped_languages() {
     const DIRECTORY: &str = "src/i18n";
     println!("cargo::rerun-if-changed={DIRECTORY}");
+    println!("cargo::rerun-if-env-changed=VERA20K_LANGUAGE_FOLDER");
+    println!("cargo::rustc-check-cfg=cfg(language_folder)");
     let mut tags: Vec<String> = std::fs::read_dir(DIRECTORY)
         .expect("read src/i18n")
         .filter_map(|entry| {
@@ -123,6 +129,10 @@ fn shipped_languages() {
         Some("en"),
         "src/i18n needs vera20k.en.ini"
     );
+    if std::env::var_os("VERA20K_LANGUAGE_FOLDER").is_some() {
+        println!("cargo::rustc-cfg=language_folder");
+        tags.truncate(1);
+    }
     let mut code = String::from("pub(super) const FILES: &[(&str, &str)] = &[\n");
     for tag in &tags {
         code.push_str(&format!(
@@ -130,6 +140,22 @@ fn shipped_languages() {
         ));
     }
     code.push_str("];\n");
+    // The optional files beside a language's text, for the languages that
+    // have them (src/i18n/mod.rs).
+    for (constant, suffix) in [("SUBTITLES", "subtitles.txt"), ("CAMEO_LABELS", "cameos")] {
+        code.push_str(&format!(
+            "pub(super) const {constant}: &[(&str, &[u8])] = &[\n"
+        ));
+        for tag in &tags {
+            let file = format!("{DIRECTORY}/vera20k.{tag}.{suffix}");
+            if std::path::Path::new(&file).exists() {
+                code.push_str(&format!(
+                    "    ({tag:?}, include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/{file}\")) as &[u8]),\n"
+                ));
+            }
+        }
+        code.push_str("];\n");
+    }
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
     std::fs::write(out.join("shipped_languages.rs"), code).expect("write shipped_languages.rs");
 }
@@ -138,7 +164,8 @@ fn shipped_languages() {
 /// fetches the bundled fonts it leaves out when text first needs one
 /// (src/render/text_engine/web_fonts.rs): every font file's name, the start
 /// of its SHA-256, which versions its URL, and the code points its character
-/// map gives a glyph, as sorted inclusive ranges.
+/// map gives a glyph, as sorted inclusive ranges; then the glyph tables'
+/// names and versions.
 fn font_coverage() {
     const DIRECTORY: &str = "src/render/fonts";
     println!("cargo::rerun-if-changed={DIRECTORY}");
@@ -160,6 +187,24 @@ fn font_coverage() {
             code.push_str(&format!("({start:#x}, {end:#x}),"));
         }
         code.push_str("]),\n");
+    }
+    code.push_str("];\n");
+    // Glyph tables that are not fonts (`Unifont-CJK-15.bin`), with the same
+    // URL versions.
+    let mut tables: Vec<String> = std::fs::read_dir(DIRECTORY)
+        .expect("read src/render/fonts")
+        .filter_map(|entry| {
+            let name = entry.expect("read src/render/fonts entry").file_name();
+            let name = name.into_string().ok()?;
+            name.ends_with(".bin").then_some(name)
+        })
+        .collect();
+    tables.sort();
+    code.push_str("pub(super) const TABLES: &[(&str, &str)] = &[\n");
+    for file in &tables {
+        let data = std::fs::read(format!("{DIRECTORY}/{file}")).expect("read a glyph table");
+        let version = &sha256::sha256_hex(&data)[..16];
+        code.push_str(&format!("    ({file:?}, {version:?}),\n"));
     }
     code.push_str("];\n");
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));

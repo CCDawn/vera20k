@@ -2,8 +2,15 @@
 //! The JSON contains native execution, never expected pixels made by Rust.
 
 use super::*;
+use crate::app::presentation::frame::PresentationFrame;
 use crate::sim::components::{DriveCoord, NavTargetRef};
+use crate::sim::game_entity::GameEntity;
 use serde_json::Value;
+
+/// The drawn snapshot of `sim`; a fixture without rules captures with empty rules.
+fn frame_of(sim: &Simulation, rules: Option<&RuleSet>) -> PresentationFrame {
+    PresentationFrame::of_test(sim, rules.unwrap_or(RuleSet::empty_for_test()))
+}
 
 fn native() -> &'static Value {
     static CORPUS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
@@ -34,6 +41,10 @@ fn palette_bytes() -> Vec<u8> {
             .as_str()
             .unwrap(),
     )
+}
+
+fn palette() -> crate::assets::pal_file::Palette {
+    crate::assets::pal_file::Palette::from_bytes(&palette_bytes()).unwrap()
 }
 
 fn baseline_rows() -> impl Iterator<Item = &'static Value> {
@@ -384,8 +395,9 @@ fn built(row: &Value, zoom: f32) -> (Vec<SpriteInstance>, TacticalViewport) {
         &state,
         row["input"]["planning"].as_bool().unwrap_or(false),
         Some(&sim),
+        Some(&frame_of(&sim, rules.as_ref())),
         rules.as_ref(),
-        Some(&palette_bytes()),
+        Some(&palette()),
         &HouseColorMap::new(),
         0,
         view,
@@ -403,7 +415,7 @@ pub(super) fn workload_fixture(
     Option<RuleSet>,
     TargetLineState,
     TacticalViewport,
-    Vec<u8>,
+    crate::assets::pal_file::Palette,
 ) {
     let row = match kind {
         SelectedLineKind::Move => baseline_rows().find(|row| {
@@ -434,7 +446,7 @@ pub(super) fn workload_fixture(
             .attack_target
             .set_for_test(Some(crate::sim::combat::TargetKind::Entity(20_001)));
     }
-    (sim, rules, state, view, palette_bytes())
+    (sim, rules, state, view, palette())
 }
 
 fn words(row: &Value) -> Vec<u16> {
@@ -550,8 +562,9 @@ fn original_unit_attack_line_pixels_and_read_only_coordinate_queries() {
             &state,
             false,
             Some(&sim),
+            Some(&frame_of(&sim, rules.as_ref())),
             rules.as_ref(),
-            Some(&palette_bytes()),
+            Some(&palette()),
             &HouseColorMap::new(),
             0,
             view,
@@ -671,7 +684,7 @@ fn original_source_and_target_projection_before_surface_clipping() {
         };
         let (sim, rules, _, view) = drawing_fixture(row);
         let cells = sim.resolved_terrain().map(NativeCellQuery::isolated);
-        let line = selected_action_line_for_entity(
+        let line = action_line_endpoints(
             sim.entities().get(1).unwrap(),
             &sim,
             rules.as_ref(),
@@ -822,8 +835,9 @@ fn move_line_query_leaves_the_simulation_dummy_unchanged() {
         &state,
         false,
         Some(&sim),
+        Some(&frame_of(&sim, None)),
         None,
-        Some(&palette_bytes()),
+        Some(&palette()),
         &HouseColorMap::new(),
         0,
         view,

@@ -93,7 +93,9 @@
 //!   later real callback can resume its system hold. Forced promotion uses
 //!   the shared held-start Resume owner. Temporal pause/release themselves
 //!   make no queue callback: warp alone keeps producing, while release alone
-//!   preserves a hold caused by another building's loss. GoOffline/GoOnline's
+//!   preserves a hold caused by another building's loss. Ares adds that
+//!   callback (hooks `0x004521C8`, `0x00452218`), run at the next factory
+//!   sweep (`Simulation::ares_refresh_temporal_factories`). GoOffline/GoOnline's
 //!   independent +660 owner is called by map input and trigger61/62.
 //!   Not wired:
 //!   - `HouseClass::CanBuild`'s upgrade-prerequisite scan
@@ -141,16 +143,18 @@ use crate::sim::world::{FrameEffects, Simulation, UninitContext};
 /// `SumChainDamage @ 0x0071AB10` recurses while the depth is at most this
 /// (`0x0071AB22 CMP EAX,0x32; JG`).
 const CHAIN_DEPTH_LIMIT: i32 = 0x32;
-/// `AnimClass(type, coord, 0, 1, 0x600, 0, 0)` for WarpAway and the sparkle.
+/// `AnimClass(type, coord, 0, 1, 0x600, 0, 0)` for WarpAway, the sparkles
+/// and KillOccupants' assault anim.
 const TEMPORAL_ANIM_DRAW_FLAGS: u32 = 0x600;
 /// The sparkle's frame phase: `frame % 24 == 0` (`0x0073622F..0x0073623E`).
 const SPARKLE_PERIOD_FRAMES: i32 = 24;
 /// A Foot's sparkle sits 0x78 leptons east and south of its Location
 /// (`0x00736274`, `0x00736280`).
 const SPARKLE_OFFSET_LEPTONS: i32 = 0x78;
-/// An occupied building's port sparkle ZAdjust (`anim+0x100 = -200`,
-/// `0x004404CF`).
-const PORT_SPARKLE_Z_ADJUST: i32 = -200;
+/// The ZAdjust of an anim at an occupied building's firing port
+/// (`anim+0x100 = -200`): the Temporal port sparkle (`0x004404CF`) and
+/// KillOccupants' assault anim (`0x004586C0`).
+pub(crate) const PORT_ANIM_Z_ADJUST: i32 = -200;
 
 /// One `TemporalClass`, owned by the attacker that fires it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -170,7 +174,7 @@ pub struct TemporalLink {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TemporalState {
     /// `TechnoClass+0x274` TemporalImUsing.
-    link: Option<TemporalLink>,
+    link: Option<Box<TemporalLink>>,
     /// `TechnoClass+0x278` TemporalTargetingMe: the chain head's attacker.
     head: Option<u64>,
 }
@@ -279,7 +283,7 @@ pub(crate) fn init_temporal(object_type: &ObjectType, rules: &RuleSet) -> Tempor
         .and_then(|weapon| rules.weapon_warhead(weapon))
         .is_some_and(|warhead| warhead.temporal);
     TemporalState {
-        link: temporal.then(TemporalLink::default),
+        link: temporal.then(Box::<TemporalLink>::default),
         head: None,
     }
 }
@@ -301,7 +305,7 @@ impl Simulation {
         substrate
             .entities
             .get(attacker)
-            .and_then(|entity| entity.temporal.link.as_ref())
+            .and_then(|entity| entity.temporal.link.as_deref())
     }
 
     /// The Temporal arm of `BulletClass::DetonateAtCoord` (`0x00469423..
@@ -350,7 +354,7 @@ impl Simulation {
                     // (1005C600, hook 0x469467) also warps a Foot in the Air
                     // or Top layer.
                     let warpable_layer = layer == DisplayLayer::GROUND
-                        || crate::rules::ARES_ENABLED
+                        || rules.ares()
                             && (layer == DisplayLayer::AIR || layer == DisplayLayer::TOP);
                     if !warpable_layer {
                         return;
@@ -589,6 +593,11 @@ impl Simulation {
             owner: entity.owner(),
             victim_type: entity.type_ref(),
             own_alert: true,
+            line: if notify_house {
+                crate::sim::combat::UnderAttackLine::House { allies: true }
+            } else {
+                crate::sim::combat::UnderAttackLine::OreMiner
+            },
         };
         if notify_house {
             self.notify_house_under_attack(event, rules, registry, effects);
@@ -818,7 +827,7 @@ impl Simulation {
             && let Some(warp_away) = warp_away
         {
             let location = location_coord(entity);
-            self.spawn_temporal_anim(warp_away, location, None, rules);
+            self.spawn_once_anim(warp_away, location, None, rules);
         }
         // 0x0071A917..0x0071A978: a Trainable attacker gains
         // `VeterancyStruct::Add(ownerCost, targetCost)` here, and again in
@@ -861,6 +870,7 @@ impl Simulation {
                 crate::sim::passenger::garrison_eject::kill_building_occupants(
                     self,
                     target,
+                    None,
                     UninitContext::new(rules, registry).with_effects(effects),
                 );
             }
@@ -1317,7 +1327,10 @@ impl Simulation {
         true
     }
 
-    fn spawn_temporal_anim(
+    /// `AnimClass(type, coord, 0, 1, 0x600, 0, 0)`, then the ZAdjust store
+    /// when given: WarpAway, the Temporal sparkles and KillOccupants' assault
+    /// anim (`passenger::garrison_eject::kill_building_occupants`).
+    pub(crate) fn spawn_once_anim(
         &mut self,
         anim_name: &str,
         coord: AnimWorldCoord,
@@ -1342,7 +1355,7 @@ impl Simulation {
         let anim = match self.spawn_anim_at_world(rules, descriptor, coord) {
             Ok(anim) => anim,
             Err(error) => {
-                log::debug!("temporal anim [{anim_name}] did not construct: {error}");
+                log::debug!("anim [{anim_name}] did not construct: {error}");
                 return;
             }
         };
@@ -1379,14 +1392,23 @@ impl Simulation {
         bridge_state_changed: &mut bool,
     ) -> bool {
         let registry = ctx.overlay_registry;
-        let Some(category) = self
-            .substrate
-            .entities
-            .get(id)
-            .map(|entity| entity.category())
-        else {
+        let Some((category, untouched)) = self.substrate.entities.get(id).map(|entity| {
+            (
+                entity.category(),
+                entity.temporal.head.is_none()
+                    && !entity.is_warped_out()
+                    && !entity.is_warping_in(),
+            )
+        }) else {
             return true;
         };
+        // VERA-only: with no head of its own and neither warped out nor
+        // warping in, nothing below acts (no sparkle, no head Update, no warp
+        // to process) and the object is not frozen, so one read answers it
+        // (the same results).
+        if untouched {
+            return false;
+        }
         // Infantry sparkles before its head's Update; the others after.
         if category == EntityCategory::Infantry {
             self.warp_foot_sparkle(id, rules);
@@ -1503,7 +1525,7 @@ impl Simulation {
             z: location.z,
         };
         let name = rules.general.chrono_sparkle1.name.clone();
-        self.spawn_temporal_anim(&name, coord, None, rules);
+        self.spawn_once_anim(&name, coord, None, rules);
     }
 
     /// A frozen building's sparkle (`0x004403D4..0x0044055D`): a type with
@@ -1524,41 +1546,58 @@ impl Simulation {
         let ports = object.max_number_occupants;
         if ports == 0 {
             if sparkle_frame(frame, 0) {
-                self.spawn_temporal_anim(&name, location, None, rules);
+                self.spawn_once_anim(&name, location, None, rules);
             }
             return;
         }
-        let muzzle_flashes = rules
-            .art()
-            .get(&object.image)
-            .or_else(|| rules.art().get(&object.id))
-            .map(|art| art.muzzle_flash_positions.clone())
-            .unwrap_or_default();
         for port in 0..ports {
             if !sparkle_frame(frame, port) {
                 continue;
             }
-            let (px, py) = muzzle_flashes.get(port as usize).copied().unwrap_or((0, 0));
-            let (dx, dy) =
-                crate::util::pixel_conversion::PixelConversionBounds::isometric_pixel_to_leptons(
-                    px, py,
-                );
-            let (base, _) = crate::sim::movement::ground_pose::building_render_order_parts(
-                crate::sim::components::DriveCoord {
-                    x: location.x,
-                    y: location.y,
-                    z: location.z,
-                },
-                false,
-                false,
-            );
-            let coord = AnimWorldCoord {
-                x: base.x.wrapping_add(dx),
-                y: base.y.wrapping_add(dy),
-                z: base.z,
-            };
-            self.spawn_temporal_anim(&name, coord, Some(PORT_SPARKLE_Z_ADJUST), rules);
+            if let Some(coord) = self.occupant_port_coord(id, port as usize, rules) {
+                self.spawn_once_anim(&name, coord, Some(PORT_ANIM_Z_ADJUST), rules);
+            }
         }
+    }
+
+    /// An occupied building's firing port `port`: its `vtable+0xAC`
+    /// coordinate plus `IsometricPixelToWorld(MuzzleFlash<port>)` (BuildingType
+    /// `+0x1588`), at the building's Z. The Temporal port sparkle
+    /// (`0x004404D5`) and KillOccupants' assault anim (`0x00458613..0x0045866C`)
+    /// read it.
+    pub(crate) fn occupant_port_coord(
+        &self,
+        id: u64,
+        port: usize,
+        rules: &RuleSet,
+    ) -> Option<AnimWorldCoord> {
+        let entity = self.substrate.entities.get(id)?;
+        let object = self.object_type(entity.type_ref(), rules)?;
+        let location = location_coord(entity);
+        let (px, py) = rules
+            .art()
+            .get(&object.image)
+            .or_else(|| rules.art().get(&object.id))
+            .and_then(|art| art.muzzle_flash_positions.get(port).copied())
+            .unwrap_or((0, 0));
+        let (dx, dy) =
+            crate::util::pixel_conversion::PixelConversionBounds::isometric_pixel_to_leptons(
+                px, py,
+            );
+        let (base, _) = crate::sim::movement::ground_pose::building_render_order_parts(
+            crate::sim::components::DriveCoord {
+                x: location.x,
+                y: location.y,
+                z: location.z,
+            },
+            false,
+            false,
+        );
+        Some(AnimWorldCoord {
+            x: base.x.wrapping_add(dx),
+            y: base.y.wrapping_add(dy),
+            z: base.z,
+        })
     }
 }
 
@@ -1566,7 +1605,7 @@ impl crate::sim::world::ObjectSubstrate {
     fn temporal_link_mut(&mut self, attacker: u64) -> Option<&mut TemporalLink> {
         self.entities
             .get_mut(attacker)
-            .and_then(|entity| entity.temporal.link.as_mut())
+            .and_then(|entity| entity.temporal.link.as_deref_mut())
     }
     fn set_temporal_head(&mut self, target: u64, head: Option<u64>) {
         if let Some(entity) = self.entities.get_mut(target) {

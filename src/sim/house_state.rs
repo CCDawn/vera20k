@@ -215,7 +215,6 @@ const fn last_attacker_house_index_default() -> i32 {
 }
 
 /// Ares HouseExt constructor's SWLastIndex.
-#[cfg(feature = "ares")]
 fn no_super_index() -> i32 {
     -1
 }
@@ -443,9 +442,7 @@ pub struct HouseAiActivationLatches {
 /// (`0x004F5855..0x004F586D`); `BuildingClass::Infiltrate @ 0x004571E0` is
 /// their only writer (operand census of each offset, 2026-10-12) and never
 /// clears one.
-#[derive(
-    Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SpyGains {
     /// `+0x2BC`: the third side's technology, read by CanBuild for
     /// `RequiresStolenThirdTech=` (`0x004F79DA`).
@@ -463,23 +460,37 @@ struct SpyGains {
     /// Ares HouseExt `+0x48`: veteran `Naval=` units, from
     /// `SpyEffect.NavalVeterancy` (`BuildingExt::ExtData::InfiltratedBy @
     /// 10012000`), never cleared.
-    #[cfg(feature = "ares")]
     #[serde(default)]
     naval_veterancy: bool,
     /// Ares HouseExt `+0x49`: veteran aircraft (`SpyEffect.AircraftVeterancy`).
-    #[cfg(feature = "ares")]
     #[serde(default)]
     aircraft_veterancy: bool,
     /// Ares HouseExt `+0x4A`: veteran buildings (`SpyEffect.BuildingVeterancy`).
-    #[cfg(feature = "ares")]
     #[serde(default)]
     building_veterancy: bool,
+}
+
+// The five native bytes fold as a derive would; the Ares bytes only once
+// one is set, so a house in a game without Ares folds what it always did.
+impl std::hash::Hash for SpyGains {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.third_tech.hash(state);
+        self.soviet_tech.hash(state);
+        self.allied_tech.hash(state);
+        self.veteran_infantry.hash(state);
+        self.veteran_units.hash(state);
+        if self.naval_veterancy || self.aircraft_veterancy || self.building_veterancy {
+            b"ares-spy-veterancy-v1".hash(state);
+            self.naval_veterancy.hash(state);
+            self.aircraft_veterancy.hash(state);
+            self.building_veterancy.hash(state);
+        }
+    }
 }
 
 /// The veterancy one Ares infiltration gives its house
 /// (`BuildingExt::ExtData::InfiltratedBy @ 10012000`): the House bytes
 /// `+0x2BF`/`+0x2C0` and the HouseExt bytes `+0x48..+0x4A`.
-#[cfg(feature = "ares")]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AresSpyVeterancy {
     pub(crate) infantry: bool,
@@ -602,7 +613,7 @@ pub struct HouseState {
     country: Option<InternedId>,
     /// Ares3.0 HouseExt+4C: ordered permanent Country plans. Constructor
     ///10021072 leaves it empty; live factory ownership is a separate source.
-    #[cfg(feature = "ares")]
+    #[serde(default)]
     permanent_factory_plans: Vec<crate::rules::ruleset::CountryIdx>,
     /// Native HouseClass `IsHuman` byte.
     is_human: bool,
@@ -882,7 +893,6 @@ pub struct HouseState {
     /// `HouseExt::UpdateAcademy` (`10022760`) appended them. Placement
     /// (hook `0x00446366`) adds, Limbo (`0x00445905`) and a capture's old
     /// owner (`0x00448AB2`) remove, the captor (`0x004491D5`) adds.
-    #[cfg(feature = "ares")]
     #[serde(default)]
     ares_academies: Vec<u64>,
     /// Ares HouseExt `+0x34` ReverseEngineered: the TechnoTypes this house
@@ -891,7 +901,6 @@ pub struct HouseState {
     /// (AresMap find-or-insert `10020250`). RequirementsMet (`10021FF0`)
     /// answers Overridden for a listed type and trigger event 78 reads it;
     /// `SpyEffect.UndoReverseEngineer` (`10012000`) empties it.
-    #[cfg(feature = "ares")]
     #[serde(default)]
     ares_reverse_engineered: Vec<crate::rules::superweapon_type::TechnoTypeReference>,
     /// Ares HouseExt `+0x40` StolenTech (constructor 0): the bits of every
@@ -899,7 +908,6 @@ pub struct HouseState {
     /// (`BuildingExt::ExtData::InfiltratedBy @ 10012000`), which
     /// `Prerequisite.StolenTechs=` asks (RequirementsMet `10021FF0`).
     /// Nothing clears it.
-    #[cfg(feature = "ares")]
     #[serde(default)]
     ares_stolen_tech: u32,
     /// Ares HouseExt `+0x14` SWLastIndex (constructor -1): the
@@ -908,7 +916,6 @@ pub struct HouseState {
     /// 10032ED0). Fire_SW's PostClick pairing (hook 4FAE72, 10034C90), the
     /// ChronoWarp's source (1006FB60) and the PostClick presentation of the
     /// common Launch read it.
-    #[cfg(feature = "ares")]
     #[serde(default = "no_super_index")]
     ares_last_super: i32,
     /// House+2D8: how many of this house's `PowersUnit=` buildings are
@@ -1549,14 +1556,12 @@ impl HouseState {
         self.country
     }
 
-    #[cfg(feature = "ares")]
     pub(crate) fn permanent_factory_plans(&self) -> &[crate::rules::ruleset::CountryIdx] {
         &self.permanent_factory_plans
     }
 
     ///10021130 checks membership before appending. Selling/capture/loss does
     /// not revoke a plan, and this append does not write tech-recheck/timers.
-    #[cfg(feature = "ares")]
     pub(crate) fn acquire_factory_plan(&mut self, country: crate::rules::ruleset::CountryIdx) {
         if !self.permanent_factory_plans.contains(&country) {
             self.permanent_factory_plans.push(country);
@@ -1565,7 +1570,6 @@ impl HouseState {
 
     /// House.ReadINI500CC5 ->100244C9..10024516 appends without a dedupe
     /// guard. Only the scenario reader invokes this; CreateHouses does not.
-    #[cfg(feature = "ares")]
     pub(crate) fn read_scenario_factory_plan(
         &mut self,
         country: Option<crate::rules::ruleset::CountryIdx>,
@@ -1896,6 +1900,28 @@ impl HouseState {
         self.stats.record_built();
     }
 
+    /// Every item [`Self::produced_count`] holds for `category` whose type's
+    /// `Naval=` is `naval`, summed: how many such objects this House has
+    /// finished. War Factory and Naval Yard products feed one counter; this
+    /// keeps them apart, as the two kinds of factory are. A VERA reader
+    /// (`app::input::primary_rotation`); gamemd has no such total.
+    pub fn produced_total(
+        &self,
+        rules: &crate::rules::ruleset::RuleSet,
+        category: ObjectCategory,
+        naval: bool,
+    ) -> i64 {
+        self.produced_type_counts[category as usize]
+            .iter()
+            .filter(|&(&index, _)| {
+                rules
+                    .type_array_at(category, index)
+                    .is_some_and(|object| object.naval == naval)
+            })
+            .map(|(_, &count)| i64::from(count))
+            .sum()
+    }
+
     /// Counter49FAE0's logical item query. Sparse lookup replaces native
     /// allocation/zero-fill; allocator capacity has no gameplay consumer here.
     pub fn produced_count(&self, category: ObjectCategory, type_index: i32) -> i32 {
@@ -2174,7 +2200,6 @@ impl HouseState {
 
     /// SW_EMPulse::Activate (Ares 3.0 `100711C0`) and the EMP cannon's
     /// Missile hook (`10036570`, hook 0x44CCE7) aim the cannons at `cell`.
-    #[cfg(feature = "ares")]
     pub(crate) fn aim_emp_cannons(&mut self, cell: (u16, u16)) {
         self.super_weapon_targets.emp_target = cell;
     }
@@ -2219,7 +2244,6 @@ impl HouseState {
 
     /// Inputs for Ares `IsTargetConstraintsEligible`10032110: the house's
     /// chosen enemy (`+0x5600`) and its scripted offensive cell (`+0x54F0`).
-    #[cfg(feature = "ares")]
     pub fn target_constraints_observations(
         &self,
     ) -> crate::rules::superweapon_targeting::HouseTargetingObservations {
@@ -2290,11 +2314,13 @@ impl HouseState {
 
     /// House+54E0 is forgotten if it names `building`: the new owner's clear
     /// in `BuildingClass::ChangeOwner` (`0x00448C8C`) and
-    /// `HouseClass::PointerExpired` (`0x004FB9BB`).
-    pub(crate) fn forget_lost_building(&mut self, building: u64) {
-        if self.lost_building == Some(building) {
+    /// `HouseClass::PointerExpired` (`0x004FB9BB`). Answers whether it did.
+    pub(crate) fn forget_lost_building(&mut self, building: u64) -> bool {
+        let named = self.lost_building == Some(building);
+        if named {
             self.lost_building = None;
         }
+        named
     }
 
     /// House+54E0, read by a computer engineer's Greatest_Threat.
@@ -2361,7 +2387,6 @@ impl HouseState {
 
     /// The veterancy arms of Ares' infiltration (`10012000`): set each
     /// granted byte, then House+1FC once any was. Answers whether any was.
-    #[cfg(feature = "ares")]
     pub(crate) fn grant_ares_spy_veterancy(&mut self, gains: AresSpyVeterancy) -> bool {
         let gains_any = gains != AresSpyVeterancy::default();
         let spy = &mut self.spy_gains;
@@ -2378,21 +2403,18 @@ impl HouseState {
 
     /// Ares HouseExt `+0x48`, read by the Unit constructor and InitFromType
     /// hooks (`0x00735678`, `0x0074689B`) and `CameoIsElite @ 1003D800`.
-    #[cfg(feature = "ares")]
     pub fn naval_veterancy(&self) -> bool {
         self.spy_gains.naval_veterancy
     }
 
     /// Ares HouseExt `+0x49`, read by `AircraftClass_Init_Academy`
     /// (`0x00413FD2`) and `CameoIsElite`.
-    #[cfg(feature = "ares")]
     pub fn aircraft_veterancy(&self) -> bool {
         self.spy_gains.aircraft_veterancy
     }
 
     /// Ares HouseExt `+0x4A`, read by `BuildingClass_Init_Academy`
     /// (`0x00442D1B`) and `CameoIsElite`.
-    #[cfg(feature = "ares")]
     pub fn building_veterancy(&self) -> bool {
         self.spy_gains.building_veterancy
     }
@@ -2446,19 +2468,16 @@ impl HouseState {
             std::hash::Hash::hash(&self.spy_gains, hasher);
         }
         // The other veterancy grant a house holds, folded while it has one.
-        #[cfg(feature = "ares")]
         if !self.ares_academies.is_empty() {
             std::hash::Hash::hash(b"ares-house-academies-v1", hasher);
             std::hash::Hash::hash(&self.ares_academies, hasher);
         }
         // The technology a house took at its grinders, folded while it has any.
-        #[cfg(feature = "ares")]
         if !self.ares_reverse_engineered.is_empty() {
             std::hash::Hash::hash(b"ares-house-reverse-engineered-v1", hasher);
             std::hash::Hash::hash(&self.ares_reverse_engineered, hasher);
         }
         // The technology bits its spies stole, folded once it has any.
-        #[cfg(feature = "ares")]
         if self.ares_stolen_tech != 0 {
             std::hash::Hash::hash(b"ares-house-stolen-tech-v1", hasher);
             std::hash::Hash::hash(&self.ares_stolen_tech, hasher);
@@ -2468,7 +2487,6 @@ impl HouseState {
     /// The StolenTech arm of Ares' infiltration (`10012000`): OR the
     /// building type's `SpyEffect.StolenTechIndex` bits into HouseExt
     /// `+0x40`, then set House+1FC.
-    #[cfg(feature = "ares")]
     pub(crate) fn steal_ares_tech(&mut self, bits: u32) {
         self.ares_stolen_tech |= bits;
         self.request_tech_recheck();
@@ -2476,7 +2494,6 @@ impl HouseState {
 
     /// Whether this house holds every StolenTech bit of `required`
     /// (`Prerequisite.StolenTechs`); an empty set is met (`10021FF0`).
-    #[cfg(feature = "ares")]
     pub(crate) fn has_ares_stolen_techs(&self, required: u32) -> bool {
         self.ares_stolen_tech & required == required
     }
@@ -2484,7 +2501,6 @@ impl HouseState {
     /// The list half of `HouseExt::ExtData::ReverseEngineer` (`10022360`):
     /// append `reversed` unless it is listed (AresMap find-or-insert
     /// `10020250`). Answers whether it was appended.
-    #[cfg(feature = "ares")]
     pub(crate) fn record_ares_reverse_engineered(
         &mut self,
         reversed: &crate::rules::superweapon_type::TechnoTypeReference,
@@ -2499,7 +2515,6 @@ impl HouseState {
     /// Whether this house reverse engineered the type `id` of `category`
     /// (HouseExt `+0x34`), as RequirementsMet (`10021FF0`) and trigger event
     /// 78 ask. Both sides hold the Rules registry's stored IDs.
-    #[cfg(feature = "ares")]
     pub(crate) fn has_ares_reverse_engineered(
         &self,
         category: crate::rules::object_type::ObjectCategory,
@@ -2512,7 +2527,6 @@ impl HouseState {
 
     /// `SpyEffect.UndoReverseEngineer` (`BuildingExt::ExtData::InfiltratedBy
     /// @ 10012000`): empty the list, then set House+1FC.
-    #[cfg(feature = "ares")]
     pub(crate) fn undo_ares_reverse_engineering(&mut self) {
         self.ares_reverse_engineered.clear();
         self.request_tech_recheck();
@@ -2520,7 +2534,6 @@ impl HouseState {
 
     /// `HouseExt::ExtData::UpdateAcademy` (`10022760`): append an academy
     /// not yet listed, or remove a listed one; anything else is a no-op.
-    #[cfg(feature = "ares")]
     pub(crate) fn update_ares_academy(&mut self, building: u64, added: bool) {
         let listed = self.ares_academies.iter().position(|&id| id == building);
         match (added, listed) {
@@ -2533,20 +2546,17 @@ impl HouseState {
     }
 
     /// Ares HouseExt Academies, which `ApplyAcademy` (`10020750`) walks.
-    #[cfg(feature = "ares")]
     pub(crate) fn ares_academies(&self) -> &[u64] {
         &self.ares_academies
     }
 
     /// Ares HouseExt SWLastIndex, -1 when no Super set it.
-    #[cfg(feature = "ares")]
     pub(crate) fn ares_last_super(&self) -> i32 {
         self.ares_last_super
     }
 
     /// The common Launch's write (10032F99): the House remembers the Super
     /// it launched last.
-    #[cfg(feature = "ares")]
     pub(crate) fn remember_ares_last_super(&mut self, index: i32) {
         self.ares_last_super = index;
     }
@@ -2554,9 +2564,6 @@ impl HouseState {
     /// Folded only once a launch set it, so other houses hash as earlier
     /// schemas did.
     pub(crate) fn hash_ares_last_super(&self, hasher: &mut impl std::hash::Hasher) {
-        #[cfg(not(feature = "ares"))]
-        let _ = hasher;
-        #[cfg(feature = "ares")]
         if self.ares_last_super != no_super_index() {
             std::hash::Hash::hash(b"ares-house-last-super-v1", hasher);
             std::hash::Hash::hash(&self.ares_last_super, hasher);
@@ -2589,6 +2596,23 @@ impl HouseState {
             std::hash::Hash::hash(b"house-last-built-types-v1", hasher);
             std::hash::Hash::hash(&self.last_built_types, hasher);
         }
+    }
+
+    /// Lend the spatial threat grid out, leaving none
+    /// ([`crate::sim::house_threat::HouseSpatialThreat::none`]).
+    pub(crate) fn take_spatial_threat(&mut self) -> crate::sim::house_threat::HouseSpatialThreat {
+        std::mem::replace(
+            &mut self.spatial_threat,
+            crate::sim::house_threat::HouseSpatialThreat::none(),
+        )
+    }
+
+    /// Give back the grid [`Self::take_spatial_threat`] lent out.
+    pub(crate) fn restore_spatial_threat(
+        &mut self,
+        grid: crate::sim::house_threat::HouseSpatialThreat,
+    ) {
+        self.spatial_threat = grid;
     }
 
     pub(crate) fn configure_spatial_threat_grid(&mut self, grid: crate::map::cell_index::CellGrid) {
@@ -3043,7 +3067,6 @@ impl HouseState {
             initial_techno_records: Vec::new(),
             side_index: side_index.into(),
             country,
-            #[cfg(feature = "ares")]
             permanent_factory_plans: Vec::new(),
             is_human,
             player_control: is_human,
@@ -3089,13 +3112,9 @@ impl HouseState {
             produced_type_counts: Default::default(),
             lost_building: None,
             spy_gains: SpyGains::default(),
-            #[cfg(feature = "ares")]
             ares_academies: Vec::new(),
-            #[cfg(feature = "ares")]
             ares_reverse_engineered: Vec::new(),
-            #[cfg(feature = "ares")]
             ares_stolen_tech: 0,
-            #[cfg(feature = "ares")]
             ares_last_super: no_super_index(),
             powered_unit_centers: 0,
             discovered_by_current_house: false,
@@ -3936,5 +3955,32 @@ mod signed_country_side_tests {
         let bytes = crate::util::save_codec::serialize(&house).unwrap();
         let restored: HouseState = crate::util::save_codec::deserialize(&bytes).unwrap();
         assert_eq!(restored.side_index, -1);
+    }
+}
+
+#[cfg(test)]
+mod produced_total_tests {
+    use super::*;
+    use crate::rules::{ini_parser::IniFile, ruleset::RuleSet};
+
+    /// VERA primary rotation counts War Factory and Naval Yard products
+    /// apart, though both feed the one Vehicle counter.
+    #[test]
+    fn ships_and_tanks_are_counted_apart() {
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[VehicleTypes]\n0=TANK\n1=BOAT\n[TANK]\nStrength=1\n[BOAT]\nStrength=1\nNaval=yes\n",
+        ))
+        .unwrap();
+        let mut house = HouseState::new(Default::default(), 0, None, false, 0, 10);
+        house.set_produced_count_for_test(ObjectCategory::Vehicle, 0, 3);
+        house.set_produced_count_for_test(ObjectCategory::Vehicle, 1, 2);
+        assert_eq!(
+            house.produced_total(&rules, ObjectCategory::Vehicle, false),
+            3
+        );
+        assert_eq!(
+            house.produced_total(&rules, ObjectCategory::Vehicle, true),
+            2
+        );
     }
 }

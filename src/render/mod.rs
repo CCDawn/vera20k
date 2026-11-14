@@ -20,6 +20,7 @@
 //! - render/ does NOT depend on: app/, audio/, net/
 
 pub(crate) mod aircraft_shadow;
+pub(crate) mod snapshot;
 pub mod area_scale;
 pub(crate) mod atlas_growth;
 #[cfg(test)]
@@ -34,6 +35,7 @@ pub mod building_zshape;
 pub mod cell_window;
 pub mod chrome_atlas;
 pub(crate) mod chrono_screen;
+pub(crate) mod color_vision;
 pub mod combat_light;
 pub mod cursor_atlas;
 #[cfg(test)]
@@ -42,6 +44,7 @@ pub mod draw_state;
 pub(crate) mod electric_bolt;
 pub(crate) mod entity_atlas_growth;
 pub(crate) mod foot_depth;
+pub(crate) mod frame_handoff;
 pub mod frame_readback;
 pub mod gpu;
 pub(crate) mod gpu_timer;

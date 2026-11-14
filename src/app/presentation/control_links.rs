@@ -11,25 +11,26 @@ use crate::sim::world::Simulation;
 
 pub(crate) fn prepare(
     sim: &Simulation,
+    frame: &crate::app::presentation::frame::PresentationFrame,
     rules: &RuleSet,
     colors: &HouseColorMap,
     wall_ms: u32,
     view: TacticalViewport,
-    interpolation: Option<&super::interpolation::RenderInterpolation>,
 ) -> std::collections::HashMap<u64, Vec<SpriteInstance>> {
     // Tactical6D47A6/6D47CB visits a Techno's manager, then its controller's.
     // Opaque repeated draws at this frame's fixed clock are idempotent: keep
     // each manager's last visit, preserving overlap order without quadratic
     // work for a manager with many captives. This temporary index has no state.
     let mut last_visit = std::collections::HashMap::new();
-    for (rank, (id, entity)) in sim.entities().iter_sorted().enumerate() {
+    for (rank, entity) in frame.objects().enumerate() {
+        let id = entity.stable_id();
         if entity.health.current() == 0 {
             continue;
         }
         if entity.capture_manager.is_some() {
             last_visit.insert(id, (rank * 2, id));
         }
-        if let Some(controller) = entity.mind_control.controller() {
+        if let Some(controller) = entity.hud.controller() {
             last_visit.insert(controller, (rank * 2 + 1, id));
         }
     }
@@ -41,7 +42,11 @@ pub(crate) fn prepare(
     let mut by_entity: std::collections::HashMap<u64, Vec<SpriteInstance>> =
         std::collections::HashMap::new();
     for (controller, (_, after_entity)) in managers {
-        for mut link in sim.capture_link_coordinates(controller, rules) {
+        // `Simulation::capture_link_coordinates`, captured.
+        let links = frame
+            .object(controller)
+            .map_or(&[][..], |controller| controller.hud.capture_links());
+        for &link in links {
             // Phobos `CaptureManagerClass_DrawLinkToVictim`: compare the
             // controller type's `MindControlLink.VisibleToHouse=` with the
             // local player's house (CurrentPlayer).
@@ -57,22 +62,6 @@ pub(crate) fn prepare(
                 )
             {
                 continue;
-            }
-            if let Some(cache) = interpolation {
-                use super::interpolation::{PointKind, PointPose};
-                let sample = |kind, coord: DriveCoord| {
-                    let [x, y, z] = cache
-                        .sample_draw_point(
-                            kind,
-                            link.victim,
-                            PointPose::new([coord.x, coord.y, coord.z], 0, Some(controller)),
-                            sim.session().binary_frame(),
-                        )
-                        .coord;
-                    DriveCoord { x, y, z }
-                };
-                link.from = sample(PointKind::ControlSource, link.from);
-                link.to = sample(PointKind::ControlTarget, link.to);
             }
             let color = colors
                 .get(sim.interner().resolve(link.owner))

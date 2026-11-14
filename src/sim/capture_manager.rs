@@ -412,7 +412,6 @@ impl MindControlLink {
 
     /// Installed Ares KillDriver10045892 clears Techno+2CC explicitly;
     /// ordinary ChangeOwner deliberately preserves this separate controller.
-    #[cfg(feature = "ares")]
     pub(crate) fn clear_house_controller(&mut self) {
         self.house_controller = None;
     }
@@ -702,7 +701,7 @@ impl Simulation {
             .entities
             .get(controller_id)?
             .capture_manager
-            .as_ref()
+            .as_deref()
             .map(CaptureManagerState::count)
     }
 
@@ -780,6 +779,27 @@ impl Simulation {
             controller,
             CaptureVictimFacts::of(target, target_obj, self.session.binary_frame()),
         )
+    }
+
+    /// The announce=1 that CaptureUnit (`0x00471DAE`) and FreeUnit
+    /// (`0x004720D5`) pass to the target's ChangeOwner (vt+0x3D4). Only
+    /// `BuildingClass::ChangeOwner @ 0x00448260` reads it: radar event 10 and
+    /// `EVA_BuildingCaptured` for the player on either side. Run before the
+    /// owner swap, as that block reads the old owner.
+    fn announce_controlled_building(
+        &mut self,
+        target_id: u64,
+        new_owner: InternedId,
+        rules: &RuleSet,
+    ) {
+        if self
+            .substrate
+            .entities
+            .get(target_id)
+            .is_some_and(|target| target.category() == EntityCategory::Structure)
+        {
+            self.announce_building_capture(target_id, new_owner, rules);
+        }
     }
 
     /// `CaptureManagerClass::CaptureUnit @ 0x00471D40`.
@@ -927,6 +947,7 @@ impl Simulation {
         };
         // 0x00471DB8: ChangeOwner(controller's house, 1). It refuses only an
         // unchanged house, which CanCapture already excluded.
+        self.announce_controlled_building(target_id, controller_owner, rules);
         self.change_owner_with_rules(target_id, controller_owner, rules, registry, frame_effects);
         if let Some(manager) = self
             .substrate
@@ -1033,7 +1054,6 @@ impl Simulation {
     /// (vt+0xF8) and `PermaControlledAnimationType=` rings it
     /// (CreateMindControlRingAnim 10043F90 inlined: a building's ring at its
     /// height with ZAdjust -1024). Buildings are not refused.
-    #[cfg(feature = "ares")]
     pub(crate) fn ares_apply_perma_mc(
         &mut self,
         id: u64,
@@ -1083,7 +1103,6 @@ impl Simulation {
     /// UnInit and `ring` (`Dominator.ControlAnim`, else
     /// `PermaControlledAnimationType=`) rings it through
     /// CreateMindControlRingAnim. Unlike ApplyPermaMC it queues nothing.
-    #[cfg(feature = "ares")]
     pub(crate) fn ares_dominate(
         &mut self,
         id: u64,
@@ -1117,7 +1136,6 @@ impl Simulation {
 
     /// Installed Ares capture10045C03..10045C1C clears permanent control
     /// and UnInit's the ring after any controller's FreeUnit has finished.
-    #[cfg(feature = "ares")]
     pub(crate) fn clear_permanent_control_and_ring(&mut self, id: u64, rules: &RuleSet) {
         let ring = self.substrate.entities.get_mut(id).and_then(|object| {
             object.mind_control.permanent = false;
@@ -1208,8 +1226,9 @@ impl Simulation {
         // Phobos `BulletClass_Detonate` uses
         // `pWHExt->MindControl_Anim.Get(ControlledAnimationType)`.
         #[cfg(feature = "phobos")]
-        let ring_anim = rules
-            .warhead(self.interner.resolve(current.payload.warhead))
+        let ring_anim = self
+            .interner
+            .warhead_type(current.payload.warhead, rules)
             .and_then(|warhead| warhead.mind_control_anim.as_deref());
         #[cfg(not(feature = "phobos"))]
         let ring_anim: Option<&str> = None;
@@ -1437,6 +1456,8 @@ impl Simulation {
                     self.sound_events.emit(event);
                 }
             }
+            // 0x004720D5..0x004720DA: ChangeOwner(original house, 1).
+            self.announce_controlled_building(victim_id, original_owner, rules);
             self.change_owner_with_rules(victim_id, original_owner, rules, registry, frame_effects);
             // DecideUnitFate runs while `+0x2C0` still names the controller.
             // Back with its own house, the unit cannot join the controller's

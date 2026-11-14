@@ -18,14 +18,12 @@ use crate::sim::world::Simulation;
 /// Ares BuildingExt+4C SensorArrayActiveCounter: Activate (10016D60) counts
 /// every call and adds the sensors only from zero; Deactivate (10016DB0)
 /// removes them only while the count is positive, then clears it.
-#[cfg(feature = "ares")]
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(transparent)]
 pub(crate) struct SensorArrayCounter(i32);
 
-#[cfg(feature = "ares")]
 impl SensorArrayCounter {
     /// Counts one activation; true when it was the first, so the sensors go up.
     fn activate(&mut self) -> bool {
@@ -104,6 +102,9 @@ impl Simulation {
 
     /// FootClass::AddSensorsAt @ 0x004DE7B0 adds at the freshly sampled
     /// current cell. It neither removes an earlier add nor changes +55C.
+    /// A non-Foot object or a type without a sensor radius makes no deposit.
+    /// `FootClass::Unlimbo @ 0x004D7170` calls it last (`0x004D7318`), from
+    /// the shared reveal tail.
     pub(crate) fn add_unit_sensors_at_current(
         &mut self,
         id: u64,
@@ -223,26 +224,6 @@ impl Simulation {
             callbacks.extend(self.sensor_reevaluate_residents(cell, rules, registry));
         }
         callbacks
-    }
-
-    /// `FootClass::Unlimbo` sensor writer. A non-Foot object or a type without
-    /// a sensor radius makes no deposit.
-    /// `FootClass::Unlimbo @ 0x004D7170`'s sensor add (vt+0x4E8 at `0x004D7318`), at
-    /// the cell of the object it took out of limbo.
-    pub(crate) fn add_unit_sensor_after_unlimbo(
-        &mut self,
-        stable_id: u64,
-        rules: &RuleSet,
-        registry: Option<&OverlayTypeRegistry>,
-    ) {
-        if self
-            .substrate
-            .entities
-            .get(stable_id)
-            .is_some_and(|entity| !entity.lifecycle.in_limbo())
-        {
-            self.add_unit_sensors_at_current(stable_id, rules, registry);
-        }
     }
 
     /// `BuildingClass::Place @ 0x00445F80`'s sensor arm, inside its first-opening
@@ -389,7 +370,6 @@ impl Simulation {
     /// of AddSensorArrayAt455820: an online (vt+0x350, the shared4555D0
     /// adapter), not Deactivated building counts the call in BuildingExt+4C
     /// and adds its SensorsSight circle only when the count was zero.
-    #[cfg(feature = "ares")]
     pub(crate) fn ares_sensor_array_activate(
         &mut self,
         stable_id: u64,
@@ -405,7 +385,7 @@ impl Simulation {
         if entity.deactivated.is_offline() {
             return;
         }
-        if !entity.sensor_array_counter.activate() {
+        if !entity.ares.sensor_array_counter.activate() {
             return;
         }
         let Some((owner, center, sight)) =
@@ -427,7 +407,6 @@ impl Simulation {
     /// Ares BuildingClass_SensorArrayDeactivate10016DB0 (hook4556E1), the
     /// body of RemoveSensorArrayAt4556D0: only a positive count removes, with
     /// SensorsSight rather than CloakRadiusInCells, and clears the count.
-    #[cfg(feature = "ares")]
     pub(crate) fn ares_sensor_array_deactivate(
         &mut self,
         stable_id: u64,
@@ -437,7 +416,7 @@ impl Simulation {
         let Some(entity) = self.substrate.entities.get_mut(stable_id) else {
             return;
         };
-        if !entity.sensor_array_counter.deactivate() {
+        if !entity.ares.sensor_array_counter.deactivate() {
             return;
         }
         let Some((owner, center, sight)) =
@@ -461,7 +440,6 @@ impl Simulation {
     /// and454B5F, 10016E30) and DisableStuff (hook4524A3, 10016D00): an
     /// online, not Deactivated array is active; a change activates or
     /// deactivates it.
-    #[cfg(feature = "ares")]
     pub(crate) fn update_ares_sensor_array(
         &mut self,
         stable_id: u64,
@@ -479,7 +457,7 @@ impl Simulation {
         {
             return;
         }
-        let was_active = entity.sensor_array_counter.is_active();
+        let was_active = entity.ares.sensor_array_counter.is_active();
         let active = !entity.deactivated.is_offline()
             && self.building_operational_state(stable_id, rules) == Some(true);
         if active == was_active {
@@ -496,7 +474,6 @@ impl Simulation {
     /// ChangeOwnership_SensorArrayB10016CD0: a `SensorArray=` building
     /// dispatches RemoveSensorArrayAt (vt+0x4F8) or AddSensorArrayAt
     /// (vt+0x4F4) with the empty cell.
-    #[cfg(feature = "ares")]
     pub(crate) fn ares_sensor_array_dispatch(
         &mut self,
         stable_id: u64,
@@ -630,6 +607,41 @@ mod tests {
         // FootLimbo4DB376 removes the live owner's current-coordinate circle.
         sim.techno_limbo_with_rules(second, &rules, None);
         assert!(!sim.fog.has_sensor_for_house(soviet, 57, 30));
+    }
+
+    /// `FootClass::Unlimbo @ 0x004D7170` stamps the circle itself
+    /// (`0x004D7300..0x004D7318`), so a unit put back on the map by any
+    /// caller (a transport unload, a Squid letting go) senses at once, and a
+    /// spawn stamps once, not twice.
+    #[test]
+    fn every_foot_unlimbo_stamps_its_sensor_circle_exactly_once() {
+        let rules = rules();
+        let mut sim = sim_with_map_authority();
+        let id = sim
+            .spawn_object_at_height("DEST", "Americans", 40, 30, 0, 0, &rules)
+            .unwrap();
+        let owner = sim.substrate.entities.get(id).unwrap().owner();
+        let index = 30 * usize::from(sim.fog.width()) + 40;
+        assert_eq!(sim.fog.sensors_by_house()[&owner][index], 1);
+        sim.techno_limbo_with_rules(id, &rules, None);
+        assert_eq!(sim.fog.sensors_by_house()[&owner][index], 0);
+
+        let position = sim.substrate.entities.get(id).unwrap().position;
+        let outcome = sim.try_reveal_entity_with_context(
+            id,
+            crate::sim::world::RevealRequest {
+                position,
+                placement: crate::sim::world::PlacementEvidence::EvaluateMark,
+                logic_eligible: true,
+            },
+            crate::sim::world::UninitContext::with_rules(&rules),
+        );
+        assert!(matches!(
+            outcome,
+            crate::sim::world::RevealOutcome::Revealed { .. }
+        ));
+        assert_eq!(sim.fog.sensors_by_house()[&owner][index], 1);
+        assert!(sim.fog.has_sensor_for_house(owner, 33, 30));
     }
 
     /// A computer house's 2x2 NAPSIS read from a map's `[Structures]` at
@@ -767,6 +779,7 @@ mod tests {
                 .entities
                 .get(id)
                 .unwrap()
+                .ares
                 .sensor_array_counter
                 .count()
         };

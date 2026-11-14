@@ -298,7 +298,7 @@ mod tests {
             actor.set_archive_target(Some(TargetKind::Cell(6, 5)));
             sim.substrate.entities.insert(actor);
             sim.resolved_terrain = Some(terrain);
-            sim.zone_grid = Some(zones);
+            sim.zone_grid = Some(zones.into());
             sim.substrate.raw_cell_occupation = raw;
             sim.playfield_bounds = Some(bounds());
             sim.playfield_size_height = Some(8);

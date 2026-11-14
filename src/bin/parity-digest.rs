@@ -506,6 +506,24 @@ fn main() -> Result<(), String> {
                     summary.failures,
                     summary.effects,
                 );
+
+        }
+        _ => {
+            // F09: the synthetic run advances through the same bound-resource
+            // runtime transaction as everything else. Empty resources stand in
+            // for the "no rules loaded" contract the synthetic scenario always
+            // had; synthetic digests are self-comparable, not parity evidence.
+            let mut runtime = vera20k_core::sim::runtime::SimRuntime {
+                simulation: build_synthetic_simulation(args.seed),
+                resources: std::sync::Arc::new(vera20k_core::sim::runtime::SimResources::empty()),
+            };
+            for _ in 0..args.ticks {
+                runtime
+                    .advance_frame_for_tooling(&[], SIM_TICK_MS)
+                    .map_err(|error| error.to_string())?;
+                let digest = runtime.simulation.parity_digest();
+                sink.write(&digest)
+                    .map_err(|error| format!("digest write failed: {error}"))?;
             }
             println!("wrote {} digests to {}", sink.written(), args.out.display());
             return Ok(());

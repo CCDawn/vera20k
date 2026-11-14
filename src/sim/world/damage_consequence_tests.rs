@@ -119,9 +119,10 @@ fn advance_lethal_shot(sim: &mut Simulation, rules: &RuleSet, attacker: u64, vic
     panic!("the command must produce a lethal shot");
 }
 
-// Phobos `ROF.RandomDelay` (`0x006FD0B5`) redraws the full-rearm jitter, so
-// this stock golden only holds without the capability.
-#[cfg(not(feature = "phobos"))]
+// Phobos `ROF.RandomDelay` (`0x006FD0B5`) redraws the full-rearm jitter, and
+// Ares simulates the SparkSys itself (hooks 0x62DF05, 0x62FD60) with its own
+// draws, so this stock golden only holds without either capability.
+#[cfg(not(any(feature = "phobos", feature = "ares")))]
 #[test]
 fn ordinary_lethal_fire_commits_debris_animations_and_sparks_once() {
     let rules = consequence_rules();
@@ -176,7 +177,10 @@ fn ordinary_lethal_fire_commits_debris_animations_and_sparks_once() {
         delivery_sounds(&sim),
         ["DieA", "DEATHREPORT", "DESTROYREPORT"]
     );
-    assert_eq!(sim.particle_systems().len(), 1);
+    // No second spark system. This world has no terrain, so the first one's
+    // particles are refused their collision query and retire with their
+    // system (`tick_spark_system_with_query`) instead of holding it open.
+    assert_eq!(sim.particle_systems().len(), 0);
 }
 
 #[test]

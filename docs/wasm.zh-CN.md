@@ -6,17 +6,17 @@ Wasm 是与 macOS、Windows 和 Linux 并列的第四个可选构建目标，复
 
 ## 构建
 
-需要稳定版 Rust、Python 3.11 或更新版本，以及与 `Cargo.lock` 中 `wasm-bindgen` 版本一致的 `wasm-bindgen-cli`（当前为 0.2.114）。
+需要稳定版 Rust、Python 3.11 或更新版本，以及与 `Cargo.lock` 中 `wasm-bindgen` 版本一致的 `wasm-bindgen-cli`（当前为 0.2.127）。
 
 ```sh
 rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.114 --locked
+cargo install wasm-bindgen-cli --version 0.2.127 --locked
 python3 tools/wasm/build.py
 ```
 
-构建工具使用 `--target wasm32-unknown-unknown --no-default-features --features wasm`，按现有 `fast` profile 将客户端库构建为 `cdylib`，再将绑定代码和不含游戏资源的宿主页面打包到 `target/wasm-dist/`。可加 `--profile release` 使用 release 优化。工具会检查绑定 CLI 与 lockfile 的版本是否一致，并为引擎设置 8 MiB 的 Wasm 栈。桌面版的产物类型、默认 feature 和构建命令保持不变。
+构建工具使用 `--target wasm32-unknown-unknown --no-default-features --features wasm` 将客户端库构建为 `cdylib`，再将绑定代码和不含游戏资源的宿主页面打包到 `target/wasm-dist/`。默认使用玩家下载的 `wasm` profile：按体积优化、fat LTO、单个 codegen unit、不含符号名，构建耗时是 `fast` 的数倍（2026-11-09 实测：单人版 Wasm 为 16.5 MB，brotli 压缩后 4.6 MB；`fast` 为 45.6 MB 和 10.3 MB）。修改代码时可加 `--profile fast`，也可加 `--profile release`。工具会检查绑定 CLI 与 lockfile 的版本是否一致，并为引擎设置 8 MiB 的 Wasm 栈。它还会先为主机构建 `src/bin/snapshot-layout.rs`：浏览器版引擎把存档布局 ID（`VERA20K_SNAPSHOT_LAYOUT`）编译进去，而不是在运行时追踪存档类型。桌面版的产物类型、默认 feature 和构建命令保持不变。
 
-界面自带的字体中，浏览器版引擎只内嵌 Noto Sans。其余字体（Noto Sans CJK 及 19 种文字的字体，约 28 MB）连同许可证复制到 `pkg/fonts/`，引擎在文字首次需要只有某个字体才有的字符时（例如聊天里的泰文名字），从自身文件旁边获取该字体。托管该包的站点也必须提供这个目录。
+浏览器版引擎不内嵌任何界面字体。这些字体（Noto Sans、Noto Sans CJK 及 19 种文字的字体，约 30 MB）和 Unifont 的 CJK 字形表连同许可证复制到 `pkg/fonts/`。引擎加载后立即开始获取用于补画 GAME.FNT 缺字的 Noto Sans 和字形表，两者都到达后 `fonts_ready()` 才 resolve：调用 `start_game` 或 `start_spawn` 前需先 await 它，否则这两个函数会报错。其余字体在文字首次需要只有该字体才有的字符时（例如聊天里的泰文名字）才获取。托管该包的站点也必须提供这个目录。每个 URL 带有文件版本，浏览器在引擎更新后仍可沿用已缓存的字体。浏览器版不设置窗口图标。
 
 可选联机版的构建命令：
 
@@ -49,7 +49,7 @@ python3 -m http.server 8000 --bind 127.0.0.1 --directory target/wasm-dist
 
 ## 多线程构建（实验性）
 
-`--threads` 让模拟工作运行在由 Web Worker 组成的 Rayon 线程池上，可以和 `--network`、`--lan` 同时使用。它需要固定版本的 nightly，因为标准库要带 Wasm atomics 重新编译。桌面版和默认浏览器包仍使用 stable。
+`--threads` 让每个 tick 在绘制旁边的模拟 Web Worker 上运行，tick 内的并行工作运行在由 Web Worker 组成的 Rayon 线程池上，可以和 `--network`、`--lan` 同时使用。它需要固定版本的 nightly，因为标准库要带 Wasm atomics 重新编译。桌面版和默认浏览器包仍使用 stable。
 
 ```sh
 rustup toolchain install nightly-2026-10-15 --profile minimal --component rust-src --target wasm32-unknown-unknown
@@ -57,9 +57,9 @@ python3 tools/wasm/build.py --threads
 python3 tools/wasm/serve.py
 ```
 
-共享内存要求跨源隔离，所以页面必须带上 `Cross-Origin-Opener-Policy: same-origin` 和 `Cross-Origin-Embedder-Policy: require-corp` 响应头。`serve.py` 会发送这两个头；普通的 `http.server` 不会，此时宿主页面会提示缺少响应头。其他宿主同样要发送它们，并在 `init()` 之后等待 `initThreadPool(workers)` 完成；不调用时，这个包会串行执行模拟工作。
+共享内存要求跨源隔离，所以页面必须带上 `Cross-Origin-Opener-Policy: same-origin` 和 `Cross-Origin-Embedder-Policy: require-corp` 响应头。`serve.py` 会发送这两个头；普通的 `http.server` 不会，此时宿主页面会提示缺少响应头。其他宿主同样要发送它们，并在 `init()` 之后等待 `initThreadPool(workers)` 完成；不调用时，这个包会在主线程上串行执行模拟工作。
 
-渲染、音频和输入留在主线程，线程池工作时主线程自旋等待。这段时间主线程不运行引擎代码，因为在主线程等待有竞争的锁会 trap。结果不依赖线程池大小。Worker 上的 panic 会中止该 Worker，主线程会一直自旋，所以页面会卡死，而不是上报 `engine-error`。
+渲染、音频、输入和网络会话留在主线程，主线程从不等待其他线程，因为在主线程等待会 trap。页面还可以让 tick 在绘制旁边的模拟 Worker 上运行，和桌面版的模拟线程一样（[浏览器](sim-thread.md#the-browser)）。它默认关闭：在 `start_game` 或 `start_spawn` 之前调用 `set_simulation_thread("1")`（自带宿主页面用 `?simulation-thread=1`）。之后 tick 的开销超过发布一帧时，这一帧交给 Worker；`"always"` 把 Worker 能接的每一帧都交给它，`"0"` 保持关闭。tick 运行期间，页面绘制最近发布的帧，并把窗口事件留到 tick 回来后再处理。仍在主线程 tick 的帧（关闭 Worker 时是全部帧；否则是后面还有一轮的追帧、回放、网络恢复）在线程池工作期间自旋等待，不运行引擎代码。结果不依赖线程池大小，也不依赖 tick 在哪个线程运行。模拟 Worker 上的 panic 或 trap，或线程池 Worker 在它的 tick 中的 panic，会在下一帧以 `engine-error` 上报；线程池 Worker 在主线程 tick 中的 panic 仍会让主线程一直自旋，页面会卡死。
 
 ## 兼容边界
 

@@ -134,6 +134,8 @@ fn emit(
     let before = (sim.state_hash(), sim.rng_state());
     let before_runtime = serde_json::to_value(sim.anim(id).unwrap().runtime()).unwrap();
     let building = sim.entities().get(plant).unwrap();
+    let frame = crate::app::presentation::frame::PresentationFrame::capture(&scene.runtime);
+    let record = frame.object(plant).unwrap();
     let order = NativeDisplayOrder::from_display(sim.display_layers());
     let light = CellLightGrid::new();
     let cell = (building.position.rx(), building.position.ry());
@@ -156,7 +158,7 @@ fn emit(
     );
     observer.drawn_voxel = Some(false);
     let material = DrawState::for_building_slot_anims(
-        building,
+        record,
         sim.session().binary_frame(),
         super::super::units::house_color_to_remap_row(HouseColorIndex(0)),
         observer,
@@ -182,9 +184,12 @@ fn emit(
         &light,
         cell,
         sim,
+        &frame,
         local_owner,
-        building,
-        &|anim| super::super::overlays::slot_anim_admissible(sim, anim, camera, [800.0, 600.0]),
+        record,
+        &|anim| {
+            super::super::overlays::slot_anim_admissible(sim, &frame, anim, camera, [800.0, 600.0])
+        },
         &|_| 0,
         crate::render::batch::DepthAxis::NONE.origin_y,
         crate::render::batch::DepthAxis::NONE.world_height,
@@ -200,8 +205,8 @@ fn emit(
     let mut parents = Vec::new();
     build_display_effect_instances(
         &DisplayEffectInputs {
-            interpolation: None,
             sim,
+            frame: &frame,
             rules,
             camera,
             render_size: [800, 600],
@@ -322,7 +327,7 @@ fn retail_power_plant_slot_obeys_detail_without_pausing_its_ai() {
             (
                 ShpSpriteKey {
                     palette_context: context,
-                    type_id: "GAPOWR_A".to_owned(),
+                    type_id: "GAPOWR_A".into(),
                     facing: 0,
                     frame: frame as u16,
                     house_color: HouseColorIndex(0),

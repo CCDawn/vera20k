@@ -41,7 +41,8 @@
 //! - A placed object plays the building type's `CreateUnitSound=`
 //!   (`+0xE74`, read at `0x004607C8..0x004607F8`) at the building
 //!   (`0x00450198`); among retail types only the Cloning Vats set it, which
-//!   have no `Factory=`.
+//!   have no `Factory=`. `HouseClass::Place_Production` plays the same key
+//!   for a player's delivery (`0x004FB50D`), also unported.
 //! - The try-later branch also copies an uninitialised stack word into the
 //!   timer's middle field (`+0x554`, `0x004501F1`), which no reader uses.
 //! - Mobile products leave through [`exit_produced_object`], the same
@@ -204,7 +205,7 @@ fn exit_finished_object(
             let frame = sim.session.binary_frame() as i32;
             let delay = rules.general.placement_delay_frames();
             if let Some(entity) = sim.substrate.entities.get_mut(building) {
-                entity.ai_placement_timer.restart(frame, delay);
+                entity.building.ai_placement_timer.restart(frame, delay);
             }
         }
         BuildingExit::Failed => {
@@ -433,7 +434,7 @@ fn placement_wait_over(sim: &Simulation, building: u64) -> bool {
     sim.substrate
         .entities
         .get(building)
-        .is_some_and(|entity| entity.ai_placement_timer.expired(frame))
+        .is_some_and(|entity| entity.building.ai_placement_timer.expired(frame))
 }
 
 /// NP `BuildingClass::Factory_AI` count comparison: NPSE #359

@@ -366,7 +366,7 @@ pub(crate) fn may_speak(state: &AppState) -> bool {
         && state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .is_some_and(|runtime| {
                 runtime.simulation.session().game_mode() == ScenarioGameMode::Skirmish
             })
@@ -384,19 +384,6 @@ pub(crate) fn may_speak(state: &AppState) -> bool {
 /// router takes the result, never when the simulation publishes it.
 pub(crate) fn holds_terminal_outcome(state: &AppState) -> bool {
     state.persistence.options_profile.custom_end_game_movie && may_speak(state)
-}
-
-/// Whether this match's verdict waited for a clip at all.
-///
-/// The exit router reads this for the result's theme, which started when the
-/// wait opened so the rest of the clip plays over it. A verdict that never
-/// waited starts it on retail's own timing.
-pub(crate) fn verdict_was_held_for_a_clip(state: &AppState) -> bool {
-    state
-        .match_state
-        .match_presentation
-        .commander_feedback
-        .verdict_held
 }
 
 /// Whether the result's own EVA line is withheld for a clip.
@@ -436,15 +423,11 @@ pub(crate) fn take_withheld_verdict_line(state: &mut AppState) -> bool {
 /// The simulation has published the result on its own frame, and the app runs
 /// no further frame while the result waits (`App::service_match_runtime_once`),
 /// so this delays only the router: the card, the teardown and the score page.
-/// The first call opens the wait, stops the score page's clock and switches
-/// the battlefield theme. The wait ends once this layer has looked at the
-/// world again and neither its own queue nor the radar FIFO holds a clip, or
-/// after [`MAX_HELD_RESULT_MS`]; it never re-opens.
-pub(crate) fn owe_the_verdict_a_clip(
-    state: &mut AppState,
-    outcome: crate::sim::house_state::HouseOutcomeKind,
-    wall_ms: u64,
-) -> bool {
+/// The first call opens the wait and stops the score page's clock. The wait
+/// ends once this layer has looked at the world again and neither its own
+/// queue nor the radar FIFO holds a clip, or after [`MAX_HELD_RESULT_MS`]; it
+/// never re-opens.
+pub(crate) fn owe_the_verdict_a_clip(state: &mut AppState, wall_ms: u64) -> bool {
     let feedback = &state.match_state.match_presentation.commander_feedback;
     if feedback.verdict_released {
         return false;
@@ -472,7 +455,6 @@ pub(crate) fn owe_the_verdict_a_clip(
         // open wait keeps it stopped through the clip's own pause and resume
         // ([`CommanderFeedback::result_waits`]).
         state.match_state.scenario_elapsed_clock.pause(wall_ms);
-        crate::app::match_runtime::sim_tick::start_verdict_theme(state, outcome, wall_ms);
         return true;
     };
     let outstanding = !feedback.queue.is_empty() || crate::app::radar_movie::has_pending(state);
@@ -505,7 +487,7 @@ fn house_name(state: &AppState, house: InternedId) -> String {
     state
         .match_state
         .sim_runtime
-        .as_ref()
+        .runtime()
         .map(|runtime| runtime.simulation.resolve(house).to_string())
         .unwrap_or_else(|| format!("{house:?}"))
 }
@@ -540,7 +522,7 @@ fn say_the_verdict_line_when_clear(state: &mut AppState) {
     {
         return;
     }
-    let Some(outcome) = state.match_state.sim_runtime.as_ref().and_then(|runtime| {
+    let Some(outcome) = state.match_state.sim_runtime.runtime().and_then(|runtime| {
         let sim = &runtime.simulation;
         sim.houses().get(&sim.session().current_house()?)?.outcome()
     }) else {
@@ -577,7 +559,7 @@ impl CommanderFeedback {
     /// Read-only sweep. `None` means the layer does not apply at all this
     /// frame; an empty pair means it applies but nothing happened.
     fn observe(&mut self, state: &AppState) -> Option<(Vec<Observed>, Vec<Scan>)> {
-        let runtime = state.match_state.sim_runtime.as_ref()?;
+        let runtime = state.match_state.sim_runtime.runtime()?;
         let sim = &runtime.simulation;
         // `game_mode_nonzero()` is true for LAN, WOL *and* skirmish, so it
         // cannot stand in for "this is a skirmish"; only mode 5 is one.

@@ -59,14 +59,12 @@ pub use self::production_queue::{
     dispatch_production_changes_for_tests, publish_production_changes_for_tests,
 };
 pub(crate) use self::production_refinery::spawn_building_free_unit;
-pub use self::production_repair::can_repair_building;
 pub use self::production_repair::{RepairControl, repair_step_cost, toggle_repair};
+pub use self::production_repair::{buildings_wanting_repair, can_repair_building};
 pub(crate) use self::production_repair::{engineer_repair, update_repair_and_power};
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use self::production_sell::begin_selling;
-#[cfg(feature = "ares")]
 pub use self::production_sell::foot_can_be_sold;
-#[cfg(feature = "ares")]
 pub(crate) use self::production_sell::foot_on_sold;
 pub(crate) use self::production_sell::sell_back;
 #[cfg(any(test, feature = "test-support"))]
@@ -90,12 +88,9 @@ pub use self::production_types::*;
 
 // Re-exports for external consumers (files outside production/ that previously
 // imported private submodules directly).
-#[cfg(feature = "ares")]
 pub(crate) use self::can_build::ares_build_limit_remaining;
-#[cfg(feature = "ares")]
 pub(crate) use self::can_build::owns_prerequisites;
 pub use self::can_build::{CanBuild, can_build};
-#[cfg(feature = "ares")]
 pub(crate) use self::can_build::{RequirementStatus, requirements_met};
 pub use self::can_build::{can_select_factory_primary, find_factory, object_find_factory};
 pub(crate) use self::can_build::{initialize_factory_primary, toggle_factory_primary};
@@ -109,8 +104,8 @@ pub(in crate::sim) use self::factory_lifecycle::construct_active_factory_fixture
 #[cfg(any(test, feature = "test-support"))]
 pub(in crate::sim) use self::factory_lifecycle::release_delivered_mobile;
 pub(in crate::sim) use self::factory_lifecycle::{
-    abandon_house_factories, detach_building_production, recalculate_strips,
-    refresh_factory_rates_for_house, step_factories, update_factory_queue,
+    abandon_house_factories, delete_building_factory, detach_building_production,
+    recalculate_strips, refresh_factory_rates_for_house, step_factories, update_factory_queue,
 };
 pub(in crate::sim) use self::production_queue::exit_produced_object;
 pub(crate) use self::production_tech::factory_category_for_building;

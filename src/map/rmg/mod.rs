@@ -6,7 +6,10 @@
 
 pub mod build;
 mod description;
+pub mod embellish;
 pub mod emit;
+pub mod extras;
+pub mod fairness;
 pub mod grid;
 pub mod options;
 pub mod phases;
@@ -52,6 +55,9 @@ pub enum Stage {
     TechBuildings,
     Tiberium,
     RegionReset,
+    /// Urban areas (`0x005A5020`): Ares hook 0x598FB8 when `RMG::UrbanAreas`
+    /// is set, or VERA's opted-in Urban Presence.
+    UrbanAreas,
     RecalcAfterTiberium,
     Hills,
     LatPatches,
@@ -88,6 +94,7 @@ pub const STAGE_ORDER: &[Stage] = &[
     Stage::TechBuildings,
     Stage::Tiberium,
     Stage::RegionReset,
+    Stage::UrbanAreas,
     Stage::RecalcAfterTiberium,
     Stage::Hills,
     Stage::LatPatches,
@@ -255,6 +262,9 @@ pub struct GeneratedMap {
     /// Start slots no region could fill. Non-zero means this map is short of
     /// spawns: fewer usable start positions than the player count implies.
     pub unfilled_start_slots: usize,
+    /// VERA extension: what the map offers each start (`fairness`), for the
+    /// dialog's readout. `None` for a map no generation run measured.
+    pub fairness: Option<fairness::FairnessReport>,
 }
 
 impl GeneratedMap {
@@ -282,6 +292,9 @@ pub fn executed_stages(options: &RmgOptions) -> Vec<Stage> {
                 return false;
             }
             if *stage == Stage::Rocks && options.theater != 0 {
+                return false;
+            }
+            if *stage == Stage::UrbanAreas && !options.urban_pass_runs() {
                 return false;
             }
             true

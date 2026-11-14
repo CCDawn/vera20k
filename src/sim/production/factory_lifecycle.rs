@@ -1087,8 +1087,9 @@ pub(in crate::sim) fn construct_active_factory_fixture(
 ///
 /// A retained head with only offline factories enters Suspend(0); a later
 /// callback with an online factory resumes only a system hold (+70 && !+71).
-/// Temporal start/stop has no native509140 callback. The independent
-/// GoOnline/GoOffline owner calls here at452337/452403.
+/// Temporal start/stop has no native509140 callback; Ares adds one (hooks
+/// `0x004521C8`, `0x00452218`: `Simulation::ares_refresh_temporal_factories`).
+/// The independent GoOnline/GoOffline owner calls here at452337/452403.
 pub(in crate::sim) fn update_factory_queue(
     sim: &mut Simulation,
     rules: &RuleSet,
@@ -1099,8 +1100,7 @@ pub(in crate::sim) fn update_factory_queue(
     // Ares 3.0 HouseClass_Update_Factories_Queues 10025100 (hook 0x00509140)
     // first runs the BuildingType/DontCare call again for BuildCat::Combat,
     // so the defense strip's queue follows its construction yards too.
-    #[cfg(feature = "ares")]
-    if category == ProductionCategory::Building {
+    if rules.ares_form() && category == ProductionCategory::Building {
         update_factory_queue(sim, rules, owner, ProductionCategory::Defense, effects);
     }
     let queued: Vec<_> = sim
@@ -1198,6 +1198,25 @@ pub(in crate::sim) fn update_factory_queue(
             .factories_mut()
             .remove_factory(FactoryHolder::House(owner, category));
     }
+}
+
+/// The Building destructor's scalar delete of its Factory (`+0x524`,
+/// `0x0043BF40..0x0043BF51`). `FactoryClass::~FactoryClass @ 0x004C9A10`
+/// leaves the factory vector and, while the game is active, abandons what it
+/// holds first (`0x004C9A7F..0x004C9A8A` -> `0x004C9FF0`).
+pub(in crate::sim) fn delete_building_factory(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    building: u64,
+    effects: FrameEffects<'_>,
+    game_active: bool,
+) {
+    if game_active {
+        super::factory_ai::detach_all(sim, rules, building, effects);
+    }
+    sim.production
+        .factories_mut()
+        .remove_building_factory(building);
 }
 
 /// BuildingDetach44EBF0's production prelude, shared by Conceal and the

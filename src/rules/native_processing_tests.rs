@@ -4,6 +4,44 @@ use super::*;
 use crate::util::save_codec;
 
 #[test]
+fn weapon_types_register_before_animation_reads_each_rules_layer() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let mut layers = RulesLayerStack::new(IniFile::from_str(
+        "[Animations]\n0=AURA\n1=UNKNOWN\n\
+         [WeaponTypes]\n0=EARLY\n\
+         [EARLY]\nDamage=1\n[LATE]\nDamage=2\n[UNLISTED]\nDamage=3\n",
+    ));
+    layers.push(
+        RulesLayerKind::Scenario,
+        IniFile::from_str("[WeaponTypes]\n0=LATE\n[LATE]\nDamage=4\n"),
+    );
+    let art = IniFile::from_str("[AURA]\nWeapon=LATE\n[UNKNOWN]\nWeapon=UNLISTED\n");
+    let processed = layers.process_with_fixed_art(&art).unwrap();
+    let mut rules = RuleSet::from_processed_rules(&processed).unwrap();
+    rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
+    assert!(rules.weapon("EARLY").is_some());
+    assert!(rules.weapon("LATE").is_some());
+    assert!(rules.weapon("UNLISTED").is_none());
+    assert_eq!(
+        rules
+            .art()
+            .anim_runtime_config("AURA")
+            .unwrap()
+            .ares_weapon
+            .as_deref(),
+        Some("LATE")
+    );
+    assert!(
+        rules
+            .art()
+            .anim_runtime_config("UNKNOWN")
+            .unwrap()
+            .ares_weapon
+            .is_none()
+    );
+}
+
+#[test]
 fn civilian_type_reads_preserve_physical_layers_save_and_reset() {
     // InfantryType5237A1/52455F: own-ID bool, false only at construction.
     let root = |civilian: &str| {
@@ -335,9 +373,9 @@ fn airburst_retained_flag_changes_effective_rules_hash() {
     );
 }
 
-#[cfg(feature = "ares")]
 #[test]
 fn ares_emp_ai_named_mission_reader_matches_native_histories() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     let corpus = crate::test_fixture::json("tools/rules_oracle/ares_emp.json");
     for row in corpus["ai_mission_readers"].as_array().unwrap() {
         let mut controls = AresGlobalControls::default();
@@ -2482,7 +2520,7 @@ fn native_startup_prepass_repeat_and_reset_keep_each_phase_on_one_registry_owner
     assert_eq!(prepass.registry_state().rules_tree_strength, 375);
     assert_eq!(
         prepass_boundaries,
-        if crate::rules::ARES_ENABLED {
+        if crate::rules::ARES_BUILD {
             [1, 2, 3]
         } else {
             [1, 2, 6]
@@ -2494,7 +2532,7 @@ fn native_startup_prepass_repeat_and_reset_keep_each_phase_on_one_registry_owner
             .iter()
             .map(|event| (event.family(), event.native_stored_id()))
             .collect::<Vec<_>>(),
-        if crate::rules::ARES_ENABLED {
+        if crate::rules::ARES_BUILD {
             vec![
                 (NativeTypeConstructorFamily::HouseType, "HOUSE"),
                 (NativeTypeConstructorFamily::AnimType, "PREANIM"),
@@ -2735,6 +2773,39 @@ fn techno_weapon_bank_uses_effective_native_gates_and_elite_slot_order() {
             .iter()
             .all(|id| !matches!(*id, "WRONG" | "ALSO_WRONG" | "MAP_WRONG"))
     );
+}
+
+/// Only a read the Ares way grows the weapon arrays past the eighteen (Ares
+/// loader 10040020), and a build restores only Rules read a way it reads: a
+/// saved stock registry holding extension slots is refused before projection.
+#[test]
+fn saved_rules_refuse_ares_weapon_slots_and_modes_this_build_never_reads() {
+    let processed = RulesLayerStack::new(IniFile::from_str(
+        "[VehicleTypes]\n0=UNIT\n[UNIT]\nPrimary=GUN\n",
+    ))
+    .process()
+    .unwrap();
+    let mut saved = serde_json::to_value(processed).unwrap();
+    let registry = &mut saved["native_type_construction_trace"]["registry_state"];
+    registry["reads_ares_way"] = false.into();
+    registry["ares_armors"] = serde_json::Value::Null;
+    registry["ares_prerequisites"] = serde_json::Value::Null;
+    let validate = |saved: &serde_json::Value| {
+        serde_json::from_value::<ProcessedRulesLayers>(saved.clone())
+            .unwrap()
+            .validate_saved_state()
+    };
+    // A build with the `ares` feature reads only the Ares way.
+    assert_eq!(
+        validate(&saved).is_ok(),
+        !crate::rules::ares_switch::reading_mode(false)
+    );
+    saved["native_type_construction_trace"]["registry_state"]["families"]["Vehicle"][0]["weapon_slots"]
+        ["extra_base"] = serde_json::json!(["GUN"]);
+    assert!(matches!(
+        validate(&saved),
+        Err(crate::rules::error::RulesError::InvalidSavedState(_))
+    ));
 }
 
 /// TiberiumRead721B20..721C1E, RulesRead66BC37..66BC51 and Process668F65:
@@ -4304,7 +4375,7 @@ fn ares_palette_requests_use_retained_names_and_resolve_each_loaded_group() {
         .unwrap();
     assert_eq!(first_name, "first");
     let second = rules.load_extra_building_palette(&assets, "tem", Some("second"));
-    assert_eq!(second.is_some(), crate::rules::ARES_ENABLED);
+    assert_eq!(second.is_some(), crate::rules::ARES_BUILD);
     if let Some((name, palette)) = second {
         assert_eq!(name, "second");
         assert_ne!(palette.to_rgba_bytes(), first.to_rgba_bytes());
@@ -4327,9 +4398,9 @@ fn ares_palette_requests_use_retained_names_and_resolve_each_loaded_group() {
 /// over the 1002A360 defaults and two passes: invalid values keep the
 /// earlier read, the CSF label is kept, and InfantryElectrocuted is a
 /// Find-only pointer an unknown later name does not clear.
-#[cfg(feature = "ares")]
 #[test]
 fn ares_general_rules_read_before_and_after_type_data() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     use crate::rules::ruleset::RuleSet;
     let defaults = AresGeneralRules::default();
     assert!(defaults.enemy_wrench() && !defaults.team_retaliate);
@@ -4365,9 +4436,9 @@ fn ares_general_rules_read_before_and_after_type_data() {
 /// The InfDeath=5 anim under Ares (InfantryClass_ReceiveDamage_ElectricDeath
 /// 1002C930, hook 0x518744): InfantryElectrocuted, else the registered
 /// `ELECTRO`, else the second AnimType.
-#[cfg(feature = "ares")]
 #[test]
 fn ares_electric_death_takes_infantry_electrocuted_then_electro() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     use crate::rules::ruleset::RuleSet;
     let death = |ini: &str| {
         RuleSet::from_ini(&IniFile::from_str(ini))
@@ -4391,9 +4462,9 @@ fn ares_electric_death_takes_infantry_electrocuted_then_electro() {
 /// HouseTypeExt LoadFromINIFile (1001C5D0) reads
 /// `StartInMultiplayer.WithConst` (Valueable<bool>, constructor false) right
 /// before GivesBounty; the parent copy (1001BDC0) does not copy it.
-#[cfg(feature = "ares")]
 #[test]
 fn ares_country_reads_start_in_multiplayer_with_const() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     let processed = RulesLayerStack::new(IniFile::from_str(
         "[Countries]\n0=PARENT\n1=CHILD\n2=PLAIN\n\
          [PARENT]\nStartInMultiplayer.WithConst=yes\n\

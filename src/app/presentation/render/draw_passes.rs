@@ -360,7 +360,15 @@ pub(super) fn dispatch_draw_passes(
     view: &wgpu::TextureView,
     data: &DrawPassData<'_>,
 ) {
-    // The posed voxel images the world draws sample.
+    // The voxel pictures this frame drew on first use, and the posed voxel
+    // images the world draws sample.
+    if let Some(atlas) = state.match_state.match_presentation.unit_atlas.as_mut() {
+        atlas.upload(
+            &state.renderer.gpu.device,
+            &state.renderer.gpu.queue,
+            &state.renderer.batch_renderer,
+        );
+    }
     state.renderer.vxl_pose_frame_cache.borrow_mut().encode(
         &state.renderer.gpu.device,
         &state.renderer.gpu.queue,
@@ -526,6 +534,25 @@ pub(super) fn dispatch_draw_passes(
         pass.set_scissor_rect(tac_x, tac_y, tac_w, tac_h);
     }
 
+    let bracket_tex = state
+        .match_state
+        .match_presentation
+        .selection_overlay
+        .as_ref()
+        .map(|o| o.white_texture());
+    // VERA ground marks (the formation line's dots, the ferry's pick-up and
+    // drop circles) lie on the ground. They follow the kept terrain picture,
+    // so are never stored in it, and precede the fogged snapshots, the
+    // building bases and every object, which cover them. Surface stores: no
+    // Z read or write.
+    draw_pooled_surface_lines(
+        &mut pass,
+        &state.renderer.batch_renderer,
+        pool,
+        bracket_tex,
+        "ground_marks",
+    );
+
     // Cell::DrawOverlay_Shadow0047F510 uses native destination halving and
     // read/write Z after all overlay bodies. End the ordinary pass before the
     // shared renderer snapshots the same live color/depth attachments. Its
@@ -653,12 +680,6 @@ pub(super) fn dispatch_draw_passes(
         pass.set_scissor_rect(tac_x, tac_y, tac_w, tac_h);
     }
 
-    let bracket_tex = state
-        .match_state
-        .match_presentation
-        .selection_overlay
-        .as_ref()
-        .map(|o| o.white_texture());
     // Original6D4648 draws the first rally pass BEFORE the object loop at
     // 6D465F. Building bases have already primed Z; mobile bodies and Anim
     // slots can cover the line. The second pass follows effects and BandBox.
@@ -1224,10 +1245,22 @@ pub(super) fn dispatch_draw_passes(
             "outcome_text",
         );
     }
+    // VERA: the pictures of the buttons a layout adds over the battlefield,
+    // from the sidebar's picture atlas, after the tactical view's own last
+    // draw: screen-fixed, clipped to the view, and zoomed with the frame.
+    draw_pooled_ui_passthrough(
+        &mut pass,
+        &state.renderer.batch_renderer,
+        pool,
+        crate::app::presentation::sidebar_render::current_sidebar_chrome(state)
+            .map(|atlas| &atlas.texture),
+        "layout_field_art",
+    );
 
     // Original4F4480's53BAE0 gate skips tactical redraw during ChronoScreen,
     // but sidebar/UI still follow. Surface stores therefore precede chrome.
     drop(pass);
+    let bar_under = state.sidebar_frame().places().bar == Some(crate::ui::sidebar::Edge::Bottom);
     state
         .match_state
         .match_presentation
@@ -1237,6 +1270,7 @@ pub(super) fn dispatch_draw_passes(
             encoder,
             state.renderer.game_frame_texture(),
             [tac_x, tac_y, tac_w, tac_h],
+            bar_under,
         );
     let page_draw = crate::app::frontend::skirmish_shell_render::in_match_page_draw(state);
     let mut pass = begin_main_load_pass(encoder, view, frame_depth);
@@ -1706,6 +1740,17 @@ mod tests {
             .expect("production source before tests")
             .find(needle)
             .unwrap_or_else(|| panic!("missing production draw anchor {needle:?}"))
+    }
+
+    #[test]
+    fn ground_marks_follow_the_kept_ground_and_precede_buildings_and_objects() {
+        let kept = source_offset(".keep(&state.renderer.gpu.device, encoder)");
+        let marks = source_offset("\"ground_marks\"");
+        let fogged = source_offset("pool.get(\"fogged_objects\")");
+        let building_bases = source_offset("ObjectDrawPhase::BuildingBase");
+        let objects = source_offset("for layer in 0..=3 {");
+        assert!(kept < marks, "the kept ground must not store the marks");
+        assert!(marks < fogged && marks < building_bases && marks < objects);
     }
 
     #[test]
