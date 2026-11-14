@@ -561,8 +561,10 @@ fn rebuild_super_players_for(
             // staffed: the map's triggers drive its waves, so a Super tier
             // seated there (PresidentDefense22 slot G) plays the map's
             // puppet instead of a base-building persona — its native AI
-            // already stood down through `command_driven`.
-            Some(*house) != wave_host
+            // already stood down through `command_driven`. (`houses()`
+            // yields by reference and `filter` lends the item, hence the
+            // double deref against the by-value host id.)
+            Some(**house) != wave_host
                 && state.command_driven()
                 && !state.multiplay_passive()
                 && !state.is_human()
