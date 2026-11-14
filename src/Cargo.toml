@@ -24,7 +24,6 @@ path = "bin/parity-digest.rs"
 name = "snapshot-layout"
 path = "bin/snapshot-layout.rs"
 
->>>>>>> origin/main
 # External two-client LAN fault proof; absent from normal game builds.
 [[bin]]
 name = "lan-fault-proxy"

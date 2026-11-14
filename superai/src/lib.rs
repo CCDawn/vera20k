@@ -18247,7 +18247,7 @@ impl SuperAi {
                 entity.owner() == self.house
                     && entity.category() == vera20k_core::map::entities::EntityCategory::Structure
                     && entity.lifecycle.object_alive()
-                    && entity.repairing.is_on()
+                    && entity.building.repairing.is_on()
             })
         {
             self.repairing_structure = None;
@@ -18270,7 +18270,7 @@ impl SuperAi {
                 || entity.category() != vera20k_core::map::entities::EntityCategory::Structure
                 || entity.lifecycle.in_limbo()
                 || !entity.lifecycle.object_alive()
-                || entity.repairing.is_on()
+                || entity.building.repairing.is_on()
             {
                 continue;
             }
@@ -24749,7 +24749,7 @@ mod tests {
                         .object("GAREFN")
                         .expect("the retail refinery type")
                         .strength;
-                    entity.repairing.is_on() || entity.health.is_full(strength)
+                    entity.building.repairing.is_on() || entity.health.is_full(strength)
                 }),
             "the activation left the refinery repairing (or repaired)"
         );

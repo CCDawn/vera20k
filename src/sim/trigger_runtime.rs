@@ -6382,7 +6382,6 @@ impl TriggerRuntime {
     }
 }
 
-#[cfg(feature = "ares")]
 #[path = "trigger_runtime_ares.rs"]
 mod ares;
 

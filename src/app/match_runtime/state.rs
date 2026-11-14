@@ -122,7 +122,7 @@ impl MatchState {
         let defense_ai = self.defense_ai_enabled;
         self.super_players = self
             .sim_runtime
-            .as_mut()
+            .home_runtime_mut()
             .map(|rt| {
                 rebuild_super_players_for(&mut rt.simulation, &rt.resources.rules, defense_ai)
             })

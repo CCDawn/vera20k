@@ -133,6 +133,12 @@ impl SimHost {
         self.runtime.as_ref()
     }
 
+    /// The live runtime mutably while it is home; `None` while a tick has
+    /// it. The command-layer driver seating never runs beside a lent tick.
+    pub(crate) fn home_runtime_mut(&mut self) -> Option<&mut SimRuntime> {
+        self.runtime.as_mut()
+    }
+
     pub(crate) fn is_installed(&self) -> bool {
         self.lent || self.runtime.is_some()
     }
