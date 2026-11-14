@@ -49,6 +49,30 @@ along the wave approaches, garrisons and quality units held in reserve:
   </tr>
 </table>
 
+### Skirmish AI showcase（对战 AI 展示）
+
+The same opponent in open skirmish — massed armor staged for the push, a tech base with
+superweapons charging, and a fortified stronghold at scale:
+
+<table>
+  <tr>
+    <td><img src="docs/images/skirmish-ai/massed-armor-push.png" alt="Massed armor and infantry staged for the push" width="100%"></td>
+    <td><img src="docs/images/skirmish-ai/yuri-base-superweapons.png" alt="Yuri base at full tech with superweapons charging" width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center">集结：装甲洪流与步兵集群待命推进</td>
+    <td align="center">运营：尤里全科技、超武倒计时</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/skirmish-ai/fortified-stronghold.png" alt="A fortified stronghold with hundreds of units at scale" width="100%"></td>
+    <td></td>
+  </tr>
+  <tr>
+    <td align="center">规模：要塞化基地，百级单位驻防</td>
+    <td></td>
+  </tr>
+</table>
+
 VERA20K is made by gamers, for gamers, and gamers have the final say in where it goes.
 
 <img src="docs/images/vera20k-screenshots.png" alt="VERA20K skirmish setup screen and in-game view" width="100%">
