@@ -74,22 +74,25 @@ Survival of the Fittest V2、Face of Death 等。
 开局后在日志中确认两行（日志位置：exe 同目录 `logs/ra2.log`）：
 
 ```
-[DEF-AI] map classified: defense-map=true (spawn-triggers=N)   ← 识别为防守图
+[DEF-AI] map classified: defense-map=true (spawn-triggers=N, wave-host-seat=true)   ← 识别为防守图
 [DEF-AI] tick=600 house=Computer1 stance=B power=... ring=... corridor=...
 ```
 
+- `wave-host-seat=true`：波次刷兵触发器集中归属的席位（波主）已识别，
+  坐在该席位上的 AI 自动让位，只当波次房主，不参与协防建设。
 - `stance=A`：独立防区模式（各自守各自的锚点与路线）。
 - `stance=B`：共享目标协防模式（图上存在 1–3 个共享保护目标时启用；
   全体 AI 在同一目标环上分扇驻守、按基地距离认领进攻路线）。
 
-对战图（无波次机器、或波主是被驱动的对战 AI）不会武装防守人格，
+对战图（无波次机器、波次刷兵也不集中于一个席位）不会武装防守人格，
 行为与常规对战 AI 一致。
 
 ## 7. 已知边界
 
 - 判负规则差异仅作用于防守形态：对战图恢复“打空即负”的原版判定。
 - 防守图的波次房主席位若为空（无人、无 AI 的席位），波次队伍可能无法
-  生成——按 CnCNet 生存图的惯例给波主席位留一个 AI 即可。
+  生成——按 CnCNet 生存图的惯例给波主席位留一个 AI 即可；坐普通 AI
+  或超级 AI 都行，超级 AI 坐上去会自动让位当波主。
 - 地图名含中文等非 Latin-1 字符时，选图列表回退显示文件名
   （引擎菜单字体无中文字形）。
 

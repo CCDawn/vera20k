@@ -535,13 +535,16 @@ fn rebuild_super_players_for(
     // every install. Its verdict gates the defeat gate's future-reinforcement
     // hold (`world::house_defeat`), so it also runs with the switch off — an
     // ordinary match only gains that field write. One INFO line per armed
-    // install carries the verdict and the armed spawn-trigger count the
-    // verdict read.
-    let (defense_map, spawn_triggers) = simulation.defense_map_classification(&driven, rules);
+    // install carries the verdict, the armed spawn-trigger count and the
+    // dominant wave-host route the verdict read.
+    let (defense_map, spawn_triggers, wave_host) =
+        simulation.defense_map_classification(&driven, rules);
     simulation.set_defense_map_form(defense_map);
     if defense_ai {
         log::info!(
-            "[DEF-AI] map classified: defense-map={defense_map} (spawn-triggers={spawn_triggers})"
+            "[DEF-AI] map classified: defense-map={defense_map} \
+             (spawn-triggers={spawn_triggers}, wave-host-seat={})",
+            wave_host.is_some()
         );
     }
     // Each house carries its launch tier mark; saves from before the mark
@@ -553,8 +556,16 @@ fn rebuild_super_players_for(
     )> = simulation
         .houses()
         .iter()
-        .filter(|(_, state)| {
-            state.command_driven() && !state.multiplay_passive() && !state.is_human()
+        .filter(|(house, state)| {
+            // The crowned wave host stands down however its seat is
+            // staffed: the map's triggers drive its waves, so a Super tier
+            // seated there (PresidentDefense22 slot G) plays the map's
+            // puppet instead of a base-building persona — its native AI
+            // already stood down through `command_driven`.
+            Some(*house) != wave_host
+                && state.command_driven()
+                && !state.multiplay_passive()
+                && !state.is_human()
         })
         .map(|(house, state)| {
             (

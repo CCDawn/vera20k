@@ -2866,14 +2866,16 @@ impl Simulation {
         value: Option<i32>,
     ) {
         if self.trigger_runtime.trigger_trace_enabled {
-            self.trigger_runtime.trigger_trace.push(HeadlessTriggerEvent {
-                trigger,
-                event,
-                action: Some(action),
-                value,
-                ok: None,
-                detail: None,
-            });
+            self.trigger_runtime
+                .trigger_trace
+                .push(HeadlessTriggerEvent {
+                    trigger,
+                    event,
+                    action: Some(action),
+                    value,
+                    ok: None,
+                    detail: None,
+                });
         }
     }
 
@@ -2894,14 +2896,16 @@ impl Simulation {
     /// authored text) even though it also travels its own frame channel.
     fn record_trigger_trace_effect(&mut self, action: i32, detail: String) {
         if self.trigger_runtime.trigger_trace_enabled {
-            self.trigger_runtime.trigger_trace.push(HeadlessTriggerEvent {
-                trigger: None,
-                event: None,
-                action: Some(action),
-                value: None,
-                ok: None,
-                detail: Some(detail),
-            });
+            self.trigger_runtime
+                .trigger_trace
+                .push(HeadlessTriggerEvent {
+                    trigger: None,
+                    event: None,
+                    action: Some(action),
+                    value: None,
+                    ok: None,
+                    detail: Some(detail),
+                });
         }
     }
 
@@ -3217,14 +3221,16 @@ impl Simulation {
             let id = self.trigger_runtime.definitions.trigger_types[type_index]
                 .id
                 .clone();
-            self.trigger_runtime.trigger_trace.push(HeadlessTriggerEvent {
-                trigger: Some(id),
-                event: Some(input.kind),
-                action: None,
-                value: None,
-                ok: None,
-                detail: None,
-            });
+            self.trigger_runtime
+                .trigger_trace
+                .push(HeadlessTriggerEvent {
+                    trigger: Some(id),
+                    event: Some(input.kind),
+                    action: None,
+                    value: None,
+                    ok: None,
+                    detail: None,
+                });
         }
         if self.trigger_runtime.spring_depth == 0 {
             self.trigger_runtime.spring_actions_left = MAX_TRIGGER_SPRING_ACTIONS;
@@ -5893,7 +5899,8 @@ impl Simulation {
     /// armed-reinforcement read above take) whose TeamType's `GetHouse`
     /// owner resolves outside `driven` — beside the count of armed trigger
     /// instances carrying any team-spawn action at all (the seat log's
-    /// `spawn-triggers=N`).
+    /// `spawn-triggers=N`) and the wave host the dominance route below
+    /// crowns, if any.
     ///
     /// The walk's shape is [`Simulation::house_has_armed_future_reinforcements`]'s
     /// own: live instances only (enabled, not pending — a spent one-shot
@@ -5904,10 +5911,19 @@ impl Simulation {
     /// which the seat assembly derives from its own seat enumeration: the
     /// old roster test (membership in `self.houses`) was dead, because the
     /// GetHouse paths (`House502D30`, the `Scenario510ED0` start-slot
-    /// mapping) only ever return installed houses. A defense map whose
-    /// wave owner is an unseated slot's house — PresidentDefense22's
-    /// `House=<Player @ G>` — reads true; a battle map's reinforcement
-    /// triggers resolve to driven AI houses and read false everywhere.
+    /// mapping) only ever return installed houses. Two routes read the
+    /// defense form: an armed spawn trigger whose owner resolves outside
+    /// `driven` — an unseated slot's house or a passive wave host — or a
+    /// single driven seat holding a dominant share of the armed spawn
+    /// triggers (at least `DEFENSE_WAVE_HOST_MIN_TRIGGERS` and two thirds
+    /// of the ones that resolve to driven seats), so the map reads defense
+    /// form however the wave slot is staffed: a Super tier seated on
+    /// PresidentDefense22's `House=<Player @ G>` teams no longer flips
+    /// the map to battle form. The dominant seat is returned as the wave
+    /// host, and the seat assembly stands its driver down — the map's
+    /// triggers speak for that house — while the other seats arm their
+    /// personas. A battle map's reinforcement triggers spread a few per
+    /// seat, crown no host and read false.
     ///
     /// Pure read: no RNG, no mutation, no render/ui dependency. Single
     /// owner and single entry: the seat assembly
@@ -5915,13 +5931,24 @@ impl Simulation {
     /// re-walks the trigger instances for map classification. External
     /// plugins (the super-AI crate) run their map-shape classification
     /// through this entry.
+    /// The wave-host dominance floor: a driven seat needs at least this
+    /// many armed spawn triggers resolving to it before the read crowns it
+    /// wave host. Measured across the wave-map corpus — PresidentDefense22
+    /// G×54/54, Daxian B×25/27, iron_prison H×13 — while a battle map
+    /// spreads a handful of reinforcement triggers over several seats.
+    const DEFENSE_WAVE_HOST_MIN_TRIGGERS: usize = 6;
+
     pub fn defense_map_classification(
         &self,
         driven: &[crate::sim::intern::InternedId],
         rules: &crate::rules::ruleset::RuleSet,
-    ) -> (bool, usize) {
+    ) -> (bool, usize, Option<crate::sim::intern::InternedId>) {
         let mut spawn_triggers = 0usize;
         let mut undriven_owner = false;
+        // Per driven seat: how many armed spawn triggers resolve to it as
+        // their first resolvable owner. The dominance read below crowns the
+        // wave host from these counts.
+        let mut owner_counts: Vec<(crate::sim::intern::InternedId, usize)> = Vec::new();
         for trigger in self
             .trigger_runtime
             .trigger_order
@@ -5930,6 +5957,7 @@ impl Simulation {
             .filter(|trigger| trigger.enabled && !trigger.pending)
         {
             let mut carries_spawn = false;
+            let mut owner: Option<crate::sim::intern::InternedId> = None;
             for action in
                 &self.trigger_runtime.definitions.trigger_types[trigger.type_index].actions
             {
@@ -5946,21 +5974,42 @@ impl Simulation {
                 let Some(team_name) = self.trigger_runtime.definitions.team_types.get(team) else {
                     continue;
                 };
-                let Some(owner) = self.interner.get(team_name) else {
+                let Some(team_type) = self.interner.get(team_name) else {
                     continue;
                 };
-                let Some(owner) = self.team_type_house(owner, rules) else {
+                let Some(resolved) = self.team_type_house(team_type, rules) else {
                     continue;
                 };
-                if !driven.contains(&owner) {
+                if !driven.contains(&resolved) {
                     undriven_owner = true;
+                } else if owner.is_none() {
+                    owner = Some(resolved);
                 }
             }
             if carries_spawn {
                 spawn_triggers += 1;
+                if let Some(owner) = owner {
+                    match owner_counts.iter_mut().find(|(house, _)| *house == owner) {
+                        Some((_, count)) => *count += 1,
+                        None => owner_counts.push((owner, 1)),
+                    }
+                }
             }
         }
-        (undriven_owner, spawn_triggers)
+        if undriven_owner {
+            // An undriven wave owner settles the verdict on its own, and no
+            // driven seat stands down for it: nothing drives that host.
+            return (true, spawn_triggers, None);
+        }
+        let owned_total: usize = owner_counts.iter().map(|(_, count)| count).sum();
+        let wave_host = owner_counts
+            .iter()
+            .max_by_key(|(_, count)| *count)
+            .filter(|(_, count)| {
+                *count >= Self::DEFENSE_WAVE_HOST_MIN_TRIGGERS && count * 3 >= owned_total * 2
+            })
+            .map(|(house, _)| *house);
+        (wave_host.is_some(), spawn_triggers, wave_host)
     }
 }
 
