@@ -2134,6 +2134,30 @@ fn defense_chebyshev(from: (i16, i16), to: (i16, i16)) -> u32 {
         .max(i32::from(to.1).abs_diff(i32::from(from.1)))
 }
 
+/// An action 1 (Country wins) names the defenders' defeat when its
+/// winner is not a driven seat: the engine's XNOR
+/// (`request_player_outcome`) reads every non-matching house Defeat, so
+/// a wave host's win is the co-defenders' lose chain. The winner resolves
+/// through the same selector-or-country owner the executor takes
+/// (`Simulation::house_by_outcome_value`); a winner that is human or
+/// command-driven is a win chain and never qualifies, and an unresolvable
+/// one conservatively reads nothing.
+fn defense_win_carries_defeat(
+    sim: &vera20k_core::sim::world::Simulation,
+    rules: &vera20k_core::rules::ruleset::RuleSet,
+    action: &vera20k_core::sim::trigger_runtime::TriggerActionView,
+) -> bool {
+    let Some(value) = action.value else {
+        return false;
+    };
+    let Some(winner) = sim.house_by_outcome_value(value, rules) else {
+        return false;
+    };
+    sim.houses().get(&winner).is_some_and(|state| {
+        !(state.is_human() || (state.command_driven() && !state.multiplay_passive()))
+    })
+}
+
 /// The map's "this falls, you lose" set: standing objects whose
 /// object-attached Tag chain reads a destroyed-by-anything event (7, or
 /// the structure twin 48) into a lose outcome (actions 2/68): one
@@ -2144,20 +2168,34 @@ fn defense_chebyshev(from: (i16, i16), to: (i16, i16)) -> u32 {
 /// (President22's "Prez died": the flag unit's destroyed event feeds
 /// action 1, and a structure-only read left the objective off the books —
 /// no ring anchor, no leak hunt around it, and one leaked rifleman ended
-/// the match). The owner does not gate the read: the objective is the
-/// map's, and defense maps re-own it mid-game (a destroyed garrison hands
-/// the statue to another seat through a ChangeHouse give), while a
-/// win-chain (the enemy's 67) never qualifies. Chains the direct walk
-/// cannot resolve — Tag- or trigger-less definitions, indirect links —
-/// stay absent; that coverage gap is a recorded residual.
+/// the match). An action 1 (Country wins) carries the defeat just the
+/// same when its winner resolves outside the driven seats
+/// ([`defense_win_carries_defeat`]): the engine's XNOR
+/// (`request_player_outcome`) reads every non-matching house Defeat, so
+/// the wave host's win is the defenders' lose chain — the form
+/// survival-family finales and PresidentDefense22's "Prez died" both
+/// take. The owner does not gate the read: the objective is the map's,
+/// and defense maps re-own it mid-game (a destroyed garrison hands the
+/// statue to another seat through a ChangeHouse give), while a win-chain
+/// (the enemy's 67) never qualifies. Chains the direct walk cannot
+/// resolve — Tag- or trigger-less definitions, indirect links — stay
+/// absent; that coverage gap is a recorded residual, and so is a
+/// command-driven winner (a Super tier seated on the wave host reads
+/// driven and its win chain stays off the books).
 ///
 /// One owner, two consumers: the perception scan writes the set into the
 /// persona every tick, and the seat assembly reads its size once at
 /// install to pick mode B ([`defense_shared_target_count`]). Pure read:
 /// no RNG, no mutation, no render/ui dependency.
-fn defense_protected_targets(sim: &vera20k_core::sim::world::Simulation) -> Vec<u64> {
+fn defense_protected_targets(
+    sim: &vera20k_core::sim::world::Simulation,
+    rules: &vera20k_core::rules::ruleset::RuleSet,
+) -> Vec<u64> {
     let carries_lose = |actions: &[vera20k_core::sim::trigger_runtime::TriggerActionView]| {
         actions.iter().any(|action| matches!(action.kind, 2 | 68))
+            || actions
+                .iter()
+                .any(|action| action.kind == 1 && defense_win_carries_defeat(sim, rules, action))
     };
     sim.entities()
         .iter_sorted()
@@ -2200,8 +2238,11 @@ fn defense_protected_targets(sim: &vera20k_core::sim::world::Simulation) -> Vec<
 /// arms [`DefenseStance::SharedObjective`] while the count holds between
 /// one and [`DEFENSE_SHARED_OBJECTIVE_CAP`], and mode A otherwise; the
 /// read runs once per install, not per tick.
-pub fn defense_shared_target_count(sim: &vera20k_core::sim::world::Simulation) -> usize {
-    defense_protected_targets(sim).len()
+pub fn defense_shared_target_count(
+    sim: &vera20k_core::sim::world::Simulation,
+    rules: &vera20k_core::rules::ruleset::RuleSet,
+) -> usize {
+    defense_protected_targets(sim, rules).len()
 }
 
 /// The defense line's standoff anchor toward one spawn: `home` walked
@@ -4151,7 +4192,7 @@ impl SuperAi {
 
         // The defense persona observes before any battle branch can return
         // early: its reads never gate a command decision this milestone.
-        self.update_defense_perception(sim);
+        self.update_defense_perception(sim, rules);
 
         // Deploy: the launch MCV deploys into the side's construction yard.
         // try_to_deploy tests the origin one cell up-left of the MCV with
@@ -10523,7 +10564,11 @@ impl SuperAi {
     /// Reads only: the trigger runtime's observer views, the entity census
     /// and the battle AI's latched home cell — no command decision consumes
     /// any of it until the D2 pillars land.
-    fn update_defense_perception(&mut self, sim: &vera20k_core::sim::world::Simulation) {
+    fn update_defense_perception(
+        &mut self,
+        sim: &vera20k_core::sim::world::Simulation,
+        rules: &vera20k_core::rules::ruleset::RuleSet,
+    ) {
         if self.defense.is_none() {
             return;
         }
@@ -10649,7 +10694,7 @@ impl SuperAi {
         // Protected targets: standing objects the map itself charges the
         // defense with — the shared lose-chain read
         // ([`defense_protected_targets`]), unchanged by the stance.
-        let protected_targets = defense_protected_targets(sim);
+        let protected_targets = defense_protected_targets(sim, rules);
 
         // The core's wound watch: any protected target whose raw health
         // dropped since the last scan latches the rescue's hit window (the
@@ -17324,10 +17369,9 @@ impl SuperAi {
             let (rx, ry) = (entity.position.rx(), entity.position.ry());
             let owner = entity.owner();
             if owner == self.house {
-                // The side's own occupiable structures (the garrison
-                // addendum): the defense bunker the branch first named,
-                // and — with the fork overlay garrisoning the power plants
-                // — every plant the overlay arms. Same nearest-first
+                // The side's own occupiable structures — the defense
+                // bunker this branch first named, or a civilian-style hall
+                // the map placed under the seat. Same nearest-first
                 // ordering as the civilians' follow.
                 bunkers.push((distance_to(rx, ry), id));
                 continue;
@@ -26093,9 +26137,12 @@ mod tests {
     const DEFENSE_WORLD_MAP: &[u8] = b"[Map]\nTheater=TEMPERATE\nSize=0,0,2,1\nLocalSize=0,0,2,1\n\
           [IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n[Basic]\nNewINIFormat=4\n\
           [Triggers]\nWAVE=<none>,<none>,Wave,0,1,1,1,0\nLOSE=Country0,<none>,Lost,0,1,1,1,0\n\
-          [Events]\nWAVE=1,13,0,2\nLOSE=1,7,0,0\n\
+          PREZ=Country1,<none>,PrezDied,0,1,1,1,0\nPREZX=Country1,<none>,PrezUnresolved,0,1,1,1,0\n\
+          [Events]\nWAVE=1,13,0,2\nLOSE=1,7,0,0\nPREZ=1,48,0,0\nPREZX=1,48,0,0\n\
           [Actions]\nWAVE=1,80,1,TT,0,0,0,0,A\nLOSE=1,2,0,0,0,0,0,0,A\n\
-          [Tags]\nWAVE_TAG=2,Wave,WAVE\nLOSE_TAG=0,Lost,LOSE\n\
+          PREZ=1,1,0,1,0,0,0,0,A\nPREZX=1,1,0,9,0,0,0,0,A\n\
+          [Tags]\nWAVE_TAG=2,Wave,WAVE\nLOSE_TAG=0,Lost,LOSE\nPREZ_TAG=0,PrezDied,PREZ\n\
+          PREZX_TAG=0,PrezUnresolved,PREZX\n\
           [TeamTypes]\n0=TT\n[TT]\nHouse=Country0\nScript=S\nTaskForce=F\nWaypoint=A\nMax=1\n\
           [ScriptTypes]\n0=S\n[S]\n0=5,0\n\
           [TaskForces]\n0=F\n[F]\n0=1,TAGUNIT\n\
@@ -26188,6 +26235,41 @@ mod tests {
             "only the tagged structure reads into the protected set"
         );
         let _ = bystander;
+    }
+
+    /// The enemy-win form of a lose chain: a destroyed-object event whose
+    /// action 1 crowns an undriven winner (the wave host's country) reads
+    /// the object into the protected set — PresidentDefense22's "Prez
+    /// died" shape, where the engine's XNOR turns the wave host's win
+    /// into the co-defenders' defeat.
+    #[test]
+    fn a_destroyed_object_feeding_an_undriven_winner_counts_as_protected() {
+        let (mut sim, rules, ai_house, _enemy) = defense_world();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
+        let prez = sim
+            .spawn_object_at_height("CABHUT", &ai_owner, 15, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the production Structure constructor");
+        sim.attach_object_trigger_tag(prez, Some("PREZ_TAG"));
+        assert!(
+            super::defense_protected_targets(&sim, &rules).contains(&prez),
+            "the enemy-win chain reads the prez into the protected set"
+        );
+    }
+
+    /// The conservative miss: an action 1 whose winner resolves to no
+    /// house — a country the fixture never registers — never counts.
+    #[test]
+    fn an_unresolvable_action1_winner_never_counts() {
+        let (mut sim, rules, ai_house, _enemy) = defense_world();
+        let ai_owner = sim.interner().resolve(ai_house).to_string();
+        let statue = sim
+            .spawn_object_at_height("CABHUT", &ai_owner, 15, 15, 0, 0, &rules)
+            .expect("the fixture cell admits the production Structure constructor");
+        sim.attach_object_trigger_tag(statue, Some("PREZX_TAG"));
+        assert!(
+            !super::defense_protected_targets(&sim, &rules).contains(&statue),
+            "an unresolvable winner reads nothing"
+        );
     }
 
     // ---- D2, pillar 1: the defense army ----
@@ -28559,10 +28641,10 @@ mod tests {
         assert_eq!(rebuilt, first, "the rebuild answers the fallen cell");
     }
 
-    /// The garrison scan's own-building branch (the garrison addendum):
-    /// an own occupiable structure — the fork overlay's power plant, or
-    /// the fixture's civilian hall — latches as a target with its full
-    /// capacity's demand, and an own building without the keys never does.
+    /// The garrison scan's own-building branch: an own occupiable
+    /// structure — the fixture's civilian hall — latches as a target with
+    /// its full capacity's demand, and an own building without the keys
+    /// never does.
     #[test]
     fn garrison_scan_latches_own_occupiable_structures() {
         let (mut sim, rules, ai_house, _enemy) = defense_forces_world();

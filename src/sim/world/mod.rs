@@ -6590,6 +6590,16 @@ impl Simulation {
         }
     }
 
+    /// The fork's super-AI read resolves an outcome action's house
+    /// parameter through the same two-path owner the executor takes
+    /// (selector first, then country index): a `<Player @ ..>` lobby
+    /// selector names its start-slot house, any other value a country
+    /// index. Published for the plugin crate's protected-target walk; the
+    /// engine's own paths stay `pub(crate)`.
+    pub fn house_by_outcome_value(&self, value: i32, rules: &RuleSet) -> Option<InternedId> {
+        self.house_by_trigger_selector(value, rules)
+    }
+
     pub(crate) fn change_owner_with_rules(
         &mut self,
         stable_id: u64,

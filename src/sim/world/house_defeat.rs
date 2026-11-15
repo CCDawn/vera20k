@@ -413,6 +413,13 @@ impl Simulation {
                 HouseOutcomeKind::Defeat => HouseOutcomeKind::Victory,
             }
         };
+        // The fork's acceptance diagnostic: the local/non-local inversion
+        // decides the on-screen verdict and nothing else recorded which
+        // hop produced it.
+        log::info!(
+            "[OUTCOME] admit house={} kind={kind:?} local={local} routed={routed:?}",
+            self.interner.resolve(owner)
+        );
         self.session.admit_outcome(routed);
     }
 
@@ -838,6 +845,15 @@ impl Simulation {
                     } else {
                         HouseOutcomeKind::Defeat
                     };
+                    // The fork's acceptance diagnostic: TAction 1/2 verdicts
+                    // ride the XNOR alone and a misresolved country read as
+                    // an instant match end, so each viewer's arm logs.
+                    log::info!(
+                        "[OUTCOME] country request: country_index={country_index} \
+                         win_on_match={win_on_match} viewer={} native={native_country} \
+                         -> {kind:?}",
+                        self.interner.resolve(owner)
+                    );
                     (kind, false)
                 }
                 PlayerOutcomeRequest::Flag { kind, skip_timer } => (kind, skip_timer),

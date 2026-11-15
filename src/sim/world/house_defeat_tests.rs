@@ -1377,6 +1377,7 @@ fn battle_form_defeats_a_wiped_wave_house_defense_form_holds_it() {
     sim.check_defeat(Some(&rules), None);
     assert!(!sim.houses[&owners[0]].is_defeated());
     assert!(!sim.houses[&owners[1]].is_defeated());
+}
 
 /// Inside an object pass the Houses are walked for the Civilian-side House
 /// once: later asks at the same House count reuse the answer, a House

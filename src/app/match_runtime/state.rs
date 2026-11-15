@@ -590,7 +590,7 @@ fn rebuild_super_players_for(
     // same read the persona's perception runs, taken once at install.
     // Everything else plays mode A.
     let stance = if defense_map {
-        let shared = crate::super_ai::defense_shared_target_count(simulation);
+        let shared = crate::super_ai::defense_shared_target_count(simulation, rules);
         if (1..=crate::super_ai::DEFENSE_SHARED_OBJECTIVE_CAP).contains(&shared) {
             crate::super_ai::DefenseStance::SharedObjective
         } else {
