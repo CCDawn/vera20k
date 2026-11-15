@@ -475,7 +475,9 @@ impl Simulation {
         // defense map keeps the hold without its persona; a session whose
         // form reads false defeats immediately, as every battle game did
         // before the read existed.
-        if self.defense_map_form && self.house_has_armed_future_reinforcements(owner, rules) {
+        let armed_reinforcements =
+            self.defense_map_form && self.house_has_armed_future_reinforcements(owner, rules);
+        if armed_reinforcements {
             return false;
         }
         // Pure lazy type lookups: retail consumes exactly three entries;
@@ -489,27 +491,49 @@ impl Simulation {
             .build_refinery_types
             .get(2)
             .and_then(|name| self.interner.get(name));
-        !house.tracking().game_alive(
-            self.session.game_options().short_game,
-            base_units,
-            build_refinery_2,
-            |category| {
-                // Native scans Unit/Infantry/Aircraft arrays without mutations.
-                // The existing Foot registry has the same candidate set; its
-                // different inter-class order cannot change this pure boolean.
-                (0..self.substrate.entities.foot_registry_len()).any(|index| {
-                    self.substrate
-                        .entities
-                        .foot_registry_at(index)
-                        .and_then(|id| self.substrate.entities.get(id))
-                        .is_some_and(|entity| {
-                            entity.category() == category
-                                && entity.owner() == owner
-                                && (!entity.in_limbo() || entity.parasite.class().is_some())
-                        })
+        let short_game = self.session.game_options().short_game;
+        let holds_nothing =
+            !house
+                .tracking()
+                .game_alive(short_game, base_units, build_refinery_2, |category| {
+                    // Native scans Unit/Infantry/Aircraft arrays without mutations.
+                    // The existing Foot registry has the same candidate set; its
+                    // different inter-class order cannot change this pure boolean.
+                    (0..self.substrate.entities.foot_registry_len()).any(|index| {
+                        self.substrate
+                            .entities
+                            .foot_registry_at(index)
+                            .and_then(|id| self.substrate.entities.get(id))
+                            .is_some_and(|entity| {
+                                entity.category() == category
+                                    && entity.owner() == owner
+                                    && (!entity.in_limbo() || entity.parasite.class().is_some())
+                            })
+                    })
+                });
+        if holds_nothing {
+            // Diagnostic, remove after naming the survival-map instant-defeat
+            // source.
+            let base_unit_counts: Vec<i32> = rules
+                .general
+                .base_unit_types
+                .iter()
+                .map(|name| {
+                    self.interner.get(name).map_or(0, |id| {
+                        house
+                            .tracking()
+                            .owned_count(crate::map::entities::EntityCategory::Unit, id)
+                    })
                 })
-            },
-        )
+                .collect();
+            log::info!(
+                "[OUTCOME] holds-nothing house={} buildings={} short_game={} base_units={base_unit_counts:?} defense_form={} armed_reinforcements={armed_reinforcements}",
+                self.interner.resolve(owner),
+                house.tracking().buildings(),
+                self.defense_map_form,
+            );
+        }
+        holds_nothing
     }
 
     /// `HouseClass::MPlayer_Defeated @ 0x004FC0B0`, the represented part:
@@ -533,6 +557,13 @@ impl Simulation {
         owner: InternedId,
         context: UninitContext<'_>,
     ) -> Option<crate::sim::command::CommandEnvelope> {
+        // Diagnostic, remove after naming the survival-map instant-defeat
+        // source.
+        log::info!(
+            "[OUTCOME] gate-defeat house={} tick={}",
+            self.interner.resolve(owner),
+            self.session.binary_frame()
+        );
         if let Some(house) = self.houses.get_mut(&owner) {
             house.mark_defeated();
         }
@@ -749,6 +780,7 @@ impl Simulation {
 
     /// `HouseClass::Flag_To_Lose4FCBD0`: clear Win first, accept Lost only
     /// once, then use the same timer/effect owners as Flag_To_Win.
+    #[track_caller]
     pub(crate) fn flag_house_to_lose(
         &mut self,
         owner: InternedId,
@@ -761,6 +793,13 @@ impl Simulation {
             house.accept_lose_result(self.session.binary_frame() as i32, savour, skip_timer)
         });
         if accepted {
+            // Diagnostic, remove after naming the survival-map instant-defeat
+            // source.
+            log::info!(
+                "[OUTCOME] flag-lose house={} caller={}",
+                self.interner.resolve(owner),
+                std::panic::Location::caller()
+            );
             self.publish_accepted_house_outcome(
                 owner,
                 crate::sim::house_state::HouseOutcomeKind::Defeat,

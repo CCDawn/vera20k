@@ -48,6 +48,22 @@ impl Simulation {
         }
     }
 
+    /// Whether the TeamType's `House=` is a lobby-selector name — the
+    /// `PlayerAt` arm of the projection above, minted only from
+    /// `house_type_player_at` tokens whose slots sit inside
+    /// `HOUSE_TYPE_PLAYER_AT_SELECTORS` (0x117B..+8), never from a country
+    /// name. Shared read-only with the defense-map classification's
+    /// environmental-wave exclusion.
+    pub(crate) fn team_type_house_is_selector(&self, team_type: InternedId) -> bool {
+        matches!(
+            self.team_script_vm
+                .team_type_ini
+                .get(&team_type)
+                .and_then(|metadata| metadata.house),
+            Some(TeamTypeHouse::PlayerAt(_))
+        )
+    }
+
     /// Ares 3.0 TeamTypeClass_ValidateHouse (1005D170, hooks 0x65D8FB and
     /// 0x65EC4A), at the entry of both reinforcement owners: the TeamType's
     /// House (GetHouse) must exist, and unless the TeamType names a Country

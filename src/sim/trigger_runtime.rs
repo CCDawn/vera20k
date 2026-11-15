@@ -5898,7 +5898,7 @@ impl Simulation {
     /// reinforcements, the same admission set the dispatcher and the
     /// armed-reinforcement read above take) whose TeamType's `GetHouse`
     /// owner resolves outside `driven` — beside the count of armed trigger
-    /// instances carrying any team-spawn action at all (the seat log's
+    /// instances carrying a selector-owned team-spawn action (the seat log's
     /// `spawn-triggers=N`) and the wave host the dominance route below
     /// crowns, if any.
     ///
@@ -5924,6 +5924,16 @@ impl Simulation {
     /// triggers speak for that house — while the other seats arm their
     /// personas. A battle map's reinforcement triggers spread a few per
     /// seat, crown no host and read false.
+    ///
+    /// Only selector-owned teams are wave machinery on both routes: a
+    /// TeamType whose `House=` is a `<Player @ ..>` lobby selector — the
+    /// arm of the TeamType -> House projection that resolves through the
+    /// start-slot mapping. A country-owned team (`Neutral`, `Special`, any
+    /// retail country) is the map's own environmental hazard —
+    /// `4_survival_of_the_fittest_v2_dctanxman` arms 412 `House=Neutral`
+    /// teams, yet native play keeps the seats fighting each other — so the
+    /// walk skips such teams entirely instead of reading their
+    /// out-of-`driven` owners as an undriven wave host.
     ///
     /// Pure read: no RNG, no mutation, no render/ui dependency. Single
     /// owner and single entry: the seat assembly
@@ -5967,16 +5977,23 @@ impl Simulation {
                 let Some(DefinitionReference::Team(team)) = action.reference else {
                     continue;
                 };
-                carries_spawn = true;
-                if undriven_owner {
-                    continue;
-                }
                 let Some(team_name) = self.trigger_runtime.definitions.team_types.get(team) else {
                     continue;
                 };
                 let Some(team_type) = self.interner.get(team_name) else {
                     continue;
                 };
+                // Environmental waves: a country-owned team is the map's own
+                // hazard machinery, not the wave machinery this read counts.
+                // Skip it before it can read as an undriven owner or a spawn
+                // trigger.
+                if !self.team_type_house_is_selector(team_type) {
+                    continue;
+                }
+                carries_spawn = true;
+                if undriven_owner {
+                    continue;
+                }
                 let Some(resolved) = self.team_type_house(team_type, rules) else {
                     continue;
                 };
