@@ -527,7 +527,7 @@ impl Simulation {
                 })
                 .collect();
             log::info!(
-                "[OUTCOME] holds-nothing house={} buildings={} short_game={} base_units={base_unit_counts:?} defense_form={} armed_reinforcements={armed_reinforcements}",
+                "[OUTCOME] holds-nothing house={} buildings={} short_game={short_game} base_units={base_unit_counts:?} defense_form={} armed_reinforcements={armed_reinforcements}",
                 self.interner.resolve(owner),
                 house.tracking().buildings(),
                 self.defense_map_form,
