@@ -736,7 +736,7 @@ fn newest_modified_path(
         .map(|(path, _)| path)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod tests {
     use super::*;
     use crate::app::match_runtime::frame_pacer::LocalFramePacer;
@@ -1611,11 +1611,11 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 #[path = "tests/save_write_tests.rs"]
 mod save_write_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 #[path = "tests/save_browser_tests.rs"]
 mod save_browser_tests;
 

@@ -391,6 +391,9 @@ pub struct SkirmishShellState {
     /// the setup dialog on screen while that dialog keeps its working options.
     pub saved_seed_browser: Option<super::SavedSeedBrowserState>,
     pub validation_modal: Option<SkirmishValidationModalState>,
+    /// VERA's Game Options box, open over the page: it takes every press
+    /// and key until OK, Enter or Esc closes it.
+    pub game_options: Option<crate::ui::skirmish_shell::game_options::GameOptionsBox>,
     pub pending_ui_sounds: Vec<SkirmishShellUiSound>,
     /// The kind-1 statics; the status line holds the hover help.
     pub(crate) statics: SkirmishStatics,
@@ -481,6 +484,7 @@ impl Default for SkirmishShellState {
             random_map_setup_modal: None,
             saved_seed_browser: None,
             validation_modal: None,
+            game_options: None,
             pending_ui_sounds: Vec::new(),
             statics: SkirmishStatics::default(),
         }
@@ -675,7 +679,7 @@ pub fn initialize_rows_for_selected_map(state: &mut SkirmishShellState, maps: &[
     reset_rows_hidden_by_capacity(state, capacity);
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod multiplayer_dialog_value_tests {
     use super::*;
 

@@ -145,6 +145,10 @@ pub struct GameEntity {
     /// LimboLaunch has removed this Unit from Logic; Unlimbo preserves it.
     #[serde(default)]
     pub unit_firing_counter: crate::sim::animation::UnitFiringCounter,
+    /// UnitClass+6D8, owned by sim::animation: the art `DeathFrames=` count
+    /// a lethal hit starts and Unit AI ends.
+    #[serde(default)]
+    pub unit_death_counter: crate::sim::animation::UnitDeathCounter,
     /// The owning house (`TechnoClass+0x21C`), interned.
     /// `TechnoClass::ChangeOwner @ 0x007014A0` moves it; here only the store's
     /// owner-change path does ([`Self::set_owner_from_store`]).
@@ -551,6 +555,18 @@ pub struct BuildingPart {
     /// [`BuildingLight`]: crate::sim::world::BuildingLight
     #[serde(default)]
     pub(crate) building_light: crate::sim::world::BuildingLight,
+    /// The `NaturalParticleSystem=` link (`TechnoClass+0x30C`, written only
+    /// by BuildingClass code): Unlimbo and the cloak's fade-in build it
+    /// ([`Simulation::construct_natural_particle_system`]), the fade-out
+    /// deletes it, and a yellow hit slows it.
+    ///
+    /// [`Simulation::construct_natural_particle_system`]: crate::sim::world::Simulation::construct_natural_particle_system
+    #[serde(default)]
+    pub(crate) natural_particle_system: crate::sim::particles::spawn::AttachedParticleSystem,
+    /// The destroy-smoke link (`TechnoClass+0x320`) DestructionEffects
+    /// fills once (`0x00441EF6`); nothing else reads it.
+    #[serde(default)]
+    pub(crate) destroy_smoke_particle_system: crate::sim::particles::spawn::AttachedParticleSystem,
     /// Shared Building C4/PostMortem detonation latch: the marker `+0x6DF`
     /// with its C4Timer (`+0x528`) and C4AppliedBy (`+0x540`). The C4 plant
     /// (`sim::c4_plant`) owns one producer; qualifying delayed-death receiver
@@ -1147,7 +1163,7 @@ mod gunner;
 mod simple_deploy;
 mod voxel_recoil;
 
-#[cfg(all(test, not(feature = "ares")))]
+#[cfg(test)]
 #[test]
 fn default_build_rejects_saved_delivery_base_override_and_keeps_base_space() {
     let mut entity = GameEntity::test_default_of_category(
@@ -2332,6 +2348,7 @@ impl GameEntity {
             turret_rotate_latch: Default::default(),
             body_frame_counter: Default::default(),
             unit_firing_counter: Default::default(),
+            unit_death_counter: Default::default(),
             owner,
             health,
             estimated_health: crate::sim::estimated_health::EstimatedHealth::from_raw(
@@ -2607,7 +2624,9 @@ impl GameEntity {
         self.fall.set_attached_anim_flag(attached);
     }
 
-    pub(crate) fn parachute_animation(&self) -> Option<u64> {
+    /// Object+88, the held canopy identity published by Paradrop5F5AF1.
+    /// Presentation reads this identity with the object's other frame facts.
+    pub fn parachute_animation(&self) -> Option<u64> {
         self.fall.parachute_animation()
     }
 
@@ -2700,15 +2719,18 @@ impl GameEntity {
 
     /// ObjectAI5F3FBC..3FFA updates even the grounding frame's rate. When
     /// Ares plays (`ares`, [`RuleSet::ares`]) it steps a Techno by its type's
-    /// `FallRate.*` (10049BA0, hook 0x5F3FB2).
+    /// `FallRate.*` (10049BA0, hook 0x5F3FB2); any other object takes the
+    /// stock step or Ares' by `ares_form` ([`RuleSet::ares_form`]).
     ///
     /// [`RuleSet::ares`]: crate::rules::ruleset::RuleSet::ares
+    /// [`RuleSet::ares_form`]: crate::rules::ruleset::RuleSet::ares_form
     pub(crate) fn advance_fall_rate(
         &mut self,
         parachute_cap: i32,
         free_fall_cap: i32,
         object: Option<&crate::rules::object_type::ObjectType>,
         ares: bool,
+        ares_form: bool,
     ) {
         if ares && let Some(object) = object {
             self.fall.advance_techno_rate(
@@ -2717,7 +2739,8 @@ impl GameEntity {
             );
             return;
         }
-        self.fall.advance_rate(parachute_cap, free_fall_cap);
+        self.fall
+            .advance_rate(parachute_cap, free_fall_cap, ares_form);
     }
 
     /// Put a fixture into a fall where it is, with a FallRate of 0.
@@ -3009,7 +3032,7 @@ impl GameEntity {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 mod tests {
     use super::*;
 
@@ -3120,7 +3143,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 mod lifecycle_tests {
     use super::*;
 
@@ -3156,7 +3179,7 @@ mod lifecycle_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 mod mission_shadow_tests {
     use super::*;
     use crate::sim::mission::state::MissionTestFixture;

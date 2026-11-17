@@ -82,7 +82,9 @@
 //! (`0x004FF8C0`, `0x004FF6C8`). TEvent55 reads this scalar; TEvent56 reads
 //! vehicles minus navy, then tracked infantry (`0x0071F159..0x0071F187`).
 //! Limbo does not remove tracking, so transports and constructed limbo objects
-//! must not be inferred from the on-map sets. `+0x2F8` is not kept.
+//! must not be inferred from the on-map sets. `+0x2F8`, the tracked aircraft,
+//! moves with `+0x553C` in the aircraft arms (`0x004FF7C8`, `0x004FF607`), so
+//! it is that counter's total; only the observer strip reads it.
 //!
 //! Factory counters (`+0x5378` aircraft, `+0x537C` infantry, `+0x5380`
 //! vehicle, `+0x5384` building, `+0x5388` naval): a building whose type has
@@ -989,17 +991,16 @@ impl HouseTracking {
     /// nonzero BaseUnit count, or class-total-gated Foot presence.
     /// `foot_present` reads the authoritative object registry only when needed;
     /// it must test owner and (!InLimbo || ParasiteImUsing), without health gates.
+    /// `ares`: the game's Rules were read the Ares way (`RuleSet::ares_form`).
     pub(crate) fn game_alive(
         &self,
+        ares: bool,
         short_game: bool,
         base_units: impl IntoIterator<Item = Option<InternedId>>,
-        _build_refinery_2: Option<InternedId>,
-        _foot_present: impl Fn(EntityCategory) -> bool,
+        build_refinery_2: Option<InternedId>,
+        foot_present: impl Fn(EntityCategory) -> bool,
     ) -> bool {
-        // Still on the feature: the House counters hold no rules; moves when
-        // the gate's callers (`world::house_defeat`) pass the answer.
-        #[cfg(feature = "ares")]
-        {
+        if ares {
             if self.keep_alive != 0 {
                 return true;
             }
@@ -1015,43 +1016,49 @@ impl HouseTracking {
                 (EntityCategory::Aircraft, self.active_aircraft()),
             ]
             .into_iter()
-            .any(|(category, total)| total != 0 && _foot_present(category))
-        }
-        #[cfg(not(feature = "ares"))]
-        {
-            if short_game {
-                let mut units = base_units.into_iter();
-                let mut tracked = || {
-                    units
-                        .next()
-                        .flatten()
-                        .map_or(0, |unit| self.unit_types.get(&unit).copied().unwrap_or(0))
-                };
-                let first = tracked();
-                let second = tracked();
-                let third = tracked();
-                let base = second.wrapping_add(third).wrapping_add(first);
-                self.buildings > 0 || base > 0
-            } else {
-                let refinery = _build_refinery_2.map_or(0, |refinery| {
-                    self.active_building_types
-                        .get(&refinery)
-                        .copied()
-                        .unwrap_or(0)
-                });
-                self.buildings
-                    .wrapping_add(self.active_units())
-                    .wrapping_add(self.active_infantry())
-                    .wrapping_add(self.active_aircraft())
-                    .wrapping_add(refinery)
-                    != 0
-            }
+            .any(|(category, total)| total != 0 && foot_present(category))
+        } else if short_game {
+            let mut units = base_units.into_iter();
+            let mut tracked = || {
+                units
+                    .next()
+                    .flatten()
+                    .map_or(0, |unit| self.unit_types.get(&unit).copied().unwrap_or(0))
+            };
+            let first = tracked();
+            let second = tracked();
+            let third = tracked();
+            let base = second.wrapping_add(third).wrapping_add(first);
+            self.buildings > 0 || base > 0
+        } else {
+            let refinery = build_refinery_2.map_or(0, |refinery| {
+                self.active_building_types
+                    .get(&refinery)
+                    .copied()
+                    .unwrap_or(0)
+            });
+            self.buildings
+                .wrapping_add(self.active_units())
+                .wrapping_add(self.active_infantry())
+                .wrapping_add(self.active_aircraft())
+                .wrapping_add(refinery)
+                != 0
         }
     }
 
     /// `+0x2F0`, the tracked buildings.
     pub fn buildings(&self) -> i32 {
         self.buildings
+    }
+
+    /// The observer strip's Units line: `+0x2F8 + +0x2F4 + +0x2F0 + +0x2E8`
+    /// (`StripClass::AI @ 0x006A8B30`, `0x006A9108..0x006A9127`). The
+    /// buildings tracked as vehicles count once, in `+0x2E8`.
+    pub fn observer_units(&self) -> i32 {
+        wrapping_total(&self.aircraft_types)
+            .wrapping_add(self.infantry)
+            .wrapping_add(self.buildings)
+            .wrapping_add(self.vehicles)
     }
 
     /// TEvent9 / DestroyedUnitsAll (`71F12F..71F187`, Steam
@@ -1252,14 +1259,14 @@ impl HouseTracking {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 #[path = "house_tracking_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 #[path = "house_storage_capacity_tests.rs"]
 mod storage_capacity_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 #[path = "ares_house_survival_tests.rs"]
 mod ares_survival_tests;

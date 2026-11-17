@@ -2,7 +2,6 @@
 //! Legal custom-map placement; no shipped water-yard or native playback claim.
 //! Ares BuildingClass_Mi_Selling_PutMcv (1005C5D0, hook 0x449FF8) forces the
 //! Put, so there the water cell takes the MCV.
-#![cfg_attr(feature = "ares", allow(unused_imports, dead_code))]
 use super::*;
 use crate::map::map_file::{MapCell, MapFile};
 use crate::rules::locomotor_type::SpeedType;
@@ -233,7 +232,6 @@ fn ares_forces_the_repacked_mcv_onto_the_water_cell() {
     );
 }
 
-#[cfg(not(feature = "ares"))]
 #[test]
 fn authored_water_yard_refusal_refunds_keeps_constructor_and_survives_short_game() {
     let Some((mut runtime, yard)) = scene() else {
@@ -382,9 +380,10 @@ fn authored_water_yard_refusal_refunds_keeps_constructor_and_survives_short_game
         .map(|name| runtime.simulation.interner().get(name))
         .collect::<Vec<_>>();
     let tracked = runtime.simulation.houses.get(&owner).unwrap().tracking();
-    assert!(tracked.game_alive(true, base_units.iter().copied(), None, |_| false));
+    let ares = runtime.resources.rules.ares_form();
+    assert!(tracked.game_alive(ares, true, base_units.iter().copied(), None, |_| false));
     assert!(
-        !tracked.game_alive(false, base_units.iter().copied(), None, |_| false),
+        !tracked.game_alive(ares, false, base_units.iter().copied(), None, |_| false),
         "normal-game active counters stay empty"
     );
     let saved = GameSnapshot::save_validated(&runtime.simulation, 0, 0, "failed-yard-repack", 0);

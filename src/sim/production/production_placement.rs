@@ -491,7 +491,10 @@ pub(crate) fn place_production_with_overlays(
         }
         wall_placement::autofill_walls(sim, rules, registry, obj, (rx, ry), owner_id, effects);
         // The native4FB240..4FB2C7 completion/radio/abandon tail also runs
-        // for an UnInit'ed object; only local selection tests its alive byte.
+        // for an UnInit'ed object. RESIDUAL (invisible): PlayerPtr's
+        // 4FB2DE..4FB2F7 vt+0x198 call (44D5D0 -> 6F4960) is not ported; in
+        // multiplayer Unlimbo made it already (440D25..440D61), and its House
+        // writes repeat Record_Last_Built's and Unlimbo's.
         held.entity_id()
     } else {
         let foundation = &obj.foundation;
@@ -847,6 +850,9 @@ pub fn is_within_build_area(
                 continue;
             }
         } else if provider_owner.eq_ignore_ascii_case(owner) {
+            // RESIDUAL (dormant, the retail EligibileForAllyBuilding= types keep
+            // BaseNormal=yes): native sends an own BaseNormal=no building on to the
+            // BuildOffAlly test (`0x004A8FE4` -> `0x004A8FFA`), where it can still count.
             if !existing.base_normal {
                 continue;
             }
@@ -878,15 +884,10 @@ pub fn is_within_build_area(
     false
 }
 
-/// The farthest Chebyshev center offset a next ladder stone of `obj`'s
-/// footprint may stand from a standing stone footprint while some provider
-/// cell still falls in the placed ring: the ring reaches
-/// `adjacent + 1` past the placed foundation's edges
-/// ([`cell_in_build_area_ring`]) and keeps that reach across the
-/// footprint's own span. The defense persona's corridor walk caps its
-/// lattice step with this, so each stone it queues stands inside the
-/// build area the stone before it carries — the engine's own admission
-/// ([`is_within_build_area`]), not a hand-picked spacing.
+/// How far, in cells from its origin cell, a provider can sit and still admit
+/// a placed `obj`: `Adjacent=` + 1 past its foundation's longer side. That is
+/// the ring [`is_within_build_area`] tests, so an external builder walks the
+/// engine's own admission ring, not a hand-picked spacing.
 pub fn build_area_reach_cells(obj: &ObjectType) -> i32 {
     let (width, height) = obj.foundation.dimensions();
     let span = i32::from(width.max(height)).saturating_sub(1);

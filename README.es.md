@@ -1,26 +1,42 @@
 <img src="docs/images/new-conscirpt-hero-image.png" alt="Imagen principal de VERA20K" width="100%">
 
 <p align="center" dir="ltr">
-  <a href="README.sv.md" lang="sv">Svenska</a> · <a href="README.zh-CN.md" lang="zh-CN">简体中文</a> · <a href="README.de.md" lang="de">Deutsch</a> · <a href="README.ar.md" lang="ar" dir="rtl">العربية</a> · <strong>Español</strong> · <a href="README.ja.md" lang="ja">日本語</a> · <a href="README.ru.md" lang="ru">Русский</a> · <a href="README.th.md" lang="th">ไทย</a> · <a href="README.tr.md" lang="tr">Türkçe</a> · <a href="README.md" lang="en">English</a>
+  <a href="README.vi.md" lang="vi">Tiếng Việt</a> · <a href="README.sv.md" lang="sv">Svenska</a> · <a href="README.zh-CN.md" lang="zh-CN">简体中文</a> · <a href="README.de.md" lang="de">Deutsch</a> · <a href="README.ar.md" lang="ar" dir="rtl">العربية</a> · <strong>Español</strong> · <a href="README.ja.md" lang="ja">日本語</a> · <a href="README.ru.md" lang="ru">Русский</a> · <a href="README.th.md" lang="th">ไทย</a> · <a href="README.tr.md" lang="tr">Türkçe</a> · <a href="README.md" lang="en">English</a>
 </p>
 <p align="center" dir="ltr">
-  <a href="https://github.com/YuriPlanet/vera20k/actions/workflows/macos.yml?query=branch%3Amain" title="Última ejecución de las pruebas de la biblioteca en macOS (se inicia manualmente)"><img src="https://github.com/YuriPlanet/vera20k/actions/workflows/macos.yml/badge.svg?branch=main" alt="Pruebas de la biblioteca en macOS" height="23" align="middle"></a>
   <a href="https://github.com/YuriPlanet/vera20k/actions/workflows/linux.yml?query=branch%3Amain" title="Última ejecución de las pruebas de la biblioteca en Linux (se inicia manualmente)"><img src="https://github.com/YuriPlanet/vera20k/actions/workflows/linux.yml/badge.svg?branch=main" alt="Pruebas de la biblioteca en Linux" height="23" align="middle"></a>
   <a href="https://github.com/YuriPlanet/vera20k/actions/workflows/windows.yml?query=branch%3Amain" title="Última ejecución de las pruebas de la biblioteca en Windows (se inicia manualmente)"><img src="https://github.com/YuriPlanet/vera20k/actions/workflows/windows.yml/badge.svg?branch=main" alt="Pruebas de la biblioteca en Windows" height="23" align="middle"></a>
-  <a href="https://github.com/YuriPlanet/vera20k/actions/workflows/wasm.yml?query=branch%3Amain" title="Última compilación de WebAssembly (se inicia manualmente)"><img src="https://github.com/YuriPlanet/vera20k/actions/workflows/wasm.yml/badge.svg?branch=main" alt="Compilación de WebAssembly" height="23" align="middle"></a>
-  <a href="https://discord.gg/kmjRUn5m5F"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&amp;logo=discord&amp;logoColor=white" alt="Únete a Discord" height="23" align="middle"></a>
-  <img src="https://img.shields.io/badge/QQ-1097193563-1EBAFC?style=flat&amp;logo=qq&amp;logoColor=white" alt="Grupo de QQ" height="23" align="middle">
+  <a href="https://discord.gg/kmjRUn5m5F"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fdiscord.com%2Fapi%2Fv10%2Finvites%2FkmjRUn5m5F%3Fwith_counts%3Dtrue&amp;query=%24.approximate_presence_count&amp;suffix=%20online&amp;label=VERA20K%20Discord&amp;color=5865F2&amp;style=flat&amp;logo=discord&amp;logoColor=white" alt="Únete a Discord" height="23" align="middle"></a>
+  <img src="https://img.shields.io/badge/VERA20K_QQ-1097193563-1EBAFC?style=flat&amp;logo=qq&amp;logoColor=white" alt="Grupo de QQ (VERA20K)" height="23" align="middle">
+  <img src="https://img.shields.io/badge/ra20k.com_QQ-319832195-1EBAFC?style=flat&amp;logo=qq&amp;logoColor=white" alt="Grupo de QQ (ra20k.com)" height="23" align="middle">
 </p>
 
 # VERA20K
 
-VERA20K es una reescritura del motor original, `gamemd.exe`, impulsada por la comunidad. Trae tu propia copia de
-Red Alert 2: Yuri's Revenge para empezar a desarrollar o a jugar.
+VERA20K es un motor nuevo para Red Alert 2: Yuri's Revenge. Se juega como el original, con las
+mismas unidades, mapas y aspecto, y funciona en Windows, macOS y Linux. Está hecho para batallas
+más grandes, con hasta 30 jugadores y 20 000 unidades en un mapa.
 
 VERA20K está hecho por jugadores y para jugadores, y son los jugadores quienes tienen la última
 palabra sobre su rumbo.
 
 <img src="docs/images/vera20k-screenshots.png" alt="VERA20K: pantalla de configuración de escaramuza y vista de una partida" width="100%">
+
+## Descargar y jugar
+
+1. Instala Red Alert 2: Yuri's Revenge desde Steam o la app de EA.
+2. Descarga VERA20K para tu sistema desde la [página de versiones](https://github.com/YuriPlanet/vera20k/releases).
+3. Abre el archivo que descargaste. Encuentra tu juego e instala VERA20K en su propia carpeta.
+
+¿Algo no funciona? Consulta la [página de ayuda](https://vera20k.org/es/help).
+
+Está en desarrollo activo: la escaramuza se puede jugar en Windows, macOS y Linux, las campañas
+funcionan en parte y el multijugador en línea (experimental) ya está disponible. Las versiones
+anteriores y lo que cambió en cada una están en la [página de
+versiones](https://github.com/YuriPlanet/vera20k/releases).
+
+Para iniciar escaramuzas o campañas de YR para un jugador desde un cliente de CnCNet, consulta la
+[configuración del cliente sin conexión](integrations/cncnet/README.md).
 
 ## Objetivos del proyecto
 
@@ -31,15 +47,6 @@ palabra sobre su rumbo.
 4. Cliente multijugador integrado
 
 Consulta la [hoja de ruta](https://github.com/orgs/YuriPlanet/projects/1) para conocer las prioridades actuales y los planes futuros.
-
-## Descargar y jugar
-
-Descarga el instalador para Windows, macOS o Linux desde la
-[página de versiones](https://github.com/YuriPlanet/vera20k/releases). El instalador encuentra tu
-copia de Yuri's Revenge e instala VERA20K en una carpeta nueva.
-
-Para iniciar escaramuzas o campañas de YR para un jugador desde un cliente de CnCNet, consulta la
-[configuración del cliente sin conexión](integrations/cncnet/README.md).
 
 ## Contribuir
 
@@ -99,7 +106,7 @@ incluidas las extensiones de mods como Ares, debe permanecer desactivada hasta q
 de estas opciones:
 
 - **Una opción de VERA para el jugador**, en **Options**, guardada en la sección `[VERA]` de `VERA.INI`.
-- **Una opción de compilación**, como `--features ares` para las [extensiones de Ares](docs/ares.md)
+- **Una opción de compilación**, como `--features phobos` para las [extensiones de Phobos](docs/phobos.md)
   compatibles.
 - **Una clave INI**, definida por un mod o un mapa.
 
@@ -133,6 +140,7 @@ pantalla y el icono de la aplicación, la estrella roja de Red Alert 2, muestran
 propiedad de Electronic Arts. VERA20K no está afiliado a Electronic Arts ni cuenta con su respaldo.
 
 This product includes software developed by the [Ares Contributors](LICENSES/Ares.txt).
+This product includes software developed by the [Phobos Developers](docs/phobos.md#original-project-and-authors).
 
 **Lee el [aviso legal](LEGAL.md) antes de compartir, vender o hacer un fork de VERA20K.**
 

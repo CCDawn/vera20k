@@ -1752,7 +1752,7 @@ fn campaign_tokens(section: &IniSection, key: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_frontend))]
 mod tests {
     use super::*;
 

@@ -190,7 +190,6 @@ pub struct HouseStrategyEmergencyState {
     last_attacker_house_index: i32,
     /// Phobos HouseExt `AIFireSaleDelayTimer` (persisted): None until the
     /// first last-legs tick with a positive `[General] AIFireSaleDelay=`.
-    #[cfg(feature = "phobos")]
     #[serde(default)]
     ai_fire_sale_delay_timer: Option<CdTimer>,
 }
@@ -202,7 +201,6 @@ impl std::hash::Hash for HouseStrategyEmergencyState {
         self.last_building_attack_frame.hash(hasher);
         self.last_attacker_house_index.hash(hasher);
         // Phobos extension state; keep the native-only hash while unset.
-        #[cfg(feature = "phobos")]
         if let Some(timer) = self.ai_fire_sale_delay_timer {
             b"phobos-ai-fire-sale-delay-v1".hash(hasher);
             timer.hash(hasher);
@@ -245,7 +243,6 @@ impl Default for HouseStrategyEmergencyState {
             all_to_hunt_bias: false,
             last_building_attack_frame: 0,
             last_attacker_house_index: last_attacker_house_index_default(),
-            #[cfg(feature = "phobos")]
             ai_fire_sale_delay_timer: None,
         }
     }
@@ -308,12 +305,10 @@ impl HouseStrategyEmergencyState {
     }
 
     /// Phobos HouseExt `AIFireSaleDelayTimer`, None until first armed.
-    #[cfg(feature = "phobos")]
     pub(crate) const fn ai_fire_sale_delay_timer(&self) -> Option<CdTimer> {
         self.ai_fire_sale_delay_timer
     }
 
-    #[cfg(feature = "phobos")]
     pub(crate) fn start_ai_fire_sale_delay(&mut self, frame: i32, delay: i32) {
         self.ai_fire_sale_delay_timer = Some(CdTimer::started(frame, delay));
     }
@@ -659,11 +654,11 @@ pub struct HouseState {
     /// mutable `HouseClass` bytes — gamemd keeps this one on the house type.
     #[serde(default)]
     multiplay_passive: bool,
-    /// Fork-only driver-ownership flag (`docs/superai.md`): an external
-    /// command-layer client owns this house's decisions, so the native AI
-    /// rungs stand down for it and the launch's tier treatment grants its
-    /// opening credits. Not a gamemd port: native `HouseClass` has no such
-    /// byte, so it stays out of the retail-state concerns entirely.
+    /// This house's decisions are owned by an external command-layer
+    /// controller, so the native AI rungs stand down for it and the launch's
+    /// tier treatment grants its opening credits. Not a gamemd port: native
+    /// `HouseClass` has no such byte, so it stays out of the retail-state
+    /// concerns entirely.
     #[serde(default)]
     command_driven: bool,
     /// Fork-only driver policy (`docs/superai.md`): the treatment a
@@ -679,8 +674,8 @@ pub struct HouseState {
     #[serde(default)]
     super_tier: Option<crate::sim::driver::DriverPolicy>,
     /// The HouseType's `Cost*Mult=`, projected from the rules at creation.
-    /// Like the flag above it is the type's, so it is left out of the state
-    /// hash.
+    /// Like `multiplay_passive` it is the type's, so it is left out of the
+    /// state hash.
     #[serde(default)]
     country_cost_mults: CountryCostMults,
     /// The HouseType's `Speed*Mult=`, projected with the cost factors and
@@ -1000,7 +995,10 @@ pub struct HouseState {
     /// Native `[0x00A8F040]`, the `EVA_LowPower` one-shot guard
     /// (`0x004F8D02` test, `0x004F8D61` set, `0x004F8DAB` clear). It is a
     /// process global gated behind `this == PlayerPtr`, so one flag per human
-    /// house is the same state. Persisted and hashed (schema v133).
+    /// house is the same state. Persisted and hashed (schema v133). RESIDUAL
+    /// (kept by the maintainer, 2026-11-15): nothing saves, loads or resets
+    /// the global, so after a load gamemd warns again if still short, and a
+    /// match that ended short leaves the next one silent until power returns.
     #[serde(default)]
     eva_low_power_guard: bool,
     /// Native `HouseClass+0x245`: a building's auto-repair start sets it
@@ -1012,7 +1010,9 @@ pub struct HouseState {
     /// Native `HouseClass+0x280` timer: the auto-repair start of a house no
     /// human controls arms it (`0x00450764..0x00450779`), and the latch holds
     /// until it expires. The constructor starts it at the construction frame
-    /// with no time left. Persisted and hashed (schema v216).
+    /// with no time left. Persisted and hashed (schema v216). RESIDUAL
+    /// (invisible): native Load's NoInit restarts it (0x004F5327..0x004F5339),
+    /// so a loaded computer may repair 36-90 frames sooner there.
     repair_latch_timer: CdTimer,
     /// House+57E4..+15FF3: native retained 130x130 padded spatial threat map.
     /// Constructor4F61EF/4F6312 clears it. Save504093 and Load5031C9 retain
@@ -1221,10 +1221,11 @@ impl HouseState {
     }
 
     /// Fork-only: hand this house's decisions to the external command-layer
-    /// driver (`docs/superai.md`); the native AI rungs stand down for it and
-    /// the launch's tier treatment supplies its opening credits. The policy
-    /// rides along so the driver rebuild recovers it later. Accepts a tier
-    /// (the four mapped policies) or a policy directly. Not a gamemd port.
+    /// controller (`docs/superai.md`); the native AI rungs stand down for it
+    /// (no upstream caller sets this) and the launch's tier treatment
+    /// supplies its opening credits. The policy rides along so the driver
+    /// rebuild recovers it later. Accepts a tier (the four mapped policies)
+    /// or a policy directly. Not a gamemd port.
     pub fn make_command_driven(&mut self, treatment: impl Into<crate::sim::driver::DriverPolicy>) {
         self.command_driven = true;
         self.super_tier = Some(treatment.into());
@@ -2262,8 +2263,8 @@ impl HouseState {
 
     /// House50DA50, reached by TAction1416E44C0: clear the alert and restore
     /// its constructor frame (-100). Original Steam gamemd,
-    /// instruction reading. Native also clears +54F8, which currently retains
-    /// its constructor zero here (ai_fire's secondary-cell residual).
+    /// instruction reading. Native also clears +54F8, which nothing in gamemd
+    /// sets (see `superweapon::ai_fire`), so it stays zero here.
     pub(crate) fn clear_super_weapon_defense(&mut self) {
         self.super_weapon_targets.defense_cell = (0, 0);
         self.super_weapon_targets.defense_frame = -100;
@@ -2632,12 +2633,15 @@ impl HouseState {
         self.spatial_threat.at_padded_index(index)
     }
 
+    /// `ares` is the caller's `rules.ares_form()`, for the index the writers
+    /// take (`HouseSpatialThreat::caller_index`).
     pub(crate) fn adjust_spatial_threat(
         &mut self,
         cell: (i16, i16),
         delta: i32,
+        ares: bool,
     ) -> Result<(), String> {
-        self.spatial_threat.adjust(cell, delta)
+        self.spatial_threat.adjust(cell, delta, ares)
     }
 
     pub(crate) fn clear_spatial_threat(&mut self) {
@@ -3187,7 +3191,7 @@ pub struct MatchStatistics {
     built: u32,
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 #[path = "house_statistics_tests.rs"]
 mod statistics_tests;
 
@@ -3225,14 +3229,35 @@ impl MatchStatistics {
         *counter = counter.wrapping_add(1);
     }
 
-    /// RecordKill7030AC/7031DC and ChangeOwner70164D increment the kill table.
-    /// The existing total projection keeps their sum, rather than a second
-    /// per-house table. Both callers share its mutation and numeric semantics.
-    pub(crate) fn record_kill(&mut self, category: crate::map::entities::EntityCategory) {
-        let counter = if category == crate::map::entities::EntityCategory::Structure {
-            &mut self.buildings_killed
-        } else {
-            &mut self.units_killed
+    /// RecordKill7030AC/7031DC and ChangeOwner70164D increment the kill table
+    /// entry at the victim owner's House index (`TechnoClass::
+    /// GetOwningHouseIndex @ 0x006F9DB0`, read before ChangeOwner's owner
+    /// store). The score screen (`0x005C996D..0x005C9995`) and the Diplomacy
+    /// dialog (`0x00658330`) sum the 20 entries of each table, so the totals
+    /// kept here are those sums. Each table is followed by its loss counter:
+    /// units `+0x53E4`, UnitsLost `+0x5434`, buildings `+0x5438`,
+    /// BuildingsLost `+0x5488`, then WhoLastHurtMe `+0x548C`, so a kill of
+    /// House 20 or later lands past its table. Both callers share its
+    /// mutation and numeric semantics.
+    pub(crate) fn record_kill(
+        &mut self,
+        category: crate::map::entities::EntityCategory,
+        victim_house: Option<usize>,
+    ) {
+        let structure = category == crate::map::entities::EntityCategory::Structure;
+        let base = if structure { 21 } else { 0 };
+        let counter = match victim_house.map_or(base, |house| house.saturating_add(base)) {
+            0..=19 => &mut self.units_killed,
+            20 => &mut self.units_lost,
+            21..=40 => &mut self.buildings_killed,
+            41 => &mut self.buildings_lost,
+            // WhoLastHurtMe, which only `HouseClass::ComputeCRC @ 0x0050300D`
+            // reads, the sync check VERA's state hash replaces. RESIDUAL: a
+            // 23rd House, beyond gamemd's 8 players and retail's 14
+            // countries (a map adding countries, or a VERA game with more
+            // players), would reach ComputedBaseCenter (`+0x5490`) and later
+            // AI fields; VERA leaves them.
+            _ => return,
         };
         *counter = counter.wrapping_add(1);
     }
@@ -3259,7 +3284,7 @@ impl MatchStatistics {
         }
     }
 
-    /// Score-screen Kills column: units + buildings destroyed.
+    /// Score-screen and Diplomacy Kills: the sum of both kill tables.
     pub const fn kills(&self) -> u32 {
         self.units_killed.wrapping_add(self.buildings_killed)
     }
@@ -3412,7 +3437,7 @@ pub(crate) fn determine_waypoint_edge(anchor: (u16, u16), bounds: PlayfieldBound
     best_edge
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod ai_activation_latch_tests {
     use super::{HouseAiActivationLatches, HouseDifficulty, HouseState};
 
@@ -3588,7 +3613,7 @@ mod ai_activation_latch_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod outcome_tests {
     use super::{HouseOutcomeKind, HouseState};
 
@@ -3719,7 +3744,7 @@ mod outcome_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod difficulty_tests {
     use super::{HouseDifficulty, HouseState, NativeF64Bits};
 
@@ -3844,7 +3869,7 @@ mod difficulty_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod multiplay_passive_tests {
     use super::resolve_multiplay_passive;
     use crate::rules::ini_parser::IniFile;
@@ -3897,7 +3922,7 @@ mod multiplay_passive_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod waypoint_edge_tests {
     use super::*;
 
@@ -3934,7 +3959,7 @@ mod waypoint_edge_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod signed_country_side_tests {
     use super::*;
     use crate::rules::{ini_parser::IniFile, ruleset::RuleSet};
@@ -3958,7 +3983,7 @@ mod signed_country_side_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod produced_total_tests {
     use super::*;
     use crate::rules::{ini_parser::IniFile, ruleset::RuleSet};

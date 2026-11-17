@@ -2629,7 +2629,7 @@ impl Simulation {
         // back (`0x0073953B..0x00739565` / `0x0073959C..0x007395B4`) before
         // either outcome acts.
         self.foot_mark_remove(stable_id, rules, registry, frame_effects);
-        self.locomotor_mark_all_occupation_bits(stable_id, false);
+        self.locomotor_mark_all_occupation_bits(stable_id, false, rules.ares_form());
         let yard = rules.object(&yard_type);
         let placeable = yard.is_some_and(|yard| {
             crate::sim::build_site::can_place_building_at(
@@ -2654,7 +2654,7 @@ impl Simulation {
                 frame_effects,
             );
         }
-        self.locomotor_mark_all_occupation_bits(stable_id, true);
+        self.locomotor_mark_all_occupation_bits(stable_id, true, rules.ares_form());
         self.foot_mark_put(stable_id, rules, registry, frame_effects);
         if !placeable {
             log::info!("MCV deploy blocked at origin {origin:?}");
@@ -2775,7 +2775,7 @@ impl Simulation {
         // Slave Miner's DeploysInto transaction. Original Steam739660..739711
         // and failure739A6E..739AA7 are retained in mcv-placement-causality.
         self.foot_mark_remove(stable_id, rules, registry, frame_effects);
-        self.locomotor_mark_all_occupation_bits(stable_id, false);
+        self.locomotor_mark_all_occupation_bits(stable_id, false, rules.ares_form());
         let owner_str = self.interner.resolve(owner_id).to_string();
         let Some(mut destination) = self
             .construct_runtime_techno(
@@ -2791,7 +2791,7 @@ impl Simulation {
             .expect("fresh Techno constructor initialization cannot fail")
         else {
             //739A77..739AA7 restores locomotor head bits before Mark(DOWN).
-            self.locomotor_mark_all_occupation_bits(stable_id, true);
+            self.locomotor_mark_all_occupation_bits(stable_id, true, rules.ares_form());
             self.foot_mark_put(stable_id, rules, registry, frame_effects);
             if let Some(entity) = self.substrate.entities.get_mut(stable_id) {
                 entity.mcv_deploy_pending.clear();
@@ -2832,7 +2832,7 @@ impl Simulation {
             //739A6E first scalar-deletes the refused constructor-complete
             // Building; only then739A94/+124(1) restore the original Unit.
             self.discard_constructed_limbo(new_sid, rules, frame_effects);
-            self.locomotor_mark_all_occupation_bits(stable_id, true);
+            self.locomotor_mark_all_occupation_bits(stable_id, true, rules.ares_form());
             self.foot_mark_put(stable_id, rules, registry, frame_effects);
             //739AA7 clears+68C only after both original restoration calls.
             if let Some(entity) = self.substrate.entities.get_mut(stable_id) {
@@ -2936,16 +2936,11 @@ impl Simulation {
             self.refresh_ai_base_after_deploy(owner_id, (rx, ry), rules, registry, frame_effects);
             // Phobos `[General] GatherWhenMCVDeploy=` skips the native
             // regroup (hook at `0x739920`) while keeping every earlier write.
-            #[cfg(feature = "phobos")]
-            let gather = rules.general.gather_when_mcv_deploy;
-            #[cfg(not(feature = "phobos"))]
-            let gather = true;
-            // Fork-only (`docs/superai.md`): a command-driven house manages
-            // its own forces, so it skips the native regroup as well. That
-            // call overwrites every own ground unit's NavCom (harvesters and
-            // engineers included) and the command layer only observes it a
-            // tick later. The base centre, base-plan recalc and AI latches
-            // written above stay; the layer relies on them.
+            let gather = !rules.phobos() || rules.general.gather_when_mcv_deploy;
+            // A command-layer-driven house manages its own forces: the
+            // regroup overwrites every own ground unit's NavCom, which the
+            // external controller only observes a tick later. Every write
+            // above this gate stays.
             if gather
                 && !self
                     .houses
@@ -3367,10 +3362,10 @@ fn undeploy_unit_cell(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_t_z))]
 #[path = "world_spawn/tests.rs"]
 mod techno_constructor_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_t_z))]
 #[path = "failed_yard_repack_tests.rs"]
 mod failed_yard_repack_tests;

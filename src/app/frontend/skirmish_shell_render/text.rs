@@ -835,61 +835,46 @@ fn push_right_panel_text_draws(
     shell: &SkirmishShellState,
 ) {
     let start = localized_label(state, "GUI:StartGame", "Start Game");
-    let choose = localized_label(state, "GUI:ChooseMap", "Choose Map");
-    let save = tr("VERA:SaveSetup");
-    let load = tr("VERA:LoadSetup");
-    let team_starts = tr("VERA:TeamStarts");
+    // VERA captions the map button "Choose Map", as its room does
+    // (`SetupDialog::button_label`): retail's "Customize Battle" reads as the
+    // settings Game Options keeps.
+    let choose = tr("VERA:ChooseMap");
+    let game_options = localized_label(
+        state,
+        crate::ui::skirmish_shell::game_options::GAME_OPTIONS_LABEL,
+        "Game Options",
+    );
     let back = localized_label(state, "GUI:Back", "Back");
-    let load_disabled = !crate::app::App::skirmish_setup_saved(state);
 
-    for (label, rect, button, disabled) in [
+    for (label, rect, button) in [
         (
             start.as_str(),
             layout.start_button,
             OwnerDrawButton::StartGame0x617,
-            false,
+        ),
+        (
+            game_options.as_str(),
+            layout.game_options_button,
+            OwnerDrawButton::GameOptions,
         ),
         (
             choose.as_str(),
             layout.choose_map_button,
             OwnerDrawButton::ChooseMap0x5aa,
-            false,
-        ),
-        (
-            save.as_str(),
-            layout.save_setup_button,
-            OwnerDrawButton::SaveSetup,
-            false,
-        ),
-        (
-            load.as_str(),
-            layout.load_setup_button,
-            OwnerDrawButton::LoadSetup,
-            load_disabled,
-        ),
-        (
-            team_starts.as_str(),
-            layout.team_starts_button,
-            OwnerDrawButton::TeamStarts,
-            false,
         ),
         (
             back.as_str(),
             layout.back_button,
             OwnerDrawButton::Back0x5c0,
-            false,
         ),
-    ]
-    .into_iter()
-    .filter(|(_, rect, _, _)| rect.w > 0)
-    {
+    ] {
         push_button_label_draw(
             shell_draws,
             state,
             label,
             rect,
             shell.pressed_owner_draw_button == Some(button),
-            disabled,
+            false,
             0.00041,
             layout.scale,
         );
@@ -1018,9 +1003,8 @@ pub(super) fn push_random_map_setup_modal_text_draws(
     }
 
     // Ares' Urban Areas box takes its caption beside the icon, like the
-    // `0x102` checkboxes, in the basic view only.
-    #[cfg(feature = "ares")]
-    if !modal.advanced {
+    // `0x102` checkboxes, in the basic view only, when Ares.dll is loaded.
+    if modal.ares && !modal.advanced {
         push_text_draw(
             out,
             state,
@@ -1157,16 +1141,8 @@ pub(super) fn push_random_map_setup_modal_text_draws(
         },
     ]
     .into_iter()
-    .filter(|(_, _, _, control)| {
-        let vera = matches!(
-            control,
-            RandomMapSetupControl::AdvancedToggle
-                | RandomMapSetupControl::ExportMap
-                | RandomMapSetupControl::FairStartsToggle
-                | RandomMapSetupControl::PresetCycle
-        );
-        !sliding && (!vera || modal.extended)
-    }) {
+    .filter(|_| !sliding)
+    {
         let mut caption = localized_label(state, key, fallback);
         // One of the player's own presets is named by its number.
         if control == RandomMapSetupControl::PresetCycle
@@ -1251,6 +1227,20 @@ pub(super) fn push_random_map_setup_modal_text_draws(
             SHELL_DROPDOWN_TEXT_DEPTH - 0.0001,
             scale.factor(),
         );
+    } else if let Some(path) = modal.exported_to.as_ref().filter(|_| modal.exported) {
+        // VERA: where Export Map wrote the file, which is not the game folder.
+        let text = localized_label(state, "VERA:RandomMapExportedTo", "Saved to {path}")
+            .replace("{path}", path);
+        push_text_draw(
+            out,
+            state,
+            &text,
+            rect_to_text_rect(layout.progress_text),
+            SHELL_LABEL_TEXT_RGB,
+            ShellAlign::V_CENTER,
+            SHELL_DROPDOWN_TEXT_DEPTH - 0.0001,
+            scale.factor(),
+        );
     } else if let Some((key, fallback)) = modal.extras_note {
         // VERA: what the last Extras tool did, where the progress text goes.
         push_text_draw(
@@ -1263,7 +1253,7 @@ pub(super) fn push_random_map_setup_modal_text_draws(
             SHELL_DROPDOWN_TEXT_DEPTH - 0.0001,
             scale.factor(),
         );
-    } else if let Some(report) = modal.fairness.filter(|_| modal.extended && modal.generated) {
+    } else if let Some(report) = modal.fairness.filter(|_| modal.generated) {
         // VERA: how evenly the map on show treats its starts.
         let readout = report.readout();
         let text = localized_label(
@@ -1552,13 +1542,14 @@ pub(super) fn push_choose_map_modal_text_draws(
             rect.h,
         )
     });
+    let display_search = map_search_display(state, &modal.search);
     let hint;
-    let (search, rgb) = if modal.search.is_empty() {
+    let (search, rgb) = if display_search.is_empty() {
         hint = tr("VERA:MapSearchHint");
         (&*hint, SHELL_LABEL_TEXT_RGB)
     } else {
         let box_w = scale.base_rect(layout.map_search).w;
-        let (tail, _) = map_search_tail(&state.renderer.bit_font, &modal.search, box_w);
+        let (tail, _) = map_search_tail(&state.renderer.bit_font, &display_search, box_w);
         (tail, SHELL_LABEL_TEXT_RGB)
     };
     push_text_draw(
@@ -1575,6 +1566,18 @@ pub(super) fn push_choose_map_modal_text_draws(
 
 /// The search caret's width, in 800x600 numbers like a NewEdit's.
 pub(super) const MAP_SEARCH_CARET_W: i32 = 2;
+
+/// The committed query plus the currently composed IME text, for display
+/// only; filtering still uses the committed query.
+pub(super) fn map_search_display(state: &AppState, search: &str) -> String {
+    let composition = state
+        .platform
+        .ime
+        .composition(crate::app::input::ime::ImeTarget::ChooseMapSearch)
+        .map(|(text, _)| String::from_utf16_lossy(text))
+        .unwrap_or_default();
+    format!("{search}{composition}")
+}
 
 /// The end of `search` that fits a `box_w` wide search box with the caret
 /// after it, and that text's width: a long search scrolls its start out of
@@ -2037,7 +2040,7 @@ pub(super) fn push_saved_browser_prompt_text<I>(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_frontend))]
 mod tests {
     use super::*;
     use crate::ui::skirmish_shell::COMBO_DROPDOWN_ROW_H;
@@ -2062,7 +2065,7 @@ mod tests {
                 let list = random_map_setup_dropdown_rect(
                     &layout,
                     combo.row(),
-                    crate::ui::skirmish_shell::setup_combo_items(combo, true).len(),
+                    crate::ui::skirmish_shell::setup_combo_items(combo, false).len(),
                 );
                 for text in &texts {
                     let inside = text.x >= list.x

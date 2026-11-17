@@ -234,13 +234,13 @@ impl ChooseMapContext {
     /// `0x005D6203..0x005D6237`.
     fn permits(self, mode: &SkirmishGameMode) -> bool {
         match self {
-            Self::Skirmish => mode.class.lists_in_skirmish(),
+            Self::Skirmish => mode.class.policy().lists_in_skirmish,
             Self::Network {
                 observer,
                 tournament_room,
                 clan_room,
             } => {
-                (!observer || mode.class.allows_observers())
+                (!observer || mode.class.policy().observers_allowed)
                     && (mode.wonline_tournament_allowed || !tournament_room)
                     && (mode.wonline_clan_tournament_allowed || !clan_room)
             }
@@ -536,6 +536,20 @@ impl ChooseMapModalState {
         if self.row_labels.is_none() {
             self.rebuild_keeping_highlight(modes, records, layout);
         }
+    }
+
+    /// VERA: append committed text from the chooser's keyboard or input
+    /// method, ignoring control characters before rebuilding the list.
+    pub fn append_search_text(
+        &mut self,
+        text: &str,
+        modes: &[SkirmishGameMode],
+        records: &[SkirmishScenarioRecord],
+        layout: &ChooseMapModalLayout,
+    ) {
+        let mut search = self.search.clone();
+        search.extend(text.chars().filter(|ch| !ch.is_control()));
+        self.set_search(search, modes, records, layout);
     }
 
     /// VERA: star or unstar the highlighted map. Returns its
@@ -894,7 +908,7 @@ impl ChooseMapModalState {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod tests {
     use super::*;
     use crate::skirmish_modes::stock_skirmish_modes;
@@ -1169,6 +1183,27 @@ mod tests {
         );
         modal.add_online_maps_row();
         assert!(!modal.mode_rows().contains(&ONLINE_MAPS_ROW));
+    }
+
+    #[test]
+    fn committed_unicode_search_text_appends_and_filters_map_names() {
+        let modes = stock_skirmish_modes();
+        let layout = compute_choose_map_modal_layout(800, 600);
+        let all = vec![record("雪地遭遇战"), record("沙漠遭遇战")];
+        let mut modal = ChooseMapModalState::open(
+            crate::ui::skirmish_shell::ChooseMapContext::Skirmish,
+            1,
+            Some(0),
+            &modes,
+            &all,
+            &layout,
+        );
+        modal.set_search("雪".into(), &modes, &all, &layout);
+
+        modal.append_search_text("\u{0001}地", &modes, &all, &layout);
+
+        assert_eq!(modal.search, "雪地");
+        assert_eq!(modal.filtered_record_indices, [0]);
     }
 
     #[test]

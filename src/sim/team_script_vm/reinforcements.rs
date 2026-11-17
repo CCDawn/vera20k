@@ -68,7 +68,6 @@ impl Simulation {
     /// 0x65EC4A), at the entry of both reinforcement owners: the TeamType's
     /// House (GetHouse) must exist, and unless the TeamType names a Country
     /// (`+0xC4`) or this is a campaign, must not be defeated.
-    #[cfg(feature = "ares")]
     fn ares_reinforcement_house_valid(&self, team_type: InternedId, rules: &RuleSet) -> bool {
         let Some(house) = self.team_type_house(team_type, rules) else {
             return false;
@@ -130,6 +129,25 @@ impl Simulation {
         Some(id)
     }
 
+    /// `TeamClass::TeamClass @ 0x006E8A90` called directly, with no `Max=`
+    /// gate: Reinforcement65DD30 and team script action 18 (`0x006E96E4`).
+    /// The constructor takes the TeamType's initial waypoint and its own Tag.
+    pub(crate) fn construct_team_unlimited(
+        &mut self,
+        team_type: InternedId,
+        owner: InternedId,
+    ) -> Option<u64> {
+        let zone = self.team_initial_zone(team_type);
+        let team = self.team_script_vm.construct_team_instance(
+            team_type,
+            owner,
+            self.session.binary_frame() as i32,
+            zone,
+        )?;
+        self.attach_team_trigger_tag(team, team_type);
+        Some(team)
+    }
+
     /// Trigger4 original6DEB6B brackets CreateTeam with A8E7AC. Recruiting
     /// remains in TeamAI's normal same-frame visit, using real class arrays.
     pub(crate) fn trigger_create_team(
@@ -154,8 +172,7 @@ impl Simulation {
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) -> (bool, Option<(i16, i16)>) {
-        #[cfg(feature = "ares")]
-        if !self.ares_reinforcement_house_valid(team_type, rules) {
+        if rules.ares_form() && !self.ares_reinforcement_house_valid(team_type, rules) {
             return (false, None);
         }
         let Some(definition) = self.team_script_vm.team_types.get(&team_type).copied() else {
@@ -341,8 +358,7 @@ impl Simulation {
         registry: Option<&OverlayTypeRegistry>,
         effects: FrameEffects<'_>,
     ) -> (bool, Option<(i16, i16)>) {
-        #[cfg(feature = "ares")]
-        if !self.ares_reinforcement_house_valid(team_type, rules) {
+        if rules.ares_form() && !self.ares_reinforcement_house_valid(team_type, rules) {
             return (false, None);
         }
         let Some(definition) = self.team_script_vm.team_types.get(&team_type).copied() else {
@@ -803,21 +819,8 @@ impl Simulation {
             );
             return None;
         }
-        let owner = self.team_type_house(team_type, rules).or_else(|| {
-            self.note_trigger_failure(format!(
-                "team {}: owner not resolvable (lobby slot house missing?)",
-                self.interner.resolve(team_type)
-            ));
-            None
-        })?;
-        let zone = self.team_initial_zone(team_type);
-        let team = self.team_script_vm.construct_team_instance(
-            team_type,
-            owner,
-            self.session.binary_frame() as i32,
-            zone,
-        )?;
-        self.attach_team_trigger_tag(team, team_type);
+        let owner = self.team_type_house(team_type, rules)?;
+        let team = self.construct_team_unlimited(team_type, owner)?;
         let state = self
             .team_script_vm
             .teams

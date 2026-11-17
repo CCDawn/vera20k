@@ -67,7 +67,6 @@ fn corpus() -> &'static Value {
 /// House, typed country/resource readers, construction and dispatch stay real.
 // Ares replaces the stock payment (DepositTiberium 10044230, hooks
 // 0x73E4A2/0x522D75): no score (`sim::ares_tiberium_storage` tests).
-#[cfg(not(feature = "ares"))]
 fn income_scene(row: &Value) -> Scene {
     use crate::util::native_x87::NativeF32Bits;
     let input = &row["input"];
@@ -149,7 +148,6 @@ fn income_scene(row: &Value) -> Scene {
 
 // Ares replaces the stock payment (DepositTiberium 10044230, hooks
 // 0x73E4A2/0x522D75): no score (`sim::ares_tiberium_storage` tests).
-#[cfg(not(feature = "ares"))]
 #[test]
 fn native_income_controls_reach_unit_and_slave_payment_callers() {
     let native = crate::test_fixture::json("tools/spatial_oracle/refinery_income.json");
@@ -223,7 +221,6 @@ fn native_income_controls_reach_unit_and_slave_payment_callers() {
 
 // Ares replaces the stock payment (DepositTiberium 10044230, hooks
 // 0x73E4A2/0x522D75): no score (`sim::ares_tiberium_storage` tests).
-#[cfg(not(feature = "ares"))]
 #[test]
 fn virtual_purifier_wrap_and_saved_payment_use_native_inputs() {
     let native = crate::test_fixture::json("tools/spatial_oracle/refinery_income.json");
@@ -1111,8 +1108,6 @@ fn mission_unload_matches_the_original_harvester_branch() {
 /// stock window's low edge turns and waits as the outside row does, and a
 /// mid-swing turret counts as facing it, so the latched west row arms the
 /// unload as the first pass does.
-// Runs again once the miner's dock window moves to the switch.
-#[cfg(feature = "ares")]
 #[test]
 fn ares_mission_unload_faces_the_dock_exactly() {
     let _ares = crate::rules::ares_switch::read_ares_way(true);

@@ -6,27 +6,27 @@
 //! RNG and native-ID owners then continue through terrain and map objects.
 //! Opening forces, shroud, AI credits and diplomacy retain their shared owners.
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 #[path = "campaign_house_bootstrap_tests.rs"]
 mod campaign_house_bootstrap_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 #[path = "scenario_house_name_retail_tests.rs"]
 mod scenario_house_name_retail_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 #[path = "scenario_launch_identity_retail_tests.rs"]
 mod scenario_launch_identity_retail_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 #[path = "scenario_fillsilos_retail_tests.rs"]
 mod scenario_fillsilos_retail_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 #[path = "scenario_special_money_retail_tests.rs"]
 mod scenario_special_money_retail_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 #[path = "building_ai_sale_tag_retail_tests.rs"]
 mod building_ai_sale_tag_retail_tests;
 
@@ -847,6 +847,7 @@ fn native_assign_launch_starts_from_preassignment(
     let mut assigned = vec![None; requested.len()];
 
     let slots = normalized_launch_slots(session);
+    let shares_bases = session.shares_bases();
     let mut observer_reserved_first = false;
     let mut observer_claim_complete = false;
     // Battle5D6C70 visits House order; chooser5D6890 shares an observer's
@@ -856,12 +857,35 @@ fn native_assign_launch_starts_from_preassignment(
         let explicit = explicit_owner
             .iter()
             .rposition(|owner| *owner == Some(slot));
+        // VERA: where players share bases, a House whose start a later House
+        // also asked for starts there too, beside it, its units on the cells
+        // nearby. The table keeps the last owner, as gamemd's does.
+        let beside = match requested[slot] {
+            LaunchStartPosition::Position(start)
+                if shares_bases
+                    && explicit.is_none()
+                    && !slots[slot].observer
+                    && usize::from(start) < starts.len() =>
+            {
+                Some(usize::from(start))
+            }
+            _ => None,
+        };
         let first_occupied = explicit_owner.iter().position(Option::is_some);
         let mut write_owner = true;
         let start_index = if let Some(explicit) = explicit {
             explicit
+        } else if let Some(start) = beside {
+            write_owner = false;
+            start
         } else if let Some(first) = first_occupied {
-            if observer_reserved_first && !observer_claim_complete {
+            if observer_reserved_first && !observer_claim_complete && slots[slot].observer {
+                // VERA: where only AI play, every observer comes before
+                // them; a later one shares the first one's view and leaves
+                // its reserved start to the next House, which plays.
+                write_owner = false;
+                first
+            } else if observer_reserved_first && !observer_claim_complete {
                 observer_claim_complete = true;
                 first
             } else if slots[slot].observer {
@@ -1417,6 +1441,9 @@ fn install_shared_house_sources(
 }
 
 /// Commit the explicit launch-session diplomacy graph at the post-crate boundary.
+/// RESIDUAL (invisible): in GameMode 4 native MakeAlly runs its live tail at
+/// launch (`0x004F9C1F..0x004F9C28`), so Paranoid gives each computer one
+/// anger point per human allying; VERA installs the graph without it.
 pub(crate) fn apply_skirmish_launch_alliances(
     sim: &mut Simulation,
     session: &SkirmishLaunchSession,
@@ -1601,15 +1628,17 @@ fn apply_resolved_skirmish_launch_session(
     let assignments = &start_assignment.placements;
     let mut spawned_mcvs = 0;
 
+    let ares = rules.ares_form();
+    // Unholy Alliance's own base-unit callback has no Bases test.
+    let unholy = session.mode.class == crate::skirmish_modes::MpModeClass::Unholy;
     // Ares 3.0 MPGameModeClass_CreateStartingUnits_BaseCenter (1001ED60,
     // hook 0x5D6F61) wraps the base-unit callback of every house, so its
     // construction-yard pass also runs with Bases off.
-    #[cfg(feature = "ares")]
-    let visit_houses = true;
-    // Unholy Alliance's own base-unit callback has no Bases test.
-    let unholy = session.mode.class == crate::skirmish_modes::MpModeClass::Unholy;
-    #[cfg(not(feature = "ares"))]
-    let visit_houses = session.options.bases || unholy;
+    let visit_houses = if ares {
+        true
+    } else {
+        session.options.bases || unholy
+    };
     if visit_houses {
         for (slot_idx, waypoint) in assignments {
             let Some(slot) = slots.get(*slot_idx) else {
@@ -1634,13 +1663,16 @@ fn apply_resolved_skirmish_launch_session(
                 continue;
             }
             // 1001ED60 keeps BaseSpawnCell (+0x5490) from before the callback.
-            #[cfg(feature = "ares")]
-            let saved_spawn_cell = crate::sim::house_state::house_state_for_owner(
-                &sim.houses,
-                &slot.owner_name,
-                &sim.interner,
-            )
-            .and_then(|house| house.base_center());
+            let saved_spawn_cell = if ares {
+                crate::sim::house_state::house_state_for_owner(
+                    &sim.houses,
+                    &slot.owner_name,
+                    &sim.interner,
+                )
+                .and_then(|house| house.base_center())
+            } else {
+                None
+            };
             if unholy {
                 let (placed, complete) = place_unholy_base_units(
                     sim,
@@ -1660,17 +1692,18 @@ fn apply_resolved_skirmish_launch_session(
             } else if session.options.bases {
                 // Ares 3.0 1001F0B0 (hook 0x5D7048): a WithConst country's
                 // house starts with a construction yard instead.
-                #[cfg(feature = "ares")]
-                let yard = ares_place_starting_construction_yard(
-                    sim,
-                    &slot.owner_name,
-                    bounds,
-                    rules,
-                    resolved_terrain,
-                    overlay_registry,
-                );
-                #[cfg(not(feature = "ares"))]
-                let yard: Option<bool> = None;
+                let yard: Option<bool> = if ares {
+                    ares_place_starting_construction_yard(
+                        sim,
+                        &slot.owner_name,
+                        bounds,
+                        rules,
+                        resolved_terrain,
+                        overlay_registry,
+                    )
+                } else {
+                    None
+                };
                 if let Some(placed) = yard {
                     if !placed {
                         // The callback fails (0x5D70DB).
@@ -1715,8 +1748,14 @@ fn apply_resolved_skirmish_launch_session(
                     }
                 }
             }
-            #[cfg(feature = "ares")]
-            ares_settle_starting_construction_yards(sim, &slot.owner_name, saved_spawn_cell, rules);
+            if ares {
+                ares_settle_starting_construction_yards(
+                    sim,
+                    &slot.owner_name,
+                    saved_spawn_cell,
+                    rules,
+                );
+            }
         }
 
         if spawned_mcvs > 0 {
@@ -1943,6 +1982,8 @@ pub fn populate_special_houses(sim: &mut Simulation, house_roster: &HouseRoster,
         // Original gamemd CreateHouses6882C2..68837E constructs this fixed
         // tail without participant SetCreditsAndColor4FCE00. House ctor
         // 4F58D8 leaves cash0; launch credits belong to participants.
+        // RESIDUAL (invisible): the constructor's TechLevel is 1 (4F56C3),
+        // not the session's; neither house ever builds.
         let mut house = HouseState::new(
             name_id,
             side_idx,
@@ -2528,7 +2569,6 @@ fn place_unholy_first_base_unit(
 /// placement (`0x005D707E`) then puts the yard at that cell, else near it.
 /// `None` when the country has no WithConst; otherwise whether the yard
 /// stands.
-#[cfg(feature = "ares")]
 fn ares_place_starting_construction_yard(
     sim: &mut Simulation,
     owner: &str,
@@ -2625,7 +2665,6 @@ fn ares_place_starting_construction_yard(
 /// current mission is the forced Guard), so the Construction commences here
 /// and the first Update's Mission_Construction restarts the build-up. An
 /// emptied BaseSpawnCell takes back its prior cell.
-#[cfg(feature = "ares")]
 fn ares_settle_starting_construction_yards(
     sim: &mut Simulation,
     owner: &str,
@@ -2898,6 +2937,7 @@ fn seed_starting_extra_units_with_overlay_registry(
     if unit_count <= 0 {
         return 0;
     }
+    let ares = rules.ares_form();
     let budget = starting_unit_budget(
         rules,
         sim.houses.values().filter_map(|house| {
@@ -2950,10 +2990,11 @@ fn seed_starting_extra_units_with_overlay_registry(
         // empty `StartInMultiplayer.Types=` list instead returns success at
         // 0x5D743E (1001F220): nothing spawns and the budget is credited.
         let has_candidates = !(candidates.vehicles.is_empty() && candidates.infantry.is_empty());
-        #[cfg(feature = "ares")]
-        let refused = !has_candidates && !candidates.listed_empty;
-        #[cfg(not(feature = "ares"))]
-        let refused = !has_candidates;
+        let refused = if ares {
+            !has_candidates && !candidates.listed_empty
+        } else {
+            !has_candidates
+        };
         if refused {
             continue;
         }
@@ -2964,8 +3005,7 @@ fn seed_starting_extra_units_with_overlay_registry(
             // Ares 3.0 MPGameMode_SpawnStartingUnits_NoInfantry 1001F200
             // (hook 0x5D7337): without infantry candidates the house always
             // draws a vehicle (0x5D734F).
-            #[cfg(feature = "ares")]
-            let prefer_vehicle = prefer_vehicle || candidates.infantry.is_empty();
+            let prefer_vehicle = prefer_vehicle || (ares && candidates.infantry.is_empty());
             let preferred = if prefer_vehicle {
                 &candidates.vehicles
             } else {
@@ -3055,11 +3095,11 @@ pub fn starting_unit_budget(
     if unit_count <= 0 {
         return 0;
     }
-    #[cfg(feature = "ares")]
-    let budget = ares_starting_unit_budget(rules, countries, tech_level, unit_count);
-    #[cfg(not(feature = "ares"))]
-    let budget = native_starting_unit_budget(rules, countries, tech_level, unit_count);
-    budget
+    if rules.ares_form() {
+        ares_starting_unit_budget(rules, countries, tech_level, unit_count)
+    } else {
+        native_starting_unit_budget(rules, countries, tech_level, unit_count)
+    }
 }
 
 /// Ares MPGameModeClass_CreateStartingUnits_UnitCost (1001EE10, hook
@@ -3072,7 +3112,6 @@ pub fn starting_unit_budget(
 /// non-passive country without that list owns; every BaseUnit is then erased
 /// from the set, the listed ones too. With no list it is the native average
 /// (unsigned division aside).
-#[cfg(feature = "ares")]
 fn ares_starting_unit_budget(
     rules: &RuleSet,
     countries: impl IntoIterator<Item = crate::rules::ruleset::CountryIdx>,
@@ -3138,7 +3177,6 @@ fn ares_starting_unit_budget(
     (unit_count as u32).wrapping_mul(cost) as i32
 }
 
-#[cfg(not(feature = "ares"))]
 fn native_starting_unit_budget(
     rules: &RuleSet,
     countries: impl IntoIterator<Item = crate::rules::ruleset::CountryIdx>,
@@ -3197,8 +3235,8 @@ fn native_starting_unit_budget(
 pub struct StartingUnitCandidates {
     pub vehicles: Vec<StartingUnitCandidate>,
     pub infantry: Vec<StartingUnitCandidate>,
-    /// The country's `StartInMultiplayer.Types=` is set and empty.
-    #[cfg(feature = "ares")]
+    /// The country's `StartInMultiplayer.Types=` is set and empty, when Ares
+    /// plays.
     pub listed_empty: bool,
 }
 
@@ -3207,7 +3245,7 @@ pub fn starting_unit_candidates_for_country(
     country: LaunchCountry,
     tech_level: i32,
 ) -> StartingUnitCandidates {
-    let Some(_country_name) = rules.country_name(country.index()) else {
+    let Some(country_name) = rules.country_name(country.index()) else {
         return StartingUnitCandidates::default();
     };
     // Ares 3.0 MPGameMode_SpawnStartingUnits_Types 1001F220 (hook
@@ -3215,8 +3253,9 @@ pub fn starting_unit_candidates_for_country(
     // country replaces both scans. Its Unit and Infantry types are the
     // candidates in list order, without the AllowedToStartInMultiplayer,
     // Owner, tech-level or BaseUnit filters; other types are skipped.
-    #[cfg(feature = "ares")]
-    if let Some(listed) = rules.country_start_in_multiplayer_types(_country_name) {
+    if rules.ares_form()
+        && let Some(listed) = rules.country_start_in_multiplayer_types(country_name)
+    {
         use crate::rules::object_type::ObjectCategory;
         let mut candidates = StartingUnitCandidates {
             listed_empty: listed.is_empty(),
@@ -3943,7 +3982,7 @@ pub fn initialize_map_roster_houses(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 mod tests {
     use super::*;
 
@@ -4105,9 +4144,9 @@ mod tests {
     /// Ares MPGameModeClass_CreateStartingUnits_UnitCost (1001EE10, hook
     /// 0x5D6D9A): a set StartInMultiplayerUnitCost prices each unit, so
     /// the budget is UnitCount times it, whatever the eligible types cost.
-    #[cfg(feature = "ares")]
     #[test]
     fn ares_start_in_multiplayer_unit_cost_prices_each_starting_unit() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
         let ini = |general: &str| {
             crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
                 &format!(
@@ -4124,7 +4163,6 @@ mod tests {
         assert_eq!(starting_unit_budget(&priced, americans, 10, 0), 0);
     }
 
-    #[cfg(feature = "ares")]
     const ARES_START_TYPES_RULES: &str = "[General]\nBaseUnit=AMCV\n\
          [Countries]\n0=Americans\n1=Russians\n2=Iraq\n3=Cuba\n\
          [Americans]\nSide=GDI\nStartInMultiplayer.Types=HTNK,E1,GAPOWR,AMCV\n\
@@ -4141,9 +4179,9 @@ mod tests {
     /// the country's own list is the candidates, unfiltered (even its
     /// BaseUnit); a list of only other types takes the refusal at 0x5D72AB,
     /// one that resolved to nothing the success edge 0x5D743E.
-    #[cfg(feature = "ares")]
     #[test]
     fn ares_start_in_multiplayer_types_replace_the_starting_candidates() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
         let rules = crate::rules::ruleset::RuleSet::from_ini(
             &crate::rules::ini_parser::IniFile::from_str(ARES_START_TYPES_RULES),
         )
@@ -4176,9 +4214,9 @@ mod tests {
     /// countries own, then BaseUnit leaves: {HTNK, E1, MTNK} averages
     /// (1 + 1100) / 3 = 367, where the native average over both countries'
     /// owned types is MTNK's 700.
-    #[cfg(feature = "ares")]
     #[test]
     fn ares_start_in_multiplayer_types_enter_the_unit_cost_average() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
         let rules = crate::rules::ruleset::RuleSet::from_ini(
             &crate::rules::ini_parser::IniFile::from_str(ARES_START_TYPES_RULES),
         )
@@ -4212,11 +4250,14 @@ mod tests {
         source.push_str(&format!(
             "[VehicleTypes]\n0={type_id}\n[{type_id}]\nTechLevel=1\n"
         ));
-        #[cfg(feature = "ares")]
-        source.push_str(
-            "[BuildingTypes]\n0=QUALIFIER_FACTORY\n\
-             [QUALIFIER_FACTORY]\nStrength=100\nFactory=UnitType\nOwner=Americans,Alliance\n",
-        );
+        // The fixture is an Ares game exactly when its thread reads Rules
+        // the Ares way.
+        if crate::rules::ares_switch::ares_way() {
+            source.push_str(
+                "[BuildingTypes]\n0=QUALIFIER_FACTORY\n\
+                 [QUALIFIER_FACTORY]\nStrength=100\nFactory=UnitType\nOwner=Americans,Alliance\n",
+            );
+        }
         for row in gate["rows"].as_array().unwrap() {
             let mut ini = IniFile::from_str(&source);
             ini.merge(&IniFile::from_str(gate["owner_layer"].as_str().unwrap()));
@@ -4253,8 +4294,7 @@ mod tests {
             let country = sim.interner.intern(actual_country);
             sim.houses
                 .register(HouseState::new(owner, -1, Some(country), false, 0, 10));
-            #[cfg(feature = "ares")]
-            {
+            if rules.ares_form() {
                 // The Ares CanBuild suffix also requires an online factory;
                 // leave that gate open while comparing the Country qualifiers.
                 let factory = sim
@@ -4340,7 +4380,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "ares")]
     const ARES_WITH_CONST_RULES: &str = "[General]\nBaseUnit=AMCV\n[AI]\nBuildConst=GACNST\n\
          [Americans]\nStartInMultiplayer.WithConst=yes\n[VehicleTypes]\n0=AMCV\n\
          [AMCV]\nStrength=1000\nSpeed=4\nOwner=Americans\nDeploysInto=GACNST\n\
@@ -4355,9 +4394,9 @@ mod tests {
     /// yard is not opened, so the forced Guard stays current; a computer's
     /// opens and commences Construction, and its house also gets the
     /// deploy's AI half at that cell.
-    #[cfg(feature = "ares")]
     #[test]
     fn ares_start_with_const_places_a_construction_yard_for_the_base_unit() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
         use crate::sim::mission::{MissionId, MissionType};
         // `Foundation=` is an ART key of the type's Image.
         let rules = RuleSet::from_ini_with_fixed_art_for_test(
@@ -4572,6 +4611,50 @@ mod tests {
                 case["name"]
             );
         }
+    }
+
+    /// VERA's room where only AI play: every observer comes before them, and
+    /// a second one leaves the first one's reserved start to the first AI,
+    /// so on a map with a start for each AI every AI gets its own.
+    #[test]
+    fn observers_ahead_of_only_ai_leave_each_ai_a_start() {
+        let mut session = one_player_battle_launch("watch.map").session().clone();
+        let template = session.humans[0].clone();
+        session.humans = (0..2u8)
+            .map(|row| {
+                let mut human = template.clone();
+                human.name = format!("Watcher{row}");
+                human.raw_slot_index = Some(row);
+                human.set_observer(true);
+                human.slot.color_index = 8;
+                human
+            })
+            .collect();
+        session.opponents = (2..4u8)
+            .map(|row| crate::skirmish_launch::SkirmishAiSlot {
+                raw_slot_index: row,
+                country: LaunchCountry::Russia,
+                country_random: false,
+                color_index: row,
+                color_random: false,
+                start_position: LaunchStartPosition::Auto,
+                team: LaunchTeam::None,
+                difficulty: crate::skirmish_launch::AiDifficulty::Normal,
+            })
+            .collect();
+        session.ai_player_count = 2;
+        session.rebuild_house_roster();
+        let starts = [(20, 20), (60, 60)].map(|(rx, ry)| Waypoint { index: 0, rx, ry });
+        let result = native_assign_launch_starts(&session, &starts, &mut SimRng::new(7));
+        let slots = normalized_launch_slots(&session);
+        let ai_starts: Vec<_> = result
+            .placements
+            .iter()
+            .filter(|(slot, _)| !slots[*slot].observer)
+            .map(|(_, start)| (start.rx, start.ry))
+            .collect();
+        assert_eq!(ai_starts.len(), 2);
+        assert_ne!(ai_starts[0], ai_starts[1]);
     }
 
     fn network_hash_perspective(

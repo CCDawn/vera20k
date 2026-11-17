@@ -3,6 +3,7 @@
 use crate::map::entities::EntityCategory;
 use crate::rules::object_type::Ability;
 use crate::rules::ruleset::RuleSet;
+use crate::sim::cloak_disguise::BuildingFadeEdge;
 use crate::sim::combat::TargetKind;
 use crate::sim::combat::veterancy::{has_weapon_ability, rank_from_u16};
 use crate::sim::intern::InternedId;
@@ -123,17 +124,14 @@ fn stock_cloak_tick_facts(
     // CORRECTION: VERA used to put "holds an attack target" in this head gate.
     // Native has no such term here — the target test lives in `CanAutoCloak`
     // step 4 below, as `Target(+0x2B4) != 0 && CanFireAtTarget(vt+0x3AC)`.
-    // vt+0x37C is `IsUnderEMP` (Techno `0x0070EFD0` reads `+0x504 > 0`; the
-    // Unit override `0x00746C90` ORs in `i32(+0x6D8) != -1`; that field's
-    // identity still needs evidence), and
+    // vt+0x37C is `IsUnderEMP` (`GameEntity::is_under_emp`: EMP, or a
+    // Unit's running `DeathFrames=` counter), and
     // vt+0x1D4/+0x1D8 are the chrono warp-in/warp-out flags.
     //
     // Original active-YR producer reachability remains unproven: the
     // dormant TS EMPulse body alone does not establish an original scenario
     // caller. Ares's Bullet hook is a separate, established producer.
-    // Ares ordinary EMP supplies this shared native+504 predicate through
-    // the entity-owned counter. This does not prove a retail TS producer.
-    let emp_active = entity.emp_remaining() > 0;
+    let emp_active = entity.is_under_emp();
     let paralyzed = entity.parasite.is_paralyzed(sim.session.binary_frame());
     // Ares ShouldNotCloak10043A40 applies the same blockers to rank cloak
     // and raw ability, and rejects parachutes and deactivated self-cloakers.
@@ -357,11 +355,8 @@ fn enemy_sensor_by_foundation(sim: &Simulation, id: u64, rules: &RuleSet) -> boo
 /// ShouldUncloak starts uncloaking, and an uncloaked one whose CanAutoCloak
 /// passes with no such sensor starts cloaking, each with `CloakSound`.
 /// Unlike CloakingTick there is no ConditionRed draw and no completion
-/// Detach/Scatter.
-///
-/// Residual: the 1 -> 2 edge also removes, and the 3 -> 0 edge restarts, the
-/// building's `NaturalParticleSystem=` (`+0x30C`). VERA has no building
-/// natural particle system and no retail type sets the key.
+/// Detach/Scatter. The 1 -> 2 edge deletes the building's
+/// `NaturalParticleSystem=` (`+0x30C`) and the 3 -> 0 edge rebuilds it.
 ///
 /// [`CloakRuntime::step_building_fade`]: crate::sim::cloak_disguise::CloakRuntime::step_building_fade
 fn tick_building_cloak(
@@ -371,18 +366,40 @@ fn tick_building_cloak(
     registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     effects: FrameEffects<'_>,
 ) {
-    let Some(state) = sim
+    let Some((edge, state)) = sim
         .substrate
         .entities
         .get_mut(id)
         .and_then(|entity| entity.cloak.as_mut())
-        .map(|cloak| {
-            cloak.step_building_fade();
-            cloak.state()
-        })
+        .map(|cloak| (cloak.step_building_fade(), cloak.state()))
     else {
         return;
     };
+    match edge {
+        // 0x00454E7F..0x00454E9E: the system goes through its vt+0x20 with 1.
+        Some(BuildingFadeEdge::Cloaked) => sim.delete_natural_particle_system(
+            id,
+            UninitContext::new(rules, registry).with_effects(effects),
+        ),
+        // 0x00454F29..0x00454F6C: with no system and a NaturalParticleLocation=
+        // other than the zero coordinate (0x0089C848), Unlimbo's constructor
+        // runs again. A type with a system at the zero offset gets it at
+        // Unlimbo, loses it here on cloaking and never gets it back.
+        // Residual: native does not test Type+0x764 here, and its
+        // constructor would dereference a NULL type; VERA builds nothing.
+        Some(BuildingFadeEdge::Uncloaked)
+            if sim.substrate.entities.get(id).is_some_and(|entity| {
+                entity.building.natural_particle_system.system().is_none()
+                    && sim
+                        .interner
+                        .object_type(entity.type_ref(), rules)
+                        .is_some_and(|object| object.natural_particle_location != glam::IVec3::ZERO)
+            }) =>
+        {
+            sim.construct_natural_particle_system(id, rules);
+        }
+        _ => {}
+    }
     if !matches!(state, 0 | 2) {
         return;
     }
@@ -391,7 +408,7 @@ fn tick_building_cloak(
     };
     let now = facts.current_frame;
     if state == 2 {
-        // 454FDE..454FF3: vt+0x2A4, then vt+0x45C(0) (7036C0).
+        // 0x00455012..0x0045502F: vt+0x2A4, then vt+0x45C(0) (7036C0).
         if !facts.should_uncloak && !enemy_sensor_by_foundation(sim, id, rules) {
             return;
         }
@@ -408,7 +425,7 @@ fn tick_building_cloak(
         }
         return;
     }
-    // 454FF5..45500B: vt+0x2A0 (457770 asks CanAutoCloak before its scan),
+    // 0x00455035..0x00455053: vt+0x2A0 (457770 asks CanAutoCloak before its scan),
     // then vt+0x460(0) (703770).
     if !facts.can_auto_cloak || enemy_sensor_by_foundation(sim, id, rules) {
         return;
@@ -1085,18 +1102,18 @@ fn ares_self_cloak_condition_holds(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_techno))]
 #[path = "techno_ai_cloak_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_techno))]
 #[path = "techno_ai_cloak_ares_tests.rs"]
 mod ares_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_techno))]
 #[path = "techno_cloak_range_tests.rs"]
 mod range_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_techno))]
 #[path = "techno_cloak_range_oracle_tests.rs"]
 mod range_oracle_tests;

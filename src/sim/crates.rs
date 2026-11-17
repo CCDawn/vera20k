@@ -725,7 +725,7 @@ fn snap_to_passable(
     )
 }
 
-#[cfg(test)]
+#[cfg(test)] // shared by test groups
 pub(crate) mod tests {
     use super::*;
 

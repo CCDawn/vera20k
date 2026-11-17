@@ -66,7 +66,7 @@
 //!   sim/team_script_vm (FNPC), sim/world.
 //! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_superweapon))]
 #[path = "paradrop_tests.rs"]
 mod tests;
 
@@ -484,6 +484,7 @@ pub(super) fn send_planes(
     crate::sim::mission::concrete_effects::represented_assign_target(
         entity,
         Some(TargetKind::Cell(target.0, target.1)),
+        rules.ares_form(),
     );
     let facing = if payload.is_ares() {
         (((edge as i32) - 2) & 3) << 6

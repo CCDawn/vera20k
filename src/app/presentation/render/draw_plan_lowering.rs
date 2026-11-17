@@ -142,8 +142,8 @@ pub(crate) enum ObjectExtrasRun {
         parent: DrawId,
         bomb_clock: Option<u32>,
         wrench: Option<u32>,
-        /// Ares POWEROFF marker (10049FE0), after the wrench.
-        #[cfg(feature = "ares")]
+        /// Ares POWEROFF marker (10049FE0), after the wrench; `None` unless
+        /// the Rules were read the Ares way (`techno_extras_for_parent`).
         power_off: Option<u32>,
         rank: Option<u32>,
         background: Option<u32>,
@@ -223,6 +223,28 @@ impl NativeDisplayOrder {
         Self { positions }
     }
 
+    /// [`Self::from_display`] for `sim`'s Display, with each presentation anim
+    /// (`Simulation::presentation_anims`) after the members of its layer, in
+    /// the order they were made.
+    pub(crate) fn from_world(sim: &crate::sim::world::Simulation) -> Self {
+        let display = sim.display_layers();
+        let mut order = Self::from_display(display);
+        let mut next = [0u64; 5];
+        for (index, slot) in next.iter_mut().enumerate() {
+            let layer = crate::sim::world::display_layers::DisplayLayer::from_index(index as u8)
+                .expect("native Display layer index");
+            *slot = display.members(layer).len() as u64;
+        }
+        for (id, layer) in sim.presentation_anims() {
+            let index = usize::from(layer.index());
+            order
+                .positions
+                .insert(id, (TacticalLayer(layer.index()), next[index]));
+            next[index] += 1;
+        }
+        order
+    }
+
     #[cfg(test)]
     pub(crate) fn new(ids: &[DrawId]) -> Self {
         Self {
@@ -232,6 +254,12 @@ impl NativeDisplayOrder {
                 .map(|(rank, &id)| (id, (TacticalLayer(2), rank as u64)))
                 .collect(),
         }
+    }
+
+    /// `id`'s place in the Display walk, `None` for an id no layer holds:
+    /// ordering by it is the order of `DisplayLayers::ordered_ids`.
+    pub(crate) fn position(&self, id: DrawId) -> Option<(TacticalLayer, u64)> {
+        self.positions.get(&id).copied()
     }
 
     pub(crate) fn object_draw(&self, id: DrawId, encoding: SpriteEncoding) -> Option<ObjectDraw> {
@@ -369,7 +397,6 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                     lowered.extras_instances.push(instance);
                     index
                 });
-                #[cfg(feature = "ares")]
                 let power_off = strip.power_off.map(|instance| {
                     let index = lowered.extras_instances.len() as u32;
                     lowered.extras_instances.push(instance);
@@ -433,7 +460,6 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                     parent: owner,
                     bomb_clock,
                     wrench,
-                    #[cfg(feature = "ares")]
                     power_off,
                     rank,
                     background,
@@ -456,19 +482,15 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                 if let Some(ObjectExtrasRun::Status {
                     bomb_clock,
                     wrench,
-                    #[cfg(feature = "ares")]
                     power_off,
                     rank,
                     fills,
                     ..
                 }) = &strip
-                    && (bomb_clock.is_some() || wrench.is_some() || rank.is_some() || {
-                        #[cfg(feature = "ares")]
-                        let marker = power_off.is_some();
-                        #[cfg(not(feature = "ares"))]
-                        let marker = false;
-                        marker
-                    })
+                    && (bomb_clock.is_some()
+                        || wrench.is_some()
+                        || rank.is_some()
+                        || power_off.is_some())
                 {
                     split_prefix = Some(lowered.extras_runs.len());
                     lowered.extras_runs.push(ObjectExtrasRun::Status {
@@ -476,7 +498,6 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                         parent: owner,
                         bomb_clock: *bomb_clock,
                         wrench: *wrench,
-                        #[cfg(feature = "ares")]
                         power_off: *power_off,
                         rank: *rank,
                         background: None,
@@ -535,7 +556,6 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
             if let Some(ObjectExtrasRun::Status {
                 bomb_clock,
                 wrench,
-                #[cfg(feature = "ares")]
                 power_off,
                 rank,
                 background,
@@ -553,12 +573,8 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
             {
                 let bomb_clock = bomb_clock.filter(|_| split_prefix.is_none());
                 let wrench = wrench.filter(|_| split_prefix.is_none());
-                #[cfg(feature = "ares")]
                 let power_off = power_off.filter(|_| split_prefix.is_none());
-                #[cfg(feature = "ares")]
                 let marker = power_off.is_some();
-                #[cfg(not(feature = "ares"))]
-                let marker = false;
                 let rank = rank.filter(|_| split_prefix.is_none());
                 if bomb_clock.is_some()
                     || wrench.is_some()
@@ -586,7 +602,6 @@ pub(crate) fn lower_object_instances(entries: Vec<PlannedObjectInstance>) -> [Ob
                         parent: owner,
                         bomb_clock,
                         wrench,
-                        #[cfg(feature = "ares")]
                         power_off,
                         rank,
                         background,
@@ -799,7 +814,7 @@ fn append_object_run(runs: &mut Vec<ObjectDrawRun>, next: ObjectDrawRun) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_presentation_render))]
 mod tests {
     use super::*;
     use crate::render::draw_state::DrawState;
