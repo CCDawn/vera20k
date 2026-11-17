@@ -3254,7 +3254,7 @@ dependencies = [
 
 [[package]]
 name = "vera20k-superai"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "log",
  "serde",
